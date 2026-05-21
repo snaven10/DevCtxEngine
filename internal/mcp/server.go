@@ -202,6 +202,37 @@ func (s *Server) registerTools(srv *mcpserver.MCPServer) {
 		),
 		s.handleIndexRepo,
 	)
+
+	// 15. memories_by_symbol — "what memories are about this code symbol?"
+	srv.AddTool(
+		mcplib.NewTool("memories_by_symbol",
+			mcplib.WithDescription("Find memories that reference a specific code symbol. Returns memories with their link_sources (files-field=exact file mention, content-mention=symbol named in content, vector-similarity=embedding match)."),
+			mcplib.WithString("symbol", mcplib.Required(), mcplib.Description("Full symbol id, e.g. 'path/file.ts::ClassName.method' or just 'methodName'")),
+			mcplib.WithString("repo", mcplib.Description("Optional repo filter")),
+			mcplib.WithString("branch", mcplib.Description("Optional branch filter")),
+			mcplib.WithNumber("limit", mcplib.Description("Maximum results (default: 20)")),
+		),
+		s.handleMemoriesBySymbol,
+	)
+
+	// 16. memories_by_file — "what memories are about this file?"
+	srv.AddTool(
+		mcplib.NewTool("memories_by_file",
+			mcplib.WithDescription("Find memories that reference a specific file path (any symbol in the file or file-level mention)."),
+			mcplib.WithString("file", mcplib.Required(), mcplib.Description("File path, e.g. 'apps/admin/src/auth.service.ts'")),
+			mcplib.WithNumber("limit", mcplib.Description("Maximum results (default: 20)")),
+		),
+		s.handleMemoriesByFile,
+	)
+
+	// 17. memory_refs — raw junction rows for a memory (symbols + files it references)
+	srv.AddTool(
+		mcplib.NewTool("memory_refs",
+			mcplib.WithDescription("Get the raw symbol/file references attached to a single memory by id. Useful when an agent wants to follow a memory back into the codebase."),
+			mcplib.WithNumber("id", mcplib.Required(), mcplib.Description("Memory id (integer)")),
+		),
+		s.handleMemoryRefs,
+	)
 }
 
 // --- Argument helpers ---
@@ -696,6 +727,61 @@ func (s *Server) handleIndexRepo(ctx context.Context, request mcplib.CallToolReq
 		return mcplib.NewToolResultError(fmt.Sprintf("indexing failed: %v", err)), nil
 	}
 
+	resultJSON, _ := json.MarshalIndent(result, "", "  ")
+	return mcplib.NewToolResultText(string(resultJSON)), nil
+}
+
+func (s *Server) handleMemoriesBySymbol(ctx context.Context, request mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	a := args(request)
+	symbol := argString(a, "symbol", "")
+	if symbol == "" {
+		return mcplib.NewToolResultError("symbol is required"), nil
+	}
+	params := map[string]interface{}{
+		"symbol": symbol,
+		"limit":  int(argFloat(a, "limit", 20)),
+	}
+	if v := argString(a, "repo", ""); v != "" {
+		params["repo"] = v
+	}
+	if v := argString(a, "branch", ""); v != "" {
+		params["branch"] = v
+	}
+	result, err := s.mlClient.Call("memories_by_symbol", params)
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("memories_by_symbol failed: %v", err)), nil
+	}
+	resultJSON, _ := json.MarshalIndent(result, "", "  ")
+	return mcplib.NewToolResultText(string(resultJSON)), nil
+}
+
+func (s *Server) handleMemoriesByFile(ctx context.Context, request mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	a := args(request)
+	file := argString(a, "file", "")
+	if file == "" {
+		return mcplib.NewToolResultError("file is required"), nil
+	}
+	result, err := s.mlClient.Call("memories_by_file", map[string]interface{}{
+		"file":  file,
+		"limit": int(argFloat(a, "limit", 20)),
+	})
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("memories_by_file failed: %v", err)), nil
+	}
+	resultJSON, _ := json.MarshalIndent(result, "", "  ")
+	return mcplib.NewToolResultText(string(resultJSON)), nil
+}
+
+func (s *Server) handleMemoryRefs(ctx context.Context, request mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	a := args(request)
+	id := int(argFloat(a, "id", 0))
+	if id <= 0 {
+		return mcplib.NewToolResultError("id must be a positive integer"), nil
+	}
+	result, err := s.mlClient.Call("memory_refs", map[string]interface{}{"id": id})
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("memory_refs failed: %v", err)), nil
+	}
 	resultJSON, _ := json.MarshalIndent(result, "", "  ")
 	return mcplib.NewToolResultText(string(resultJSON)), nil
 }
