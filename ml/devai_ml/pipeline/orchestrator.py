@@ -93,7 +93,22 @@ class IndexPipeline:
         if full_reindex:
             changes = git.compute_diff(None, state.current_commit)
         else:
-            changes = git.compute_diff(last.last_commit, state.current_commit)
+            try:
+                changes = git.compute_diff(last.last_commit, state.current_commit)
+            except RuntimeError as e:
+                # The last indexed commit may no longer exist in the repo (history
+                # rewrite, force-push, rebased branch, shallow clone). Falling back
+                # to a full reindex is safer than refusing to index at all.
+                if "Invalid revision range" in str(e) or "unknown revision" in str(e):
+                    logger.warning(
+                        "Incremental diff failed (commit %s missing from repo) — "
+                        "falling back to full reindex for %s/%s",
+                        last.last_commit, repo_path, branch,
+                    )
+                    full_reindex = True
+                    changes = git.compute_diff(None, state.current_commit)
+                else:
+                    raise
 
         # Optionally include dirty (uncommitted) changes
         # dirty = git.get_dirty_changes()
