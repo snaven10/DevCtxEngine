@@ -499,7 +499,56 @@ class TreeSitterLanguageParser:
         """
         if self._language == "java":
             return self._build_java_field_map(tree, source)
+        if self._language in ("typescript", "javascript"):
+            return self._build_ts_property_map(tree, source)
         return {}
+
+    def _build_ts_property_map(self, tree: Any, source: bytes | str) -> dict[str, dict[str, str]]:
+        """TypeScript: `private readonly repo: BirthRepository;` →
+        {'BirthService': {'repo': 'BirthRepository'}}.
+
+        Walks `class_declaration` / `abstract_class_declaration` /
+        `interface_declaration` bodies and reads each `public_field_definition`'s
+        `name` (property_identifier) and `type` (type_annotation). The
+        type_annotation text includes the leading `:` which is stripped here so
+        the stored value is the raw type expression. Union and generic types
+        are normalised at lookup time in `_resolve_target_name`.
+
+        Constructor-shorthand parameters (`constructor(private svc: X)`) are NOT
+        captured in this pass — tracked as a future follow-up.
+        """
+        result: dict[str, dict[str, str]] = {}
+
+        CLASS_TYPES = {"class_declaration", "abstract_class_declaration",
+                       "interface_declaration"}
+
+        def _strip_leading_colon(t: str) -> str:
+            t = t.strip()
+            if t.startswith(":"):
+                t = t[1:].lstrip()
+            return t
+
+        def walk(node, current_class: str | None):
+            if node.type in CLASS_TYPES:
+                name = self._node_field_text(node, "name", source)
+                if name:
+                    result.setdefault(name, {})
+                    for c in node.children:
+                        walk(c, name)
+                    return
+            if node.type == "public_field_definition" and current_class is not None:
+                name_node = node.child_by_field_name("name")
+                type_node = node.child_by_field_name("type")
+                if name_node is not None and type_node is not None:
+                    prop_name = self._node_text(name_node, source)
+                    type_text = _strip_leading_colon(self._node_text(type_node, source))
+                    if prop_name and type_text:
+                        result[current_class][prop_name] = type_text
+            for c in node.children:
+                walk(c, current_class)
+
+        walk(tree.root_node, None)
+        return result
 
     def _build_java_field_map(self, tree: Any, source: bytes | str) -> dict[str, dict[str, str]]:
         """Java: `private final UserRepository repo;` → {'ServiceClass': {'repo': 'UserRepository'}}.
@@ -701,9 +750,29 @@ class TreeSitterLanguageParser:
                 enclosing_class = enclosing.split(".", 1)[0]
 
         def _strip_generics(t: str) -> str:
-            # 'List<String>' → 'List'; 'Map.Entry<K,V>' → 'Map.Entry'
+            """Normalise a declared-type text down to a lookup-able identifier.
+
+            Strips:
+              - Generic parameters: 'List<String>' → 'List', 'Map.Entry<K,V>' → 'Map.Entry'
+              - TS union nullability: 'Logger | null' / 'Logger|undefined' → 'Logger'
+              - Whitespace
+            For more exotic unions ('A | B') the first alternative wins; the
+            caller treats this as best-effort and falls back to bare-name
+            matching if the import_map doesn't recognise the result.
+            """
+            t = t.strip()
+            # Generic head: keep everything before '<'
             i = t.find("<")
-            return t[:i].strip() if i >= 0 else t.strip()
+            if i >= 0:
+                t = t[:i].strip()
+            # TS union: split on '|' and pick the first non-null/undefined token
+            if "|" in t:
+                parts = [p.strip() for p in t.split("|") if p.strip()]
+                for p in parts:
+                    if p not in ("null", "undefined", "void", "never"):
+                        t = p
+                        break
+            return t
 
         def _via_field_type(field_name: str) -> str | None:
             """If `field_name` is a known field of the enclosing class, return
