@@ -418,11 +418,23 @@ class TreeSitterLanguageParser:
             if method_name is None and t in method_types:
                 name = self._node_field_text(cur, "name", source)
                 # Anonymous arrow/function expressions take the name of their
-                # enclosing variable_declarator (TS/JS idiom `const x = () => {}`).
+                # enclosing context. TS/JS idioms covered:
+                #   const x = () => {}           → variable_declarator.name = 'x'
+                #   { key: () => {} }            → pair.key / property.key = 'key'
+                #   class C { x = () => {} }     → field_definition.name = 'x'
+                #   x = () => {}                 → assignment_expression.left = 'x'
                 if not name and t in ("arrow_function", "function_expression"):
                     parent = cur.parent
-                    if parent is not None and parent.type == "variable_declarator":
-                        name = self._node_field_text(parent, "name", source)
+                    if parent is not None:
+                        ptype = parent.type
+                        if ptype == "variable_declarator":
+                            name = self._node_field_text(parent, "name", source)
+                        elif ptype in ("pair", "property"):
+                            name = self._node_field_text(parent, "key", source)
+                        elif ptype == "assignment_expression":
+                            name = self._node_field_text(parent, "left", source)
+                        elif ptype in ("public_field_definition", "field_definition"):
+                            name = self._node_field_text(parent, "name", source)
                 if name:
                     method_name = name
             if class_name is None and t in class_types:

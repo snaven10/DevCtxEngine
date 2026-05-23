@@ -50,10 +50,13 @@ def extract(source: str, file_path: str) -> list[Route]:
 
     routes: list[Route] = []
 
-    # Tokenize relevant lines: track an in-Routes brace-depth so children
-    # can concatenate paths with their parent.
-    path_stack: list[str] = []   # parent paths from outer routes
-    brace_stack: list[str] = []  # what each brace opening represents: 'route' | 'children' | 'other'
+    # `parent_stack` holds (depth_at_push, parent_path) tuples. When we see
+    # `children: [`, we push the most recent `path:` value at the current
+    # depth — any path: encountered inside that block prepends every parent
+    # currently on the stack. We pop when the bracket balance drops below
+    # the depth-at-push, i.e. we exited that `children:` array.
+    parent_stack: list[tuple[int, str]] = []
+    last_path_seen = ""
 
     lines = source.splitlines()
     in_routes_block = False
@@ -80,24 +83,35 @@ def extract(source: str, file_path: str) -> list[Route]:
         opens = line.count("[")
         closes = line.count("]")
         routes_brace_balance += opens - closes
+
+        # Pop parent entries whose depth-at-push is now above our balance
+        # (we exited the `children:` arrays they came from).
+        while parent_stack and parent_stack[-1][0] > routes_brace_balance:
+            parent_stack.pop()
+            last_path_seen = ""
+
         if routes_brace_balance <= 0:
             in_routes_block = False
-            path_stack = []
+            parent_stack = []
+            last_path_seen = ""
             continue
 
-        # Track children: nesting via `children: [` openers
-        if _CHILDREN_OPEN.search(line):
-            # Push the current most-recent path onto the stack
-            # (the parent's path was set by the most recent `path:` field)
-            pass
+        # `children: [` on this line opens a nested route array. The parent
+        # path for everything inside is the most recent `path:` we just saw.
+        if _CHILDREN_OPEN.search(line) and last_path_seen:
+            parent_stack.append((routes_brace_balance, last_path_seen))
+            last_path_seen = ""  # reset for the inner scope
 
         pm = _PATH_FIELD.search(line)
         if not pm:
             continue
         path = pm.group(1)
-        full_path = _join_paths("/".join(path_stack), path) if path_stack else (
-            "/" + path if path else "/"
-        )
+        last_path_seen = path
+        prefix = "/".join(p for _, p in parent_stack if p)
+        if prefix:
+            full_path = _join_paths(prefix, path)
+        else:
+            full_path = "/" + path if path else "/"
 
         # Look for the target on the same line or the next few
         target = ""
