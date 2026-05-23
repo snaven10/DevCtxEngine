@@ -95,6 +95,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/index/{repo}", s.authMiddleware(s.handleGetIndex))
 	s.mux.HandleFunc("POST /api/v1/index/{repo}/push", s.authMiddleware(s.handlePushIndex))
 	s.mux.HandleFunc("POST /api/v1/index/{repo}/pull", s.authMiddleware(s.handlePullIndex))
+	s.mux.HandleFunc("POST /api/v1/index/{repo}", s.authMiddleware(s.handleIndexRepo))
 	s.mux.HandleFunc("GET /api/v1/memory/{repo}", s.authMiddleware(s.handleGetMemories))
 	s.mux.HandleFunc("POST /api/v1/memory/{repo}", s.authMiddleware(s.handlePostMemory))
 	s.mux.HandleFunc("POST /api/v1/memory/{repo}/sync", s.authMiddleware(s.handleSyncMemory))
@@ -230,6 +231,35 @@ func (s *Server) handlePullIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleIndexRepo triggers an index (or re-index) of a repo from the dashboard
+// or any HTTP client. Reuses the shared ML stdio client (no per-request spawn).
+//
+// Path:     POST /api/v1/index/{repo}
+// Query:    path=<on-disk path>    (optional; defaults to {repo})
+//           branch=<name>          (optional)
+//           incremental=true|false (optional, default true)
+//
+// The Python `index_repo` handler expects `repo_path` to be a directory with
+// a `.git`. The `{repo}` path-segment is convenient when the user is running
+// `devai server api` from the parent of the repo; otherwise pass `path=`.
+func (s *Server) handleIndexRepo(w http.ResponseWriter, r *http.Request) {
+	repoPath := r.URL.Query().Get("path")
+	if repoPath == "" {
+		repoPath = r.PathValue("repo")
+	}
+	branch := r.URL.Query().Get("branch")
+	incremental := r.URL.Query().Get("incremental") != "false" // default true
+
+	result, err := s.ml.IndexRepo(repoPath, branch, incremental)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": fmt.Sprintf("index_repo failed: %v", err),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 
