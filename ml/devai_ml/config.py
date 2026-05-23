@@ -126,6 +126,96 @@ class EmbeddingConfig:
 
 
 @dataclass(frozen=True)
+class TokenBudgetConfig:
+    """Token budget for handler outputs.
+
+    Strategies:
+        drop            — keep top items by score, omit until budget fits
+        soft_truncate   — cut each oversize item at sentence/newline boundary
+        hard_truncate   — cut each oversize item at exact char count
+        summarize       — pass each oversize item through the summarizer
+
+    Env vars:
+        DEVAI_MAX_OUTPUT_TOKENS         (default 4000)
+        DEVAI_TOKEN_STRATEGY            drop|soft_truncate|hard_truncate|summarize
+        DEVAI_TOKEN_ENCODING            tiktoken encoding (default cl100k_base)
+    """
+    max_output_tokens: int = 4000
+    strategy: str = "drop"
+    encoding: str = "cl100k_base"
+
+    _VALID_STRATEGIES = ("drop", "soft_truncate", "hard_truncate", "summarize")
+
+    def __post_init__(self) -> None:
+        if self.strategy not in self._VALID_STRATEGIES:
+            raise ValueError(
+                f"Invalid strategy {self.strategy!r}. "
+                f"Valid: {', '.join(self._VALID_STRATEGIES)}"
+            )
+        if self.max_output_tokens <= 0:
+            raise ValueError(f"max_output_tokens must be > 0, got {self.max_output_tokens}")
+
+    @classmethod
+    def from_env(cls) -> "TokenBudgetConfig":
+        return cls(
+            max_output_tokens=_env_int("DEVAI_MAX_OUTPUT_TOKENS", 4000),
+            strategy=_env_str("DEVAI_TOKEN_STRATEGY", "drop") or "drop",
+            encoding=_env_str("DEVAI_TOKEN_ENCODING", "cl100k_base") or "cl100k_base",
+        )
+
+
+@dataclass(frozen=True)
+class SummarizerConfig:
+    """Summarizer provider configuration.
+
+    Providers:
+        noop            — return content unchanged
+        extractive      — top-N sentences by similarity (reuses embedding model)
+        flan-t5         — local abstractive (HF transformers, ~80MB for small)
+        openai          — cloud abstractive (BLOCKED by require_local=True default)
+
+    require_local guards against accidentally leaking content to a third-party
+    API. To use openai you must explicitly set DEVAI_SUMMARIZER_REQUIRE_LOCAL=false.
+
+    Env vars:
+        DEVAI_SUMMARIZER_PROVIDER         (default extractive)
+        DEVAI_SUMMARIZER_MODEL            provider-specific (e.g. google/flan-t5-small)
+        DEVAI_SUMMARIZER_DEVICE           cpu | cuda (default cpu)
+        DEVAI_SUMMARIZER_API_KEY          for openai
+        DEVAI_SUMMARIZER_TARGET_TOKENS    target summary length (default 200)
+        DEVAI_SUMMARIZER_REQUIRE_LOCAL    block non-local providers (default true)
+    """
+    provider: str = "extractive"
+    model: str | None = None
+    api_key: str | None = None
+    device: str = "cpu"
+    target_tokens: int = 200
+    require_local: bool = True
+
+    _VALID_PROVIDERS = ("noop", "extractive", "flan-t5", "openai")
+
+    def __post_init__(self) -> None:
+        if self.provider not in self._VALID_PROVIDERS:
+            raise ValueError(
+                f"Invalid provider {self.provider!r}. "
+                f"Valid: {', '.join(self._VALID_PROVIDERS)}"
+            )
+        if self.target_tokens <= 0:
+            raise ValueError(f"target_tokens must be > 0, got {self.target_tokens}")
+
+    @classmethod
+    def from_env(cls) -> "SummarizerConfig":
+        return cls(
+            provider=_env_str("DEVAI_SUMMARIZER_PROVIDER", "extractive") or "extractive",
+            model=_env_str("DEVAI_SUMMARIZER_MODEL"),
+            api_key=_env_str("DEVAI_SUMMARIZER_API_KEY"),
+            device=_env_str("DEVAI_SUMMARIZER_DEVICE", "cpu") or "cpu",
+            target_tokens=_env_int("DEVAI_SUMMARIZER_TARGET_TOKENS", 200),
+            require_local=_env_bool("DEVAI_SUMMARIZER_REQUIRE_LOCAL", True),
+        )
+
+
+@dataclass(frozen=True)
 class IdleTimeoutConfig:
     """Idle watchdog (v0.7.1). 0 disables the watchdog entirely.
 
@@ -148,6 +238,8 @@ class DevAIConfig:
     """
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    token_budget: TokenBudgetConfig = field(default_factory=TokenBudgetConfig)
+    summarizer: SummarizerConfig = field(default_factory=SummarizerConfig)
     idle_timeout: IdleTimeoutConfig = field(default_factory=IdleTimeoutConfig)
     state_dir: Path | None = None
 
@@ -158,6 +250,8 @@ class DevAIConfig:
         return cls(
             chunking=ChunkingConfig.from_env(),
             embedding=EmbeddingConfig.from_env(),
+            token_budget=TokenBudgetConfig.from_env(),
+            summarizer=SummarizerConfig.from_env(),
             idle_timeout=IdleTimeoutConfig.from_env(),
             state_dir=Path(state_dir_raw) if state_dir_raw else None,
         )
