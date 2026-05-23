@@ -19,6 +19,8 @@ from .stores.factory import create_storage_config_from_env, create_vector_store
 from .stores.graph_store import SQLiteGraphStore
 from .stores.index_state import IndexStateStore
 from .stores.memory_store import Memory, MemoryStore
+from .summarization import create_summarizer
+from .util import TokenBudget
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,12 @@ class MLService:
         self._embedding = create_provider(cfg.embedding.to_legacy_dict())
         self._parser_registry = ParserRegistry()
         self._chunker = SemanticChunker(config=cfg.chunking)
+        self._summarizer = create_summarizer(
+            cfg.summarizer, embedding_provider=self._embedding,
+        )
+        self._token_budget = TokenBudget(
+            cfg.token_budget, summarizer=self._summarizer,
+        )
 
         # Storage path resolution (priority order):
         #   1. cfg.state_dir (env var DEVAI_STATE_DIR or CLI --state-dir)
@@ -242,10 +250,17 @@ class MLService:
                 "text": r.text[:500] if r.text else "",
             })
 
+        # Apply token budget. is_code=True forces DROP strategy — truncating
+        # or summarizing code chunks would corrupt identifiers.
+        deduped, budget = self._token_budget.fit(
+            deduped, content_key="text", is_code=True, query=query,
+        )
+
         return {
             "query": query,
             "count": len(deduped),
             "results": deduped,
+            "budget": budget.to_dict(),
         }
 
     def _handle_parse_file(self, params: dict) -> dict:
@@ -619,7 +634,18 @@ class MLService:
                     "score": round(vr.score, 4),
                 })
 
-        return {"query": query, "count": len(memories), "memories": memories}
+        # Apply token budget. is_code=False — strategy from config (drop /
+        # soft_truncate / hard_truncate / summarize) applies.
+        memories, budget = self._token_budget.fit(
+            memories, content_key="content", is_code=False, query=query,
+        )
+
+        return {
+            "query": query,
+            "count": len(memories),
+            "memories": memories,
+            "budget": budget.to_dict(),
+        }
 
     def _handle_memory_context(self, params: dict) -> dict:
         """Get recent memories without search."""
@@ -627,25 +653,34 @@ class MLService:
         scope = params.get("scope", "")
         limit = int(params.get("limit", 20))
 
-        memories = self._memory_store.get_recent(project=project, scope=scope, limit=limit)
+        memories_raw = self._memory_store.get_recent(project=project, scope=scope, limit=limit)
+        memories = [
+            {
+                "id": m.id,
+                "title": m.title,
+                "content": m.content,
+                "type": m.memory_type,
+                "scope": m.scope,
+                "project": m.project,
+                "topic_key": m.topic_key,
+                "tags": m.tags,
+                "revision_count": m.revision_count,
+                "created_at": m.created_at,
+                "updated_at": m.updated_at,
+            }
+            for m in memories_raw
+        ]
+
+        # Apply token budget — replaces the previous hardcoded 200-char per-item
+        # truncate with the configured strategy (drop default).
+        memories, budget = self._token_budget.fit(
+            memories, content_key="content", is_code=False,
+        )
+
         return {
             "count": len(memories),
-            "memories": [
-                {
-                    "id": m.id,
-                    "title": m.title,
-                    "content": m.content[:200] + "..." if len(m.content) > 200 else m.content,
-                    "type": m.memory_type,
-                    "scope": m.scope,
-                    "project": m.project,
-                    "topic_key": m.topic_key,
-                    "tags": m.tags,
-                    "revision_count": m.revision_count,
-                    "created_at": m.created_at,
-                    "updated_at": m.updated_at,
-                }
-                for m in memories
-            ],
+            "memories": memories,
+            "budget": budget.to_dict(),
         }
 
     def _handle_memory_update(self, params: dict) -> dict:
@@ -673,7 +708,8 @@ class MLService:
             d = _mem_to_dict(m)
             d["link_sources"] = link_sources
             out.append(d)
-        return {"symbol": symbol, "count": len(out), "memories": out}
+        out, budget = self._token_budget.fit(out, content_key="content", is_code=False)
+        return {"symbol": symbol, "count": len(out), "memories": out, "budget": budget.to_dict()}
 
     def _handle_memories_by_file(self, params: dict) -> dict:
         """Memories that reference a file path."""
@@ -685,7 +721,8 @@ class MLService:
             d = _mem_to_dict(m)
             d["link_sources"] = link_sources
             out.append(d)
-        return {"file": file, "count": len(out), "memories": out}
+        out, budget = self._token_budget.fit(out, content_key="content", is_code=False)
+        return {"file": file, "count": len(out), "memories": out, "budget": budget.to_dict()}
 
     def _handle_extract_routes(self, params: dict) -> dict:
         """Generic dispatcher. Picks the right extractor per framework, scans
