@@ -488,6 +488,56 @@ class TreeSitterLanguageParser:
             return self._build_python_import_map(tree, source)
         return {}
 
+    def _build_field_map(self, tree: Any, source: bytes | str) -> dict[str, dict[str, str]]:
+        """Return `{ClassName: {field_name: declared_type_text}}` for every
+        typed field declared in the file. Used by `_resolve_target_name` to
+        resolve calls of the form `this.svc.create()` or `svc.create()` where
+        `svc` is a class field — without this we can only resolve imported
+        receivers.
+
+        Per-language helpers; languages without field-type tracking return {}.
+        """
+        if self._language == "java":
+            return self._build_java_field_map(tree, source)
+        return {}
+
+    def _build_java_field_map(self, tree: Any, source: bytes | str) -> dict[str, dict[str, str]]:
+        """Java: `private final UserRepository repo;` → {'ServiceClass': {'repo': 'UserRepository'}}.
+
+        Walks every `class_declaration` (also `interface_declaration` / `enum_declaration`
+        for completeness) and collects its `field_declaration` children. Each
+        `field_declaration` has a `type` field and one-or-more `variable_declarator`
+        children whose `.name` is the field name. Generic types are stored raw
+        (e.g. `List<String>`); the resolver strips the `<...>` before lookup.
+        """
+        result: dict[str, dict[str, str]] = {}
+
+        CLASS_TYPES = {"class_declaration", "interface_declaration",
+                       "enum_declaration", "record_declaration"}
+
+        def walk(node, current_class: str | None):
+            if node.type in CLASS_TYPES:
+                name = self._node_field_text(node, "name", source)
+                if name:
+                    result.setdefault(name, {})
+                    for c in node.children:
+                        walk(c, name)
+                    return
+            if node.type == "field_declaration" and current_class is not None:
+                type_node = node.child_by_field_name("type")
+                if type_node is not None:
+                    type_text = self._node_text(type_node, source)
+                    for c in node.children:
+                        if c.type == "variable_declarator":
+                            fname = self._node_field_text(c, "name", source)
+                            if fname:
+                                result[current_class][fname] = type_text
+            for c in node.children:
+                walk(c, current_class)
+
+        walk(tree.root_node, None)
+        return result
+
     def _build_java_import_map(self, tree: Any, source: bytes | str) -> dict[str, str]:
         """Java: `import a.b.C;` → {'C': 'a.b.C'}. Wildcards skipped (no
         local name to anchor on). Static imports keep their member name."""
@@ -622,30 +672,93 @@ class TreeSitterLanguageParser:
         return imports
 
     def _resolve_target_name(self, name_node: Any, source: bytes | str,
-                              import_map: dict[str, str]) -> str:
+                              import_map: dict[str, str],
+                              field_map: dict[str, dict[str, str]] | None = None) -> str:
         """Take an `@call.name` node and return either the bare name or its
-        fully-qualified form when the receiver maps to an import."""
+        fully-qualified form when the receiver maps to an import or a typed
+        field of the enclosing class.
+
+        Resolution priority (highest confidence first):
+          1. Receiver is identifier → look it up in import_map
+          2. Receiver is identifier that names a field of the enclosing class
+             → look up its declared type → look up that type in import_map
+          3. Receiver is `this.field` (field_access) → same field-type path as 2
+          4. Free-standing call name appears in import_map (static-import idiom)
+        """
         call_name = self._node_text(name_node, source)
         if not call_name:
             return call_name
         parent = name_node.parent if hasattr(name_node, "parent") else None
+        field_map = field_map or {}
 
-        # Receiver-aware resolution: `Logger.getLogger` where `Logger` is imported.
+        # Compute the enclosing class once if the field_map has anything to offer.
+        enclosing_class: str | None = None
+        if field_map:
+            enclosing = self._find_enclosing_symbol(name_node, source)
+            if enclosing:
+                # _find_enclosing_symbol returns either 'Class.method' or 'Class' or 'method'.
+                # We want just the class part.
+                enclosing_class = enclosing.split(".", 1)[0]
+
+        def _strip_generics(t: str) -> str:
+            # 'List<String>' → 'List'; 'Map.Entry<K,V>' → 'Map.Entry'
+            i = t.find("<")
+            return t[:i].strip() if i >= 0 else t.strip()
+
+        def _via_field_type(field_name: str) -> str | None:
+            """If `field_name` is a known field of the enclosing class, return
+            `<FQN-of-its-type>.<call_name>` (or just `<type>.<call_name>` when
+            the type isn't imported but is known)."""
+            if not enclosing_class or enclosing_class not in field_map:
+                return None
+            type_text = field_map[enclosing_class].get(field_name)
+            if not type_text:
+                return None
+            type_name = _strip_generics(type_text)
+            if type_name in import_map:
+                return f"{import_map[type_name]}.{call_name}"
+            # Type is in scope but not imported (same package, java.lang, etc.)
+            return f"{type_name}.{call_name}"
+
+        # Receiver-aware resolution: `Logger.getLogger` where `Logger` is imported,
+        # or `repo.findById(...)` where `repo` is a typed field.
         if parent is not None:
             container_type = parent.type
-            obj_field = "object"
-            # Java: name node lives directly under method_invocation
-            # TS/JS: name node lives under member_expression which is under call_expression
-            # Python: name node lives under `attribute`
             if container_type in ("method_invocation", "member_expression", "attribute"):
                 try:
-                    obj_node = parent.child_by_field_name(obj_field)
+                    obj_node = parent.child_by_field_name("object")
                 except Exception:
                     obj_node = None
-                if obj_node is not None and obj_node.type in ("identifier", "type_identifier"):
-                    receiver = self._node_text(obj_node, source)
-                    if receiver in import_map:
-                        return f"{import_map[receiver]}.{call_name}"
+                if obj_node is not None:
+                    # Pattern: `Identifier.method()` — try imports first, then field map
+                    if obj_node.type in ("identifier", "type_identifier"):
+                        receiver = self._node_text(obj_node, source)
+                        if receiver in import_map:
+                            return f"{import_map[receiver]}.{call_name}"
+                        promoted = _via_field_type(receiver)
+                        if promoted:
+                            return promoted
+                    # Pattern: `this.field.method()` (Java/TS) or `self.field.method()` (Python)
+                    elif obj_node.type == "field_access":
+                        fld_node = obj_node.child_by_field_name("field")
+                        if fld_node is not None:
+                            promoted = _via_field_type(self._node_text(fld_node, source))
+                            if promoted:
+                                return promoted
+                    elif obj_node.type == "member_expression":
+                        # TS: `this.field.method()` parses as member_expression(member_expression, identifier)
+                        prop_node = obj_node.child_by_field_name("property")
+                        if prop_node is not None:
+                            promoted = _via_field_type(self._node_text(prop_node, source))
+                            if promoted:
+                                return promoted
+                    elif obj_node.type == "attribute":
+                        # Python: `self.x.method()` parses as attribute(attribute, identifier)
+                        attr_node = obj_node.child_by_field_name("attribute")
+                        if attr_node is not None:
+                            promoted = _via_field_type(self._node_text(attr_node, source))
+                            if promoted:
+                                return promoted
 
         # Free-standing call where the function name itself is the import (no receiver)
         # — common with `from X import foo; foo()` (Python) or
@@ -686,8 +799,9 @@ class TreeSitterLanguageParser:
         cursor = tree_sitter.QueryCursor(query)
         matches = cursor.matches(tree.root_node)
 
-        # One pass over imports per file — reused for every call below.
+        # One pass over imports + class fields per file — reused for every call below.
         import_map = self._build_import_map(tree, source)
+        field_map = self._build_field_map(tree, source)
 
         for _pattern_idx, captures_dict in matches:
             for capture_name, nodes in captures_dict.items():
@@ -695,7 +809,7 @@ class TreeSitterLanguageParser:
                     for node in nodes:
                         edges.append(GraphEdge(
                             source=self._container_source_id(node, source, file_path),
-                            target=self._resolve_target_name(node, source, import_map),
+                            target=self._resolve_target_name(node, source, import_map, field_map),
                             kind="calls",
                             file_path=file_path,
                             line=node.start_point[0] + 1,
