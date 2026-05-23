@@ -4,14 +4,16 @@ import hashlib
 import logging
 from dataclasses import dataclass
 
+from ..config import ChunkingConfig
 from ..parsers.base import ParseResult, Symbol
 
 logger = logging.getLogger(__name__)
 
-# Chunk size thresholds (in estimated tokens, ~4 chars per token)
-MAX_CHUNK_TOKENS = 512      # ~2048 chars — upper bound per chunk
-MIN_CHUNK_TOKENS = 64       # ~256 chars — below this, merge with neighbors
-LARGE_FUNCTION_THRESHOLD = 1024  # tokens — above this, split at block boundaries
+# Backward-compat re-exports. New code should consume ChunkingConfig directly.
+_DEFAULTS = ChunkingConfig()
+MAX_CHUNK_TOKENS = _DEFAULTS.max_chunk_tokens
+MIN_CHUNK_TOKENS = _DEFAULTS.min_chunk_tokens
+LARGE_FUNCTION_THRESHOLD = _DEFAULTS.large_function_threshold
 
 
 @dataclass(slots=True)
@@ -50,13 +52,30 @@ class SemanticChunker:
 
     def __init__(
         self,
-        max_chunk_tokens: int = MAX_CHUNK_TOKENS,
-        min_chunk_tokens: int = MIN_CHUNK_TOKENS,
-        large_fn_threshold: int = LARGE_FUNCTION_THRESHOLD,
+        config: ChunkingConfig | None = None,
+        *,
+        max_chunk_tokens: int | None = None,
+        min_chunk_tokens: int | None = None,
+        large_fn_threshold: int | None = None,
     ) -> None:
-        self.max_chunk_tokens = max_chunk_tokens
-        self.min_chunk_tokens = min_chunk_tokens
-        self.large_fn_threshold = large_fn_threshold
+        legacy_kwargs = (max_chunk_tokens, min_chunk_tokens, large_fn_threshold)
+        if config is not None and any(v is not None for v in legacy_kwargs):
+            raise ValueError(
+                "Pass either `config` OR the legacy kwargs (max_chunk_tokens, "
+                "min_chunk_tokens, large_fn_threshold), not both."
+            )
+        if config is None:
+            config = ChunkingConfig(
+                max_chunk_tokens=max_chunk_tokens if max_chunk_tokens is not None
+                                 else MAX_CHUNK_TOKENS,
+                min_chunk_tokens=min_chunk_tokens if min_chunk_tokens is not None
+                                 else MIN_CHUNK_TOKENS,
+                large_function_threshold=large_fn_threshold if large_fn_threshold is not None
+                                         else LARGE_FUNCTION_THRESHOLD,
+            )
+        self.max_chunk_tokens = config.max_chunk_tokens
+        self.min_chunk_tokens = config.min_chunk_tokens
+        self.large_fn_threshold = config.large_function_threshold
 
     def chunk(self, parse_result: ParseResult) -> list[CodeChunk]:
         """Generate semantic chunks from a parse result."""
