@@ -3,6 +3,7 @@ package mlclient
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/snaven10/devai/internal/config"
@@ -94,63 +96,67 @@ func NewStdioClient(opts ...Option) (*StdioClient, error) {
 	for _, opt := range opts {
 		opt(client)
 	}
+	if err := client.start(); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
 
-	pythonBin := runtime.FindPython(client.projectCfg)
+// start spawns a fresh Python ML process and waits for the READY signal.
+// Called by NewStdioClient on first launch and by restart() on broken pipe
+// after the Python process exits (e.g. via DEVAI_ML_IDLE_TIMEOUT_SEC).
+func (c *StdioClient) start() error {
+	pythonBin := runtime.FindPython(c.projectCfg)
 
 	args := []string{"-m", "devai_ml.server"}
-	if client.stateDir != "" {
-		args = append(args, "--state-dir", client.stateDir)
+	if c.stateDir != "" {
+		args = append(args, "--state-dir", c.stateDir)
 	}
-	if client.model != "" {
-		args = append(args, "--model", client.model)
+	if c.model != "" {
+		args = append(args, "--model", c.model)
 	}
 	cmd := exec.Command(pythonBin, args...)
-	client.cmd = cmd
 
-	// Propagate extra env vars to the ML sidecar process.
-	// When cmd.Env is nil, the child inherits the parent's env.
-	// When extraEnv is set, we explicitly merge parent env + extras.
-	if len(client.extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), client.extraEnv...)
+	if len(c.extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), c.extraEnv...)
 	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, fmt.Errorf("creating stdin pipe: %w", err)
+		return fmt.Errorf("creating stdin pipe: %w", err)
 	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("creating stdout pipe: %w", err)
+		return fmt.Errorf("creating stdout pipe: %w", err)
 	}
 
-	// Capture stderr to wait for READY signal and forward logs
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, fmt.Errorf("creating stderr pipe: %w", err)
+		return fmt.Errorf("creating stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting ML service (%s): %w", pythonBin, err)
+		return fmt.Errorf("starting ML service (%s): %w", pythonBin, err)
 	}
 
-	client.stdin = stdin
-	client.stdout = bufio.NewReader(stdout)
+	c.cmd = cmd
+	c.stdin = stdin
+	c.stdout = bufio.NewReader(stdout)
 
-	// Wait for DEVAI_ML_READY on stderr (model loaded)
 	ready := make(chan error, 1)
+	quiet := c.quiet
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if !client.quiet {
+			if !quiet {
 				fmt.Fprintln(os.Stderr, "[ml] "+line)
 			}
 			if strings.Contains(line, "DEVAI_ML_READY") {
 				ready <- nil
-				// Keep draining stderr in background
 				for scanner.Scan() {
-					if !client.quiet {
+					if !quiet {
 						fmt.Fprintln(os.Stderr, "[ml] "+scanner.Text())
 					}
 				}
@@ -164,21 +170,55 @@ func NewStdioClient(opts ...Option) (*StdioClient, error) {
 	case err := <-ready:
 		if err != nil {
 			cmd.Process.Kill()
-			return nil, err
+			return err
 		}
 	case <-time.After(120 * time.Second):
 		cmd.Process.Kill()
-		return nil, fmt.Errorf("ML service startup timed out (120s) — model download may be needed")
+		return fmt.Errorf("ML service startup timed out (120s) — model download may be needed")
 	}
 
-	return client, nil
+	return nil
+}
+
+// restart reaps the dead Python process and spawns a fresh one.
+// Caller MUST hold c.mu. Used after a broken-pipe / EOF on Call().
+func (c *StdioClient) restart() error {
+	if c.cmd != nil && c.cmd.Process != nil {
+		_ = c.cmd.Process.Kill()
+		_ = c.cmd.Wait()
+	}
+	if c.stdin != nil {
+		_ = c.stdin.Close()
+	}
+	c.cmd = nil
+	c.stdin = nil
+	c.stdout = nil
+	return c.start()
+}
+
+// isDeadProcessErr reports whether err indicates the child process exited
+// (broken pipe on write, EOF on read, or closed-pipe variants).
+func isDeadProcessErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "broken pipe") || strings.Contains(msg, "file already closed")
 }
 
 // Call sends a JSON-RPC request and waits for the response.
+// If the Python ML process has exited (e.g. via the idle watchdog), Call
+// transparently respawns it and retries the request once.
 func (c *StdioClient) Call(method string, params interface{}) (interface{}, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.callOnce(method, params, true)
+}
 
+func (c *StdioClient) callOnce(method string, params interface{}, allowRetry bool) (interface{}, error) {
 	id := c.nextID.Add(1)
 
 	req := jsonRPCRequest{
@@ -193,14 +233,24 @@ func (c *StdioClient) Call(method string, params interface{}) (interface{}, erro
 		return nil, fmt.Errorf("marshaling request: %w", err)
 	}
 
-	// Send request
 	if _, err := c.stdin.Write(append(data, '\n')); err != nil {
+		if allowRetry && isDeadProcessErr(err) {
+			if rerr := c.restart(); rerr != nil {
+				return nil, fmt.Errorf("ML respawn after write fail: %w (orig: %v)", rerr, err)
+			}
+			return c.callOnce(method, params, false)
+		}
 		return nil, fmt.Errorf("writing request: %w", err)
 	}
 
-	// Read response
 	line, err := c.stdout.ReadBytes('\n')
 	if err != nil {
+		if allowRetry && isDeadProcessErr(err) {
+			if rerr := c.restart(); rerr != nil {
+				return nil, fmt.Errorf("ML respawn after read fail: %w (orig: %v)", rerr, err)
+			}
+			return c.callOnce(method, params, false)
+		}
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
