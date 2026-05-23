@@ -4,7 +4,7 @@ import re
 import sqlite3
 import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
