@@ -117,7 +117,7 @@ class MemoryStore:
         branch     TEXT NOT NULL DEFAULT '',
         source     TEXT NOT NULL DEFAULT '',  -- 'files-field' | 'content-mention' | 'manual'
         created_at TEXT NOT NULL,
-        PRIMARY KEY (memory_id, symbol, file),
+        PRIMARY KEY (memory_id, symbol, file, branch),
         FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_msref_symbol ON memory_symbol_references(symbol);
@@ -133,8 +133,40 @@ class MemoryStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(self.SCHEMA)
+        self._migrate_memory_symbol_references_pk()
         self._conn.commit()
         logger.debug("MemoryStore initialized at %s", db_path)
+
+    def _migrate_memory_symbol_references_pk(self) -> None:
+        """One-shot migration: add `branch` to the junction table PK.
+
+        Older databases created `memory_symbol_references` with
+        PRIMARY KEY (memory_id, symbol, file) — that silently collapsed
+        cross-branch references for the same (memory, symbol, file). The
+        current schema includes `branch` in the PK. Detect the old layout
+        via PRAGMA and recreate the table (safe: it is rebuildable with
+        `backfill_symbol_refs` / `extract_symbol_refs`).
+        """
+        try:
+            rows = self._conn.execute(
+                "PRAGMA table_info(memory_symbol_references)"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return  # table doesn't exist yet; CREATE TABLE will use the new PK
+        pk_cols = {r["name"] for r in rows if r["pk"] > 0}
+        if not pk_cols:
+            return  # no PK info available
+        if "branch" in pk_cols:
+            return  # already migrated
+        logger.warning(
+            "Migrating memory_symbol_references: adding 'branch' to PRIMARY KEY. "
+            "Existing junction rows are dropped — run /api/v1/memory/backfill-refs "
+            "to repopulate."
+        )
+        self._conn.execute("DROP TABLE memory_symbol_references")
+        # Re-run the full SCHEMA — every CREATE TABLE is IF NOT EXISTS so only
+        # the dropped one comes back, with the new PK and indexes.
+        self._conn.executescript(self.SCHEMA)
 
     def close(self) -> None:
         self._conn.close()
@@ -244,7 +276,7 @@ class MemoryStore:
             return symbol.rsplit("/", 1)[1]
         return symbol
 
-    def extract_symbol_refs(self, memory: Memory) -> int:
+    def extract_symbol_refs(self, memory: Memory, commit: bool = True) -> int:
         """Populate memory_symbol_references for a saved memory.
 
         Strategy:
@@ -254,6 +286,11 @@ class MemoryStore:
              appears as a distinct identifier, link it.
 
         Idempotent: PRIMARY KEY (memory_id, symbol, file) makes re-runs cheap.
+
+        `commit=False` lets the caller own the transaction boundary. The
+        backfill loop uses this so the whole sweep is atomic — a Ctrl-C
+        partway through doesn't leave half-cleared junction rows.
+
         Returns the number of distinct references inserted (counting both files and symbols).
         """
         if memory.id is None or not memory.content:
@@ -279,17 +316,20 @@ class MemoryStore:
         try:
             self._conn.execute("SELECT 1 FROM graph_edges LIMIT 0")
         except sqlite3.OperationalError:
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
             return inserted
 
         if not files:
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
             return inserted
 
         # Tokenize memory content into a set of candidate identifiers
         tokens = set(self._IDENT_RE.findall(memory.content))
         if not tokens:
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
             return inserted
 
         placeholders = ",".join(["?"] * len(files))
@@ -326,7 +366,8 @@ class MemoryStore:
             )
             inserted += 1
 
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
         return inserted
 
     def memories_by_symbol(self, symbol: str, repo: str = "", branch: str = "",
@@ -435,18 +476,28 @@ class MemoryStore:
     def backfill_symbol_refs(self) -> dict:
         """Re-run extract_symbol_refs across every non-deleted memory.
         Use after upgrading or after a fresh index.
-        Returns {memories_scanned, refs_inserted}."""
+
+        Runs the whole loop inside a single SQLite transaction
+        (`with self._conn:`). If the process is interrupted partway, every
+        memory's junction rows are atomically rolled back — none get left
+        in the half-cleared "DELETE happened, INSERT didn't" state that an
+        unbatched flush would produce.
+
+        Returns {memories_scanned, refs_inserted}.
+        """
         rows = self._conn.execute(
             "SELECT id FROM memories WHERE deleted_at IS NULL"
         ).fetchall()
         scanned = 0
         inserted = 0
-        for r in rows:
-            mem = self.get(r["id"])
-            if mem is None:
-                continue
-            scanned += 1
-            inserted += self.extract_symbol_refs(mem)
+        with self._conn:  # SQLite savepoint — all-or-nothing
+            for r in rows:
+                mem = self.get(r["id"])
+                if mem is None:
+                    continue
+                scanned += 1
+                # commit=False so the outer `with` block owns the tx
+                inserted += self.extract_symbol_refs(mem, commit=False)
         logger.info("backfill_symbol_refs: scanned=%d inserted=%d", scanned, inserted)
         return {"memories_scanned": scanned, "refs_inserted": inserted}
 

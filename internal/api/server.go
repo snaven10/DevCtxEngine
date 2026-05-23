@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,23 @@ import (
 	"github.com/snaven10/devai/internal/session"
 	"github.com/snaven10/devai/internal/storage"
 )
+
+// parseIntParam reads `name` from the request's query string. Returns
+// `defaultVal` when the param is absent. When present, it must parse as a
+// positive integer ≤ maxVal; otherwise an empty errMsg is returned so the
+// handler can emit a 400 Bad Request. Stricter than fmt.Sscanf, which
+// silently accepts garbage suffixes ("5abc") and negative values.
+func parseIntParam(r *http.Request, name string, defaultVal, maxVal int) (int, string) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return defaultVal, ""
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 || v > maxVal {
+		return 0, fmt.Sprintf("invalid '%s' (must be integer 1..%d)", name, maxVal)
+	}
+	return v, ""
+}
 
 // Config holds API server configuration.
 type Config struct {
@@ -224,8 +242,11 @@ func (s *Server) handleGetMemories(w http.ResponseWriter, r *http.Request) {
 	memType := r.URL.Query().Get("type")
 	query := r.URL.Query().Get("q")
 	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
+	if n, errMsg := parseIntParam(r, "limit", limit, 500); errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		return
+	} else {
+		limit = n
 	}
 
 	var (
@@ -286,8 +307,11 @@ func (s *Server) handleMemoriesBySymbol(w http.ResponseWriter, r *http.Request) 
 	repo := r.URL.Query().Get("repo")
 	branch := r.URL.Query().Get("branch")
 	limit := 20
-	if l := r.URL.Query().Get("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
+	if n, errMsg := parseIntParam(r, "limit", limit, 500); errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		return
+	} else {
+		limit = n
 	}
 	result, err := s.ml.MemoriesBySymbol(symbol, repo, branch, limit)
 	if err != nil {
@@ -305,8 +329,11 @@ func (s *Server) handleMemoriesByFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := 20
-	if l := r.URL.Query().Get("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
+	if n, errMsg := parseIntParam(r, "limit", limit, 500); errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		return
+	} else {
+		limit = n
 	}
 	result, err := s.ml.MemoriesByFile(file, limit)
 	if err != nil {
@@ -319,9 +346,8 @@ func (s *Server) handleMemoriesByFile(w http.ResponseWriter, r *http.Request) {
 // handleMemoryRefs returns the junction rows for a memory id — used by the UI
 // to know which symbols/files a memory talks about.
 func (s *Server) handleMemoryRefs(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	var id int
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil || id <= 0 {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || id <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "memory id must be a positive integer"})
 		return
 	}
@@ -337,9 +363,8 @@ func (s *Server) handleMemoryRefs(w http.ResponseWriter, r *http.Request) {
 // the memory references. One round-trip from the UI's "click a memory" flow.
 // Query params: branch (required), hide_external (1/0), hide_synthetic (1/0).
 func (s *Server) handleMemoryGraph(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	var id int
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil || id <= 0 {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || id <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "memory id must be a positive integer"})
 		return
 	}
@@ -440,8 +465,11 @@ func (s *Server) handleBackfillRefs(w http.ResponseWriter, r *http.Request) {
 //	only_unlinked  (default true) — false = re-link everything
 func (s *Server) handleBackfillVectorLinks(w http.ResponseWriter, r *http.Request) {
 	topK := 5
-	if k := r.URL.Query().Get("top_k"); k != "" {
-		fmt.Sscanf(k, "%d", &topK)
+	if n, errMsg := parseIntParam(r, "top_k", topK, 50); errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		return
+	} else {
+		topK = n
 	}
 	onlyUnlinked := true
 	if v := r.URL.Query().Get("only_unlinked"); v == "0" || v == "false" {
@@ -558,8 +586,11 @@ func (s *Server) handleGetGraph(w http.ResponseWriter, r *http.Request) {
 	hideExternal := r.URL.Query().Get("hide_external") == "1"
 	hideSynthetic := r.URL.Query().Get("hide_synthetic") == "1"
 	limit := 150
-	if l := r.URL.Query().Get("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
+	if n, errMsg := parseIntParam(r, "limit", limit, 500); errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		return
+	} else {
+		limit = n
 	}
 	if limit > 2000 {
 		limit = 2000
@@ -711,8 +742,11 @@ func (s *Server) handleSearchRoutes(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get("repo")
 	branch := r.URL.Query().Get("branch")
 	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
+	if n, errMsg := parseIntParam(r, "limit", limit, 500); errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		return
+	} else {
+		limit = n
 	}
 	result, err := s.ml.SearchRoutes(q, framework, httpMethod, repo, branch, limit)
 	if err != nil {
@@ -811,8 +845,11 @@ func (s *Server) handleGraphImpact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	depth := 3
-	if d := r.URL.Query().Get("depth"); d != "" {
-		fmt.Sscanf(d, "%d", &depth)
+	if n, errMsg := parseIntParam(r, "depth", depth, 8); errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		return
+	} else {
+		depth = n
 	}
 	kind := r.URL.Query().Get("kind")
 	if kind == "" {

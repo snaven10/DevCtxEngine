@@ -269,13 +269,24 @@ class SQLiteGraphStore:
         return {"rebuilt": True, "rows": new}
 
     def remove_file(self, repo: str, branch: str, file_path: str) -> None:
+        """Drop every edge AND the matching FTS rows for `file_path` under
+        (repo, branch). Keeping the FTS index in sync with `graph_edges`
+        prevents stale 'ghost' symbols from showing up in search results
+        after a file is deleted upstream."""
         self._conn.execute(
             "DELETE FROM graph_edges WHERE repo = ? AND branch = ? AND source_file = ?",
             (repo, branch, file_path),
         )
+        self._conn.execute(
+            "DELETE FROM graph_symbols_fts WHERE source_file = ? AND repo = ? AND branch = ?",
+            (file_path, repo, branch),
+        )
         self._conn.commit()
 
     def rename_file(self, repo: str, branch: str, old_path: str, new_path: str) -> None:
+        """Update graph_edges + graph_symbols_fts so both stay anchored to
+        the new path. FTS row IDs change but the canonical/label content
+        remains; we update in place rather than delete+reinsert."""
         self._conn.execute(
             """UPDATE graph_edges SET source_file = ?
                WHERE repo = ? AND branch = ? AND source_file = ?""",
@@ -285,6 +296,11 @@ class SQLiteGraphStore:
             """UPDATE graph_edges SET target_file = ?
                WHERE repo = ? AND branch = ? AND target_file = ?""",
             (new_path, repo, branch, old_path),
+        )
+        self._conn.execute(
+            """UPDATE graph_symbols_fts SET source_file = ?
+               WHERE source_file = ? AND repo = ? AND branch = ?""",
+            (new_path, old_path, repo, branch),
         )
         self._conn.commit()
 
