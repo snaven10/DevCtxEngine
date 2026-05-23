@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1492,6 +1494,44 @@ def serve_stdio(config: dict[str, Any] | None = None) -> None:
         len(service._parser_registry.supported_languages()),
     )
 
+    # Idle watchdog: exit after DEVAI_ML_IDLE_TIMEOUT_SEC of inactivity.
+    # Set to 0 to disable. Default 1800s (30 min). The main thread blocks on
+    # stdin so we use os._exit() to terminate immediately from the watchdog.
+    try:
+        idle_timeout = int(os.environ.get("DEVAI_ML_IDLE_TIMEOUT_SEC", "1800"))
+    except ValueError:
+        idle_timeout = 1800
+
+    last_activity = [time.monotonic()]
+    activity_lock = threading.Lock()
+
+    def _bump_activity() -> None:
+        with activity_lock:
+            last_activity[0] = time.monotonic()
+
+    if idle_timeout > 0:
+        def _watchdog() -> None:
+            check_interval = min(60, max(5, idle_timeout // 4))
+            while True:
+                time.sleep(check_interval)
+                with activity_lock:
+                    idle_for = time.monotonic() - last_activity[0]
+                if idle_for >= idle_timeout:
+                    logger.info(
+                        "Idle for %.0fs (timeout=%ds), exiting",
+                        idle_for, idle_timeout,
+                    )
+                    sys.stderr.flush()
+                    os._exit(0)
+
+        watchdog_thread = threading.Thread(
+            target=_watchdog, name="idle-watchdog", daemon=True,
+        )
+        watchdog_thread.start()
+        logger.info("Idle watchdog active (timeout=%ds)", idle_timeout)
+    else:
+        logger.info("Idle watchdog disabled (DEVAI_ML_IDLE_TIMEOUT_SEC=0)")
+
     # Signal ready
     sys.stderr.write("DEVAI_ML_READY\n")
     sys.stderr.flush()
@@ -1500,6 +1540,7 @@ def serve_stdio(config: dict[str, Any] | None = None) -> None:
         line = line.strip()
         if not line:
             continue
+        _bump_activity()
         try:
             request = json.loads(line)
             response = service.handle_request(request)
@@ -1513,6 +1554,7 @@ def serve_stdio(config: dict[str, Any] | None = None) -> None:
             }
             sys.stdout.write(json.dumps(error_response) + "\n")
             sys.stdout.flush()
+        _bump_activity()
 
 
 def main() -> None:
