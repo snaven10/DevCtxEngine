@@ -306,6 +306,19 @@ func (c *StdioClient) ImpactAnalysis(symbol, repo, branch string, depth int, kin
 	})
 }
 
+// IndexRepo triggers a (re-)index of the repo at the given on-disk path.
+// branch="" means "current". incremental=false forces a full reindex.
+func (c *StdioClient) IndexRepo(repoPath, branch string, incremental bool) (interface{}, error) {
+	p := map[string]interface{}{
+		"repo_path":   repoPath,
+		"incremental": incremental,
+	}
+	if branch != "" {
+		p["branch"] = branch
+	}
+	return c.Call("index_repo", p)
+}
+
 // FTSRebuild populates (or rebuilds) the graph_symbols_fts index.
 func (c *StdioClient) FTSRebuild(force bool) (interface{}, error) {
 	return c.Call("fts_rebuild", map[string]interface{}{"force": force})
