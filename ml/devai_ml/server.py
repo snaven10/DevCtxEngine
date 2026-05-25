@@ -11,13 +11,17 @@ from pathlib import Path
 from typing import Any
 
 from .chunking.semantic_chunker import SemanticChunker
+from .config import DevAIConfig
 from .embeddings.factory import create_provider
 from .parsers.registry import ParserRegistry
 from .pipeline.orchestrator import IndexPipeline
+from .retrieval import create_reranker
 from .stores.factory import create_storage_config_from_env, create_vector_store
 from .stores.graph_store import SQLiteGraphStore
 from .stores.index_state import IndexStateStore
 from .stores.memory_store import Memory, MemoryStore
+from .summarization import create_summarizer
+from .util import TokenBudget
 
 logger = logging.getLogger(__name__)
 
@@ -47,26 +51,32 @@ class MLService:
     once proto stubs are generated.
     """
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
-        config = config or {}
-        self._config = config
+    def __init__(self, config: DevAIConfig | dict[str, Any] | None = None) -> None:
+        # Accept DevAIConfig directly (v0.8+) OR the legacy dict shape (pre-v0.8).
+        if isinstance(config, DevAIConfig):
+            cfg = config
+        else:
+            cfg = DevAIConfig.from_legacy_dict(config)
+        self._config = cfg
 
-        # Initialize components
-        self._embedding = create_provider(config.get("embeddings", {}))
+        # Initialize components from the typed sub-configs.
+        self._embedding = create_provider(cfg.embedding.to_legacy_dict())
         self._parser_registry = ParserRegistry()
-        self._chunker = SemanticChunker()
+        self._chunker = SemanticChunker(config=cfg.chunking)
+        self._summarizer = create_summarizer(
+            cfg.summarizer, embedding_provider=self._embedding,
+        )
+        self._token_budget = TokenBudget(
+            cfg.token_budget, summarizer=self._summarizer,
+        )
+        self._reranker = create_reranker(cfg.rerank)
+        self._rerank_top_k_fetch = cfg.rerank.top_k_fetch
 
         # Storage path resolution (priority order):
-        #   1. DEVAI_STATE_DIR env var
-        #   2. config.state_dir (from CLI --state-dir or config file)
-        #   3. ~/.local/share/devai/state/ (XDG default)
-        import os
-        xdg_default = str(Path.home() / ".local" / "share" / "devai" / "state")
-        state_dir = Path(
-            os.environ.get("DEVAI_STATE_DIR")
-            or config.get("state_dir")
-            or xdg_default
-        )
+        #   1. cfg.state_dir (env var DEVAI_STATE_DIR or CLI --state-dir)
+        #   2. ~/.local/share/devai/state/ (XDG default)
+        xdg_default = Path.home() / ".local" / "share" / "devai" / "state"
+        state_dir = cfg.state_dir if cfg.state_dir is not None else xdg_default
         state_dir.mkdir(parents=True, exist_ok=True)
         logger.debug("State directory: %s", state_dir)
 
@@ -214,12 +224,20 @@ class MLService:
         if language:
             filters["language"] = language
 
-        # Search vector store
+        # Search vector store. When the reranker is active we fetch wider
+        # (top_k_fetch) so the reranker has more material to reorder; the
+        # final response is still narrowed to `limit` by the reranker.
+        fetch_limit = (
+            max(self._rerank_top_k_fetch, limit)
+            if self._reranker.is_active() else limit
+        )
         results = self._vector_store.search(
             vector=vector,
             filter_conditions=filters if filters else None,
-            limit=limit,
+            limit=fetch_limit,
         )
+        # Rerank with the cross-encoder before truncating to `limit`.
+        results = self._reranker.rerank(query, results, top_k=limit)
 
         # Deduplicate by file + start_line (handles duplicate vectors from
         # re-indexing with inconsistent repo paths)
@@ -243,10 +261,18 @@ class MLService:
                 "text": r.text[:500] if r.text else "",
             })
 
+        # Apply token budget. is_code=True forces DROP strategy — truncating
+        # or summarizing code chunks would corrupt identifiers.
+        deduped, budget = self._token_budget.fit(
+            deduped, content_key="text", is_code=True, query=query,
+        )
+
         return {
             "query": query,
             "count": len(deduped),
             "results": deduped,
+            "budget": budget.to_dict(),
+            "reranker": self._reranker.model_name(),
         }
 
     def _handle_parse_file(self, params: dict) -> dict:
@@ -569,9 +595,15 @@ class MLService:
         if mem_type:
             filters["memory_type"] = mem_type
 
-        vector_results = self._vector_store.search(
-            vector=vector, filter_conditions=filters, limit=limit,
+        # Same fetch-wider-then-rerank pattern as _handle_search.
+        fetch_limit = (
+            max(self._rerank_top_k_fetch, limit)
+            if self._reranker.is_active() else limit
         )
+        vector_results = self._vector_store.search(
+            vector=vector, filter_conditions=filters, limit=fetch_limit,
+        )
+        vector_results = self._reranker.rerank(query, vector_results, top_k=limit)
 
         # Enrich with SQLite metadata
         memories = []
@@ -620,7 +652,19 @@ class MLService:
                     "score": round(vr.score, 4),
                 })
 
-        return {"query": query, "count": len(memories), "memories": memories}
+        # Apply token budget. is_code=False — strategy from config (drop /
+        # soft_truncate / hard_truncate / summarize) applies.
+        memories, budget = self._token_budget.fit(
+            memories, content_key="content", is_code=False, query=query,
+        )
+
+        return {
+            "query": query,
+            "count": len(memories),
+            "memories": memories,
+            "budget": budget.to_dict(),
+            "reranker": self._reranker.model_name(),
+        }
 
     def _handle_memory_context(self, params: dict) -> dict:
         """Get recent memories without search."""
@@ -628,25 +672,34 @@ class MLService:
         scope = params.get("scope", "")
         limit = int(params.get("limit", 20))
 
-        memories = self._memory_store.get_recent(project=project, scope=scope, limit=limit)
+        memories_raw = self._memory_store.get_recent(project=project, scope=scope, limit=limit)
+        memories = [
+            {
+                "id": m.id,
+                "title": m.title,
+                "content": m.content,
+                "type": m.memory_type,
+                "scope": m.scope,
+                "project": m.project,
+                "topic_key": m.topic_key,
+                "tags": m.tags,
+                "revision_count": m.revision_count,
+                "created_at": m.created_at,
+                "updated_at": m.updated_at,
+            }
+            for m in memories_raw
+        ]
+
+        # Apply token budget — replaces the previous hardcoded 200-char per-item
+        # truncate with the configured strategy (drop default).
+        memories, budget = self._token_budget.fit(
+            memories, content_key="content", is_code=False,
+        )
+
         return {
             "count": len(memories),
-            "memories": [
-                {
-                    "id": m.id,
-                    "title": m.title,
-                    "content": m.content[:200] + "..." if len(m.content) > 200 else m.content,
-                    "type": m.memory_type,
-                    "scope": m.scope,
-                    "project": m.project,
-                    "topic_key": m.topic_key,
-                    "tags": m.tags,
-                    "revision_count": m.revision_count,
-                    "created_at": m.created_at,
-                    "updated_at": m.updated_at,
-                }
-                for m in memories
-            ],
+            "memories": memories,
+            "budget": budget.to_dict(),
         }
 
     def _handle_memory_update(self, params: dict) -> dict:
@@ -674,7 +727,8 @@ class MLService:
             d = _mem_to_dict(m)
             d["link_sources"] = link_sources
             out.append(d)
-        return {"symbol": symbol, "count": len(out), "memories": out}
+        out, budget = self._token_budget.fit(out, content_key="content", is_code=False)
+        return {"symbol": symbol, "count": len(out), "memories": out, "budget": budget.to_dict()}
 
     def _handle_memories_by_file(self, params: dict) -> dict:
         """Memories that reference a file path."""
@@ -686,7 +740,8 @@ class MLService:
             d = _mem_to_dict(m)
             d["link_sources"] = link_sources
             out.append(d)
-        return {"file": file, "count": len(out), "memories": out}
+        out, budget = self._token_budget.fit(out, content_key="content", is_code=False)
+        return {"file": file, "count": len(out), "memories": out, "budget": budget.to_dict()}
 
     def _handle_extract_routes(self, params: dict) -> dict:
         """Generic dispatcher. Picks the right extractor per framework, scans
@@ -1458,10 +1513,13 @@ class MLService:
         return {"status": "downloaded", "model": info.name}
 
 
-def serve_stdio(config: dict[str, Any] | None = None) -> None:
-    """Run the ML service over stdin/stdout JSON-RPC."""
+def serve_stdio(config: DevAIConfig | dict[str, Any] | None = None) -> None:
+    """Run the ML service over stdin/stdout JSON-RPC.
+
+    Accepts DevAIConfig (v0.8+) OR the legacy dict shape (pre-v0.8). When None,
+    config is built entirely from env vars.
+    """
     # Silence HuggingFace warnings and progress bars before any imports trigger them
-    import os
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -1478,13 +1536,14 @@ def serve_stdio(config: dict[str, Any] | None = None) -> None:
     logging.getLogger("transformers").setLevel(logging.WARNING)
     logging.getLogger("torch").setLevel(logging.WARNING)
 
-    # Allow env var override for offline mode (used by devai model update)
-    offline_env = os.environ.get("DEVAI_EMBEDDINGS_OFFLINE")
-    if offline_env is not None:
-        emb_config = config.setdefault("embeddings", {})
-        emb_config["offline"] = offline_env.lower() in ("true", "1")
+    # Normalize to DevAIConfig. EmbeddingConfig.from_env reads DEVAI_EMBEDDINGS_OFFLINE
+    # internally, so the previous manual override here is no longer needed.
+    if isinstance(config, DevAIConfig):
+        cfg = config
+    else:
+        cfg = DevAIConfig.from_legacy_dict(config)
 
-    service = MLService(config)
+    service = MLService(cfg)
 
     emb = service._embedding
     # Single concise ready line with key info
@@ -1494,13 +1553,10 @@ def serve_stdio(config: dict[str, Any] | None = None) -> None:
         len(service._parser_registry.supported_languages()),
     )
 
-    # Idle watchdog: exit after DEVAI_ML_IDLE_TIMEOUT_SEC of inactivity.
+    # Idle watchdog: exit after cfg.idle_timeout.timeout_sec of inactivity.
     # Set to 0 to disable. Default 1800s (30 min). The main thread blocks on
     # stdin so we use os._exit() to terminate immediately from the watchdog.
-    try:
-        idle_timeout = int(os.environ.get("DEVAI_ML_IDLE_TIMEOUT_SEC", "1800"))
-    except ValueError:
-        idle_timeout = 1800
+    idle_timeout = cfg.idle_timeout.timeout_sec
 
     last_activity = [time.monotonic()]
     activity_lock = threading.Lock()
