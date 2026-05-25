@@ -15,6 +15,7 @@ from .config import DevAIConfig
 from .embeddings.factory import create_provider
 from .parsers.registry import ParserRegistry
 from .pipeline.orchestrator import IndexPipeline
+from .retrieval import create_reranker
 from .stores.factory import create_storage_config_from_env, create_vector_store
 from .stores.graph_store import SQLiteGraphStore
 from .stores.index_state import IndexStateStore
@@ -68,6 +69,8 @@ class MLService:
         self._token_budget = TokenBudget(
             cfg.token_budget, summarizer=self._summarizer,
         )
+        self._reranker = create_reranker(cfg.rerank)
+        self._rerank_top_k_fetch = cfg.rerank.top_k_fetch
 
         # Storage path resolution (priority order):
         #   1. cfg.state_dir (env var DEVAI_STATE_DIR or CLI --state-dir)
@@ -221,12 +224,20 @@ class MLService:
         if language:
             filters["language"] = language
 
-        # Search vector store
+        # Search vector store. When the reranker is active we fetch wider
+        # (top_k_fetch) so the reranker has more material to reorder; the
+        # final response is still narrowed to `limit` by the reranker.
+        fetch_limit = (
+            max(self._rerank_top_k_fetch, limit)
+            if self._reranker.is_active() else limit
+        )
         results = self._vector_store.search(
             vector=vector,
             filter_conditions=filters if filters else None,
-            limit=limit,
+            limit=fetch_limit,
         )
+        # Rerank with the cross-encoder before truncating to `limit`.
+        results = self._reranker.rerank(query, results, top_k=limit)
 
         # Deduplicate by file + start_line (handles duplicate vectors from
         # re-indexing with inconsistent repo paths)
@@ -261,6 +272,7 @@ class MLService:
             "count": len(deduped),
             "results": deduped,
             "budget": budget.to_dict(),
+            "reranker": self._reranker.model_name(),
         }
 
     def _handle_parse_file(self, params: dict) -> dict:
@@ -583,9 +595,15 @@ class MLService:
         if mem_type:
             filters["memory_type"] = mem_type
 
-        vector_results = self._vector_store.search(
-            vector=vector, filter_conditions=filters, limit=limit,
+        # Same fetch-wider-then-rerank pattern as _handle_search.
+        fetch_limit = (
+            max(self._rerank_top_k_fetch, limit)
+            if self._reranker.is_active() else limit
         )
+        vector_results = self._vector_store.search(
+            vector=vector, filter_conditions=filters, limit=fetch_limit,
+        )
+        vector_results = self._reranker.rerank(query, vector_results, top_k=limit)
 
         # Enrich with SQLite metadata
         memories = []
@@ -645,6 +663,7 @@ class MLService:
             "count": len(memories),
             "memories": memories,
             "budget": budget.to_dict(),
+            "reranker": self._reranker.model_name(),
         }
 
     def _handle_memory_context(self, params: dict) -> dict:

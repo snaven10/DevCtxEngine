@@ -126,6 +126,54 @@ class EmbeddingConfig:
 
 
 @dataclass(frozen=True)
+class RerankConfig:
+    """Cross-encoder reranking applied to vector-search results.
+
+    The factory fetches `top_k_fetch` candidates from the vector store, hands
+    them to the reranker, and returns the top `limit` (handler-provided) by
+    rerank score. Lifts precision@N over raw cosine distance.
+
+    Providers:
+        noop        — return candidates[:top_k] unchanged
+        flashrank   — local cross-encoder, ~80MB model (lazy-downloaded)
+
+    Env vars:
+        DEVAI_RERANK_ENABLED        (default true)
+        DEVAI_RERANK_PROVIDER       noop | flashrank (default flashrank)
+        DEVAI_RERANK_MODEL          model id for the provider
+                                    (flashrank default: ms-marco-MiniLM-L-12-v2)
+        DEVAI_RERANK_TOP_K_FETCH    candidates pulled before reranking (default 15)
+        DEVAI_RERANK_CACHE_DIR      model cache (default ~/.local/share/devai/flashrank)
+    """
+    enabled: bool = True
+    provider: str = "flashrank"
+    model: str = "ms-marco-MiniLM-L-12-v2"
+    top_k_fetch: int = 15
+    cache_dir: str | None = None
+
+    _VALID_PROVIDERS = ("noop", "flashrank")
+
+    def __post_init__(self) -> None:
+        if self.provider not in self._VALID_PROVIDERS:
+            raise ValueError(
+                f"Invalid provider {self.provider!r}. "
+                f"Valid: {', '.join(self._VALID_PROVIDERS)}"
+            )
+        if self.top_k_fetch <= 0:
+            raise ValueError(f"top_k_fetch must be > 0, got {self.top_k_fetch}")
+
+    @classmethod
+    def from_env(cls) -> "RerankConfig":
+        return cls(
+            enabled=_env_bool("DEVAI_RERANK_ENABLED", True),
+            provider=_env_str("DEVAI_RERANK_PROVIDER", "flashrank") or "flashrank",
+            model=_env_str("DEVAI_RERANK_MODEL", "ms-marco-MiniLM-L-12-v2") or "ms-marco-MiniLM-L-12-v2",
+            top_k_fetch=_env_int("DEVAI_RERANK_TOP_K_FETCH", 15),
+            cache_dir=_env_str("DEVAI_RERANK_CACHE_DIR"),
+        )
+
+
+@dataclass(frozen=True)
 class TokenBudgetConfig:
     """Token budget for handler outputs.
 
@@ -238,6 +286,7 @@ class DevAIConfig:
     """
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    rerank: RerankConfig = field(default_factory=RerankConfig)
     token_budget: TokenBudgetConfig = field(default_factory=TokenBudgetConfig)
     summarizer: SummarizerConfig = field(default_factory=SummarizerConfig)
     idle_timeout: IdleTimeoutConfig = field(default_factory=IdleTimeoutConfig)
@@ -250,6 +299,7 @@ class DevAIConfig:
         return cls(
             chunking=ChunkingConfig.from_env(),
             embedding=EmbeddingConfig.from_env(),
+            rerank=RerankConfig.from_env(),
             token_budget=TokenBudgetConfig.from_env(),
             summarizer=SummarizerConfig.from_env(),
             idle_timeout=IdleTimeoutConfig.from_env(),
