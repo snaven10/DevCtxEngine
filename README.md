@@ -524,6 +524,7 @@ Full documentation is available in both languages. Each document links to its co
 - [Extending the System](docs/06-extending-the-system.md) — Add tools, providers, languages, storage backends
 - [Performance](docs/07-performance.md) — Latency, throughput, sizing, optimization tips
 - [Design Decisions](docs/08-design-decisions.md) — 12 Architecture Decision Records with tradeoffs
+- [Models & Tuning](docs/09-models-and-tuning.md) — Embedding models compared, summarizer & token-budget strategies, hardware-based config, model-migration runbook ([español](docs/es/09-modelos-embeddings-y-tuning.md))
 
 ---
 
