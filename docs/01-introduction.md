@@ -50,7 +50,7 @@ Token-budget-aware assembly of search results, symbol definitions, memory entrie
 
 ### 5. MCP Integration
 
-14 tools exposed via the Model Context Protocol over stdio. Any MCP-compatible agent can call `search`, `read_symbol`, `get_references`, `build_context`, `remember`, `recall`, and more. Zero configuration when auto-setup is used.
+21 tools exposed via the Model Context Protocol over stdio. Any MCP-compatible agent can call `search`, `read_symbol`, `get_references`, `build_context`, `remember`, `recall`, and more. Zero configuration when auto-setup is used.
 
 ---
 
@@ -95,7 +95,7 @@ Returns ranked results with file paths, symbol names, and relevance scores.
 devai server configure claude
 ```
 
-Auto-writes the MCP server entry to Claude Code's configuration. The agent can now call all 14 DevAI tools directly. No manual JSON editing.
+Auto-writes the MCP server entry to Claude Code's configuration. The agent can now call all 21 DevAI tools directly. No manual JSON editing.
 
 ---
 
@@ -129,13 +129,18 @@ Indexing is incremental. After the first full index, DevAI uses `git diff` to de
 | Document | What it covers |
 |----------|---------------|
 | [Introduction](01-introduction.md) | You are here — overview, quick start, mental model |
-| [Setup](setup.md) | Installation options, configuration, environment variables |
-| [Architecture](architecture.md) | Go + Python hybrid design, storage layers, data flow |
+| [Install & Setup](../README.md#install) | Install script, manual build, configuration, environment variables |
+| [Architecture](02-architecture.md) | Go + Python hybrid design, storage layers, data flow |
+| [Semantic Search](03-core-concepts/search.md) | Indexing pipeline, chunking, branch-aware queries |
+| [Symbol Graph](03-core-concepts/symbol-graph.md) | AST-based call/import graphs, edge types, navigation |
+| [Memory](03-core-concepts/memory.md) | Persistent memories, deduplication, topic key upserts |
+| [Context Builder](03-core-concepts/context-builder.md) | Token-budget-aware context assembly for LLMs |
+| [MCP Integration](03-core-concepts/mcp-integration.md) | All 21 tools, auto-configure, handler architecture |
 | [Agent Workflow](04-agent-workflow.md) | How AI agents interact with DevAI, tool selection patterns |
-| [MCP Tools Reference](mcp-tools.md) | All 14 tools with parameters, examples, and response schemas |
-| [Features](features.md) | Detailed capability breakdown — search, graph, memory, branches |
-| [API](api.md) | JSON-RPC protocol between Go and Python |
-| [Schemas](schemas.md) | Database schemas, config file formats, state structures |
+| [Extending the System](06-extending-the-system.md) | Add tools, providers, languages, storage backends |
+| [Performance](07-performance.md) | Latency, throughput, sizing, optimization tips |
+| [Design Decisions](08-design-decisions.md) | Architecture Decision Records with tradeoffs |
+| [Models & Tuning](09-models-and-tuning.md) | Embedding models, summarizer & token-budget strategies, hardware config |
 
 ---
 

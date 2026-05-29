@@ -62,7 +62,7 @@ Every MCP tool follows the same internal flow:
 
 ## Tool Reference
 
-DevAI exposes 14 tools via MCP. Three additional operations (`push_index`, `pull_index`, `sync_index`) are CLI-only.
+DevAI exposes 21 tools via MCP. Three additional operations (`push_index`, `pull_index`, `sync_index`) are CLI-only.
 
 ### Code Intelligence
 
@@ -225,7 +225,7 @@ To add a new MCP tool to DevAI:
 2. **Python side** (`ml/devai_ml/server.py`): Implement the JSON-RPC method that does the actual work
 3. **Test both sides**: The handler parses args and formats output; the ML method implements logic
 
-For detailed instructions, see the [Extending DevAI](../04-extending/adding-tools.md) guide.
+For detailed instructions, see the [Extending DevAI](../06-extending-the-system.md) guide.
 
 ## Mental Model
 

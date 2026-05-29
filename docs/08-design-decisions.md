@@ -201,7 +201,7 @@ Read this if you are a contributor wondering "why is it built this way?" These a
 - **HTTP API**: Universal, any client can call it. But agents need specific tool schemas to know what is available. HTTP is too low-level — you end up building a tool layer on top anyway.
 - **MCP (Model Context Protocol)**: Standardized protocol for exposing tools to AI agents. Agents that support MCP can use DevAI immediately. Schema-first — tools are self-describing.
 
-**Choice**: MCP. DevAI exposes 14 tools via MCP. Any MCP-compatible agent can use them without custom integration code.
+**Choice**: MCP. DevAI exposes 21 tools via MCP. Any MCP-compatible agent can use them without custom integration code.
 
 **Tradeoffs**:
 - MCP is still evolving — spec changes may require updates

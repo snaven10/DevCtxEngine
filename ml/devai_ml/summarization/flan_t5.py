@@ -5,9 +5,15 @@ Models recommended:
     google/flan-t5-base   (~250 MB, ~2-3s on CPU)
     google/flan-t5-large  (~1 GB, slow on CPU)
 
-The pipeline is lazy-loaded on first call so startup stays fast. On any error
-(missing model, OOM, bad output) the summarizer falls back to the truncated
-original to keep the budget contract.
+The tokenizer + seq2seq model are lazy-loaded on first call so startup stays
+fast. On any error (missing model, OOM, bad output) the summarizer falls back
+to the truncated original to keep the budget contract.
+
+NOTE: uses AutoModelForSeq2SeqLM + AutoTokenizer directly rather than the
+`pipeline("text2text-generation", ...)` helper — transformers 5.x removed that
+pipeline task. T5 has a 512-token input limit; the tokenizer truncates oversize
+inputs (truncation=True) so big memories are summarized from their first ~512
+tokens rather than erroring.
 """
 
 from __future__ import annotations
@@ -15,6 +21,9 @@ from __future__ import annotations
 import logging
 
 logger = logging.getLogger(__name__)
+
+# T5 encoder hard limit. Inputs longer than this are truncated by the tokenizer.
+_MAX_INPUT_TOKENS = 512
 
 
 class FlanT5Summarizer:
@@ -25,13 +34,14 @@ class FlanT5Summarizer:
     ) -> None:
         self._model_name = model_name
         self._device = device
-        self._pipeline = None  # lazy
+        self._tokenizer = None  # lazy
+        self._model = None  # lazy
 
     def _ensure_loaded(self) -> None:
-        if self._pipeline is not None:
+        if self._model is not None:
             return
         try:
-            from transformers import pipeline
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
         except ImportError as exc:
             raise RuntimeError(
                 "FlanT5Summarizer requires the `transformers` package. "
@@ -39,11 +49,13 @@ class FlanT5Summarizer:
             ) from exc
 
         logger.info("Loading flan-t5 summarizer: %s (device=%s)", self._model_name, self._device)
-        self._pipeline = pipeline(
-            "text2text-generation",
-            model=self._model_name,
-            device=-1 if self._device == "cpu" else 0,
-        )
+        tokenizer = AutoTokenizer.from_pretrained(self._model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(self._model_name)
+        if self._device != "cpu":
+            model = model.to(self._device)
+        model.eval()
+        self._tokenizer = tokenizer
+        self._model = model
 
     def summarize(
         self,
@@ -70,15 +82,34 @@ class FlanT5Summarizer:
             )
 
         try:
-            # max_length here is in model tokens, close enough to tiktoken count
-            # for sizing purposes. Buffer of 50 absorbs slight overshoot.
-            result = self._pipeline(
+            import torch
+
+            input_ids = self._tokenizer(
                 prompt,
-                max_length=target_tokens + 50,
-                min_length=max(target_tokens // 3, 30),
-                do_sample=False,
-            )
-            return result[0]["generated_text"].strip()
+                return_tensors="pt",
+                truncation=True,
+                max_length=_MAX_INPUT_TOKENS,
+            ).input_ids
+            if self._device != "cpu":
+                input_ids = input_ids.to(self._device)
+
+            # max_new_tokens caps the summary length (in model tokens, close
+            # enough to tiktoken for sizing). Buffer of 50 absorbs overshoot.
+            # no_repeat_ngram_size + repetition_penalty kill flan-t5's degenerate
+            # "X: X: X:" repetition loops; beam search + early_stopping favor a
+            # complete, coherent summary. min_new_tokens is intentionally dropped
+            # — forcing length made the model emit filler/repetition.
+            with torch.no_grad():
+                output_ids = self._model.generate(
+                    input_ids,
+                    max_new_tokens=target_tokens + 50,
+                    do_sample=False,
+                    num_beams=4,
+                    no_repeat_ngram_size=3,
+                    repetition_penalty=1.3,
+                    early_stopping=True,
+                )
+            return self._tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
         except Exception as exc:
             logger.warning("FlanT5 inference failed: %s. Returning truncated original.", exc)
             return self._truncate_chars(content, target_tokens * 4)

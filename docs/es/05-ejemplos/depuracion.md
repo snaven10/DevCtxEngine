@@ -10,7 +10,7 @@ Un recorrido paso a paso de un agente de IA usando las herramientas MCP de DevAI
 
 Un usuario reporta: **"Los pagos se están procesando dos veces en producción."** El codebase tiene más de 200 archivos distribuidos entre múltiples servicios. Nadie sabe de dónde viene la duplicación.
 
-El agente de IA tiene acceso a las 14 herramientas MCP de DevAI. Así es exactamente cómo encuentra el bug.
+El agente de IA tiene acceso a las 21 herramientas MCP de DevAI. Así es exactamente cómo encuentra el bug.
 
 ---
 

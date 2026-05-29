@@ -17,7 +17,7 @@ DevAI es un Motor de Inteligencia de Código con IA híbrido Go + Python. La cap
                     |         GO BINARY (devai)           |
                     |                                     |
                     |  +-------------------------------+  |
-                    |  |       MCP Server (14 tools)    |  |
+                    |  |       MCP Server (21 tools)    |  |
                     |  |    internal/mcp/server.go      |  |
                     |  +-------------------------------+  |
                     |          |                           |

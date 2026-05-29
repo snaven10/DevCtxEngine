@@ -20,7 +20,7 @@
 
 Your AI coding agent has no idea what your codebase looks like. It reads files one at a time, guesses at structure, and forgets everything between sessions. DevAI gives it **semantic understanding** — search by meaning, trace call graphs, resolve symbols, and remember decisions across sessions.
 
-One binary, one state directory, 14 MCP tools.
+One binary, one state directory, 21 MCP tools.
 
 ## Install
 
@@ -220,7 +220,7 @@ DevAI uses **tree-sitter** for AST parsing across 25+ languages:
 
 ## MCP Tools
 
-When running as an MCP server (`devai server mcp`), DevAI exposes 14 tools:
+When running as an MCP server (`devai server mcp`), DevAI exposes 21 tools:
 
 ### Search & Read
 
@@ -453,7 +453,7 @@ devai/
 ├── cmd/devai/              # CLI entry point (Cobra)
 │   └── cmd/                # All CLI commands
 ├── internal/
-│   ├── mcp/                # MCP server (14 tools)
+│   ├── mcp/                # MCP server (21 tools)
 │   ├── mlclient/           # JSON-RPC client to Python service
 │   ├── tui/                # Bubbletea TUI (9 screens)
 │   ├── branch/             # Branch overlay & deduplication
@@ -507,7 +507,7 @@ Full documentation is available in both languages. Each document links to its co
 - [Symbol Graph](docs/03-core-concepts/symbol-graph.md) — AST-based call/import graphs, edge types, navigation
 - [Memory](docs/03-core-concepts/memory.md) — Persistent memories, deduplication, topic key upserts
 - [Context Builder](docs/03-core-concepts/context-builder.md) — Token-budget-aware context assembly for LLMs
-- [MCP Integration](docs/03-core-concepts/mcp-integration.md) — All 14 MCP tools, auto-configure, handler architecture
+- [MCP Integration](docs/03-core-concepts/mcp-integration.md) — All 21 MCP tools, auto-configure, handler architecture
 
 ### Using DevAI
 
@@ -524,6 +524,7 @@ Full documentation is available in both languages. Each document links to its co
 - [Extending the System](docs/06-extending-the-system.md) — Add tools, providers, languages, storage backends
 - [Performance](docs/07-performance.md) — Latency, throughput, sizing, optimization tips
 - [Design Decisions](docs/08-design-decisions.md) — 12 Architecture Decision Records with tradeoffs
+- [Models & Tuning](docs/09-models-and-tuning.md) — Embedding models compared, summarizer & token-budget strategies, hardware-based config, model-migration runbook ([español](docs/es/09-modelos-embeddings-y-tuning.md))
 
 ---
 

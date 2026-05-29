@@ -2,7 +2,7 @@
 
 # Flujo de Trabajo del Agente
 
-> Volver al [README](../README.md)
+> Volver al [README](../../README.md)
 
 ---
 
@@ -32,7 +32,7 @@ Agent Host                          DevAI MCP Server
     │◀──── initialize (capabilities) ──────│
     │                                      │
     │───── tools/list ────────────────────▶│
-    │◀──── [14 tool definitions] ──────────│
+    │◀──── [21 tool definitions] ──────────│
     │                                      │
     │───── tools/call (search, ...) ──────▶│──── JSON-RPC ──▶ Python
     │◀──── result ─────────────────────────│◀─── result ─────┘
@@ -43,7 +43,7 @@ Agent Host                          DevAI MCP Server
     │                                      │── terminate Python
 ```
 
-**Registro:** Cuando el agente llama a `tools/list`, DevAI devuelve las 14 definiciones de herramientas con parámetros JSON Schema. El runtime del agente valida los parámetros antes de cada llamada. Sin descubrimiento de herramientas en runtime — todo se declara de entrada.
+**Registro:** Cuando el agente llama a `tools/list`, DevAI devuelve las 21 definiciones de herramientas con parámetros JSON Schema. El runtime del agente valida los parámetros antes de cada llamada. Sin descubrimiento de herramientas en runtime — todo se declara de entrada.
 
 ---
 
@@ -392,4 +392,4 @@ Si DevAI está conectado, el agente va a llamar a `search(query: "main function 
 
 ---
 
-> **DevAI está en alpha.** Los parámetros de herramientas y los schemas de respuesta pueden cambiar entre versiones. Consultá la [Referencia de Herramientas MCP](mcp-tools.md) para los schemas actuales.
+> **DevAI está en alpha.** Los parámetros de herramientas y los schemas de respuesta pueden cambiar entre versiones. Consultá la [Referencia de Herramientas MCP](03-conceptos-fundamentales/integracion-mcp.md) para los schemas actuales.
