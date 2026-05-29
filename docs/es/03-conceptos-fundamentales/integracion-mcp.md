@@ -62,7 +62,7 @@ Cada herramienta MCP sigue el mismo flujo interno:
 
 ## Referencia de herramientas
 
-DevAI expone 14 herramientas via MCP. Tres operaciones adicionales (`push_index`, `pull_index`, `sync_index`) son solo CLI.
+DevAI expone 21 herramientas via MCP. Tres operaciones adicionales (`push_index`, `pull_index`, `sync_index`) son solo CLI.
 
 ### Inteligencia de codigo
 

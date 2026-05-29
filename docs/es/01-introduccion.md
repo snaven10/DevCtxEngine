@@ -51,7 +51,7 @@ Ensamblaje consciente del presupuesto de tokens que combina resultados de búsqu
 
 ### 5. Integración MCP
 
-14 herramientas expuestas via el Model Context Protocol sobre stdio. Cualquier agente compatible con MCP puede llamar a `search`, `read_symbol`, `get_references`, `build_context`, `remember`, `recall`, y más. Cero configuración cuando se usa el auto-setup.
+21 herramientas expuestas via el Model Context Protocol sobre stdio. Cualquier agente compatible con MCP puede llamar a `search`, `read_symbol`, `get_references`, `build_context`, `remember`, `recall`, y más. Cero configuración cuando se usa el auto-setup.
 
 ---
 
@@ -96,7 +96,7 @@ Devuelve resultados rankeados con rutas de archivo, nombres de símbolos y punta
 devai server configure claude
 ```
 
-Escribe automáticamente la entrada del servidor MCP en la configuración de Claude Code. El agente ahora puede llamar a las 14 herramientas de DevAI directamente. Sin editar JSON manualmente.
+Escribe automáticamente la entrada del servidor MCP en la configuración de Claude Code. El agente ahora puede llamar a las 21 herramientas de DevAI directamente. Sin editar JSON manualmente.
 
 ---
 
@@ -133,7 +133,7 @@ La indexación es incremental. Después del primer índice completo, DevAI usa `
 | [Setup](setup.md) | Opciones de instalación, configuración, variables de entorno |
 | [Arquitectura](02-arquitectura.md) | Diseño híbrido Go + Python, capas de almacenamiento, flujo de datos |
 | [Flujo de Trabajo del Agente](04-flujo-de-trabajo-del-agente.md) | Cómo los agentes de IA interactúan con DevAI, patrones de selección de herramientas |
-| [Referencia de Herramientas MCP](mcp-tools.md) | Las 14 herramientas con parámetros, ejemplos y schemas de respuesta |
+| [Referencia de Herramientas MCP](mcp-tools.md) | Las 21 herramientas con parámetros, ejemplos y schemas de respuesta |
 | [Funcionalidades](features.md) | Desglose detallado de capacidades — búsqueda, grafo, memoria, branches |
 | [API](api.md) | Protocolo JSON-RPC entre Go y Python |
 | [Schemas](schemas.md) | Schemas de base de datos, formatos de archivos de configuración, estructuras de estado |

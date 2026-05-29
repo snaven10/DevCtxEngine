@@ -62,7 +62,7 @@ Every MCP tool follows the same internal flow:
 
 ## Tool Reference
 
-DevAI exposes 14 tools via MCP. Three additional operations (`push_index`, `pull_index`, `sync_index`) are CLI-only.
+DevAI exposes 21 tools via MCP. Three additional operations (`push_index`, `pull_index`, `sync_index`) are CLI-only.
 
 ### Code Intelligence
 

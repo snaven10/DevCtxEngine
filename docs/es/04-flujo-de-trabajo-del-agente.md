@@ -32,7 +32,7 @@ Agent Host                          DevAI MCP Server
     │◀──── initialize (capabilities) ──────│
     │                                      │
     │───── tools/list ────────────────────▶│
-    │◀──── [14 tool definitions] ──────────│
+    │◀──── [21 tool definitions] ──────────│
     │                                      │
     │───── tools/call (search, ...) ──────▶│──── JSON-RPC ──▶ Python
     │◀──── result ─────────────────────────│◀─── result ─────┘
@@ -43,7 +43,7 @@ Agent Host                          DevAI MCP Server
     │                                      │── terminate Python
 ```
 
-**Registro:** Cuando el agente llama a `tools/list`, DevAI devuelve las 14 definiciones de herramientas con parámetros JSON Schema. El runtime del agente valida los parámetros antes de cada llamada. Sin descubrimiento de herramientas en runtime — todo se declara de entrada.
+**Registro:** Cuando el agente llama a `tools/list`, DevAI devuelve las 21 definiciones de herramientas con parámetros JSON Schema. El runtime del agente valida los parámetros antes de cada llamada. Sin descubrimiento de herramientas en runtime — todo se declara de entrada.
 
 ---
 

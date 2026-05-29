@@ -10,7 +10,7 @@ A step-by-step walkthrough of an AI agent using DevAI's MCP tools to track down 
 
 A user reports: **"Payments are being processed twice in production."** The codebase has 200+ files across multiple services. No one knows where the duplication originates.
 
-The AI agent has access to DevAI's 14 MCP tools. Here's exactly how it finds the bug.
+The AI agent has access to DevAI's 21 MCP tools. Here's exactly how it finds the bug.
 
 ---
 

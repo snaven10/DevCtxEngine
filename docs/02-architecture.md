@@ -17,7 +17,7 @@ DevAI is a hybrid Go + Python AI Code Intelligence Engine. The Go layer provides
                     |         GO BINARY (devai)           |
                     |                                     |
                     |  +-------------------------------+  |
-                    |  |       MCP Server (14 tools)    |  |
+                    |  |       MCP Server (21 tools)    |  |
                     |  |    internal/mcp/server.go      |  |
                     |  +-------------------------------+  |
                     |          |                           |

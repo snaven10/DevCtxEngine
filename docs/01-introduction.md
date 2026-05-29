@@ -50,7 +50,7 @@ Token-budget-aware assembly of search results, symbol definitions, memory entrie
 
 ### 5. MCP Integration
 
-14 tools exposed via the Model Context Protocol over stdio. Any MCP-compatible agent can call `search`, `read_symbol`, `get_references`, `build_context`, `remember`, `recall`, and more. Zero configuration when auto-setup is used.
+21 tools exposed via the Model Context Protocol over stdio. Any MCP-compatible agent can call `search`, `read_symbol`, `get_references`, `build_context`, `remember`, `recall`, and more. Zero configuration when auto-setup is used.
 
 ---
 
@@ -95,7 +95,7 @@ Returns ranked results with file paths, symbol names, and relevance scores.
 devai server configure claude
 ```
 
-Auto-writes the MCP server entry to Claude Code's configuration. The agent can now call all 14 DevAI tools directly. No manual JSON editing.
+Auto-writes the MCP server entry to Claude Code's configuration. The agent can now call all 21 DevAI tools directly. No manual JSON editing.
 
 ---
 
@@ -132,7 +132,7 @@ Indexing is incremental. After the first full index, DevAI uses `git diff` to de
 | [Setup](setup.md) | Installation options, configuration, environment variables |
 | [Architecture](architecture.md) | Go + Python hybrid design, storage layers, data flow |
 | [Agent Workflow](04-agent-workflow.md) | How AI agents interact with DevAI, tool selection patterns |
-| [MCP Tools Reference](mcp-tools.md) | All 14 tools with parameters, examples, and response schemas |
+| [MCP Tools Reference](mcp-tools.md) | All 21 tools with parameters, examples, and response schemas |
 | [Features](features.md) | Detailed capability breakdown — search, graph, memory, branches |
 | [API](api.md) | JSON-RPC protocol between Go and Python |
 | [Schemas](schemas.md) | Database schemas, config file formats, state structures |
