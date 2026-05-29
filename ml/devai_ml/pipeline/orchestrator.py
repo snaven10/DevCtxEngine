@@ -56,8 +56,14 @@ class IndexPipeline:
 
     @staticmethod
     def _repo_name(repo_path: str) -> str:
-        """Extract short repo name from full path (basename)."""
-        return Path(repo_path).name
+        """Extract short repo name from the path.
+
+        Resolve first so a relative path like '.' (what `devai index` sends
+        when run from inside a repo) yields the actual directory name instead
+        of an empty string — `Path('.').name` is '' but
+        `Path('.').resolve().name` is the repo dir name.
+        """
+        return Path(repo_path).resolve().name
 
     def index_repo(
         self,
