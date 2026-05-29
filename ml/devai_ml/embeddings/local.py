@@ -69,6 +69,27 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         desc_en="BGE base model with 768 dimensions. State-of-the-art quality for code search and complex queries. Uses 2x storage. Best for large codebases where precision matters.",
         desc_es="Modelo BGE base con 768 dimensiones. Calidad de vanguardia para busqueda de codigo y consultas complejas. Usa 2x almacenamiento. Mejor para grandes repositorios donde la precision importa.",
     ),
+    # Multilingual models (50+ languages incl. Spanish). No query/passage prefix
+    # required — drop-in with the plain encode() call. Use these when content is
+    # non-English (e.g. Spanish code comments + memories).
+    "ml-minilm": ModelInfo(
+        name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        dimension=384,
+        size_mb=470,
+        speed="fast",
+        quality="better",
+        desc_en="Multilingual MiniLM (50+ langs). Fast, good for Spanish/mixed-language code and memories. No prefix needed.",
+        desc_es="MiniLM multilingue (50+ idiomas). Rapido, bueno para codigo y memorias en espanol o mezcla. No requiere prefijo.",
+    ),
+    "ml-mpnet": ModelInfo(
+        name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+        dimension=768,
+        size_mb=1110,
+        speed="medium",
+        quality="best",
+        desc_en="Multilingual MPNet base, 768 dims (50+ langs). Best multilingual quality for Spanish content. 2x storage, slower on CPU. No prefix needed.",
+        desc_es="MPNet base multilingue, 768 dims (50+ idiomas). Mejor calidad multilingue para contenido en espanol. 2x almacenamiento, mas lento en CPU. No requiere prefijo.",
+    ),
 }
 
 # Backward-compatible tuple format: (name, dimension)
