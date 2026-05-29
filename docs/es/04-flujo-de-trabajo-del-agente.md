@@ -2,7 +2,7 @@
 
 # Flujo de Trabajo del Agente
 
-> Volver al [README](../README.md)
+> Volver al [README](../../README.md)
 
 ---
 
@@ -392,4 +392,4 @@ Si DevAI está conectado, el agente va a llamar a `search(query: "main function 
 
 ---
 
-> **DevAI está en alpha.** Los parámetros de herramientas y los schemas de respuesta pueden cambiar entre versiones. Consultá la [Referencia de Herramientas MCP](mcp-tools.md) para los schemas actuales.
+> **DevAI está en alpha.** Los parámetros de herramientas y los schemas de respuesta pueden cambiar entre versiones. Consultá la [Referencia de Herramientas MCP](03-conceptos-fundamentales/integracion-mcp.md) para los schemas actuales.

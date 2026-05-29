@@ -2,7 +2,7 @@
 
 # Introducción
 
-> Volver al [README](../README.md)
+> Volver al [README](../../README.md)
 
 ---
 
@@ -130,14 +130,19 @@ La indexación es incremental. Después del primer índice completo, DevAI usa `
 | Documento | Qué cubre |
 |----------|---------------|
 | [Introducción](01-introduccion.md) | Estás acá — resumen, inicio rápido, modelo mental |
-| [Setup](setup.md) | Opciones de instalación, configuración, variables de entorno |
+| [Instalación y Setup](../../README.md#install) | Script de instalación, build manual, configuración, variables de entorno |
 | [Arquitectura](02-arquitectura.md) | Diseño híbrido Go + Python, capas de almacenamiento, flujo de datos |
+| [Búsqueda Semántica](03-conceptos-fundamentales/busqueda.md) | Pipeline de indexación, chunking, queries branch-aware |
+| [Grafo de Símbolos](03-conceptos-fundamentales/grafo-de-simbolos.md) | Grafos de llamadas/imports basados en AST, tipos de edge |
+| [Memoria](03-conceptos-fundamentales/memoria.md) | Memorias persistentes, deduplicación, upserts por topic key |
+| [Constructor de Contexto](03-conceptos-fundamentales/constructor-de-contexto.md) | Ensamblado de contexto consciente del presupuesto de tokens |
+| [Integración MCP](03-conceptos-fundamentales/integracion-mcp.md) | Las 21 herramientas, auto-configuración, arquitectura de handlers |
 | [Flujo de Trabajo del Agente](04-flujo-de-trabajo-del-agente.md) | Cómo los agentes de IA interactúan con DevAI, patrones de selección de herramientas |
-| [Referencia de Herramientas MCP](mcp-tools.md) | Las 21 herramientas con parámetros, ejemplos y schemas de respuesta |
-| [Funcionalidades](features.md) | Desglose detallado de capacidades — búsqueda, grafo, memoria, branches |
-| [API](api.md) | Protocolo JSON-RPC entre Go y Python |
-| [Schemas](schemas.md) | Schemas de base de datos, formatos de archivos de configuración, estructuras de estado |
+| [Extender el Sistema](06-extender-el-sistema.md) | Agregar tools, providers, lenguajes, backends de storage |
+| [Rendimiento](07-rendimiento.md) | Latencia, throughput, sizing, tips de optimización |
+| [Decisiones de Diseño](08-decisiones-de-diseno.md) | Architecture Decision Records con tradeoffs |
+| [Modelos y Tuning](09-modelos-embeddings-y-tuning.md) | Modelos de embeddings, estrategias de summarizer y presupuesto, config por hardware |
 
 ---
 
-> **DevAI está en alpha.** Las APIs, flags de CLI y formatos de almacenamiento pueden cambiar entre versiones. Consultá el [README](../README.md) para el estado actual.
+> **DevAI está en alpha.** Las APIs, flags de CLI y formatos de almacenamiento pueden cambiar entre versiones. Consultá el [README](../../README.md) para el estado actual.

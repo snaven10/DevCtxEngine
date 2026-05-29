@@ -390,4 +390,4 @@ If DevAI is connected, the agent will call `search(query: "main function entry p
 
 ---
 
-> **DevAI is in alpha.** Tool parameters and response schemas may change between versions. See the [MCP Tools Reference](mcp-tools.md) for current schemas.
+> **DevAI is in alpha.** Tool parameters and response schemas may change between versions. See the [MCP Tools Reference](03-core-concepts/mcp-integration.md) for current schemas.

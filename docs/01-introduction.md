@@ -129,13 +129,18 @@ Indexing is incremental. After the first full index, DevAI uses `git diff` to de
 | Document | What it covers |
 |----------|---------------|
 | [Introduction](01-introduction.md) | You are here — overview, quick start, mental model |
-| [Setup](setup.md) | Installation options, configuration, environment variables |
-| [Architecture](architecture.md) | Go + Python hybrid design, storage layers, data flow |
+| [Install & Setup](../README.md#install) | Install script, manual build, configuration, environment variables |
+| [Architecture](02-architecture.md) | Go + Python hybrid design, storage layers, data flow |
+| [Semantic Search](03-core-concepts/search.md) | Indexing pipeline, chunking, branch-aware queries |
+| [Symbol Graph](03-core-concepts/symbol-graph.md) | AST-based call/import graphs, edge types, navigation |
+| [Memory](03-core-concepts/memory.md) | Persistent memories, deduplication, topic key upserts |
+| [Context Builder](03-core-concepts/context-builder.md) | Token-budget-aware context assembly for LLMs |
+| [MCP Integration](03-core-concepts/mcp-integration.md) | All 21 tools, auto-configure, handler architecture |
 | [Agent Workflow](04-agent-workflow.md) | How AI agents interact with DevAI, tool selection patterns |
-| [MCP Tools Reference](mcp-tools.md) | All 21 tools with parameters, examples, and response schemas |
-| [Features](features.md) | Detailed capability breakdown — search, graph, memory, branches |
-| [API](api.md) | JSON-RPC protocol between Go and Python |
-| [Schemas](schemas.md) | Database schemas, config file formats, state structures |
+| [Extending the System](06-extending-the-system.md) | Add tools, providers, languages, storage backends |
+| [Performance](07-performance.md) | Latency, throughput, sizing, optimization tips |
+| [Design Decisions](08-design-decisions.md) | Architecture Decision Records with tradeoffs |
+| [Models & Tuning](09-models-and-tuning.md) | Embedding models, summarizer & token-budget strategies, hardware config |
 
 ---
 
