@@ -17,9 +17,11 @@ var hooksCmd = &cobra.Command{
 var hooksInstallCmd = &cobra.Command{
 	Use:   "install [repo-path]",
 	Short: "Install post-commit hook for auto-indexing",
-	Long:  `Installs a git post-commit hook that triggers devai index after each commit.`,
-	Args:  cobra.MaximumNArgs(1),
-	RunE:  runHooksInstall,
+	Long: `Installs (or updates) a git post-commit hook that triggers ` + "`devai index`" + ` after
+each commit, in the background. The hook is written as a clearly delimited block so it
+can coexist with other post-commit hooks and be updated/removed cleanly.`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runHooksInstall,
 }
 
 var hooksUninstallCmd = &cobra.Command{
@@ -35,19 +37,26 @@ func init() {
 	rootCmd.AddCommand(hooksCmd)
 }
 
-const hookMarker = "# DEVAI_AUTO_INDEX"
+const (
+	// Delimited block markers — let us update/remove only our section without
+	// touching other post-commit logic.
+	hookBeginMarker = "# >>> DEVAI_AUTO_INDEX >>>"
+	hookEndMarker   = "# <<< DEVAI_AUTO_INDEX <<<"
+	// Legacy single-line marker from older installs (pre-delimited-block). Kept
+	// so `uninstall` and re-`install` can clean up hooks written by old versions.
+	legacyHookMarker = "# DEVAI_AUTO_INDEX"
+)
 
-// hookScript generates the post-commit hook content.
-// It finds the devai binary path and runs index in background.
-func hookScript(devaiBinary string, stateDir string) string {
-	return fmt.Sprintf(`#!/bin/sh
-%s
-# Auto-index after commit. Installed by: devai hooks install
-# Remove with: devai hooks uninstall
-
-# Run indexing in background so commit isn't blocked
-DEVAI_STATE_DIR="%s" "%s" index --incremental &
-`, hookMarker, stateDir, devaiBinary)
+// hookBlock builds the delimited block injected into the post-commit hook.
+//
+// It cd's to the repo top-level first so `devai index` resolves the real repo
+// name (it sends repo_path="."), and redirects output + backgrounds the run so
+// the commit is never blocked or polluted by indexing logs.
+func hookBlock(devaiBinary, stateDir string) string {
+	return fmt.Sprintf(`%s
+# Auto-index after each commit. Managed by 'devai hooks install/uninstall' — do not edit by hand.
+( cd "$(git rev-parse --show-toplevel)" && DEVAI_STATE_DIR=%q %q index --incremental ) >/dev/null 2>&1 &
+%s`, hookBeginMarker, stateDir, devaiBinary, hookEndMarker)
 }
 
 func runHooksInstall(cmd *cobra.Command, args []string) error {
@@ -61,20 +70,17 @@ func runHooksInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving path: %w", err)
 	}
 
-	// Verify it's a git repo
 	gitDir := filepath.Join(absPath, ".git")
 	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() {
 		return fmt.Errorf("%s is not a git repository", absPath)
 	}
 
-	// Find devai binary
 	devaiBinary, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("finding devai binary: %w", err)
 	}
 	devaiBinary, _ = filepath.Abs(devaiBinary)
 
-	// Determine state dir
 	stateDir := os.Getenv("DEVAI_STATE_DIR")
 	if stateDir == "" {
 		stateDir = filepath.Join(absPath, ".devai", "state")
@@ -84,43 +90,43 @@ func runHooksInstall(cmd *cobra.Command, args []string) error {
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		return fmt.Errorf("creating hooks directory: %w", err)
 	}
-
 	hookPath := filepath.Join(hooksDir, "post-commit")
 
-	// Check if hook already exists
-	if data, err := os.ReadFile(hookPath); err == nil {
-		content := string(data)
-		// If our hook is already there, update it
-		if strings.Contains(content, hookMarker) {
-			fmt.Println("Updating existing devai post-commit hook")
-		} else {
-			// Append to existing hook
-			fmt.Println("Appending devai auto-index to existing post-commit hook")
-			script := fmt.Sprintf("\n%s\nDEVAI_STATE_DIR=\"%s\" \"%s\" index --incremental &\n",
-				hookMarker, stateDir, devaiBinary)
-			f, err := os.OpenFile(hookPath, os.O_APPEND|os.O_WRONLY, 0o755)
-			if err != nil {
-				return fmt.Errorf("appending to hook: %w", err)
-			}
-			defer f.Close()
-			if _, err := f.WriteString(script); err != nil {
-				return fmt.Errorf("writing hook: %w", err)
-			}
-			fmt.Printf("Hook installed: %s\n", hookPath)
-			return nil
-		}
+	block := hookBlock(devaiBinary, stateDir)
+
+	existing, _ := os.ReadFile(hookPath) // ignore error: missing file => fresh install
+	content := string(existing)
+
+	var out, action string
+	switch {
+	case strings.TrimSpace(content) == "":
+		// Fresh hook.
+		out = "#!/bin/sh\n\n" + block + "\n"
+		action = "installed"
+	case strings.Contains(content, hookBeginMarker):
+		// Our delimited block is already present → replace it in place,
+		// preserving everything else in the file.
+		out = replaceHookBlock(content, block)
+		action = "updated"
+	case strings.Contains(content, legacyHookMarker):
+		// Older single-line install → strip the legacy lines, then append the
+		// new delimited block.
+		out = strings.TrimRight(stripLegacyHook(content), "\n") + "\n\n" + block + "\n"
+		action = "migrated"
+	default:
+		// Foreign post-commit hook with no devai section → append ours.
+		out = strings.TrimRight(content, "\n") + "\n\n" + block + "\n"
+		action = "appended to existing hook"
 	}
 
-	// Write new hook
-	script := hookScript(devaiBinary, stateDir)
-	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(hookPath, []byte(out), 0o755); err != nil {
 		return fmt.Errorf("writing hook: %w", err)
 	}
 
-	fmt.Printf("Post-commit hook installed: %s\n", hookPath)
+	fmt.Printf("Post-commit hook %s: %s\n", action, hookPath)
 	fmt.Printf("  Binary: %s\n", devaiBinary)
 	fmt.Printf("  State:  %s\n", stateDir)
-	fmt.Println("\nAuto-indexing will run after each commit (in background).")
+	fmt.Println("\nAuto-indexing will run after each commit (background, output suppressed).")
 	return nil
 }
 
@@ -136,56 +142,92 @@ func runHooksUninstall(cmd *cobra.Command, args []string) error {
 	}
 
 	hookPath := filepath.Join(absPath, ".git", "hooks", "post-commit")
-
 	data, err := os.ReadFile(hookPath)
 	if err != nil {
 		fmt.Println("No post-commit hook found")
 		return nil
 	}
-
 	content := string(data)
-	if !strings.Contains(content, hookMarker) {
+
+	var stripped string
+	switch {
+	case strings.Contains(content, hookBeginMarker):
+		stripped = removeHookBlock(content)
+	case strings.Contains(content, legacyHookMarker):
+		stripped = stripLegacyHook(content)
+	default:
 		fmt.Println("No devai hook found in post-commit")
 		return nil
 	}
 
-	// If the entire hook is ours, remove it
-	// Otherwise just remove our lines
+	// If only a shebang / whitespace remains, remove the file entirely.
+	if isHookEmpty(stripped) {
+		if err := os.Remove(hookPath); err != nil {
+			return fmt.Errorf("removing hook: %w", err)
+		}
+		fmt.Println("Post-commit hook removed")
+		return nil
+	}
+
+	if err := os.WriteFile(hookPath, []byte(strings.TrimRight(stripped, "\n")+"\n"), 0o755); err != nil {
+		return fmt.Errorf("writing hook: %w", err)
+	}
+	fmt.Println("DevAI section removed from post-commit (other hooks preserved)")
+	return nil
+}
+
+// replaceHookBlock swaps the BEGIN..END block for a new one, keeping the rest.
+func replaceHookBlock(content, block string) string {
+	return strings.TrimRight(removeHookBlock(content), "\n") + "\n\n" + block + "\n"
+}
+
+// removeHookBlock deletes the BEGIN..END block (inclusive) from content.
+func removeHookBlock(content string) string {
+	start := strings.Index(content, hookBeginMarker)
+	if start < 0 {
+		return content
+	}
+	endIdx := strings.Index(content[start:], hookEndMarker)
+	if endIdx < 0 {
+		// Malformed (no END marker): drop everything from BEGIN onward.
+		return content[:start]
+	}
+	end := start + endIdx + len(hookEndMarker)
+	return content[:start] + content[end:]
+}
+
+// stripLegacyHook removes the old single-line install: the legacy marker plus
+// the immediately-following devai/index/comment lines.
+func stripLegacyHook(content string) string {
 	lines := strings.Split(content, "\n")
 	var kept []string
 	skip := false
 	for _, line := range lines {
-		if strings.Contains(line, hookMarker) {
+		if strings.Contains(line, legacyHookMarker) {
 			skip = true
 			continue
 		}
 		if skip {
-			// Skip the next few lines that are part of our hook
 			if strings.Contains(line, "devai") || strings.Contains(line, "DEVAI_STATE_DIR") ||
-				strings.Contains(line, "Auto-index") || strings.Contains(line, "Remove with") || line == "" {
+				strings.Contains(line, "Auto-index") || strings.Contains(line, "Remove with") ||
+				strings.TrimSpace(line) == "" {
 				continue
 			}
 			skip = false
 		}
 		kept = append(kept, line)
 	}
+	return strings.Join(kept, "\n")
+}
 
-	// If only shebang left (or empty), remove the file
-	meaningful := false
-	for _, line := range kept {
-		if line != "" && line != "#!/bin/sh" && line != "#!/bin/bash" {
-			meaningful = true
-			break
+// isHookEmpty reports whether only a shebang and/or whitespace remains.
+func isHookEmpty(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || t == "#!/bin/sh" || t == "#!/bin/bash" {
+			continue
 		}
+		return false
 	}
-
-	if !meaningful {
-		os.Remove(hookPath)
-		fmt.Println("Post-commit hook removed")
-	} else {
-		result := strings.Join(kept, "\n") + "\n"
-		os.WriteFile(hookPath, []byte(result), 0o755)
-		fmt.Println("DevAI hook removed from post-commit (other hooks preserved)")
-	}
-	return nil
+	return true
 }
