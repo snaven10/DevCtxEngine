@@ -168,6 +168,7 @@ son los autoritativos de la config del servicio.)
 | `DEVAI_MAX_OUTPUT_TOKENS` | Presupuesto de tokens de las respuestas | `4000` |
 | `DEVAI_SUMMARIZER_PROVIDER` | `noop` \| `extractive` \| `flan-t5` \| `openai` | `extractive` |
 | `DEVAI_RERANK_PROVIDER` | `noop` \| `flashrank` | `flashrank` |
+| `DEVAI_RERANK_MODEL` | modelo flashrank; usar `ms-marco-MultiBERT-L-12` para rerank **multilingüe** | `ms-marco-MiniLM-L-12-v2` |
 | `DEVAI_RERANK_TOP_K_FETCH` | Candidatos traídos antes del rerank | `15` |
 | `DEVAI_ML_IDLE_TIMEOUT_SEC` | Segundos idle antes de que el servicio ML salga (`0` desactiva) | `1800` |
 | `DEVAI_STORAGE_MODE` | `local` \| `shared` \| `hybrid` | `local` |
