@@ -48,10 +48,15 @@ vector search (top_k_fetch)  →  reranker  →  token budget (fit)  →  respue
 ```
 
 1. **Reranker** (`DEVAI_RERANK_*`): por defecto `flashrank` (ms-marco-MiniLM-L-12-v2).
-   Reordena por relevancia y recorta a `limit`. **Nota: flashrank es un modelo en
-   INGLÉS** — reordena bien pero da scores más bajos en consultas cross-lingual
-   (ej. query en inglés contra memoria en español: rankea #1 correcto pero con
-   score ~0.37 en vez de ~0.99). Mejora futura opcional: reranker multilingüe.
+   Reordena por relevancia y recorta a `limit`. El modelo por defecto es **INGLÉS**
+   — reordena bien pero da scores más bajos en consultas cross-lingual (query en
+   inglés contra memoria en español: rankea #1 correcto pero con score ~0.37). Para
+   contenido no-inglés, setear **`DEVAI_RERANK_MODEL=ms-marco-MultiBERT-L-12`** — un
+   modelo flashrank multilingüe (misma velocidad ONNX/CPU, ~150 ms para 15
+   candidatos). Medido: el mismo query cross-lingual salta de **~0.37 → ~0.99**. NO
+   requiere re-index — el reranker corre solo en query-time. Otras opciones flashrank:
+   `ms-marco-TinyBERT-L-2-v2` (el más rápido), `ms-marco-MiniLM-L-12-v2` (default,
+   inglés), `ms-marco-MultiBERT-L-12` (multilingüe).
 
 2. **Token budget** (`DEVAI_TOKEN_*` + `DEVAI_SUMMARIZER_*`): ajusta el contenido
    para no exceder `DEVAI_MAX_OUTPUT_TOKENS`. Aquí se decide drop/resumen/truncado.
@@ -163,7 +168,7 @@ Batería de pruebas empíricas sobre memorias reales con `ml-mpnet` + `extractiv
 | Umbral verbatim | barrido de presupuesto | verbatim si `presupuesto ≥ tamaño memoria`; resume si menos |
 | Presupuesto mínimo (60 tok) | compresión extrema | coherente, **identificadores intactos, cero corrupción** |
 | 3 estrategias | drop/summarize/soft_truncate | drop = todo-o-nada; summarize = comprime lo relevante; soft = lineal |
-| Multilingüe EN→ES | query en inglés, memoria en español | match #1 correcto (score ~0.37 por reranker inglés) |
+| Multilingüe EN→ES | query en inglés, memoria en español | match #1 correcto — score ~0.37 con reranker inglés, ~0.99 con `ms-marco-MultiBERT-L-12` |
 | Código (`search`) | — | fuerza `drop` automáticamente — **el código nunca se resume** (evita corromper identificadores) |
 
 **Conclusiones**:

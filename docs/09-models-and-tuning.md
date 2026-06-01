@@ -49,10 +49,15 @@ vector search (top_k_fetch)  →  reranker  →  token budget (fit)  →  respon
 
 1. **Reranker** (`DEVAI_RERANK_*`): defaults to `flashrank`
    (ms-marco-MiniLM-L-12-v2). Reorders by relevance and trims to `limit`.
-   **Note: flashrank is an English model** — it reorders well but yields lower
-   scores on cross-lingual queries (e.g. an English query against a non-English
-   memory ranks #1 correctly but with a score near ~0.37 instead of ~0.99). An
-   optional future improvement is a multilingual reranker.
+   The default model is **English** — it reorders well but yields lower scores on
+   cross-lingual queries (an English query against a non-English memory ranks #1
+   correctly but with a score near ~0.37). For non-English content, set
+   **`DEVAI_RERANK_MODEL=ms-marco-MultiBERT-L-12`** — a multilingual flashrank
+   model (same ONNX/CPU speed, ~150 ms for 15 candidates). Measured: the same
+   cross-lingual query jumps from **~0.37 → ~0.99**. No re-index needed — the
+   reranker runs at query time only. Other flashrank options:
+   `ms-marco-TinyBERT-L-2-v2` (fastest), `ms-marco-MiniLM-L-12-v2` (default,
+   English), `ms-marco-MultiBERT-L-12` (multilingual).
 
 2. **Token budget** (`DEVAI_TOKEN_*` + `DEVAI_SUMMARIZER_*`): fits the content
    under `DEVAI_MAX_OUTPUT_TOKENS`. This is where drop/summarize/truncate happens.
@@ -164,7 +169,7 @@ An empirical test battery over real memories with `ml-mpnet` + `extractive`:
 | Verbatim threshold | budget sweep | verbatim if `budget ≥ memory size`; summarized below that |
 | Minimum budget (60 tok) | extreme compression | coherent, **identifiers intact, zero corruption** |
 | 3 strategies | drop/summarize/soft_truncate | drop = all-or-nothing; summarize = compresses the relevant part; soft = linear |
-| Cross-lingual query | query in language A, memory in language B | correct #1 match (score ~0.37 due to the English reranker) |
+| Cross-lingual query | query in language A, memory in language B | correct #1 match — score ~0.37 with the English reranker, ~0.99 with `ms-marco-MultiBERT-L-12` |
 | Code (`search`) | — | forces `drop` automatically — **code is never summarized** (avoids corrupting identifiers) |
 
 **Conclusions**:

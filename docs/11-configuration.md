@@ -165,6 +165,7 @@ authoritative ones from the service config.)
 | `DEVAI_MAX_OUTPUT_TOKENS` | Token budget for tool responses | `4000` |
 | `DEVAI_SUMMARIZER_PROVIDER` | `noop` \| `extractive` \| `flan-t5` \| `openai` | `extractive` |
 | `DEVAI_RERANK_PROVIDER` | `noop` \| `flashrank` | `flashrank` |
+| `DEVAI_RERANK_MODEL` | flashrank model; use `ms-marco-MultiBERT-L-12` for **multilingual** reranking | `ms-marco-MiniLM-L-12-v2` |
 | `DEVAI_RERANK_TOP_K_FETCH` | Candidates pulled before reranking | `15` |
 | `DEVAI_ML_IDLE_TIMEOUT_SEC` | Idle seconds before the ML service exits (`0` disables) | `1800` |
 | `DEVAI_STORAGE_MODE` | `local` \| `shared` \| `hybrid` | `local` |

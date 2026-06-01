@@ -11,7 +11,11 @@ All notable changes to DevAI are documented here. The format is based on
 
 ## [Unreleased]
 
-_Nothing yet. Add entries here as changes merge._
+### Added
+- Documented the **multilingual reranker** option: set `DEVAI_RERANK_MODEL=ms-marco-MultiBERT-L-12` (a
+  flashrank ONNX model) so cross-lingual queries score correctly — measured ~0.37 → ~0.99 on an
+  English-query/Spanish-memory case, with no re-index (the reranker runs at query time). Updated
+  `docs/09-models-and-tuning.md` and `docs/11-configuration.md` (EN + ES).
 
 <!-- Template:
 ### Added
