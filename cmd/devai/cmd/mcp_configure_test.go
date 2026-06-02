@@ -24,5 +24,17 @@ func TestParseEnvPairs(t *testing.T) {
 	}
 }
 
-// filepath is used by TestResolveClaudeTarget (added in Task 3)
-var _ = filepath.Join
+func TestResolveClaudeTarget(t *testing.T) {
+	root := "/work/myrepo"
+	proj := resolveClaudeTarget("project", root)
+	if proj != filepath.Join(root, ".mcp.json") {
+		t.Errorf("project target = %q, want %q", proj, filepath.Join(root, ".mcp.json"))
+	}
+	global := resolveClaudeTarget("global", root)
+	if global != claudeConfigPath() {
+		t.Errorf("global target = %q, want claudeConfigPath() %q", global, claudeConfigPath())
+	}
+	if resolveClaudeTarget("", root) != claudeConfigPath() {
+		t.Error("empty scope should fall back to global")
+	}
+}

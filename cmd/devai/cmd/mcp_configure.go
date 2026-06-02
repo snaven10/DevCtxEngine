@@ -430,6 +430,15 @@ After significant code changes:
 `
 }
 
+// resolveClaudeTarget returns the file the Claude Code MCP entry should be written to.
+// scope "project" -> <projectRoot>/.mcp.json ; anything else -> the global settings.json.
+func resolveClaudeTarget(scope, projectRoot string) string {
+	if scope == "project" {
+		return filepath.Join(projectRoot, ".mcp.json")
+	}
+	return claudeConfigPath()
+}
+
 // parseEnvPairs converts ["KEY=VALUE", ...] into a map. Only the first '=' splits,
 // so values may contain '='. Empty keys or pairs without '=' are an error.
 func parseEnvPairs(pairs []string) (map[string]string, error) {
