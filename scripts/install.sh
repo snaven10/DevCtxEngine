@@ -53,7 +53,7 @@ ask() {
     if [[ "${INTERACTIVE}" != true ]]; then
         echo "${default}"; return
     fi
-    read -rp "$(echo -e "${CYAN}?${NC} ${prompt} ${BOLD}[${default}]${NC}: ")" reply
+    read -rp "$(echo -e "${CYAN}?${NC} ${prompt} ${BOLD}[${default}]${NC}: ")" reply || true
     echo "${reply:-${default}}"
 }
 
@@ -62,7 +62,7 @@ ask_yesno() {
     local prompt="$1" default="$2" def_label reply
     if [[ "${default}" == true ]]; then def_label="Y/n"; else def_label="y/N"; fi
     if [[ "${INTERACTIVE}" != true ]]; then REPLY_BOOL="${default}"; return; fi
-    read -rp "$(echo -e "${CYAN}?${NC} ${prompt} ${BOLD}[${def_label}]${NC}: ")" reply
+    read -rp "$(echo -e "${CYAN}?${NC} ${prompt} ${BOLD}[${def_label}]${NC}: ")" reply || true
     case "${reply}" in
         [Yy]*) REPLY_BOOL=true ;;
         [Nn]*) REPLY_BOOL=false ;;
@@ -71,7 +71,7 @@ ask_yesno() {
 }
 
 run_wizard() {
-    [[ "${INTERACTIVE}" != true ]] && return 0
+    if [[ "${INTERACTIVE}" != true ]]; then return 0; fi
     step "Configuration"
     INSTALL_DIR="$(ask "Install directory" "${INSTALL_DIR}")"
     derive_paths
@@ -141,6 +141,7 @@ derive_paths() {
     [[ -z "${STATE_DIR}" ]] && STATE_DIR="${INSTALL_DIR}/state"
 }
 
+# Needed by the --uninstall block below; main() re-derives after the wizard.
 derive_paths
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
@@ -476,7 +477,7 @@ configure_client() {
 
 # ── Install git hooks (delegates to the binary) ─────────────────────────────────
 maybe_install_hooks() {
-    [[ "${INSTALL_HOOKS}" != true ]] && return 0
+    if [[ "${INSTALL_HOOKS}" != true ]]; then return 0; fi
     if git -C "$(pwd)" rev-parse --is-inside-work-tree &>/dev/null; then
         step "Installing git auto-index hook"
         "${BIN_DIR}/devai" hooks install || warn "Hook install failed — run 'devai hooks install' manually."
