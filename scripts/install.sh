@@ -46,6 +46,46 @@ die() {
     exit 1
 }
 
+# ── Interactive Wizard ──────────────────────────────────────────────────────────
+# ask PROMPT DEFAULT -> echoes the answer (default when non-interactive or blank input)
+ask() {
+    local prompt="$1" default="$2" reply
+    if [[ "${INTERACTIVE}" != true ]]; then
+        echo "${default}"; return
+    fi
+    read -rp "$(echo -e "${CYAN}?${NC} ${prompt} ${BOLD}[${default}]${NC}: ")" reply
+    echo "${reply:-${default}}"
+}
+
+# ask_yesno PROMPT DEFAULT(true|false) -> sets REPLY_BOOL
+ask_yesno() {
+    local prompt="$1" default="$2" def_label reply
+    if [[ "${default}" == true ]]; then def_label="Y/n"; else def_label="y/N"; fi
+    if [[ "${INTERACTIVE}" != true ]]; then REPLY_BOOL="${default}"; return; fi
+    read -rp "$(echo -e "${CYAN}?${NC} ${prompt} ${BOLD}[${def_label}]${NC}: ")" reply
+    case "${reply}" in
+        [Yy]*) REPLY_BOOL=true ;;
+        [Nn]*) REPLY_BOOL=false ;;
+        *)     REPLY_BOOL="${default}" ;;
+    esac
+}
+
+run_wizard() {
+    [[ "${INTERACTIVE}" != true ]] && return 0
+    step "Configuration"
+    INSTALL_DIR="$(ask "Install directory" "${INSTALL_DIR}")"
+    derive_paths
+    STATE_DIR="$(ask "State directory (vectors/memory)" "${STATE_DIR}")"
+
+    ask_yesno "Use GPU (CUDA) PyTorch? (No = CPU-only)" "${GPU}"; GPU="${REPLY_BOOL}"
+    MODEL="$(ask "Embedding model (minilm-l6 | ml-mpnet)" "${MODEL}")"
+    CLIENT="$(ask "Configure AI client (claude | cursor | both | none)" "${CLIENT}")"
+    if [[ "${CLIENT}" != none ]]; then
+        SCOPE="$(ask "Claude config scope (global | project)" "${SCOPE}")"
+    fi
+    ask_yesno "Install git auto-index hook?" "${INSTALL_HOOKS}"; INSTALL_HOOKS="${REPLY_BOOL}"
+}
+
 cleanup() {
     if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
         rm -rf "${TMP_DIR}"
@@ -437,6 +477,12 @@ print_summary() {
 main() {
     echo -e "${BOLD}DevAI Installer${NC}"
     echo ""
+
+    if [[ -t 0 && "${ASSUME_YES}" != true ]]; then
+        INTERACTIVE=true
+    fi
+    run_wizard
+    derive_paths   # re-derive in case the wizard changed INSTALL_DIR
 
     check_deps
     detect_platform
