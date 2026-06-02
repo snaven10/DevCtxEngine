@@ -430,6 +430,20 @@ After significant code changes:
 `
 }
 
+// parseEnvPairs converts ["KEY=VALUE", ...] into a map. Only the first '=' splits,
+// so values may contain '='. Empty keys or pairs without '=' are an error.
+func parseEnvPairs(pairs []string) (map[string]string, error) {
+	out := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		i := strings.Index(p, "=")
+		if i <= 0 {
+			return nil, fmt.Errorf("invalid --env %q: expected KEY=VALUE", p)
+		}
+		out[p[:i]] = p[i+1:]
+	}
+	return out, nil
+}
+
 // toForwardSlashes converts backslashes to forward slashes for JSON paths on Windows.
 func toForwardSlashes(p string) string {
 	if runtime.GOOS == "windows" {
