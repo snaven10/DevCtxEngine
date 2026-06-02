@@ -452,6 +452,39 @@ setup_path() {
     fi
 }
 
+# ── Configure AI Client (delegates to the binary) ───────────────────────────────
+configure_client() {
+    [[ "${CLIENT}" == none ]] && { info "Skipping AI client configuration (--client none)."; return 0; }
+    step "Configuring AI client(s): ${CLIENT}"
+
+    local client_flags=()
+    case "${CLIENT}" in
+        claude) client_flags=(--claude) ;;
+        cursor) client_flags=(--cursor) ;;
+        both)   client_flags=(--all) ;;
+        *)      warn "Unknown --client '${CLIENT}', defaulting to claude"; client_flags=(--claude) ;;
+    esac
+
+    local env_flags=(--env "DEVAI_STATE_DIR=${STATE_DIR}" --env "DEVAI_EMBEDDING_MODEL=${MODEL}")
+    if [[ "${MODEL}" == "ml-mpnet" ]]; then
+        env_flags+=(--env "DEVAI_RERANK_MODEL=ms-marco-MultiBERT-L-12")
+    fi
+
+    "${BIN_DIR}/devai" server configure "${client_flags[@]}" --scope "${SCOPE}" "${env_flags[@]}" \
+        || warn "Client configuration failed — run 'devai server configure' manually."
+}
+
+# ── Install git hooks (delegates to the binary) ─────────────────────────────────
+maybe_install_hooks() {
+    [[ "${INSTALL_HOOKS}" != true ]] && return 0
+    if git -C "$(pwd)" rev-parse --is-inside-work-tree &>/dev/null; then
+        step "Installing git auto-index hook"
+        "${BIN_DIR}/devai" hooks install || warn "Hook install failed — run 'devai hooks install' manually."
+    else
+        info "Not a git repo here — skipping auto-index hook. Run 'devai hooks install' inside a repo later."
+    fi
+}
+
 # ── Print Summary ─────────────────────────────────────────────────────────────
 print_summary() {
     local devai_version
@@ -468,6 +501,9 @@ print_summary() {
     echo -e "  ${BOLD}Python:${NC}  ${python_version}"
     echo -e "  ${BOLD}Venv:${NC}    ${VENV_DIR}"
     echo -e "  ${BOLD}PyTorch:${NC} $(if [[ "${GPU}" == true ]]; then echo "GPU (CUDA)"; else echo "CPU-only"; fi)"
+    echo -e "  ${BOLD}State:${NC}   ${STATE_DIR}"
+    echo -e "  ${BOLD}Model:${NC}   ${MODEL}"
+    echo -e "  ${BOLD}Client:${NC}  ${CLIENT} (scope: ${SCOPE})"
     echo ""
     echo -e "  Run ${CYAN}devai --help${NC} to get started."
     echo ""
@@ -495,6 +531,8 @@ main() {
     install_python
     create_venv
     install_python_deps
+    configure_client
+    maybe_install_hooks
     setup_path
     print_summary
 }
