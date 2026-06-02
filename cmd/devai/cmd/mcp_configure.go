@@ -27,6 +27,8 @@ func init() {
 	mcpConfigureCmd.Flags().Bool("all", false, "Configure for all detected clients")
 	mcpConfigureCmd.Flags().Bool("show", false, "Show current MCP config without writing")
 	mcpConfigureCmd.Flags().Bool("remove", false, "Remove DevAI from MCP configs")
+	mcpConfigureCmd.Flags().String("scope", "global", "Where to write Claude config: global (settings.json) or project (.mcp.json)")
+	mcpConfigureCmd.Flags().StringArray("env", nil, "Extra env var for the MCP entry, KEY=VALUE (repeatable)")
 
 	// Register under the existing server command
 	serverCmd.AddCommand(mcpConfigureCmd)
@@ -56,6 +58,19 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 	flagAll, _ := cmd.Flags().GetBool("all")
 	flagShow, _ := cmd.Flags().GetBool("show")
 	flagRemove, _ := cmd.Flags().GetBool("remove")
+	flagScope, _ := cmd.Flags().GetString("scope")
+	flagEnv, _ := cmd.Flags().GetStringArray("env")
+
+	if flagScope != "global" && flagScope != "project" {
+		return fmt.Errorf("invalid --scope %q: must be 'global' or 'project'", flagScope)
+	}
+
+	var extraEnv map[string]string
+	var err error
+	extraEnv, err = parseEnvPairs(flagEnv)
+	if err != nil {
+		return err
+	}
 
 	// If no specific flag, default to --all behavior
 	if !flagClaude && !flagCursor && !flagAll {
@@ -104,6 +119,11 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// User-supplied env (model, rerank, summarizer, …) overrides defaults.
+	for k, v := range extraEnv {
+		env[k] = v
+	}
+
 	entry := mcpServerEntry{
 		Type:    "stdio",
 		Command: binaryPathJSON,
@@ -113,7 +133,7 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 
 	// --show: print what would be written and exit
 	if flagShow {
-		return showConfig(entry, doClaude, doCursor, projectRoot)
+		return showConfig(entry, doClaude, doCursor, projectRoot, flagScope)
 	}
 
 	// Print header
@@ -121,6 +141,7 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Printf("  Binary:     %s\n", binaryPath)
 	fmt.Printf("  State:      %s\n", stateDir)
+	fmt.Printf("  Scope:      %s\n", flagScope)
 	if projectCfg != nil {
 		mode := projectCfg.Storage.Mode
 		if mode == "" {
@@ -142,7 +163,12 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 	var results []clientResult
 
 	if doClaude {
-		r := writeClaudeConfig(entry)
+		target := resolveClaudeTarget(flagScope, projectRoot)
+		clientName := "Claude Code"
+		if flagScope == "project" {
+			clientName = "Claude Code (project)"
+		}
+		r := writeMCPToJSON(target, clientName, entry)
 		results = append(results, r)
 	}
 	if doCursor {
@@ -339,16 +365,14 @@ func printRemoveResult(r clientResult) {
 }
 
 // showConfig prints the MCP config that would be written without actually writing.
-func showConfig(entry mcpServerEntry, doClaude, doCursor bool, projectRoot string) error {
+func showConfig(entry mcpServerEntry, doClaude, doCursor bool, projectRoot, scope string) error {
 	entryJSON, _ := json.MarshalIndent(entry, "  ", "  ")
-
 	fmt.Println("DevAI MCP server config (would be written):")
 	fmt.Println()
 	fmt.Printf("  %s\n", string(entryJSON))
 	fmt.Println()
-
 	if doClaude {
-		fmt.Printf("  Claude Code: %s\n", claudeConfigPath())
+		fmt.Printf("  Claude Code: %s\n", resolveClaudeTarget(scope, projectRoot))
 	}
 	if doCursor {
 		fmt.Printf("  Cursor:      %s\n", cursorConfigPath())
