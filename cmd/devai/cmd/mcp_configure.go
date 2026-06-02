@@ -27,7 +27,7 @@ func init() {
 	mcpConfigureCmd.Flags().Bool("all", false, "Configure for all detected clients")
 	mcpConfigureCmd.Flags().Bool("show", false, "Show current MCP config without writing")
 	mcpConfigureCmd.Flags().Bool("remove", false, "Remove DevAI from MCP configs")
-	mcpConfigureCmd.Flags().String("scope", "global", "Where to write Claude config: global (settings.json) or project (.mcp.json)")
+	mcpConfigureCmd.Flags().String("scope", "global", "Where to write Claude config: global (settings.json) or project (.mcp.json) (Claude Code only)")
 	mcpConfigureCmd.Flags().StringArray("env", nil, "Extra env var for the MCP entry, KEY=VALUE (repeatable)")
 
 	// Register under the existing server command
@@ -65,9 +65,7 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --scope %q: must be 'global' or 'project'", flagScope)
 	}
 
-	var extraEnv map[string]string
-	var err error
-	extraEnv, err = parseEnvPairs(flagEnv)
+	extraEnv, err := parseEnvPairs(flagEnv)
 	if err != nil {
 		return err
 	}
@@ -226,12 +224,6 @@ func claudeConfigPath() string {
 func cursorConfigPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".cursor", "mcp.json")
-}
-
-// writeClaudeConfig adds/updates the devai entry in Claude Code's settings.json.
-func writeClaudeConfig(entry mcpServerEntry) clientResult {
-	p := claudeConfigPath()
-	return writeMCPToJSON(p, "Claude Code", entry)
 }
 
 // writeCursorConfig adds/updates the devai entry in Cursor's mcp.json.
