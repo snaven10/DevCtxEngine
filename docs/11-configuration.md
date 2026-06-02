@@ -101,6 +101,11 @@ instructions for the agent).
 
 > `--scope project` writes the Claude entry to `<projectRoot>/.mcp.json` (merged non-destructively, Claude Code only).
 > `--env KEY=VALUE` is repeatable and merges on top of the defaults (`DEVAI_STATE_DIR`, Qdrant).
+>
+> **Note on the model and `--env`:** by default `server configure` does *not* write `DEVAI_EMBEDDING_MODEL`
+> into `env` — the model is resolved from `config.yaml` (§1.3). When you pass it explicitly (e.g. the
+> installer's `--env DEVAI_EMBEDDING_MODEL=…`), it *is* pinned into the entry and acts as the effective
+> model until a `config.yaml` exists (which then overrides it again, per §1.3).
 
 The entry it writes:
 

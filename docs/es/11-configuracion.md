@@ -104,6 +104,11 @@ devai server configure --claude --env DEVAI_EMBEDDING_MODEL=ml-mpnet  # fija var
 
 > `--scope project` escribe el entry de Claude en `<projectRoot>/.mcp.json` (merge no destructivo, solo Claude Code).
 > `--env KEY=VALUE` es repetible y mergea sobre los defaults (`DEVAI_STATE_DIR`, Qdrant).
+>
+> **Nota sobre el modelo y `--env`:** por defecto `server configure` *no* escribe `DEVAI_EMBEDDING_MODEL`
+> en `env` — el modelo se resuelve desde `config.yaml` (§1.3). Cuando lo pasás explícitamente (p. ej. el
+> `--env DEVAI_EMBEDDING_MODEL=…` del instalador), *sí* queda fijado en el entry y actúa como el modelo
+> efectivo hasta que exista un `config.yaml` (que entonces vuelve a tener prioridad, según §1.3).
 
 El entry que escribe:
 
