@@ -86,6 +86,8 @@ devai server configure --all      # Claude Code + Cursor (default)
 devai server configure --claude   # only Claude Code
 devai server configure --show     # preview without writing
 devai server configure --remove   # remove the devai entry
+devai server configure --claude --scope project   # write a project .mcp.json instead of global settings.json
+devai server configure --claude --env DEVAI_EMBEDDING_MODEL=ml-mpnet  # pin tuning vars into the entry
 ```
 
 It (a) resolves the absolute `devai` binary path, (b) detects the project `config.yaml` + state dir, (c)
@@ -96,6 +98,9 @@ instructions for the agent).
 |--------|--------------|-----|
 | Claude Code | `~/.claude/settings.json` | `mcpServers.devai` |
 | Cursor / Windsurf | `~/.cursor/mcp.json` | `mcpServers.devai` |
+
+> `--scope project` writes the Claude entry to `<projectRoot>/.mcp.json` (merged non-destructively, Claude Code only).
+> `--env KEY=VALUE` is repeatable and merges on top of the defaults (`DEVAI_STATE_DIR`, Qdrant).
 
 The entry it writes:
 
@@ -146,6 +151,25 @@ After any change, **restart / reconnect the MCP** in your client for it to take 
 `build_context`, `read_symbol`, `get_references`, `recall`/`remember`) over manual file reads. Point your
 agent's instructions at it, or paste its contents into your project rules.
 
+### 2.4 The installer wizard
+
+`scripts/install.sh` is **TTY-aware**. Run from a terminal it walks you through a short wizard; piped
+(`curl … | bash`) it runs non-interactively with defaults + flags and never blocks on a prompt.
+
+| Prompt | Default | Flag |
+|--------|---------|------|
+| Install directory | `~/.local/share/devai` | `--install-dir DIR` |
+| State directory (`DEVAI_STATE_DIR`) | `<install-dir>/state` | `--state-dir DIR` |
+| PyTorch CPU or GPU | CPU | `--gpu` |
+| Embedding model | `minilm-l6` (or `ml-mpnet`) | `--model KEY` |
+| Configure AI client | `claude` (or `cursor` / `both` / `none`) | `--client NAME` |
+| Claude config scope | `global` (or `project`) | `--scope SCOPE` |
+| Install git auto-index hook | yes | `--hooks` / `--no-hooks` |
+| Accept all defaults, no prompts | — | `--yes` (implied when no TTY) |
+
+After installing, the wizard delegates client wiring to `devai server configure` and (optionally) installs
+the git hook via `devai hooks install` — it never writes client JSON itself.
+
 ---
 
 ## 3. Environment Variables
@@ -153,23 +177,70 @@ agent's instructions at it, or paste its contents into your project rules.
 Read by the Python ML service at startup. Useful in the MCP `env` block or your shell. (Names are the
 authoritative ones from the service config.)
 
+**Core / paths**
+
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `DEVAI_STATE_DIR` | Where vectors/graph/memory live | `~/.local/share/devai/state` |
 | `DEVAI_LOCAL_DB_PATH` | Override the LanceDB vectors path | `<state_dir>/vectors` |
+| `DEVAI_PYTHON` | Explicit python binary for the ML service | auto-detected |
+
+**Embeddings**
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
 | `DEVAI_EMBEDDING_MODEL` | Embedding model key *(overridden by `config.yaml`, §1.3)* | `minilm-l6` |
 | `DEVAI_EMBEDDING_PROVIDER` | `local` \| `openai` \| `voyage` \| `custom` | `local` |
 | `DEVAI_EMBEDDING_DEVICE` | `cpu` \| `cuda` | `cpu` |
+| `DEVAI_EMBEDDING_API_KEY` | API key for remote embedding providers | — |
 | `DEVAI_EMBEDDINGS_OFFLINE` | `auto` \| `true` \| `false` | `auto` |
+
+**Token budget & summarizer**
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
 | `DEVAI_TOKEN_STRATEGY` | `drop` \| `soft_truncate` \| `hard_truncate` \| `summarize` | `drop` |
 | `DEVAI_MAX_OUTPUT_TOKENS` | Token budget for tool responses | `4000` |
+| `DEVAI_TOKEN_ENCODING` | Tokenizer encoding name | `cl100k_base` |
 | `DEVAI_SUMMARIZER_PROVIDER` | `noop` \| `extractive` \| `flan-t5` \| `openai` | `extractive` |
+| `DEVAI_SUMMARIZER_MODEL` | Model id for non-extractive summarizers (e.g. `google/flan-t5-small`) | provider-specific |
+| `DEVAI_SUMMARIZER_DEVICE` | `cpu` \| `cuda` for local summarizers | `cpu` |
+| `DEVAI_SUMMARIZER_API_KEY` | API key for `openai` summarizer | — |
+| `DEVAI_SUMMARIZER_TARGET_TOKENS` | Target length for summaries | `200` |
+| `DEVAI_SUMMARIZER_REQUIRE_LOCAL` | Block non-local providers (fail instead of using a remote summarizer) | `true` |
+
+**Rerank**
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `DEVAI_RERANK_ENABLED` | Toggle reranking on/off | `true` |
 | `DEVAI_RERANK_PROVIDER` | `noop` \| `flashrank` | `flashrank` |
-| `DEVAI_RERANK_MODEL` | flashrank model; use `ms-marco-MultiBERT-L-12` for **multilingual** reranking | `ms-marco-MiniLM-L-12-v2` |
+| `DEVAI_RERANK_MODEL` | flashrank model; `ms-marco-MultiBERT-L-12` for **multilingual** | `ms-marco-MiniLM-L-12-v2` |
 | `DEVAI_RERANK_TOP_K_FETCH` | Candidates pulled before reranking | `15` |
-| `DEVAI_ML_IDLE_TIMEOUT_SEC` | Idle seconds before the ML service exits (`0` disables) | `1800` |
+| `DEVAI_RERANK_CACHE_DIR` | Where flashrank model files are cached | `<install>/flashrank` |
+
+**Chunking**
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `DEVAI_MAX_CHUNK_TOKENS` | Upper bound on a code chunk | `512` |
+| `DEVAI_MIN_CHUNK_TOKENS` | Lower bound on a code chunk | `64` |
+| `DEVAI_LARGE_FUNCTION_THRESHOLD` | Token size above which a function is split | `1024` |
+
+**Storage & service**
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
 | `DEVAI_STORAGE_MODE` | `local` \| `shared` \| `hybrid` | `local` |
 | `DEVAI_QDRANT_URL` / `DEVAI_QDRANT_API_KEY` | Shared/hybrid Qdrant | — |
+| `DEVAI_ML_IDLE_TIMEOUT_SEC` | Idle seconds before the ML service exits (`0` disables) | `1800` |
+| `DEVAI_API_TOKEN` | Bearer token for the HTTP server mode (`devai server http`) | — |
+
+> **Not user-configurable env vars** — these strings appear in the codebase but are **not** read from the
+> environment, so do **not** treat them as tunables:
+> - `DEVAI_ML_READY` — set by the runtime to signal the ML service is up.
+> - `DEVAI_AUTO_INDEX` — the begin/end **marker text** of the git post-commit hook block (see §4), not a variable.
+> - `DEVAI_UUID_NAMESPACE` — a hardcoded UUID **constant** in the Qdrant store, not an env var.
 
 > Long re-index runs (large repos on CPU) can exceed the idle watchdog. Set `DEVAI_ML_IDLE_TIMEOUT_SEC=0`
 > while re-indexing — see [Models & Tuning](09-models-and-tuning.md#7-gotchas-when-migrating-models-learned-in-production).
