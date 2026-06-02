@@ -16,19 +16,23 @@ NC='\033[0m' # No Color
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 INSTALL_DIR="${HOME}/.local/share/devai"
-BIN_DIR="${INSTALL_DIR}/bin"
-PYTHON_DIR="${INSTALL_DIR}/python"
-VENV_DIR="${PYTHON_DIR}/venv"
+STATE_DIR=""                       # defaults to ${INSTALL_DIR}/state after parsing
 TMP_DIR=""
 REPO="snaven10/devai-context-engine"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases"
 PYTHON_STANDALONE_REPO="astral-sh/python-build-standalone"
 PYTHON_VERSION="3.12"
 
-# Flags
+# Flags / wizard answers
 GPU=false
 VERSION=""
 UNINSTALL=false
+ASSUME_YES=false
+MODEL="minilm-l6"
+CLIENT="claude"                    # claude | cursor | both | none
+SCOPE="global"                     # global | project
+INSTALL_HOOKS=true
+INTERACTIVE=false
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
@@ -40,6 +44,46 @@ step()    { echo -e "\n${CYAN}${BOLD}▸ $*${NC}"; }
 die() {
     error "$@"
     exit 1
+}
+
+# ── Interactive Wizard ──────────────────────────────────────────────────────────
+# ask PROMPT DEFAULT -> echoes the answer (default when non-interactive or blank input)
+ask() {
+    local prompt="$1" default="$2" reply
+    if [[ "${INTERACTIVE}" != true ]]; then
+        echo "${default}"; return
+    fi
+    read -rp "$(echo -e "${CYAN}?${NC} ${prompt} ${BOLD}[${default}]${NC}: ")" reply || true
+    echo "${reply:-${default}}"
+}
+
+# ask_yesno PROMPT DEFAULT(true|false) -> sets REPLY_BOOL
+ask_yesno() {
+    local prompt="$1" default="$2" def_label reply
+    if [[ "${default}" == true ]]; then def_label="Y/n"; else def_label="y/N"; fi
+    if [[ "${INTERACTIVE}" != true ]]; then REPLY_BOOL="${default}"; return; fi
+    read -rp "$(echo -e "${CYAN}?${NC} ${prompt} ${BOLD}[${def_label}]${NC}: ")" reply || true
+    case "${reply}" in
+        [Yy]*) REPLY_BOOL=true ;;
+        [Nn]*) REPLY_BOOL=false ;;
+        *)     REPLY_BOOL="${default}" ;;
+    esac
+}
+
+run_wizard() {
+    if [[ "${INTERACTIVE}" != true ]]; then return 0; fi
+    step "Configuration"
+    INSTALL_DIR="$(ask "Install directory" "${INSTALL_DIR}")"
+    derive_paths
+    STATE_DIR="$(ask "State directory (vectors/memory)" "${STATE_DIR}")"
+
+    ask_yesno "Use GPU (CUDA) PyTorch? (No = CPU-only)" "${GPU}"; GPU="${REPLY_BOOL}"
+    MODEL="$(ask "Embedding model (minilm-l6 | ml-mpnet)" "${MODEL}")"
+    CLIENT="$(ask "Configure AI client (claude | cursor | both | none)" "${CLIENT}")"
+    if [[ "${CLIENT}" != none ]]; then
+        SCOPE="$(ask "Claude config scope (global | project)" "${SCOPE}")"
+    fi
+    ask_yesno "Install git auto-index hook?" "${INSTALL_HOOKS}"; INSTALL_HOOKS="${REPLY_BOOL}"
 }
 
 cleanup() {
@@ -56,23 +100,49 @@ usage() {
 Usage: install.sh [OPTIONS]
 
 Options:
-  --gpu         Install PyTorch with CUDA support (default: CPU-only)
-  --version TAG Install a specific release version (default: latest)
-  --uninstall   Remove DevAI and all its files
-  -h, --help    Show this help message
+  --install-dir DIR   Install location (default: ~/.local/share/devai)
+  --state-dir DIR     State location for vectors/memory (default: <install-dir>/state)
+  --gpu               Install PyTorch with CUDA support (default: CPU-only)
+  --model KEY         Embedding model: minilm-l6 (default) or ml-mpnet (multilingual)
+  --client NAME       Configure AI client: claude (default), cursor, both, none
+  --scope SCOPE       Claude config location: global (default) or project (.mcp.json)
+  --hooks             Install the git auto-index post-commit hook (default)
+  --no-hooks          Skip the git auto-index hook
+  --version TAG       Install a specific release version (default: latest)
+  --yes, -y           Accept all defaults; never prompt (implied when no TTY)
+  --uninstall         Remove DevAI and all its files
+  -h, --help          Show this help message
 EOF
     exit 0
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --gpu)       GPU=true; shift ;;
-        --version)   VERSION="$2"; shift 2 ;;
-        --uninstall) UNINSTALL=true; shift ;;
-        -h|--help)   usage ;;
-        *)           die "Unknown option: $1. Use --help for usage." ;;
+        --install-dir) INSTALL_DIR="$2"; shift 2 ;;
+        --state-dir)   STATE_DIR="$2"; shift 2 ;;
+        --gpu)         GPU=true; shift ;;
+        --model)       MODEL="$2"; shift 2 ;;
+        --client)      CLIENT="$2"; shift 2 ;;
+        --scope)       SCOPE="$2"; shift 2 ;;
+        --hooks)       INSTALL_HOOKS=true; shift ;;
+        --no-hooks)    INSTALL_HOOKS=false; shift ;;
+        --version)     VERSION="$2"; shift 2 ;;
+        --yes|-y)      ASSUME_YES=true; shift ;;
+        --uninstall)   UNINSTALL=true; shift ;;
+        -h|--help)     usage ;;
+        *)             die "Unknown option: $1. Use --help for usage." ;;
     esac
 done
+
+derive_paths() {
+    BIN_DIR="${INSTALL_DIR}/bin"
+    PYTHON_DIR="${INSTALL_DIR}/python"
+    VENV_DIR="${PYTHON_DIR}/venv"
+    [[ -z "${STATE_DIR}" ]] && STATE_DIR="${INSTALL_DIR}/state"
+}
+
+# Needed by the --uninstall block below; main() re-derives after the wizard.
+derive_paths
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 if [[ "${UNINSTALL}" == true ]]; then
@@ -371,8 +441,8 @@ setup_path() {
         echo ""
         echo "  ${path_line}"
         echo ""
-        read -rp "Add it automatically? [Y/n] " answer
-        if [[ "${answer}" =~ ^[Nn] ]]; then
+        ask_yesno "Add it automatically?" true
+        if [[ "${REPLY_BOOL}" != true ]]; then
             warn "Skipped. Add it manually to use 'devai' from anywhere."
         else
             echo "" >> "${shell_rc}"
@@ -380,6 +450,39 @@ setup_path() {
             echo "${path_line}" >> "${shell_rc}"
             success "Added to ${shell_rc} — restart your shell or run: source ${shell_rc}"
         fi
+    fi
+}
+
+# ── Configure AI Client (delegates to the binary) ───────────────────────────────
+configure_client() {
+    [[ "${CLIENT}" == none ]] && { info "Skipping AI client configuration (--client none)."; return 0; }
+    step "Configuring AI client(s): ${CLIENT}"
+
+    local client_flags=()
+    case "${CLIENT}" in
+        claude) client_flags=(--claude) ;;
+        cursor) client_flags=(--cursor) ;;
+        both)   client_flags=(--all) ;;
+        *)      warn "Unknown --client '${CLIENT}', defaulting to claude"; client_flags=(--claude) ;;
+    esac
+
+    local env_flags=(--env "DEVAI_STATE_DIR=${STATE_DIR}" --env "DEVAI_EMBEDDING_MODEL=${MODEL}")
+    if [[ "${MODEL}" == "ml-mpnet" ]]; then
+        env_flags+=(--env "DEVAI_RERANK_MODEL=ms-marco-MultiBERT-L-12")
+    fi
+
+    "${BIN_DIR}/devai" server configure "${client_flags[@]}" --scope "${SCOPE}" "${env_flags[@]}" \
+        || warn "Client configuration failed — run 'devai server configure' manually."
+}
+
+# ── Install git hooks (delegates to the binary) ─────────────────────────────────
+maybe_install_hooks() {
+    if [[ "${INSTALL_HOOKS}" != true ]]; then return 0; fi
+    if git -C "$(pwd)" rev-parse --is-inside-work-tree &>/dev/null; then
+        step "Installing git auto-index hook"
+        "${BIN_DIR}/devai" hooks install || warn "Hook install failed — run 'devai hooks install' manually."
+    else
+        info "Not a git repo here — skipping auto-index hook. Run 'devai hooks install' inside a repo later."
     fi
 }
 
@@ -399,6 +502,9 @@ print_summary() {
     echo -e "  ${BOLD}Python:${NC}  ${python_version}"
     echo -e "  ${BOLD}Venv:${NC}    ${VENV_DIR}"
     echo -e "  ${BOLD}PyTorch:${NC} $(if [[ "${GPU}" == true ]]; then echo "GPU (CUDA)"; else echo "CPU-only"; fi)"
+    echo -e "  ${BOLD}State:${NC}   ${STATE_DIR}"
+    echo -e "  ${BOLD}Model:${NC}   ${MODEL}"
+    echo -e "  ${BOLD}Client:${NC}  ${CLIENT} (scope: ${SCOPE})"
     echo ""
     echo -e "  Run ${CYAN}devai --help${NC} to get started."
     echo ""
@@ -408,6 +514,12 @@ print_summary() {
 main() {
     echo -e "${BOLD}DevAI Installer${NC}"
     echo ""
+
+    if [[ -t 0 && "${ASSUME_YES}" != true ]]; then
+        INTERACTIVE=true
+    fi
+    run_wizard
+    derive_paths   # re-derive in case the wizard changed INSTALL_DIR
 
     check_deps
     detect_platform
@@ -420,6 +532,8 @@ main() {
     install_python
     create_venv
     install_python_deps
+    configure_client
+    maybe_install_hooks
     setup_path
     print_summary
 }

@@ -34,6 +34,14 @@ curl -fsSL https://raw.githubusercontent.com/snaven10/devai-context-engine/main/
 irm https://raw.githubusercontent.com/snaven10/devai-context-engine/main/scripts/install.ps1 | iex
 ```
 
+The installer is interactive when run from a terminal (asks for paths, CPU/GPU, model,
+which AI client to configure, and whether to install the git hook) and falls back to
+flags + defaults when piped:
+
+    ./install.sh                      # interactive wizard
+    ./install.sh --yes                # all defaults, no prompts
+    ./install.sh --client claude --scope project --model ml-mpnet --gpu
+
 **Install script flags:**
 
 | Flag | Description |
