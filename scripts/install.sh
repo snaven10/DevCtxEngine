@@ -109,7 +109,7 @@ Options:
   --hooks             Install the git auto-index post-commit hook (default)
   --no-hooks          Skip the git auto-index hook
   --version TAG       Install a specific release version (default: latest)
-  --yes               Accept all defaults; never prompt (implied when no TTY)
+  --yes, -y           Accept all defaults; never prompt (implied when no TTY)
   --uninstall         Remove DevAI and all its files
   -h, --help          Show this help message
 EOF
@@ -440,8 +440,8 @@ setup_path() {
         echo ""
         echo "  ${path_line}"
         echo ""
-        read -rp "Add it automatically? [Y/n] " answer
-        if [[ "${answer}" =~ ^[Nn] ]]; then
+        ask_yesno "Add it automatically?" true
+        if [[ "${REPLY_BOOL}" != true ]]; then
             warn "Skipped. Add it manually to use 'devai' from anywhere."
         else
             echo "" >> "${shell_rc}"
