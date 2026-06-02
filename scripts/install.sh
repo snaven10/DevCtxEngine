@@ -16,19 +16,23 @@ NC='\033[0m' # No Color
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 INSTALL_DIR="${HOME}/.local/share/devai"
-BIN_DIR="${INSTALL_DIR}/bin"
-PYTHON_DIR="${INSTALL_DIR}/python"
-VENV_DIR="${PYTHON_DIR}/venv"
+STATE_DIR=""                       # defaults to ${INSTALL_DIR}/state after parsing
 TMP_DIR=""
 REPO="snaven10/devai-context-engine"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases"
 PYTHON_STANDALONE_REPO="astral-sh/python-build-standalone"
 PYTHON_VERSION="3.12"
 
-# Flags
+# Flags / wizard answers
 GPU=false
 VERSION=""
 UNINSTALL=false
+ASSUME_YES=false
+MODEL="minilm-l6"
+CLIENT="claude"                    # claude | cursor | both | none
+SCOPE="global"                     # global | project
+INSTALL_HOOKS=true
+INTERACTIVE=false
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
@@ -56,23 +60,48 @@ usage() {
 Usage: install.sh [OPTIONS]
 
 Options:
-  --gpu         Install PyTorch with CUDA support (default: CPU-only)
-  --version TAG Install a specific release version (default: latest)
-  --uninstall   Remove DevAI and all its files
-  -h, --help    Show this help message
+  --install-dir DIR   Install location (default: ~/.local/share/devai)
+  --state-dir DIR     State location for vectors/memory (default: <install-dir>/state)
+  --gpu               Install PyTorch with CUDA support (default: CPU-only)
+  --model KEY         Embedding model: minilm-l6 (default) or ml-mpnet (multilingual)
+  --client NAME       Configure AI client: claude (default), cursor, both, none
+  --scope SCOPE       Claude config location: global (default) or project (.mcp.json)
+  --hooks             Install the git auto-index post-commit hook (default)
+  --no-hooks          Skip the git auto-index hook
+  --version TAG       Install a specific release version (default: latest)
+  --yes               Accept all defaults; never prompt (implied when no TTY)
+  --uninstall         Remove DevAI and all its files
+  -h, --help          Show this help message
 EOF
     exit 0
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --gpu)       GPU=true; shift ;;
-        --version)   VERSION="$2"; shift 2 ;;
-        --uninstall) UNINSTALL=true; shift ;;
-        -h|--help)   usage ;;
-        *)           die "Unknown option: $1. Use --help for usage." ;;
+        --install-dir) INSTALL_DIR="$2"; shift 2 ;;
+        --state-dir)   STATE_DIR="$2"; shift 2 ;;
+        --gpu)         GPU=true; shift ;;
+        --model)       MODEL="$2"; shift 2 ;;
+        --client)      CLIENT="$2"; shift 2 ;;
+        --scope)       SCOPE="$2"; shift 2 ;;
+        --hooks)       INSTALL_HOOKS=true; shift ;;
+        --no-hooks)    INSTALL_HOOKS=false; shift ;;
+        --version)     VERSION="$2"; shift 2 ;;
+        --yes|-y)      ASSUME_YES=true; shift ;;
+        --uninstall)   UNINSTALL=true; shift ;;
+        -h|--help)     usage ;;
+        *)             die "Unknown option: $1. Use --help for usage." ;;
     esac
 done
+
+derive_paths() {
+    BIN_DIR="${INSTALL_DIR}/bin"
+    PYTHON_DIR="${INSTALL_DIR}/python"
+    VENV_DIR="${PYTHON_DIR}/venv"
+    [[ -z "${STATE_DIR}" ]] && STATE_DIR="${INSTALL_DIR}/state"
+}
+
+derive_paths
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 if [[ "${UNINSTALL}" == true ]]; then
