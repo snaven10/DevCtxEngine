@@ -16,10 +16,15 @@ All notable changes to DevAI are documented here. The format is based on
   flashrank ONNX model) so cross-lingual queries score correctly — measured ~0.37 → ~0.99 on an
   English-query/Spanish-memory case, with no re-index (the reranker runs at query time). Updated
   `docs/09-models-and-tuning.md` and `docs/11-configuration.md` (EN + ES).
+- Interactive `install.sh` wizard (paths, CPU/GPU, model, AI client, scope, git hook) that is
+  TTY-aware and falls back to flags + defaults when piped.
+- `devai server configure --scope project` writes a project `.mcp.json`; `--env KEY=VALUE`
+  pins tuning vars into the MCP entry.
+
+### Changed
+- `docs/11-configuration.md` (+ Spanish mirror) now document every `DEVAI_*` variable.
 
 <!-- Template:
-### Added
-### Changed
 ### Fixed
 ### Removed
 -->
