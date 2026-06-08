@@ -11,23 +11,41 @@ All notable changes to DevAI are documented here. The format is based on
 
 ## [Unreleased]
 
+<!-- Template:
 ### Added
+### Changed
+### Fixed
+### Removed
+-->
+
+---
+
+## [v0.11.0-alpha] — 2026-06-08
+
+### Added
+- **ONNX embedding backend** for the local provider (`backend="onnx"` via sentence-transformers +
+  `optimum`), plus two Granite R2 models: **`ml-granite`** (97M, int8, 384 dims) and **`ml-granite-lg`**
+  (311M, int8, 768 dims). On CPU, `ml-granite` beats the previous multilingual default on recall while
+  indexing ~6× faster at half the vector storage (benchmark in `docs/09`). `devai setup` installs the
+  ONNX backend automatically; no `query:`/`passage:` prefixes required; needs an AVX2 CPU. (#26)
+- Interactive `install.sh` wizard (paths, CPU/GPU, model, AI client, scope, git hook) that is
+  TTY-aware and falls back to flags + defaults when piped. (#25)
+- `devai server configure --scope project` writes a project `.mcp.json`; `--env KEY=VALUE`
+  pins tuning vars into the MCP entry. (#25)
 - Documented the **multilingual reranker** option: set `DEVAI_RERANK_MODEL=ms-marco-MultiBERT-L-12` (a
   flashrank ONNX model) so cross-lingual queries score correctly — measured ~0.37 → ~0.99 on an
   English-query/Spanish-memory case, with no re-index (the reranker runs at query time). Updated
   `docs/09-models-and-tuning.md` and `docs/11-configuration.md` (EN + ES).
-- Interactive `install.sh` wizard (paths, CPU/GPU, model, AI client, scope, git hook) that is
-  TTY-aware and falls back to flags + defaults when piped.
-- `devai server configure --scope project` writes a project `.mcp.json`; `--env KEY=VALUE`
-  pins tuning vars into the MCP entry.
 
 ### Changed
-- `docs/11-configuration.md` (+ Spanish mirror) now document every `DEVAI_*` variable.
+- ML requirements: bump `sentence-transformers>=3.2` and add `optimum[onnxruntime]` (CPU + GPU) so the
+  ONNX backend installs with `devai setup`. (#26)
+- `docs/11-configuration.md` (+ Spanish mirror) now document every `DEVAI_*` variable. (#25)
 
-<!-- Template:
-### Fixed
-### Removed
--->
+### Documented
+- `docs/09` (EN + ES): chunk size vs the embedder's context window — with the reranker, recall is
+  chunk-size-agnostic across 256–1024; pick by efficiency. `ml-granite`'s 32768-token window removes the
+  truncation `ml-mpnet` (128) suffered. (#26)
 
 ---
 

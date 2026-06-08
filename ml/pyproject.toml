@@ -11,7 +11,7 @@ dependencies = [
     "grpcio >= 1.60.0",
     "grpcio-tools >= 1.60.0",
     "protobuf >= 4.25.0",
-    "sentence-transformers >= 2.2.0",
+    "sentence-transformers >= 3.2.0",
     "tree-sitter >= 0.23.0",
     "tree-sitter-python",
     "tree-sitter-javascript",
@@ -30,6 +30,11 @@ dependencies = [
 api = [
     "openai >= 1.0.0",
     "voyageai >= 0.2.0",
+]
+# ONNX embedding backend (e.g. the ml-granite model). onnxruntime already comes
+# transitively via flashrank; optimum is what enables backend="onnx" loading.
+onnx = [
+    "optimum[onnxruntime] >= 1.23.0",
 ]
 dev = [
     "pytest",

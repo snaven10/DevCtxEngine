@@ -43,7 +43,9 @@ var modelUseCmd = &cobra.Command{
 	Long: `Change the embedding model used for indexing. This updates the
 config file and will trigger a full reindex on next 'devai index'.
 
-Available models: minilm-l6, minilm-l12, bge-small, bge-base`,
+Available models: minilm-l6, minilm-l12, bge-small, bge-base,
+ml-minilm, ml-mpnet, ml-granite (ONNX int8, best multilingual on CPU).
+Run 'devai model list' for the full registry with metadata.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runModelUse,
 }

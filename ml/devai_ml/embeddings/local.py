@@ -7,11 +7,19 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 class ModelInfo:
-    """Metadata for an embedding model."""
-    __slots__ = ("name", "dimension", "size_mb", "speed", "quality", "desc_en", "desc_es")
+    """Metadata for an embedding model.
+
+    backend / onnx_file control how sentence-transformers loads the model:
+        - backend="torch" (default): plain SentenceTransformer(name).
+        - backend="onnx": loads an ONNX graph via the onnx backend; onnx_file
+          selects the weight inside the repo (e.g. "onnx/model_quint8_avx2.onnx").
+    """
+    __slots__ = ("name", "dimension", "size_mb", "speed", "quality",
+                 "desc_en", "desc_es", "backend", "onnx_file")
 
     def __init__(self, name: str, dimension: int, size_mb: int, speed: str,
-                 quality: str, desc_en: str, desc_es: str) -> None:
+                 quality: str, desc_en: str, desc_es: str,
+                 backend: str = "torch", onnx_file: str | None = None) -> None:
         self.name = name
         self.dimension = dimension
         self.size_mb = size_mb
@@ -19,6 +27,8 @@ class ModelInfo:
         self.quality = quality   # "good", "better", "best"
         self.desc_en = desc_en
         self.desc_es = desc_es
+        self.backend = backend       # "torch" or "onnx"
+        self.onnx_file = onnx_file   # path to onnx weight when backend="onnx"
 
     def to_dict(self) -> dict:
         return {
@@ -29,6 +39,8 @@ class ModelInfo:
             "quality": self.quality,
             "desc_en": self.desc_en,
             "desc_es": self.desc_es,
+            "backend": self.backend,
+            "onnx_file": self.onnx_file,
         }
 
 
@@ -90,27 +102,55 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         desc_en="Multilingual MPNet base, 768 dims (50+ langs). Best multilingual quality for Spanish content. 2x storage, slower on CPU. No prefix needed.",
         desc_es="MPNet base multilingue, 768 dims (50+ idiomas). Mejor calidad multilingue para contenido en espanol. 2x almacenamiento, mas lento en CPU. No requiere prefijo.",
     ),
+    # ONNX (int8) models. Loaded through the onnx backend for fast CPU inference.
+    # Require an x86 CPU with AVX2 (the quint8_avx2 weight) + optimum installed.
+    "ml-granite": ModelInfo(
+        name="ibm-granite/granite-embedding-97m-multilingual-r2",
+        dimension=384,
+        size_mb=94,
+        speed="fast",
+        quality="best",
+        backend="onnx",
+        onnx_file="onnx/model_quint8_avx2.onnx",
+        desc_en="Granite 97M multilingual in ONNX int8. Best quality/speed on CPU: 95% top-1 recall, ~6x faster indexing than torch, half the storage (384 dims). No prefix needed. Needs AVX2 + optimum.",
+        desc_es="Granite 97M multilingue en ONNX int8. La mejor relacion calidad/velocidad en CPU: 95% de recall en primer lugar, ~6x mas rapido al indexar que torch, mitad de almacenamiento (384 dims). No requiere prefijo. Requiere AVX2 + optimum.",
+    ),
+    "ml-granite-lg": ModelInfo(
+        name="ibm-granite/granite-embedding-311m-multilingual-r2",
+        dimension=768,
+        size_mb=299,
+        speed="medium",
+        quality="best",
+        backend="onnx",
+        onnx_file="onnx/model_quint8_avx2.onnx",
+        desc_en="Granite 311M multilingual in ONNX int8, 768 dims. Larger sibling of ml-granite. In CPU tests the smaller ml-granite (97M) matched or beat it on recall while indexing ~4x faster — prefer ml-granite unless you specifically need 768-dim vectors. Needs AVX2 + optimum.",
+        desc_es="Granite 311M multilingue en ONNX int8, 768 dims. Hermano mayor de ml-granite. En las pruebas en CPU el ml-granite (97M) lo iguala o supera en recall indexando ~4x mas rapido — preferir ml-granite salvo que necesites vectores de 768 dims. Requiere AVX2 + optimum.",
+    ),
 }
 
 # Backward-compatible tuple format: (name, dimension)
 MODELS = {k: (v.name, v.dimension) for k, v in MODEL_REGISTRY.items()}
 
 
-def _model_is_cached(model_name: str) -> bool:
-    """Check if a HuggingFace model is already downloaded in the local cache."""
+def _model_is_cached(model_name: str, onnx_file: str | None = None) -> bool:
+    """Check if a HuggingFace model is already downloaded in the local cache.
+
+    When onnx_file is given, also require that specific ONNX weight to be present
+    in a snapshot — a metadata-only snapshot does not count as cached for ONNX.
+    """
     cache_dir = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
     # HF cache uses models--{org}--{name} or models--{name} directory format
     safe_name = model_name.replace("/", "--")
-    candidate = cache_dir / f"models--{safe_name}"
-    if candidate.exists():
-        # Verify it has actual model files (not just metadata)
+    for prefix in (f"models--{safe_name}", f"models--sentence-transformers--{safe_name}"):
+        candidate = cache_dir / prefix
+        if not candidate.exists():
+            continue
         snapshots = candidate / "snapshots"
-        return snapshots.exists() and any(snapshots.iterdir())
-    # Also check sentence-transformers namespaced variant
-    candidate_st = cache_dir / f"models--sentence-transformers--{safe_name}"
-    if candidate_st.exists():
-        snapshots = candidate_st / "snapshots"
-        return snapshots.exists() and any(snapshots.iterdir())
+        if not (snapshots.exists() and any(snapshots.iterdir())):
+            continue
+        if onnx_file and not any((snap / onnx_file).exists() for snap in snapshots.iterdir()):
+            continue
+        return True
     return False
 
 
@@ -138,10 +178,25 @@ class LocalEmbedding:
 
     def __init__(self, model_key: str = "minilm-l6", device: str = "cpu",
                  offline: str | bool = "auto") -> None:
-        if model_key not in MODELS:
-            raise ValueError(f"Unknown model: {model_key}. Available: {list(MODELS.keys())}")
-        name, dim = MODELS[model_key]
-        cached = _model_is_cached(name)
+        if model_key not in MODEL_REGISTRY:
+            raise ValueError(f"Unknown model: {model_key}. Available: {list(MODEL_REGISTRY.keys())}")
+        info = MODEL_REGISTRY[model_key]
+        name, dim = info.name, info.dimension
+        cached = _model_is_cached(name, info.onnx_file)
+
+        # Backend-specific load kwargs. Torch models pass only device (unchanged
+        # behaviour); ONNX models add backend + the selected onnx weight.
+        st_kwargs: dict = {"device": device}
+        if info.backend == "onnx":
+            try:
+                import optimum.onnxruntime  # noqa: F401
+            except ImportError as exc:
+                raise RuntimeError(
+                    f"Model '{model_key}' uses the ONNX backend but 'optimum' is not "
+                    f"installed. Install it with: pip install 'devai-ml[onnx]'"
+                ) from exc
+            st_kwargs["backend"] = "onnx"
+            st_kwargs["model_kwargs"] = {"file_name": info.onnx_file}
 
         # Resolve offline mode
         if offline == "auto":
@@ -155,18 +210,18 @@ class LocalEmbedding:
                     f"Model {name} not cached and offline=true. "
                     f"Run 'devai model update' to download it first."
                 )
-            logger.info("Loading embedding model: %s (cached, dim=%d)", name, dim)
+            logger.info("Loading embedding model: %s (cached, dim=%d, backend=%s)", name, dim, info.backend)
             os.environ["HF_HUB_OFFLINE"] = "1"
             from sentence_transformers import SentenceTransformer
             try:
-                self._model = SentenceTransformer(name, device=device)
+                self._model = SentenceTransformer(name, **st_kwargs)
             finally:
                 os.environ.pop("HF_HUB_OFFLINE", None)
         else:
             action = "Updating" if cached else "Downloading"
-            logger.info("%s embedding model: %s (dim=%d, device=%s)", action, name, dim, device)
+            logger.info("%s embedding model: %s (dim=%d, device=%s, backend=%s)", action, name, dim, device, info.backend)
             from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(name, device=device)
+            self._model = SentenceTransformer(name, **st_kwargs)
 
         self._dim = dim
         self._name = name

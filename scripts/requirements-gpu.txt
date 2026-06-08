@@ -1,5 +1,8 @@
 torch
-sentence-transformers>=2.2.0
+sentence-transformers>=3.2.0
+# ONNX embedding backend (ml-granite / ml-granite-lg). optimum's deps (torch,
+# transformers, hf_hub, numpy) are already pulled in above, so this adds little.
+optimum[onnxruntime]>=1.23.0
 grpcio>=1.60.0
 grpcio-tools>=1.60.0
 protobuf>=4.25.0
