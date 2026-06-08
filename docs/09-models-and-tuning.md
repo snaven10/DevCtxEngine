@@ -70,6 +70,41 @@ on a CPU-only machine. Indexing throughput uses sustained batches of 32.
 > Projected indexing time at this throughput: ~50k chunks take **~14 min** with
 > `ml-granite` vs **~48 min** with `ml-mpnet` (and ~5 h with granite-311m in torch).
 
+### Chunk size vs the model's context window
+
+The chunker (`semantic_chunker.py`) sizes chunks in **tokens** (`DEVAI_MAX_CHUNK_TOKENS`,
+default **512**), splitting by AST so a symbol is never cut mid-body. But the embedder
+only embeds up to its `max_seq_length`:
+
+| Model | `max_seq_length` | vs the 512-token chunk |
+|-------|------------------|------------------------|
+| `ml-mpnet` | **128 tokens** | chunks were **truncated** — the tail of large chunks never reached the vector |
+| `ml-granite` | **32768 tokens** | the full chunk is embedded, no truncation |
+
+So `ml-mpnet` had a latent mismatch: it emits 512-token chunks but only embeds the
+first 128. `ml-granite` removes that waste.
+
+**Does a bigger chunk improve recall?** Measured on a real repo (137 files, 12 ground-truth
+queries) through the **real pipeline (vector fetch → flashrank rerank → top-k)**:
+
+| chunk size | chunks | Recall@1 | Recall@3 |
+|------------|--------|----------|----------|
+| 256 | 603 | 58% | 67% |
+| 512 | 582 | 58% | 67% |
+| 1024 | 570 | 58% | 67% |
+
+**Recall is the same across 256–1024.** Chunk size is not the lever it appears to be.
+The reason: the **reranker reads the full chunk text** (stored untruncated), not the
+embedding — so as long as the right chunk lands in the fetch window, the reranker
+recovers it even when the embedder truncated it. (This is also why `ml-mpnet` is not
+as crippled in practice as its 128-token window suggests.)
+
+**Recommendation:** pick chunk size by **efficiency, not recall**. Keep **512** (default)
+or raise to **1024** (fewer chunks → smaller, faster index; whole method in one chunk).
+**256 adds nothing** — more storage, same recall. With `ml-granite` (32768) no size is
+ever truncated. *(Caveat: measured on 12 queries — the "all equal" signal is robust,
+but fine differences would need a 50+ query harness.)*
+
 > ⚠️ **Changing the model changes the vector dimension** (384 ↔ 768). The vector
 > store is incompatible across dimensions → it **forces a full re-index**. See §6.
 

@@ -75,6 +75,41 @@ medido en una máquina solo-CPU. El throughput de indexado usa lotes sostenidos 
 > Tiempo de indexado proyectado a este throughput: ~50k chunks tardan **~14 min**
 > con `ml-granite` vs **~48 min** con `ml-mpnet` (y ~5 h con granite-311m en torch).
 
+### Tamaño de chunk vs la ventana de contexto del modelo
+
+El chunker (`semantic_chunker.py`) mide los chunks en **tokens** (`DEVAI_MAX_CHUNK_TOKENS`,
+default **512**), cortando por AST para nunca partir un símbolo a la mitad. Pero el
+embedder solo embebe hasta su `max_seq_length`:
+
+| Modelo | `max_seq_length` | vs el chunk de 512 tokens |
+|--------|------------------|----------------------------|
+| `ml-mpnet` | **128 tokens** | los chunks se **truncaban** — la cola de los chunks grandes nunca llegaba al vector |
+| `ml-granite` | **32768 tokens** | el chunk completo se embebe, sin truncar |
+
+O sea, `ml-mpnet` tenía un desajuste latente: emite chunks de 512 tokens pero solo
+embebe los primeros 128. `ml-granite` elimina ese desperdicio.
+
+**¿Un chunk más grande mejora el recall?** Medido sobre un repo real (137 archivos, 12
+queries con ground truth) a través del **pipeline real (vector fetch → rerank flashrank → top-k)**:
+
+| tamaño chunk | chunks | Recall@1 | Recall@3 |
+|--------------|--------|----------|----------|
+| 256 | 603 | 58% | 67% |
+| 512 | 582 | 58% | 67% |
+| 1024 | 570 | 58% | 67% |
+
+**El recall es el mismo entre 256–1024.** El tamaño de chunk no es la palanca que parece.
+La razón: el **reranker lee el TEXTO completo del chunk** (guardado sin truncar), no el
+embedding — así que mientras el chunk correcto entre en la ventana de fetch, el reranker
+lo recupera aunque el embedder lo haya truncado. (Por eso también `ml-mpnet` no queda tan
+lisiado en la práctica como sugiere su ventana de 128 tokens.)
+
+**Recomendación:** elegí el tamaño de chunk por **eficiencia, no por recall**. Dejá **512**
+(default) o subí a **1024** (menos chunks → índice más chico y rápido; método entero en un
+chunk). **256 no aporta** — más almacenamiento, mismo recall. Con `ml-granite` (32768) ningún
+tamaño se trunca jamás. *(Caveat: medido con 12 queries — la señal "todos iguales" es robusta,
+pero diferencias finas pedirían un harness de 50+ queries.)*
+
 ---
 
 ## 2. El pipeline de respuesta: rerank → presupuesto de tokens
