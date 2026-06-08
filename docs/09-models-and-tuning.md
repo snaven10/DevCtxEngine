@@ -28,8 +28,9 @@ run locally via `sentence-transformers`. Select with `embeddings.model` in
 | `ml-granite-lg` | granite-embedding-311m-multilingual-r2 (**ONNX int8**) | 768 | 299 MB | medium | 🌍 multilingual | larger 768-dim sibling; `ml-granite` matches/beats it on CPU — use only if you need 768 dims |
 
 > 🔹 **`ml-granite` / `ml-granite-lg` are loaded through the ONNX backend**
-> (`onnx/model_quint8_avx2.onnx`). They need the optional dependency
-> (`pip install 'devai-ml[onnx]'`) and an x86 CPU with **AVX2**. No
+> (`onnx/model_quint8_avx2.onnx`). The backend (`optimum`) is installed
+> automatically by `devai setup`; if you installed the package by hand, run
+> `pip install 'devai-ml[onnx]'`. Needs an x86 CPU with **AVX2**. No
 > `query:`/`passage:` prefixes required.
 
 ### Which one to pick
@@ -201,9 +202,9 @@ DEVAI_TOKEN_STRATEGY     = "summarize"
 DEVAI_SUMMARIZER_PROVIDER= "extractive"
 DEVAI_MAX_OUTPUT_TOKENS  = "8000"
 ```
-> Best quality **and** fastest indexing on CPU (see the benchmark in §1). Requires
-> the `onnx` extra (`pip install 'devai-ml[onnx]'`) and an AVX2 CPU. If neither is
-> available, use `ml-mpnet` (best torch quality) or `ml-minilm` (lightest) below.
+> Best quality **and** fastest indexing on CPU (see the benchmark in §1). The ONNX
+> backend ships with `devai setup`; needs an AVX2 CPU. If your CPU lacks AVX2,
+> use `ml-mpnet` (best torch quality) or `ml-minilm` (lightest) below.
 
 ### 🖥️ Small / no-GPU (or weak GPU) machine, non-English content
 ```jsonc
