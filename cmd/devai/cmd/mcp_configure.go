@@ -27,6 +27,8 @@ func init() {
 	mcpConfigureCmd.Flags().Bool("all", false, "Configure for all detected clients")
 	mcpConfigureCmd.Flags().Bool("show", false, "Show current MCP config without writing")
 	mcpConfigureCmd.Flags().Bool("remove", false, "Remove DevAI from MCP configs")
+	mcpConfigureCmd.Flags().String("scope", "global", "Where to write Claude config: global (settings.json) or project (.mcp.json) (Claude Code only)")
+	mcpConfigureCmd.Flags().StringArray("env", nil, "Extra env var for the MCP entry, KEY=VALUE (repeatable)")
 
 	// Register under the existing server command
 	serverCmd.AddCommand(mcpConfigureCmd)
@@ -56,6 +58,17 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 	flagAll, _ := cmd.Flags().GetBool("all")
 	flagShow, _ := cmd.Flags().GetBool("show")
 	flagRemove, _ := cmd.Flags().GetBool("remove")
+	flagScope, _ := cmd.Flags().GetString("scope")
+	flagEnv, _ := cmd.Flags().GetStringArray("env")
+
+	if flagScope != "global" && flagScope != "project" {
+		return fmt.Errorf("invalid --scope %q: must be 'global' or 'project'", flagScope)
+	}
+
+	extraEnv, err := parseEnvPairs(flagEnv)
+	if err != nil {
+		return err
+	}
 
 	// If no specific flag, default to --all behavior
 	if !flagClaude && !flagCursor && !flagAll {
@@ -104,6 +117,11 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// User-supplied env (model, rerank, summarizer, …) overrides defaults.
+	for k, v := range extraEnv {
+		env[k] = v
+	}
+
 	entry := mcpServerEntry{
 		Type:    "stdio",
 		Command: binaryPathJSON,
@@ -113,7 +131,7 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 
 	// --show: print what would be written and exit
 	if flagShow {
-		return showConfig(entry, doClaude, doCursor, projectRoot)
+		return showConfig(entry, doClaude, doCursor, projectRoot, flagScope)
 	}
 
 	// Print header
@@ -121,6 +139,7 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Printf("  Binary:     %s\n", binaryPath)
 	fmt.Printf("  State:      %s\n", stateDir)
+	fmt.Printf("  Scope:      %s\n", flagScope)
 	if projectCfg != nil {
 		mode := projectCfg.Storage.Mode
 		if mode == "" {
@@ -142,7 +161,12 @@ func runMCPConfigure(cmd *cobra.Command, args []string) error {
 	var results []clientResult
 
 	if doClaude {
-		r := writeClaudeConfig(entry)
+		target := resolveClaudeTarget(flagScope, projectRoot)
+		clientName := "Claude Code"
+		if flagScope == "project" {
+			clientName = "Claude Code (project)"
+		}
+		r := writeMCPToJSON(target, clientName, entry)
 		results = append(results, r)
 	}
 	if doCursor {
@@ -200,12 +224,6 @@ func claudeConfigPath() string {
 func cursorConfigPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".cursor", "mcp.json")
-}
-
-// writeClaudeConfig adds/updates the devai entry in Claude Code's settings.json.
-func writeClaudeConfig(entry mcpServerEntry) clientResult {
-	p := claudeConfigPath()
-	return writeMCPToJSON(p, "Claude Code", entry)
 }
 
 // writeCursorConfig adds/updates the devai entry in Cursor's mcp.json.
@@ -339,16 +357,14 @@ func printRemoveResult(r clientResult) {
 }
 
 // showConfig prints the MCP config that would be written without actually writing.
-func showConfig(entry mcpServerEntry, doClaude, doCursor bool, projectRoot string) error {
+func showConfig(entry mcpServerEntry, doClaude, doCursor bool, projectRoot, scope string) error {
 	entryJSON, _ := json.MarshalIndent(entry, "  ", "  ")
-
 	fmt.Println("DevAI MCP server config (would be written):")
 	fmt.Println()
 	fmt.Printf("  %s\n", string(entryJSON))
 	fmt.Println()
-
 	if doClaude {
-		fmt.Printf("  Claude Code: %s\n", claudeConfigPath())
+		fmt.Printf("  Claude Code: %s\n", resolveClaudeTarget(scope, projectRoot))
 	}
 	if doCursor {
 		fmt.Printf("  Cursor:      %s\n", cursorConfigPath())
@@ -428,6 +444,29 @@ After significant code changes:
 3. For specific files: ` + "`read_file`" + `
 4. Only fall back to manual file reading if DevAI tools don't return what you need
 `
+}
+
+// resolveClaudeTarget returns the file the Claude Code MCP entry should be written to.
+// scope "project" -> <projectRoot>/.mcp.json ; anything else -> the global settings.json.
+func resolveClaudeTarget(scope, projectRoot string) string {
+	if scope == "project" {
+		return filepath.Join(projectRoot, ".mcp.json")
+	}
+	return claudeConfigPath()
+}
+
+// parseEnvPairs converts ["KEY=VALUE", ...] into a map. Only the first '=' splits,
+// so values may contain '='. Empty keys or pairs without '=' are an error.
+func parseEnvPairs(pairs []string) (map[string]string, error) {
+	out := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		i := strings.Index(p, "=")
+		if i <= 0 {
+			return nil, fmt.Errorf("invalid --env %q: expected KEY=VALUE", p)
+		}
+		out[p[:i]] = p[i+1:]
+	}
+	return out, nil
 }
 
 // toForwardSlashes converts backslashes to forward slashes for JSON paths on Windows.
