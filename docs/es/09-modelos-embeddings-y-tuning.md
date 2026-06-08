@@ -24,18 +24,56 @@ corren localmente vía `sentence-transformers`. Se selecciona con la clave en
 | `bge-small` | BAAI/bge-small-en-v1.5 | 384 | 33 MB | rápida | 🇬🇧 inglés | mejor recuperación que MiniLM en inglés |
 | `bge-base` | BAAI/bge-base-en-v1.5 | 768 | 110 MB | media | 🇬🇧 inglés | máxima precisión en inglés, repos grandes |
 | **`ml-minilm`** | paraphrase-multilingual-MiniLM-L12-v2 | 384 | 470 MB | rápida | 🌍 50+ idiomas | **español rápido**, equipos chicos con contenido multilingüe |
-| **`ml-mpnet`** | paraphrase-multilingual-mpnet-base-v2 | 768 | 1.1 GB | media | 🌍 50+ idiomas | **máxima calidad en español**, equipos con CPU decente o GPU |
+| **`ml-mpnet`** | paraphrase-multilingual-mpnet-base-v2 | 768 | 1.1 GB | media | 🌍 50+ idiomas | **máxima calidad en español** (torch), equipos con CPU decente o GPU |
+| **`ml-granite`** | granite-embedding-97m-multilingual-r2 (**ONNX int8**) | 384 | 94 MB | **muy rápida** | 🌍 multilingüe | **mejor multilingüe en CPU**: top recall + indexado más rápido + mitad de almacenamiento |
+| `ml-granite-lg` | granite-embedding-311m-multilingual-r2 (**ONNX int8**) | 768 | 299 MB | media | 🌍 multilingüe | hermano de 768 dims; `ml-granite` lo iguala/supera en CPU — usar solo si necesitás 768 dims |
+
+> 🔹 **`ml-granite` / `ml-granite-lg` se cargan vía el backend ONNX**
+> (`onnx/model_quint8_avx2.onnx`). Requieren la dependencia opcional
+> (`pip install 'devai-ml[onnx]'`) y una CPU x86 con **AVX2**. No requieren
+> prefijos `query:`/`passage:`.
 
 ### Cuál elegir
 
-- **Contenido en español/mixto** → `ml-minilm` (rápido) o `ml-mpnet` (mejor calidad).
-  Ambos NO requieren prefijos `query:`/`passage:` — son drop-in con el `encode()` actual.
+- **Contenido en español/mixto en CPU** → **`ml-granite`** es ahora el mejor default:
+  le gana a `ml-mpnet` en recall indexando ~6x más rápido y usando la mitad del
+  almacenamiento de vectores (ver el benchmark abajo). Caé a `ml-mpnet` (torch) solo
+  si tu CPU no tiene AVX2 o no podés instalar el extra `onnx`; `ml-minilm` si querés
+  la opción torch multilingüe más liviana. Ninguno requiere prefijos.
 - **Solo inglés** → `bge-base` (mejor) o `minilm-l6` (más liviano).
 - **Evitar los `e5`**: rinden por debajo de su potencial acá porque el provider
   no agrega los prefijos `query:`/`passage:` que esos modelos necesitan.
 
 > ⚠️ **Cambiar de modelo cambia la dimensión del vector** (384 ↔ 768). El vector
 > store es incompatible entre dimensiones → **obliga a re-indexar todo**. Ver §6.
+
+### Benchmark (medido, solo CPU)
+
+Corpus de dominio de 49 documentos / 40 consultas (contenido técnico en español),
+medido en una máquina solo-CPU. El throughput de indexado usa lotes sostenidos de 32.
+
+| Modelo | Backend | Dims | Recall@1 | MRR | Velocidad indexado (textos/s) | RAM pico | Disco |
+|--------|---------|------|----------|-----|------------------------------|----------|-------|
+| `ml-mpnet` (default anterior) | torch | 768 | 87.5% | 0.921 | 17.5 | 1248 MB | 1060 MB |
+| e5-base (cuant. de terceros) | ONNX int8 | 768 | 82.5% | 0.906 | 22.3 | 559 MB | 270 MB |
+| granite-97m | torch | 384 | 95.0% | 0.975 | 9.3 | 841 MB | 186 MB |
+| **`ml-granite` (granite-97m)** | **ONNX int8** | **384** | **95.0%** | **0.975** | **58.7** | 822 MB | **94 MB** |
+| `ml-granite-lg` (granite-311m) | ONNX int8 | 768 | 92.5% | 0.963 | 15.0 | 1177 MB | 299 MB |
+
+**Conclusiones:**
+- **El backend ONNX es lo que desbloquea todo.** El mismo granite-97m pasa de 9.3 a
+  58.7 textos/s (**6.3x**) al cambiar torch → ONNX int8, con **calidad idéntica**
+  (la cuantización int8 no degradó al modelo de 97M).
+- `ml-granite` gana en cada eje frente al default anterior `ml-mpnet`: más recall
+  (95% vs 87.5%), indexado más rápido, mitad de dimensión (vector store más chico)
+  y la menor huella en disco — con RAM comparable.
+- **La cuantización es sensible al modelo.** En el granite-311m más grande, el ONNX
+  int8 *sí* bajó la calidad (97.5% → 92.5%), así que el modelo chico es el punto
+  óptimo en CPU.
+- La familia e5 sigue siendo la peor acá (sin soporte de prefijos) — confirma la advertencia de arriba.
+
+> Tiempo de indexado proyectado a este throughput: ~50k chunks tardan **~14 min**
+> con `ml-granite` vs **~48 min** con `ml-mpnet` (y ~5 h con granite-311m en torch).
 
 ---
 
@@ -121,6 +159,18 @@ El factor de CPU más pesado es **el modelo de embeddings** (ml-mpnet 768d es ~5
 más lento que minilm-l6 en CPU). La estrategia de resumen es secundaria
 (`extractive` agrega ~0.5-1 s por recall al embeber oraciones; `soft_truncate` es gratis).
 
+### 🖥️ PC con CPU, contenido en ESPAÑOL — RECOMENDADO
+```jsonc
+DEVAI_EMBEDDING_MODEL    = "ml-granite"        // 384d multilingüe, ONNX int8
+DEVAI_EMBEDDING_DEVICE   = "cpu"
+DEVAI_TOKEN_STRATEGY     = "summarize"
+DEVAI_SUMMARIZER_PROVIDER= "extractive"
+DEVAI_MAX_OUTPUT_TOKENS  = "8000"
+```
+> Mejor calidad **y** indexado más rápido en CPU (ver el benchmark en §1). Requiere
+> el extra `onnx` (`pip install 'devai-ml[onnx]'`) y una CPU con AVX2. Si no tenés
+> alguno de los dos, usá `ml-mpnet` (mejor calidad torch) o `ml-minilm` (más liviano) abajo.
+
 ### 🖥️ PC pequeña / sin GPU (o GPU débil), contenido en ESPAÑOL
 ```jsonc
 DEVAI_EMBEDDING_MODEL    = "ml-minilm"        // 384d multilingüe, rápido
@@ -152,9 +202,12 @@ DEVAI_SUMMARIZER_PROVIDER= "extractive"
 ```
 
 ### Costo medido (CPU, sin GPU — laptop con GPU Maxwell vieja, solo CPU)
-- `ml-mpnet`: ~225 ms por embed de memoria; ~27 chunks/seg en batch.
-- Re-index de un repo grande (~1500 archivos, ~7000 chunks, 58k edges): ~2 h.
-- Recall normal: ~1-2 s. (`minilm-l6` era ~5x más rápido.)
+- `ml-granite` (ONNX int8): ~58 textos/seg en batch — el más rápido de los
+  multilingües; ~50k chunks en ~14 min. Mitad de dimensión (384) → store más chico.
+- `ml-mpnet`: ~225 ms por embed de memoria; ~17-27 chunks/seg en batch; ~50k chunks ~48 min.
+- Re-index de un repo grande (~1500 archivos, ~7000 chunks, 58k edges): ~2 h con
+  `ml-mpnet`, proporcionalmente más rápido con `ml-granite`.
+- Recall normal: ~1-2 s. (`minilm-l6` era ~5x más rápido que `ml-mpnet`.)
 
 ---
 
