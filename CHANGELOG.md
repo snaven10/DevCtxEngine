@@ -11,6 +11,17 @@ All notable changes to DevAI are documented here. The format is based on
 
 ## [Unreleased]
 
+<!-- Template:
+### Added
+### Changed
+### Fixed
+### Removed
+-->
+
+---
+
+## [v0.12.0-alpha] — 2026-06-09
+
 ### Added
 - `DEVAI_EMBED_MAX_CHARS` (default `4096`) and `DEVAI_EMBED_BATCH_SIZE` (default `16`): RAM
   guards for the local embedder. See `docs/09-models-and-tuning.md` §1 "RAM guard".
