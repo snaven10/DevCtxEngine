@@ -33,6 +33,7 @@ CLIENT="claude"                    # claude | cursor | both | none
 SCOPE="global"                     # global | project
 INSTALL_HOOKS=true
 INTERACTIVE=false
+ALLOW_NO_ML=false
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
@@ -128,6 +129,7 @@ while [[ $# -gt 0 ]]; do
         --no-hooks)    INSTALL_HOOKS=false; shift ;;
         --version)     VERSION="$2"; shift 2 ;;
         --yes|-y)      ASSUME_YES=true; shift ;;
+        --allow-no-ml) ALLOW_NO_ML=true; shift ;;
         --uninstall)   UNINSTALL=true; shift ;;
         -h|--help)     usage ;;
         *)             die "Unknown option: $1. Use --help for usage." ;;
@@ -410,7 +412,11 @@ install_python_deps() {
         "${pip}" install "${wheel_path}" --quiet \
             || die "Failed to install devai_ml wheel."
     else
-        warn "devai_ml wheel not found in release assets — ML features will not work."
+        if [[ "${ALLOW_NO_ML}" == true ]]; then
+            warn "devai_ml wheel not found — continuing without ML (search/index will not work)."
+        else
+            die "devai_ml wheel not found in release assets. ML features (embeddings, search, indexing) will not work. Re-run with --allow-no-ml to install anyway."
+        fi
     fi
 
     success "Python dependencies installed"
@@ -466,7 +472,11 @@ configure_client() {
         *)      warn "Unknown --client '${CLIENT}', defaulting to claude"; client_flags=(--claude) ;;
     esac
 
-    local env_flags=(--env "DEVAI_STATE_DIR=${STATE_DIR}" --env "DEVAI_EMBEDDING_MODEL=${MODEL}")
+    local env_flags=(
+        --env "DEVAI_STATE_DIR=${STATE_DIR}"
+        --env "DEVAI_EMBEDDING_MODEL=${MODEL}"
+        --env "DEVAI_EMBED_MAX_CHARS=2048"
+    )
     if [[ "${MODEL}" == "ml-mpnet" ]]; then
         env_flags+=(--env "DEVAI_RERANK_MODEL=ms-marco-MultiBERT-L-12")
     fi

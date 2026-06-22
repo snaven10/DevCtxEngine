@@ -21,7 +21,7 @@ var (
 
 var (
 	styleApp = lipgloss.NewStyle().
-		Padding(1, 2)
+			Padding(1, 2)
 
 	styleHeader = lipgloss.NewStyle().
 			Foreground(colorPrimary).

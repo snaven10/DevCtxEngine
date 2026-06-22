@@ -53,12 +53,31 @@ func runInit(cmd *cobra.Command, args []string) error {
 		if name == "" {
 			name = filepath.Base(absPath)
 		}
-		config := fmt.Sprintf(`# DevAI project configuration
+		config := renderInitConfig(name, absPath)
+
+		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+			return fmt.Errorf("writing config: %w", err)
+		}
+	}
+
+	fmt.Printf("Initialized devai for %s\n", absPath)
+	fmt.Printf("  Config: %s\n", configPath)
+	fmt.Printf("  Store:  central default (~/.local/share/devai/state) — set state_dir or DEVAI_STATE_DIR to override\n")
+	return nil
+}
+
+// renderInitConfig builds the default .devai/config.yaml body. It intentionally
+// omits `state_dir` so the store resolves to the central XDG default
+// (~/.local/share/devai/state) unless the user opts into a per-repo or shared
+// path. See docs/12-multi-repo-central-store.md.
+func renderInitConfig(name, absPath string) string {
+	return fmt.Sprintf(`# DevAI project configuration
 project:
   name: %s
   path: %s
 
-state_dir: %s
+# Store resolves to ~/.local/share/devai/state (central XDG default).
+# Override via DEVAI_STATE_DIR env var or by adding a state_dir key below.
 language: es  # en | es
 
 embeddings:
@@ -81,15 +100,5 @@ indexing:
     - "build/**"
     - "*.min.js"
     - "*.lock"
-`, name, absPath, stateDir)
-
-		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
-			return fmt.Errorf("writing config: %w", err)
-		}
-	}
-
-	fmt.Printf("Initialized devai for %s\n", absPath)
-	fmt.Printf("  Config: %s\n", configPath)
-	fmt.Printf("  State:  %s\n", stateDir)
-	return nil
+`, name, absPath)
 }

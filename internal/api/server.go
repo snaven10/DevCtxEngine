@@ -239,8 +239,9 @@ func (s *Server) handlePullIndex(w http.ResponseWriter, r *http.Request) {
 //
 // Path:     POST /api/v1/index/{repo}
 // Query:    path=<on-disk path>    (optional; defaults to {repo})
-//           branch=<name>          (optional)
-//           incremental=true|false (optional, default true)
+//
+//	branch=<name>          (optional)
+//	incremental=true|false (optional, default true)
 //
 // The Python `index_repo` handler expects `repo_path` to be a directory with
 // a `.git`. The `{repo}` path-segment is convenient when the user is running

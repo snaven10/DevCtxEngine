@@ -141,7 +141,7 @@ place to pin per-project tuning. Same structure as the entry above, e.g.:
         "DEVAI_EMBEDDING_MODEL": "ml-mpnet",
         "DEVAI_TOKEN_STRATEGY": "summarize",
         "DEVAI_SUMMARIZER_PROVIDER": "extractive",
-        "DEVAI_MAX_OUTPUT_TOKENS": "8000"
+        "DEVAI_MAX_OUTPUT_TOKENS": "4000"
       }
     }
   }
@@ -199,6 +199,8 @@ authoritative ones from the service config.)
 | `DEVAI_EMBEDDING_DEVICE` | `cpu` \| `cuda` | `cpu` |
 | `DEVAI_EMBEDDING_API_KEY` | API key for remote embedding providers | — |
 | `DEVAI_EMBEDDINGS_OFFLINE` | `auto` \| `true` \| `false` | `auto` |
+| `DEVAI_EMBED_MAX_CHARS` | RAM guard — max chars fed to the encoder per text (NOT the model's context limit). Lower (e.g. `2048`) on low-RAM machines to avoid OOM on minified/large non-code chunks. | `4096` |
+| `DEVAI_EMBED_BATCH_SIZE` | Texts per embedding batch. Lower (e.g. `8`) to reduce peak RAM. | `16` |
 
 **Token budget & summarizer**
 

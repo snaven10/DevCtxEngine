@@ -11,12 +11,37 @@ All notable changes to DevAI are documented here. The format is based on
 
 ## [Unreleased]
 
-<!-- Template:
 ### Added
+- Installer (`install.sh`) now injects `DEVAI_EMBED_MAX_CHARS` into the MCP client config so the
+  embed cap is active from the first index without manual env-var wiring.
+- `DEVAI_EMBED_MAX_CHARS` and `DEVAI_EMBED_BATCH_SIZE` documented in `docs/11-configuration.md`
+  (EN + ES mirror) with default values, RAM-impact notes, and hook interaction.
+- `docs/12-multi-repo-central-store.md` (EN + ES) — step-by-step recipe for pointing multiple
+  repos at a single central store: when to do it, which env vars to set, how to verify with
+  `devai index --status`, and common pitfalls.
+
 ### Changed
+- `devai init` no longer writes a per-repo `state_dir` into the generated `config.yaml`. The
+  store now resolves to the central default (`~/.local/share/devai/state`) unless the user
+  explicitly overrides `DEVAI_STATE_DIR`. Removes the main footgun where each cloned repo got
+  its own isolated vector store.
+- The auto-index post-commit hook now embeds the active embedding model name and
+  `DEVAI_EMBED_MAX_CHARS` (default `2048`) so incremental indexes use the same model/cap as the
+  full index without requiring a separate env-var export in the shell profile.
+- `install.sh` fails loudly (exit 1 with an explanatory message) when the ML wheel is absent
+  from the release assets. Pass `--allow-no-ml` (or set `ALLOW_NO_ML=1`) to proceed with a
+  search-only install.
+
 ### Fixed
-### Removed
--->
+- `devai index` now aborts with a clear error when the requested model's output dimension
+  mismatches the existing store's dimension, instead of silently appending mismatched vectors
+  and corrupting the store. (#footgun-C)
+
+### Docs
+- Consolidated install and configuration into a single source of truth; removed the stale
+  `DOCS.md` (which contradicted README and `docs/`).
+- Corrected README ↔ docs contradictions: `DEVAI_STATE_DIR` default path, `DEVAI_TOKEN_STRATEGY`
+  valid values, `DEVAI_MAX_OUTPUT_TOKENS` default, and `server configure --claude` flag name.
 
 ---
 
