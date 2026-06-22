@@ -510,6 +510,7 @@ Full documentation is available in both languages. Each document links to its co
 - [Design Decisions](docs/08-design-decisions.md) — 12 Architecture Decision Records with tradeoffs
 - [Models & Tuning](docs/09-models-and-tuning.md) — Embedding models compared, summarizer & token-budget strategies, hardware-based config, model-migration runbook ([español](docs/es/09-modelos-embeddings-y-tuning.md))
 - [Token & Cost Benchmark](docs/10-mcp-token-benchmark.md) — Real A/B measuring MCP filtered retrieval vs. brute-force dump: 71% cost savings, ~12× fewer tokens ([español](docs/es/10-benchmark-tokens-mcp.md))
+- [Multi-repo Central Store](docs/12-multi-repo-central-store.md) — one shared index across many repos via hooks ([español](docs/es/12-multi-repo-store-central.md))
 - [Changelog](CHANGELOG.md) — Release history and unreleased changes
 
 ---
