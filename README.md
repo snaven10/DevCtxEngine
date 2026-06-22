@@ -475,7 +475,7 @@ devai/
 
 ## Documentation
 
-> **🇬🇧 English** — [`docs/`](docs/) | **🇪🇸 Español** — [`docs/es/`](docs/es/)
+> **📖 Documentación / Documentation:** 🇬🇧 [English](#documentation) · 🇪🇸 [Español](docs/es/README.md)
 
 Full documentation is available in both languages. Each document links to its counterpart at the top.
 

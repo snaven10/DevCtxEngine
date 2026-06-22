@@ -1,3 +1,5 @@
+> 🇪🇸 [Leer en español](es/09-modelos-embeddings-y-tuning.md)
+
 # Embedding models, summarizer & tuning
 
 A practical guide to the available embedding models, the token-budget strategies,
