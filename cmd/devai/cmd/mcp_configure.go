@@ -44,12 +44,12 @@ type mcpServerEntry struct {
 
 // clientResult tracks what happened for each client.
 type clientResult struct {
-	name     string
-	path     string
-	ok       bool
-	skipped  bool
-	reason   string
-	removed  bool
+	name    string
+	path    string
+	ok      bool
+	skipped bool
+	reason  string
+	removed bool
 }
 
 func runMCPConfigure(cmd *cobra.Command, args []string) error {

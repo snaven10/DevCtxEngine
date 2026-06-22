@@ -406,4 +406,3 @@ func resolvedClientOptsWithOffline(offline bool) ([]mlclient.Option, error) {
 	}
 	return opts, nil
 }
-

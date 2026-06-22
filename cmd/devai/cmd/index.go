@@ -22,14 +22,14 @@ import (
 //
 // Keep in sync with MODEL_REGISTRY in ml/devai_ml/embeddings/local.py.
 var modelDims = map[string]int{
-	"minilm-l6":      384,
-	"minilm-l12":     384,
-	"bge-small":      384,
-	"bge-base":       768,
-	"ml-minilm":      384,
-	"ml-mpnet":       768,
-	"ml-granite":     384,
-	"ml-granite-lg":  768,
+	"minilm-l6":     384,
+	"minilm-l12":    384,
+	"bge-small":     384,
+	"bge-base":      768,
+	"ml-minilm":     384,
+	"ml-mpnet":      768,
+	"ml-granite":    384,
+	"ml-granite-lg": 768,
 }
 
 // resolveStateDir resolves the absolute path to the state directory using the

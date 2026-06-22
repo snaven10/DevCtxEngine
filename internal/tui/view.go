@@ -51,7 +51,7 @@ func (m Model) View() string {
 
 	// Status bar
 	if m.errorMsg != "" {
-		b.WriteString("\n" + styleError.Render("✗ " + m.errorMsg))
+		b.WriteString("\n" + styleError.Render("✗ "+m.errorMsg))
 	} else if m.statusMsg != "" {
 		b.WriteString("\n" + styleStatus.Render(m.statusMsg))
 	}

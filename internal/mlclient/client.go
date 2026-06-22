@@ -20,15 +20,15 @@ import (
 
 // StdioClient communicates with the Python ML service via JSON-RPC over stdio.
 type StdioClient struct {
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    *bufio.Reader
-	mu        sync.Mutex
-	nextID    atomic.Int64
-	quiet     bool                // suppress stderr forwarding (for MCP mode)
-	extraEnv  []string            // additional env vars for the ML process ("KEY=VALUE")
-	stateDir  string              // state directory to pass to ML process (--state-dir)
-	model     string              // embedding model key to pass to ML process (--model)
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     *bufio.Reader
+	mu         sync.Mutex
+	nextID     atomic.Int64
+	quiet      bool                  // suppress stderr forwarding (for MCP mode)
+	extraEnv   []string              // additional env vars for the ML process ("KEY=VALUE")
+	stateDir   string                // state directory to pass to ML process (--state-dir)
+	model      string                // embedding model key to pass to ML process (--model)
 	projectCfg *config.ProjectConfig // optional project config for python resolution
 }
 

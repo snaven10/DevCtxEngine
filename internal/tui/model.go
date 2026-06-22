@@ -271,12 +271,12 @@ func New(client *mlclient.StdioClient, version string, lang ...string) Model {
 	}
 
 	return Model{
-		client:    client,
-		version:   version,
-		lang:      l,
-		screen:    ScreenDashboard,
-		menuIndex: 0,
-		menuItems: menuItems,
+		client:      client,
+		version:     version,
+		lang:        l,
+		screen:      ScreenDashboard,
+		menuIndex:   0,
+		menuItems:   menuItems,
 		searchInput: si,
 		memoryInput: mi,
 		indexInput:  ii,
@@ -292,8 +292,6 @@ func (m Model) Init() tea.Cmd {
 		checkVersionAsync(m.version),
 	)
 }
-
-
 
 // ─── Commands (async data loading) ──────────────────────────────────────────
 
@@ -471,15 +469,15 @@ func parseRepoInfoFromResult(result interface{}) []RepoInfo {
 			continue
 		}
 		repos = append(repos, RepoInfo{
-			Path:      getString(r, "repo"),
-			Name:      getString(r, "name"),
-			Branch:    getString(r, "branch"),
+			Path:       getString(r, "repo"),
+			Name:       getString(r, "name"),
+			Branch:     getString(r, "branch"),
 			LastCommit: getString(r, "last_commit"),
-			Files:     getInt(r, "files"),
-			Symbols:   getInt(r, "symbols"),
-			Chunks:    getInt(r, "chunks"),
-			IndexedAt: getString(r, "indexed_at"),
-			IsIndexed: getString(r, "status") == "indexed",
+			Files:      getInt(r, "files"),
+			Symbols:    getInt(r, "symbols"),
+			Chunks:     getInt(r, "chunks"),
+			IndexedAt:  getString(r, "indexed_at"),
+			IsIndexed:  getString(r, "status") == "indexed",
 		})
 	}
 
@@ -627,4 +625,3 @@ func getString(m map[string]interface{}, key string) string {
 	}
 	return s
 }
-

@@ -146,10 +146,10 @@ func TestEnvVars_ReturnsKeyValuePairs(t *testing.T) {
 	envs := r.EnvVars()
 
 	expected := map[string]string{
-		"DEVAI_STORAGE_MODE":  "shared",
-		"DEVAI_QDRANT_URL":    "qdrant:6334",
+		"DEVAI_STORAGE_MODE":   "shared",
+		"DEVAI_QDRANT_URL":     "qdrant:6334",
 		"DEVAI_QDRANT_API_KEY": "tok",
-		"DEVAI_LOCAL_DB_PATH": "/tmp/local",
+		"DEVAI_LOCAL_DB_PATH":  "/tmp/local",
 	}
 
 	for _, kv := range envs {
