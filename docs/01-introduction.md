@@ -92,7 +92,7 @@ Returns ranked results with file paths, symbol names, and relevance scores.
 ### Connect to Claude Code
 
 ```bash
-devai server configure claude
+devai server configure --claude
 ```
 
 Auto-writes the MCP server entry to Claude Code's configuration. The agent can now call all 21 DevAI tools directly. No manual JSON editing.

@@ -93,7 +93,7 @@ Devuelve resultados rankeados con rutas de archivo, nombres de símbolos y punta
 ### Conectar con Claude Code
 
 ```bash
-devai server configure claude
+devai server configure --claude
 ```
 
 Escribe automáticamente la entrada del servidor MCP en la configuración de Claude Code. El agente ahora puede llamar a las 21 herramientas de DevAI directamente. Sin editar JSON manualmente.
