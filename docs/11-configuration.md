@@ -1,3 +1,5 @@
+> 🇪🇸 [Leer en español](es/11-configuracion.md)
+
 # Configuration
 
 How DevAI is configured: the `config.yaml` files, how the MCP server is wired into AI clients

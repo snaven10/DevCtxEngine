@@ -1,3 +1,5 @@
+> 🌐 [English version](../11-configuration.md)
+
 # Configuración
 
 Cómo se configura DevAI: los archivos `config.yaml`, cómo se conecta el servidor MCP a los clientes de IA

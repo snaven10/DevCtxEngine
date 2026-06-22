@@ -1,3 +1,5 @@
+> 🇪🇸 [Leer en español](es/10-benchmark-tokens-mcp.md)
+
 # Token & Cost Benchmark: MCP (Filtered Retrieval) vs. Direct Mode (Brute-Force Dump)
 
 A controlled A/B measuring how DevAI's MCP affects token consumption and cost on a real task. The **same

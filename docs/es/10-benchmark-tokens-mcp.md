@@ -1,3 +1,5 @@
+> 🌐 [English version](../10-mcp-token-benchmark.md)
+
 # Análisis de Infraestructura DevAI
 ## Comparativa de Consumo y Costos: MCP (Retrieval Filtrado) vs. Modo Directo (Volcado Bruto)
 
