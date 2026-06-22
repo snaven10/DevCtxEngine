@@ -24,6 +24,8 @@ One binary, one state directory, 21 MCP tools.
 
 ## Install
 
+### Quick install (recommended)
+
 The install script downloads a precompiled Go binary and a portable Python runtime. No Go or Python required on your machine.
 
 ```bash
@@ -42,15 +44,32 @@ flags + defaults when piped:
     ./install.sh --yes                # all defaults, no prompts
     ./install.sh --client claude --scope project --model ml-mpnet --gpu
 
-**Install script flags:**
+> Full installer flag reference: [docs/11-configuration.md §2.4](docs/11-configuration.md).
 
-| Flag | Description |
-|------|-------------|
-| `--gpu` / `-Gpu` | Install PyTorch with CUDA support (default: CPU-only) |
-| `--version TAG` / `-Version TAG` | Install a specific release version (default: latest) |
-| `--uninstall` / `-Uninstall` | Remove DevAI and all its files |
+### From source (for contributors)
 
-See [Introduction](docs/01-introduction.md) for detailed setup, manual install from source, and configuration.
+> **Prerequisites**: Go 1.24+, Python 3.11+
+
+```bash
+git clone <repo-url> devai
+cd devai
+make build
+```
+
+This builds the Go binary (`./devai`) and installs the Python ML package into a virtual environment.
+
+```bash
+make build-go       # Go binary only
+make build-ml       # Python ML service only
+make install        # Install to $GOPATH/bin
+```
+
+#### Docker
+
+```bash
+make docker              # Build image as devai:latest
+docker-compose up -d     # Start DevAI + Qdrant
+```
 
 ```
   AI Assistant ──MCP──▶ DevAI CLI (Go)
@@ -126,37 +145,6 @@ devai server mcp
 ```
 
 That's it. Your AI agent can now search, read symbols, trace references, and build context automatically.
-
----
-
-## Installation
-
-### From Source (recommended)
-
-> **Prerequisites**: Go 1.24+, Python 3.11+
-
-```bash
-git clone <repo-url> devai
-cd devai
-make build
-```
-
-This builds the Go binary (`./devai`) and installs the Python ML package into a virtual environment.
-
-### Build Individually
-
-```bash
-make build-go       # Go binary only
-make build-ml       # Python ML service only
-make install        # Install to $GOPATH/bin
-```
-
-### Docker
-
-```bash
-make docker              # Build image as devai:latest
-docker-compose up -d     # Start DevAI + Qdrant
-```
 
 ---
 
