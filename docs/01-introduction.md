@@ -128,7 +128,7 @@ Indexing is incremental. After the first full index, DevAI uses `git diff` to de
 
 | Document | What it covers |
 |----------|---------------|
-| [Introduction](01-introduction.md) | You are here — overview, quick start, mental model |
+| Introduction *(this document)* | Overview, quick start, mental model |
 | [Install & Setup](../README.md#install) | Install script, manual build, configuration, environment variables |
 | [Architecture](02-architecture.md) | Go + Python hybrid design, storage layers, data flow |
 | [Semantic Search](03-core-concepts/search.md) | Indexing pipeline, chunking, branch-aware queries |
