@@ -24,7 +24,7 @@ repositorio que escriba en él.
                    |
           STORE CENTRAL
           $WORKSPACE/.devai/state/
-           ├── memory.db        (grafo + memoria SQLite)
+           ├── index.db         (grafo + index_state + memoria SQLite)
            ├── vectors/         (vectores de embeddings LanceDB)
            └── config.yaml      (configuración del modelo compartido)
                    |

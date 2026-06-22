@@ -23,7 +23,7 @@ topology inverts this: you designate **one central store** and tell every repo t
                    |
           CENTRAL STORE
           $WORKSPACE/.devai/state/
-           ├── memory.db        (graph + memory SQLite)
+           ├── index.db         (graph + index_state + memory SQLite)
            ├── vectors/         (LanceDB embedding vectors)
            └── config.yaml      (shared model config)
                    |

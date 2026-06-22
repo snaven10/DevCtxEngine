@@ -116,7 +116,7 @@ func checkDimensionMismatch(cfg *config.ProjectConfig) error {
 			"store was built with %d dims (model %q); config requests %d dims (model %q).\n"+
 				"To fix: reindex from scratch with `devai index --incremental=false` after confirming\n"+
 				"that the model in .devai/config.yaml is correct, or set the matching model.\n"+
-				"See docs/12-config-reference.md for details.",
+				"See docs/12-multi-repo-central-store.md for details.",
 			storedDim, storedModel, expectedDim, modelKey,
 		)
 	}
