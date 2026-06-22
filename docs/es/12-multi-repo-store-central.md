@@ -129,12 +129,11 @@ El bloque resultante en `.git/hooks/post-commit` de cada repositorio tendrá est
 ```sh
 # >>> DEVAI_AUTO_INDEX >>>
 # Auto-index after each commit. Managed by 'devai hooks install/uninstall' — do not edit by hand.
-( cd "$(git rev-parse --show-toplevel)" \
-  && DEVAI_STATE_DIR="/ruta/absoluta/al/store/central" \
-     DEVAI_EMBED_MAX_CHARS="2048" \
-     "/ruta/absoluta/a/devai" index --incremental ) >/dev/null 2>&1 &
+( cd "$(git rev-parse --show-toplevel)" && DEVAI_STATE_DIR="/ruta/absoluta/al/store/central" DEVAI_EMBEDDING_MODEL="ml-granite" DEVAI_EMBED_MAX_CHARS="2048" "/ruta/absoluta/a/devai" index --incremental ) >/dev/null 2>&1 &
 # <<< DEVAI_AUTO_INDEX <<<
 ```
+
+Nota: el comando completo del hook es **una sola línea** — sin continuaciones con barra inversa. `DEVAI_EMBEDDING_MODEL` se incluye cuando había un modelo activo al momento de instalar; si no había ninguno, se omite.
 
 ### 2.5 Apuntar el cliente MCP al store central
 
@@ -195,9 +194,18 @@ esac
 ```
 
 El patrón `case` debe coincidir con el sufijo o nombre que uses para los worktrees
-(`*-desp`, `*_worktree`, `*/worktrees/*`, etc.). El `exit 0` deja que el resto del
-archivo de hook continúe si existen otras tareas post-commit fuera del bloque devai; para
-abortar el hook completo, usa `exit 0` antes del bloque devai, no dentro de él.
+(`*-desp`, `*_worktree`, `*/worktrees/*`, etc.).
+
+El `exit 0` dentro de la guarda `case` termina el **script del hook post-commit completo**
+de inmediato, con un código de salida limpio (git procede normalmente). Esto es correcto —
+y el caso habitual — cuando el bloque de auto-indexación de devai es la única lógica
+post-commit del archivo.
+
+**Advertencia:** si tu archivo de hook contiene otras tareas post-commit (linters, scripts
+de notificación, etc.), un `exit 0` al inicio del archivo también las saltará en los
+worktrees que coincidan con el patrón. En ese caso, protege solo el bloque devai en lugar
+del archivo completo — por ejemplo, envuelve la línea devai en un `if` que la omita en los
+worktrees coincidentes — para que tus otras tareas sigan ejecutándose.
 
 ---
 
@@ -221,15 +229,19 @@ Ver el [runbook de migración de modelos en Modelos y Tuning](09-modelos-embeddi
 
 Los archivos grandes o minificados pueden producir chunks de texto enormes. Sin un límite,
 el modelo de embeddings asigna el tensor completo para cada chunk y puede agotar la RAM a
-mitad de la indexación (especialmente con `ml-granite` en CPU). Establece un techo seguro
-en el entorno del hook y en el bloque `env` del MCP:
+mitad de la indexación (especialmente con `ml-granite` en CPU).
+
+`devai hooks install` **siempre** incrusta `DEVAI_EMBED_MAX_CHARS` en el hook — su valor
+por defecto es `"2048"` cuando la variable de entorno no está definida, por lo que la
+protección contra OOM se aplica automáticamente. Para usar un techo diferente, define
+`DEVAI_EMBED_MAX_CHARS` en tu shell **antes** de ejecutar `devai hooks install`:
 
 ```bash
-DEVAI_EMBED_MAX_CHARS=2048   # valor por defecto: 4096
+DEVAI_EMBED_MAX_CHARS=4096 DEVAI_STATE_DIR="$CENTRAL" devai hooks install
 ```
 
-`devai hooks install` ahora embebe este valor automáticamente cuando `DEVAI_EMBED_MAX_CHARS`
-está definido en el shell que lo invoca.
+El valor queda incrustado en la línea del hook y se aplica a cada ejecución de indexación
+en segundo plano.
 
 ### 4.3 Nunca commitear `.mcp.json`
 
