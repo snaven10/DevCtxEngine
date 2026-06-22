@@ -472,7 +472,11 @@ configure_client() {
         *)      warn "Unknown --client '${CLIENT}', defaulting to claude"; client_flags=(--claude) ;;
     esac
 
-    local env_flags=(--env "DEVAI_STATE_DIR=${STATE_DIR}" --env "DEVAI_EMBEDDING_MODEL=${MODEL}")
+    local env_flags=(
+        --env "DEVAI_STATE_DIR=${STATE_DIR}"
+        --env "DEVAI_EMBEDDING_MODEL=${MODEL}"
+        --env "DEVAI_EMBED_MAX_CHARS=2048"
+    )
     if [[ "${MODEL}" == "ml-mpnet" ]]; then
         env_flags+=(--env "DEVAI_RERANK_MODEL=ms-marco-MultiBERT-L-12")
     fi
