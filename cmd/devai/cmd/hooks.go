@@ -50,13 +50,21 @@ const (
 // hookBlock builds the delimited block injected into the post-commit hook.
 //
 // It cd's to the repo top-level first so `devai index` resolves the real repo
-// name (it sends repo_path="."), and redirects output + backgrounds the run so
-// the commit is never blocked or polluted by indexing logs.
-func hookBlock(devaiBinary, stateDir string) string {
+// name (it sends repo_path="."), pins the store + model + embed cap so the
+// auto-index matches the MCP server's store exactly, and backgrounds the run so
+// the commit is never blocked. model may be empty (then it is omitted).
+func hookBlock(devaiBinary, stateDir, model, maxChars string) string {
+	env := fmt.Sprintf(`DEVAI_STATE_DIR=%q`, stateDir)
+	if model != "" {
+		env += fmt.Sprintf(` DEVAI_EMBEDDING_MODEL=%q`, model)
+	}
+	if maxChars != "" {
+		env += fmt.Sprintf(` DEVAI_EMBED_MAX_CHARS=%q`, maxChars)
+	}
 	return fmt.Sprintf(`%s
 # Auto-index after each commit. Managed by 'devai hooks install/uninstall' — do not edit by hand.
-( cd "$(git rev-parse --show-toplevel)" && DEVAI_STATE_DIR=%q %q index --incremental ) >/dev/null 2>&1 &
-%s`, hookBeginMarker, stateDir, devaiBinary, hookEndMarker)
+( cd "$(git rev-parse --show-toplevel)" && %s %q index --incremental ) >/dev/null 2>&1 &
+%s`, hookBeginMarker, env, devaiBinary, hookEndMarker)
 }
 
 func runHooksInstall(cmd *cobra.Command, args []string) error {
@@ -84,6 +92,14 @@ func runHooksInstall(cmd *cobra.Command, args []string) error {
 	stateDir := os.Getenv("DEVAI_STATE_DIR")
 	if stateDir == "" {
 		stateDir = filepath.Join(absPath, ".devai", "state")
+		fmt.Println("  ⚠  DEVAI_STATE_DIR not set — hook will use a per-repo store.")
+		fmt.Println("     For a central store, set DEVAI_STATE_DIR before installing the hook.")
+	}
+
+	model := os.Getenv("DEVAI_EMBEDDING_MODEL")
+	maxChars := os.Getenv("DEVAI_EMBED_MAX_CHARS")
+	if maxChars == "" {
+		maxChars = "2048" // conservative OOM guard for the background indexer
 	}
 
 	hooksDir := filepath.Join(gitDir, "hooks")
@@ -92,7 +108,7 @@ func runHooksInstall(cmd *cobra.Command, args []string) error {
 	}
 	hookPath := filepath.Join(hooksDir, "post-commit")
 
-	block := hookBlock(devaiBinary, stateDir)
+	block := hookBlock(devaiBinary, stateDir, model, maxChars)
 
 	existing, _ := os.ReadFile(hookPath) // ignore error: missing file => fresh install
 	content := string(existing)
