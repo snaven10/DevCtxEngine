@@ -4,12 +4,13 @@
 
 Guía práctica de los modelos disponibles, las estrategias de presupuesto de
 tokens, qué configuración conviene según el hardware, y los comportamientos
-verificados empíricamente (pruebas del 2026-05-28).
+verificados empíricamente.
 
-> **Contexto**: esta instalación migró de `minilm-l6` (384 dims, entrenado en
-> inglés) a **`ml-mpnet`** (768 dims, multilingüe) para mejorar el recall y el
-> resumen de memorias escritas en **español**. La documentación de abajo explica
-> por qué, cómo, y cómo ajustarlo a otros equipos.
+> **Por qué importa**: el modelo de embeddings determina la calidad del retrieval
+> y la dimensión del vector store; el summarizer + el presupuesto de tokens
+> determinan cuánto de cada resultado llega al LLM. Elegir la combinación
+> incorrecta implica perder memorias relevantes, corromper identificadores o
+> quemar CPU que no tenés.
 
 ---
 
@@ -25,8 +26,8 @@ corren localmente vía `sentence-transformers`. Se selecciona con la clave en
 | `minilm-l12` | all-MiniLM-L12-v2 | 384 | 33 MB | rápida | 🇬🇧 inglés | algo más de precisión que L6, sigue liviano |
 | `bge-small` | BAAI/bge-small-en-v1.5 | 384 | 33 MB | rápida | 🇬🇧 inglés | mejor recuperación que MiniLM en inglés |
 | `bge-base` | BAAI/bge-base-en-v1.5 | 768 | 110 MB | media | 🇬🇧 inglés | máxima precisión en inglés, repos grandes |
-| **`ml-minilm`** | paraphrase-multilingual-MiniLM-L12-v2 | 384 | 470 MB | rápida | 🌍 50+ idiomas | **español rápido**, equipos chicos con contenido multilingüe |
-| **`ml-mpnet`** | paraphrase-multilingual-mpnet-base-v2 | 768 | 1.1 GB | media | 🌍 50+ idiomas | **máxima calidad en español** (torch), equipos con CPU decente o GPU |
+| **`ml-minilm`** | paraphrase-multilingual-MiniLM-L12-v2 | 384 | 470 MB | rápida | 🌍 50+ idiomas | **multilingüe rápido**, equipos chicos con contenido no-inglés |
+| **`ml-mpnet`** | paraphrase-multilingual-mpnet-base-v2 | 768 | 1.1 GB | media | 🌍 50+ idiomas | **mejor calidad multilingüe** (torch), equipos con CPU decente o GPU |
 | **`ml-granite`** | granite-embedding-97m-multilingual-r2 (**ONNX int8**) | 384 | 94 MB | **muy rápida** | 🌍 multilingüe | **mejor multilingüe en CPU**: top recall + indexado más rápido + mitad de almacenamiento |
 | `ml-granite-lg` | granite-embedding-311m-multilingual-r2 (**ONNX int8**) | 768 | 299 MB | media | 🌍 multilingüe | hermano de 768 dims; `ml-granite` lo iguala/supera en CPU — usar solo si necesitás 768 dims |
 
@@ -47,13 +48,11 @@ corren localmente vía `sentence-transformers`. Se selecciona con la clave en
 - **Evitar los `e5`**: rinden por debajo de su potencial acá porque el provider
   no agrega los prefijos `query:`/`passage:` que esos modelos necesitan.
 
-> ⚠️ **Cambiar de modelo cambia la dimensión del vector** (384 ↔ 768). El vector
-> store es incompatible entre dimensiones → **obliga a re-indexar todo**. Ver §6.
-
 ### Benchmark (medido, solo CPU)
 
 Corpus de dominio de 49 documentos / 40 consultas (contenido técnico en español),
-medido en una máquina solo-CPU. El throughput de indexado usa lotes sostenidos de 32.
+medido en una máquina solo-CPU. El throughput de indexado usa lotes sostenidos de
+`DEVAI_EMBED_BATCH_SIZE` (default 16; ver la nota sobre RAM guard en §1).
 
 | Modelo | Backend | Dims | Recall@1 | MRR | Velocidad indexado (textos/s) | RAM pico | Disco |
 |--------|---------|------|----------|-----|------------------------------|----------|-------|
@@ -136,6 +135,9 @@ el texto completo igual, así que el recall del código no se ve afectado.
 > **~20.9 GB (OOM) → ~1–3 GB**; 4096 se queda cómodo bajo un cap de cgroup de 20 GB. En máquinas
 > ajustadas, combinalo con un `systemd-run --user --scope -p MemoryMax=…` para que un descontrol
 > nunca tumbe la máquina entera (incluido WSL).
+
+> ⚠️ **Cambiar de modelo cambia la dimensión del vector** (384 ↔ 768). El vector
+> store es incompatible entre dimensiones → **obliga a re-indexar todo**. Ver §6.
 
 ---
 
@@ -221,7 +223,7 @@ El factor de CPU más pesado es **el modelo de embeddings** (ml-mpnet 768d es ~5
 más lento que minilm-l6 en CPU). La estrategia de resumen es secundaria
 (`extractive` agrega ~0.5-1 s por recall al embeber oraciones; `soft_truncate` es gratis).
 
-### 🖥️ PC con CPU, contenido en ESPAÑOL — RECOMENDADO
+### 🖥️ PC con CPU, contenido no-inglés — RECOMENDADO
 ```jsonc
 DEVAI_EMBEDDING_MODEL    = "ml-granite"        // 384d multilingüe, ONNX int8
 DEVAI_EMBEDDING_DEVICE   = "cpu"
@@ -233,7 +235,7 @@ DEVAI_MAX_OUTPUT_TOKENS  = "8000"
 > ONNX viene con `devai setup`; necesita una CPU con AVX2. Si tu CPU no tiene AVX2,
 > usá `ml-mpnet` (mejor calidad torch) o `ml-minilm` (más liviano) abajo.
 
-### 🖥️ PC pequeña / sin GPU (o GPU débil), contenido en ESPAÑOL
+### 🖥️ PC pequeña / sin GPU (o GPU débil), contenido no-inglés
 ```jsonc
 DEVAI_EMBEDDING_MODEL    = "ml-minilm"        // 384d multilingüe, rápido
 DEVAI_EMBEDDING_DEVICE   = "cpu"
@@ -247,7 +249,7 @@ DEVAI_RERANK_PROVIDER    = "flashrank"
 > extra (no embebe oraciones). Usá `summarize`+`extractive` solo si tolerás
 > ~1 s más por recall a cambio de resúmenes query-focused.
 
-### 🖥️ PC potente / con GPU, contenido en ESPAÑOL  (← esta instalación)
+### 🖥️ PC potente / con GPU, contenido no-inglés
 ```jsonc
 DEVAI_EMBEDDING_MODEL    = "ml-mpnet"         // 768d multilingüe, máxima calidad
 DEVAI_EMBEDDING_DEVICE   = "cpu"              // o "cuda" si hay GPU buena
@@ -256,7 +258,7 @@ DEVAI_SUMMARIZER_PROVIDER= "extractive"
 DEVAI_MAX_OUTPUT_TOKENS  = "8000"
 ```
 
-### 🖥️ Contenido solo en INGLÉS
+### 🖥️ Contenido solo en inglés
 ```jsonc
 DEVAI_EMBEDDING_MODEL    = "bge-base"   // o "minilm-l6" si el equipo es chico
 DEVAI_TOKEN_STRATEGY     = "summarize"
@@ -273,7 +275,7 @@ DEVAI_SUMMARIZER_PROVIDER= "extractive"
 
 ---
 
-## 6. Comportamientos verificados (pruebas 2026-05-28)
+## 6. Comportamientos verificados
 
 Batería de pruebas empíricas sobre memorias reales con `ml-mpnet` + `extractive`:
 
@@ -289,7 +291,7 @@ Batería de pruebas empíricas sobre memorias reales con `ml-mpnet` + `extractiv
 **Conclusiones**:
 - `extractive` trae contenido relevante aunque esté enterrado en una memoria larga
   → es la estrategia correcta para recall por consulta puntual.
-- El cruce multilingüe funciona (query inglés ↔ contenido español) gracias a mpnet.
+- El retrieval cross-lingual funciona gracias al modelo multilingüe.
 - `summarize`/`soft_truncate` nunca pierden memorias (`output_count == input_count`).
 
 ### Cheat sheet de uso
@@ -298,8 +300,8 @@ Batería de pruebas empíricas sobre memorias reales con `ml-mpnet` + `extractiv
 |-----------|-----------------|
 | Detalle exacto de algo puntual | `limit 3-5` → verbatim completo |
 | Explorar un tema amplio | `limit 12-18` → muchos resultados al grano, 0 perdidos |
-| Buscar en otro idioma | nada — `ml-mpnet`/`ml-minilm` ya lo bridgean |
-| Que siempre traiga lo relevante aunque esté enterrado | `summarize` + `extractive` (ya activo) |
+| Buscar en otro idioma | nada — `ml-mpnet`/`ml-minilm` lo cubren |
+| Que siempre traiga lo relevante aunque esté enterrado | `summarize` + `extractive` |
 
 ---
 
@@ -310,7 +312,7 @@ Batería de pruebas empíricas sobre memorias reales con `ml-mpnet` + `extractiv
    `DEVAI_EMBEDDING_MODEL`. **Cada repo tiene su propio `.devai/config.yaml`** +
    uno en la raíz del workspace + uno en `state/`. Cambiar solo el env NO basta:
    usar `devai model use <clave>` en CADA repo, o editar todos los `config.yaml`.
-   (El default del template está en `cmd/devai/cmd/init.go` → ya apunta a `ml-mpnet`.)
+   (El default del template está en `cmd/devai/cmd/init.go`.)
 
 2. **Wipear `vectors/` no basta — limpiar `file_state`.** El re-index chequea el
    hash por archivo en la tabla `file_state` (en `index.db`) y **salta** los que
