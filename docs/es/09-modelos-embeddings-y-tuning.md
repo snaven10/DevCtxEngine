@@ -26,8 +26,8 @@ corren localmente vía `sentence-transformers`. Se selecciona con la clave en
 | `minilm-l12` | all-MiniLM-L12-v2 | 384 | 33 MB | rápida | 🇬🇧 inglés | algo más de precisión que L6, sigue liviano |
 | `bge-small` | BAAI/bge-small-en-v1.5 | 384 | 33 MB | rápida | 🇬🇧 inglés | mejor recuperación que MiniLM en inglés |
 | `bge-base` | BAAI/bge-base-en-v1.5 | 768 | 110 MB | media | 🇬🇧 inglés | máxima precisión en inglés, repos grandes |
-| **`ml-minilm`** | paraphrase-multilingual-MiniLM-L12-v2 | 384 | 470 MB | rápida | 🌍 50+ idiomas | **español rápido**, equipos chicos con contenido multilingüe |
-| **`ml-mpnet`** | paraphrase-multilingual-mpnet-base-v2 | 768 | 1.1 GB | media | 🌍 50+ idiomas | **máxima calidad en español** (torch), equipos con CPU decente o GPU |
+| **`ml-minilm`** | paraphrase-multilingual-MiniLM-L12-v2 | 384 | 470 MB | rápida | 🌍 50+ idiomas | **multilingüe rápido**, equipos chicos con contenido no-inglés |
+| **`ml-mpnet`** | paraphrase-multilingual-mpnet-base-v2 | 768 | 1.1 GB | media | 🌍 50+ idiomas | **mejor calidad multilingüe** (torch), equipos con CPU decente o GPU |
 | **`ml-granite`** | granite-embedding-97m-multilingual-r2 (**ONNX int8**) | 384 | 94 MB | **muy rápida** | 🌍 multilingüe | **mejor multilingüe en CPU**: top recall + indexado más rápido + mitad de almacenamiento |
 | `ml-granite-lg` | granite-embedding-311m-multilingual-r2 (**ONNX int8**) | 768 | 299 MB | media | 🌍 multilingüe | hermano de 768 dims; `ml-granite` lo iguala/supera en CPU — usar solo si necesitás 768 dims |
 
