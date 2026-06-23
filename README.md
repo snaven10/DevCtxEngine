@@ -9,6 +9,10 @@
   Hybrid Go + Python. Single binary. Git-aware.
 </p>
 
+<p align="center">
+  📖 <strong>Documentation:</strong> 🇬🇧 English (you are here) &#8226; 🇪🇸 <a href="docs/es/README.md">Español</a>
+</p>
+
 > **Warning**
 > **Alpha — Active Development.** DevAI is under heavy development. APIs, CLI flags, and storage formats may change without notice. Expect rough edges. See [Project Status](#project-status) for what works and what does not.
 
