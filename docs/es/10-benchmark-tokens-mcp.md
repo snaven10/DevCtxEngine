@@ -1,12 +1,10 @@
 > 🌐 [English version](../10-mcp-token-benchmark.md)
 
-# Análisis de Infraestructura DevAI
-## Comparativa de Consumo y Costos: MCP (Retrieval Filtrado) vs. Modo Directo (Volcado Bruto)
+# Benchmark de Tokens y Costo: MCP (recuperación filtrada) vs. modo directo (volcado bruto)
 
-Este documento analiza el impacto del Model Context Protocol (MCP) de DevAI sobre el consumo de
-tokens y el costo de una tarea real ejecutada con agentes de desarrollo. La medición se hizo con un
-A/B controlado: **la misma tarea de diagnóstico**, resuelta dos veces, variando únicamente si el agente
-tenía acceso a las herramientas de DevAI (retrieval vectorial + memoria) o estaba forzado a `grep`/`read`.
+Un A/B controlado que mide cómo el MCP de DevAI afecta el consumo de tokens y el costo en una tarea
+real. La **misma tarea de diagnóstico** fue resuelta dos veces, variando únicamente si el agente tenía
+acceso a las herramientas de DevAI (retrieval vectorial + memoria) o estaba limitado a `grep`/`read`.
 
 > **Metodología**: ambas sesiones partieron de contexto limpio, mismo modelo, misma tarea de
 > análisis/consulta (**0 líneas de código cambiadas** en ambas → sin varianza de implementación).
@@ -92,15 +90,15 @@ los resultados, porque cada métrica reacciona distinto al peso del modelo:
   - `ml-minilm` (384 dim, multilingüe): ~5× más rápido que `ml-mpnet` en CPU.
   - `minilm-l6` (384 dim, inglés): aún más rápido (22 MB vs 1.1 GB).
   → El gap de ~8 min de wall time **se reduciría sustancialmente** con cualquiera de los dos.
-- **El precio a pagar: precisión de retrieval.** `ml-mpnet` da el mejor ranking, sobre todo en **español**.
+- **El precio a pagar: precisión de retrieval.** `ml-mpnet` da el mejor ranking, sobre todo para **contenido no-inglés**.
   Un modelo más liviano puede traer resultados algo menos relevantes → ocasionalmente el agente hace una
   búsqueda extra o lee un poco más, lo que **erosiona marginalmente** el ahorro de tokens, sin cambiar el
   orden de magnitud.
 
-| Modelo | Dim | Velocidad (CPU) | Calidad retrieval (ES) | Cuándo conviene |
+| Modelo | Dim | Velocidad (CPU) | Calidad retrieval | Cuándo conviene |
 |---|---|---|---|---|
-| `ml-mpnet` *(usado en este benchmark)* | 768 | lenta (~225 ms/embed) | **mejor** | Máxima precisión en español; equipo con CPU decente o GPU |
-| `ml-minilm` | 384 | ~5× más rápida | buena | **Balance** velocidad/calidad para español en equipos modestos |
+| `ml-mpnet` *(usado en este benchmark)* | 768 | lenta (~225 ms/embed) | **mejor** (multilingüe) | Máxima precisión; equipo con CPU decente o GPU |
+| `ml-minilm` | 384 | ~5× más rápida | buena (multilingüe) | **Balance** velocidad/calidad en equipos modestos |
 | `minilm-l6` | 384 | la más rápida | menor (inglés) | Prioridad velocidad / contenido en inglés |
 
 > **Lectura honesta:** los números de este informe son el **escenario de mayor calidad y mayor wall time**.
@@ -129,10 +127,7 @@ cada archivo (p. ej. un refactor masivo), porque ahí el contenido se lee igual 
 - **Doble ahorro:** el MCP recorta tanto la *re-lectura de contexto* (cache) como la *verbosidad de la
   respuesta* (output caro de Opus).
 - **Costo de tiempo:** mayor *wall time*, pero por **latencia de indexación local (CPU)**, no por el API —
-  mitigable con GPU o un modelo de embeddings más liviano.
-- **Modelo usado:** este benchmark corrió con el modelo **más pesado** (`ml-mpnet`, 768 dim) → es el peor
-  caso en *wall time* y el mejor en precisión. Con `ml-minilm` el ahorro de costo se mantendría y el tiempo
-  bajaría notablemente (ver §5).
+  mitigable con GPU o un modelo de embeddings más liviano (§5).
 
 **Recomendación:** para tareas de diagnóstico y comprensión de código, el uso de DevAI MCP es **altamente
 recomendable**: el ahorro financiero (≈71%) y la reducción de volumen de tokens (≈12×) superan con holgura
