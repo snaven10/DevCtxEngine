@@ -86,6 +86,10 @@ pub struct Storage {
     /// Path to the DuckDB database file. Empty => derived from `state_dir`.
     #[serde(default)]
     pub db_path: String,
+    /// Build a VSS HNSW index for approximate nearest-neighbor search after
+    /// indexing (requires the DuckDB VSS extension). Off => brute-force cosine.
+    #[serde(default)]
+    pub hnsw: bool,
 }
 
 /// `indexing:` section.

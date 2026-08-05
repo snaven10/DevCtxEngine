@@ -35,19 +35,47 @@ impl Store {
         }
         let conn = Connection::open(path)?;
         schema::init_schema(&conn, dim)?;
-        Ok(Self { conn, dim })
+        let store = Self { conn, dim };
+        store.load_vss(); // best-effort, so an existing HNSW index is usable
+        Ok(store)
     }
 
     /// Open an in-memory store (for tests).
     pub fn open_in_memory(dim: usize) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         schema::init_schema(&conn, dim)?;
-        Ok(Self { conn, dim })
+        let store = Self { conn, dim };
+        store.load_vss();
+        Ok(store)
     }
 
     /// The store's fixed vector dimension.
     pub fn dimension(&self) -> usize {
         self.dim
+    }
+
+    /// Best-effort load of the DuckDB VSS extension (for HNSW). Returns whether
+    /// it loaded; silently no-ops when the extension is unavailable (e.g. offline).
+    fn load_vss(&self) -> bool {
+        self.conn
+            .execute_batch(
+                "INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;",
+            )
+            .is_ok()
+    }
+
+    /// Create the HNSW (cosine) index on the `vectors` table for approximate
+    /// nearest-neighbor search. Requires the VSS extension; returns `Ok(false)`
+    /// (leaving brute-force search intact) when it is unavailable.
+    pub fn enable_hnsw(&self) -> Result<bool> {
+        if !self.load_vss() {
+            return Ok(false);
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw \
+             ON vectors USING HNSW (vector) WITH (metric = 'cosine');",
+        )?;
+        Ok(true)
     }
 
     /// Insert or replace points (delete-by-id then insert), atomically.
@@ -92,7 +120,10 @@ impl Store {
         Ok(())
     }
 
-    /// Brute-force cosine search with optional equality filters.
+    /// Cosine search with optional equality filters. Uses the HNSW index when
+    /// present (VSS loaded, no filters); otherwise a brute-force scan. The
+    /// `ORDER BY array_cosine_distance(...) LIMIT` shape is what the VSS optimizer
+    /// matches, so no query change is needed to benefit from the index.
     pub fn search(
         &self,
         query: &[f32],
@@ -100,19 +131,22 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let (where_clause, params) = build_where(filter);
-        let sql = format!(
-            "SELECT {COLS}, array_cosine_distance(vector, {qv}::FLOAT[{dim}])::DOUBLE AS dist
-             FROM vectors {where_clause}
-             ORDER BY dist ASC
-             LIMIT {limit}",
+        let dist_expr = format!(
+            "array_cosine_distance(vector, {qv}::FLOAT[{dim}])",
             qv = self.vec_literal(query),
             dim = self.dim,
+        );
+        let sql = format!(
+            "SELECT {COLS}, {dist_expr} AS dist
+             FROM vectors {where_clause}
+             ORDER BY {dist_expr}
+             LIMIT {limit}",
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(params), |row| {
             let point = row_to_point(row)?;
-            let dist: f64 = row.get(19)?;
-            Ok((point, dist as f32))
+            let dist: f32 = row.get(19)?;
+            Ok((point, dist))
         })?;
         let mut out = Vec::new();
         for r in rows {

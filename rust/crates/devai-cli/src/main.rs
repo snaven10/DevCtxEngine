@@ -454,6 +454,14 @@ fn cmd_index(full: bool) -> Result<()> {
         res.files_renamed,
     );
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);
+
+    if cfg.storage.hnsw {
+        if store.enable_hnsw()? {
+            println!("  HNSW index ready (VSS)");
+        } else {
+            eprintln!("  HNSW requested but the VSS extension is unavailable; using brute-force");
+        }
+    }
     Ok(())
 }
 

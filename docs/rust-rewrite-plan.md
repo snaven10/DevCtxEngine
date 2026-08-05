@@ -156,9 +156,16 @@ Cada fase deja el binario compilando y con tests; se compara salida contra el De
 - **Modo compartido de equipo — DESCARTADO (solo-local).** Se elimina shared/hybrid/Qdrant y `push/pull/sync_index`. Cada dev tiene su `index.duckdb` local. (§7)
 - **Ubicación del workspace Rust: `rust/`.** Convive con el árbol Go/Python de referencia durante el port incremental; se promueve a la raíz al alcanzar paridad.
 
+### Resueltas
+- **HNSW (VSS) — implementado, opt-in.** Brute-force por defecto; `storage.hnsw: true`
+  construye el índice `USING HNSW (vector) WITH (metric='cosine')` tras indexar. La
+  extensión VSS se carga best-effort (`INSTALL vss; LOAD vss`) con fallback a
+  brute-force si no está disponible. La persistencia HNSW usa el flag experimental
+  de DuckDB. La búsqueda no cambia: el optimizador VSS usa el índice para
+  `ORDER BY array_cosine_distance(...) LIMIT` (sin filtros).
+
 ### Abiertas (a decidir en su fase)
 1. **FTS**: DuckDB `fts` vs `LIKE`/propio vs `rusqlite` FTS5 (§4.2). Plan: empezar con matching propio.
-2. **HNSW ya o brute-force primero** (recomendado brute-force; §4.1).
-3. **Summarización abstractiva** (flan-t5): ¿portar vía `ort` o dejar solo extractiva al inicio?
-4. **TUI/API**: ¿en alcance del fork o posponer?
+2. **Summarización abstractiva** (flan-t5): ¿portar vía `ort` o dejar solo extractiva al inicio?
+3. **TUI/API**: ¿en alcance del fork o posponer?
 ```
