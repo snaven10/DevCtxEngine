@@ -5,9 +5,11 @@
 
 pub mod config;
 pub mod error;
+pub mod types;
 
 pub use config::{ProjectConfig, CONFIG_FILE_NAME};
 pub use error::{Error, Result};
+pub use types::{SearchFilter, SearchResult, VectorMetadata, VectorPoint};
 
 /// The DevAI version, sourced from the crate's `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

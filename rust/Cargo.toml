@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/devai-core",
     "crates/devai-cli",
+    "crates/devai-store",
 ]
 
 [workspace.package]
