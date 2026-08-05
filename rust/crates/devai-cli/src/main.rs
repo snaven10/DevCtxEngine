@@ -12,6 +12,7 @@ use devai_core::config::{find_config_file, Project, ProjectConfig};
 use devai_core::{SearchFilter, SearchResult};
 use devai_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devai_index::{run as index_run, IndexRequest};
+use devai_memory::{memory_stats, recall, remember, RememberRequest};
 use devai_rerank::{create_reranker, RerankSettings};
 use devai_store::Store;
 use serde::Serialize;
@@ -61,6 +62,33 @@ enum Command {
     },
     /// Run the MCP server over stdio (for AI agents / editors).
     Mcp,
+    /// Save a memory (deduplicated by topic key or content).
+    Remember {
+        /// The memory content.
+        content: String,
+        /// Short title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Memory type (decision/note/bug/insight/architecture/…).
+        #[arg(long = "type", default_value = "note")]
+        memory_type: String,
+        /// Topic key (upsert-by-topic).
+        #[arg(long)]
+        topic: Option<String>,
+        /// Comma-separated tags.
+        #[arg(long)]
+        tags: Option<String>,
+    },
+    /// Recall memories relevant to a query.
+    Recall {
+        /// The query.
+        query: String,
+        /// Maximum results.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
+    /// Show memory counts for the project.
+    MemoryStats,
 }
 
 /// Search output format.
@@ -86,6 +114,15 @@ fn main() -> Result<()> {
             no_rerank,
         } => cmd_search(query, limit, language, format, no_rerank),
         Command::Mcp => cmd_mcp(),
+        Command::Remember {
+            content,
+            title,
+            memory_type,
+            topic,
+            tags,
+        } => cmd_remember(content, title, memory_type, topic, tags),
+        Command::Recall { query, limit } => cmd_recall(query, limit),
+        Command::MemoryStats => cmd_memory_stats(),
     }
 }
 
@@ -94,6 +131,80 @@ fn cmd_mcp() -> Result<()> {
     let cfg = load_project()?;
     eprintln!("Starting DevAI MCP server (stdio)…");
     devai_mcp::run_stdio(cfg)
+}
+
+/// `devai remember` — save a memory.
+fn cmd_remember(
+    content: String,
+    title: Option<String>,
+    memory_type: String,
+    topic: Option<String>,
+    tags: Option<String>,
+) -> Result<()> {
+    let cfg = load_project()?;
+    let embedder = build_embedder(&cfg)?;
+    let store = open_store(&cfg, embedder.dimension())?;
+
+    let req = RememberRequest {
+        title: title.unwrap_or_default(),
+        content,
+        memory_type,
+        project: project_name(&cfg),
+        topic_key: topic.unwrap_or_default(),
+        tags: tags.unwrap_or_default(),
+        now: now_epoch(),
+        ..Default::default()
+    };
+    let res = remember(&store, embedder.as_ref(), &req)?;
+    let title = if res.memory.title.is_empty() {
+        "(untitled)"
+    } else {
+        &res.memory.title
+    };
+    println!("{:?}: {} — {}", res.status, res.memory.id, title);
+    Ok(())
+}
+
+/// `devai recall` — recall memories relevant to a query.
+fn cmd_recall(query: String, limit: usize) -> Result<()> {
+    let cfg = load_project()?;
+    let embedder = build_embedder(&cfg)?;
+    let store = open_store(&cfg, embedder.dimension())?;
+
+    let hits = recall(
+        &store,
+        embedder.as_ref(),
+        &query,
+        Some(&project_name(&cfg)),
+        limit,
+    )?;
+    if hits.is_empty() {
+        println!("No memories.");
+        return Ok(());
+    }
+    for h in &hits {
+        let m = &h.memory;
+        let title = if m.title.is_empty() {
+            "(untitled)"
+        } else {
+            &m.title
+        };
+        println!("{:.3}  [{}] {}", h.score, m.memory_type, title);
+        println!("        {}", snippet(&m.content, 100));
+    }
+    Ok(())
+}
+
+/// `devai memory-stats` — show memory counts for the project.
+fn cmd_memory_stats() -> Result<()> {
+    let cfg = load_project()?;
+    let store = open_store(&cfg, configured_dimension(&cfg))?;
+    let stats = memory_stats(&store, &project_name(&cfg))?;
+    println!("{} memories in {}", stats.total, cfg.project.name);
+    for (ty, n) in &stats.by_type {
+        println!("  {ty}: {n}");
+    }
+    Ok(())
 }
 
 /// `devai init` — write a `.devai/config.yaml` for the target repo.
@@ -286,6 +397,51 @@ fn build_embedder(cfg: &ProjectConfig) -> Result<Box<dyn EmbeddingProvider>> {
 fn open_store(cfg: &ProjectConfig, dim: usize) -> Result<Store> {
     let path = cfg.db_path();
     Ok(Store::open(&path, dim)?)
+}
+
+/// Project name for memory scoping (config name, else db-derived fallback).
+fn project_name(cfg: &ProjectConfig) -> String {
+    if !cfg.project.name.is_empty() {
+        cfg.project.name.clone()
+    } else {
+        "default".to_string()
+    }
+}
+
+/// Current epoch seconds as a string (memory timestamp).
+fn now_epoch() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
+/// The store's vector dimension for the configured model, without loading it.
+fn configured_dimension(cfg: &ProjectConfig) -> usize {
+    use devai_embed::registry;
+    let model = &cfg.embeddings.model;
+    match cfg.embeddings.provider.as_str() {
+        "openai" => registry::openai_dimension(model).unwrap_or(1536),
+        "voyage" => registry::voyage_dimension(model).unwrap_or(1024),
+        "custom" => std::env::var("DEVAI_EMBED_DIMENSION")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(384),
+        _ => registry::find_local(model)
+            .map(|m| m.dimension)
+            .unwrap_or(384),
+    }
+}
+
+/// A one-line snippet of `text`, truncated to `max` chars.
+fn snippet(text: &str, max: usize) -> String {
+    let line = text.split('\n').next().unwrap_or("").trim();
+    if line.chars().count() > max {
+        let s: String = line.chars().take(max).collect();
+        format!("{s}…")
+    } else {
+        line.to_string()
+    }
 }
 
 fn short_commit(commit: &str) -> &str {

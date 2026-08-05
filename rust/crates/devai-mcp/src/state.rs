@@ -11,6 +11,7 @@ use devai_core::config::ProjectConfig;
 use devai_core::{SearchFilter, SearchResult};
 use devai_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devai_index::{run as index_run, GitRepo, IndexRequest};
+use devai_memory::{memory_stats, recall, remember, RememberRequest};
 use devai_rerank::{create_reranker, NoopReranker, RerankSettings, Reranker};
 use devai_store::Store;
 use serde_json::{json, Value};
@@ -64,6 +65,15 @@ impl AppState {
 
     fn open_store(&self) -> Result<Store, String> {
         Store::open(&self.db_path, self.dim).map_err(|e| e.to_string())
+    }
+
+    /// Project name for memory scoping.
+    fn project(&self) -> String {
+        if self.cfg.project.name.is_empty() {
+            "default".to_string()
+        } else {
+            self.cfg.project.name.clone()
+        }
     }
 }
 
@@ -177,6 +187,82 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
         }),
     };
     Ok(value.to_string())
+}
+
+/// `remember` tool: save a memory (deduplicated).
+pub fn do_remember(
+    state: &AppState,
+    content: String,
+    title: String,
+    memory_type: String,
+    topic: String,
+    tags: String,
+) -> Result<String, String> {
+    let store = state.open_store()?;
+    let req = RememberRequest {
+        title,
+        content,
+        memory_type,
+        project: state.project(),
+        topic_key: topic,
+        tags,
+        now: now_epoch(),
+        ..Default::default()
+    };
+    let res = remember(&store, state.embedder.as_ref(), &req).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "status": format!("{:?}", res.status).to_lowercase(),
+        "id": res.memory.id,
+        "title": res.memory.title,
+    })
+    .to_string())
+}
+
+/// `recall` tool: recall memories relevant to a query.
+pub fn do_recall(state: &AppState, query: &str, limit: usize) -> Result<String, String> {
+    let store = state.open_store()?;
+    let project = state.project();
+    let hits = recall(
+        &store,
+        state.embedder.as_ref(),
+        query,
+        Some(&project),
+        limit,
+    )
+    .map_err(|e| e.to_string())?;
+    let arr: Vec<Value> = hits
+        .iter()
+        .map(|h| {
+            json!({
+                "score": h.score,
+                "id": h.memory.id,
+                "title": h.memory.title,
+                "type": h.memory.memory_type,
+                "tags": h.memory.tags,
+                "content": h.memory.content,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
+}
+
+/// `memory_stats` tool: memory counts for the project.
+pub fn do_memory_stats(state: &AppState) -> Result<String, String> {
+    let store = state.open_store()?;
+    let stats = memory_stats(&store, &state.project()).map_err(|e| e.to_string())?;
+    let by_type: Vec<Value> = stats
+        .by_type
+        .iter()
+        .map(|(ty, n)| json!({ "type": ty, "count": n }))
+        .collect();
+    Ok(json!({ "total": stats.total, "by_type": by_type }).to_string())
+}
+
+fn now_epoch() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
 }
 
 fn hits_to_json(hits: &[SearchResult]) -> Value {

@@ -14,7 +14,10 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 
-use state::{do_index, do_index_status, do_read_file, do_search, AppState};
+use state::{
+    do_index, do_index_status, do_memory_stats, do_read_file, do_recall, do_remember, do_search,
+    AppState,
+};
 
 /// Parameters for the `search` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -51,6 +54,37 @@ struct IndexReq {
     /// Force a full reindex instead of incremental (default false).
     #[serde(default)]
     full: Option<bool>,
+}
+
+/// Parameters for the `remember` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct RememberReq {
+    /// The memory content to save.
+    content: String,
+    /// Short title (optional).
+    #[serde(default)]
+    title: Option<String>,
+    /// Memory type: decision/note/bug/insight/architecture/… (default "note").
+    #[serde(default)]
+    memory_type: Option<String>,
+    /// Topic key for upsert-by-topic (optional).
+    #[serde(default)]
+    topic: Option<String>,
+    /// Comma-separated tags (optional).
+    #[serde(default)]
+    tags: Option<String>,
+}
+
+/// Parameters for the `recall` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct RecallReq {
+    /// The query to recall memories for.
+    query: String,
+    /// Maximum results (default 5).
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// The DevAI MCP server.
@@ -106,6 +140,47 @@ impl DevaiServer {
     async fn index_status(&self) -> Result<String, ErrorData> {
         let state = self.state.clone();
         run_blocking(move || do_index_status(&state)).await
+    }
+
+    /// Save a memory (decision, insight, note) for later recall.
+    #[tool(
+        description = "Save a memory (decision/insight/note/bug/…) so it can be \
+        recalled across sessions. Deduplicated by topic key or content."
+    )]
+    async fn remember(
+        &self,
+        Parameters(req): Parameters<RememberReq>,
+    ) -> Result<String, ErrorData> {
+        let state = self.state.clone();
+        run_blocking(move || {
+            do_remember(
+                &state,
+                req.content,
+                req.title.unwrap_or_default(),
+                req.memory_type.unwrap_or_else(|| "note".to_string()),
+                req.topic.unwrap_or_default(),
+                req.tags.unwrap_or_default(),
+            )
+        })
+        .await
+    }
+
+    /// Recall memories relevant to a query.
+    #[tool(description = "Recall previously saved memories relevant to a query \
+        (semantic + intro/chunk blend). Returns JSON.")]
+    async fn recall(&self, Parameters(req): Parameters<RecallReq>) -> Result<String, ErrorData> {
+        let state = self.state.clone();
+        run_blocking(move || do_recall(&state, &req.query, req.limit.unwrap_or(5))).await
+    }
+
+    /// Memory counts for the current project.
+    #[tool(
+        description = "Report memory counts for the current project (total and \
+        per type)."
+    )]
+    async fn memory_stats(&self) -> Result<String, ErrorData> {
+        let state = self.state.clone();
+        run_blocking(move || do_memory_stats(&state)).await
     }
 }
 

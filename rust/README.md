@@ -13,6 +13,9 @@ devai init --name myproj
 devai index                       # git diff → parse → chunk → embed → store
 devai search "connect to a database" --limit 5
 devai search "greet a user" --format json
+devai remember "We chose Postgres for JSONB" --type decision --topic db-engine
+devai recall "which database did we pick"
+devai memory-stats
 devai mcp                         # MCP server over stdio (for AI agents/editors)
 ```
 

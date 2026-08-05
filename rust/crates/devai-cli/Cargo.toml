@@ -18,6 +18,7 @@ devai-embed = { path = "../devai-embed" }
 devai-index = { path = "../devai-index" }
 devai-rerank = { path = "../devai-rerank" }
 devai-mcp = { path = "../devai-mcp" }
+devai-memory = { path = "../devai-memory" }
 anyhow.workspace = true
 clap.workspace = true
 serde_yaml.workspace = true
