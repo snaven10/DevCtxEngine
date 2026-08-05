@@ -16,9 +16,10 @@ for the architecture and phased plan.
 | `devai-store` | DuckDB store: vectors (brute-force cosine) + relational schema | F1 |
 | `devai-embed` | embeddings: local (fastembed/ort) + OpenAI/Voyage/custom | F2 |
 | `devai-parse` | tree-sitter symbols/imports (py/js/ts/go/java/rust) + lang registry | F3 |
+| `devai-chunk` | semantic multi-level chunker (file/class/function/block) | F3 |
 
-Planned (later phases): `devai-chunk`, `devai-rerank`,
-`devai-summarize`, `devai-index`, `devai-mcp`, `devai-api`, `devai-tui`.
+Planned (later phases): `devai-rerank`, `devai-summarize`, `devai-index`,
+`devai-mcp`, `devai-api`, `devai-tui`.
 
 The `devai-embed` `local` feature (default) pulls in `fastembed`/`ort`; build
 with `--no-default-features` for an API-only build where the ONNX Runtime binary
