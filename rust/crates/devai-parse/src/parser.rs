@@ -1,19 +1,25 @@
 //! The tree-sitter-backed language parser.
 
+use std::collections::HashMap;
+
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::error::{ParseError, Result};
 use crate::lang::{Lang, CONTAINER_KINDS, FUNCTION_KINDS};
 use crate::types::{GraphEdge, Import, ParsedFile, Symbol};
 
+/// Variable/field name → declared type, for receiver resolution.
+type TypeMap = HashMap<String, String>;
+
 /// A reusable parser for a single language. Owns the tree-sitter parser and the
-/// compiled symbol/import/calls queries.
+/// compiled symbol/import/calls/type queries.
 pub struct LanguageParser {
     lang: Lang,
     parser: Parser,
     symbol_query: Query,
     import_query: Query,
     calls_query: Query,
+    type_query: Option<Query>,
 }
 
 impl LanguageParser {
@@ -39,12 +45,22 @@ impl LanguageParser {
                 lang: lang.name(),
                 source,
             })?;
+        let type_query = match lang.type_bindings_query() {
+            Some(src) => Some(
+                Query::new(&grammar, src).map_err(|source| ParseError::Query {
+                    lang: lang.name(),
+                    source,
+                })?,
+            ),
+            None => None,
+        };
         Ok(Self {
             lang,
             parser,
             symbol_query,
             import_query,
             calls_query,
+            type_query,
         })
     }
 
@@ -59,7 +75,8 @@ impl LanguageParser {
 
         let symbols = self.extract_symbols(root, bytes);
         let imports = self.extract_imports(root, bytes);
-        let edges = self.extract_edges(root, bytes);
+        let type_map = self.extract_type_bindings(root, bytes);
+        let edges = self.extract_edges(root, bytes, &type_map);
         Ok(ParsedFile {
             language: self.lang.name().to_string(),
             symbols,
@@ -68,7 +85,33 @@ impl LanguageParser {
         })
     }
 
-    fn extract_edges(&self, root: Node<'_>, bytes: &[u8]) -> Vec<GraphEdge> {
+    /// Build the file-level variable/field → type map.
+    fn extract_type_bindings(&self, root: Node<'_>, bytes: &[u8]) -> TypeMap {
+        let mut map = TypeMap::new();
+        let Some(query) = &self.type_query else {
+            return map;
+        };
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, root, bytes);
+        while let Some(m) = matches.next() {
+            let mut name = None;
+            let mut ty = None;
+            for cap in m.captures {
+                match names[cap.index as usize] {
+                    "name" => name = cap.node.utf8_text(bytes).ok(),
+                    "type" => ty = cap.node.utf8_text(bytes).ok(),
+                    _ => {}
+                }
+            }
+            if let (Some(n), Some(t)) = (name, ty) {
+                map.entry(n.to_string()).or_insert_with(|| t.to_string());
+            }
+        }
+        map
+    }
+
+    fn extract_edges(&self, root: Node<'_>, bytes: &[u8], type_map: &TypeMap) -> Vec<GraphEdge> {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.calls_query, root, bytes);
         let mut out = Vec::new();
@@ -82,7 +125,7 @@ impl LanguageParser {
                 let Some(source) = qualified_source(callee, bytes) else {
                     continue; // module-level call: no source symbol.
                 };
-                let target = qualified_target(callee, name, bytes);
+                let target = qualified_target(callee, name, bytes, type_map);
                 out.push(GraphEdge {
                     source,
                     target,
@@ -179,8 +222,9 @@ fn qualified_source(node: Node<'_>, bytes: &[u8]) -> Option<String> {
 
 /// The edge target, resolved from the call receiver where possible:
 /// `self`/`this` → `EnclosingClass.callee`; a `Type`-looking receiver →
-/// `Type.callee`; otherwise the bare callee name.
-fn qualified_target(callee: Node<'_>, name: &str, bytes: &[u8]) -> String {
+/// `Type.callee`; a local/field whose type is known → `Type.callee`; otherwise
+/// the bare callee name.
+fn qualified_target(callee: Node<'_>, name: &str, bytes: &[u8], type_map: &TypeMap) -> String {
     let Some(receiver) = receiver_of(callee, bytes) else {
         return name.to_string();
     };
@@ -190,7 +234,18 @@ fn qualified_target(callee: Node<'_>, name: &str, bytes: &[u8]) -> String {
             .map(|class| format!("{class}.{name}"))
             .unwrap_or_else(|| name.to_string()),
         r if r.chars().next().is_some_and(|c| c.is_uppercase()) => format!("{r}.{name}"),
-        _ => name.to_string(),
+        r => {
+            // Local/field receiver: resolve its declared type (also handles a
+            // `self.field` / `this.field` receiver by stripping the prefix).
+            let key = r
+                .strip_prefix("self.")
+                .or_else(|| r.strip_prefix("this."))
+                .unwrap_or(r);
+            match type_map.get(key) {
+                Some(ty) => format!("{ty}.{name}"),
+                None => name.to_string(),
+            }
+        }
     }
 }
 

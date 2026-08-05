@@ -1,9 +1,10 @@
 //! `devai-parse` — source parsing for DevAI.
 //!
-//! F3: tree-sitter symbol + import extraction for a starter language set
-//! (Python, JavaScript, TypeScript/TSX, Go, Java, Rust), plus extension-based
-//! language detection (parseable + raw-text). Call-graph edges, exports and the
-//! framework route extractors land in a follow-up. See `docs/rust-rewrite-plan.md` §4.
+//! tree-sitter symbol + import extraction for Python, JavaScript, TypeScript/TSX,
+//! Go, Java and Rust, plus call-graph edges with FQN receiver resolution
+//! (self/type/field-type maps) and framework HTTP route extraction. Extension-based
+//! language detection covers parseable + raw-text files. See
+//! `docs/rust-rewrite-plan.md` §4.
 
 pub mod error;
 pub mod lang;
@@ -244,6 +245,74 @@ impl Point {
             pf.edges
                 .iter()
                 .any(|e| e.source == "Point.mag" && e.target == "Point.compute"),
+            "edges: {:?}",
+            pf.edges
+        );
+    }
+
+    fn has_edge(pf: &ParsedFile, source: &str, target: &str) -> bool {
+        pf.edges
+            .iter()
+            .any(|e| e.source == source && e.target == target)
+    }
+
+    #[test]
+    fn resolves_java_field_receiver_type() {
+        let src = "\
+public class Svc {
+    private UserRepository repo;
+    public void run() {
+        repo.findById();
+    }
+}
+";
+        let pf = parse_ok(Lang::Java, src);
+        assert!(
+            has_edge(&pf, "Svc.run", "UserRepository.findById"),
+            "edges: {:?}",
+            pf.edges
+        );
+    }
+
+    #[test]
+    fn resolves_rust_param_receiver_type() {
+        let src = "fn handle(repo: Repo) { repo.load(); }\n";
+        let pf = parse_ok(Lang::Rust, src);
+        assert!(
+            has_edge(&pf, "handle", "Repo.load"),
+            "edges: {:?}",
+            pf.edges
+        );
+    }
+
+    #[test]
+    fn resolves_go_param_receiver_type() {
+        let src = "package m\nfunc handle(repo Repo) {\n\trepo.Save()\n}\n";
+        let pf = parse_ok(Lang::Go, src);
+        assert!(
+            has_edge(&pf, "handle", "Repo.Save"),
+            "edges: {:?}",
+            pf.edges
+        );
+    }
+
+    #[test]
+    fn resolves_python_typed_param_receiver() {
+        let src = "def handle(repo: Repo):\n    repo.load()\n";
+        let pf = parse_ok(Lang::Python, src);
+        assert!(
+            has_edge(&pf, "handle", "Repo.load"),
+            "edges: {:?}",
+            pf.edges
+        );
+    }
+
+    #[test]
+    fn resolves_typescript_local_var_receiver() {
+        let src = "function handle() {\n  const repo: Repo = make();\n  repo.load();\n}\n";
+        let pf = parse_ok(Lang::TypeScript, src);
+        assert!(
+            has_edge(&pf, "handle", "Repo.load"),
             "edges: {:?}",
             pf.edges
         );

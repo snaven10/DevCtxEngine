@@ -112,6 +112,44 @@ impl Lang {
         }
     }
 
+    /// tree-sitter query capturing `@name`/`@type` binding pairs (fields, typed
+    /// locals, typed params) to resolve a receiver's type. `None` for untyped
+    /// languages (JavaScript).
+    pub fn type_bindings_query(self) -> Option<&'static str> {
+        Some(match self {
+            Lang::JavaScript => return None,
+            Lang::Python => {
+                "(assignment left: (identifier) @name type: (type (identifier) @type))
+                 (typed_parameter (identifier) @name type: (type (identifier) @type))"
+            }
+            Lang::TypeScript | Lang::Tsx => {
+                "(public_field_definition name: (property_identifier) @name
+                    type: (type_annotation (type_identifier) @type))
+                 (variable_declarator name: (identifier) @name
+                    type: (type_annotation (type_identifier) @type))
+                 (required_parameter pattern: (identifier) @name
+                    type: (type_annotation (type_identifier) @type))"
+            }
+            Lang::Go => {
+                "(var_spec name: (identifier) @name type: (type_identifier) @type)
+                 (parameter_declaration name: (identifier) @name type: (type_identifier) @type)
+                 (field_declaration name: (field_identifier) @name type: (type_identifier) @type)"
+            }
+            Lang::Java => {
+                "(field_declaration type: (type_identifier) @type
+                    declarator: (variable_declarator name: (identifier) @name))
+                 (local_variable_declaration type: (type_identifier) @type
+                    declarator: (variable_declarator name: (identifier) @name))
+                 (formal_parameter type: (type_identifier) @type name: (identifier) @name)"
+            }
+            Lang::Rust => {
+                "(let_declaration pattern: (identifier) @name type: (type_identifier) @type)
+                 (parameter pattern: (identifier) @name type: (type_identifier) @type)
+                 (field_declaration name: (field_identifier) @name type: (type_identifier) @type)"
+            }
+        })
+    }
+
     /// tree-sitter query capturing whole import statements as `@import`.
     pub fn import_query(self) -> &'static str {
         match self {
