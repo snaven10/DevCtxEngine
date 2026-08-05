@@ -5,6 +5,7 @@ members = [
     "crates/devai-cli",
     "crates/devai-store",
     "crates/devai-embed",
+    "crates/devai-parse",
 ]
 
 [workspace.package]
