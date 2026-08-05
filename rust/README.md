@@ -26,9 +26,9 @@ devai search "greet a user" --format json
 | `devai-parse` | tree-sitter symbols/imports (py/js/ts/go/java/rust) + lang registry | F3 |
 | `devai-chunk` | semantic multi-level chunker (file/class/function/block) | F3 |
 | `devai-index` | pipeline: git diff → parse → chunk → embed → store (incremental) | F4 |
+| `devai-rerank` | cross-encoder reranking (fastembed BGE) + no-op fallback | F5 |
 
-Planned (later phases): `devai-rerank`, `devai-summarize`, `devai-mcp`,
-`devai-api`, `devai-tui`.
+Planned (later phases): `devai-summarize`, `devai-mcp`, `devai-api`, `devai-tui`.
 
 The `devai-embed` `local` feature (default) pulls in `fastembed`/`ort`; build
 with `--no-default-features` for an API-only build where the ONNX Runtime binary

@@ -16,6 +16,7 @@ devai-core.workspace = true
 devai-store = { path = "../devai-store" }
 devai-embed = { path = "../devai-embed" }
 devai-index = { path = "../devai-index" }
+devai-rerank = { path = "../devai-rerank" }
 anyhow.workspace = true
 clap.workspace = true
 serde_yaml.workspace = true

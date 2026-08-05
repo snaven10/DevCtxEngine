@@ -8,6 +8,7 @@ members = [
     "crates/devai-parse",
     "crates/devai-chunk",
     "crates/devai-index",
+    "crates/devai-rerank",
 ]
 
 [workspace.package]

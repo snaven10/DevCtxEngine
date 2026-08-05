@@ -12,6 +12,7 @@ use devai_core::config::{find_config_file, Project, ProjectConfig};
 use devai_core::{SearchFilter, SearchResult};
 use devai_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devai_index::{run as index_run, IndexRequest};
+use devai_rerank::{create_reranker, RerankSettings};
 use devai_store::Store;
 use serde::Serialize;
 
@@ -54,6 +55,9 @@ enum Command {
         /// Output format.
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
+        /// Disable cross-encoder reranking (return raw vector-search order).
+        #[arg(long)]
+        no_rerank: bool,
     },
 }
 
@@ -77,7 +81,8 @@ fn main() -> Result<()> {
             limit,
             language,
             format,
-        } => cmd_search(query, limit, language, format),
+            no_rerank,
+        } => cmd_search(query, limit, language, format, no_rerank),
     }
 }
 
@@ -183,16 +188,31 @@ fn cmd_index(full: bool) -> Result<()> {
     Ok(())
 }
 
-/// `devai search` — embed the query and search the store.
+/// Candidates fetched from vector search before reranking down to `limit`.
+const RERANK_FETCH: usize = 15;
+
+/// `devai search` — embed the query, search the store, and (optionally) rerank.
 fn cmd_search(
     query: String,
     limit: usize,
     language: Option<String>,
     format: OutputFormat,
+    no_rerank: bool,
 ) -> Result<()> {
     let cfg = load_project()?;
     let embedder = build_embedder(&cfg)?;
     let store = open_store(&cfg, embedder.dimension())?;
+
+    let rerank = !no_rerank && cfg.reranking.enabled;
+    let reranker = if rerank {
+        eprintln!("Loading reranker ({})…", cfg.reranking.model);
+        Some(create_reranker(&RerankSettings {
+            enabled: true,
+            model: cfg.reranking.model.clone(),
+        })?)
+    } else {
+        None
+    };
 
     let qvec = embedder.embed_query(&query)?;
     let filter = SearchFilter {
@@ -200,7 +220,27 @@ fn cmd_search(
         exclude_deletions: true,
         ..Default::default()
     };
-    let hits = store.search(&qvec, &filter, limit)?;
+    let fetch_k = if rerank {
+        limit.max(RERANK_FETCH)
+    } else {
+        limit
+    };
+    let hits = store.search(&qvec, &filter, fetch_k)?;
+
+    let hits = match reranker {
+        Some(r) => {
+            let texts: Vec<String> = hits.iter().map(|h| h.point.text.clone()).collect();
+            r.rerank(&query, &texts, limit)?
+                .into_iter()
+                .map(|ranked| {
+                    let mut hit = hits[ranked.index].clone();
+                    hit.score = ranked.score;
+                    hit
+                })
+                .collect()
+        }
+        None => hits,
+    };
 
     let out = match format {
         OutputFormat::Table => render_table(&hits),

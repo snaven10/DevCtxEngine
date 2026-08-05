@@ -1,0 +1,17 @@
+[package]
+name = "devai-rerank"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Cross-encoder reranking for DevAI (fastembed) with a no-op fallback."
+
+[features]
+default = ["local"]
+# Gates the fastembed/ort-backed cross-encoder. Disabled => no-op reranker.
+local = ["dep:fastembed"]
+
+[dependencies]
+thiserror.workspace = true
+fastembed = { version = "4", optional = true }

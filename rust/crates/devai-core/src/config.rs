@@ -96,6 +96,34 @@ pub struct Indexing {
     pub exclude: Vec<String>,
 }
 
+/// `reranking:` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reranking {
+    /// Whether to rerank search results with a cross-encoder.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Reranker model key (`bge-base` default, `bge-v2-m3` multilingual).
+    #[serde(default = "default_reranker")]
+    pub model: String,
+}
+
+impl Default for Reranking {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: default_reranker(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_reranker() -> String {
+    "bge-base".to_string()
+}
+
 /// The full project configuration, mirroring `.devai/config.yaml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -117,6 +145,9 @@ pub struct ProjectConfig {
     /// `indexing:` section.
     #[serde(default)]
     pub indexing: Indexing,
+    /// `reranking:` section.
+    #[serde(default)]
+    pub reranking: Reranking,
 }
 
 impl ProjectConfig {
