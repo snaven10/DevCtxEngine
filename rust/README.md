@@ -17,6 +17,7 @@ devai remember "We chose Postgres for JSONB" --type decision --topic db-engine
 devai recall "which database did we pick"
 devai memory-stats
 devai mcp                         # MCP server over stdio (for AI agents/editors)
+devai mcp configure --client cursor --scope project   # register in an AI client
 ```
 
 ## Crates

@@ -4,6 +4,8 @@
 //! embedder pulls in fastembed/ort (the `local` provider) and downloads the
 //! model on first use.
 
+mod mcp_configure;
+
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -15,6 +17,7 @@ use devai_index::{run as index_run, IndexRequest};
 use devai_memory::{memory_stats, recall, remember, RememberRequest};
 use devai_rerank::{create_reranker, RerankSettings};
 use devai_store::Store;
+use mcp_configure::{McpClient, Options, Scope};
 use serde::Serialize;
 
 /// Git-aware AI code intelligence tool.
@@ -60,8 +63,14 @@ enum Command {
         #[arg(long)]
         no_rerank: bool,
     },
-    /// Run the MCP server over stdio (for AI agents / editors).
-    Mcp,
+    /// Run the MCP server over stdio, or `mcp configure` a client.
+    Mcp {
+        /// Project root for the server (defaults to discovery from the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<McpAction>,
+    },
     /// Save a memory (deduplicated by topic key or content).
     Remember {
         /// The memory content.
@@ -117,6 +126,32 @@ enum OutputFormat {
     Json,
 }
 
+/// Actions under `devai mcp`.
+#[derive(Debug, Subcommand)]
+enum McpAction {
+    /// Register DevAI as an MCP server in an AI client.
+    Configure {
+        /// Target client.
+        #[arg(long, value_enum, default_value_t = McpClient::ClaudeCode)]
+        client: McpClient,
+        /// Config scope.
+        #[arg(long, value_enum, default_value_t = Scope::Project)]
+        scope: Scope,
+        /// Server name under `mcpServers`.
+        #[arg(long, default_value = "devai")]
+        name: String,
+        /// Remove the entry instead of adding it.
+        #[arg(long)]
+        remove: bool,
+        /// Print the resulting config without writing it.
+        #[arg(long)]
+        show: bool,
+        /// Extra env entries (`KEY=VALUE`), repeatable.
+        #[arg(long = "env")]
+        envs: Vec<String>,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -130,7 +165,17 @@ fn main() -> Result<()> {
             format,
             no_rerank,
         } => cmd_search(query, limit, language, format, no_rerank),
-        Command::Mcp => cmd_mcp(),
+        Command::Mcp { project, action } => match action {
+            None => cmd_mcp(project),
+            Some(McpAction::Configure {
+                client,
+                scope,
+                name,
+                remove,
+                show,
+                envs,
+            }) => cmd_mcp_configure(client, scope, name, remove, show, envs),
+        },
         Command::Remember {
             content,
             title,
@@ -146,10 +191,38 @@ fn main() -> Result<()> {
 }
 
 /// `devai mcp` — run the MCP server over stdio.
-fn cmd_mcp() -> Result<()> {
-    let cfg = load_project()?;
+fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
+    let cfg = match project {
+        Some(root) => ProjectConfig::load(&root.join(devai_core::CONFIG_FILE_NAME))
+            .with_context(|| format!("loading project at {}", root.display()))?,
+        None => load_project()?,
+    };
     eprintln!("Starting DevAI MCP server (stdio)…");
     devai_mcp::run_stdio(cfg)
+}
+
+/// `devai mcp configure` — register DevAI as an MCP server in an AI client.
+fn cmd_mcp_configure(
+    client: McpClient,
+    scope: Scope,
+    name: String,
+    remove: bool,
+    show: bool,
+    envs: Vec<String>,
+) -> Result<()> {
+    let cfg = load_project()?;
+    let project_root = project_root(&cfg)?;
+    let exe = std::env::current_exe().context("resolving the devai binary path")?;
+    mcp_configure::run(&Options {
+        client,
+        scope,
+        name,
+        project_root,
+        exe,
+        envs,
+        remove,
+        show,
+    })
 }
 
 /// `devai remember` — save a memory.
