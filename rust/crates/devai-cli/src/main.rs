@@ -62,6 +62,9 @@ enum Command {
         /// Disable cross-encoder reranking (return raw vector-search order).
         #[arg(long)]
         no_rerank: bool,
+        /// Keyword (BM25) search instead of semantic vector search.
+        #[arg(long)]
+        keyword: bool,
     },
     /// Run the MCP server over stdio, or `mcp configure` a client.
     Mcp {
@@ -164,7 +167,8 @@ fn main() -> Result<()> {
             language,
             format,
             no_rerank,
-        } => cmd_search(query, limit, language, format, no_rerank),
+            keyword,
+        } => cmd_search(query, limit, language, format, no_rerank, keyword),
         Command::Mcp { project, action } => match action {
             None => cmd_mcp(project),
             Some(McpAction::Configure {
@@ -462,6 +466,13 @@ fn cmd_index(full: bool) -> Result<()> {
             eprintln!("  HNSW requested but the VSS extension is unavailable; using brute-force");
         }
     }
+    if cfg.storage.fts {
+        if store.rebuild_fts()? {
+            println!("  FTS index ready (BM25)");
+        } else {
+            eprintln!("  FTS requested but the FTS extension is unavailable");
+        }
+    }
     Ok(())
 }
 
@@ -475,8 +486,27 @@ fn cmd_search(
     language: Option<String>,
     format: OutputFormat,
     no_rerank: bool,
+    keyword: bool,
 ) -> Result<()> {
     let cfg = load_project()?;
+    let filter = SearchFilter {
+        languages: language.into_iter().collect(),
+        exclude_deletions: true,
+        ..Default::default()
+    };
+
+    // Keyword (BM25) mode: no embedder/reranker needed.
+    if keyword {
+        let store = open_store(&cfg, configured_dimension(&cfg))?;
+        let hits = store.keyword_search(&query, &filter, limit)?;
+        let out = match format {
+            OutputFormat::Table => render_table(&hits),
+            OutputFormat::Json => render_json(&hits)?,
+        };
+        println!("{out}");
+        return Ok(());
+    }
+
     let embedder = build_embedder(&cfg)?;
     let store = open_store(&cfg, embedder.dimension())?;
 
@@ -492,11 +522,6 @@ fn cmd_search(
     };
 
     let qvec = embedder.embed_query(&query)?;
-    let filter = SearchFilter {
-        languages: language.into_iter().collect(),
-        exclude_deletions: true,
-        ..Default::default()
-    };
     let fetch_k = if rerank {
         limit.max(RERANK_FETCH)
     } else {

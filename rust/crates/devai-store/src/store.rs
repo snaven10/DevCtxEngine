@@ -36,7 +36,7 @@ impl Store {
         let conn = Connection::open(path)?;
         schema::init_schema(&conn, dim)?;
         let store = Self { conn, dim };
-        store.load_vss(); // best-effort, so an existing HNSW index is usable
+        store.load_extensions(); // best-effort, so existing HNSW/FTS indexes are usable
         Ok(store)
     }
 
@@ -45,13 +45,20 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         schema::init_schema(&conn, dim)?;
         let store = Self { conn, dim };
-        store.load_vss();
+        store.load_extensions();
         Ok(store)
     }
 
     /// The store's fixed vector dimension.
     pub fn dimension(&self) -> usize {
         self.dim
+    }
+
+    /// Best-effort load of the optional DuckDB extensions (VSS for HNSW, FTS for
+    /// keyword search), so pre-built indexes are usable.
+    fn load_extensions(&self) {
+        self.load_vss();
+        self.load_fts();
     }
 
     /// Best-effort load of the DuckDB VSS extension (for HNSW). Returns whether
@@ -62,6 +69,11 @@ impl Store {
                 "INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;",
             )
             .is_ok()
+    }
+
+    /// Best-effort load of the DuckDB FTS extension (for BM25 keyword search).
+    fn load_fts(&self) -> bool {
+        self.conn.execute_batch("INSTALL fts; LOAD fts;").is_ok()
     }
 
     /// Create the HNSW (cosine) index on the `vectors` table for approximate
@@ -76,6 +88,57 @@ impl Store {
              ON vectors USING HNSW (vector) WITH (metric = 'cosine');",
         )?;
         Ok(true)
+    }
+
+    /// (Re)build the full-text (BM25) index over `vectors.text`. Rebuild-on-demand:
+    /// call after indexing. Requires the FTS extension; returns `Ok(false)` when
+    /// it is unavailable.
+    pub fn rebuild_fts(&self) -> Result<bool> {
+        if !self.load_fts() {
+            return Ok(false);
+        }
+        self.conn
+            .execute_batch("PRAGMA create_fts_index('vectors', 'id', 'text', overwrite = 1);")?;
+        Ok(true)
+    }
+
+    /// BM25 keyword search over chunk text, with the same equality filters as
+    /// [`search`](Self::search). Requires a prior [`rebuild_fts`](Self::rebuild_fts).
+    /// Scores are BM25 relevance (higher is better), not cosine similarity.
+    pub fn keyword_search(
+        &self,
+        query: &str,
+        filter: &SearchFilter,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let (where_clause, fparams) = build_where(filter);
+        let cond = if where_clause.is_empty() {
+            "WHERE score IS NOT NULL".to_string()
+        } else {
+            format!("{where_clause} AND score IS NOT NULL")
+        };
+        let sql = format!(
+            "SELECT {COLS}, score FROM (
+                 SELECT *, fts_main_vectors.match_bm25(id, ?) AS score FROM vectors
+             ) {cond}
+             ORDER BY score DESC
+             LIMIT {limit}",
+        );
+        let mut params: Vec<String> = vec![query.to_string()];
+        params.extend(fparams);
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            let point = row_to_point(row)?;
+            let score: f64 = row.get(19)?;
+            Ok((point, score as f32))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (point, score) = r?;
+            out.push(SearchResult { point, score });
+        }
+        Ok(out)
     }
 
     /// Insert or replace points (delete-by-id then insert), atomically.

@@ -117,6 +117,52 @@ mod tests {
     }
 
     #[test]
+    fn keyword_search_ranks_by_bm25() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mk = |id: &str, text: &str| VectorPoint {
+            id: id.into(),
+            vector: vec![0.0; DIM],
+            text: text.into(),
+            metadata: VectorMetadata {
+                repo: "demo".into(),
+                branch: "main".into(),
+                language: "rust".into(),
+                ..Default::default()
+            },
+        };
+        store
+            .upsert(&[
+                mk("a", "connect to the postgres database"),
+                mk("b", "greet a user by name"),
+                mk("c", "database connection pool setup"),
+            ])
+            .unwrap();
+        if !store.rebuild_fts().unwrap() {
+            return; // FTS extension unavailable.
+        }
+        let hits = store
+            .keyword_search("database connection", &SearchFilter::default(), 5)
+            .unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.point.id.clone()).collect();
+        assert!(ids.contains(&"a".to_string()));
+        assert!(ids.contains(&"c".to_string()));
+        assert!(!ids.contains(&"b".to_string()), "non-matching doc returned");
+
+        // Filter is honored.
+        let filtered = store
+            .keyword_search(
+                "database",
+                &SearchFilter {
+                    languages: vec!["python".into()],
+                    ..Default::default()
+                },
+                5,
+            )
+            .unwrap();
+        assert!(filtered.is_empty(), "language filter not applied");
+    }
+
+    #[test]
     fn search_filters_by_language() {
         let store = seeded();
         let filter = SearchFilter {

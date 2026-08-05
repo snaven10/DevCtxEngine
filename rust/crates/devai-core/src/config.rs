@@ -90,6 +90,10 @@ pub struct Storage {
     /// indexing (requires the DuckDB VSS extension). Off => brute-force cosine.
     #[serde(default)]
     pub hnsw: bool,
+    /// Build a BM25 full-text index over chunk text after indexing, enabling
+    /// `search --keyword` (requires the DuckDB FTS extension).
+    #[serde(default)]
+    pub fts: bool,
 }
 
 /// `indexing:` section.

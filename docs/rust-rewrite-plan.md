@@ -157,6 +157,11 @@ Cada fase deja el binario compilando y con tests; se compara salida contra el De
 - **Ubicación del workspace Rust: `rust/`.** Convive con el árbol Go/Python de referencia durante el port incremental; se promueve a la raíz al alcanzar paridad.
 
 ### Resueltas
+- **FTS (BM25) — implementado, opt-in.** `storage.fts: true` reconstruye un índice
+  full-text con la extensión DuckDB `fts` (`PRAGMA create_fts_index`) tras indexar;
+  `devai search --keyword` usa `match_bm25` sobre `vectors.text` (con los mismos
+  filtros). Rebuild-on-demand (no incremental); best-effort con fallback si la
+  extensión no está. Complementa la búsqueda vectorial (fusión híbrida = follow-up).
 - **HNSW (VSS) — implementado, opt-in.** Brute-force por defecto; `storage.hnsw: true`
   construye el índice `USING HNSW (vector) WITH (metric='cosine')` tras indexar. La
   extensión VSS se carga best-effort (`INSTALL vss; LOAD vss`) con fallback a
@@ -165,7 +170,7 @@ Cada fase deja el binario compilando y con tests; se compara salida contra el De
   `ORDER BY array_cosine_distance(...) LIMIT` (sin filtros).
 
 ### Abiertas (a decidir en su fase)
-1. **FTS**: DuckDB `fts` vs `LIKE`/propio vs `rusqlite` FTS5 (§4.2). Plan: empezar con matching propio.
+1. **Búsqueda híbrida**: fusionar rankings vectorial + BM25 (p.ej. RRF) + rerank.
 2. **Summarización abstractiva** (flan-t5): ¿portar vía `ort` o dejar solo extractiva al inicio?
 3. **TUI/API**: ¿en alcance del fork o posponer?
 ```
