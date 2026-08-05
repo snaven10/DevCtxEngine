@@ -3,10 +3,17 @@
 Rust + DuckDB rewrite of DevAI. See [`../docs/rust-rewrite-plan.md`](../docs/rust-rewrite-plan.md)
 for the architecture and phased plan.
 
-> **Status: F4 done.** Config, DuckDB store, embeddings, tree-sitter parsers,
-> the semantic chunker and the incremental indexing pipeline exist and are
-> tested end-to-end. The legacy Go + Python tree in the repo root remains the
-> reference implementation until parity is reached.
+> **Status: F5 done.** `devai init`, `index` and `search` work end-to-end: the
+> incremental pipeline indexes a repo and semantic search returns ranked results
+> using a real local model. The legacy Go + Python tree in the repo root remains
+> the reference implementation until parity is reached.
+
+```bash
+devai init --name myproj
+devai index                       # git diff → parse → chunk → embed → store
+devai search "connect to a database" --limit 5
+devai search "greet a user" --format json
+```
 
 ## Crates
 
