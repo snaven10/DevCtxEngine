@@ -208,11 +208,14 @@ impl Ctx<'_> {
                 result.symbols += parsed.symbols.len();
                 (parsed.language.clone(), parsed.symbols.len(), chunks.len())
             }
-            // Raw text (markdown/json/yaml/…): one file-spanning chunk (or blocks).
+            // Raw text (markdown/json/yaml/kotlin/…): one file-spanning chunk (or
+            // blocks). Route extraction still runs (e.g. Kotlin Spring), returning
+            // nothing for non-route file types.
             None => {
                 let rl = raw_lang.expect("raw language checked above");
                 let chunks = chunk_raw_text(file, &content, &self.cfg);
                 self.embed_and_store(file, rl, &chunks)?;
+                self.store_routes(file, &content)?;
                 (rl.to_string(), 0, chunks.len())
             }
         };

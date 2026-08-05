@@ -222,6 +222,9 @@ pub fn raw_text_language(ext: &str) -> Option<&'static str> {
         "sql" => "sql",
         "graphql" | "gql" => "graphql",
         "proto" => "protobuf",
+        // Kotlin has no tree-sitter grammar wired yet: index as text, but its
+        // Spring routes are still extracted (see routes::extract_routes).
+        "kt" | "kts" => "kotlin",
         _ => return None,
     })
 }

@@ -127,6 +127,39 @@ mod tests {
     }
 
     #[test]
+    fn indexes_kotlin_routes_via_raw_path() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devai_index_kt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(
+            &dir,
+            "UserController.kt",
+            "@RestController\n@RequestMapping(\"/api\")\nclass UserController {\n    @GetMapping(\"/users\")\n    fun list(): List<User> { return emptyList() }\n}\n",
+        );
+        commit_all(&dir, "kt");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        let r = index(&store, &dir);
+        assert_eq!(r.files_indexed, 1);
+
+        let git_repo = GitRepo::open(&dir).unwrap();
+        let branch = git_repo.state().branch;
+        let routes = store
+            .search_routes(&git_repo.short_name(), &branch, None, None)
+            .unwrap();
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/api/users" && r.handler_symbol == "UserController.list"),
+            "kotlin route not extracted: {routes:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn end_to_end_incremental_indexing() {
         let dir: PathBuf =
             std::env::temp_dir().join(format!("devai_index_e2e_{}", std::process::id()));

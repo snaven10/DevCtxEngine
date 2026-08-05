@@ -331,6 +331,7 @@ public class Svc {
     fn raw_text_languages_map() {
         assert_eq!(raw_text_language("md"), Some("markdown"));
         assert_eq!(raw_text_language("yaml"), Some("yaml"));
+        assert_eq!(raw_text_language("kt"), Some("kotlin"));
         assert_eq!(raw_text_language("py"), None);
     }
 

@@ -501,6 +501,24 @@ public class UserController {
     }
 
     #[test]
+    fn spring_kotlin_routes() {
+        let src = "\
+@RestController
+@RequestMapping(\"/api\")
+class UserController {
+    @GetMapping(\"/users\")
+    fun list(): List<User> { return emptyList() }
+}
+";
+        let r = routes(src, "UserController.kt");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].framework, "spring");
+        assert_eq!(r[0].path, "/api/users");
+        assert_eq!(r[0].http_method, "GET");
+        assert_eq!(r[0].handler_symbol, "UserController.list");
+    }
+
+    #[test]
     fn quarkus_jaxrs_routes() {
         let src = "\
 import jakarta.ws.rs.GET;
