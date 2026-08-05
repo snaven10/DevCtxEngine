@@ -1,0 +1,18 @@
+[package]
+name = "devai-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "DevAI command-line interface (Rust)."
+
+[[bin]]
+name = "devai"
+path = "src/main.rs"
+
+[dependencies]
+devai-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_yaml.workspace = true
