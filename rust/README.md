@@ -3,9 +3,10 @@
 Rust + DuckDB rewrite of DevAI. See [`../docs/rust-rewrite-plan.md`](../docs/rust-rewrite-plan.md)
 for the architecture and phased plan.
 
-> **Status: F2 in progress.** Config, DuckDB store and embeddings exist. The
-> legacy Go + Python tree in the repo root remains the reference implementation
-> until parity is reached.
+> **Status: F4 done.** Config, DuckDB store, embeddings, tree-sitter parsers,
+> the semantic chunker and the incremental indexing pipeline exist and are
+> tested end-to-end. The legacy Go + Python tree in the repo root remains the
+> reference implementation until parity is reached.
 
 ## Crates
 
@@ -17,9 +18,10 @@ for the architecture and phased plan.
 | `devai-embed` | embeddings: local (fastembed/ort) + OpenAI/Voyage/custom | F2 |
 | `devai-parse` | tree-sitter symbols/imports (py/js/ts/go/java/rust) + lang registry | F3 |
 | `devai-chunk` | semantic multi-level chunker (file/class/function/block) | F3 |
+| `devai-index` | pipeline: git diff → parse → chunk → embed → store (incremental) | F4 |
 
-Planned (later phases): `devai-rerank`, `devai-summarize`, `devai-index`,
-`devai-mcp`, `devai-api`, `devai-tui`.
+Planned (later phases): `devai-rerank`, `devai-summarize`, `devai-mcp`,
+`devai-api`, `devai-tui`.
 
 The `devai-embed` `local` feature (default) pulls in `fastembed`/`ort`; build
 with `--no-default-features` for an API-only build where the ONNX Runtime binary

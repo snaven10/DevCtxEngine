@@ -7,6 +7,7 @@ members = [
     "crates/devai-embed",
     "crates/devai-parse",
     "crates/devai-chunk",
+    "crates/devai-index",
 ]
 
 [workspace.package]

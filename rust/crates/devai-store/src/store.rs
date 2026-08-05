@@ -21,7 +21,7 @@ const COLS: &str = r#"id, text, vector, repo, branch, "commit", file, symbol,
 
 /// A DuckDB-backed store. Holds one connection and the fixed vector dimension.
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
     dim: usize,
 }
 

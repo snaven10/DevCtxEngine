@@ -7,10 +7,12 @@
 
 mod error;
 mod schema;
+mod state;
 mod store;
 
 pub use error::{Result, StoreError};
 pub use schema::init_schema;
+pub use state::{FileState, IndexRecord};
 pub use store::Store;
 
 #[cfg(test)]
