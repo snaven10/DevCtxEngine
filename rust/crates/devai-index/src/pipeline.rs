@@ -3,10 +3,10 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use devai_chunk::{chunk_file, content_hash, ChunkConfig};
+use devai_chunk::{chunk_file, chunk_raw_text, content_hash, Chunk, ChunkConfig};
 use devai_core::types::{VectorMetadata, VectorPoint};
 use devai_embed::EmbeddingProvider;
-use devai_parse::{detect_lang, extract_routes, parse};
+use devai_parse::{detect_lang, extract_routes, parse, raw_text_language};
 use devai_store::{FileState, IndexRecord, Store, StoredEdge, StoredRoute};
 
 use crate::error::{IndexError, Result};
@@ -157,10 +157,23 @@ impl Ctx<'_> {
     }
 
     fn index_file(&mut self, file: &str, result: &mut IndexResult) -> Result<()> {
-        let Some(lang) = detect_lang(Path::new(file)) else {
+        let path = Path::new(file);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let lang = detect_lang(path);
+        let raw_lang = if lang.is_none() {
+            raw_text_language(&ext)
+        } else {
+            None
+        };
+        if lang.is_none() && raw_lang.is_none() {
             result.files_skipped += 1;
             return Ok(());
-        };
+        }
+
         let Ok(content) = self.git.read_file(file) else {
             // Unreadable / non-UTF-8 (binary): skip.
             result.files_skipped += 1;
@@ -184,46 +197,83 @@ impl Ctx<'_> {
         self.store
             .delete_by_file(self.repo_short, self.branch, file)?;
 
-        let parsed = parse(lang, &content)?;
-        let chunks = chunk_file(file, &content, &parsed, &self.cfg);
-
-        if !chunks.is_empty() {
-            let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-            let vectors = self.embedder.embed(&texts)?;
-            let mut points = Vec::with_capacity(chunks.len());
-            for (ordinal, (chunk, vector)) in chunks.iter().zip(vectors).enumerate() {
-                points.push(VectorPoint {
-                    id: chunk_id(
-                        self.repo_short,
-                        self.branch,
-                        file,
-                        chunk.start_line,
-                        ordinal,
-                    ),
-                    vector,
-                    text: chunk.text.clone(),
-                    metadata: VectorMetadata {
-                        repo: self.repo_short.to_string(),
-                        branch: self.branch.to_string(),
-                        commit: self.commit.to_string(),
-                        file: file.to_string(),
-                        symbol: chunk.symbol_name.clone(),
-                        symbol_type: chunk.symbol_type.clone(),
-                        language: parsed.language.clone(),
-                        start_line: chunk.start_line as i32,
-                        end_line: chunk.end_line as i32,
-                        chunk_level: chunk.level.clone(),
-                        content_hash: chunk.content_hash.clone(),
-                        is_deletion: false,
-                        indexed_at: now_stamp(),
-                        ..Default::default()
-                    },
-                });
+        let (language, symbol_count, chunk_count) = match lang {
+            // Parseable code: chunk + embed, plus call-graph edges and routes.
+            Some(lang) => {
+                let parsed = parse(lang, &content)?;
+                let chunks = chunk_file(file, &content, &parsed, &self.cfg);
+                self.embed_and_store(file, &parsed.language, &chunks)?;
+                self.store_edges(file, &parsed)?;
+                self.store_routes(file, &content)?;
+                result.symbols += parsed.symbols.len();
+                (parsed.language.clone(), parsed.symbols.len(), chunks.len())
             }
-            self.store.upsert(&points)?;
-        }
+            // Raw text (markdown/json/yaml/…): one file-spanning chunk (or blocks).
+            None => {
+                let rl = raw_lang.expect("raw language checked above");
+                let chunks = chunk_raw_text(file, &content, &self.cfg);
+                self.embed_and_store(file, rl, &chunks)?;
+                (rl.to_string(), 0, chunks.len())
+            }
+        };
 
-        // Store call-graph edges for this file.
+        self.store.save_file_state(&FileState {
+            repo_path: self.repo_path.to_string(),
+            branch: self.branch.to_string(),
+            file_path: file.to_string(),
+            content_hash: hash,
+            language,
+            symbol_count: symbol_count as i64,
+            chunk_count: chunk_count as i64,
+        })?;
+
+        result.files_indexed += 1;
+        result.chunks += chunk_count;
+        Ok(())
+    }
+
+    /// Embed `chunks` and upsert them as vectors for `file` under `language`.
+    fn embed_and_store(&self, file: &str, language: &str, chunks: &[Chunk]) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+        let vectors = self.embedder.embed(&texts)?;
+        let mut points = Vec::with_capacity(chunks.len());
+        for (ordinal, (chunk, vector)) in chunks.iter().zip(vectors).enumerate() {
+            points.push(VectorPoint {
+                id: chunk_id(
+                    self.repo_short,
+                    self.branch,
+                    file,
+                    chunk.start_line,
+                    ordinal,
+                ),
+                vector,
+                text: chunk.text.clone(),
+                metadata: VectorMetadata {
+                    repo: self.repo_short.to_string(),
+                    branch: self.branch.to_string(),
+                    commit: self.commit.to_string(),
+                    file: file.to_string(),
+                    symbol: chunk.symbol_name.clone(),
+                    symbol_type: chunk.symbol_type.clone(),
+                    language: language.to_string(),
+                    start_line: chunk.start_line as i32,
+                    end_line: chunk.end_line as i32,
+                    chunk_level: chunk.level.clone(),
+                    content_hash: chunk.content_hash.clone(),
+                    is_deletion: false,
+                    indexed_at: now_stamp(),
+                    ..Default::default()
+                },
+            });
+        }
+        self.store.upsert(&points)?;
+        Ok(())
+    }
+
+    fn store_edges(&self, file: &str, parsed: &devai_parse::ParsedFile) -> Result<()> {
         let edges: Vec<StoredEdge> = parsed
             .edges
             .iter()
@@ -236,10 +286,12 @@ impl Ctx<'_> {
             })
             .collect();
         self.store
-            .replace_file_edges(self.repo_short, self.branch, file, &edges)?;
+            .replace_file_edges(self.repo_short, self.branch, file, &edges)
+            .map_err(Into::into)
+    }
 
-        // Extract and store HTTP routes (framework-detected from content).
-        let routes: Vec<StoredRoute> = extract_routes(&content, Path::new(file))
+    fn store_routes(&self, file: &str, content: &str) -> Result<()> {
+        let routes: Vec<StoredRoute> = extract_routes(content, Path::new(file))
             .into_iter()
             .map(|r| StoredRoute {
                 framework: r.framework,
@@ -252,28 +304,9 @@ impl Ctx<'_> {
                 line: r.line as i32,
             })
             .collect();
-        self.store.replace_file_routes(
-            self.repo_short,
-            self.branch,
-            file,
-            &routes,
-            &now_stamp(),
-        )?;
-
-        self.store.save_file_state(&FileState {
-            repo_path: self.repo_path.to_string(),
-            branch: self.branch.to_string(),
-            file_path: file.to_string(),
-            content_hash: hash,
-            language: parsed.language.clone(),
-            symbol_count: parsed.symbols.len() as i64,
-            chunk_count: chunks.len() as i64,
-        })?;
-
-        result.files_indexed += 1;
-        result.symbols += parsed.symbols.len();
-        result.chunks += chunks.len();
-        Ok(())
+        self.store
+            .replace_file_routes(self.repo_short, self.branch, file, &routes, &now_stamp())
+            .map_err(Into::into)
     }
 }
 

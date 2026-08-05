@@ -1,9 +1,10 @@
 //! `devai-index` — the indexing pipeline for DevAI.
 //!
 //! Orchestrates git diff → parse → chunk → embed → store with deterministic
-//! chunk ids and incremental `index_state`/`file_state`. See
-//! `docs/rust-rewrite-plan.md` §8 (F4). Raw-text (non-parseable) files and stale
-//! full-reindex cleanup are follow-ups.
+//! chunk ids and incremental `index_state`/`file_state`. Parseable code also
+//! yields call-graph edges + routes; raw-text files (markdown/json/yaml/…) are
+//! indexed as file-spanning chunks. See `docs/rust-rewrite-plan.md` §8 (F4).
+//! Stale full-reindex cleanup is a follow-up.
 
 pub mod error;
 pub mod git;
@@ -91,6 +92,38 @@ mod tests {
             model_name: "minilm-l6",
         })
         .unwrap()
+    }
+
+    #[test]
+    fn indexes_raw_text_files() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devai_index_raw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(
+            &dir,
+            "docs/notes.md",
+            "# Notes\n\nWe use Postgres for storage.\n",
+        );
+        commit_all(&dir, "docs");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        let r = index(&store, &dir);
+        assert_eq!(r.files_indexed, 1);
+        assert!(r.chunks >= 1);
+
+        let hits = store
+            .search(&[0.1; DIM], &SearchFilter::default(), 10)
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.point.metadata.file == "docs/notes.md"
+                && h.point.metadata.language == "markdown"
+                && h.point.metadata.chunk_level == "file"),
+            "no markdown chunk indexed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

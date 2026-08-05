@@ -65,6 +65,55 @@ pub fn chunk_file(path: &str, source: &str, parsed: &ParsedFile, cfg: &ChunkConf
     chunks
 }
 
+/// Chunk a raw-text (non-parseable) file: one `file` chunk when small, else
+/// line-interval `block` chunks. No symbols/headers.
+pub fn chunk_raw_text(path: &str, content: &str, cfg: &ChunkConfig) -> Vec<Chunk> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+    let base = basename(path);
+    let total_lines = content.lines().count().max(1) as u32;
+
+    if estimate_tokens(content) <= cfg.max_chunk_tokens {
+        return vec![Chunk::new(
+            content.to_string(),
+            "file",
+            base,
+            "file",
+            1,
+            total_lines,
+            String::new(),
+        )];
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let parts = (estimate_tokens(content) / cfg.max_chunk_tokens).max(2);
+    let target = (lines.len() / parts).max(1);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let mut end = (i + target).min(lines.len());
+        if end < lines.len() {
+            end = snap_to_blank(&lines, end, 3);
+        }
+        if end <= i {
+            end = (i + target).min(lines.len()).max(i + 1);
+        }
+        let text = lines[i..end].join("\n");
+        out.push(Chunk::new(
+            text,
+            "block",
+            base,
+            "file",
+            i as u32 + 1,
+            end as u32,
+            String::new(),
+        ));
+        i = end;
+    }
+    out
+}
+
 struct PendingSmall {
     text: String,
     start: u32,

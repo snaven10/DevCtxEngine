@@ -9,7 +9,7 @@ mod chunker;
 mod memory;
 
 pub use chunk::{content_hash, estimate_tokens, Chunk, ChunkConfig};
-pub use chunker::chunk_file;
+pub use chunker::{chunk_file, chunk_raw_text};
 pub use memory::{memory_chunks, MemoryChunk, MemoryChunkConfig};
 
 #[cfg(test)]
@@ -92,6 +92,36 @@ fn c() {}
         assert_eq!(grouped[0].level, "function");
         // No individual function chunks for the tiny fns.
         assert!(chunks.iter().all(|c| c.symbol_name != "a"));
+    }
+
+    #[test]
+    fn raw_text_small_is_one_file_chunk() {
+        let chunks = chunk_raw_text(
+            "docs/readme.md",
+            "# Title\n\nSome notes here.\n",
+            &ChunkConfig::default(),
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].level, "file");
+        assert_eq!(chunks[0].symbol_name, "readme.md");
+        assert!(chunks[0].text.contains("Some notes"));
+    }
+
+    #[test]
+    fn raw_text_large_splits_into_blocks() {
+        let content: String = (0..600).map(|i| format!("line number {i}\n")).collect();
+        let chunks = chunk_raw_text("data.txt", &content, &ChunkConfig::default());
+        assert!(chunks.len() >= 2, "got {}", chunks.len());
+        assert!(chunks.iter().all(|c| c.level == "block"));
+        // Increasing, non-overlapping ranges.
+        for w in chunks.windows(2) {
+            assert!(w[1].start_line > w[0].start_line);
+        }
+    }
+
+    #[test]
+    fn raw_text_empty_yields_nothing() {
+        assert!(chunk_raw_text("x.md", "   \n\n", &ChunkConfig::default()).is_empty());
     }
 
     #[test]
