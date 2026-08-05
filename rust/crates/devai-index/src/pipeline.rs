@@ -7,7 +7,7 @@ use devai_chunk::{chunk_file, content_hash, ChunkConfig};
 use devai_core::types::{VectorMetadata, VectorPoint};
 use devai_embed::EmbeddingProvider;
 use devai_parse::{detect_lang, parse};
-use devai_store::{FileState, IndexRecord, Store};
+use devai_store::{FileState, IndexRecord, Store, StoredEdge};
 
 use crate::error::{IndexError, Result};
 use crate::git::{Change, GitRepo};
@@ -148,6 +148,8 @@ impl Ctx<'_> {
         self.store
             .delete_by_file(self.repo_short, self.branch, file)?;
         self.store
+            .delete_file_edges(self.repo_short, self.branch, file)?;
+        self.store
             .delete_file_state(self.repo_path, self.branch, file)?;
         Ok(())
     }
@@ -218,6 +220,21 @@ impl Ctx<'_> {
             }
             self.store.upsert(&points)?;
         }
+
+        // Store call-graph edges for this file.
+        let edges: Vec<StoredEdge> = parsed
+            .edges
+            .iter()
+            .map(|e| StoredEdge {
+                source: e.source.clone(),
+                target: e.target.clone(),
+                kind: e.kind.clone(),
+                source_file: file.to_string(),
+                line: e.line as i32,
+            })
+            .collect();
+        self.store
+            .replace_file_edges(self.repo_short, self.branch, file, &edges)?;
 
         self.store.save_file_state(&FileState {
             repo_path: self.repo_path.to_string(),

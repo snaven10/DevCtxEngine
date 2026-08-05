@@ -88,6 +88,30 @@ impl Lang {
         }
     }
 
+    /// tree-sitter query capturing call callees as `@callee`.
+    pub fn calls_query(self) -> &'static str {
+        match self {
+            Lang::Python => {
+                "(call function: (identifier) @callee)
+                 (call function: (attribute attribute: (identifier) @callee))"
+            }
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+                "(call_expression function: (identifier) @callee)
+                 (call_expression function: (member_expression property: (property_identifier) @callee))"
+            }
+            Lang::Go => {
+                "(call_expression function: (identifier) @callee)
+                 (call_expression function: (selector_expression field: (field_identifier) @callee))"
+            }
+            Lang::Java => "(method_invocation name: (identifier) @callee)",
+            Lang::Rust => {
+                "(call_expression function: (identifier) @callee)
+                 (call_expression function: (field_expression field: (field_identifier) @callee))
+                 (call_expression function: (scoped_identifier name: (identifier) @callee))"
+            }
+        }
+    }
+
     /// tree-sitter query capturing whole import statements as `@import`.
     pub fn import_query(self) -> &'static str {
         match self {
@@ -109,6 +133,15 @@ pub const ALL: &[Lang] = &[
     Lang::Go,
     Lang::Java,
     Lang::Rust,
+];
+
+/// Node kinds that define a callable (for resolving an edge's source symbol).
+pub const FUNCTION_KINDS: &[&str] = &[
+    "function_definition",
+    "function_declaration",
+    "method_declaration",
+    "method_definition",
+    "function_item",
 ];
 
 /// Node kinds that act as symbol containers (for parent + method detection).

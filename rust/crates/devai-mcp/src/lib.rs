@@ -15,8 +15,8 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 
 use state::{
-    do_index, do_index_status, do_memory_stats, do_read_file, do_recall, do_remember, do_search,
-    AppState,
+    do_impact, do_index, do_index_status, do_memory_stats, do_read_file, do_recall, do_references,
+    do_remember, do_search, AppState,
 };
 
 /// Parameters for the `search` tool.
@@ -85,6 +85,25 @@ struct RecallReq {
     /// Maximum results (default 5).
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// Parameters for the `impact_analysis` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ImpactReq {
+    /// The symbol to analyze.
+    symbol: String,
+    /// Traversal depth (default 3).
+    #[serde(default)]
+    depth: Option<usize>,
+}
+
+/// Parameters for the `get_references` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ReferencesReq {
+    /// The symbol whose call sites to list.
+    symbol: String,
 }
 
 /// The DevAI MCP server.
@@ -181,6 +200,32 @@ impl DevaiServer {
     async fn memory_stats(&self) -> Result<String, ErrorData> {
         let state = self.state.clone();
         run_blocking(move || do_memory_stats(&state)).await
+    }
+
+    /// Blast radius of a symbol (transitive callers + callees).
+    #[tool(
+        description = "Impact analysis: transitive callers (blast radius) and \
+        callees of a symbol from the call graph. Returns JSON."
+    )]
+    async fn impact_analysis(
+        &self,
+        Parameters(req): Parameters<ImpactReq>,
+    ) -> Result<String, ErrorData> {
+        let state = self.state.clone();
+        run_blocking(move || do_impact(&state, &req.symbol, req.depth.unwrap_or(3))).await
+    }
+
+    /// All call sites (references) of a symbol.
+    #[tool(
+        description = "Find all call sites (references) of a symbol across the \
+        indexed code. Returns JSON."
+    )]
+    async fn get_references(
+        &self,
+        Parameters(req): Parameters<ReferencesReq>,
+    ) -> Result<String, ErrorData> {
+        let state = self.state.clone();
+        run_blocking(move || do_references(&state, &req.symbol)).await
     }
 }
 

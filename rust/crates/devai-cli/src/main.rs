@@ -89,6 +89,14 @@ enum Command {
     },
     /// Show memory counts for the project.
     MemoryStats,
+    /// Show the blast radius (transitive callers/callees) of a symbol.
+    Impact {
+        /// The symbol to analyze.
+        symbol: String,
+        /// Traversal depth.
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
 }
 
 /// Search output format.
@@ -123,6 +131,7 @@ fn main() -> Result<()> {
         } => cmd_remember(content, title, memory_type, topic, tags),
         Command::Recall { query, limit } => cmd_recall(query, limit),
         Command::MemoryStats => cmd_memory_stats(),
+        Command::Impact { symbol, depth } => cmd_impact(symbol, depth),
     }
 }
 
@@ -193,6 +202,33 @@ fn cmd_recall(query: String, limit: usize) -> Result<()> {
         println!("        {}", snippet(&m.content, 100));
     }
     Ok(())
+}
+
+/// `devai impact` — show the blast radius of a symbol.
+fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
+    let cfg = load_project()?;
+    let store = open_store(&cfg, configured_dimension(&cfg))?;
+    let git = devai_index::GitRepo::open(&project_root(&cfg)?)?;
+    let branch = git.state().branch;
+    let impact = store.impact_analysis(&git.short_name(), &branch, &symbol, depth)?;
+
+    println!("Impact of `{symbol}` (depth {depth}):");
+    print_impact("callers (upstream)", &impact.upstream);
+    print_impact("callees (downstream)", &impact.downstream);
+    Ok(())
+}
+
+fn print_impact(label: &str, items: &[(String, usize)]) {
+    println!("  {label}:");
+    if items.is_empty() {
+        println!("    (none)");
+        return;
+    }
+    let mut sorted = items.to_vec();
+    sorted.sort_by_key(|(_, d)| *d);
+    for (sym, d) in &sorted {
+        println!("    {sym} (depth {d})");
+    }
 }
 
 /// `devai memory-stats` — show memory counts for the project.

@@ -31,6 +31,19 @@ pub struct Import {
     pub line: u32,
 }
 
+/// A call-graph edge: `source` calls `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEdge {
+    /// Enclosing symbol making the call.
+    pub source: String,
+    /// Called symbol (bare callee name).
+    pub target: String,
+    /// Edge kind (`calls`).
+    pub kind: String,
+    /// 1-based line of the call.
+    pub line: u32,
+}
+
 /// The result of parsing one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedFile {
@@ -40,4 +53,6 @@ pub struct ParsedFile {
     pub symbols: Vec<Symbol>,
     /// Extracted imports, in source order.
     pub imports: Vec<Import>,
+    /// Extracted call-graph edges, in source order.
+    pub edges: Vec<GraphEdge>,
 }

@@ -3,16 +3,17 @@
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::error::{ParseError, Result};
-use crate::lang::{Lang, CONTAINER_KINDS};
-use crate::types::{Import, ParsedFile, Symbol};
+use crate::lang::{Lang, CONTAINER_KINDS, FUNCTION_KINDS};
+use crate::types::{GraphEdge, Import, ParsedFile, Symbol};
 
 /// A reusable parser for a single language. Owns the tree-sitter parser and the
-/// compiled symbol/import queries.
+/// compiled symbol/import/calls queries.
 pub struct LanguageParser {
     lang: Lang,
     parser: Parser,
     symbol_query: Query,
     import_query: Query,
+    calls_query: Query,
 }
 
 impl LanguageParser {
@@ -33,11 +34,17 @@ impl LanguageParser {
                 lang: lang.name(),
                 source,
             })?;
+        let calls_query =
+            Query::new(&grammar, lang.calls_query()).map_err(|source| ParseError::Query {
+                lang: lang.name(),
+                source,
+            })?;
         Ok(Self {
             lang,
             parser,
             symbol_query,
             import_query,
+            calls_query,
         })
     }
 
@@ -52,11 +59,39 @@ impl LanguageParser {
 
         let symbols = self.extract_symbols(root, bytes);
         let imports = self.extract_imports(root, bytes);
+        let edges = self.extract_edges(root, bytes);
         Ok(ParsedFile {
             language: self.lang.name().to_string(),
             symbols,
             imports,
+            edges,
         })
+    }
+
+    fn extract_edges(&self, root: Node<'_>, bytes: &[u8]) -> Vec<GraphEdge> {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.calls_query, root, bytes);
+        let mut out = Vec::new();
+        while let Some(m) = matches.next() {
+            for cap in m.captures {
+                let callee = cap.node;
+                let Ok(target) = callee.utf8_text(bytes) else {
+                    continue;
+                };
+                // Resolve the enclosing function/method as the edge source.
+                let Some(source) = enclosing_function_name(callee, bytes) else {
+                    continue; // module-level call: no source symbol.
+                };
+                out.push(GraphEdge {
+                    source,
+                    target: target.to_string(),
+                    kind: "calls".to_string(),
+                    line: callee.start_position().row as u32 + 1,
+                });
+            }
+        }
+        out.sort_by_key(|e| e.line);
+        out
     }
 
     fn extract_symbols(&self, root: Node<'_>, bytes: &[u8]) -> Vec<Symbol> {
@@ -113,6 +148,21 @@ impl LanguageParser {
         out.sort_by_key(|i| i.line);
         out
     }
+}
+
+/// Name of the nearest enclosing function/method definition, if any.
+fn enclosing_function_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if FUNCTION_KINDS.contains(&n.kind()) {
+            return n
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(bytes).ok())
+                .map(str::to_string);
+        }
+        cur = n.parent();
+    }
+    None
 }
 
 /// Walk up from `node` to the nearest container (class/impl/…) definition.

@@ -75,6 +75,12 @@ impl AppState {
             self.cfg.project.name.clone()
         }
     }
+
+    /// The short repo name + branch (for graph queries), from git.
+    fn repo_branch(&self) -> Result<(String, String), String> {
+        let git = GitRepo::open(&self.root).map_err(|e| e.to_string())?;
+        Ok((git.short_name(), git.state().branch))
+    }
 }
 
 /// `search` tool: embed the query, vector-search, rerank, return JSON hits.
@@ -256,6 +262,40 @@ pub fn do_memory_stats(state: &AppState) -> Result<String, String> {
         .map(|(ty, n)| json!({ "type": ty, "count": n }))
         .collect();
     Ok(json!({ "total": stats.total, "by_type": by_type }).to_string())
+}
+
+/// `impact_analysis` tool: blast radius (transitive callers/callees) of a symbol.
+pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String, String> {
+    let store = state.open_store()?;
+    let (repo, branch) = state.repo_branch()?;
+    let impact = store
+        .impact_analysis(&repo, &branch, symbol, depth)
+        .map_err(|e| e.to_string())?;
+    let to_json = |v: &[(String, usize)]| -> Vec<Value> {
+        v.iter()
+            .map(|(s, d)| json!({ "symbol": s, "depth": d }))
+            .collect()
+    };
+    Ok(json!({
+        "symbol": symbol,
+        "upstream": to_json(&impact.upstream),
+        "downstream": to_json(&impact.downstream),
+    })
+    .to_string())
+}
+
+/// `get_references` tool: all call sites of a symbol.
+pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
+    let store = state.open_store()?;
+    let (repo, branch) = state.repo_branch()?;
+    let refs = store
+        .find_references(&repo, &branch, symbol)
+        .map_err(|e| e.to_string())?;
+    let arr: Vec<Value> = refs
+        .iter()
+        .map(|r| json!({ "file": r.file, "line": r.line, "source": r.source }))
+        .collect();
+    serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
 }
 
 fn now_epoch() -> String {

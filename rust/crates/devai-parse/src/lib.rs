@@ -177,6 +177,42 @@ class Box { open() {} }
     }
 
     #[test]
+    fn extracts_rust_call_edges() {
+        let src = "\
+fn helper() -> i32 { 1 }
+fn caller() -> i32 { helper() + helper() }
+";
+        let pf = parse_ok(Lang::Rust, src);
+        let calls: Vec<_> = pf
+            .edges
+            .iter()
+            .filter(|e| e.source == "caller" && e.target == "helper")
+            .collect();
+        assert_eq!(calls.len(), 2, "edges: {:?}", pf.edges);
+        assert!(pf.edges.iter().all(|e| e.kind == "calls"));
+    }
+
+    #[test]
+    fn extracts_python_method_call_edges() {
+        let src = "\
+class A:
+    def run(self):
+        self.helper()
+
+    def helper(self):
+        pass
+";
+        let pf = parse_ok(Lang::Python, src);
+        assert!(
+            pf.edges
+                .iter()
+                .any(|e| e.source == "run" && e.target == "helper"),
+            "edges: {:?}",
+            pf.edges
+        );
+    }
+
+    #[test]
     fn detects_language_from_path() {
         assert_eq!(detect_lang(Path::new("a/b/foo.py")), Some(Lang::Python));
         assert_eq!(detect_lang(Path::new("Main.java")), Some(Lang::Java));
