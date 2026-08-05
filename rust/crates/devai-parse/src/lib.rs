@@ -195,7 +195,7 @@ fn caller() -> i32 { helper() + helper() }
     }
 
     #[test]
-    fn extracts_python_method_call_edges() {
+    fn resolves_python_self_call_to_class() {
         let src = "\
 class A:
     def run(self):
@@ -208,7 +208,42 @@ class A:
         assert!(
             pf.edges
                 .iter()
-                .any(|e| e.source == "run" && e.target == "helper"),
+                .any(|e| e.source == "A.run" && e.target == "A.helper"),
+            "edges: {:?}",
+            pf.edges
+        );
+    }
+
+    #[test]
+    fn resolves_type_receiver_call() {
+        let src = "\
+def configure():
+    Logger.getLogger()
+";
+        let pf = parse_ok(Lang::Python, src);
+        assert!(
+            pf.edges
+                .iter()
+                .any(|e| e.source == "configure" && e.target == "Logger.getLogger"),
+            "edges: {:?}",
+            pf.edges
+        );
+    }
+
+    #[test]
+    fn resolves_rust_self_call_to_impl_type() {
+        let src = "\
+struct Point;
+impl Point {
+    fn mag(&self) { self.compute(); }
+    fn compute(&self) {}
+}
+";
+        let pf = parse_ok(Lang::Rust, src);
+        assert!(
+            pf.edges
+                .iter()
+                .any(|e| e.source == "Point.mag" && e.target == "Point.compute"),
             "edges: {:?}",
             pf.edges
         );

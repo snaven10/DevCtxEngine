@@ -75,16 +75,17 @@ impl LanguageParser {
         while let Some(m) = matches.next() {
             for cap in m.captures {
                 let callee = cap.node;
-                let Ok(target) = callee.utf8_text(bytes) else {
+                let Ok(name) = callee.utf8_text(bytes) else {
                     continue;
                 };
-                // Resolve the enclosing function/method as the edge source.
-                let Some(source) = enclosing_function_name(callee, bytes) else {
+                // Source: the enclosing function, qualified with its class if any.
+                let Some(source) = qualified_source(callee, bytes) else {
                     continue; // module-level call: no source symbol.
                 };
+                let target = qualified_target(callee, name, bytes);
                 out.push(GraphEdge {
                     source,
-                    target: target.to_string(),
+                    target,
                     kind: "calls".to_string(),
                     line: callee.start_position().row as u32 + 1,
                 });
@@ -150,19 +151,63 @@ impl LanguageParser {
     }
 }
 
-/// Name of the nearest enclosing function/method definition, if any.
-fn enclosing_function_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+/// The nearest enclosing function/method definition node, if any.
+fn enclosing_function_node(node: Node<'_>) -> Option<Node<'_>> {
     let mut cur = node.parent();
     while let Some(n) = cur {
         if FUNCTION_KINDS.contains(&n.kind()) {
-            return n
-                .child_by_field_name("name")
-                .and_then(|name| name.utf8_text(bytes).ok())
-                .map(str::to_string);
+            return Some(n);
         }
         cur = n.parent();
     }
     None
+}
+
+/// The edge source: the enclosing function, qualified as `Class.method` when the
+/// function is defined inside a container (class/impl/…).
+fn qualified_source(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let func = enclosing_function_node(node)?;
+    let name = func
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok())?
+        .to_string();
+    match enclosing_container(func).and_then(|c| container_name(c, bytes)) {
+        Some(class) => Some(format!("{class}.{name}")),
+        None => Some(name),
+    }
+}
+
+/// The edge target, resolved from the call receiver where possible:
+/// `self`/`this` → `EnclosingClass.callee`; a `Type`-looking receiver →
+/// `Type.callee`; otherwise the bare callee name.
+fn qualified_target(callee: Node<'_>, name: &str, bytes: &[u8]) -> String {
+    let Some(receiver) = receiver_of(callee, bytes) else {
+        return name.to_string();
+    };
+    match receiver.as_str() {
+        "self" | "this" | "cls" | "super" => enclosing_container(callee)
+            .and_then(|c| container_name(c, bytes))
+            .map(|class| format!("{class}.{name}"))
+            .unwrap_or_else(|| name.to_string()),
+        r if r.chars().next().is_some_and(|c| c.is_uppercase()) => format!("{r}.{name}"),
+        _ => name.to_string(),
+    }
+}
+
+/// Text of the call's receiver (the object before the `.`), if this is a
+/// member/method call rather than a plain function call.
+fn receiver_of(callee: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let parent = callee.parent()?;
+    let field = match parent.kind() {
+        "attribute" | "member_expression" | "method_invocation" => "object",
+        "selector_expression" => "operand",
+        "field_expression" => "value",
+        _ => return None,
+    };
+    parent
+        .child_by_field_name(field)
+        .and_then(|n| n.utf8_text(bytes).ok())
+        .map(str::to_string)
 }
 
 /// Walk up from `node` to the nearest container (class/impl/…) definition.
