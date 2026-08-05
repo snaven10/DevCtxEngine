@@ -157,6 +157,11 @@ Cada fase deja el binario compilando y con tests; se compara salida contra el De
 - **Ubicación del workspace Rust: `rust/`.** Convive con el árbol Go/Python de referencia durante el port incremental; se promueve a la raíz al alcanzar paridad.
 
 ### Resueltas
+- **Búsqueda híbrida — implementada.** Crate `devai-search` con 3 modos
+  (vector / keyword / hybrid). Hybrid fusiona los rankings vectorial + BM25 por
+  Reciprocal Rank Fusion (`Σ 1/(k+rank)`, k=60) y luego rerank opcional; degrada a
+  vector-only si no hay índice FTS. CLI `search --hybrid`/`--keyword`; tool MCP
+  `search` con `mode`. Centraliza la lógica antes duplicada en CLI/MCP.
 - **FTS (BM25) — implementado, opt-in.** `storage.fts: true` reconstruye un índice
   full-text con la extensión DuckDB `fts` (`PRAGMA create_fts_index`) tras indexar;
   `devai search --keyword` usa `match_bm25` sobre `vectors.text` (con los mismos
@@ -170,7 +175,6 @@ Cada fase deja el binario compilando y con tests; se compara salida contra el De
   `ORDER BY array_cosine_distance(...) LIMIT` (sin filtros).
 
 ### Abiertas (a decidir en su fase)
-1. **Búsqueda híbrida**: fusionar rankings vectorial + BM25 (p.ej. RRF) + rerank.
-2. **Summarización abstractiva** (flan-t5): ¿portar vía `ort` o dejar solo extractiva al inicio?
-3. **TUI/API**: ¿en alcance del fork o posponer?
+1. **Summarización abstractiva** (flan-t5): ¿portar vía `ort` o dejar solo extractiva al inicio?
+2. **TUI/API**: ¿en alcance del fork o posponer?
 ```

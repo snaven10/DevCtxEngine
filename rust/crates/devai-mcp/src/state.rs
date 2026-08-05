@@ -13,11 +13,9 @@ use devai_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devai_index::{run as index_run, GitRepo, IndexRequest};
 use devai_memory::{memory_stats, recall, remember, RememberRequest};
 use devai_rerank::{create_reranker, NoopReranker, RerankSettings, Reranker};
+use devai_search::SearchMode;
 use devai_store::Store;
 use serde_json::{json, Value};
-
-/// Candidates fetched before reranking down to the requested limit.
-const RERANK_FETCH: usize = 15;
 
 /// Immutable server state shared across tool calls.
 pub struct AppState {
@@ -83,50 +81,42 @@ impl AppState {
     }
 }
 
-/// `search` tool: embed the query, vector-search, rerank, return JSON hits.
+/// `search` tool: vector / keyword / hybrid search, then rerank, return JSON hits.
 pub fn do_search(
     state: &AppState,
     query: &str,
     limit: usize,
     language: Option<String>,
+    mode: SearchMode,
 ) -> Result<String, String> {
     let store = state.open_store()?;
-    let qvec = state
-        .embedder
-        .embed_query(query)
-        .map_err(|e| e.to_string())?;
     let filter = SearchFilter {
         languages: language.into_iter().collect(),
         exclude_deletions: true,
         ..Default::default()
     };
-    let fetch_k = if state.rerank_enabled {
-        limit.max(RERANK_FETCH)
+    let embedder = if mode == SearchMode::Keyword {
+        None
     } else {
-        limit
+        Some(state.embedder.as_ref())
     };
-    let hits = store
-        .search(&qvec, &filter, fetch_k)
+    let reranker = if state.rerank_enabled && mode != SearchMode::Keyword {
+        Some(state.reranker.as_ref())
+    } else {
+        None
+    };
+    let hits = devai_search::search(&store, query, &filter, limit, mode, embedder, reranker)
         .map_err(|e| e.to_string())?;
-
-    let hits = if state.rerank_enabled {
-        let texts: Vec<String> = hits.iter().map(|h| h.point.text.clone()).collect();
-        state
-            .reranker
-            .rerank(query, &texts, limit)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|r| {
-                let mut hit = hits[r.index].clone();
-                hit.score = r.score;
-                hit
-            })
-            .collect()
-    } else {
-        hits
-    };
-
     serde_json::to_string_pretty(&hits_to_json(&hits)).map_err(|e| e.to_string())
+}
+
+/// Parse an optional mode string into a [`SearchMode`] (default vector).
+pub fn parse_mode(mode: Option<&str>) -> SearchMode {
+    match mode.map(str::to_ascii_lowercase).as_deref() {
+        Some("keyword") => SearchMode::Keyword,
+        Some("hybrid") => SearchMode::Hybrid,
+        _ => SearchMode::Vector,
+    }
 }
 
 /// `read_file` tool: read a repo file, optionally a 1-based inclusive line range.

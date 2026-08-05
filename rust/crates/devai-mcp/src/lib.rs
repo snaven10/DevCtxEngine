@@ -16,7 +16,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt
 
 use state::{
     do_impact, do_index, do_index_status, do_memory_stats, do_read_file, do_recall, do_references,
-    do_remember, do_routes_for_handler, do_search, do_search_routes, AppState,
+    do_remember, do_routes_for_handler, do_search, do_search_routes, parse_mode, AppState,
 };
 
 /// Parameters for the `search` tool.
@@ -31,6 +31,9 @@ struct SearchReq {
     /// Restrict to a language, e.g. "rust" or "python".
     #[serde(default)]
     language: Option<String>,
+    /// Retrieval mode: "vector" (default), "keyword" (BM25), or "hybrid".
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// Parameters for the `read_file` tool.
@@ -145,13 +148,25 @@ impl DevaiServer {
 
 #[tool_router]
 impl DevaiServer {
-    /// Semantic code search over the indexed repository (returns ranked JSON hits).
-    #[tool(description = "Semantic code search over the indexed repository. \
-        Returns ranked chunks (file, lines, symbol, text) as JSON.")]
+    /// Code search over the indexed repository (vector/keyword/hybrid).
+    #[tool(
+        description = "Search the indexed repository — mode \"vector\" (semantic, \
+        default), \"keyword\" (BM25), or \"hybrid\" (RRF fusion). Returns ranked \
+        chunks (file, lines, symbol, text) as JSON."
+    )]
     async fn search(&self, Parameters(req): Parameters<SearchReq>) -> Result<String, ErrorData> {
         let state = self.state.clone();
-        run_blocking(move || do_search(&state, &req.query, req.limit.unwrap_or(10), req.language))
-            .await
+        run_blocking(move || {
+            let mode = parse_mode(req.mode.as_deref());
+            do_search(
+                &state,
+                &req.query,
+                req.limit.unwrap_or(10),
+                req.language,
+                mode,
+            )
+        })
+        .await
     }
 
     /// Read a file (optionally a line range) from the repository.

@@ -32,6 +32,7 @@ devai mcp configure --client cursor --scope project   # register in an AI client
 | `devai-chunk` | semantic multi-level chunker (file/class/function/block) | F3 |
 | `devai-index` | pipeline: git diff → parse → chunk → embed → store (incremental) | F4 |
 | `devai-rerank` | cross-encoder reranking (fastembed BGE) + no-op fallback | F5 |
+| `devai-search` | search orchestration: vector / keyword / hybrid (RRF) + rerank | F8 |
 | `devai-mcp` | MCP server (rmcp, stdio): search / read_file / index_repo / index_status | F6 |
 | `devai-memory` | memory engine: remember (dedup) + recall (intro/chunk blend) | F7 |
 

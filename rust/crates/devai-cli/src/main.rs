@@ -16,6 +16,7 @@ use devai_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devai_index::{run as index_run, IndexRequest};
 use devai_memory::{memory_stats, recall, remember, RememberRequest};
 use devai_rerank::{create_reranker, RerankSettings};
+use devai_search::SearchMode;
 use devai_store::Store;
 use mcp_configure::{McpClient, Options, Scope};
 use serde::Serialize;
@@ -65,6 +66,9 @@ enum Command {
         /// Keyword (BM25) search instead of semantic vector search.
         #[arg(long)]
         keyword: bool,
+        /// Hybrid search: fuse vector + keyword (BM25) via reciprocal rank fusion.
+        #[arg(long)]
+        hybrid: bool,
     },
     /// Run the MCP server over stdio, or `mcp configure` a client.
     Mcp {
@@ -168,7 +172,8 @@ fn main() -> Result<()> {
             format,
             no_rerank,
             keyword,
-        } => cmd_search(query, limit, language, format, no_rerank, keyword),
+            hybrid,
+        } => cmd_search(query, limit, language, format, no_rerank, keyword, hybrid),
         Command::Mcp { project, action } => match action {
             None => cmd_mcp(project),
             Some(McpAction::Configure {
@@ -476,10 +481,7 @@ fn cmd_index(full: bool) -> Result<()> {
     Ok(())
 }
 
-/// Candidates fetched from vector search before reranking down to `limit`.
-const RERANK_FETCH: usize = 15;
-
-/// `devai search` — embed the query, search the store, and (optionally) rerank.
+/// `devai search` — vector / keyword / hybrid search, then optional rerank.
 fn cmd_search(
     query: String,
     limit: usize,
@@ -487,6 +489,7 @@ fn cmd_search(
     format: OutputFormat,
     no_rerank: bool,
     keyword: bool,
+    hybrid: bool,
 ) -> Result<()> {
     let cfg = load_project()?;
     let filter = SearchFilter {
@@ -495,23 +498,28 @@ fn cmd_search(
         ..Default::default()
     };
 
-    // Keyword (BM25) mode: no embedder/reranker needed.
-    if keyword {
-        let store = open_store(&cfg, configured_dimension(&cfg))?;
-        let hits = store.keyword_search(&query, &filter, limit)?;
-        let out = match format {
-            OutputFormat::Table => render_table(&hits),
-            OutputFormat::Json => render_json(&hits)?,
-        };
-        println!("{out}");
-        return Ok(());
-    }
+    let mode = if hybrid {
+        SearchMode::Hybrid
+    } else if keyword {
+        SearchMode::Keyword
+    } else {
+        SearchMode::Vector
+    };
 
-    let embedder = build_embedder(&cfg)?;
-    let store = open_store(&cfg, embedder.dimension())?;
+    // Keyword-only search needs no embedding model; vector/hybrid do.
+    let embedder = if mode == SearchMode::Keyword {
+        None
+    } else {
+        Some(build_embedder(&cfg)?)
+    };
+    let dim = embedder
+        .as_ref()
+        .map(|e| e.dimension())
+        .unwrap_or_else(|| configured_dimension(&cfg));
+    let store = open_store(&cfg, dim)?;
 
-    let rerank = !no_rerank && cfg.reranking.enabled;
-    let reranker = if rerank {
+    // Rerank vector/hybrid results when enabled; keep keyword lightweight.
+    let reranker = if !no_rerank && cfg.reranking.enabled && mode != SearchMode::Keyword {
         eprintln!("Loading reranker ({})…", cfg.reranking.model);
         Some(create_reranker(&RerankSettings {
             enabled: true,
@@ -521,28 +529,15 @@ fn cmd_search(
         None
     };
 
-    let qvec = embedder.embed_query(&query)?;
-    let fetch_k = if rerank {
-        limit.max(RERANK_FETCH)
-    } else {
-        limit
-    };
-    let hits = store.search(&qvec, &filter, fetch_k)?;
-
-    let hits = match reranker {
-        Some(r) => {
-            let texts: Vec<String> = hits.iter().map(|h| h.point.text.clone()).collect();
-            r.rerank(&query, &texts, limit)?
-                .into_iter()
-                .map(|ranked| {
-                    let mut hit = hits[ranked.index].clone();
-                    hit.score = ranked.score;
-                    hit
-                })
-                .collect()
-        }
-        None => hits,
-    };
+    let hits = devai_search::search(
+        &store,
+        &query,
+        &filter,
+        limit,
+        mode,
+        embedder.as_deref(),
+        reranker.as_deref(),
+    )?;
 
     let out = match format {
         OutputFormat::Table => render_table(&hits),
