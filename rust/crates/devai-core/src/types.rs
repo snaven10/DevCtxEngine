@@ -80,6 +80,9 @@ pub struct SearchFilter {
     pub languages: Vec<String>,
     /// Restrict to a chunk level.
     pub chunk_level: Option<String>,
+    /// Restrict to one or more chunk levels (`IN (...)`); use for memory recall
+    /// (`memory` + `memory_chunk`).
+    pub chunk_levels: Vec<String>,
     /// Restrict to a memory type.
     pub memory_type: Option<String>,
     /// Exclude tombstoned rows when `true`.

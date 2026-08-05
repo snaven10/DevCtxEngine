@@ -29,6 +29,7 @@ devai mcp                         # MCP server over stdio (for AI agents/editors
 | `devai-index` | pipeline: git diff → parse → chunk → embed → store (incremental) | F4 |
 | `devai-rerank` | cross-encoder reranking (fastembed BGE) + no-op fallback | F5 |
 | `devai-mcp` | MCP server (rmcp, stdio): search / read_file / index_repo / index_status | F6 |
+| `devai-memory` | memory engine: remember (dedup) + recall (intro/chunk blend) | F7 |
 
 Planned (later phases): `devai-summarize`, `devai-api`, `devai-tui`.
 

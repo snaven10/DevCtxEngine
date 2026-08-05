@@ -239,6 +239,11 @@ fn build_where(f: &SearchFilter) -> (String, Vec<String>) {
         clauses.push("chunk_level = ?".to_string());
         params.push(cl.clone());
     }
+    if !f.chunk_levels.is_empty() {
+        let ph = vec!["?"; f.chunk_levels.len()].join(", ");
+        clauses.push(format!("chunk_level IN ({ph})"));
+        params.extend(f.chunk_levels.iter().cloned());
+    }
     if let Some(mt) = &f.memory_type {
         clauses.push("memory_type = ?".to_string());
         params.push(mt.clone());

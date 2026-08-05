@@ -6,9 +6,11 @@
 
 mod chunk;
 mod chunker;
+mod memory;
 
 pub use chunk::{content_hash, estimate_tokens, Chunk, ChunkConfig};
 pub use chunker::chunk_file;
+pub use memory::{memory_chunks, MemoryChunk, MemoryChunkConfig};
 
 #[cfg(test)]
 mod tests {

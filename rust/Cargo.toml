@@ -10,6 +10,7 @@ members = [
     "crates/devai-index",
     "crates/devai-rerank",
     "crates/devai-mcp",
+    "crates/devai-memory",
 ]
 
 [workspace.package]
