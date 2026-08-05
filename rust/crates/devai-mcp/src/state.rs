@@ -298,6 +298,47 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
     serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
 }
 
+/// `search_routes` tool: find HTTP routes by optional method + path substring.
+pub fn do_search_routes(
+    state: &AppState,
+    method: Option<String>,
+    path: Option<String>,
+) -> Result<String, String> {
+    let store = state.open_store()?;
+    let (repo, branch) = state.repo_branch()?;
+    let routes = store
+        .search_routes(&repo, &branch, method.as_deref(), path.as_deref())
+        .map_err(|e| e.to_string())?;
+    routes_to_json(&routes)
+}
+
+/// `routes_for_handler` tool: routes served by a handler symbol.
+pub fn do_routes_for_handler(state: &AppState, handler: &str) -> Result<String, String> {
+    let store = state.open_store()?;
+    let (repo, branch) = state.repo_branch()?;
+    let routes = store
+        .routes_for_handler(&repo, &branch, handler)
+        .map_err(|e| e.to_string())?;
+    routes_to_json(&routes)
+}
+
+fn routes_to_json(routes: &[devai_store::StoredRoute]) -> Result<String, String> {
+    let arr: Vec<Value> = routes
+        .iter()
+        .map(|r| {
+            json!({
+                "framework": r.framework,
+                "method": r.http_method,
+                "path": r.path,
+                "handler": r.handler_symbol,
+                "file": r.file,
+                "line": r.line,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
+}
+
 fn now_epoch() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -8,12 +8,14 @@
 pub mod error;
 pub mod lang;
 pub mod parser;
+pub mod routes;
 pub mod types;
 
 pub use error::{ParseError, Result};
 pub use lang::{lang_for_extension, raw_text_language, Lang};
 pub use parser::LanguageParser;
-pub use types::{Import, ParsedFile, Symbol};
+pub use routes::{extract_routes, Route};
+pub use types::{GraphEdge, Import, ParsedFile, Symbol};
 
 use std::path::Path;
 

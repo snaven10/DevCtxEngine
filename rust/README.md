@@ -27,7 +27,7 @@ devai mcp                         # MCP server over stdio (for AI agents/editors
 | `devai-cli`   | the `devai` binary (clap) | F0 |
 | `devai-store` | DuckDB store: vectors (brute-force cosine) + relational schema | F1 |
 | `devai-embed` | embeddings: local (fastembed/ort) + OpenAI/Voyage/custom | F2 |
-| `devai-parse` | tree-sitter symbols/imports (py/js/ts/go/java/rust) + lang registry | F3 |
+| `devai-parse` | tree-sitter symbols/imports/call-edges + framework route extractors | F3 |
 | `devai-chunk` | semantic multi-level chunker (file/class/function/block) | F3 |
 | `devai-index` | pipeline: git diff → parse → chunk → embed → store (incremental) | F4 |
 | `devai-rerank` | cross-encoder reranking (fastembed BGE) + no-op fallback | F5 |

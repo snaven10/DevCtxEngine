@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use devai_chunk::{chunk_file, content_hash, ChunkConfig};
 use devai_core::types::{VectorMetadata, VectorPoint};
 use devai_embed::EmbeddingProvider;
-use devai_parse::{detect_lang, parse};
-use devai_store::{FileState, IndexRecord, Store, StoredEdge};
+use devai_parse::{detect_lang, extract_routes, parse};
+use devai_store::{FileState, IndexRecord, Store, StoredEdge, StoredRoute};
 
 use crate::error::{IndexError, Result};
 use crate::git::{Change, GitRepo};
@@ -150,6 +150,8 @@ impl Ctx<'_> {
         self.store
             .delete_file_edges(self.repo_short, self.branch, file)?;
         self.store
+            .delete_file_routes(self.repo_short, self.branch, file)?;
+        self.store
             .delete_file_state(self.repo_path, self.branch, file)?;
         Ok(())
     }
@@ -235,6 +237,28 @@ impl Ctx<'_> {
             .collect();
         self.store
             .replace_file_edges(self.repo_short, self.branch, file, &edges)?;
+
+        // Extract and store HTTP routes (framework-detected from content).
+        let routes: Vec<StoredRoute> = extract_routes(&content, Path::new(file))
+            .into_iter()
+            .map(|r| StoredRoute {
+                framework: r.framework,
+                http_method: r.http_method,
+                path: r.path,
+                handler_class: r.handler_class,
+                handler_method: r.handler_method,
+                handler_symbol: r.handler_symbol,
+                file: file.to_string(),
+                line: r.line as i32,
+            })
+            .collect();
+        self.store.replace_file_routes(
+            self.repo_short,
+            self.branch,
+            file,
+            &routes,
+            &now_stamp(),
+        )?;
 
         self.store.save_file_state(&FileState {
             repo_path: self.repo_path.to_string(),

@@ -97,6 +97,15 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         depth: usize,
     },
+    /// List framework-aware HTTP routes.
+    Routes {
+        /// Filter by HTTP method.
+        #[arg(long)]
+        method: Option<String>,
+        /// Filter by path substring.
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 /// Search output format.
@@ -132,6 +141,7 @@ fn main() -> Result<()> {
         Command::Recall { query, limit } => cmd_recall(query, limit),
         Command::MemoryStats => cmd_memory_stats(),
         Command::Impact { symbol, depth } => cmd_impact(symbol, depth),
+        Command::Routes { method, path } => cmd_routes(method, path),
     }
 }
 
@@ -229,6 +239,35 @@ fn print_impact(label: &str, items: &[(String, usize)]) {
     for (sym, d) in &sorted {
         println!("    {sym} (depth {d})");
     }
+}
+
+/// `devai routes` — list framework-aware HTTP routes.
+fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
+    let cfg = load_project()?;
+    let store = open_store(&cfg, configured_dimension(&cfg))?;
+    let git = devai_index::GitRepo::open(&project_root(&cfg)?)?;
+    let routes = store.search_routes(
+        &git.short_name(),
+        &git.state().branch,
+        method.as_deref(),
+        path.as_deref(),
+    )?;
+    if routes.is_empty() {
+        println!("No routes.");
+        return Ok(());
+    }
+    for r in &routes {
+        let handler = if r.handler_symbol.is_empty() {
+            "-"
+        } else {
+            &r.handler_symbol
+        };
+        println!(
+            "{:6} {}  [{}] {} ({}:{})",
+            r.http_method, r.path, r.framework, handler, r.file, r.line
+        );
+    }
+    Ok(())
 }
 
 /// `devai memory-stats` — show memory counts for the project.

@@ -8,6 +8,7 @@
 mod error;
 mod graph;
 mod memory;
+mod routes;
 mod schema;
 mod state;
 mod store;
@@ -15,6 +16,7 @@ mod store;
 pub use error::{Result, StoreError};
 pub use graph::{ImpactResult, Reference, StoredEdge};
 pub use memory::{Memory, MemoryStats};
+pub use routes::StoredRoute;
 pub use schema::init_schema;
 pub use state::{FileState, IndexRecord};
 pub use store::Store;

@@ -16,7 +16,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt
 
 use state::{
     do_impact, do_index, do_index_status, do_memory_stats, do_read_file, do_recall, do_references,
-    do_remember, do_search, AppState,
+    do_remember, do_routes_for_handler, do_search, do_search_routes, AppState,
 };
 
 /// Parameters for the `search` tool.
@@ -104,6 +104,26 @@ struct ImpactReq {
 struct ReferencesReq {
     /// The symbol whose call sites to list.
     symbol: String,
+}
+
+/// Parameters for the `search_routes` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct SearchRoutesReq {
+    /// Restrict to an HTTP method (GET/POST/…), optional.
+    #[serde(default)]
+    method: Option<String>,
+    /// Restrict to routes whose path contains this substring, optional.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Parameters for the `routes_for_handler` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct RoutesForHandlerReq {
+    /// The handler symbol (`Class.method` or `method`).
+    handler: String,
 }
 
 /// The DevAI MCP server.
@@ -226,6 +246,29 @@ impl DevaiServer {
     ) -> Result<String, ErrorData> {
         let state = self.state.clone();
         run_blocking(move || do_references(&state, &req.symbol)).await
+    }
+
+    /// Find HTTP routes (framework-aware) by method and/or path.
+    #[tool(
+        description = "Find HTTP routes across frameworks (FastAPI/Flask/Express/\
+        NestJS/Spring/Quarkus/Angular) by method and/or path substring. Returns JSON."
+    )]
+    async fn search_routes(
+        &self,
+        Parameters(req): Parameters<SearchRoutesReq>,
+    ) -> Result<String, ErrorData> {
+        let state = self.state.clone();
+        run_blocking(move || do_search_routes(&state, req.method, req.path)).await
+    }
+
+    /// Reverse lookup: which routes a handler serves.
+    #[tool(description = "Find the HTTP routes served by a handler symbol. Returns JSON.")]
+    async fn routes_for_handler(
+        &self,
+        Parameters(req): Parameters<RoutesForHandlerReq>,
+    ) -> Result<String, ErrorData> {
+        let state = self.state.clone();
+        run_blocking(move || do_routes_for_handler(&state, &req.handler)).await
     }
 }
 
