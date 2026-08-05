@@ -59,6 +59,8 @@ enum Command {
         #[arg(long)]
         no_rerank: bool,
     },
+    /// Run the MCP server over stdio (for AI agents / editors).
+    Mcp,
 }
 
 /// Search output format.
@@ -83,7 +85,15 @@ fn main() -> Result<()> {
             format,
             no_rerank,
         } => cmd_search(query, limit, language, format, no_rerank),
+        Command::Mcp => cmd_mcp(),
     }
+}
+
+/// `devai mcp` — run the MCP server over stdio.
+fn cmd_mcp() -> Result<()> {
+    let cfg = load_project()?;
+    eprintln!("Starting DevAI MCP server (stdio)…");
+    devai_mcp::run_stdio(cfg)
 }
 
 /// `devai init` — write a `.devai/config.yaml` for the target repo.

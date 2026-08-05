@@ -1,15 +1,11 @@
 [package]
-name = "devai-cli"
+name = "devai-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "DevAI command-line interface (Rust)."
-
-[[bin]]
-name = "devai"
-path = "src/main.rs"
+description = "Model Context Protocol server for DevAI (stdio)."
 
 [dependencies]
 devai-core.workspace = true
@@ -17,9 +13,8 @@ devai-store = { path = "../devai-store" }
 devai-embed = { path = "../devai-embed" }
 devai-index = { path = "../devai-index" }
 devai-rerank = { path = "../devai-rerank" }
-devai-mcp = { path = "../devai-mcp" }
 anyhow.workspace = true
-clap.workspace = true
-serde_yaml.workspace = true
 serde = { workspace = true }
 serde_json = "1"
+rmcp = { version = "3", features = ["server", "transport-io", "macros", "schemars"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }

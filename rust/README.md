@@ -13,6 +13,7 @@ devai init --name myproj
 devai index                       # git diff → parse → chunk → embed → store
 devai search "connect to a database" --limit 5
 devai search "greet a user" --format json
+devai mcp                         # MCP server over stdio (for AI agents/editors)
 ```
 
 ## Crates
@@ -27,8 +28,9 @@ devai search "greet a user" --format json
 | `devai-chunk` | semantic multi-level chunker (file/class/function/block) | F3 |
 | `devai-index` | pipeline: git diff → parse → chunk → embed → store (incremental) | F4 |
 | `devai-rerank` | cross-encoder reranking (fastembed BGE) + no-op fallback | F5 |
+| `devai-mcp` | MCP server (rmcp, stdio): search / read_file / index_repo / index_status | F6 |
 
-Planned (later phases): `devai-summarize`, `devai-mcp`, `devai-api`, `devai-tui`.
+Planned (later phases): `devai-summarize`, `devai-api`, `devai-tui`.
 
 The `devai-embed` `local` feature (default) pulls in `fastembed`/`ort`; build
 with `--no-default-features` for an API-only build where the ONNX Runtime binary
