@@ -103,6 +103,78 @@ fn symbol(class: &str, method: &str) -> String {
     }
 }
 
+static RE_WORD_PAREN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\w+)\s*\(").unwrap());
+static RE_CLASS_DECL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:class|interface|enum)\s+(\w+)").unwrap());
+static RE_EXPRESS_HANDLER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*,\s*([A-Za-z_$][\w.$]*)\s*[),]").unwrap());
+
+/// Words that look like `name(` but are not method declarations.
+const CTRL_KEYWORDS: &[&str] = &[
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "return",
+    "new",
+    "synchronized",
+    "function",
+];
+
+/// The next method-declaration name after `from` (Java/Kotlin/TS): the first
+/// `name(` not preceded by `@`/`.` and not a control keyword.
+fn method_after(source: &str, from: usize) -> String {
+    let sub = &source[from.min(source.len())..];
+    for c in RE_WORD_PAREN.captures_iter(sub) {
+        let g = c.get(1).unwrap();
+        let word = g.as_str();
+        if CTRL_KEYWORDS.contains(&word) {
+            continue;
+        }
+        let prev = sub[..g.start()].trim_end().chars().last();
+        if matches!(prev, Some('@') | Some('.')) {
+            continue;
+        }
+        return word.to_string();
+    }
+    String::new()
+}
+
+/// The nearest class/interface/enum declared before `pos`.
+fn enclosing_class_before(source: &str, pos: usize) -> String {
+    RE_CLASS_DECL
+        .captures_iter(&source[..pos.min(source.len())])
+        .last()
+        .map(|c| c[1].to_string())
+        .unwrap_or_default()
+}
+
+/// A named Express handler reference (`handler` or `controller.list`) following
+/// the route path; empty for inline/arrow functions.
+fn express_handler(source: &str, after: usize) -> String {
+    RE_EXPRESS_HANDLER
+        .captures(&source[after.min(source.len())..])
+        .map(|c| c[1].to_string())
+        .unwrap_or_default()
+}
+
+/// Split a `Class.method` (or `object.method`) handler into (class, method).
+fn split_handler(handler: &str) -> (String, String) {
+    match handler.rsplit_once('.') {
+        Some((c, m)) => (c.to_string(), m.to_string()),
+        None => (String::new(), handler.to_string()),
+    }
+}
+
+/// Build the `(class, method, symbol)` triple for an annotation at `end`/`start`.
+fn annotated_handler(source: &str, ann_start: usize, ann_end: usize) -> (String, String, String) {
+    let method = method_after(source, ann_end);
+    let class = enclosing_class_before(source, ann_start);
+    let sym = symbol(&class, &method);
+    (class, method, sym)
+}
+
 // --- FastAPI ---
 static RE_FASTAPI: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -184,13 +256,15 @@ fn express(source: &str, file: &str) -> Vec<Route> {
         .captures_iter(source)
         .map(|c| {
             let m = c.get(0).unwrap();
+            let handler = express_handler(source, m.end());
+            let (hc, hm) = split_handler(&handler);
             Route {
                 framework: "express".into(),
                 http_method: c[1].to_uppercase(),
                 path: c[2].to_string(),
-                handler_class: String::new(),
-                handler_method: String::new(),
-                handler_symbol: String::new(),
+                handler_class: hc,
+                handler_method: hm,
+                handler_symbol: handler,
                 file: file.to_string(),
                 line: line_of(source, m.start()),
             }
@@ -215,13 +289,14 @@ fn nest(source: &str, file: &str) -> Vec<Route> {
         .map(|c| {
             let m = c.get(0).unwrap();
             let sub = c.get(2).map(|x| x.as_str()).unwrap_or("");
+            let (hc, hm, hs) = annotated_handler(source, m.start(), m.end());
             Route {
                 framework: "nestjs".into(),
                 http_method: c[1].to_uppercase(),
                 path: join_path(&prefix, sub),
-                handler_class: String::new(),
-                handler_method: String::new(),
-                handler_symbol: String::new(),
+                handler_class: hc,
+                handler_method: hm,
+                handler_symbol: hs,
                 file: file.to_string(),
                 line: line_of(source, m.start()),
             }
@@ -250,13 +325,14 @@ fn spring(source: &str, file: &str) -> Vec<Route> {
         .captures_iter(source)
         .map(|c| {
             let m = c.get(0).unwrap();
+            let (hc, hm, hs) = annotated_handler(source, m.start(), m.end());
             Route {
                 framework: "spring".into(),
                 http_method: c[1].to_uppercase(),
                 path: join_path(&prefix, &c[2]),
-                handler_class: String::new(),
-                handler_method: String::new(),
-                handler_symbol: String::new(),
+                handler_class: hc,
+                handler_method: hm,
+                handler_symbol: hs,
                 file: file.to_string(),
                 line: line_of(source, m.start()),
             }
@@ -284,13 +360,14 @@ fn quarkus(source: &str, file: &str) -> Vec<Route> {
                 .captures(window)
                 .map(|p| p[1].to_string())
                 .unwrap_or_default();
+            let (hc, hm, hs) = annotated_handler(source, m.start(), m.end());
             Route {
                 framework: "quarkus".into(),
                 http_method: c[1].to_uppercase(),
                 path: join_path(&class_prefix, &sub),
-                handler_class: String::new(),
-                handler_method: String::new(),
-                handler_symbol: String::new(),
+                handler_class: hc,
+                handler_method: hm,
+                handler_symbol: hs,
                 file: file.to_string(),
                 line: line_of(source, m.start()),
             }
@@ -396,7 +473,9 @@ def login():
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].http_method, "GET");
         assert_eq!(r[0].path, "/health");
+        assert_eq!(r[0].handler_symbol, ""); // inline arrow function
         assert_eq!(r[1].http_method, "POST");
+        assert_eq!(r[1].handler_symbol, "handler"); // named handler
     }
 
     #[test]
@@ -416,6 +495,9 @@ public class UserController {
         assert_eq!(r[0].framework, "spring");
         assert_eq!(r[0].path, "/api/users");
         assert_eq!(r[0].http_method, "GET");
+        assert_eq!(r[0].handler_method, "list");
+        assert_eq!(r[0].handler_symbol, "UserController.list");
+        assert_eq!(r[1].handler_symbol, "UserController.create");
     }
 
     #[test]
@@ -434,6 +516,7 @@ public class GreetResource {
         assert_eq!(r[0].framework, "quarkus");
         assert_eq!(r[0].http_method, "GET");
         assert_eq!(r[0].path, "/greet/hello");
+        assert_eq!(r[0].handler_symbol, "GreetResource.hello");
     }
 
     #[test]
@@ -451,7 +534,9 @@ export class CatsController {
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].framework, "nestjs");
         assert_eq!(r[0].path, "/cats");
+        assert_eq!(r[0].handler_symbol, "CatsController.findAll");
         assert_eq!(r[1].path, "/cats/create");
+        assert_eq!(r[1].handler_method, "create");
     }
 
     #[test]
