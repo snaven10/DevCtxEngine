@@ -15,11 +15,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_impact, do_index, do_index_status, do_memory_stats, do_read_file, do_recall, do_references,
-    do_remember, do_routes_for_handler, do_search, do_search_routes, do_summarize, parse_mode,
-    AppState,
+    do_graph, do_impact, do_index, do_index_status, do_memory_context, do_memory_stats,
+    do_read_file, do_recall, do_references, do_remember, do_routes_for_handler, do_search,
+    do_search_routes, do_summarize, parse_mode, AppState,
 };
 use serde::Deserialize;
+
+/// Vendored web dashboard (served at `/`) and its cytoscape bundle.
+const DASHBOARD_HTML: &str = include_str!("../assets/index.html");
+const CYTOSCAPE_JS: &str = include_str!("../assets/cytoscape.min.js");
 
 /// Shared router state: the engine plus an optional auth token.
 #[derive(Clone)]
@@ -31,13 +35,17 @@ struct Api {
 /// Build the router with all routes and the auth layer.
 fn router(api: Api) -> Router {
     Router::new()
+        .route("/", get(dashboard))
+        .route("/assets/cytoscape.min.js", get(cytoscape_js))
         .route("/health", get(health))
         .route("/search", post(search))
         .route("/index", post(index))
         .route("/status", get(status))
         .route("/remember", post(remember))
         .route("/recall", post(recall))
+        .route("/memories", get(memories))
         .route("/memory/stats", get(memory_stats))
+        .route("/graph", get(graph))
         .route("/impact/:symbol", get(impact))
         .route("/references/:symbol", get(references))
         .route("/routes", get(routes))
@@ -145,10 +153,67 @@ struct ImpactQuery {
     depth: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct GraphQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    hide_external: Option<bool>,
+    #[serde(default)]
+    hide_synthetic: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct MemoriesQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 // --- handlers ---
 
 async fn health() -> Response {
     json_ok(r#"{"status":"ok"}"#.to_string())
+}
+
+/// The web dashboard shell (call-graph + memories).
+async fn dashboard() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        DASHBOARD_HTML,
+    )
+        .into_response()
+}
+
+/// The vendored cytoscape bundle (served locally, no CDN).
+async fn cytoscape_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        CYTOSCAPE_JS,
+    )
+        .into_response()
+}
+
+async fn graph(State(api): State<Api>, Query(q): Query<GraphQuery>) -> Response {
+    run(api.state, move |s| {
+        do_graph(
+            s,
+            q.kind,
+            None,
+            q.limit.unwrap_or(0),
+            q.hide_external.unwrap_or(false),
+            q.hide_synthetic.unwrap_or(true),
+        )
+    })
+    .await
+}
+
+async fn memories(State(api): State<Api>, Query(q): Query<MemoriesQuery>) -> Response {
+    run(api.state, move |s| {
+        do_memory_context(s, q.limit.unwrap_or(25))
+    })
+    .await
 }
 
 async fn search(State(api): State<Api>, Json(b): Json<SearchBody>) -> Response {
@@ -236,9 +301,11 @@ async fn summarize(State(api): State<Api>, Json(b): Json<SummarizeBody>) -> Resp
 
 // --- helpers ---
 
-/// Bearer-token auth for all routes except `/health`.
+/// Bearer-token auth for all routes except public ones (health + the dashboard
+/// shell and its static assets, so the page always loads).
 async fn auth(State(api): State<Api>, req: Request, next: Next) -> Response {
-    if req.uri().path() == "/health" {
+    let path = req.uri().path();
+    if path == "/health" || path == "/" || path.starts_with("/assets/") {
         return next.run(req).await;
     }
     if let Some(expected) = &api.token {

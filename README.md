@@ -19,7 +19,13 @@ devctx recall "which database did we pick"
 devctx memory-stats
 devctx mcp                         # MCP server over stdio (for AI agents/editors)
 devctx mcp configure --client cursor --scope project   # register in an AI client
+devctx tui                         # terminal UI: search + call-graph + memories (F1/F2/F3)
+devctx web                         # web dashboard: interactive call-graph + memories
 ```
+
+`devctx web` serves a self-contained dashboard (call-graph via a vendored,
+offline cytoscape build + a memories browser) and opens it in your browser.
+`devctx tui` is the terminal equivalent, with three views switched by F1/F2/F3.
 
 ## Crates
 

@@ -23,6 +23,21 @@ pub struct StoredEdge {
     pub line: i32,
 }
 
+/// A raw call-graph edge, for bulk export (graph visualization).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEdge {
+    /// Enclosing (calling) symbol.
+    pub source: String,
+    /// Called symbol.
+    pub target: String,
+    /// Edge kind (`calls`).
+    pub kind: String,
+    /// File the call occurs in.
+    pub source_file: String,
+    /// 1-based line.
+    pub line: i32,
+}
+
 /// A reference to a symbol (a call site).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
@@ -87,6 +102,61 @@ impl Store {
             params![repo, branch, source_file],
         )?;
         Ok(())
+    }
+
+    /// Bulk-export call-graph edges for a repo/branch, for visualization.
+    ///
+    /// Optionally filtered to a single edge `kind` or `source_file`, and capped
+    /// at `limit` edges (0 = a generous default). Ordered by source/target so
+    /// the result is deterministic.
+    pub fn graph_edges(
+        &self,
+        repo: &str,
+        branch: &str,
+        kind: Option<&str>,
+        source_file: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>> {
+        let mut sql = String::from(
+            "SELECT source, target, kind, source_file, line FROM graph_edges
+             WHERE repo = ? AND branch = ?",
+        );
+        let mut args: Vec<String> = vec![repo.to_string(), branch.to_string()];
+        if let Some(k) = kind {
+            sql.push_str(" AND kind = ?");
+            args.push(k.to_string());
+        }
+        if let Some(f) = source_file {
+            sql.push_str(" AND source_file = ?");
+            args.push(f.to_string());
+        }
+        let cap = if limit == 0 { 2000 } else { limit };
+        sql.push_str(&format!(" ORDER BY source, target LIMIT {cap}"));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(duckdb::params_from_iter(args.iter()), |r| {
+            Ok(GraphEdge {
+                source: r.get(0)?,
+                target: r.get(1)?,
+                kind: r.get(2)?,
+                source_file: r.get(3)?,
+                line: r.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Distinct locally-defined symbols (every symbol that makes a call) for a
+    /// repo/branch. Used to classify call targets as internal vs external for
+    /// graph visualization, independent of any display limit.
+    pub fn graph_defined_symbols(&self, repo: &str, branch: &str) -> Result<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT source FROM graph_edges WHERE repo = ? AND branch = ?")?;
+        let rows = stmt.query_map(params![repo, branch], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<HashSet<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Direct callers of `symbol` (sources of edges targeting it).
@@ -242,6 +312,39 @@ mod tests {
             .downstream;
         assert!(down.contains(&("b".to_string(), 1)));
         assert!(down.contains(&("c".to_string(), 2)));
+    }
+
+    #[test]
+    fn graph_edges_bulk_export_and_filters() {
+        let store = seeded();
+        // All edges for repo/main: a->b, a->d, b->c.
+        let all = store.graph_edges("repo", "main", None, None, 0).unwrap();
+        assert_eq!(all.len(), 3);
+        // Deterministic order by (source, target): a->b, a->d, b->c.
+        assert_eq!((all[0].source.as_str(), all[0].target.as_str()), ("a", "b"));
+        assert_eq!((all[2].source.as_str(), all[2].target.as_str()), ("b", "c"));
+        // Filter by source_file: only a.rs edges (a->b, a->d).
+        let a = store
+            .graph_edges("repo", "main", None, Some("a.rs"), 0)
+            .unwrap();
+        assert_eq!(a.len(), 2);
+        assert!(a.iter().all(|e| e.source_file == "a.rs"));
+        // Limit caps the result.
+        assert_eq!(
+            store
+                .graph_edges("repo", "main", None, None, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Filter by kind: all are "calls".
+        assert_eq!(
+            store
+                .graph_edges("repo", "main", Some("calls"), None, 0)
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]

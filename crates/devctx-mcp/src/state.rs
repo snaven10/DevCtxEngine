@@ -4,6 +4,7 @@
 //! behind `Arc`; the DuckDB store is opened per call (a `Connection` is not
 //! `Sync`), which is cheap relative to embedding.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::{run as index_run, GitRepo, IndexRequest};
-use devctx_memory::{memory_stats, recall, remember, RememberRequest};
+use devctx_memory::{memory_context, memory_stats, recall, remember, RememberRequest};
 use devctx_rerank::{create_reranker, NoopReranker, RerankSettings, Reranker};
 use devctx_search::SearchMode;
 use devctx_store::Store;
@@ -245,6 +246,112 @@ pub fn do_recall(state: &AppState, query: &str, limit: usize) -> Result<String, 
     serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
 }
 
+/// `memory_context` tool: the most recent memories for the project (no query).
+pub fn do_memory_context(state: &AppState, limit: usize) -> Result<String, String> {
+    let store = state.open_store()?;
+    let mems = memory_context(&store, &state.project(), limit).map_err(|e| e.to_string())?;
+    let arr: Vec<Value> = mems
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "title": m.title,
+                "type": m.memory_type,
+                "tags": m.tags,
+                "content": m.content,
+                "created_at": m.created_at,
+                "updated_at": m.updated_at,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
+}
+
+/// `graph` tool: cytoscape-shaped `{nodes, edges}` for the call-graph.
+///
+/// A node is *external* when it is called but never defined locally (never a
+/// source). `hide_external`/`hide_synthetic` drop those before assembly.
+pub fn do_graph(
+    state: &AppState,
+    kind: Option<String>,
+    file: Option<String>,
+    limit: usize,
+    hide_external: bool,
+    hide_synthetic: bool,
+) -> Result<String, String> {
+    let store = state.open_store()?;
+    let (repo, branch) = state.repo_branch()?;
+    let edges = store
+        .graph_edges(&repo, &branch, kind.as_deref(), file.as_deref(), limit)
+        .map_err(|e| e.to_string())?;
+
+    // "Defined locally" = any symbol that makes a call anywhere in the repo.
+    // A call target that is never itself a caller is treated as external
+    // (a library/undefined symbol). Computed over the whole graph, not the
+    // limited display window, so internal→internal edges survive the limit.
+    let defined = store
+        .graph_defined_symbols(&repo, &branch)
+        .map_err(|e| e.to_string())?;
+    let external = |id: &str| !defined.contains(id);
+
+    let mut node_ids: Vec<String> = Vec::new();
+    let mut node_file: HashMap<String, String> = HashMap::new();
+    let mut node_ext: HashMap<String, bool> = HashMap::new();
+    let mut out_edges: Vec<Value> = Vec::new();
+
+    for (i, e) in edges.iter().enumerate() {
+        if hide_external && external(&e.target) {
+            continue;
+        }
+        if hide_synthetic && (is_synthetic(&e.source) || is_synthetic(&e.target)) {
+            continue;
+        }
+        // Register both endpoints; keep the first file seen for a node.
+        for (id, file) in [(&e.source, e.source_file.as_str()), (&e.target, "")] {
+            if !node_file.contains_key(id) {
+                node_ids.push(id.clone());
+                node_file.insert(id.clone(), file.to_string());
+                node_ext.insert(id.clone(), external(id));
+            } else if node_file[id].is_empty() && !file.is_empty() {
+                node_file.insert(id.clone(), file.to_string());
+            }
+        }
+        out_edges.push(json!({
+            "data": {
+                "id": format!("e{i}"),
+                "source": e.source,
+                "target": e.target,
+                "kind": e.kind,
+                "file": e.source_file,
+                "line": e.line,
+            }
+        }));
+    }
+
+    let nodes: Vec<Value> = node_ids
+        .iter()
+        .map(|id| {
+            json!({
+                "data": {
+                    "id": id,
+                    "label": short_label(id),
+                    "file": node_file.get(id).cloned().unwrap_or_default(),
+                    "repo": repo,
+                    "external": node_ext.get(id).copied().unwrap_or(false),
+                }
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "repo": repo,
+        "branch": branch,
+        "nodes": nodes,
+        "edges": out_edges,
+    })
+    .to_string())
+}
+
 /// `memory_stats` tool: memory counts for the project.
 pub fn do_memory_stats(state: &AppState) -> Result<String, String> {
     let store = state.open_store()?;
@@ -362,6 +469,22 @@ pub fn do_summarize(
         .map_err(|e| e.to_string())
 }
 
+/// The trailing segment of a symbol id (after the last `::` or `/`).
+fn short_label(id: &str) -> &str {
+    if let Some(i) = id.rfind("::") {
+        return &id[i + 2..];
+    }
+    if let Some(i) = id.rfind('/') {
+        return &id[i + 1..];
+    }
+    id
+}
+
+/// Placeholder nodes the parsers emit for un-resolvable receivers.
+fn is_synthetic(id: &str) -> bool {
+    matches!(short_label(id), "<unknown>" | "<module>" | "<anonymous>")
+}
+
 fn now_epoch() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -416,6 +539,16 @@ mod tests {
         assert_eq!(slice_lines(c, Some(4), None), "d\ne");
         assert_eq!(slice_lines(c, None, Some(2)), "a\nb");
         assert_eq!(slice_lines(c, Some(10), Some(20)), "");
+    }
+
+    #[test]
+    fn short_label_and_synthetic() {
+        assert_eq!(short_label("crate::mod::func"), "func");
+        assert_eq!(short_label("pkg/Class"), "Class");
+        assert_eq!(short_label("plain"), "plain");
+        assert!(is_synthetic("mod::<unknown>"));
+        assert!(is_synthetic("<module>"));
+        assert!(!is_synthetic("mod::real"));
     }
 
     #[test]

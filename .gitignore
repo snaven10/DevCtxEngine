@@ -3,9 +3,11 @@
 Cargo.lock
 
 # DevCtxEngine local state / caches
+.devctx/
 .devai/
 .fastembed_cache/
 *.db
+*.duckdb
 *.db-journal
 *.db-wal
 *.db-shm

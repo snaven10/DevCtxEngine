@@ -12,5 +12,7 @@ devctx-core.workspace = true
 devctx-store = { path = "../devctx-store" }
 devctx-embed = { path = "../devctx-embed" }
 devctx-search = { path = "../devctx-search" }
+devctx-index = { path = "../devctx-index" }
+devctx-memory = { path = "../devctx-memory" }
 anyhow.workspace = true
 ratatui = "0.29"

@@ -144,8 +144,17 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Open the interactive terminal UI (live search browser).
+    /// Open the interactive terminal UI (search, graph & memories).
     Tui,
+    /// Serve the web dashboard (call-graph + memories) in a browser.
+    Web {
+        /// Address to bind (host:port).
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Don't try to open the dashboard in a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
 }
 
 /// Search output format.
@@ -227,6 +236,7 @@ fn main() -> Result<()> {
         } => cmd_summarize(path, query, tokens),
         Command::Api { addr, token } => cmd_api(addr, token),
         Command::Tui => cmd_tui(),
+        Command::Web { addr, no_open } => cmd_web(addr, no_open),
     }
 }
 
@@ -244,6 +254,37 @@ fn cmd_api(addr: String, token: Option<String>) -> Result<()> {
         .with_context(|| format!("invalid --addr `{addr}`"))?;
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
     devctx_api::run_blocking(cfg, socket, token)
+}
+
+/// `devctx web` — serve the web dashboard (call-graph + memories) locally.
+fn cmd_web(addr: String, no_open: bool) -> Result<()> {
+    let cfg = load_project()?;
+    let socket = addr
+        .parse()
+        .with_context(|| format!("invalid --addr `{addr}`"))?;
+    let url = format!("http://{addr}");
+    println!("DevCtxEngine dashboard → {url}");
+    if !no_open {
+        // Best-effort: open the default browser; ignore failures (headless/CI).
+        open_browser(&url);
+    }
+    // No token: the dashboard runs locally and needs unauthenticated access.
+    devctx_api::run_blocking(cfg, socket, None)
+}
+
+/// Best-effort open of a URL in the platform browser.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "linux")]
+    let cmd = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+    let _ = std::process::Command::new(cmd)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// `devctx mcp` — run the MCP server over stdio.
