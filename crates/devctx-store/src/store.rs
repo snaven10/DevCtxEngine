@@ -19,6 +19,10 @@ const COLS: &str = r#"id, text, vector, repo, branch, "commit", file, symbol,
     symbol_type, language, start_line, end_line, chunk_level, content_hash,
     is_deletion, memory_type, memory_scope, memory_tags, indexed_at"#;
 
+/// Rows per `INSERT`/`DELETE` statement in [`Store::upsert`]. Bounds SQL size
+/// and bound-parameter count while collapsing many single-row writes into few.
+const UPSERT_BATCH: usize = 256;
+
 /// A DuckDB-backed store. Holds one connection and the fixed vector dimension.
 pub struct Store {
     pub(crate) conn: Connection,
@@ -88,6 +92,18 @@ impl Store {
              ON vectors USING HNSW (vector) WITH (metric = 'cosine');",
         )?;
         Ok(true)
+    }
+
+    /// Drop the HNSW index if present. DuckDB maintains an HNSW index on every
+    /// insert, which is expensive during a bulk (re)index; dropping it before a
+    /// full load and rebuilding with [`enable_hnsw`](Self::enable_hnsw) after is
+    /// far faster than loading into an indexed table. Best-effort no-op when the
+    /// VSS extension or index is absent.
+    pub fn drop_hnsw(&self) -> Result<()> {
+        let _ = self
+            .conn
+            .execute_batch("DROP INDEX IF EXISTS idx_vectors_hnsw;");
+        Ok(())
     }
 
     /// (Re)build the full-text (BM25) index over `vectors.text`. Rebuild-on-demand:
@@ -168,17 +184,40 @@ impl Store {
     }
 
     fn upsert_inner(&self, points: &[VectorPoint]) -> Result<()> {
-        let insert_sql = format!(
-            "INSERT INTO vectors ({COLS}) VALUES \
-             (?, ?, {{VEC}}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        );
-        for p in points {
-            self.conn
-                .execute("DELETE FROM vectors WHERE id = ?", [&p.id])?;
-            let sql = insert_sql.replace("{VEC}", &self.vec_literal(&p.vector));
-            let m = &p.metadata;
-            self.conn
-                .execute(&sql, params_from_iter(row_params(&p.id, &p.text, m)))?;
+        // Batch the writes: DuckDB is a columnar/OLAP engine where single-row
+        // `INSERT`s are the slowest path (fixed per-statement overhead). We
+        // collapse each batch into one multi-row `INSERT` and one `DELETE`.
+        //
+        // The vector is inlined as a `FLOAT[dim]` literal rather than bound as a
+        // parameter because duckdb-rs (as of 1.x) supports neither binding an
+        // array as a `?` parameter ("binding List parameters is not yet
+        // supported") nor appending array columns via the `Appender`. The
+        // Arrow `append_record_batch` path could avoid literals entirely, but it
+        // pulls in the heavy `arrow` stack for a per-file workload of tens to a
+        // few hundred rows, where multi-row `INSERT` is already ample.
+        for chunk in points.chunks(UPSERT_BATCH) {
+            // 1) Delete any existing rows for these ids in a single statement.
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let del_ids: Vec<Value> = chunk.iter().map(|p| Value::Text(p.id.clone())).collect();
+            self.conn.execute(
+                &format!("DELETE FROM vectors WHERE id IN ({placeholders})"),
+                params_from_iter(del_ids),
+            )?;
+
+            // 2) One multi-row INSERT: vectors as literals, scalars as params.
+            let mut tuples = Vec::with_capacity(chunk.len());
+            let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 18);
+            for p in chunk {
+                tuples.push(format!(
+                    "(?, ?, {}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    self.vec_literal(&p.vector)
+                ));
+                params.extend(row_params(&p.id, &p.text, &p.metadata));
+            }
+            self.conn.execute(
+                &format!("INSERT INTO vectors ({COLS}) VALUES {}", tuples.join(", ")),
+                params_from_iter(params),
+            )?;
         }
         Ok(())
     }
@@ -403,4 +442,83 @@ fn value_to_f32_vec(v: Value) -> Vec<f32> {
             _ => 0.0,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    const DIM: usize = 384;
+
+    fn points(n: usize) -> Vec<VectorPoint> {
+        (0..n)
+            .map(|i| VectorPoint {
+                id: format!("id_{i}"),
+                vector: (0..DIM)
+                    .map(|j| ((i * 31 + j) % 100) as f32 / 100.0)
+                    .collect(),
+                text: format!("chunk text number {i}"),
+                metadata: VectorMetadata {
+                    repo: "demo".into(),
+                    branch: "main".into(),
+                    file: format!("src/f{}.rs", i % 50),
+                    symbol: format!("sym_{i}"),
+                    symbol_type: "function".into(),
+                    language: "rust".into(),
+                    start_line: 1,
+                    end_line: 10,
+                    chunk_level: "function".into(),
+                    content_hash: "hash".into(),
+                    indexed_at: "0".into(),
+                    ..Default::default()
+                },
+            })
+            .collect()
+    }
+
+    /// A/B: the old per-row DELETE+INSERT (one statement per row, one shared
+    /// transaction) vs the batched multi-row `upsert`. Run with:
+    /// `cargo test -p devctx-store --release -- --ignored --nocapture bench_upsert`
+    #[test]
+    #[ignore = "perf benchmark; run explicitly"]
+    fn bench_upsert_rowwise_vs_batched() {
+        let n = 8000;
+        let pts = points(n);
+
+        // Old path: replicate the pre-batch code exactly (per-row statements).
+        let slow = Store::open_in_memory(DIM).unwrap();
+        let insert_sql = format!(
+            "INSERT INTO vectors ({COLS}) VALUES \
+             (?, ?, {{VEC}}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        );
+        let t0 = Instant::now();
+        slow.conn.execute_batch("BEGIN TRANSACTION").unwrap();
+        for p in &pts {
+            slow.conn
+                .execute("DELETE FROM vectors WHERE id = ?", [&p.id])
+                .unwrap();
+            let sql = insert_sql.replace("{VEC}", &slow.vec_literal(&p.vector));
+            slow.conn
+                .execute(
+                    &sql,
+                    params_from_iter(row_params(&p.id, &p.text, &p.metadata)),
+                )
+                .unwrap();
+        }
+        slow.conn.execute_batch("COMMIT").unwrap();
+        let row_wise = t0.elapsed();
+
+        // New path: batched multi-row upsert.
+        let fast = Store::open_in_memory(DIM).unwrap();
+        let t1 = Instant::now();
+        fast.upsert(&pts).unwrap();
+        let batched = t1.elapsed();
+
+        assert_eq!(fast.count(&SearchFilter::default()).unwrap(), n as u64);
+        eprintln!(
+            "\nupsert {n} vectors (dim {DIM}):\n  row-wise: {row_wise:?}\n  batched : {batched:?}\n  speedup : {:.1}x\n",
+            row_wise.as_secs_f64() / batched.as_secs_f64().max(1e-9)
+        );
+    }
 }

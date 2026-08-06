@@ -28,6 +28,9 @@ use ratatui::{DefaultTerminal, Frame};
 /// Results fetched per query.
 const LIMIT: usize = 20;
 
+/// Transitive callers and callees of a symbol, each `(symbol, depth)`.
+type ImpactLists = (Vec<(String, usize)>, Vec<(String, usize)>);
+
 /// A memory row, unified across recall (scored) and recent (unscored).
 #[derive(Clone)]
 struct MemoryItem {
@@ -97,7 +100,7 @@ impl Engine {
     }
 
     /// Transitive callers (upstream) and callees (downstream) of a symbol.
-    fn graph(&self, symbol: &str) -> anyhow::Result<(Vec<(String, usize)>, Vec<(String, usize)>)> {
+    fn graph(&self, symbol: &str) -> anyhow::Result<ImpactLists> {
         let im = self
             .store
             .impact_analysis(&self.repo, &self.branch, symbol, 3)?;

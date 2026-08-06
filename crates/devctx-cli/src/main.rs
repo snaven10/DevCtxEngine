@@ -591,6 +591,12 @@ fn cmd_index(full: bool) -> Result<()> {
     let embedder = build_embedder(&cfg)?;
     let store = open_store(&cfg, embedder.dimension())?;
 
+    // Golden rule for bulk loads: don't maintain the HNSW index row-by-row.
+    // For a full reindex, drop it up front and rebuild once after the load.
+    if full && cfg.storage.hnsw {
+        store.drop_hnsw()?;
+    }
+
     let progress = IndexBar::new();
     let res = index_run(IndexRequest {
         store: &store,
