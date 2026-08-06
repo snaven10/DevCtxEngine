@@ -1,0 +1,23 @@
+[package]
+name = "devctx-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Embedding providers for DevCtxEngine: local (fastembed/ort) + API (OpenAI/Voyage/custom)."
+
+[features]
+default = ["local"]
+# Gates the fastembed/ort-backed local provider. Disable to build API-only
+# (e.g. where the ONNX Runtime binary can't be fetched at build time).
+local = ["dep:fastembed"]
+
+[dependencies]
+devctx-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+fastembed = { version = "4", optional = true }

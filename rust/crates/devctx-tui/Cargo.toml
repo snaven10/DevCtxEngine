@@ -1,0 +1,16 @@
+[package]
+name = "devctx-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Interactive terminal UI for DevCtxEngine (ratatui): live search browser."
+
+[dependencies]
+devctx-core.workspace = true
+devctx-store = { path = "../devctx-store" }
+devctx-embed = { path = "../devctx-embed" }
+devctx-search = { path = "../devctx-search" }
+anyhow.workspace = true
+ratatui = "0.29"

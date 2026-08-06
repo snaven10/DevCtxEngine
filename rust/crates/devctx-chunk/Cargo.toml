@@ -1,0 +1,13 @@
+[package]
+name = "devctx-chunk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Semantic multi-level code chunker for DevCtxEngine."
+
+[dependencies]
+devctx-core.workspace = true
+devctx-parse = { path = "../devctx-parse" }
+sha2.workspace = true

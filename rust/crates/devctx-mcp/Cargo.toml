@@ -1,0 +1,27 @@
+[package]
+name = "devctx-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Model Context Protocol server for DevCtxEngine (stdio)."
+
+[features]
+# Enable the local flan-t5 summarizer (heavy: pulls in candle + model download).
+flan-t5 = ["devctx-summarize/flan-t5"]
+
+[dependencies]
+devctx-core.workspace = true
+devctx-store = { path = "../devctx-store" }
+devctx-embed = { path = "../devctx-embed" }
+devctx-index = { path = "../devctx-index" }
+devctx-rerank = { path = "../devctx-rerank" }
+devctx-memory = { path = "../devctx-memory" }
+devctx-search = { path = "../devctx-search" }
+devctx-summarize = { path = "../devctx-summarize" }
+anyhow.workspace = true
+serde = { workspace = true }
+serde_json = "1"
+rmcp = { version = "3", features = ["server", "transport-io", "macros", "schemars"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }

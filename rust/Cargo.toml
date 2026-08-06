@@ -1,20 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/devai-core",
-    "crates/devai-cli",
-    "crates/devai-store",
-    "crates/devai-embed",
-    "crates/devai-parse",
-    "crates/devai-chunk",
-    "crates/devai-index",
-    "crates/devai-rerank",
-    "crates/devai-mcp",
-    "crates/devai-memory",
-    "crates/devai-search",
-    "crates/devai-summarize",
-    "crates/devai-api",
-    "crates/devai-tui",
+    "crates/devctx-core",
+    "crates/devctx-cli",
+    "crates/devctx-store",
+    "crates/devctx-embed",
+    "crates/devctx-parse",
+    "crates/devctx-chunk",
+    "crates/devctx-index",
+    "crates/devctx-rerank",
+    "crates/devctx-mcp",
+    "crates/devctx-memory",
+    "crates/devctx-search",
+    "crates/devctx-summarize",
+    "crates/devctx-api",
+    "crates/devctx-tui",
 ]
 
 [workspace.package]
@@ -25,7 +25,7 @@ repository = "https://github.com/snaven10/devai-context-engine"
 rust-version = "1.82"
 
 [workspace.dependencies]
-devai-core = { path = "crates/devai-core" }
+devctx-core = { path = "crates/devctx-core" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

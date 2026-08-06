@@ -1,0 +1,34 @@
+[package]
+name = "devctx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "DevCtxEngine command-line interface (Rust)."
+
+[[bin]]
+name = "devctx"
+path = "src/main.rs"
+
+[features]
+# Build with the local flan-t5 summarizer (heavy: candle + model download).
+flan-t5 = ["devctx-summarize/flan-t5", "devctx-mcp/flan-t5"]
+
+[dependencies]
+devctx-core.workspace = true
+devctx-store = { path = "../devctx-store" }
+devctx-embed = { path = "../devctx-embed" }
+devctx-index = { path = "../devctx-index" }
+devctx-rerank = { path = "../devctx-rerank" }
+devctx-mcp = { path = "../devctx-mcp" }
+devctx-memory = { path = "../devctx-memory" }
+devctx-search = { path = "../devctx-search" }
+devctx-summarize = { path = "../devctx-summarize" }
+devctx-api = { path = "../devctx-api" }
+devctx-tui = { path = "../devctx-tui" }
+anyhow.workspace = true
+clap.workspace = true
+serde_yaml.workspace = true
+serde = { workspace = true }
+serde_json = "1"

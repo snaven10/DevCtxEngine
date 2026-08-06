@@ -1,0 +1,16 @@
+[package]
+name = "devctx-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Search orchestration for DevCtxEngine: vector / keyword / hybrid (RRF) + rerank."
+
+[dependencies]
+devctx-core.workspace = true
+devctx-store = { path = "../devctx-store" }
+thiserror.workspace = true
+# Only the EmbeddingProvider / Reranker traits are needed — no fastembed/ort.
+devctx-embed = { path = "../devctx-embed", default-features = false }
+devctx-rerank = { path = "../devctx-rerank", default-features = false }
