@@ -1,0 +1,21 @@
+[package]
+name = "devai-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "HTTP REST API for DevAI (axum), reusing the MCP engine."
+
+[features]
+# Passthrough for the local flan-t5 summarizer (used by the `summarize` route).
+flan-t5 = ["devai-mcp/flan-t5"]
+
+[dependencies]
+devai-core.workspace = true
+devai-mcp = { path = "../devai-mcp" }
+anyhow.workspace = true
+serde = { workspace = true }
+serde_json = "1"
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }

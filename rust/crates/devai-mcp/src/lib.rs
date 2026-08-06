@@ -4,7 +4,7 @@
 //! `index_repo`, `index_status`. Memory/route/graph tools follow. Built on the
 //! official `rmcp` SDK. See `docs/rust-rewrite-plan.md` §8 (F6).
 
-mod state;
+pub mod state;
 
 use std::sync::Arc;
 

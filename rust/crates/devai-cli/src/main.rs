@@ -135,6 +135,15 @@ enum Command {
         #[arg(long)]
         tokens: Option<usize>,
     },
+    /// Serve the HTTP REST API.
+    Api {
+        /// Address to bind (host:port).
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Bearer token required on all routes except /health (or DEVAI_API_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 /// Search output format.
@@ -214,7 +223,18 @@ fn main() -> Result<()> {
             query,
             tokens,
         } => cmd_summarize(path, query, tokens),
+        Command::Api { addr, token } => cmd_api(addr, token),
     }
+}
+
+/// `devai api` — serve the HTTP REST API.
+fn cmd_api(addr: String, token: Option<String>) -> Result<()> {
+    let cfg = load_project()?;
+    let socket = addr
+        .parse()
+        .with_context(|| format!("invalid --addr `{addr}`"))?;
+    let token = token.or_else(|| std::env::var("DEVAI_API_TOKEN").ok());
+    devai_api::run_blocking(cfg, socket, token)
 }
 
 /// `devai mcp` — run the MCP server over stdio.

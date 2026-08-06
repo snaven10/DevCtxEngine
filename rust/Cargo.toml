@@ -13,6 +13,7 @@ members = [
     "crates/devai-memory",
     "crates/devai-search",
     "crates/devai-summarize",
+    "crates/devai-api",
 ]
 
 [workspace.package]

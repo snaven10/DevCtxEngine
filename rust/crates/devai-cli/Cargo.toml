@@ -25,6 +25,7 @@ devai-mcp = { path = "../devai-mcp" }
 devai-memory = { path = "../devai-memory" }
 devai-search = { path = "../devai-search" }
 devai-summarize = { path = "../devai-summarize" }
+devai-api = { path = "../devai-api" }
 anyhow.workspace = true
 clap.workspace = true
 serde_yaml.workspace = true
