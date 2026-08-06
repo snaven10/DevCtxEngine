@@ -142,6 +142,7 @@ pub fn do_index(state: &AppState, full: bool) -> Result<String, String> {
         repo_root: &state.root,
         incremental: !full,
         model_name: &state.cfg.embeddings.model,
+        progress: None,
     })
     .map_err(|e| e.to_string())?;
     Ok(json!({

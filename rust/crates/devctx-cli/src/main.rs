@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use devctx_core::config::{find_config_file, Project, ProjectConfig};
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
-use devctx_index::{run as index_run, IndexRequest};
+use devctx_index::{run as index_run, IndexRequest, ProgressSink};
 use devctx_memory::{memory_stats, recall, remember, RememberRequest};
 use devctx_rerank::{create_reranker, RerankSettings};
 use devctx_search::SearchMode;
@@ -432,6 +432,40 @@ fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// A CLI progress bar for indexing (shows elapsed time, ETA and the current file).
+struct IndexBar {
+    bar: indicatif::ProgressBar,
+}
+
+impl IndexBar {
+    fn new() -> Self {
+        let bar = indicatif::ProgressBar::new(0);
+        bar.set_style(
+            indicatif::ProgressStyle::with_template(
+                "  {spinner:.green} [{elapsed_precise}] [{bar:32.cyan/blue}] {pos}/{len} \
+                 (eta {eta}) {msg}",
+            )
+            .unwrap()
+            .progress_chars("=> "),
+        );
+        Self { bar }
+    }
+
+    fn finish(&self) {
+        self.bar.finish_and_clear();
+    }
+}
+
+impl ProgressSink for IndexBar {
+    fn start(&self, total: usize) {
+        self.bar.set_length(total as u64);
+    }
+    fn file(&self, path: &str) {
+        self.bar.set_message(path.to_string());
+        self.bar.inc(1);
+    }
+}
+
 /// `devctx memory-stats` — show memory counts for the project.
 fn cmd_memory_stats() -> Result<()> {
     let cfg = load_project()?;
@@ -516,13 +550,16 @@ fn cmd_index(full: bool) -> Result<()> {
     let embedder = build_embedder(&cfg)?;
     let store = open_store(&cfg, embedder.dimension())?;
 
+    let progress = IndexBar::new();
     let res = index_run(IndexRequest {
         store: &store,
         embedder: embedder.as_ref(),
         repo_root: &root,
         incremental: !full,
         model_name: &cfg.embeddings.model,
+        progress: Some(&progress),
     })?;
+    progress.finish();
 
     println!(
         "Indexed {} ({}) @ {}",

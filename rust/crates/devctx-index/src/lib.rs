@@ -14,7 +14,7 @@ pub mod pipeline;
 pub use error::{IndexError, Result};
 pub use git::{Change, GitRepo, GitState};
 pub use id::chunk_id;
-pub use pipeline::{run, IndexRequest, IndexResult};
+pub use pipeline::{run, IndexRequest, IndexResult, ProgressSink};
 
 #[cfg(test)]
 mod tests {
@@ -90,6 +90,7 @@ mod tests {
             repo_root: root,
             incremental: true,
             model_name: "minilm-l6",
+            progress: None,
         })
         .unwrap()
     }
@@ -183,6 +184,7 @@ mod tests {
             repo_root: &dir,
             incremental: false,
             model_name: "minilm-l6",
+            progress: None,
         })
         .unwrap();
 

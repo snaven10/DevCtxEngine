@@ -14,6 +14,14 @@ use crate::error::{IndexError, Result};
 use crate::git::{Change, GitRepo};
 use crate::id::chunk_id;
 
+/// Receives progress updates during an indexing run (e.g. a CLI progress bar).
+pub trait ProgressSink {
+    /// Called once with the total number of changes to process.
+    fn start(&self, total: usize);
+    /// Called before each change is processed, with its file path.
+    fn file(&self, path: &str);
+}
+
 /// Inputs for one indexing run.
 pub struct IndexRequest<'a> {
     /// The DuckDB store.
@@ -26,6 +34,8 @@ pub struct IndexRequest<'a> {
     pub incremental: bool,
     /// Model name recorded in `index_state` (drives model-change reindex).
     pub model_name: &'a str,
+    /// Optional progress reporter.
+    pub progress: Option<&'a dyn ProgressSink>,
 }
 
 /// Summary of an indexing run.
@@ -111,7 +121,14 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         ..Default::default()
     };
 
-    for change in git.changes(from)? {
+    let changes = git.changes(from)?;
+    if let Some(p) = req.progress {
+        p.start(changes.len());
+    }
+    for change in changes {
+        if let Some(p) = req.progress {
+            p.file(change_path(&change));
+        }
         match change {
             Change::Deleted(file) => {
                 ctx.delete_file(&file)?;
@@ -333,6 +350,14 @@ impl Ctx<'_> {
         self.store
             .replace_file_routes(self.repo_short, self.branch, file, &routes, &now_stamp())
             .map_err(Into::into)
+    }
+}
+
+/// The display path of a change (the destination for a rename).
+fn change_path(c: &Change) -> &str {
+    match c {
+        Change::Added(f) | Change::Modified(f) | Change::Deleted(f) => f,
+        Change::Renamed { to, .. } => to,
     }
 }
 
