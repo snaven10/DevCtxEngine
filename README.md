@@ -21,7 +21,14 @@ devctx mcp                         # MCP server over stdio (for AI agents/editor
 devctx mcp configure --client cursor --scope project   # register in an AI client
 devctx tui                         # terminal UI: search + call-graph + memories (F1/F2/F3)
 devctx web                         # web dashboard: interactive call-graph + memories
+devctx serve                       # long-lived server that owns the DB (server mode)
 ```
+
+**Server mode.** DuckDB allows a single read-write process. Run `devctx serve`
+and it becomes the sole owner of the database; every other `devctx` command
+discovers it (via `.devctx/state/serve.json`) and routes over HTTP instead of
+opening the file, so concurrent CLI/editor/web use never hits a lock. When no
+server is running, commands open the store directly as usual.
 
 `devctx web` serves a self-contained dashboard (call-graph via a vendored,
 offline cytoscape build + a memories browser) and opens it in your browser.

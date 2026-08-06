@@ -58,6 +58,21 @@ impl Store {
         self.dim
     }
 
+    /// Open another connection to the *same* in-process database. Unlike
+    /// [`open`](Self::open), this shares the already-open database instance, so
+    /// it does not take a second file lock — the way to hand concurrent
+    /// connections to server request handlers while one owner keeps the file
+    /// open. Extensions are loaded per connection.
+    pub fn try_clone(&self) -> Result<Self> {
+        let conn = self.conn.try_clone()?;
+        let store = Self {
+            conn,
+            dim: self.dim,
+        };
+        store.load_extensions();
+        Ok(store)
+    }
+
     /// Best-effort load of the optional DuckDB extensions (VSS for HNSW, FTS for
     /// keyword search), so pre-built indexes are usable.
     fn load_extensions(&self) {

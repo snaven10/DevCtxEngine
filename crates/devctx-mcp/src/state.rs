@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult};
@@ -23,8 +23,11 @@ use serde_json::{json, Value};
 pub struct AppState {
     cfg: ProjectConfig,
     root: PathBuf,
-    db_path: PathBuf,
-    dim: usize,
+    /// The primary connection: opened once and kept for the server's lifetime so
+    /// this process owns the DuckDB file (single writer). Request handlers get a
+    /// cloned connection to the same in-process database via [`Store::try_clone`],
+    /// so they never take a second file lock.
+    primary: Arc<Mutex<Store>>,
     embedder: Arc<dyn EmbeddingProvider>,
     reranker: Arc<dyn Reranker>,
     rerank_enabled: bool,
@@ -50,13 +53,12 @@ impl AppState {
         } else {
             PathBuf::from(&cfg.project.path)
         };
-        let db_path = cfg.db_path();
         let dim = embedder.dimension();
+        let primary = Store::open(&cfg.db_path(), dim)?;
         Ok(Self {
             cfg,
             root,
-            db_path,
-            dim,
+            primary: Arc::new(Mutex::new(primary)),
             embedder,
             reranker,
             rerank_enabled,
@@ -64,7 +66,13 @@ impl AppState {
     }
 
     fn open_store(&self) -> Result<Store, String> {
-        Store::open(&self.db_path, self.dim).map_err(|e| e.to_string())
+        // Hand out a fresh connection to the same in-process database; the mutex
+        // is held only for the cheap clone, not for the query.
+        self.primary
+            .lock()
+            .map_err(|e| e.to_string())?
+            .try_clone()
+            .map_err(|e| e.to_string())
     }
 
     /// Project name for memory scoping.

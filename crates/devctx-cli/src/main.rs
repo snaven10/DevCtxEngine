@@ -5,7 +5,9 @@
 //! model on first use.
 
 mod mcp_configure;
+mod remote;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -155,6 +157,15 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
+    /// Run the long-lived server that owns the DB; other commands route to it.
+    Serve {
+        /// Address to bind (host:port).
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Bearer token required on all routes except /health (or DEVCTX_API_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 /// Search output format.
@@ -237,6 +248,7 @@ fn main() -> Result<()> {
         Command::Api { addr, token } => cmd_api(addr, token),
         Command::Tui => cmd_tui(),
         Command::Web { addr, no_open } => cmd_web(addr, no_open),
+        Command::Serve { addr, token } => cmd_serve(addr, token),
     }
 }
 
@@ -254,6 +266,24 @@ fn cmd_api(addr: String, token: Option<String>) -> Result<()> {
         .with_context(|| format!("invalid --addr `{addr}`"))?;
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
     devctx_api::run_blocking(cfg, socket, token)
+}
+
+/// `devctx serve` — the long-lived owner of the DB. Advertises itself in a
+/// discovery file so other `devctx` commands route through it (no lock fights).
+fn cmd_serve(addr: String, token: Option<String>) -> Result<()> {
+    let cfg = load_project()?;
+    let socket: SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid --addr `{addr}`"))?;
+    let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
+
+    remote::write_serve_file(&cfg, socket, token.as_deref())?;
+    println!("DevCtxEngine server (owns the DB) → http://{addr}");
+    println!("Other `devctx` commands will route through it while it runs. Ctrl-C to stop.");
+
+    let result = devctx_api::run_blocking(cfg.clone(), socket, token);
+    remote::remove_serve_file(&cfg);
+    result
 }
 
 /// `devctx web` — serve the web dashboard (call-graph + memories) locally.
@@ -331,6 +361,19 @@ fn cmd_remember(
     tags: Option<String>,
 ) -> Result<()> {
     let cfg = load_project()?;
+    if let Some(r) = remote::discover(&cfg) {
+        println!(
+            "{}",
+            r.remember(
+                &content,
+                title.as_deref().unwrap_or(""),
+                &memory_type,
+                topic.as_deref().unwrap_or(""),
+                tags.as_deref().unwrap_or(""),
+            )?
+        );
+        return Ok(());
+    }
     let embedder = build_embedder(&cfg)?;
     let store = open_store(&cfg, embedder.dimension())?;
 
@@ -357,6 +400,10 @@ fn cmd_remember(
 /// `devctx recall` — recall memories relevant to a query.
 fn cmd_recall(query: String, limit: usize) -> Result<()> {
     let cfg = load_project()?;
+    if let Some(r) = remote::discover(&cfg) {
+        println!("{}", r.recall(&query, limit)?);
+        return Ok(());
+    }
     let embedder = build_embedder(&cfg)?;
     let store = open_store(&cfg, embedder.dimension())?;
 
@@ -387,6 +434,10 @@ fn cmd_recall(query: String, limit: usize) -> Result<()> {
 /// `devctx impact` — show the blast radius of a symbol.
 fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     let cfg = load_project()?;
+    if let Some(r) = remote::discover(&cfg) {
+        println!("{}", r.impact(&symbol, depth)?);
+        return Ok(());
+    }
     let store = open_store(&cfg, configured_dimension(&cfg))?;
     let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
     let branch = git.state().branch;
@@ -416,6 +467,13 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
     let cfg = load_project()?;
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    if let Some(r) = remote::discover(&cfg) {
+        println!(
+            "{}",
+            r.summarize(&content, query.as_deref(), tokens.unwrap_or(200))?
+        );
+        return Ok(());
+    }
     let target = tokens.unwrap_or(cfg.summarization.target_tokens);
 
     // The extractive summarizer needs an embedder; other providers don't.
@@ -447,6 +505,10 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
 /// `devctx routes` — list framework-aware HTTP routes.
 fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
     let cfg = load_project()?;
+    if let Some(r) = remote::discover(&cfg) {
+        println!("{}", r.routes(method.as_deref(), path.as_deref())?);
+        return Ok(());
+    }
     let store = open_store(&cfg, configured_dimension(&cfg))?;
     let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
     let routes = store.search_routes(
@@ -510,6 +572,10 @@ impl ProgressSink for IndexBar {
 /// `devctx memory-stats` — show memory counts for the project.
 fn cmd_memory_stats() -> Result<()> {
     let cfg = load_project()?;
+    if let Some(r) = remote::discover(&cfg) {
+        println!("{}", r.memory_stats()?);
+        return Ok(());
+    }
     let store = open_store(&cfg, configured_dimension(&cfg))?;
     let stats = memory_stats(&store, &project_name(&cfg))?;
     println!("{} memories in {}", stats.total, cfg.project.name);
@@ -567,6 +633,12 @@ fn cmd_status() -> Result<()> {
         return Ok(());
     };
     let cfg = ProjectConfig::load(&cfg_path)?;
+    if let Some(r) = remote::discover(&cfg) {
+        println!("DevCtxEngine {} (server mode)", devctx_core::VERSION);
+        println!("  config:   {}", cfg_path.display());
+        println!("{}", r.status()?);
+        return Ok(());
+    }
 
     println!("DevCtxEngine {}", devctx_core::VERSION);
     println!("  config:   {}", cfg_path.display());
@@ -583,6 +655,10 @@ fn cmd_status() -> Result<()> {
 /// `devctx index` — run the indexing pipeline.
 fn cmd_index(full: bool) -> Result<()> {
     let cfg = load_project()?;
+    if let Some(r) = remote::discover(&cfg) {
+        println!("{}", r.index(full)?);
+        return Ok(());
+    }
     let root = project_root(&cfg)?;
     eprintln!(
         "Loading embedder ({} / {})…",
@@ -657,6 +733,18 @@ fn cmd_search(
     hybrid: bool,
 ) -> Result<()> {
     let cfg = load_project()?;
+    if let Some(r) = remote::discover(&cfg) {
+        let mode = if hybrid {
+            "hybrid"
+        } else if keyword {
+            "keyword"
+        } else {
+            "vector"
+        };
+        let json = r.search(&query, limit, language.as_deref(), mode)?;
+        print_remote_search(&json, format)?;
+        return Ok(());
+    }
     let filter = SearchFilter {
         languages: language.into_iter().collect(),
         exclude_deletions: true,
@@ -825,6 +913,41 @@ fn hit_out(h: &SearchResult) -> SearchHitOut<'_> {
 fn render_json(hits: &[SearchResult]) -> Result<String> {
     let out: Vec<SearchHitOut> = hits.iter().map(hit_out).collect();
     Ok(serde_json::to_string_pretty(&out)?)
+}
+
+/// Render a server's `/search` JSON response in the requested output format,
+/// matching the local table layout so routing is transparent.
+fn print_remote_search(json: &str, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{json}"),
+        OutputFormat::Table => {
+            let hits: serde_json::Value = serde_json::from_str(json)?;
+            let arr = hits.as_array().cloned().unwrap_or_default();
+            if arr.is_empty() {
+                println!("No results.");
+                return Ok(());
+            }
+            for h in arr {
+                let s = |k| h.get(k).and_then(|v| v.as_str()).unwrap_or("");
+                let i = |k| h.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+                let sym = if s("symbol").is_empty() {
+                    "-"
+                } else {
+                    s("symbol")
+                };
+                println!(
+                    "{:.3}  {}:{}-{}  {} [{}]",
+                    h.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    s("file"),
+                    i("start_line"),
+                    i("end_line"),
+                    sym,
+                    s("level"),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn render_table(hits: &[SearchResult]) -> String {
