@@ -1,41 +1,16 @@
-# Go
-/devai
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.test
-*.out
-vendor/
+# Rust
+/target
+Cargo.lock
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-*.egg
-dist/
-build/
-.eggs/
-*.whl
-.venv/
-venv/
-env/
+# DevCtxEngine local state / caches
+.devai/
+.fastembed_cache/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 
-# gRPC generated
-ml/devai_ml/proto/*_pb2.py
-ml/devai_ml/proto/*_pb2_grpc.py
-ml/devai_ml/proto/*_pb2.pyi
-
-# Dotfolders (IDE, AI tools, config)
-.*
-!.gitignore
-!.github/
-!.goreleaser.yaml
-
-# IDE (redundant but explicit)
+# IDE / OS
 .idea/
 .vscode/
 *.swp
@@ -43,18 +18,6 @@ ml/devai_ml/proto/*_pb2.pyi
 *~
 .DS_Store
 
-# DevAI state (keep config, ignore state)
-.devai/state/
-!.devai/config.yaml
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
-
-# LanceDB
-*.lance/
-
 # Environment
 .env
 .env.local
-credentials.yaml
