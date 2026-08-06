@@ -59,6 +59,83 @@ pub struct Remote {
     token: Option<String>,
 }
 
+/// A deterministic loopback address per project, so auto-spawned servers for
+/// different projects don't collide on one port.
+fn auto_addr(cfg: &ProjectConfig) -> String {
+    // FNV-1a over the project path → a stable high port.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in cfg.project.path.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let port = 20000 + (h % 40000) as u16;
+    format!("127.0.0.1:{port}")
+}
+
+/// Ensure a server is running for this project, auto-spawning one in the
+/// background if needed, and return a client to it. Falls back to `None` (run
+/// locally) when auto-spawn is disabled (`DEVCTX_NO_AUTOSERVE`) or the server
+/// does not come up in time. Use this for model-heavy commands so the daemon
+/// keeps the embedding model warm across invocations.
+pub fn ensure(cfg: &ProjectConfig) -> Option<Remote> {
+    if let Some(r) = discover(cfg) {
+        return Some(r);
+    }
+    if std::env::var_os("DEVCTX_NO_AUTOSERVE").is_some() {
+        return None;
+    }
+    if spawn_server(cfg).is_err() {
+        return None;
+    }
+    eprintln!("· started background server (devctx serve); it stays warm for later commands");
+    // Poll until healthy (model load can take a few seconds on a cold start).
+    for _ in 0..200 {
+        std::thread::sleep(Duration::from_millis(300));
+        if let Some(r) = discover(cfg) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Launch `devctx serve` detached in the background, with an idle timeout so it
+/// eventually exits on its own.
+fn spawn_server(cfg: &ProjectConfig) -> Result<()> {
+    let exe = std::env::current_exe().context("locating the devctx binary")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["serve", "--addr", &auto_addr(cfg), "--idle", "900"])
+        .current_dir(&cfg.project.path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Detach from the parent's process group so it survives the CLI exiting.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    cmd.spawn().context("spawning devctx serve")?;
+    Ok(())
+}
+
+/// Stop the server advertised for this project (SIGTERM its pid, drop the file).
+pub fn stop_server(cfg: &ProjectConfig) -> Result<()> {
+    let path = serve_file(cfg);
+    let Ok(raw) = std::fs::read(&path) else {
+        println!("No server is registered for this project.");
+        return Ok(());
+    };
+    let info: ServeInfo = serde_json::from_slice(&raw).context("parsing serve.json")?;
+    if let Some(pid) = info.pid {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        println!("Stopped server (pid {pid}).");
+    }
+    remove_serve_file(cfg);
+    Ok(())
+}
+
 /// Discover a running server for this project and confirm it is reachable.
 /// Returns `None` when there is no server (so the caller runs locally).
 pub fn discover(cfg: &ProjectConfig) -> Option<Remote> {

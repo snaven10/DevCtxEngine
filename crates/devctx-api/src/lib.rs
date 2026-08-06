@@ -5,7 +5,8 @@
 //! `/health`. See `docs/rust-rewrite-plan.md`.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
@@ -56,18 +57,48 @@ fn router(api: Api) -> Router {
         .with_state(api)
 }
 
-/// Serve the API until the process is stopped.
+/// Serve the API until the process is stopped. When `idle` is `Some`, the
+/// process exits after that long with no non-health request — used by
+/// auto-spawned servers so they don't linger forever.
 pub async fn serve(
     cfg: ProjectConfig,
     addr: SocketAddr,
     token: Option<String>,
+    idle: Option<Duration>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(AppState::build(cfg)?);
-    let app = router(Api { state, token });
+    let activity = Arc::new(Mutex::new(Instant::now()));
+    let app =
+        router(Api { state, token }).layer(middleware::from_fn_with_state(activity.clone(), track));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("DevCtxEngine API listening on http://{addr}");
+
+    if let Some(timeout) = idle {
+        let act = activity.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let idle_for = act.lock().map(|t| t.elapsed()).unwrap_or_default();
+                if idle_for >= timeout {
+                    eprintln!("DevCtxEngine server idle for {idle_for:?}; shutting down.");
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Middleware: record the time of the last non-health request (for idle-shutdown).
+async fn track(State(act): State<Arc<Mutex<Instant>>>, req: Request, next: Next) -> Response {
+    if req.uri().path() != "/health" {
+        if let Ok(mut t) = act.lock() {
+            *t = Instant::now();
+        }
+    }
+    next.run(req).await
 }
 
 /// Blocking entry point: build a Tokio runtime and serve.
@@ -75,11 +106,12 @@ pub fn run_blocking(
     cfg: ProjectConfig,
     addr: SocketAddr,
     token: Option<String>,
+    idle: Option<Duration>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(cfg, addr, token))
+    rt.block_on(serve(cfg, addr, token, idle))
 }
 
 // --- request bodies / query params ---

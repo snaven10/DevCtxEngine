@@ -165,6 +165,12 @@ enum Command {
         /// Bearer token required on all routes except /health (or DEVCTX_API_TOKEN).
         #[arg(long)]
         token: Option<String>,
+        /// Exit after this many seconds with no request (0 = never; used by auto-spawn).
+        #[arg(long, default_value_t = 0)]
+        idle: u64,
+        /// Stop a running server for this project instead of starting one.
+        #[arg(long)]
+        stop: bool,
     },
 }
 
@@ -248,7 +254,12 @@ fn main() -> Result<()> {
         Command::Api { addr, token } => cmd_api(addr, token),
         Command::Tui => cmd_tui(),
         Command::Web { addr, no_open } => cmd_web(addr, no_open),
-        Command::Serve { addr, token } => cmd_serve(addr, token),
+        Command::Serve {
+            addr,
+            token,
+            idle,
+            stop,
+        } => cmd_serve(addr, token, idle, stop),
     }
 }
 
@@ -265,13 +276,16 @@ fn cmd_api(addr: String, token: Option<String>) -> Result<()> {
         .parse()
         .with_context(|| format!("invalid --addr `{addr}`"))?;
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
-    devctx_api::run_blocking(cfg, socket, token)
+    devctx_api::run_blocking(cfg, socket, token, None)
 }
 
 /// `devctx serve` — the long-lived owner of the DB. Advertises itself in a
 /// discovery file so other `devctx` commands route through it (no lock fights).
-fn cmd_serve(addr: String, token: Option<String>) -> Result<()> {
+fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Result<()> {
     let cfg = load_project()?;
+    if stop {
+        return remote::stop_server(&cfg);
+    }
     let socket: SocketAddr = addr
         .parse()
         .with_context(|| format!("invalid --addr `{addr}`"))?;
@@ -281,7 +295,8 @@ fn cmd_serve(addr: String, token: Option<String>) -> Result<()> {
     println!("DevCtxEngine server (owns the DB) → http://{addr}");
     println!("Other `devctx` commands will route through it while it runs. Ctrl-C to stop.");
 
-    let result = devctx_api::run_blocking(cfg.clone(), socket, token);
+    let idle = (idle > 0).then(|| std::time::Duration::from_secs(idle));
+    let result = devctx_api::run_blocking(cfg.clone(), socket, token, idle);
     remote::remove_serve_file(&cfg);
     result
 }
@@ -299,7 +314,7 @@ fn cmd_web(addr: String, no_open: bool) -> Result<()> {
         open_browser(&url);
     }
     // No token: the dashboard runs locally and needs unauthenticated access.
-    devctx_api::run_blocking(cfg, socket, None)
+    devctx_api::run_blocking(cfg, socket, None, None)
 }
 
 /// Best-effort open of a URL in the platform browser.
@@ -361,7 +376,7 @@ fn cmd_remember(
     tags: Option<String>,
 ) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::discover(&cfg) {
+    if let Some(r) = remote::ensure(&cfg) {
         println!(
             "{}",
             r.remember(
@@ -400,7 +415,7 @@ fn cmd_remember(
 /// `devctx recall` — recall memories relevant to a query.
 fn cmd_recall(query: String, limit: usize) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::discover(&cfg) {
+    if let Some(r) = remote::ensure(&cfg) {
         println!("{}", r.recall(&query, limit)?);
         return Ok(());
     }
@@ -467,7 +482,7 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
     let cfg = load_project()?;
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    if let Some(r) = remote::discover(&cfg) {
+    if let Some(r) = remote::ensure(&cfg) {
         println!(
             "{}",
             r.summarize(&content, query.as_deref(), tokens.unwrap_or(200))?
@@ -733,7 +748,7 @@ fn cmd_search(
     hybrid: bool,
 ) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::discover(&cfg) {
+    if let Some(r) = remote::ensure(&cfg) {
         let mode = if hybrid {
             "hybrid"
         } else if keyword {

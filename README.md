@@ -30,6 +30,12 @@ discovers it (via `.devctx/state/serve.json`) and routes over HTTP instead of
 opening the file, so concurrent CLI/editor/web use never hits a lock. When no
 server is running, commands open the store directly as usual.
 
+Model-heavy commands (`search`, `recall`, `remember`, `summarize`) **auto-spawn**
+a background server on first use and route through it, so the embedding model
+stays warm — repeated commands then return in milliseconds instead of reloading
+the model each time. The daemon idles out after 15 minutes; stop it explicitly
+with `devctx serve --stop`, or disable auto-spawn with `DEVCTX_NO_AUTOSERVE=1`.
+
 `devctx web` serves a self-contained dashboard (call-graph via a vendored,
 offline cytoscape build + a memories browser) and opens it in your browser.
 `devctx tui` is the terminal equivalent, with three views switched by F1/F2/F3.
