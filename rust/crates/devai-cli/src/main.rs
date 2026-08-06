@@ -7,6 +7,7 @@
 mod mcp_configure;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -18,6 +19,7 @@ use devai_memory::{memory_stats, recall, remember, RememberRequest};
 use devai_rerank::{create_reranker, RerankSettings};
 use devai_search::SearchMode;
 use devai_store::Store;
+use devai_summarize::{create_summarizer, SummarizeSettings};
 use mcp_configure::{McpClient, Options, Scope};
 use serde::Serialize;
 
@@ -122,6 +124,17 @@ enum Command {
         #[arg(long)]
         path: Option<String>,
     },
+    /// Summarize a file (extractive by default; query-focusable).
+    Summarize {
+        /// File to summarize.
+        path: PathBuf,
+        /// Focus the summary on a query.
+        #[arg(long)]
+        query: Option<String>,
+        /// Target length in tokens (overrides config).
+        #[arg(long)]
+        tokens: Option<usize>,
+    },
 }
 
 /// Search output format.
@@ -196,6 +209,11 @@ fn main() -> Result<()> {
         Command::MemoryStats => cmd_memory_stats(),
         Command::Impact { symbol, depth } => cmd_impact(symbol, depth),
         Command::Routes { method, path } => cmd_routes(method, path),
+        Command::Summarize {
+            path,
+            query,
+            tokens,
+        } => cmd_summarize(path, query, tokens),
     }
 }
 
@@ -321,6 +339,39 @@ fn print_impact(label: &str, items: &[(String, usize)]) {
     for (sym, d) in &sorted {
         println!("    {sym} (depth {d})");
     }
+}
+
+/// `devai summarize` — summarize a file.
+fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) -> Result<()> {
+    let cfg = load_project()?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let target = tokens.unwrap_or(cfg.summarization.target_tokens);
+
+    // The extractive summarizer needs an embedder; other providers don't.
+    let extractive =
+        cfg.summarization.provider.is_empty() || cfg.summarization.provider == "extractive";
+    let embedder: Option<Arc<dyn EmbeddingProvider>> = if extractive {
+        Some(Arc::from(build_embedder(&cfg)?))
+    } else {
+        None
+    };
+
+    let summarizer = create_summarizer(
+        &SummarizeSettings {
+            provider: cfg.summarization.provider.clone(),
+            require_local: cfg.summarization.require_local,
+            target_tokens: target,
+            model: cfg.summarization.model.clone(),
+            api_key: None,
+        },
+        embedder,
+    )?;
+    println!(
+        "{}",
+        summarizer.summarize(&content, query.as_deref(), target)?
+    );
+    Ok(())
 }
 
 /// `devai routes` — list framework-aware HTTP routes.

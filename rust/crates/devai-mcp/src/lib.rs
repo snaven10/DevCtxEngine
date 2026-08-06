@@ -16,7 +16,8 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt
 
 use state::{
     do_impact, do_index, do_index_status, do_memory_stats, do_read_file, do_recall, do_references,
-    do_remember, do_routes_for_handler, do_search, do_search_routes, parse_mode, AppState,
+    do_remember, do_routes_for_handler, do_search, do_search_routes, do_summarize, parse_mode,
+    AppState,
 };
 
 /// Parameters for the `search` tool.
@@ -127,6 +128,20 @@ struct SearchRoutesReq {
 struct RoutesForHandlerReq {
     /// The handler symbol (`Class.method` or `method`).
     handler: String,
+}
+
+/// Parameters for the `summarize` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct SummarizeReq {
+    /// The text to summarize.
+    content: String,
+    /// Focus the summary on a query (optional).
+    #[serde(default)]
+    query: Option<String>,
+    /// Target length in tokens (default 200).
+    #[serde(default)]
+    max_tokens: Option<usize>,
 }
 
 /// The DevAI MCP server.
@@ -284,6 +299,27 @@ impl DevaiServer {
     ) -> Result<String, ErrorData> {
         let state = self.state.clone();
         run_blocking(move || do_routes_for_handler(&state, &req.handler)).await
+    }
+
+    /// Summarize text (extractive by default; query-focusable).
+    #[tool(
+        description = "Summarize text to roughly `max_tokens`, optionally focused \
+        on a query. Extractive by default (preserves identifiers)."
+    )]
+    async fn summarize(
+        &self,
+        Parameters(req): Parameters<SummarizeReq>,
+    ) -> Result<String, ErrorData> {
+        let state = self.state.clone();
+        run_blocking(move || {
+            do_summarize(
+                &state,
+                &req.content,
+                req.query,
+                req.max_tokens.unwrap_or(200),
+            )
+        })
+        .await
     }
 }
 

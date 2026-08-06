@@ -15,6 +15,7 @@ use devai_memory::{memory_stats, recall, remember, RememberRequest};
 use devai_rerank::{create_reranker, NoopReranker, RerankSettings, Reranker};
 use devai_search::SearchMode;
 use devai_store::Store;
+use devai_summarize::{create_summarizer, SummarizeSettings};
 use serde_json::{json, Value};
 
 /// Immutable server state shared across tool calls.
@@ -328,6 +329,36 @@ fn routes_to_json(routes: &[devai_store::StoredRoute]) -> Result<String, String>
         })
         .collect();
     serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
+}
+
+/// `summarize` tool: condense `content`, optionally focused on `query`.
+pub fn do_summarize(
+    state: &AppState,
+    content: &str,
+    query: Option<String>,
+    target_tokens: usize,
+) -> Result<String, String> {
+    let s = &state.cfg.summarization;
+    let extractive = s.provider.is_empty() || s.provider == "extractive";
+    let embedder = if extractive {
+        Some(state.embedder.clone())
+    } else {
+        None
+    };
+    let summarizer = create_summarizer(
+        &SummarizeSettings {
+            provider: s.provider.clone(),
+            require_local: s.require_local,
+            target_tokens,
+            model: s.model.clone(),
+            api_key: None,
+        },
+        embedder,
+    )
+    .map_err(|e| e.to_string())?;
+    summarizer
+        .summarize(content, query.as_deref(), target_tokens)
+        .map_err(|e| e.to_string())
 }
 
 fn now_epoch() -> String {

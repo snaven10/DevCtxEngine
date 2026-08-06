@@ -1,0 +1,16 @@
+[package]
+name = "devai-summarize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Summarization for DevAI: extractive (default) + OpenAI (abstractive)."
+
+[dependencies]
+devai-core.workspace = true
+thiserror.workspace = true
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+# Only the EmbeddingProvider trait is needed — no fastembed/ort.
+devai-embed = { path = "../devai-embed", default-features = false }

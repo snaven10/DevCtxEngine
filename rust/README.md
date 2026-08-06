@@ -35,8 +35,9 @@ devai mcp configure --client cursor --scope project   # register in an AI client
 | `devai-search` | search orchestration: vector / keyword / hybrid (RRF) + rerank | F8 |
 | `devai-mcp` | MCP server (rmcp, stdio): search / read_file / index_repo / index_status | F6 |
 | `devai-memory` | memory engine: remember (dedup) + recall (intro/chunk blend) | F7 |
+| `devai-summarize` | summarization: extractive (default) + OpenAI (abstractive) | F9 |
 
-Planned (later phases): `devai-summarize`, `devai-api`, `devai-tui`.
+Planned (later phases): local abstractive (flan-t5), `devai-api`, `devai-tui`.
 
 The `devai-embed` `local` feature (default) pulls in `fastembed`/`ort`; build
 with `--no-default-features` for an API-only build where the ONNX Runtime binary

@@ -20,6 +20,7 @@ devai-rerank = { path = "../devai-rerank" }
 devai-mcp = { path = "../devai-mcp" }
 devai-memory = { path = "../devai-memory" }
 devai-search = { path = "../devai-search" }
+devai-summarize = { path = "../devai-summarize" }
 anyhow.workspace = true
 clap.workspace = true
 serde_yaml.workspace = true

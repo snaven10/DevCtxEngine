@@ -15,6 +15,7 @@ devai-index = { path = "../devai-index" }
 devai-rerank = { path = "../devai-rerank" }
 devai-memory = { path = "../devai-memory" }
 devai-search = { path = "../devai-search" }
+devai-summarize = { path = "../devai-summarize" }
 anyhow.workspace = true
 serde = { workspace = true }
 serde_json = "1"

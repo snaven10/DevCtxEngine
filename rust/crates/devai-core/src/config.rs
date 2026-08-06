@@ -132,6 +132,46 @@ fn default_reranker() -> String {
     "bge-base".to_string()
 }
 
+/// `summarization:` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Summarization {
+    /// Provider: `extractive` (default), `openai`, `noop`.
+    #[serde(default = "default_summarizer")]
+    pub provider: String,
+    /// Block non-local providers (privacy guard).
+    #[serde(default = "default_true")]
+    pub require_local: bool,
+    /// Target summary length in tokens.
+    #[serde(default = "default_target_tokens")]
+    pub target_tokens: usize,
+    /// Model id for API providers.
+    #[serde(default = "default_summ_model")]
+    pub model: String,
+}
+
+impl Default for Summarization {
+    fn default() -> Self {
+        Self {
+            provider: default_summarizer(),
+            require_local: true,
+            target_tokens: default_target_tokens(),
+            model: default_summ_model(),
+        }
+    }
+}
+
+fn default_summarizer() -> String {
+    "extractive".to_string()
+}
+
+fn default_target_tokens() -> usize {
+    200
+}
+
+fn default_summ_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
 /// The full project configuration, mirroring `.devai/config.yaml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -156,6 +196,9 @@ pub struct ProjectConfig {
     /// `reranking:` section.
     #[serde(default)]
     pub reranking: Reranking,
+    /// `summarization:` section.
+    #[serde(default)]
+    pub summarization: Summarization,
 }
 
 impl ProjectConfig {
