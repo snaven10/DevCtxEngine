@@ -37,8 +37,9 @@ devai mcp configure --client cursor --scope project   # register in an AI client
 | `devai-memory` | memory engine: remember (dedup) + recall (intro/chunk blend) | F7 |
 | `devai-summarize` | summarization: extractive (default) + OpenAI + local flan-t5 | F9 |
 | `devai-api` | HTTP REST API (axum) reusing the MCP engine, Bearer-token auth | F9 |
+| `devai-tui` | interactive terminal UI (ratatui): live vector/keyword/hybrid search | F9 |
 
-Planned (later phases): `devai-tui`.
+All rewrite phases (F0–F9) are complete.
 
 The `flan-t5` feature (off by default) adds a local abstractive summarizer via
 candle — build with `--features flan-t5` (heavy; downloads the model on first use).

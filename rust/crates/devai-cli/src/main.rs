@@ -144,6 +144,8 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Open the interactive terminal UI (live search browser).
+    Tui,
 }
 
 /// Search output format.
@@ -224,7 +226,14 @@ fn main() -> Result<()> {
             tokens,
         } => cmd_summarize(path, query, tokens),
         Command::Api { addr, token } => cmd_api(addr, token),
+        Command::Tui => cmd_tui(),
     }
+}
+
+/// `devai tui` — open the interactive terminal UI.
+fn cmd_tui() -> Result<()> {
+    let cfg = load_project()?;
+    devai_tui::run(cfg)
 }
 
 /// `devai api` — serve the HTTP REST API.
