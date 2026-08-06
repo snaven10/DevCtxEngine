@@ -451,7 +451,7 @@ fn cmd_index(full: bool) -> Result<()> {
         short_commit(&res.commit)
     );
     println!(
-        "  {} ({} files, {} skipped, {} deleted, {} renamed)",
+        "  {} ({} files, {} skipped, {} deleted, {} pruned, {} renamed)",
         if res.full_reindex {
             "full reindex"
         } else {
@@ -460,6 +460,7 @@ fn cmd_index(full: bool) -> Result<()> {
         res.files_indexed,
         res.files_skipped,
         res.files_deleted,
+        res.files_pruned,
         res.files_renamed,
     );
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);

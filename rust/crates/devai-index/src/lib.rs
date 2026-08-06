@@ -160,6 +160,48 @@ mod tests {
     }
 
     #[test]
+    fn full_reindex_prunes_vanished_files() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devai_index_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "a.rs", "pub fn a() -> i32 { 1 }\n");
+        write(&dir, "b.rs", "pub fn b() -> i32 { 2 }\n");
+        commit_all(&dir, "init");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        let r1 = index(&store, &dir);
+        assert_eq!(r1.files_indexed, 2);
+
+        // Remove b.rs and commit; then force a FULL reindex (git diff won't be used).
+        std::fs::remove_file(dir.join("b.rs")).unwrap();
+        commit_all(&dir, "rm b");
+        let r2 = run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: false,
+            model_name: "minilm-l6",
+        })
+        .unwrap();
+
+        assert!(r2.full_reindex);
+        assert_eq!(r2.files_indexed, 1, "only a.rs remains");
+        assert_eq!(r2.files_pruned, 1, "b.rs should be pruned");
+
+        let b_hits = store
+            .search(&[0.1; DIM], &SearchFilter::default(), 100)
+            .unwrap()
+            .into_iter()
+            .filter(|h| h.point.metadata.file == "b.rs")
+            .count();
+        assert_eq!(b_hits, 0, "stale b.rs vectors remain");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn end_to_end_incremental_indexing() {
         let dir: PathBuf =
             std::env::temp_dir().join(format!("devai_index_e2e_{}", std::process::id()));

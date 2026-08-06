@@ -1,5 +1,6 @@
 //! The indexing pipeline: git diff → parse → chunk → embed → store.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,8 +41,10 @@ pub struct IndexResult {
     pub files_indexed: usize,
     /// Files skipped (unchanged or unsupported).
     pub files_skipped: usize,
-    /// Files removed from the index.
+    /// Files removed from the index (via git deletions).
     pub files_deleted: usize,
+    /// Files pruned as stale during a full reindex (vanished since last index).
+    pub files_pruned: usize,
     /// Files renamed.
     pub files_renamed: usize,
     /// Total symbols across indexed files.
@@ -80,6 +83,14 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     };
     let full_reindex = from.is_none();
 
+    // Snapshot the previously-indexed files so a full reindex can prune any that
+    // vanished (git diff can't detect them when we list all tracked files).
+    let prev_files = if full_reindex {
+        req.store.list_file_states(&repo_path, &branch)?
+    } else {
+        Vec::new()
+    };
+
     let mut ctx = Ctx {
         store: req.store,
         embedder: req.embedder,
@@ -90,6 +101,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         commit: &state.commit,
         full_reindex,
         cfg: ChunkConfig::default(),
+        indexed: HashSet::new(),
     };
 
     let mut result = IndexResult {
@@ -113,6 +125,14 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
             Change::Added(file) | Change::Modified(file) => {
                 ctx.index_file(&file, &mut result)?;
             }
+        }
+    }
+
+    // Prune stale files: previously indexed but not re-indexed this full run.
+    for file in &prev_files {
+        if !ctx.indexed.contains(file) {
+            ctx.delete_file(file)?;
+            result.files_pruned += 1;
         }
     }
 
@@ -141,6 +161,8 @@ struct Ctx<'a> {
     commit: &'a str,
     full_reindex: bool,
     cfg: ChunkConfig,
+    /// Files that were (re)indexed this run — used to prune stale files.
+    indexed: HashSet<String>,
 }
 
 impl Ctx<'_> {
@@ -229,6 +251,7 @@ impl Ctx<'_> {
             symbol_count: symbol_count as i64,
             chunk_count: chunk_count as i64,
         })?;
+        self.indexed.insert(file.to_string());
 
         result.files_indexed += 1;
         result.chunks += chunk_count;

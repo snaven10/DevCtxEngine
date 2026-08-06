@@ -150,6 +150,7 @@ pub fn do_index(state: &AppState, full: bool) -> Result<String, String> {
         "files_indexed": res.files_indexed,
         "files_skipped": res.files_skipped,
         "files_deleted": res.files_deleted,
+        "files_pruned": res.files_pruned,
         "files_renamed": res.files_renamed,
         "symbols": res.symbols,
         "chunks": res.chunks,

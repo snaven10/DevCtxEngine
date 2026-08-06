@@ -152,6 +152,17 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// All file paths with recorded state for a (repo_path, branch). Used to
+    /// prune files that vanished since the last index (full-reindex cleanup).
+    pub fn list_file_states(&self, repo_path: &str, branch: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path FROM file_state WHERE repo_path = ? AND branch = ?")?;
+        let rows = stmt.query_map(params![repo_path, branch], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
