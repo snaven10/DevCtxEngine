@@ -7,6 +7,17 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Summarization for DevAI: extractive (default) + OpenAI (abstractive)."
 
+[features]
+# Local abstractive summarizer (flan-t5 via candle). Off by default — pulls in a
+# heavy ML stack and downloads the model on first use.
+flan-t5 = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+
 [dependencies]
 devai-core.workspace = true
 thiserror.workspace = true
@@ -14,3 +25,9 @@ serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 # Only the EmbeddingProvider trait is needed — no fastembed/ort.
 devai-embed = { path = "../devai-embed", default-features = false }
+
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+tokenizers = { version = "0.21", optional = true }
+hf-hub = { version = "0.4", optional = true }

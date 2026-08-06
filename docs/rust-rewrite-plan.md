@@ -174,7 +174,12 @@ Cada fase deja el binario compilando y con tests; se compara salida contra el De
   de DuckDB. La búsqueda no cambia: el optimizador VSS usa el índice para
   `ORDER BY array_cosine_distance(...) LIMIT` (sin filtros).
 
+### Resueltas
+- **Summarización abstractiva (flan-t5) — implementada, feature-gated.** Crate
+  `devai-summarize` con extractiva (default), OpenAI (cloud) y **flan-t5 local**
+  vía candle (`google/flan-t5-small`, encoder + loop de decode greedy con KV-cache)
+  detrás de la feature `flan-t5`. Validado con un test real (descarga + genera).
+
 ### Abiertas (a decidir en su fase)
-1. **Summarización abstractiva** (flan-t5): ¿portar vía `ort` o dejar solo extractiva al inicio?
-2. **TUI/API**: ¿en alcance del fork o posponer?
+1. **TUI/API**: ¿en alcance del fork o posponer?
 ```

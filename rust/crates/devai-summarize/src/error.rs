@@ -33,4 +33,8 @@ pub enum SummarizeError {
     /// The requested provider is unknown.
     #[error("unknown summarizer provider '{0}'")]
     UnknownProvider(String),
+
+    /// A local model backend failed (load / tokenize / generate).
+    #[error("summarizer backend: {0}")]
+    Backend(String),
 }

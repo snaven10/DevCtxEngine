@@ -10,6 +10,9 @@ mod extractive;
 mod openai;
 mod provider;
 
+#[cfg(feature = "flan-t5")]
+mod flan_t5;
+
 use std::sync::Arc;
 
 use devai_embed::EmbeddingProvider;
@@ -69,8 +72,21 @@ pub fn create_summarizer(
                 .ok_or_else(|| SummarizeError::MissingConfig("OPENAI_API_KEY".into()))?;
             Ok(Box::new(OpenAiSummarizer::new(settings.model.clone(), key)))
         }
+        "flan-t5" => create_flan_t5(),
         other => Err(SummarizeError::UnknownProvider(other.to_string())),
     }
+}
+
+#[cfg(feature = "flan-t5")]
+fn create_flan_t5() -> Result<Box<dyn Summarizer>> {
+    Ok(Box::new(flan_t5::FlanT5Summarizer::load()?))
+}
+
+#[cfg(not(feature = "flan-t5"))]
+fn create_flan_t5() -> Result<Box<dyn Summarizer>> {
+    Err(SummarizeError::UnknownProvider(
+        "flan-t5 (not compiled in; enable the `flan-t5` feature)".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -111,6 +127,33 @@ mod tests {
             create_summarizer(&SummarizeSettings::default(), None),
             Err(SummarizeError::MissingEmbedder)
         ));
+    }
+
+    /// Real local abstractive summary: downloads flan-t5-small and generates.
+    /// Ignored by default (network + model download).
+    #[cfg(feature = "flan-t5")]
+    #[test]
+    #[ignore = "downloads flan-t5-small from HuggingFace"]
+    fn flan_t5_summarizes() {
+        let s = create_summarizer(
+            &SummarizeSettings {
+                provider: "flan-t5".into(),
+                require_local: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let summary = s
+            .summarize(
+                "The quick brown fox jumps over the lazy dog. \
+                 Paris is the capital city of France. \
+                 Rust is a systems programming language focused on safety.",
+                None,
+                40,
+            )
+            .unwrap();
+        assert!(!summary.is_empty(), "empty summary");
     }
 
     #[test]
