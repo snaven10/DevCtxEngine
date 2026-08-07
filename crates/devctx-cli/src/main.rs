@@ -283,11 +283,20 @@ fn main() -> Result<()> {
 /// `devctx tui` — open the interactive terminal UI.
 fn cmd_tui() -> Result<()> {
     let cfg = load_project()?;
-    // The TUI opens the DB directly; stop any background server that owns it.
-    if remote::reclaim_db(&cfg) {
-        eprintln!("· stopped the background server so the TUI can own the database");
-    }
-    devctx_tui::run(cfg)
+    // Route through the server (auto-spawned if needed) so the TUI never opens
+    // the DB itself and coexists with other processes. Fall back to local only
+    // when no server is available.
+    let server = match remote::ensure(&cfg) {
+        Some(r) => {
+            let (base, token) = r.into_parts();
+            Some(devctx_tui::ServerConn { base, token })
+        }
+        None => {
+            remote::reclaim_db(&cfg);
+            None
+        }
+    };
+    devctx_tui::run(cfg, server)
 }
 
 /// `devctx api` — serve the HTTP REST API.

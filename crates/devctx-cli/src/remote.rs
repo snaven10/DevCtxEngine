@@ -211,6 +211,11 @@ pub fn discover(cfg: &ProjectConfig) -> Option<Remote> {
 }
 
 impl Remote {
+    /// Consume into `(base_url, token)` — for handing the connection to the TUI.
+    pub fn into_parts(self) -> (String, Option<String>) {
+        (self.base, self.token)
+    }
+
     fn agent(&self) -> ureq::Agent {
         // Generous overall timeout: a routed `index` of a large repo (or a slow
         // model) can run for many minutes on the server before responding.

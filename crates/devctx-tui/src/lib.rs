@@ -10,13 +10,15 @@
 //! Reranking is skipped for responsiveness. See `docs/rust-rewrite-plan.md`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use devctx_core::config::ProjectConfig;
-use devctx_core::{SearchFilter, SearchResult};
+use devctx_core::{SearchFilter, SearchResult, VectorMetadata, VectorPoint};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::GitRepo;
 use devctx_search::{search as run_search, SearchMode};
 use devctx_store::Store;
+use serde_json::Value;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -41,18 +43,36 @@ struct MemoryItem {
     score: Option<f32>,
 }
 
-/// The engine backing the UI (embedder + store; no reranker for speed).
-struct Engine {
-    store: Store,
-    embedder: Box<dyn EmbeddingProvider>,
-    filter: SearchFilter,
-    repo: String,
-    branch: String,
-    project: String,
+/// Connection to a running server the TUI routes through, so it never opens the
+/// DuckDB file itself (no lock fights with other `devctx` processes).
+pub struct ServerConn {
+    /// Base URL, e.g. `http://127.0.0.1:20111`.
+    pub base: String,
+    /// Bearer token, if the server requires one.
+    pub token: Option<String>,
+}
+
+/// The engine backing the UI: a client of a running server (preferred) or a
+/// direct store (fallback when no server is available).
+// One `Engine` exists per process, so the size gap between variants is irrelevant.
+#[allow(clippy::large_enum_variant)]
+enum Engine {
+    Local {
+        store: Store,
+        embedder: Box<dyn EmbeddingProvider>,
+        filter: SearchFilter,
+        repo: String,
+        branch: String,
+        project: String,
+    },
+    Remote {
+        base: String,
+        token: Option<String>,
+    },
 }
 
 impl Engine {
-    fn build(cfg: &ProjectConfig) -> anyhow::Result<Self> {
+    fn local(cfg: &ProjectConfig) -> anyhow::Result<Self> {
         let embedder = create_provider(&EmbedSettings::from_config(&cfg.embeddings))?;
         let store = Store::open(&cfg.db_path(), embedder.dimension())?;
         let root = if cfg.project.path.is_empty() {
@@ -69,7 +89,7 @@ impl Engine {
         } else {
             cfg.project.name.clone()
         };
-        Ok(Self {
+        Ok(Engine::Local {
             store,
             embedder,
             filter: SearchFilter {
@@ -83,63 +103,217 @@ impl Engine {
     }
 
     fn search(&self, query: &str, mode: SearchMode) -> anyhow::Result<Vec<SearchResult>> {
-        let embedder = if mode == SearchMode::Keyword {
-            None
-        } else {
-            Some(self.embedder.as_ref())
-        };
-        Ok(run_search(
-            &self.store,
-            query,
-            &self.filter,
-            LIMIT,
-            mode,
-            embedder,
-            None,
-        )?)
+        match self {
+            Engine::Local {
+                store,
+                embedder,
+                filter,
+                ..
+            } => {
+                let emb = if mode == SearchMode::Keyword {
+                    None
+                } else {
+                    Some(embedder.as_ref())
+                };
+                Ok(run_search(store, query, filter, LIMIT, mode, emb, None)?)
+            }
+            Engine::Remote { base, token } => {
+                let m = match mode {
+                    SearchMode::Vector => "vector",
+                    SearchMode::Keyword => "keyword",
+                    SearchMode::Hybrid => "hybrid",
+                };
+                let v = http_post(
+                    base,
+                    "/search",
+                    token,
+                    serde_json::json!({ "query": query, "limit": LIMIT, "mode": m }),
+                )?;
+                Ok(v.as_array()
+                    .map(|a| a.iter().map(json_to_hit).collect())
+                    .unwrap_or_default())
+            }
+        }
     }
 
     /// Transitive callers (upstream) and callees (downstream) of a symbol.
     fn graph(&self, symbol: &str) -> anyhow::Result<ImpactLists> {
-        let im = self
-            .store
-            .impact_analysis(&self.repo, &self.branch, symbol, 3)?;
-        Ok((im.upstream, im.downstream))
+        match self {
+            Engine::Local {
+                store,
+                repo,
+                branch,
+                ..
+            } => {
+                let im = store.impact_analysis(repo, branch, symbol, 3)?;
+                Ok((im.upstream, im.downstream))
+            }
+            Engine::Remote { base, token } => {
+                let v = http_get(
+                    base,
+                    &format!("/impact/{}?depth=3", urlencode(symbol)),
+                    token,
+                )?;
+                Ok((json_pairs(&v["upstream"]), json_pairs(&v["downstream"])))
+            }
+        }
     }
 
     fn recall(&self, query: &str) -> anyhow::Result<Vec<MemoryItem>> {
-        let hits = devctx_memory::recall(
-            &self.store,
-            self.embedder.as_ref(),
-            query,
-            Some(&self.project),
-            LIMIT,
-        )?;
-        Ok(hits
-            .into_iter()
-            .map(|h| MemoryItem {
-                title: h.memory.title,
-                mtype: h.memory.memory_type,
-                tags: h.memory.tags,
-                content: h.memory.content,
-                score: Some(h.score),
-            })
-            .collect())
+        match self {
+            Engine::Local {
+                store,
+                embedder,
+                project,
+                ..
+            } => {
+                let hits =
+                    devctx_memory::recall(store, embedder.as_ref(), query, Some(project), LIMIT)?;
+                Ok(hits
+                    .into_iter()
+                    .map(|h| MemoryItem {
+                        title: h.memory.title,
+                        mtype: h.memory.memory_type,
+                        tags: h.memory.tags,
+                        content: h.memory.content,
+                        score: Some(h.score),
+                    })
+                    .collect())
+            }
+            Engine::Remote { base, token } => {
+                let v = http_post(
+                    base,
+                    "/recall",
+                    token,
+                    serde_json::json!({ "query": query, "limit": LIMIT }),
+                )?;
+                Ok(json_memories(&v))
+            }
+        }
     }
 
     fn recent_memories(&self) -> anyhow::Result<Vec<MemoryItem>> {
-        let mems = devctx_memory::memory_context(&self.store, &self.project, LIMIT)?;
-        Ok(mems
-            .into_iter()
-            .map(|m| MemoryItem {
-                title: m.title,
-                mtype: m.memory_type,
-                tags: m.tags,
-                content: m.content,
-                score: None,
-            })
-            .collect())
+        match self {
+            Engine::Local { store, project, .. } => {
+                let mems = devctx_memory::memory_context(store, project, LIMIT)?;
+                Ok(mems
+                    .into_iter()
+                    .map(|m| MemoryItem {
+                        title: m.title,
+                        mtype: m.memory_type,
+                        tags: m.tags,
+                        content: m.content,
+                        score: None,
+                    })
+                    .collect())
+            }
+            Engine::Remote { base, token } => {
+                let v = http_get(base, &format!("/memories?limit={LIMIT}"), token)?;
+                Ok(json_memories(&v))
+            }
+        }
     }
+}
+
+// --- HTTP helpers for the remote backend ---
+
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(120))
+        .build()
+}
+
+fn with_auth(req: ureq::Request, token: &Option<String>) -> ureq::Request {
+    match token {
+        Some(t) => req.set("Authorization", &format!("Bearer {t}")),
+        None => req,
+    }
+}
+
+fn http_get(base: &str, path: &str, token: &Option<String>) -> anyhow::Result<Value> {
+    let req = with_auth(http_agent().get(&format!("{base}{path}")), token);
+    let body = req
+        .call()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .into_string()?;
+    Ok(serde_json::from_str(&body)?)
+}
+
+fn http_post(base: &str, path: &str, token: &Option<String>, body: Value) -> anyhow::Result<Value> {
+    let req = with_auth(http_agent().post(&format!("{base}{path}")), token);
+    let resp = req
+        .send_json(body)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .into_string()?;
+    Ok(serde_json::from_str(&resp)?)
+}
+
+/// Build a display `SearchResult` from a server `/search` hit (vector omitted).
+fn json_to_hit(v: &Value) -> SearchResult {
+    let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+    let i = |k: &str| v[k].as_i64().unwrap_or(0) as i32;
+    SearchResult {
+        score: v["score"].as_f64().unwrap_or(0.0) as f32,
+        point: VectorPoint {
+            id: String::new(),
+            vector: Vec::new(),
+            text: s("text"),
+            metadata: VectorMetadata {
+                file: s("file"),
+                symbol: s("symbol"),
+                symbol_type: s("symbol_type"),
+                start_line: i("start_line"),
+                end_line: i("end_line"),
+                chunk_level: s("level"),
+                ..Default::default()
+            },
+        },
+    }
+}
+
+fn json_pairs(v: &Value) -> Vec<(String, usize)> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|e| {
+                    (
+                        e["symbol"].as_str().unwrap_or("").to_string(),
+                        e["depth"].as_u64().unwrap_or(0) as usize,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_memories(v: &Value) -> Vec<MemoryItem> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|m| MemoryItem {
+                    title: m["title"].as_str().unwrap_or("").to_string(),
+                    mtype: m["type"].as_str().unwrap_or("note").to_string(),
+                    tags: m["tags"].as_str().unwrap_or("").to_string(),
+                    content: m["content"].as_str().unwrap_or("").to_string(),
+                    score: m["score"].as_f64().map(|x| x as f32),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Minimal percent-encoding for a path segment.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Which view is active.
@@ -237,10 +411,20 @@ impl App {
     }
 }
 
-/// Launch the TUI, restoring the terminal on exit.
-pub fn run(cfg: ProjectConfig) -> anyhow::Result<()> {
-    eprintln!("Loading the embedding model…");
-    let engine = Engine::build(&cfg)?;
+/// Launch the TUI, restoring the terminal on exit. When `server` is `Some`, the
+/// TUI routes all queries through that server (no direct DB access); otherwise
+/// it opens the store locally and loads the embedding model.
+pub fn run(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Result<()> {
+    let engine = match server {
+        Some(conn) => Engine::Remote {
+            base: conn.base,
+            token: conn.token,
+        },
+        None => {
+            eprintln!("Loading the embedding model…");
+            Engine::local(&cfg)?
+        }
+    };
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &engine);
     ratatui::restore();
