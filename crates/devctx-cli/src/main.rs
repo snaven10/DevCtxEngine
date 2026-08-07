@@ -283,6 +283,10 @@ fn main() -> Result<()> {
 /// `devctx tui` — open the interactive terminal UI.
 fn cmd_tui() -> Result<()> {
     let cfg = load_project()?;
+    // The TUI opens the DB directly; stop any background server that owns it.
+    if remote::reclaim_db(&cfg) {
+        eprintln!("· stopped the background server so the TUI can own the database");
+    }
     devctx_tui::run(cfg)
 }
 
@@ -293,6 +297,7 @@ fn cmd_api(addr: String, token: Option<String>) -> Result<()> {
         .parse()
         .with_context(|| format!("invalid --addr `{addr}`"))?;
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
+    remote::reclaim_db(&cfg); // take over the DB from any auto-spawned daemon
     devctx_api::run_blocking(cfg, socket, token, None)
 }
 
@@ -303,6 +308,7 @@ fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Resu
     if stop {
         return remote::stop_server(&cfg);
     }
+    remote::reclaim_db(&cfg); // replace any auto-spawned daemon
     let socket: SocketAddr = addr
         .parse()
         .with_context(|| format!("invalid --addr `{addr}`"))?;
@@ -321,6 +327,15 @@ fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Resu
 /// `devctx web` — serve the web dashboard (call-graph + memories) locally.
 fn cmd_web(addr: String, no_open: bool) -> Result<()> {
     let cfg = load_project()?;
+    // A running server (incl. an auto-spawned one) already serves the dashboard
+    // and owns the DB — reuse it instead of trying to bind a second owner.
+    if let Some(url) = remote::running_server_url(&cfg) {
+        println!("Reusing the running server → {url}");
+        if !no_open {
+            open_browser(&url);
+        }
+        return Ok(());
+    }
     let socket = addr
         .parse()
         .with_context(|| format!("invalid --addr `{addr}`"))?;
@@ -356,6 +371,7 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
             .with_context(|| format!("loading project at {}", root.display()))?,
         None => load_project()?,
     };
+    remote::reclaim_db(&cfg); // take over the DB from any auto-spawned daemon
     eprintln!("Starting DevCtxEngine MCP server (stdio)…");
     devctx_mcp::run_stdio(cfg)
 }

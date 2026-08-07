@@ -119,6 +119,59 @@ fn spawn_server(cfg: &ProjectConfig) -> Result<()> {
     Ok(())
 }
 
+/// The base URL of a reachable running server for this project, if any.
+pub fn running_server_url(cfg: &ProjectConfig) -> Option<String> {
+    discover(cfg).map(|r| r.base)
+}
+
+/// Whether a process with `pid` is alive (`kill -0`).
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Send SIGTERM to `pid`, quietly (no "No such process" noise on a race).
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Stop any background server holding this project's DB so the caller can take
+/// exclusive ownership (used by interactive owners like the TUI). Returns
+/// whether a server was stopped. Best-effort and quiet.
+pub fn reclaim_db(cfg: &ProjectConfig) -> bool {
+    let Ok(raw) = std::fs::read(serve_file(cfg)) else {
+        return false;
+    };
+    let Ok(info) = serde_json::from_slice::<ServeInfo>(&raw) else {
+        return false;
+    };
+    let Some(pid) = info.pid else {
+        return false;
+    };
+    if !pid_alive(pid) {
+        remove_serve_file(cfg);
+        return false;
+    }
+    kill_pid(pid);
+    // Wait for it to exit and release the file lock.
+    for _ in 0..40 {
+        if !pid_alive(pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    remove_serve_file(cfg);
+    true
+}
+
 /// Stop the server advertised for this project (SIGTERM its pid, drop the file).
 pub fn stop_server(cfg: &ProjectConfig) -> Result<()> {
     let path = serve_file(cfg);
@@ -128,9 +181,7 @@ pub fn stop_server(cfg: &ProjectConfig) -> Result<()> {
     };
     let info: ServeInfo = serde_json::from_slice(&raw).context("parsing serve.json")?;
     if let Some(pid) = info.pid {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .status();
+        kill_pid(pid);
         println!("Stopped server (pid {pid}).");
     }
     remove_serve_file(cfg);
