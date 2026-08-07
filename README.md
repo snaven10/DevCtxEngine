@@ -30,11 +30,14 @@ discovers it (via `.devctx/state/serve.json`) and routes over HTTP instead of
 opening the file, so concurrent CLI/editor/web use never hits a lock. When no
 server is running, commands open the store directly as usual.
 
-Model-heavy commands (`search`, `recall`, `remember`, `summarize`) **auto-spawn**
-a background server on first use and route through it, so the embedding model
-stays warm — repeated commands then return in milliseconds instead of reloading
-the model each time. The daemon idles out after 15 minutes; stop it explicitly
-with `devctx serve --stop`, or disable auto-spawn with `DEVCTX_NO_AUTOSERVE=1`.
+Every DB command (`search`, `recall`, `remember`, `summarize`, `index`,
+`impact`, `status`, `memory-stats`, `routes`) **auto-spawns** a background
+server on first use and routes through it. This means the server is always the
+single owner of the DB, so nothing ever fights the lock — you can query while
+an `index` runs (readers see a consistent snapshot) — and the embedding model
+stays warm, so repeated commands return in milliseconds. The daemon idles out
+after 15 minutes; stop it explicitly with `devctx serve --stop`, or disable
+auto-spawn with `DEVCTX_NO_AUTOSERVE=1`.
 
 `devctx web` serves a self-contained dashboard (call-graph via a vendored,
 offline cytoscape build + a memories browser) and opens it in your browser.

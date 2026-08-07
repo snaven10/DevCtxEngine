@@ -466,8 +466,14 @@ fn cmd_recall(query: String, limit: usize) -> Result<()> {
 /// `devctx impact` — show the blast radius of a symbol.
 fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::discover(&cfg) {
-        println!("{}", r.impact(&symbol, depth)?);
+    if let Some(r) = remote::ensure(&cfg) {
+        let json: serde_json::Value = serde_json::from_str(&r.impact(&symbol, depth)?)?;
+        println!("Impact of `{symbol}` (depth {depth}):");
+        print_impact("callers (upstream)", &json_depth_pairs(&json["upstream"]));
+        print_impact(
+            "callees (downstream)",
+            &json_depth_pairs(&json["downstream"]),
+        );
         return Ok(());
     }
     let store = open_store(&cfg, configured_dimension(&cfg))?;
@@ -479,6 +485,22 @@ fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     print_impact("callers (upstream)", &impact.upstream);
     print_impact("callees (downstream)", &impact.downstream);
     Ok(())
+}
+
+/// Extract `[{symbol, depth}]` from a server JSON array into `(symbol, depth)`.
+fn json_depth_pairs(v: &serde_json::Value) -> Vec<(String, usize)> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|e| {
+                    (
+                        e["symbol"].as_str().unwrap_or("").to_string(),
+                        e["depth"].as_u64().unwrap_or(0) as usize,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn print_impact(label: &str, items: &[(String, usize)]) {
@@ -537,7 +559,7 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
 /// `devctx routes` — list framework-aware HTTP routes.
 fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::discover(&cfg) {
+    if let Some(r) = remote::ensure(&cfg) {
         println!("{}", r.routes(method.as_deref(), path.as_deref())?);
         return Ok(());
     }
@@ -604,7 +626,7 @@ impl ProgressSink for IndexBar {
 /// `devctx memory-stats` — show memory counts for the project.
 fn cmd_memory_stats() -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::discover(&cfg) {
+    if let Some(r) = remote::ensure(&cfg) {
         println!("{}", r.memory_stats()?);
         return Ok(());
     }
@@ -801,7 +823,7 @@ fn cmd_status() -> Result<()> {
         return Ok(());
     };
     let cfg = ProjectConfig::load(&cfg_path)?;
-    if let Some(r) = remote::discover(&cfg) {
+    if let Some(r) = remote::ensure(&cfg) {
         println!("DevCtxEngine {} (server mode)", devctx_core::VERSION);
         println!("  config:   {}", cfg_path.display());
         println!("{}", r.status()?);
@@ -823,7 +845,7 @@ fn cmd_status() -> Result<()> {
 /// `devctx index` — run the indexing pipeline.
 fn cmd_index(full: bool) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::discover(&cfg) {
+    if let Some(r) = remote::ensure(&cfg) {
         println!("{}", r.index(full)?);
         return Ok(());
     }

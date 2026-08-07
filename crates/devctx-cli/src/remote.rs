@@ -75,8 +75,9 @@ fn auto_addr(cfg: &ProjectConfig) -> String {
 /// Ensure a server is running for this project, auto-spawning one in the
 /// background if needed, and return a client to it. Falls back to `None` (run
 /// locally) when auto-spawn is disabled (`DEVCTX_NO_AUTOSERVE`) or the server
-/// does not come up in time. Use this for model-heavy commands so the daemon
-/// keeps the embedding model warm across invocations.
+/// does not come up in time. Every DB command routes through this so the server
+/// is the single owner of the DuckDB file — no command ever fights the lock
+/// (e.g. querying while an `index` runs), and the embedding model stays warm.
 pub fn ensure(cfg: &ProjectConfig) -> Option<Remote> {
     if let Some(r) = discover(cfg) {
         return Some(r);
@@ -160,8 +161,10 @@ pub fn discover(cfg: &ProjectConfig) -> Option<Remote> {
 
 impl Remote {
     fn agent(&self) -> ureq::Agent {
+        // Generous overall timeout: a routed `index` of a large repo (or a slow
+        // model) can run for many minutes on the server before responding.
         ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(3600))
             .build()
     }
 
