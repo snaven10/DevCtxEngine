@@ -307,7 +307,10 @@ fn cmd_api(addr: String, token: Option<String>) -> Result<()> {
         .with_context(|| format!("invalid --addr `{addr}`"))?;
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
     remote::reclaim_db(&cfg); // take over the DB from any auto-spawned daemon
-    devctx_api::run_blocking(cfg, socket, token, None)
+    remote::write_serve_file(&cfg, socket, token.as_deref())?;
+    let result = devctx_api::run_blocking(cfg.clone(), socket, token, None);
+    remote::remove_serve_file(&cfg);
+    result
 }
 
 /// `devctx serve` — the long-lived owner of the DB. Advertises itself in a
@@ -354,8 +357,13 @@ fn cmd_web(addr: String, no_open: bool) -> Result<()> {
         // Best-effort: open the default browser; ignore failures (headless/CI).
         open_browser(&url);
     }
+    // Advertise so other commands (TUI/CLI) discover and route to this server.
+    remote::reclaim_db(&cfg);
+    remote::write_serve_file(&cfg, socket, None)?;
     // No token: the dashboard runs locally and needs unauthenticated access.
-    devctx_api::run_blocking(cfg, socket, None, None)
+    let result = devctx_api::run_blocking(cfg.clone(), socket, None, None);
+    remote::remove_serve_file(&cfg);
+    result
 }
 
 /// Best-effort open of a URL in the platform browser.

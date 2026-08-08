@@ -57,6 +57,12 @@ pub struct Embeddings {
     /// Model key from the registry (e.g. `minilm-l6`, `ml-granite`).
     #[serde(default = "default_model")]
     pub model: String,
+    /// Directory holding a user-defined ONNX model (e.g. Granite): the ONNX file
+    /// plus `tokenizer.json`/`config.json`. Overrides `DEVCTX_MODEL_DIR`; empty
+    /// falls back to that env var. Lets you pin the model path in the config so
+    /// no shell export is needed.
+    #[serde(default)]
+    pub model_dir: String,
     /// Offline policy.
     #[serde(default)]
     pub offline: Offline,
@@ -67,6 +73,7 @@ impl Default for Embeddings {
         Self {
             provider: default_provider(),
             model: default_model(),
+            model_dir: String::new(),
             offline: Offline::default(),
         }
     }

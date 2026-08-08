@@ -52,7 +52,12 @@ impl EmbedSettings {
             custom_dimension: std::env::var("DEVCTX_EMBED_DIMENSION")
                 .ok()
                 .and_then(|s| s.parse().ok()),
-            model_dir: std::env::var("DEVCTX_MODEL_DIR").ok().map(PathBuf::from),
+            // Config `model_dir` wins; otherwise fall back to the env var.
+            model_dir: if cfg.model_dir.is_empty() {
+                std::env::var("DEVCTX_MODEL_DIR").ok().map(PathBuf::from)
+            } else {
+                Some(PathBuf::from(&cfg.model_dir))
+            },
         }
     }
 }
