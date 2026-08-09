@@ -1,8 +1,9 @@
 //! Shared server state and the blocking tool implementations.
 //!
-//! The embedder and reranker are built once (model load is expensive) and shared
-//! behind `Arc`; the DuckDB store is opened per call (a `Connection` is not
-//! `Sync`), which is cheap relative to embedding.
+//! The embedder and reranker are built **lazily** on first use (model load is
+//! expensive and would otherwise block server startup — e.g. an MCP client's
+//! connect handshake times out while the model downloads). The DuckDB store is
+//! opened once and cloned per call (a `Connection` is not `Sync`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,16 +11,16 @@ use std::sync::{Arc, Mutex};
 
 use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult};
-use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
+use devctx_embed::{create_provider, registry, EmbedSettings, EmbeddingProvider};
 use devctx_index::{run as index_run, GitRepo, IndexRequest};
 use devctx_memory::{memory_context, memory_stats, recall, remember, RememberRequest};
-use devctx_rerank::{create_reranker, NoopReranker, RerankSettings, Reranker};
+use devctx_rerank::{create_reranker, RerankSettings, Reranker};
 use devctx_search::SearchMode;
 use devctx_store::Store;
 use devctx_summarize::{create_summarizer, SummarizeSettings};
 use serde_json::{json, Value};
 
-/// Immutable server state shared across tool calls.
+/// Server state shared across tool calls. Models are loaded on first use.
 pub struct AppState {
     cfg: ProjectConfig,
     root: PathBuf,
@@ -28,41 +29,66 @@ pub struct AppState {
     /// cloned connection to the same in-process database via [`Store::try_clone`],
     /// so they never take a second file lock.
     primary: Arc<Mutex<Store>>,
-    embedder: Arc<dyn EmbeddingProvider>,
-    reranker: Arc<dyn Reranker>,
+    embed_settings: EmbedSettings,
+    rerank_settings: RerankSettings,
     rerank_enabled: bool,
+    /// Built on first use (see [`AppState::embedder`]).
+    embedder: Mutex<Option<Arc<dyn EmbeddingProvider>>>,
+    /// Built on first use (see [`AppState::reranker`]).
+    reranker: Mutex<Option<Arc<dyn Reranker>>>,
 }
 
 impl AppState {
-    /// Build state from a project config (constructs the embedder + reranker).
+    /// Build state from a project config. Cheap: opens the store (dimension read
+    /// from the registry) but does **not** load any model — those come lazily.
     pub fn build(cfg: ProjectConfig) -> anyhow::Result<Self> {
-        let embedder: Arc<dyn EmbeddingProvider> = Arc::from(create_provider(
-            &EmbedSettings::from_config(&cfg.embeddings),
-        )?);
+        let embed_settings = EmbedSettings::from_config(&cfg.embeddings);
         let rerank_enabled = cfg.reranking.enabled;
-        let reranker: Arc<dyn Reranker> = if rerank_enabled {
-            Arc::from(create_reranker(&RerankSettings {
-                enabled: true,
-                model: cfg.reranking.model.clone(),
-            })?)
-        } else {
-            Arc::new(NoopReranker)
+        let rerank_settings = RerankSettings {
+            enabled: rerank_enabled,
+            model: cfg.reranking.model.clone(),
         };
         let root = if cfg.project.path.is_empty() {
             std::env::current_dir()?
         } else {
             PathBuf::from(&cfg.project.path)
         };
-        let dim = embedder.dimension();
+        let dim = configured_dimension(&cfg);
         let primary = Store::open(&cfg.db_path(), dim)?;
         Ok(Self {
             cfg,
             root,
             primary: Arc::new(Mutex::new(primary)),
-            embedder,
-            reranker,
+            embed_settings,
+            rerank_settings,
             rerank_enabled,
+            embedder: Mutex::new(None),
+            reranker: Mutex::new(None),
         })
+    }
+
+    /// The embedding provider, built (and cached) on first use.
+    fn embedder(&self) -> Result<Arc<dyn EmbeddingProvider>, String> {
+        let mut guard = self.embedder.lock().map_err(|e| e.to_string())?;
+        if let Some(e) = guard.as_ref() {
+            return Ok(e.clone());
+        }
+        let e: Arc<dyn EmbeddingProvider> =
+            Arc::from(create_provider(&self.embed_settings).map_err(|e| e.to_string())?);
+        *guard = Some(e.clone());
+        Ok(e)
+    }
+
+    /// The reranker, built (and cached) on first use. Only called when enabled.
+    fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
+        let mut guard = self.reranker.lock().map_err(|e| e.to_string())?;
+        if let Some(r) = guard.as_ref() {
+            return Ok(r.clone());
+        }
+        let r: Arc<dyn Reranker> =
+            Arc::from(create_reranker(&self.rerank_settings).map_err(|e| e.to_string())?);
+        *guard = Some(r.clone());
+        Ok(r)
     }
 
     fn open_store(&self) -> Result<Store, String> {
@@ -91,6 +117,23 @@ impl AppState {
     }
 }
 
+/// The store vector dimension for a config, read from the registry so we don't
+/// have to load the model just to open the store.
+fn configured_dimension(cfg: &ProjectConfig) -> usize {
+    let model = &cfg.embeddings.model;
+    match cfg.embeddings.provider.as_str() {
+        "openai" => registry::openai_dimension(model).unwrap_or(1536),
+        "voyage" => registry::voyage_dimension(model).unwrap_or(1024),
+        "custom" => std::env::var("DEVCTX_EMBED_DIMENSION")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(384),
+        _ => registry::find_local(model)
+            .map(|m| m.dimension)
+            .unwrap_or(384),
+    }
+}
+
 /// `search` tool: vector / keyword / hybrid search, then rerank, return JSON hits.
 pub fn do_search(
     state: &AppState,
@@ -108,15 +151,23 @@ pub fn do_search(
     let embedder = if mode == SearchMode::Keyword {
         None
     } else {
-        Some(state.embedder.as_ref())
+        Some(state.embedder()?)
     };
     let reranker = if state.rerank_enabled && mode != SearchMode::Keyword {
-        Some(state.reranker.as_ref())
+        Some(state.reranker()?)
     } else {
         None
     };
-    let hits = devctx_search::search(&store, query, &filter, limit, mode, embedder, reranker)
-        .map_err(|e| e.to_string())?;
+    let hits = devctx_search::search(
+        &store,
+        query,
+        &filter,
+        limit,
+        mode,
+        embedder.as_deref(),
+        reranker.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
     serde_json::to_string_pretty(&hits_to_json(&hits)).map_err(|e| e.to_string())
 }
 
@@ -145,9 +196,10 @@ pub fn do_read_file(
 /// `index_repo` tool: run the pipeline and return a summary.
 pub fn do_index(state: &AppState, full: bool) -> Result<String, String> {
     let store = state.open_store()?;
+    let embedder = state.embedder()?;
     let res = index_run(IndexRequest {
         store: &store,
-        embedder: state.embedder.as_ref(),
+        embedder: embedder.as_ref(),
         repo_root: &state.root,
         incremental: !full,
         model_name: &state.cfg.embeddings.model,
@@ -217,7 +269,8 @@ pub fn do_remember(
         now: now_epoch(),
         ..Default::default()
     };
-    let res = remember(&store, state.embedder.as_ref(), &req).map_err(|e| e.to_string())?;
+    let embedder = state.embedder()?;
+    let res = remember(&store, embedder.as_ref(), &req).map_err(|e| e.to_string())?;
     Ok(json!({
         "status": format!("{:?}", res.status).to_lowercase(),
         "id": res.memory.id,
@@ -230,14 +283,9 @@ pub fn do_remember(
 pub fn do_recall(state: &AppState, query: &str, limit: usize) -> Result<String, String> {
     let store = state.open_store()?;
     let project = state.project();
-    let hits = recall(
-        &store,
-        state.embedder.as_ref(),
-        query,
-        Some(&project),
-        limit,
-    )
-    .map_err(|e| e.to_string())?;
+    let embedder = state.embedder()?;
+    let hits = recall(&store, embedder.as_ref(), query, Some(&project), limit)
+        .map_err(|e| e.to_string())?;
     let arr: Vec<Value> = hits
         .iter()
         .map(|h| {
@@ -457,7 +505,7 @@ pub fn do_summarize(
     let s = &state.cfg.summarization;
     let extractive = s.provider.is_empty() || s.provider == "extractive";
     let embedder = if extractive {
-        Some(state.embedder.clone())
+        Some(state.embedder()?)
     } else {
         None
     };
