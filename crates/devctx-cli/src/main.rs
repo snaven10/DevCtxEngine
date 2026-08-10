@@ -388,9 +388,22 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
             .with_context(|| format!("loading project at {}", root.display()))?,
         None => load_project()?,
     };
-    remote::reclaim_db(&cfg); // take over the DB from any auto-spawned daemon
-    eprintln!("Starting DevCtxEngine MCP server (stdio)…");
-    devctx_mcp::run_stdio(cfg)
+    // Route through a shared server (auto-spawned if needed) so many MCP
+    // sessions + web/TUI/CLI of the same project coexist without lock fights.
+    // Fall back to owning the DB locally only when no server is available.
+    let server = match remote::ensure(&cfg) {
+        Some(r) => {
+            let (base, token) = r.into_parts();
+            eprintln!("Starting DevCtxEngine MCP server (stdio) → routing to {base}");
+            Some(devctx_mcp::ServerConn { base, token })
+        }
+        None => {
+            remote::reclaim_db(&cfg);
+            eprintln!("Starting DevCtxEngine MCP server (stdio, local DB)…");
+            None
+        }
+    };
+    devctx_mcp::run_stdio(cfg, server)
 }
 
 /// `devctx mcp configure` — register DevCtxEngine as an MCP server in an AI client.

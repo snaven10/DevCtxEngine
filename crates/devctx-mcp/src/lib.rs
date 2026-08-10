@@ -4,6 +4,7 @@
 //! `index_repo`, `index_status`. Memory/route/graph tools follow. Built on the
 //! official `rmcp` SDK. See `docs/rust-rewrite-plan.md` §8 (F6).
 
+pub mod backend;
 pub mod state;
 
 use std::sync::Arc;
@@ -14,11 +15,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 
-use state::{
-    do_impact, do_index, do_index_status, do_memory_stats, do_read_file, do_recall, do_references,
-    do_remember, do_routes_for_handler, do_search, do_search_routes, do_summarize, parse_mode,
-    AppState,
-};
+pub use backend::{Backend, ServerConn};
+use state::AppState;
 
 /// Parameters for the `search` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -144,18 +142,19 @@ struct SummarizeReq {
     max_tokens: Option<usize>,
 }
 
-/// The DevCtxEngine MCP server.
+/// The DevCtxEngine MCP server. The backend is either a local DB owner or a
+/// client of a shared server.
 #[derive(Clone)]
 pub struct DevctxServer {
-    state: Arc<AppState>,
+    backend: Arc<Backend>,
     tool_router: ToolRouter<Self>,
 }
 
 impl DevctxServer {
-    /// Create a server over the given state.
-    pub fn new(state: Arc<AppState>) -> Self {
+    /// Create a server over the given backend.
+    pub fn new(backend: Arc<Backend>) -> Self {
         Self {
-            state,
+            backend,
             tool_router: Self::tool_router(),
         }
     }
@@ -170,16 +169,9 @@ impl DevctxServer {
         chunks (file, lines, symbol, text) as JSON."
     )]
     async fn search(&self, Parameters(req): Parameters<SearchReq>) -> Result<String, ErrorData> {
-        let state = self.state.clone();
+        let backend = self.backend.clone();
         run_blocking(move || {
-            let mode = parse_mode(req.mode.as_deref());
-            do_search(
-                &state,
-                &req.query,
-                req.limit.unwrap_or(10),
-                req.language,
-                mode,
-            )
+            backend.search(&req.query, req.limit.unwrap_or(10), req.language, req.mode)
         })
         .await
     }
@@ -191,24 +183,24 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ReadFileReq>,
     ) -> Result<String, ErrorData> {
-        let state = self.state.clone();
-        run_blocking(move || do_read_file(&state, &req.path, req.start_line, req.end_line)).await
+        let backend = self.backend.clone();
+        run_blocking(move || backend.read_file(&req.path, req.start_line, req.end_line)).await
     }
 
     /// Index (or reindex) the repository.
     #[tool(description = "Index the repository: git diff -> parse -> chunk -> \
         embed -> store. Returns a summary.")]
     async fn index_repo(&self, Parameters(req): Parameters<IndexReq>) -> Result<String, ErrorData> {
-        let state = self.state.clone();
-        run_blocking(move || do_index(&state, req.full.unwrap_or(false))).await
+        let backend = self.backend.clone();
+        run_blocking(move || backend.index(req.full.unwrap_or(false))).await
     }
 
     /// Report index freshness for the current repo/branch.
     #[tool(description = "Report the last-indexed commit/counts for the current \
         repo and branch, and whether the index is up to date.")]
     async fn index_status(&self) -> Result<String, ErrorData> {
-        let state = self.state.clone();
-        run_blocking(move || do_index_status(&state)).await
+        let backend = self.backend.clone();
+        run_blocking(move || backend.index_status()).await
     }
 
     /// Save a memory (decision, insight, note) for later recall.
@@ -220,10 +212,9 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<RememberReq>,
     ) -> Result<String, ErrorData> {
-        let state = self.state.clone();
+        let backend = self.backend.clone();
         run_blocking(move || {
-            do_remember(
-                &state,
+            backend.remember(
                 req.content,
                 req.title.unwrap_or_default(),
                 req.memory_type.unwrap_or_else(|| "note".to_string()),
@@ -238,8 +229,8 @@ impl DevctxServer {
     #[tool(description = "Recall previously saved memories relevant to a query \
         (semantic + intro/chunk blend). Returns JSON.")]
     async fn recall(&self, Parameters(req): Parameters<RecallReq>) -> Result<String, ErrorData> {
-        let state = self.state.clone();
-        run_blocking(move || do_recall(&state, &req.query, req.limit.unwrap_or(5))).await
+        let backend = self.backend.clone();
+        run_blocking(move || backend.recall(&req.query, req.limit.unwrap_or(5))).await
     }
 
     /// Memory counts for the current project.
@@ -248,8 +239,8 @@ impl DevctxServer {
         per type)."
     )]
     async fn memory_stats(&self) -> Result<String, ErrorData> {
-        let state = self.state.clone();
-        run_blocking(move || do_memory_stats(&state)).await
+        let backend = self.backend.clone();
+        run_blocking(move || backend.memory_stats()).await
     }
 
     /// Blast radius of a symbol (transitive callers + callees).
@@ -261,8 +252,8 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ImpactReq>,
     ) -> Result<String, ErrorData> {
-        let state = self.state.clone();
-        run_blocking(move || do_impact(&state, &req.symbol, req.depth.unwrap_or(3))).await
+        let backend = self.backend.clone();
+        run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3))).await
     }
 
     /// All call sites (references) of a symbol.
@@ -274,8 +265,8 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ReferencesReq>,
     ) -> Result<String, ErrorData> {
-        let state = self.state.clone();
-        run_blocking(move || do_references(&state, &req.symbol)).await
+        let backend = self.backend.clone();
+        run_blocking(move || backend.references(&req.symbol)).await
     }
 
     /// Find HTTP routes (framework-aware) by method and/or path.
@@ -287,8 +278,8 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<SearchRoutesReq>,
     ) -> Result<String, ErrorData> {
-        let state = self.state.clone();
-        run_blocking(move || do_search_routes(&state, req.method, req.path)).await
+        let backend = self.backend.clone();
+        run_blocking(move || backend.search_routes(req.method, req.path)).await
     }
 
     /// Reverse lookup: which routes a handler serves.
@@ -297,8 +288,8 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<RoutesForHandlerReq>,
     ) -> Result<String, ErrorData> {
-        let state = self.state.clone();
-        run_blocking(move || do_routes_for_handler(&state, &req.handler)).await
+        let backend = self.backend.clone();
+        run_blocking(move || backend.routes_for_handler(&req.handler)).await
     }
 
     /// Summarize text (extractive by default; query-focusable).
@@ -310,14 +301,9 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<SummarizeReq>,
     ) -> Result<String, ErrorData> {
-        let state = self.state.clone();
+        let backend = self.backend.clone();
         run_blocking(move || {
-            do_summarize(
-                &state,
-                &req.content,
-                req.query,
-                req.max_tokens.unwrap_or(200),
-            )
+            backend.summarize(&req.content, req.query, req.max_tokens.unwrap_or(200))
         })
         .await
     }
@@ -350,18 +336,24 @@ where
 }
 
 /// Serve the DevCtxEngine MCP server over stdio until the client disconnects.
-pub async fn serve_stdio(cfg: ProjectConfig) -> anyhow::Result<()> {
-    let state = Arc::new(AppState::build(cfg)?);
-    let server = DevctxServer::new(state);
-    let service = server.serve(rmcp::transport::stdio()).await?;
+/// When `server` is `Some`, every tool routes to that shared server (no direct
+/// DB access); otherwise the MCP owns the DB locally.
+pub async fn serve_stdio(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Result<()> {
+    let backend = match server {
+        Some(conn) => Arc::new(Backend::remote(conn)),
+        None => Arc::new(Backend::local(Arc::new(AppState::build(cfg)?))),
+    };
+    let service = DevctxServer::new(backend)
+        .serve(rmcp::transport::stdio())
+        .await?;
     service.waiting().await?;
     Ok(())
 }
 
 /// Blocking entry point: build a Tokio runtime and serve over stdio.
-pub fn run_stdio(cfg: ProjectConfig) -> anyhow::Result<()> {
+pub fn run_stdio(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve_stdio(cfg))
+    rt.block_on(serve_stdio(cfg, server))
 }

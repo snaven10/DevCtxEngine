@@ -31,13 +31,15 @@ opening the file, so concurrent CLI/editor/web use never hits a lock. When no
 server is running, commands open the store directly as usual.
 
 Every DB command (`search`, `recall`, `remember`, `summarize`, `index`,
-`impact`, `status`, `memory-stats`, `routes`) **auto-spawns** a background
-server on first use and routes through it. This means the server is always the
-single owner of the DB, so nothing ever fights the lock — you can query while
-an `index` runs (readers see a consistent snapshot) — and the embedding model
-stays warm, so repeated commands return in milliseconds. The daemon idles out
-after 15 minutes; stop it explicitly with `devctx serve --stop`, or disable
-auto-spawn with `DEVCTX_NO_AUTOSERVE=1`.
+`impact`, `status`, `memory-stats`, `routes`), the TUI, the web dashboard **and
+the MCP server** route through one shared server, **auto-spawning** it on first
+use. The server is the single owner of the DB, so nothing ever fights the lock —
+you can run several Claude Code sessions (each an MCP client), the web dashboard,
+the TUI and CLI commands against the same project at once, and query while an
+`index` runs (readers see a consistent snapshot). The embedding model stays warm,
+so repeated commands return in milliseconds. The daemon idles out after 15
+minutes; stop it explicitly with `devctx serve --stop`, or disable auto-spawn
+with `DEVCTX_NO_AUTOSERVE=1`.
 
 `devctx web` serves a self-contained dashboard (call-graph via a vendored,
 offline cytoscape build + a memories browser) and opens it in your browser.
