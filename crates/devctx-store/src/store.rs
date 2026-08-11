@@ -162,6 +162,20 @@ impl Store {
         Ok(true)
     }
 
+    /// Whether the BM25 index exists and is usable.
+    ///
+    /// The FTS extension defines `match_bm25` only once an index has been built,
+    /// so probing the function is what distinguishes "no index" from "no
+    /// extension" — and lets a caller build one instead of surfacing a raw
+    /// catalog error.
+    pub fn has_fts(&self) -> bool {
+        self.load_fts()
+            && self
+                .conn
+                .prepare("SELECT fts_main_vectors.match_bm25(id, 'x') FROM vectors LIMIT 1")
+                .is_ok()
+    }
+
     /// BM25 keyword search over chunk text, with the same equality filters as
     /// [`search`](Self::search). Requires a prior [`rebuild_fts`](Self::rebuild_fts).
     /// Scores are BM25 relevance (higher is better), not cosine similarity.

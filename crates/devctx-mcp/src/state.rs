@@ -130,6 +130,7 @@ pub fn do_search(
     limit: usize,
     language: Option<String>,
     mode: SearchMode,
+    rerank: bool,
 ) -> Result<String, String> {
     let store = state.open_store()?;
     let filter = SearchFilter {
@@ -137,12 +138,37 @@ pub fn do_search(
         exclude_deletions: true,
         ..Default::default()
     };
+    // Keyword search needs the BM25 index, which is opt-in and therefore usually
+    // absent. Building it here — the user has just asked for the feature — turns
+    // a raw `match_bm25 does not exist` catalog error into a one-off wait.
+    if mode != SearchMode::Vector && !store.has_fts() {
+        match store.rebuild_fts() {
+            Ok(true) => eprintln!("· built the keyword (BM25) index for this project"),
+            Ok(false) if mode == SearchMode::Keyword => {
+                return Err("keyword search needs DuckDB's FTS extension, which is \
+                            unavailable here (it is downloaded on first use, so this \
+                            usually means no network). Use vector search instead."
+                    .to_string())
+            }
+            Ok(false) => {}
+            Err(e) if mode == SearchMode::Keyword => {
+                return Err(format!("building the keyword index failed: {e}"))
+            }
+            Err(_) => {}
+        }
+    }
+
     let embedder = if mode == SearchMode::Keyword {
         None
     } else {
         Some(state.embedder()?)
     };
-    let reranker = if state.rerank_enabled && mode != SearchMode::Keyword {
+    // Reranking is by far the most expensive stage — a cross-encoder pass over the
+    // whole candidate pool, seconds on CPU against milliseconds for the search
+    // itself. Callers that value latency over ordering must be able to skip it,
+    // and until this flag existed `--no-rerank` was silently ignored whenever a
+    // command routed through the server, which is the normal case.
+    let reranker = if rerank && state.rerank_enabled && mode != SearchMode::Keyword {
         Some(state.reranker()?)
     } else {
         None

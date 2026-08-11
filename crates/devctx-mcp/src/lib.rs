@@ -33,6 +33,11 @@ struct SearchReq {
     /// Retrieval mode: "vector" (default), "keyword" (BM25), or "hybrid".
     #[serde(default)]
     mode: Option<String>,
+    /// Reorder results with a cross-encoder (default true). Much slower —
+    /// seconds rather than milliseconds — so set false when latency matters
+    /// more than the exact ordering.
+    #[serde(default)]
+    rerank: Option<bool>,
 }
 
 /// Parameters for the `read_file` tool.
@@ -209,7 +214,13 @@ impl DevctxServer {
     async fn search(&self, Parameters(req): Parameters<SearchReq>) -> Result<String, ErrorData> {
         let backend = self.backend.clone();
         run_blocking(move || {
-            backend.search(&req.query, req.limit.unwrap_or(10), req.language, req.mode)
+            backend.search(
+                &req.query,
+                req.limit.unwrap_or(10),
+                req.language,
+                req.mode,
+                req.rerank.unwrap_or(true),
+            )
         })
         .await
     }

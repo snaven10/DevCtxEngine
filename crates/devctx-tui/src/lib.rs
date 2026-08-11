@@ -180,11 +180,18 @@ impl Engine {
                     SearchMode::Keyword => "keyword",
                     SearchMode::Hybrid => "hybrid",
                 };
+                // Reranking costs seconds against milliseconds for the search
+                // itself, which is the difference between this view feeling
+                // instant and feeling broken. The local path already skipped it;
+                // routed — the normal case — it did not, so F1 was slow while
+                // every other view stayed fast.
                 let v = http_post(
                     base,
                     "/search",
                     token,
-                    serde_json::json!({ "query": query, "limit": LIMIT, "mode": m }),
+                    serde_json::json!({
+                        "query": query, "limit": LIMIT, "mode": m, "rerank": false,
+                    }),
                 )?;
                 Ok(v.as_array()
                     .map(|a| a.iter().map(json_to_hit).collect())

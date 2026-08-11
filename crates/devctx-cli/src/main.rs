@@ -1704,7 +1704,7 @@ fn cmd_search(
         } else {
             "vector"
         };
-        let json = r.search(&query, limit, language.as_deref(), mode)?;
+        let json = r.search(&query, limit, language.as_deref(), mode, !no_rerank)?;
         print_remote_search(&json, format)?;
         return Ok(());
     }

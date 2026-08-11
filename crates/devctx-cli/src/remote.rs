@@ -262,11 +262,13 @@ impl Remote {
         limit: usize,
         language: Option<&str>,
         mode: &str,
+        rerank: bool,
     ) -> Result<String> {
         self.post(
             "/search",
             serde_json::json!({
-                "query": query, "limit": limit, "language": language, "mode": mode,
+                "query": query, "limit": limit, "language": language,
+                "mode": mode, "rerank": rerank,
             }),
         )
     }

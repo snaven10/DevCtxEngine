@@ -133,6 +133,10 @@ struct SearchBody {
     language: Option<String>,
     #[serde(default)]
     mode: Option<String>,
+    /// Reorder with the cross-encoder. Defaults to on, matching the config;
+    /// interactive callers turn it off because it dominates latency.
+    #[serde(default)]
+    rerank: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -282,6 +286,7 @@ async fn search(State(api): State<Api>, Json(b): Json<SearchBody>) -> Response {
             b.limit.unwrap_or(10),
             b.language,
             parse_mode(b.mode.as_deref()),
+            b.rerank.unwrap_or(true),
         )
     })
     .await

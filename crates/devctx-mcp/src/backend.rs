@@ -103,13 +103,21 @@ impl Backend {
         limit: usize,
         language: Option<String>,
         mode: Option<String>,
+        rerank: bool,
     ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_search(s, query, limit, language, parse_mode(mode.as_deref())),
+            Backend::Local(s) => do_search(
+                s,
+                query,
+                limit,
+                language,
+                parse_mode(mode.as_deref()),
+                rerank,
+            ),
             Backend::Remote(r) => r.post(
                 "/search",
                 json!({ "query": query, "limit": limit, "language": language,
-                        "mode": mode.unwrap_or_else(|| "vector".into()) }),
+                        "mode": mode.unwrap_or_else(|| "vector".into()), "rerank": rerank }),
             ),
         }
     }
