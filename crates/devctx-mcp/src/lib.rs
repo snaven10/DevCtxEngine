@@ -76,6 +76,10 @@ struct RememberReq {
     /// Comma-separated tags (optional).
     #[serde(default)]
     tags: Option<String>,
+    /// Where the memory belongs: "local" (this project, the default) or
+    /// "global" (the central store, recallable from every other project).
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// Parameters for the `recall` tool.
@@ -87,6 +91,21 @@ struct RecallReq {
     /// Maximum results (default 5).
     #[serde(default)]
     limit: Option<usize>,
+    /// Which memories to search: "local", "global", or "all" (the default).
+    #[serde(default)]
+    scope: Option<String>,
+    /// Only global memories contributed by this repository (see list_projects).
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+/// Parameters for the `list_projects` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ListProjectsReq {
+    /// Include deactivated projects (default false).
+    #[serde(default)]
+    include_inactive: Option<bool>,
 }
 
 /// Parameters for the `impact_analysis` tool.
@@ -206,7 +225,9 @@ impl DevctxServer {
     /// Save a memory (decision, insight, note) for later recall.
     #[tool(
         description = "Save a memory (decision/insight/note/bug/…) so it can be \
-        recalled across sessions. Deduplicated by topic key or content."
+        recalled across sessions. Deduplicated by topic key or content. Use \
+        scope=\"global\" for a lesson worth carrying to other projects; it is \
+        then deduplicated across all of them."
     )]
     async fn remember(
         &self,
@@ -220,6 +241,7 @@ impl DevctxServer {
                 req.memory_type.unwrap_or_else(|| "note".to_string()),
                 req.topic.unwrap_or_default(),
                 req.tags.unwrap_or_default(),
+                req.scope.unwrap_or_else(|| "local".to_string()),
             )
         })
         .await
@@ -227,10 +249,35 @@ impl DevctxServer {
 
     /// Recall memories relevant to a query.
     #[tool(description = "Recall previously saved memories relevant to a query \
-        (semantic + intro/chunk blend). Returns JSON.")]
+        (semantic + intro/chunk blend). Searches this project and the shared \
+        central store by default; each hit is tagged with the scope it came \
+        from. Returns JSON.")]
     async fn recall(&self, Parameters(req): Parameters<RecallReq>) -> Result<String, ErrorData> {
         let backend = self.backend.clone();
-        run_blocking(move || backend.recall(&req.query, req.limit.unwrap_or(5))).await
+        run_blocking(move || {
+            backend.recall(
+                &req.query,
+                req.limit.unwrap_or(5),
+                req.scope.as_deref().unwrap_or("all"),
+                req.repo.as_deref(),
+            )
+        })
+        .await
+    }
+
+    /// Every project DevCtxEngine knows about.
+    #[tool(
+        description = "List every repository DevCtxEngine tracks: name, path, \
+        description, embedding model and how fresh its index is. Use this to \
+        discover which other projects exist before recalling from them or \
+        reading their code. Returns JSON."
+    )]
+    async fn list_projects(
+        &self,
+        Parameters(req): Parameters<ListProjectsReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.backend.clone();
+        run_blocking(move || backend.list_projects(req.include_inactive.unwrap_or(false))).await
     }
 
     /// Memory counts for the current project.

@@ -35,6 +35,10 @@ pub enum CentralError {
     #[error("{0} is not a DevCtxEngine project (run `devctx init` there, or pass --init)")]
     NotInitialized(PathBuf),
 
+    /// A relative repository path reached the registry.
+    #[error("repository path `{0}` must be absolute (it is resolved by whoever holds the store, not the caller)")]
+    RelativePath(PathBuf),
+
     /// Another repository is already registered under this name.
     #[error("project name `{name}` is already taken by {path}; pass --name to choose another")]
     NameTaken {
@@ -71,6 +75,10 @@ pub enum CentralError {
     /// Building the central memory embedder failed.
     #[error("loading the central memory model: {0}")]
     Embed(#[from] devctx_embed::EmbedError),
+
+    /// Talking to the central daemon failed, or it returned an error.
+    #[error("{0}")]
+    Request(String),
 
     /// A memory operation failed.
     #[error(transparent)]

@@ -10,6 +10,7 @@
 //! `devctx serve --central` is that writer; short-lived commands may open it
 //! directly while no daemon is running.
 
+pub mod client;
 pub mod config;
 pub mod error;
 pub mod paths;
@@ -22,6 +23,7 @@ use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_memory::{RecallQuery, RecalledMemory, RememberRequest, RememberResult};
 use devctx_store::{Memory, ProjectRecord, Store};
 
+pub use client::{CentralClient, ServeInfo};
 pub use config::CentralConfig;
 pub use error::{CentralError, Result};
 pub use paths::{CentralPaths, HOME_ENV};
@@ -216,6 +218,12 @@ impl Central {
     /// entry is carried forward, preserving its registration time and index
     /// statistics, and renamed if the caller asked for a different name.
     pub fn register(&self, req: &RegisterRequest) -> Result<ProjectRecord> {
+        // A relative path is meaningless here: the daemon's working directory is
+        // not the caller's, so resolving one would register the wrong repository
+        // without anyone noticing. Callers resolve before they hand it over.
+        if req.root.is_relative() {
+            return Err(CentralError::RelativePath(req.root.clone()));
+        }
         let root =
             std::fs::canonicalize(&req.root).map_err(|e| CentralError::Io(e, req.root.clone()))?;
         let config_path = root.join(devctx_core::CONFIG_FILE_NAME);
@@ -668,6 +676,21 @@ mod tests {
             central.refresh("ghost", "400").unwrap_err(),
             CentralError::UnknownProject(_)
         ));
+    }
+
+    /// A relative path resolved by the store rather than the caller would point
+    /// at whatever repository the daemon happens to be sitting in.
+    #[test]
+    fn a_relative_path_is_refused() {
+        let tmp = Tmp::new("relative");
+        let central = Central::open_in(&tmp.join("home")).unwrap();
+        match central.register(&RegisterRequest {
+            root: PathBuf::from("./somewhere"),
+            ..req(PathBuf::from("."))
+        }) {
+            Err(CentralError::RelativePath(p)) => assert_eq!(p, PathBuf::from("./somewhere")),
+            other => panic!("expected a relative-path refusal, got {other:?}"),
+        }
     }
 
     #[test]

@@ -4,7 +4,6 @@
 //! embedder pulls in fastembed/ort (the `local` provider) and downloads the
 //! model on first use.
 
-mod central_remote;
 mod mcp_configure;
 mod remote;
 
@@ -383,7 +382,7 @@ fn cmd_projects(action: ProjectsAction) -> Result<()> {
     // Route through the daemon so concurrent commands don't fight over the
     // single-writer DuckDB file. Falling back to a direct open keeps a lone
     // command working when no daemon can be spawned.
-    let remote = central_remote::ensure(&paths);
+    let remote = devctx_central::client::ensure(&paths);
     let direct = || Central::open().context("opening the central store");
 
     match action {
@@ -398,6 +397,11 @@ fn cmd_projects(action: ProjectsAction) -> Result<()> {
                 Some(p) => p,
                 None => std::env::current_dir().context("resolving current directory")?,
             };
+            // Resolve against *our* working directory before the path leaves this
+            // process: the daemon has its own cwd, so a relative path would
+            // otherwise silently register whatever repository it happens to sit in.
+            let root = std::fs::canonicalize(&root)
+                .with_context(|| format!("resolving {}", root.display()))?;
             let rec = match &remote {
                 Some(r) => r.add(&root, name.as_deref(), &description, &tags, init)?,
                 None => project_json(&direct()?.register(&RegisterRequest {
@@ -633,9 +637,9 @@ fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Resu
 fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool) -> Result<()> {
     let paths = CentralPaths::resolve().context("resolving the central store location")?;
     if stop {
-        return central_remote::stop(&paths);
+        return Ok(devctx_central::client::stop(&paths)?);
     }
-    if central_remote::discover(&paths).is_some() {
+    if devctx_central::client::discover(&paths).is_some() {
         bail!(
             "a central daemon is already running for {} (stop it with \
              `devctx serve --central --stop`)",
@@ -646,7 +650,7 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
     // `--addr` defaults to the project-server port, which would be wrong here;
     // when it is left at that default, use the per-home address instead.
     let addr = if addr == DEFAULT_ADDR {
-        central_remote::default_addr(&paths)
+        devctx_central::client::default_addr(&paths)
     } else {
         addr
     };
@@ -656,7 +660,7 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
 
     let central = Central::open().context("opening the central store")?;
-    central_remote::write_serve_file(&paths, socket, token.as_deref())?;
+    devctx_central::client::write_serve_file(&paths, socket, token.as_deref())?;
     println!("DevCtxEngine central store → http://{addr}");
     println!("  Database: {}", paths.db.display());
     println!("  Config:   {}", paths.config.display());
@@ -664,7 +668,7 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
 
     let idle = (idle > 0).then(|| std::time::Duration::from_secs(idle));
     let result = devctx_api::central::run_blocking(central, socket, token, idle);
-    central_remote::remove_serve_file(&paths);
+    devctx_central::client::remove_serve_file(&paths);
     result
 }
 
@@ -776,7 +780,16 @@ fn cmd_remember(
     // A global memory belongs to the central store, which only the daemon may
     // write — so this path never touches a project database.
     if scope != MemoryScope::Local {
+        // Provenance must never be blank: a directory that is not a git repo
+        // still belongs to a named project, and "which project taught me this"
+        // is the whole point of recording it.
+        let project = project_name(&cfg);
         let (repo, branch) = repo_branch(&cfg);
+        let repo = if repo.is_empty() {
+            project.clone()
+        } else {
+            repo
+        };
         let out = with_central(|c| {
             c.remember(
                 &content,
@@ -784,7 +797,7 @@ fn cmd_remember(
                 &memory_type,
                 topic.as_deref().unwrap_or(""),
                 tags.as_deref().unwrap_or(""),
-                &project_name(&cfg),
+                &project,
                 &repo,
                 &branch,
             )
@@ -903,10 +916,12 @@ fn local_recall(cfg: &ProjectConfig, query: &str, limit: usize) -> Result<Vec<se
 
 /// Open the central store — through the daemon when one is reachable, directly
 /// otherwise — and run `f` against it.
-fn with_central<T>(f: impl FnOnce(&central_remote::CentralRemote) -> Result<T>) -> Result<T> {
+fn with_central<T>(
+    f: impl FnOnce(&devctx_central::CentralClient) -> devctx_central::Result<T>,
+) -> Result<T> {
     let paths = CentralPaths::resolve().context("resolving the central store location")?;
-    match central_remote::ensure(&paths) {
-        Some(r) => f(&r),
+    match devctx_central::client::ensure(&paths) {
+        Some(r) => Ok(f(&r)?),
         None => bail!(
             "no central daemon and one could not be started; run \
              `devctx serve --central` (store: {})",

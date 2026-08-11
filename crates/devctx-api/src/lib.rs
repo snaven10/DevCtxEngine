@@ -16,9 +16,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_graph, do_impact, do_index, do_index_status, do_memory_context, do_memory_stats,
-    do_read_file, do_recall, do_references, do_remember, do_routes_for_handler, do_search,
-    do_search_routes, do_summarize, parse_mode, AppState,
+    do_graph, do_impact, do_index, do_index_status, do_list_projects, do_memory_context,
+    do_memory_stats, do_read_file, do_recall_scoped, do_references, do_remember,
+    do_remember_global, do_routes_for_handler, do_search, do_search_routes, do_summarize,
+    parse_mode, AppState,
 };
 use serde::Deserialize;
 
@@ -48,6 +49,7 @@ fn router(api: Api) -> Router {
         .route("/recall", post(recall))
         .route("/memories", get(memories))
         .route("/memory/stats", get(memory_stats))
+        .route("/projects", get(list_projects))
         .route("/graph", get(graph))
         .route("/impact/:symbol", get(impact))
         .route("/references/:symbol", get(references))
@@ -150,6 +152,9 @@ struct RememberBody {
     topic: Option<String>,
     #[serde(default)]
     tags: Option<String>,
+    /// `local` (default) or `global` — global goes to the central store.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -157,6 +162,18 @@ struct RecallBody {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
+    /// `local`, `global`, or `all` (default).
+    #[serde(default)]
+    scope: Option<String>,
+    /// Narrow global results to one contributing repository.
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListProjectsQuery {
+    #[serde(default)]
+    all: bool,
 }
 
 #[derive(Deserialize)]
@@ -277,23 +294,42 @@ async fn status(State(api): State<Api>) -> Response {
 
 async fn remember(State(api): State<Api>, Json(b): Json<RememberBody>) -> Response {
     run(api.state, move |s| {
-        do_remember(
-            s,
-            b.content,
-            b.title.unwrap_or_default(),
-            b.memory_type.unwrap_or_else(|| "note".to_string()),
-            b.topic.unwrap_or_default(),
-            b.tags.unwrap_or_default(),
-        )
+        let title = b.title.unwrap_or_default();
+        let memory_type = b.memory_type.unwrap_or_else(|| "note".to_string());
+        let topic = b.topic.unwrap_or_default();
+        let tags = b.tags.unwrap_or_default();
+        if devctx_memory::is_global(b.scope.as_deref().unwrap_or("local")) {
+            return do_remember_global(s, &b.content, &title, &memory_type, &topic, &tags);
+        }
+        do_remember(s, b.content, title, memory_type, topic, tags)
     })
     .await
 }
 
 async fn recall(State(api): State<Api>, Json(b): Json<RecallBody>) -> Response {
     run(api.state, move |s| {
-        do_recall(s, &b.query, b.limit.unwrap_or(5))
+        do_recall_scoped(
+            s,
+            &b.query,
+            b.limit.unwrap_or(5),
+            b.scope.as_deref().unwrap_or("all"),
+            b.repo.as_deref(),
+        )
     })
     .await
+}
+
+/// The registry, proxied so a routed MCP session can reach it without opening
+/// the central database itself.
+async fn list_projects(Query(q): Query<ListProjectsQuery>) -> Response {
+    match tokio::task::spawn_blocking(move || do_list_projects(q.all)).await {
+        Ok(Ok(body)) => json_ok(body),
+        Ok(Err(e)) => json_err(StatusCode::BAD_REQUEST, e),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task failed: {e}"),
+        ),
+    }
 }
 
 async fn memory_stats(State(api): State<Api>) -> Response {

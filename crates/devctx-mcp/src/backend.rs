@@ -8,9 +8,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::state::{
-    do_impact, do_index, do_index_status, do_memory_stats, do_read_file, do_recall, do_references,
-    do_remember, do_routes_for_handler, do_search, do_search_routes, do_summarize, parse_mode,
-    AppState,
+    do_impact, do_index, do_index_status, do_list_projects, do_memory_stats, do_read_file,
+    do_recall_scoped, do_references, do_remember, do_remember_global, do_routes_for_handler,
+    do_search, do_search_routes, do_summarize, parse_mode, AppState,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -43,19 +43,39 @@ impl RemoteClient {
     }
 
     fn get(&self, path: &str) -> Result<String, String> {
-        self.auth(self.agent().get(&format!("{}{path}", self.base)))
-            .call()
-            .map_err(|e| e.to_string())?
-            .into_string()
-            .map_err(|e| e.to_string())
+        read(
+            self.auth(self.agent().get(&format!("{}{path}", self.base)))
+                .call(),
+        )
     }
 
     fn post(&self, path: &str, body: Value) -> Result<String, String> {
-        self.auth(self.agent().post(&format!("{}{path}", self.base)))
-            .send_json(body)
-            .map_err(|e| e.to_string())?
-            .into_string()
-            .map_err(|e| e.to_string())
+        read(
+            self.auth(self.agent().post(&format!("{}{path}", self.base)))
+                .send_json(body),
+        )
+    }
+}
+
+/// Read a response body, surfacing the server's own `error` message on a
+/// failure status. Without this a routed tool call reports only "status code
+/// 500" and the actual cause — which the server did explain — is thrown away.
+fn read(r: Result<ureq::Response, ureq::Error>) -> Result<String, String> {
+    match r {
+        Ok(resp) => resp.into_string().map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or(body);
+            Err(if msg.is_empty() {
+                format!("server returned status {code}")
+            } else {
+                msg
+            })
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -131,22 +151,42 @@ impl Backend {
         memory_type: String,
         topic: String,
         tags: String,
+        scope: String,
     ) -> Result<String, String> {
+        let global = devctx_memory::is_global(&scope);
         match self {
+            Backend::Local(s) if global => {
+                do_remember_global(s, &content, &title, &memory_type, &topic, &tags)
+            }
             Backend::Local(s) => do_remember(s, content, title, memory_type, topic, tags),
             Backend::Remote(r) => r.post(
                 "/remember",
                 json!({ "content": content, "title": title, "type": memory_type,
-                        "topic": topic, "tags": tags }),
+                        "topic": topic, "tags": tags, "scope": scope }),
             ),
         }
     }
 
-    pub fn recall(&self, query: &str, limit: usize) -> Result<String, String> {
+    pub fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        scope: &str,
+        repo: Option<&str>,
+    ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_recall(s, query, limit),
-            Backend::Remote(r) => r.post("/recall", json!({ "query": query, "limit": limit })),
+            Backend::Local(s) => do_recall_scoped(s, query, limit, scope, repo),
+            Backend::Remote(r) => r.post(
+                "/recall",
+                json!({ "query": query, "limit": limit, "scope": scope, "repo": repo }),
+            ),
         }
+    }
+
+    /// The project registry. Independent of which project this session is in —
+    /// both backends ask the central daemon, since neither may open its database.
+    pub fn list_projects(&self, include_inactive: bool) -> Result<String, String> {
+        do_list_projects(include_inactive)
     }
 
     pub fn memory_stats(&self) -> Result<String, String> {

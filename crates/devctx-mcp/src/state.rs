@@ -406,6 +406,152 @@ pub fn do_graph(
     .to_string())
 }
 
+/// Reach the central store, auto-spawning the daemon if needed.
+///
+/// The project server must never open the central database itself — DuckDB
+/// allows one writing process per file, and that process is the daemon.
+fn central() -> Result<devctx_central::CentralClient, String> {
+    let paths = devctx_central::CentralPaths::resolve().map_err(|e| e.to_string())?;
+    devctx_central::client::ensure(&paths).ok_or_else(|| {
+        "no central store daemon and one could not be started; run `devctx serve --central`"
+            .to_string()
+    })
+}
+
+/// `list_projects` tool: every repository DevCtxEngine knows about.
+///
+/// This is what lets an agent working in one repo discover the others without
+/// being told they exist.
+pub fn do_list_projects(include_inactive: bool) -> Result<String, String> {
+    let projects = central()?
+        .list(include_inactive)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&json!({ "projects": projects })).map_err(|e| e.to_string())
+}
+
+/// `remember` with `scope: global`: store in the shared central memory instead
+/// of this project's, so every other project can recall it.
+pub fn do_remember_global(
+    state: &AppState,
+    content: &str,
+    title: &str,
+    memory_type: &str,
+    topic: &str,
+    tags: &str,
+) -> Result<String, String> {
+    let project = state.project();
+    let (repo, branch) = state.repo_branch().unwrap_or_default();
+    // Provenance must never be blank: a directory that is not a git repo still
+    // belongs to a named project, and "which project taught me this" is the
+    // whole point of recording it.
+    let repo = if repo.is_empty() {
+        project.clone()
+    } else {
+        repo
+    };
+    let out = central()?
+        .remember(
+            content,
+            title,
+            memory_type,
+            topic,
+            tags,
+            &project,
+            &repo,
+            &branch,
+        )
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// `recall` across scopes. Local and global results are fused by **rank**, not
+/// score: the two stores may embed with different models, so their similarities
+/// are not on comparable scales.
+pub fn do_recall_scoped(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    scope: &str,
+    repo: Option<&str>,
+) -> Result<String, String> {
+    let want_local = scope != "global";
+    let want_global = scope != "local";
+
+    let local: Vec<Value> = if want_local {
+        let store = state.open_store()?;
+        let project = state.project();
+        let embedder = state.embedder()?;
+        recall(
+            &store,
+            embedder.as_ref(),
+            &RecallQuery {
+                query,
+                project: Some(&project),
+                repo: None,
+                limit,
+            },
+        )
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|h| {
+            json!({
+                "id": h.memory.id, "title": h.memory.title, "content": h.memory.content,
+                "type": h.memory.memory_type, "tags": h.memory.tags, "repo": h.memory.repo,
+            })
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+
+    let global: Vec<Value> = if want_global {
+        central()?
+            .recall(query, limit, repo)
+            .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+
+    let fused = fuse_by_rank(vec![(local, "local"), (global, "global")], limit);
+    serde_json::to_string_pretty(&json!({ "memories": fused })).map_err(|e| e.to_string())
+}
+
+/// Reciprocal rank fusion over labelled result lists, tagging each survivor with
+/// the scope it came from.
+fn fuse_by_rank(lists: Vec<(Vec<Value>, &str)>, limit: usize) -> Vec<Value> {
+    const RRF_K: f32 = 60.0;
+    let mut scores: HashMap<String, f32> = HashMap::new();
+    let mut items: HashMap<String, Value> = HashMap::new();
+
+    for (list, origin) in lists {
+        for (rank, hit) in list.into_iter().enumerate() {
+            let id = hit
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+            items.entry(id).or_insert_with(|| {
+                let mut v = hit;
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("scope".to_string(), json!(origin));
+                }
+                v
+            });
+        }
+    }
+
+    let mut out: Vec<(String, Value)> = items.into_iter().collect();
+    out.sort_by(|a, b| {
+        scores[&b.0]
+            .partial_cmp(&scores[&a.0])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out.truncate(limit);
+    out.into_iter().map(|(_, v)| v).collect()
+}
+
 /// `memory_stats` tool: memory counts for the project.
 pub fn do_memory_stats(state: &AppState) -> Result<String, String> {
     let store = state.open_store()?;

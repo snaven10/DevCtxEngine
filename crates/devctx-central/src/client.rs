@@ -1,25 +1,37 @@
 //! Client side of the central daemon: discover a running `devctx serve
-//! --central`, auto-spawn one when absent, and route registry calls to it.
+//! --central`, auto-spawn one when absent, and route calls to it.
 //!
-//! This mirrors [`crate::remote`], with one difference that matters: a project
-//! server is per-repository, while the central store is a singleton. Opening it
-//! from two processes at once does not degrade — it fails outright, since DuckDB
-//! permits a single writing process per file. So unlike the project case, where
-//! falling back to a direct open is harmless, here the daemon is what keeps
-//! concurrent commands from knocking each other over.
+//! Everything that is not the daemon itself reaches the central store through
+//! here — the CLI, the MCP server, and later the TUI. That matters because the
+//! central database is a singleton: opening it from two processes at once does
+//! not degrade, it fails outright, since DuckDB permits a single writing process
+//! per file.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use devctx_central::CentralPaths;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::remote::ServeInfo;
+use crate::error::{CentralError, Result};
+use crate::paths::CentralPaths;
+
+/// What `devctx serve --central` advertises so clients can find it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServeInfo {
+    /// `host:port` the daemon is bound to.
+    pub addr: String,
+    /// Bearer token it requires (if any).
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Owner process id (informational).
+    #[serde(default)]
+    pub pid: Option<u32>,
+}
 
 /// A reachable central daemon.
-pub struct CentralRemote {
+pub struct CentralClient {
     base: String,
     token: Option<String>,
 }
@@ -53,8 +65,9 @@ pub fn write_serve_file(paths: &CentralPaths, addr: SocketAddr, token: Option<&s
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(&path, serde_json::to_vec_pretty(&info)?)
-        .with_context(|| format!("writing {}", path.display()))?;
+    let body =
+        serde_json::to_vec_pretty(&info).map_err(|e| CentralError::Request(e.to_string()))?;
+    std::fs::write(&path, body).map_err(|e| CentralError::Io(e, path.clone()))?;
     Ok(())
 }
 
@@ -64,7 +77,7 @@ pub fn remove_serve_file(paths: &CentralPaths) {
 }
 
 /// Discover a running central daemon and confirm it answers.
-pub fn discover(paths: &CentralPaths) -> Option<CentralRemote> {
+pub fn discover(paths: &CentralPaths) -> Option<CentralClient> {
     let raw = std::fs::read(serve_file(paths)).ok()?;
     let info: ServeInfo = serde_json::from_slice(&raw).ok()?;
     let base = format!("http://{}", info.addr);
@@ -77,7 +90,7 @@ pub fn discover(paths: &CentralPaths) -> Option<CentralRemote> {
     if !ok {
         return None;
     }
-    Some(CentralRemote {
+    Some(CentralClient {
         base,
         token: info.token,
     })
@@ -89,7 +102,7 @@ pub fn discover(paths: &CentralPaths) -> Option<CentralRemote> {
 /// which case the caller opens the store directly — correct for a lone command,
 /// and the reason a single `devctx projects list` still works with no daemon at
 /// all.
-pub fn ensure(paths: &CentralPaths) -> Option<CentralRemote> {
+pub fn ensure(paths: &CentralPaths) -> Option<CentralClient> {
     if let Some(r) = discover(paths) {
         return Some(r);
     }
@@ -111,8 +124,9 @@ pub fn ensure(paths: &CentralPaths) -> Option<CentralRemote> {
 
 /// Launch `devctx serve --central` detached, with an idle timeout.
 fn spawn(paths: &CentralPaths) -> Result<()> {
-    let exe = std::env::current_exe().context("locating the devctx binary")?;
-    let mut cmd = std::process::Command::new(exe);
+    let exe_path =
+        std::env::current_exe().map_err(|e| CentralError::Io(e, PathBuf::from("<current exe>")))?;
+    let mut cmd = std::process::Command::new(&exe_path);
     cmd.args([
         "serve",
         "--central",
@@ -126,13 +140,14 @@ fn spawn(paths: &CentralPaths) -> Result<()> {
     .stderr(std::process::Stdio::null());
     // The daemon resolves its own paths from the environment, so pass the home
     // through explicitly rather than relying on the parent's cwd.
-    cmd.env(devctx_central::HOME_ENV, &paths.dir);
+    cmd.env(crate::HOME_ENV, &paths.dir);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
     }
-    cmd.spawn().context("spawning devctx serve --central")?;
+    cmd.spawn()
+        .map_err(|e| CentralError::Io(e, exe_path.clone()))?;
     Ok(())
 }
 
@@ -143,7 +158,10 @@ pub fn stop(paths: &CentralPaths) -> Result<()> {
         println!("No central daemon is running.");
         return Ok(());
     };
-    let info: ServeInfo = serde_json::from_slice(&raw).context("parsing serve.json")?;
+    let Ok(info) = serde_json::from_slice::<ServeInfo>(&raw) else {
+        remove_serve_file(paths);
+        return Ok(());
+    };
     if let Some(pid) = info.pid {
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
@@ -160,7 +178,7 @@ pub fn default_addr(paths: &CentralPaths) -> String {
     auto_addr(paths)
 }
 
-impl CentralRemote {
+impl CentralClient {
     fn agent(&self) -> ureq::Agent {
         ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(60))
@@ -275,16 +293,18 @@ impl CentralRemote {
 /// routed failure reads the same as a local one.
 fn parse(r: std::result::Result<ureq::Response, ureq::Error>) -> Result<Value> {
     match r {
-        Ok(resp) => Ok(resp.into_json()?),
+        Ok(resp) => resp
+            .into_json()
+            .map_err(|e| CentralError::Request(e.to_string())),
         Err(ureq::Error::Status(_, resp)) => {
             let body: Value = resp.into_json().unwrap_or(Value::Null);
             let msg = body
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("central store request failed");
-            Err(anyhow::anyhow!(msg.to_string()))
+            Err(CentralError::Request(msg.to_string()))
         }
-        Err(e) => Err(anyhow::anyhow!(e.to_string())),
+        Err(e) => Err(CentralError::Request(e.to_string())),
     }
 }
 
