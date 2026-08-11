@@ -2,6 +2,12 @@
 
 # Decisiones de Diseño
 
+> **Nota — esta página es anterior a la reescritura en Rust** y describe la
+> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
+> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
+> Referencias actuales: [Arquitectura](02-arquitectura.md),
+> [Configuración](11-configuracion.md).
+
 Registros de Decisiones de Arquitectura (ADRs) para DevAI. Cada entrada documenta qué se decidió, por qué y qué tradeoffs se aceptaron.
 
 Leé esto si sos contribuidor y te preguntás "¿por qué está construido así?" Estas son las respuestas.

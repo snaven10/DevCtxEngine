@@ -2,6 +2,12 @@
 
 # Depuración de un Bug en un Codebase Grande
 
+> **Nota — esta página es anterior a la reescritura en Rust** y describe la
+> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
+> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
+> Referencias actuales: [Arquitectura](../02-arquitectura.md),
+> [Configuración](../11-configuracion.md).
+
 Un recorrido paso a paso de un agente de IA usando las herramientas MCP de DevAI para rastrear y diagnosticar un bug en producción — desde un reporte vago hasta la causa raíz en siete llamadas a herramientas.
 
 ---

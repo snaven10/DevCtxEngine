@@ -4,6 +4,12 @@
 
 ## Que es
 
+> **Nota — esta página es anterior a la reescritura en Rust** y describe la
+> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
+> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
+> Referencias actuales: [Arquitectura](../02-arquitectura.md),
+> [Configuración](../11-configuracion.md).
+
 El constructor de contexto es un motor de ensamblado consciente del presupuesto de tokens. Dada una consulta en lenguaje natural y un presupuesto de tokens, reune el codigo y las memorias mas relevantes, los deduplica y rankea, y produce un unico documento markdown que cabe dentro del presupuesto. Es el puente entre los indices de DevAI y la ventana de contexto de un LLM.
 
 ## Por que existe

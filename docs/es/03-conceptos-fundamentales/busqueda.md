@@ -4,6 +4,12 @@
 
 ## Que es
 
+> **Nota — esta página es anterior a la reescritura en Rust** y describe la
+> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
+> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
+> Referencias actuales: [Arquitectura](../02-arquitectura.md),
+> [Configuración](../11-configuracion.md).
+
 La busqueda de DevAI es un motor de busqueda semantica de codigo. Entiende el **significado** de tu consulta, no solo las palabras clave. Cuando buscas "authentication middleware", encuentra la clase `AuthGuard`, la funcion `verifyJWT` y el decorator `requirePermissions` — aunque ninguno de ellos contenga la palabra "authentication".
 
 ## Por que existe

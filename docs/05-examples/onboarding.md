@@ -2,6 +2,11 @@
 
 > 🇪🇸 [Leer en español](../es/05-ejemplos/incorporacion.md)
 
+> **Note — this page predates the Rust rewrite** and describes the earlier
+> Go + Python implementation. The concepts largely still apply; the commands,
+> file layout and `DEVAI_*` variables do not. Current references:
+> [Architecture](../02-architecture.md), [Configuration](../11-configuration.md).
+
 A step-by-step walkthrough of a developer using DevAI to go from zero knowledge of a codebase to productive contributor — in a single session instead of a week of reading code.
 
 ---

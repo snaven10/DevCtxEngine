@@ -4,6 +4,11 @@
 
 ## What It Is
 
+> **Note — this page predates the Rust rewrite** and describes the earlier
+> Go + Python implementation. The concepts largely still apply; the commands,
+> file layout and `DEVAI_*` variables do not. Current references:
+> [Architecture](../02-architecture.md), [Configuration](../11-configuration.md).
+
 DevAI's search is a semantic code search engine. It understands the **meaning** of your query, not just the keywords. When you search for "authentication middleware," it finds the `AuthGuard` class, the `verifyJWT` function, and the `requirePermissions` decorator — even though none of them contain the word "authentication."
 
 ## Why It Exists

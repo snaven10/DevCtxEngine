@@ -2,6 +2,11 @@
 
 > 🇪🇸 [Leer en español](es/06-extender-el-sistema.md)
 
+> **Note — this page predates the Rust rewrite** and describes the earlier
+> Go + Python implementation. The concepts largely still apply; the commands,
+> file layout and `DEVAI_*` variables do not. Current references:
+> [Architecture](02-architecture.md), [Configuration](11-configuration.md).
+
 This guide covers how to extend DevAI with new capabilities. Each section follows a consistent pattern: where to add code, what interface to implement, and how to wire it in.
 
 DevAI's extension points are intentionally simple. No plugin system, no dynamic loading. You add code in the right place and register it.

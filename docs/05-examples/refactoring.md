@@ -2,6 +2,11 @@
 
 > 🇪🇸 [Leer en español](../es/05-ejemplos/refactorizacion.md)
 
+> **Note — this page predates the Rust rewrite** and describes the earlier
+> Go + Python implementation. The concepts largely still apply; the commands,
+> file layout and `DEVAI_*` variables do not. Current references:
+> [Architecture](../02-architecture.md), [Configuration](../11-configuration.md).
+
 A step-by-step walkthrough of using DevAI to plan and scope a major refactoring effort — extracting authentication logic into a standalone module — with full impact analysis before writing a single line of code.
 
 ---

@@ -4,6 +4,12 @@
 
 ## Que es
 
+> **Nota — esta página es anterior a la reescritura en Rust** y describe la
+> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
+> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
+> Referencias actuales: [Arquitectura](../02-arquitectura.md),
+> [Configuración](../11-configuracion.md).
+
 DevAI expone sus capacidades — busqueda, memoria, grafo de simbolos, construccion de contexto — como herramientas via el [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). MCP es un estandar abierto que permite a las aplicaciones de IA (Claude Code, Cursor, Windsurf, etc.) descubrir y llamar herramientas externas a traves de una interfaz unificada. DevAI implementa un servidor MCP que convierte la inteligencia de tu codebase en herramientas que cualquier cliente compatible con MCP puede usar.
 
 ## Por que existe

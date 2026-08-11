@@ -2,6 +2,11 @@
 
 # Token & Cost Benchmark: MCP (Filtered Retrieval) vs. Direct Mode (Brute-Force Dump)
 
+> **Note — this page predates the Rust rewrite** and describes the earlier
+> Go + Python implementation. The concepts largely still apply; the commands,
+> file layout and `DEVAI_*` variables do not. Current references:
+> [Architecture](02-architecture.md), [Configuration](11-configuration.md).
+
 A controlled A/B measuring how DevAI's MCP affects token consumption and cost on a real task. The **same
 diagnostic task** was solved twice, varying only whether the agent had access to DevAI's tools (vector
 retrieval + memory) or was restricted to `grep`/`read`.

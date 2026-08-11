@@ -1,10 +1,10 @@
 > 🌐 [English documentation](../../README.md#documentation) · 🇪🇸 Español (estás aquí)
 
-# Documentación de DevAI
+# Documentación de DevCtxEngine
 
 ## Primeros pasos
 
-- [Introducción](01-introduccion.md) — Qué es DevAI, el problema que resuelve, inicio rápido
+- [Introducción](01-introduccion.md) — Qué es DevCtxEngine, el problema que resuelve, inicio rápido
 - [Arquitectura](02-arquitectura.md) — Diagrama del sistema, componentes, flujo de datos
 - [Configuración](11-configuracion.md) — config del proyecto y central, variables de entorno, cliente MCP, modo servidor
 
@@ -16,9 +16,9 @@
 - [Constructor de contexto](03-conceptos-fundamentales/constructor-de-contexto.md) — Ensamblado de contexto con presupuesto de tokens
 - [Integración MCP](03-conceptos-fundamentales/integracion-mcp.md) — Las herramientas MCP, auto-configuración, arquitectura de handlers
 
-## Usando DevAI
+## Usando DevCtxEngine
 
-- [Flujo de trabajo del agente](04-flujo-de-trabajo-del-agente.md) — Cómo los agentes usan DevAI, patrones de selección de herramientas
+- [Flujo de trabajo del agente](04-flujo-de-trabajo-del-agente.md) — Cómo los agentes usan DevCtxEngine, patrones de selección de herramientas
 
 ## Ejemplos de extremo a extremo
 

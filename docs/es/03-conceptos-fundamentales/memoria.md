@@ -4,6 +4,12 @@
 
 ## Que es
 
+> **Nota — esta página es anterior a la reescritura en Rust** y describe la
+> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
+> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
+> Referencias actuales: [Arquitectura](../02-arquitectura.md),
+> [Configuración](../11-configuracion.md).
+
 La memoria de DevAI es un almacen de conocimiento persistente y estructurado para agentes de IA. Captura decisiones, descubrimientos, patrones y bugs que sobreviven entre sesiones — dandole a los agentes memoria a largo plazo que el historial de chat nunca fue disenado para proveer.
 
 ## Por que existe

@@ -4,6 +4,11 @@
 
 ## What It Is
 
+> **Note — this page predates the Rust rewrite** and describes the earlier
+> Go + Python implementation. The concepts largely still apply; the commands,
+> file layout and `DEVAI_*` variables do not. Current references:
+> [Architecture](../02-architecture.md), [Configuration](../11-configuration.md).
+
 The context builder is a token-budget-aware assembly engine. Given a natural language query and a token budget, it gathers the most relevant code and memories, deduplicates and ranks them, and produces a single markdown document that fits within the budget. It's the bridge between DevAI's indexes and an LLM's context window.
 
 ## Why It Exists

@@ -2,6 +2,11 @@
 
 > 🇪🇸 [Leer en español](../es/05-ejemplos/depuracion.md)
 
+> **Note — this page predates the Rust rewrite** and describes the earlier
+> Go + Python implementation. The concepts largely still apply; the commands,
+> file layout and `DEVAI_*` variables do not. Current references:
+> [Architecture](../02-architecture.md), [Configuration](../11-configuration.md).
+
 A step-by-step walkthrough of an AI agent using DevAI's MCP tools to track down and diagnose a production bug — from vague report to root cause in seven tool calls.
 
 ---

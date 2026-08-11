@@ -2,6 +2,12 @@
 
 # Benchmark de Tokens y Costo: MCP (recuperación filtrada) vs. modo directo (volcado bruto)
 
+> **Nota — esta página es anterior a la reescritura en Rust** y describe la
+> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
+> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
+> Referencias actuales: [Arquitectura](02-arquitectura.md),
+> [Configuración](11-configuracion.md).
+
 Un A/B controlado que mide cómo el MCP de DevAI afecta el consumo de tokens y el costo en una tarea
 real. La **misma tarea de diagnóstico** fue resuelta dos veces, variando únicamente si el agente tenía
 acceso a las herramientas de DevAI (retrieval vectorial + memoria) o estaba limitado a `grep`/`read`.

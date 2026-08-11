@@ -2,6 +2,12 @@
 
 # Incorporación a un Codebase Desconocido
 
+> **Nota — esta página es anterior a la reescritura en Rust** y describe la
+> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
+> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
+> Referencias actuales: [Arquitectura](../02-arquitectura.md),
+> [Configuración](../11-configuracion.md).
+
 Un recorrido paso a paso de un desarrollador usando DevAI para pasar de cero conocimiento de un codebase a contribuidor productivo — en una sola sesión en vez de una semana leyendo código.
 
 ---
