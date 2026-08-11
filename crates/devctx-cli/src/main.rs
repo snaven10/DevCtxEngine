@@ -19,7 +19,7 @@ use devctx_core::config::{find_config_file, Project, ProjectConfig};
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::{run as index_run, IndexRequest, ProgressSink};
-use devctx_memory::{memory_stats, recall, remember, RememberRequest};
+use devctx_memory::{memory_stats, recall, remember, RecallQuery, RememberRequest};
 use devctx_rerank::{create_reranker, RerankSettings};
 use devctx_search::SearchMode;
 use devctx_store::Store;
@@ -104,6 +104,9 @@ enum Command {
         /// Comma-separated tags.
         #[arg(long)]
         tags: Option<String>,
+        /// Where the memory belongs: this project, or every project.
+        #[arg(long, value_enum, default_value_t = MemoryScope::Local)]
+        scope: MemoryScope,
     },
     /// Recall memories relevant to a query.
     Recall {
@@ -112,6 +115,12 @@ enum Command {
         /// Maximum results.
         #[arg(long, default_value_t = 5)]
         limit: usize,
+        /// Which memories to search.
+        #[arg(long, value_enum, default_value_t = MemoryScope::All)]
+        scope: MemoryScope,
+        /// Only global memories contributed by this repository.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Show memory counts for the project.
     MemoryStats,
@@ -249,6 +258,17 @@ enum ProjectsAction {
     },
 }
 
+/// Which memories a command applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MemoryScope {
+    /// This project only.
+    Local,
+    /// The shared central store, visible from every project.
+    Global,
+    /// Both, fused by rank.
+    All,
+}
+
 /// Search output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
@@ -316,8 +336,14 @@ fn main() -> Result<()> {
             memory_type,
             topic,
             tags,
-        } => cmd_remember(content, title, memory_type, topic, tags),
-        Command::Recall { query, limit } => cmd_recall(query, limit),
+            scope,
+        } => cmd_remember(content, title, memory_type, topic, tags, scope),
+        Command::Recall {
+            query,
+            limit,
+            scope,
+            repo,
+        } => cmd_recall(query, limit, scope, repo),
         Command::MemoryStats => cmd_memory_stats(),
         Command::Migrate {
             from,
@@ -743,8 +769,35 @@ fn cmd_remember(
     memory_type: String,
     topic: Option<String>,
     tags: Option<String>,
+    scope: MemoryScope,
 ) -> Result<()> {
     let cfg = load_project()?;
+
+    // A global memory belongs to the central store, which only the daemon may
+    // write — so this path never touches a project database.
+    if scope != MemoryScope::Local {
+        let (repo, branch) = repo_branch(&cfg);
+        let out = with_central(|c| {
+            c.remember(
+                &content,
+                title.as_deref().unwrap_or(""),
+                &memory_type,
+                topic.as_deref().unwrap_or(""),
+                tags.as_deref().unwrap_or(""),
+                &project_name(&cfg),
+                &repo,
+                &branch,
+            )
+        })?;
+        println!(
+            "{}: {} — {} [global]",
+            field(&out, "status"),
+            field(&out, "id"),
+            title_or_untitled(&field(&out, "title")),
+        );
+        return Ok(());
+    }
+
     if let Some(r) = remote::ensure(&cfg) {
         println!(
             "{}",
@@ -782,37 +835,136 @@ fn cmd_remember(
 }
 
 /// `devctx recall` — recall memories relevant to a query.
-fn cmd_recall(query: String, limit: usize) -> Result<()> {
+///
+/// With both scopes the two result lists are fused **by rank**: the project and
+/// the central store may embed with different models, so their similarity scores
+/// are not on comparable scales.
+fn cmd_recall(query: String, limit: usize, scope: MemoryScope, repo: Option<String>) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure(&cfg) {
-        println!("{}", r.recall(&query, limit)?);
-        return Ok(());
-    }
-    let embedder = build_embedder(&cfg)?;
-    let store = open_store(&cfg, embedder.dimension())?;
 
-    let hits = recall(
-        &store,
-        embedder.as_ref(),
-        &query,
-        Some(&project_name(&cfg)),
-        limit,
-    )?;
+    let global: Vec<serde_json::Value> = if scope == MemoryScope::Local {
+        Vec::new()
+    } else {
+        with_central(|c| c.recall(&query, limit, repo.as_deref()))?
+    };
+
+    let local = if scope == MemoryScope::Global {
+        Vec::new()
+    } else {
+        local_recall(&cfg, &query, limit)?
+    };
+
+    let hits = fuse_memory_lists(vec![local, global], limit);
     if hits.is_empty() {
         println!("No memories.");
         return Ok(());
     }
-    for h in &hits {
-        let m = &h.memory;
-        let title = if m.title.is_empty() {
-            "(untitled)"
-        } else {
-            &m.title
-        };
-        println!("{:.3}  [{}] {}", h.score, m.memory_type, title);
-        println!("        {}", snippet(&m.content, 100));
+    for (h, origin) in &hits {
+        println!(
+            "[{origin}] {} — {}",
+            field(h, "type"),
+            title_or_untitled(&field(h, "title"))
+        );
+        println!("        {}", snippet(&field(h, "content"), 100));
     }
     Ok(())
+}
+
+/// Recall a project's own memories, routing through its server when one is
+/// running so no second process takes the DuckDB lock.
+fn local_recall(cfg: &ProjectConfig, query: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
+    if let Some(r) = remote::ensure(cfg) {
+        let raw = r.recall(query, limit)?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw).context("parsing recall")?;
+        return Ok(parsed.as_array().cloned().unwrap_or_default());
+    }
+    let embedder = build_embedder(cfg)?;
+    let store = open_store(cfg, embedder.dimension())?;
+    Ok(recall(
+        &store,
+        embedder.as_ref(),
+        &RecallQuery {
+            query,
+            project: Some(&project_name(cfg)),
+            repo: None,
+            limit,
+        },
+    )?
+    .iter()
+    .map(|h| {
+        serde_json::json!({
+            "id": h.memory.id, "title": h.memory.title, "content": h.memory.content,
+            "type": h.memory.memory_type, "tags": h.memory.tags, "repo": h.memory.repo,
+            "score": h.score,
+        })
+    })
+    .collect())
+}
+
+/// Open the central store — through the daemon when one is reachable, directly
+/// otherwise — and run `f` against it.
+fn with_central<T>(f: impl FnOnce(&central_remote::CentralRemote) -> Result<T>) -> Result<T> {
+    let paths = CentralPaths::resolve().context("resolving the central store location")?;
+    match central_remote::ensure(&paths) {
+        Some(r) => f(&r),
+        None => bail!(
+            "no central daemon and one could not be started; run \
+             `devctx serve --central` (store: {})",
+            paths.db.display()
+        ),
+    }
+}
+
+fn title_or_untitled(title: &str) -> String {
+    if title.is_empty() {
+        "(untitled)".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+/// Fuse local and global recall results by rank, tagging each with its origin.
+fn fuse_memory_lists(
+    lists: Vec<Vec<serde_json::Value>>,
+    limit: usize,
+) -> Vec<(serde_json::Value, &'static str)> {
+    const RRF_K: f32 = 60.0;
+    let origins = ["local", "global"];
+    let mut scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let mut items: std::collections::HashMap<String, (serde_json::Value, &'static str)> =
+        std::collections::HashMap::new();
+
+    for (idx, list) in lists.into_iter().enumerate() {
+        let origin = origins.get(idx).copied().unwrap_or("local");
+        for (rank, hit) in list.into_iter().enumerate() {
+            let id = field(&hit, "id");
+            *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+            items.entry(id).or_insert((hit, origin));
+        }
+    }
+
+    let mut out: Vec<(String, (serde_json::Value, &'static str))> = items.into_iter().collect();
+    out.sort_by(|a, b| {
+        let (sa, sb) = (scores[&a.0], scores[&b.0]);
+        sb.partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out.truncate(limit);
+    out.into_iter().map(|(_, v)| v).collect()
+}
+
+/// The short repo name and branch for the active project, empty when not a repo.
+fn repo_branch(cfg: &ProjectConfig) -> (String, String) {
+    let root = if cfg.project.path.is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        std::path::PathBuf::from(&cfg.project.path)
+    };
+    match devctx_index::GitRepo::open(&root) {
+        Ok(git) => (git.short_name(), git.state().branch),
+        Err(_) => (String::new(), String::new()),
+    }
 }
 
 /// `devctx impact` — show the blast radius of a symbol.

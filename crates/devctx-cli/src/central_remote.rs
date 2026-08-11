@@ -230,6 +230,39 @@ impl CentralRemote {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn remember(
+        &self,
+        content: &str,
+        title: &str,
+        memory_type: &str,
+        topic: &str,
+        tags: &str,
+        project: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Value> {
+        self.post(
+            "/remember",
+            serde_json::json!({
+                "content": content, "title": title, "type": memory_type,
+                "topic": topic, "tags": tags,
+                "project": project, "repo": repo, "branch": branch,
+            }),
+        )
+    }
+
+    pub fn recall(&self, query: &str, limit: usize, repo: Option<&str>) -> Result<Vec<Value>> {
+        let v = self.post(
+            "/recall",
+            serde_json::json!({ "query": query, "limit": limit, "repo": repo }),
+        )?;
+        Ok(v.get("memories")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     pub fn remove(&self, name: &str, deactivate: bool) -> Result<Value> {
         self.delete(&format!(
             "/projects/{}?deactivate={deactivate}",

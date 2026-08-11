@@ -15,9 +15,12 @@ pub mod error;
 pub mod paths;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use devctx_core::config::{Project, ProjectConfig};
-use devctx_store::{ProjectRecord, Store};
+use devctx_core::config::{Embeddings, Project, ProjectConfig};
+use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
+use devctx_memory::{RecallQuery, RecalledMemory, RememberRequest, RememberResult};
+use devctx_store::{Memory, ProjectRecord, Store};
 
 pub use config::CentralConfig;
 pub use error::{CentralError, Result};
@@ -59,6 +62,10 @@ pub struct Central {
     paths: CentralPaths,
     config: CentralConfig,
     store: Store,
+    /// Built on first use. The daemon must start without paying a model load —
+    /// registry work needs no embedder at all, and most sessions never touch a
+    /// global memory.
+    embedder: Mutex<Option<Arc<dyn EmbeddingProvider>>>,
 }
 
 impl Central {
@@ -103,6 +110,7 @@ impl Central {
             paths,
             config,
             store,
+            embedder: Mutex::new(None),
         })
     }
 
@@ -119,6 +127,87 @@ impl Central {
     /// The underlying store (memories and vectors live here too).
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Settings for the embedder that owns the global vector space.
+    pub fn memory_embed_settings(&self) -> EmbedSettings {
+        EmbedSettings::from_config(&Embeddings {
+            provider: self.config.memory.provider.clone(),
+            model: self.config.memory.model.clone(),
+            ..Default::default()
+        })
+    }
+
+    /// Whether a project's embeddings land in the same vector space as the
+    /// central memory, in which case a caller can reuse the embedder it has
+    /// already loaded instead of paying for a second one. This is the common
+    /// case, and the reason global memory usually costs no extra memory.
+    pub fn shares_vector_space(&self, e: &Embeddings) -> bool {
+        e.provider == self.config.memory.provider && e.model == self.config.memory.model
+    }
+
+    /// The central memory embedder, built (and cached) on first use.
+    pub fn embedder(&self) -> Result<Arc<dyn EmbeddingProvider>> {
+        let mut guard = self.embedder.lock().expect("central embedder lock");
+        if let Some(e) = guard.as_ref() {
+            return Ok(e.clone());
+        }
+        let e: Arc<dyn EmbeddingProvider> =
+            Arc::from(create_provider(&self.memory_embed_settings())?);
+        *guard = Some(e.clone());
+        Ok(e)
+    }
+
+    /// Store a globally-scoped memory, deduplicated across every repository.
+    pub fn remember(&self, req: &RememberRequest) -> Result<RememberResult> {
+        let embedder = self.embedder()?;
+        let mut req = req.clone();
+        // Whatever the caller passed, a memory reaching the central store is
+        // global by definition.
+        req.scope = devctx_memory::SCOPE_GLOBAL.to_string();
+        Ok(devctx_memory::remember(
+            &self.store,
+            embedder.as_ref(),
+            &req,
+        )?)
+    }
+
+    /// Recall globally-scoped memories, optionally narrowed to the repository
+    /// that contributed them.
+    pub fn recall(
+        &self,
+        query: &str,
+        repo: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RecalledMemory>> {
+        let embedder = self.embedder()?;
+        Ok(devctx_memory::recall(
+            &self.store,
+            embedder.as_ref(),
+            &RecallQuery {
+                query,
+                project: Some(devctx_memory::GLOBAL_PROJECT),
+                repo,
+                limit,
+            },
+        )?)
+    }
+
+    /// The most recently updated global memories (no query).
+    pub fn recent_memories(&self, limit: usize) -> Result<Vec<Memory>> {
+        Ok(devctx_memory::memory_context(
+            &self.store,
+            devctx_memory::GLOBAL_PROJECT,
+            limit,
+        )?)
+    }
+
+    /// Counts of global memories, total and per type.
+    pub fn memory_stats(&self) -> Result<devctx_store::MemoryStats> {
+        Ok(devctx_memory::memory_stats(
+            &self.store,
+            devctx_memory::GLOBAL_PROJECT,
+        )?)
     }
 
     /// Register a repository, or update its entry if it is already known.

@@ -167,8 +167,16 @@ impl Engine {
                 project,
                 ..
             } => {
-                let hits =
-                    devctx_memory::recall(store, embedder.as_ref(), query, Some(project), LIMIT)?;
+                let hits = devctx_memory::recall(
+                    store,
+                    embedder.as_ref(),
+                    &devctx_memory::RecallQuery {
+                        query,
+                        project: Some(project),
+                        repo: None,
+                        limit: LIMIT,
+                    },
+                )?;
                 Ok(hits
                     .into_iter()
                     .map(|h| MemoryItem {

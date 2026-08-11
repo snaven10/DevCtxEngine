@@ -354,3 +354,87 @@ fn a_second_daemon_is_refused() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("already running"), "got: {err}");
 }
+
+/// The end-to-end payoff of the central store: a lesson learned in one
+/// repository is recalled from another, project-local notes stay private, and
+/// the same lesson contributed twice converges on one memory.
+///
+/// Ignored by default because it loads a real embedding model — the engine
+/// semantics themselves are covered by unit tests in `devctx-memory`.
+#[test]
+#[ignore = "loads an embedding model (downloads it on a cold cache)"]
+fn global_memories_cross_projects_while_local_ones_stay_put() {
+    let tmp = Tmp::new("globalmem");
+    let home = tmp.home();
+    let one = tmp.repo("one");
+    let two = tmp.repo("two");
+    ok(&home, &["projects", "add", one.to_str().unwrap(), "--init"]);
+    ok(&home, &["projects", "add", two.to_str().unwrap(), "--init"]);
+
+    let in_repo = |repo: &PathBuf, args: &[&str]| -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+            .env("DEVCTX_HOME", &home)
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("running devctx");
+        assert!(
+            out.status.success(),
+            "`devctx {}` failed:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let lesson = "always verify the HMAC signature on an incoming webhook";
+    let created = in_repo(
+        &one,
+        &[
+            "remember",
+            lesson,
+            "--title",
+            "Webhook signatures",
+            "--scope",
+            "global",
+        ],
+    );
+    assert!(created.contains("created"), "got: {created}");
+    in_repo(
+        &one,
+        &[
+            "remember",
+            "refunds live in src/refunds.rs",
+            "--scope",
+            "local",
+        ],
+    );
+
+    // The other repository sees the global lesson…
+    let recalled = in_repo(
+        &two,
+        &["recall", "how do I validate a webhook", "--scope", "global"],
+    );
+    assert!(recalled.contains("Webhook signatures"), "got: {recalled}");
+
+    // …but never the first one's private note.
+    let all = in_repo(&two, &["recall", "where do refunds live", "--scope", "all"]);
+    assert!(
+        !all.contains("src/refunds.rs"),
+        "local memory leaked: {all}"
+    );
+
+    // Learning the same thing again converges instead of duplicating.
+    let again = in_repo(
+        &two,
+        &[
+            "remember",
+            lesson,
+            "--title",
+            "Webhook signatures",
+            "--scope",
+            "global",
+        ],
+    );
+    assert!(again.contains("duplicate"), "got: {again}");
+}

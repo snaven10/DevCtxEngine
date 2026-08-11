@@ -13,7 +13,7 @@ use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::{run as index_run, GitRepo, IndexRequest};
-use devctx_memory::{memory_context, memory_stats, recall, remember, RememberRequest};
+use devctx_memory::{memory_context, memory_stats, recall, remember, RecallQuery, RememberRequest};
 use devctx_rerank::{create_reranker, RerankSettings, Reranker};
 use devctx_search::SearchMode;
 use devctx_store::Store;
@@ -273,8 +273,17 @@ pub fn do_recall(state: &AppState, query: &str, limit: usize) -> Result<String, 
     let store = state.open_store()?;
     let project = state.project();
     let embedder = state.embedder()?;
-    let hits = recall(&store, embedder.as_ref(), query, Some(&project), limit)
-        .map_err(|e| e.to_string())?;
+    let hits = recall(
+        &store,
+        embedder.as_ref(),
+        &RecallQuery {
+            query,
+            project: Some(&project),
+            repo: None,
+            limit,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     let arr: Vec<Value> = hits
         .iter()
         .map(|h| {

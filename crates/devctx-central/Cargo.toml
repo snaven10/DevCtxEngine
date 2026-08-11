@@ -10,7 +10,8 @@ description = "Central store for DevCtxEngine: the project registry and cross-pr
 [dependencies]
 devctx-core.workspace = true
 devctx-store = { path = "../devctx-store" }
-devctx-embed = { path = "../devctx-embed", default-features = false }
+devctx-embed = { path = "../devctx-embed" }
+devctx-memory = { path = "../devctx-memory" }
 thiserror.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true

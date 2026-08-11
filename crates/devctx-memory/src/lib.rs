@@ -21,6 +21,40 @@ pub use error::{MemoryError, Result};
 /// Blend weight for the intro vector vs the best body chunk.
 const BLEND_ALPHA: f32 = 0.5;
 
+/// RRF constant, matching `devctx-search`. Kept local because the two fuse
+/// different types (`RecalledMemory` vs `SearchResult`) and the formula is
+/// three lines — a shared generic would cost more clarity than it saves.
+const RRF_K: f32 = 60.0;
+
+/// Scope value for a memory that belongs to one repository only.
+pub const SCOPE_LOCAL: &str = "local";
+
+/// Scope value for a memory worth carrying between repositories.
+pub const SCOPE_GLOBAL: &str = "global";
+
+/// Reserved `project` value for globally-scoped memories.
+///
+/// Memory identity is derived from `project` + content hash, so if global rows
+/// kept their contributing project the *same* lesson learned in two repositories
+/// would land as two rows in the shared store — deduplication failing exactly
+/// where it matters most. Global rows therefore all carry this key, and the
+/// repository that contributed one stays in `repo` as provenance.
+pub const GLOBAL_PROJECT: &str = "@global";
+
+/// Whether a scope string means "global" (`shared` is the legacy spelling).
+pub fn is_global(scope: &str) -> bool {
+    scope == SCOPE_GLOBAL || scope == "shared"
+}
+
+/// The `project` a memory is stored under, given its requested scope.
+fn identity_project(req: &RememberRequest) -> String {
+    if is_global(&req.scope) {
+        GLOBAL_PROJECT.to_string()
+    } else {
+        req.project.clone()
+    }
+}
+
 /// What `remember` did with an incoming memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RememberStatus {
@@ -90,13 +124,16 @@ pub fn remember(
     check_dim(store, embedder)?;
 
     let normalized_hash = sha_hex(&normalize(&req.content));
+    // Global memories are keyed by a reserved project so the same lesson from
+    // two repositories converges on one row (see [`GLOBAL_PROJECT`]).
+    let project = identity_project(req);
 
     // Find an existing memory: by topic key, else by content-derived id.
     let existing = if !req.topic_key.is_empty() {
-        store.find_memory_by_topic(&req.project, &req.topic_key)?
+        store.find_memory_by_topic(&project, &req.topic_key)?
     } else {
         store
-            .get_memory(&memory_id(&req.project, &normalized_hash))?
+            .get_memory(&memory_id(&project, &normalized_hash))?
             .filter(|m| m.deleted_at.is_none())
     };
 
@@ -122,7 +159,7 @@ pub fn remember(
             RememberStatus::Revised,
         ),
         None => (
-            memory_id(&req.project, &normalized_hash),
+            memory_id(&project, &normalized_hash),
             req.now.clone(),
             0,
             RememberStatus::Created,
@@ -135,7 +172,7 @@ pub fn remember(
         content: req.content.clone(),
         memory_type: req.memory_type.clone(),
         scope: req.scope.clone(),
-        project: req.project.clone(),
+        project,
         topic_key: req.topic_key.clone(),
         tags: req.tags.clone(),
         author: req.author.clone(),
@@ -201,14 +238,42 @@ fn index_memory_vectors(store: &Store, embedder: &dyn EmbeddingProvider, m: &Mem
     Ok(())
 }
 
-/// Recall memories relevant to `query`, blending intro + best-chunk similarity.
+/// What to recall, and how to narrow it.
+#[derive(Debug, Clone, Default)]
+pub struct RecallQuery<'a> {
+    /// The natural-language query.
+    pub query: &'a str,
+    /// Restrict to one `project` (`None` = any). For the central store this is
+    /// [`GLOBAL_PROJECT`], since every global row carries it.
+    pub project: Option<&'a str>,
+    /// Restrict to memories contributed by one repository — the way to ask the
+    /// central store for "what did I learn in *that* project".
+    pub repo: Option<&'a str>,
+    /// Maximum memories to return.
+    pub limit: usize,
+}
+
+impl<'a> RecallQuery<'a> {
+    /// A query for `text`, unfiltered.
+    pub fn new(text: &'a str, limit: usize) -> Self {
+        Self {
+            query: text,
+            project: None,
+            repo: None,
+            limit,
+        }
+    }
+}
+
+/// Recall memories relevant to a query, blending intro + best-chunk similarity.
 pub fn recall(
     store: &Store,
     embedder: &dyn EmbeddingProvider,
-    query: &str,
-    project: Option<&str>,
-    limit: usize,
+    q: &RecallQuery<'_>,
 ) -> Result<Vec<RecalledMemory>> {
+    let query = q.query;
+    let project = q.project;
+    let limit = q.limit;
     check_dim(store, embedder)?;
     let qvec = embedder.embed_query(query)?;
     let filter = SearchFilter {
@@ -252,6 +317,11 @@ pub fn recall(
                 continue;
             }
         }
+        if let Some(r) = q.repo {
+            if memory.repo != r {
+                continue;
+            }
+        }
         out.push(RecalledMemory { memory, score });
     }
 
@@ -272,6 +342,43 @@ pub fn memory_context(store: &Store, project: &str, limit: usize) -> Result<Vec<
 /// Aggregate memory counts for a project.
 pub fn memory_stats(store: &Store, project: &str) -> Result<MemoryStats> {
     Ok(store.memory_stats(project)?)
+}
+
+/// Fuse independently-ranked recall results **by rank**, never by score.
+///
+/// The lists may come from stores embedded with different models — a project
+/// using `ml-granite` and a central store pinned to `minilm-l6`, say — whose
+/// cosine similarities live on incomparable scales. Reciprocal rank fusion only
+/// looks at position, so it stays correct across that boundary, and a memory
+/// surfacing in both lists is rewarded for it.
+pub fn fuse(lists: Vec<Vec<RecalledMemory>>, limit: usize) -> Vec<RecalledMemory> {
+    let mut scores: HashMap<String, f32> = HashMap::new();
+    let mut best: HashMap<String, RecalledMemory> = HashMap::new();
+
+    for list in lists {
+        for (rank, hit) in list.into_iter().enumerate() {
+            let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
+            *scores.entry(hit.memory.id.clone()).or_insert(0.0) += contribution;
+            best.entry(hit.memory.id.clone()).or_insert(hit);
+        }
+    }
+
+    let mut out: Vec<RecalledMemory> = best
+        .into_values()
+        .map(|mut m| {
+            m.score = scores.get(&m.memory.id).copied().unwrap_or(0.0);
+            m
+        })
+        .collect();
+    // Ties broken by id so the order is stable across runs.
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.memory.id.cmp(&b.memory.id))
+    });
+    out.truncate(limit);
+    out
 }
 
 fn blend(intro: Option<f32>, chunk: Option<f32>) -> f32 {
@@ -394,7 +501,17 @@ mod tests {
         )
         .unwrap();
 
-        let hits = recall(&store, &KwEmbedder, "how does auth work", Some("proj"), 5).unwrap();
+        let hits = recall(
+            &store,
+            &KwEmbedder,
+            &RecallQuery {
+                query: "how does auth work",
+                project: Some("proj"),
+                repo: None,
+                limit: 5,
+            },
+        )
+        .unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].memory.title, "Auth decision");
     }
@@ -449,5 +566,146 @@ mod tests {
         assert_eq!(strip_chunk_suffix("mem_abc123_c5"), "mem_abc123");
         // 'c' as a hex digit at the start must not be stripped.
         assert_eq!(strip_chunk_suffix("mem_c3abdef"), "mem_c3abdef");
+    }
+
+    /// The whole point of the reserved key: the same lesson contributed by two
+    /// repositories must converge on one row, not sit there twice.
+    #[test]
+    fn the_same_global_lesson_from_two_projects_is_one_memory() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mk = |project: &str, repo: &str| RememberRequest {
+            title: "Cache invalidation".into(),
+            content: "always bust the cache key on schema change".into(),
+            memory_type: "insight".into(),
+            project: project.into(),
+            repo: repo.into(),
+            scope: SCOPE_GLOBAL.into(),
+            now: "100".into(),
+            ..Default::default()
+        };
+
+        let a = remember(&store, &KwEmbedder, &mk("alpha", "alpha")).unwrap();
+        assert_eq!(a.status, RememberStatus::Created);
+        assert_eq!(
+            a.memory.project, GLOBAL_PROJECT,
+            "stored under the shared key"
+        );
+        assert_eq!(a.memory.repo, "alpha", "provenance preserved");
+
+        let b = remember(&store, &KwEmbedder, &mk("beta", "beta")).unwrap();
+        assert_eq!(
+            b.status,
+            RememberStatus::Duplicate,
+            "converged, not duplicated"
+        );
+        assert_eq!(b.memory.id, a.memory.id);
+        assert_eq!(store.memory_stats(GLOBAL_PROJECT).unwrap().total, 1);
+    }
+
+    /// Local memories keep their per-project identity, so the same note in two
+    /// projects stays two notes.
+    #[test]
+    fn local_memories_stay_per_project() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mk = |project: &str| RememberRequest {
+            title: "Cache".into(),
+            content: "the cache lives in redis".into(),
+            memory_type: "note".into(),
+            project: project.into(),
+            scope: SCOPE_LOCAL.into(),
+            now: "100".into(),
+            ..Default::default()
+        };
+        let a = remember(&store, &KwEmbedder, &mk("alpha")).unwrap();
+        let b = remember(&store, &KwEmbedder, &mk("beta")).unwrap();
+        assert_ne!(a.memory.id, b.memory.id);
+        assert_eq!(store.memory_stats("alpha").unwrap().total, 1);
+        assert_eq!(store.memory_stats("beta").unwrap().total, 1);
+    }
+
+    /// `shared` is the legacy spelling of `global` and must behave identically.
+    #[test]
+    fn shared_is_accepted_as_global() {
+        assert!(is_global("global"));
+        assert!(is_global("shared"));
+        assert!(!is_global("local"));
+        assert!(!is_global(""));
+    }
+
+    /// Global memories can be narrowed to the repository that contributed them.
+    #[test]
+    fn recall_can_filter_globals_by_contributing_repo() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        for (repo, content) in [
+            ("alpha", "auth tokens expire hourly"),
+            ("beta", "the database is sharded"),
+        ] {
+            remember(
+                &store,
+                &KwEmbedder,
+                &RememberRequest {
+                    title: content.into(),
+                    content: content.into(),
+                    memory_type: "insight".into(),
+                    project: "whatever".into(),
+                    repo: repo.into(),
+                    scope: SCOPE_GLOBAL.into(),
+                    now: "100".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let all = recall(
+            &store,
+            &KwEmbedder,
+            &RecallQuery::new("auth and database", 10),
+        )
+        .unwrap();
+        assert_eq!(all.len(), 2);
+
+        let only_beta = recall(
+            &store,
+            &KwEmbedder,
+            &RecallQuery {
+                query: "auth and database",
+                project: Some(GLOBAL_PROJECT),
+                repo: Some("beta"),
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(only_beta.len(), 1);
+        assert_eq!(only_beta[0].memory.repo, "beta");
+    }
+
+    /// Fusion must rank by position, never by score, because the two lists can
+    /// come from different embedding models.
+    #[test]
+    fn fusion_ranks_by_position_not_score() {
+        let mk = |id: &str, score: f32| RecalledMemory {
+            memory: Memory {
+                id: id.into(),
+                ..Default::default()
+            },
+            score,
+        };
+
+        // `both` is second in each list but appears in both; `huge` is third in
+        // one list with an absurd score that must not buy it the top spot.
+        let local = vec![mk("local_top", 0.9), mk("both", 0.8), mk("huge", 99.0)];
+        let global = vec![mk("global_top", 0.2), mk("both", 0.1)];
+
+        let fused = fuse(vec![local, global], 10);
+        assert_eq!(fused[0].memory.id, "both", "appearing in both lists wins");
+        assert!(
+            fused.iter().position(|m| m.memory.id == "huge").unwrap() > 0,
+            "an incomparable score must not decide the ranking"
+        );
+        assert_eq!(fused.len(), 4, "deduplicated across lists");
+
+        assert!(fuse(vec![], 5).is_empty());
+        assert_eq!(fuse(vec![vec![mk("a", 1.0), mk("b", 0.5)]], 1).len(), 1);
     }
 }

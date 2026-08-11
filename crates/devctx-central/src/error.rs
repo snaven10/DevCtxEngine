@@ -67,4 +67,12 @@ pub enum CentralError {
     /// The underlying store failed.
     #[error(transparent)]
     Store(#[from] devctx_store::StoreError),
+
+    /// Building the central memory embedder failed.
+    #[error("loading the central memory model: {0}")]
+    Embed(#[from] devctx_embed::EmbedError),
+
+    /// A memory operation failed.
+    #[error(transparent)]
+    Memory(#[from] devctx_memory::MemoryError),
 }

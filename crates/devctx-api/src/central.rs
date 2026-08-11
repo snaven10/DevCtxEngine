@@ -22,6 +22,7 @@ use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use devctx_central::{project_json, Central, RegisterRequest};
+use devctx_memory::RememberRequest;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -43,6 +44,10 @@ fn router(api: CentralApi) -> Router {
         .route("/projects/:name", get(show_project))
         .route("/projects/:name", delete(remove_project))
         .route("/projects/:name/refresh", post(refresh_project))
+        .route("/remember", post(remember))
+        .route("/recall", post(recall))
+        .route("/memories", get(memories))
+        .route("/memory/stats", get(memory_stats))
         .layer(middleware::from_fn_with_state(api.clone(), auth))
         .with_state(api)
 }
@@ -121,6 +126,42 @@ struct RemoveQuery {
     deactivate: bool,
 }
 
+#[derive(Deserialize)]
+struct RememberBody {
+    content: String,
+    #[serde(default)]
+    title: String,
+    #[serde(rename = "type", default)]
+    memory_type: String,
+    #[serde(default)]
+    topic: String,
+    #[serde(default)]
+    tags: String,
+    /// Contributing project and repository, kept as provenance.
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    branch: String,
+}
+
+#[derive(Deserialize)]
+struct RecallBody {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Narrow to memories contributed by one repository.
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MemoriesQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 // --- handlers ---
 
 async fn health() -> Response {
@@ -191,6 +232,91 @@ async fn remove_project(
             return Err(format!("no registered project named `{name}`"));
         }
         Ok(json!({ "removed": name, "deactivated": q.deactivate }).to_string())
+    })
+    .await
+}
+
+async fn remember(State(api): State<CentralApi>, Json(b): Json<RememberBody>) -> Response {
+    run(api, move |c| {
+        let res = c
+            .remember(&RememberRequest {
+                title: b.title,
+                content: b.content,
+                memory_type: if b.memory_type.is_empty() {
+                    "insight".to_string()
+                } else {
+                    b.memory_type
+                },
+                project: b.project,
+                topic_key: b.topic,
+                tags: b.tags,
+                repo: b.repo,
+                branch: b.branch,
+                now: devctx_central::now_stamp(),
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "id": res.memory.id,
+            "title": res.memory.title,
+            "status": format!("{:?}", res.status).to_lowercase(),
+            "scope": res.memory.scope,
+            "repo": res.memory.repo,
+            "revision_count": res.memory.revision_count,
+            "duplicate_count": res.memory.duplicate_count,
+        })
+        .to_string())
+    })
+    .await
+}
+
+async fn recall(State(api): State<CentralApi>, Json(b): Json<RecallBody>) -> Response {
+    run(api, move |c| {
+        let hits = c
+            .recall(&b.query, b.repo.as_deref(), b.limit.unwrap_or(5))
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "memories": hits.iter().map(|h| json!({
+                "id": h.memory.id,
+                "title": h.memory.title,
+                "content": h.memory.content,
+                "type": h.memory.memory_type,
+                "tags": h.memory.tags,
+                "repo": h.memory.repo,
+                "score": h.score,
+                "updated_at": h.memory.updated_at,
+            })).collect::<Vec<_>>()
+        })
+        .to_string())
+    })
+    .await
+}
+
+async fn memories(State(api): State<CentralApi>, Query(q): Query<MemoriesQuery>) -> Response {
+    run(api, move |c| {
+        let mems = c
+            .recent_memories(q.limit.unwrap_or(20))
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "memories": mems.iter().map(|m| json!({
+                "id": m.id,
+                "title": m.title,
+                "content": m.content,
+                "type": m.memory_type,
+                "tags": m.tags,
+                "repo": m.repo,
+                "updated_at": m.updated_at,
+            })).collect::<Vec<_>>()
+        })
+        .to_string())
+    })
+    .await
+}
+
+async fn memory_stats(State(api): State<CentralApi>) -> Response {
+    run(api, move |c| {
+        let stats = c.memory_stats().map_err(|e| e.to_string())?;
+        Ok(json!({ "total": stats.total, "by_type": stats.by_type }).to_string())
     })
     .await
 }
