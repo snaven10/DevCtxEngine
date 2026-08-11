@@ -3,6 +3,13 @@
 > Back to [README](../README.md)
 > 🇪🇸 [Leer en español](es/04-flujo-de-trabajo-del-agente.md)
 
+> **Note — parts of this page predate the Rust rewrite.** Figures and
+> configuration below were measured against the earlier Go + Python
+> implementation, which no longer exists: parsing, chunking, embedding and
+> reranking now run in-process, and the `DEVAI_*` variables named here were never
+> ported. Treat the numbers as unverified until re-measured. Current references:
+> [Architecture](02-architecture.md), [Configuration](11-configuration.md).
+
 ---
 
 ## Mental Model

@@ -2,6 +2,13 @@
 
 # Embedding models, summarizer & tuning
 
+> **Note — parts of this page predate the Rust rewrite.** Figures and
+> configuration below were measured against the earlier Go + Python
+> implementation, which no longer exists: parsing, chunking, embedding and
+> reranking now run in-process, and the `DEVAI_*` variables named here were never
+> ported. Treat the numbers as unverified until re-measured. Current references:
+> [Architecture](02-architecture.md), [Configuration](11-configuration.md).
+
 A practical guide to the available embedding models, the token-budget strategies,
 which configuration fits which hardware, and the behaviors verified empirically.
 

@@ -2,6 +2,14 @@
 
 # Rendimiento
 
+> **Nota — parte de esta página es anterior a la reescritura en Rust.** Las
+> cifras y la configuración de abajo se midieron sobre la implementación previa
+> en Go + Python, que ya no existe: parseo, chunking, embeddings y reranking
+> corren ahora en proceso, y las variables `DEVAI_*` que aquí se nombran nunca se
+> portaron. Toma los números como no verificados hasta volver a medirlos.
+> Referencias actuales: [Arquitectura](02-arquitectura.md),
+> [Configuración](11-configuracion.md).
+
 Este documento cubre qué podés esperar de DevAI en términos de velocidad, uso de recursos y cómo optimizar para tu carga de trabajo.
 
 ---
