@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use devctx_central::{project_json, Central, RegisterRequest};
 use devctx_core::config::{find_config_file, Project, ProjectConfig};
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
@@ -24,6 +25,10 @@ use devctx_store::Store;
 use devctx_summarize::{create_summarizer, SummarizeSettings};
 use mcp_configure::{McpClient, Options, Scope};
 use serde::Serialize;
+
+/// Default bind address for the project server (and the `--addr` default that
+/// `serve --central` overrides with a per-home port).
+const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 /// Git-aware AI code intelligence tool.
 #[derive(Debug, Parser)]
@@ -152,7 +157,7 @@ enum Command {
     /// Serve the HTTP REST API.
     Api {
         /// Address to bind (host:port).
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        #[arg(long, default_value = DEFAULT_ADDR)]
         addr: String,
         /// Bearer token required on all routes except /health (or DEVCTX_API_TOKEN).
         #[arg(long)]
@@ -163,7 +168,7 @@ enum Command {
     /// Serve the web dashboard (call-graph + memories) in a browser.
     Web {
         /// Address to bind (host:port).
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        #[arg(long, default_value = DEFAULT_ADDR)]
         addr: String,
         /// Don't try to open the dashboard in a browser.
         #[arg(long)]
@@ -172,7 +177,7 @@ enum Command {
     /// Run the long-lived server that owns the DB; other commands route to it.
     Serve {
         /// Address to bind (host:port).
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        #[arg(long, default_value = DEFAULT_ADDR)]
         addr: String,
         /// Bearer token required on all routes except /health (or DEVCTX_API_TOKEN).
         #[arg(long)]
@@ -183,6 +188,60 @@ enum Command {
         /// Stop a running server for this project instead of starting one.
         #[arg(long)]
         stop: bool,
+    },
+    /// Manage the central registry of projects DevCtxEngine knows about.
+    Projects {
+        #[command(subcommand)]
+        action: ProjectsAction,
+    },
+}
+
+/// Actions under `devctx projects`.
+#[derive(Debug, Subcommand)]
+enum ProjectsAction {
+    /// Register a repository (or update its entry).
+    Add {
+        /// Repository path (defaults to the current directory).
+        path: Option<PathBuf>,
+        /// Project name (defaults to the config's name, then the directory).
+        #[arg(long)]
+        name: Option<String>,
+        /// Description, so an agent can pick a project without opening it.
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Comma-separated tags.
+        #[arg(long, default_value = "")]
+        tags: String,
+        /// Create `.devctx/config.yaml` from the central defaults when missing.
+        #[arg(long)]
+        init: bool,
+    },
+    /// List registered projects.
+    List {
+        /// Include deactivated projects.
+        #[arg(long)]
+        all: bool,
+        /// Print JSON instead of a table.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
+    /// Show one project in full.
+    Show {
+        /// Project name.
+        name: String,
+    },
+    /// Re-read a project's `.devctx/config.yaml` into the registry.
+    Refresh {
+        /// Project name.
+        name: String,
+    },
+    /// Remove a project from the registry (the repository is left untouched).
+    Rm {
+        /// Project name.
+        name: String,
+        /// Deactivate instead of deleting, keeping the row and its history.
+        #[arg(long)]
+        deactivate: bool,
     },
 }
 
@@ -277,7 +336,177 @@ fn main() -> Result<()> {
             idle,
             stop,
         } => cmd_serve(addr, token, idle, stop),
+        Command::Projects { action } => cmd_projects(action),
     }
+}
+
+/// `devctx projects` — the central registry.
+fn cmd_projects(action: ProjectsAction) -> Result<()> {
+    let direct = || Central::open().context("opening the central store");
+
+    match action {
+        ProjectsAction::Add {
+            path,
+            name,
+            description,
+            tags,
+            init,
+        } => {
+            let root = match path {
+                Some(p) => p,
+                None => std::env::current_dir().context("resolving current directory")?,
+            };
+            let rec = project_json(&direct()?.register(&RegisterRequest {
+                root,
+                name,
+                description,
+                tags,
+                create_config: init,
+                now: devctx_central::now_stamp(),
+            })?);
+            println!(
+                "Registered `{}` at {}",
+                field(&rec, "name"),
+                field(&rec, "path")
+            );
+            println!(
+                "  Model:  {} ({}, {}d)",
+                field(&rec, "embed_model"),
+                field(&rec, "embed_provider"),
+                num(&rec, "embed_dim")
+            );
+            println!("  Store:  {}", field(&rec, "db_path"));
+            if field(&rec, "last_indexed_at").is_empty() {
+                println!("  Index:  not indexed yet — run `devctx index` in the repo");
+            }
+            Ok(())
+        }
+
+        ProjectsAction::List { all, format } => {
+            let projects: Vec<serde_json::Value> =
+                direct()?.list(all)?.iter().map(project_json).collect();
+            if format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&projects)?);
+                return Ok(());
+            }
+            if projects.is_empty() {
+                println!("No projects registered (run `devctx projects add`).");
+                return Ok(());
+            }
+            let width = projects
+                .iter()
+                .map(|p| field(p, "name").len())
+                .max()
+                .unwrap_or(4);
+            for p in &projects {
+                let indexed = if field(p, "last_indexed_at").is_empty() {
+                    "never indexed".to_string()
+                } else {
+                    format!(
+                        "{} files @ {}",
+                        num(p, "file_count"),
+                        short_commit(&field(p, "last_commit"))
+                    )
+                };
+                let flag = if p.get("active").and_then(|v| v.as_bool()).unwrap_or(true) {
+                    " "
+                } else {
+                    "-"
+                };
+                println!(
+                    "{flag} {:width$}  {:<12} {:<22} {}",
+                    field(p, "name"),
+                    field(p, "embed_model"),
+                    indexed,
+                    field(p, "path")
+                );
+            }
+            Ok(())
+        }
+
+        ProjectsAction::Show { name } => {
+            let p = match direct()?.get(&name)? {
+                Some(rec) => project_json(&rec),
+                None => bail!("no registered project named `{name}`"),
+            };
+            println!("{}", field(&p, "name"));
+            println!("  Path:        {}", field(&p, "path"));
+            println!("  Config:      {}", field(&p, "config_path"));
+            println!("  Store:       {}", field(&p, "db_path"));
+            println!(
+                "  Model:       {} ({}, {}d)",
+                field(&p, "embed_model"),
+                field(&p, "embed_provider"),
+                num(&p, "embed_dim")
+            );
+            if !field(&p, "description").is_empty() {
+                println!("  Description: {}", field(&p, "description"));
+            }
+            if !field(&p, "tags").is_empty() {
+                println!("  Tags:        {}", field(&p, "tags"));
+            }
+            if field(&p, "last_indexed_at").is_empty() {
+                println!("  Index:       never indexed");
+            } else {
+                println!(
+                    "  Index:       {} files, {} symbols, {} chunks",
+                    num(&p, "file_count"),
+                    num(&p, "symbol_count"),
+                    num(&p, "chunk_count")
+                );
+                println!(
+                    "  Last:        {} on {}",
+                    short_commit(&field(&p, "last_commit")),
+                    field(&p, "last_branch")
+                );
+            }
+            println!(
+                "  Active:      {}",
+                p.get("active").and_then(|v| v.as_bool()).unwrap_or(true)
+            );
+            Ok(())
+        }
+
+        ProjectsAction::Refresh { name } => {
+            let rec = project_json(&direct()?.refresh(&name, &devctx_central::now_stamp())?);
+            println!(
+                "Refreshed `{}` from {} — model {} ({}d)",
+                field(&rec, "name"),
+                field(&rec, "config_path"),
+                field(&rec, "embed_model"),
+                num(&rec, "embed_dim")
+            );
+            Ok(())
+        }
+
+        ProjectsAction::Rm { name, deactivate } => {
+            let c = direct()?;
+            let done = if deactivate {
+                c.deactivate(&name, &devctx_central::now_stamp())?
+            } else {
+                c.remove(&name)?
+            };
+            if !done {
+                bail!("no registered project named `{name}`");
+            }
+            let verb = if deactivate { "Deactivated" } else { "Removed" };
+            println!("{verb} `{name}` (the repository itself was not touched)");
+            Ok(())
+        }
+    }
+}
+
+/// A string field of a registry row, empty when absent.
+fn field(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A numeric field of a registry row.
+fn num(v: &serde_json::Value, key: &str) -> i64 {
+    v.get(key).and_then(|x| x.as_i64()).unwrap_or(0)
 }
 
 /// `devctx tui` — open the interactive terminal UI.
@@ -858,7 +1087,28 @@ fn cmd_init(path: Option<PathBuf>, name: Option<String>) -> Result<()> {
     std::fs::write(&cfg_path, yaml).with_context(|| format!("writing {}", cfg_path.display()))?;
 
     println!("Initialized DevCtxEngine project at {}", cfg_path.display());
+    register_centrally(&root);
     Ok(())
+}
+
+/// Add a freshly initialized repo to the central registry so it is discoverable
+/// from other projects.
+///
+/// Best-effort on purpose: a central store that cannot be opened (unwritable
+/// home, or a daemon holding the file) must not make `devctx init` fail — the
+/// project config, which is what actually matters here, is already written.
+fn register_centrally(root: &std::path::Path) {
+    let result = Central::open().and_then(|c| {
+        c.register(&RegisterRequest {
+            root: root.to_path_buf(),
+            now: devctx_central::now_stamp(),
+            ..Default::default()
+        })
+    });
+    match result {
+        Ok(rec) => println!("Registered in the central store as `{}`", rec.name),
+        Err(e) => eprintln!("· not registered centrally ({e}); run `devctx projects add` later"),
+    }
 }
 
 /// `devctx status` — discover and summarize the active project config.
@@ -1083,19 +1333,7 @@ fn now_epoch() -> String {
 
 /// The store's vector dimension for the configured model, without loading it.
 fn configured_dimension(cfg: &ProjectConfig) -> usize {
-    use devctx_embed::registry;
-    let model = &cfg.embeddings.model;
-    match cfg.embeddings.provider.as_str() {
-        "openai" => registry::openai_dimension(model).unwrap_or(1536),
-        "voyage" => registry::voyage_dimension(model).unwrap_or(1024),
-        "custom" => std::env::var("DEVCTX_EMBED_DIMENSION")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(384),
-        _ => registry::find_local(model)
-            .map(|m| m.dimension)
-            .unwrap_or(384),
-    }
+    devctx_embed::dimension_for(&cfg.embeddings.provider, &cfg.embeddings.model)
 }
 
 /// A one-line snippet of `text`, truncated to `max` chars.

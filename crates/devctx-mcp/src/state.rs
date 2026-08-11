@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult};
-use devctx_embed::{create_provider, registry, EmbedSettings, EmbeddingProvider};
+use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::{run as index_run, GitRepo, IndexRequest};
 use devctx_memory::{memory_context, memory_stats, recall, remember, RememberRequest};
 use devctx_rerank::{create_reranker, RerankSettings, Reranker};
@@ -120,18 +120,7 @@ impl AppState {
 /// The store vector dimension for a config, read from the registry so we don't
 /// have to load the model just to open the store.
 fn configured_dimension(cfg: &ProjectConfig) -> usize {
-    let model = &cfg.embeddings.model;
-    match cfg.embeddings.provider.as_str() {
-        "openai" => registry::openai_dimension(model).unwrap_or(1536),
-        "voyage" => registry::voyage_dimension(model).unwrap_or(1024),
-        "custom" => std::env::var("DEVCTX_EMBED_DIMENSION")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(384),
-        _ => registry::find_local(model)
-            .map(|m| m.dimension)
-            .unwrap_or(384),
-    }
+    devctx_embed::dimension_for(&cfg.embeddings.provider, &cfg.embeddings.model)
 }
 
 /// `search` tool: vector / keyword / hybrid search, then rerank, return JSON hits.

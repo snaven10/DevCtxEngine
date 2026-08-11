@@ -15,6 +15,7 @@ members = [
     "crates/devctx-summarize",
     "crates/devctx-api",
     "crates/devctx-tui",
+    "crates/devctx-central",
 ]
 
 [workspace.package]

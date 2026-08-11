@@ -118,6 +118,32 @@ CREATE TABLE IF NOT EXISTS memory_symbol_references (
     PRIMARY KEY (memory_id, symbol, file, branch)
 );
 
+-- The project registry. Only ever populated in the *central* store, which is
+-- the one place that knows about every repository DevCtxEngine tracks; it stays
+-- empty in per-project databases.
+CREATE TABLE IF NOT EXISTS projects (
+    name            VARCHAR PRIMARY KEY,
+    path            VARCHAR,
+    config_path     VARCHAR,
+    db_path         VARCHAR,
+    embed_provider  VARCHAR,
+    embed_model     VARCHAR,
+    embed_dim       INTEGER,
+    description     VARCHAR,
+    tags            VARCHAR,
+    last_commit     VARCHAR,
+    last_branch     VARCHAR,
+    last_indexed_at VARCHAR,
+    file_count      INTEGER,
+    symbol_count    INTEGER,
+    chunk_count     INTEGER,
+    registered_at   VARCHAR,
+    updated_at      VARCHAR,
+    active          BOOLEAN
+);
+CREATE INDEX IF NOT EXISTS idx_projects_path ON projects (path);
+CREATE INDEX IF NOT EXISTS idx_projects_active ON projects (active);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id         VARCHAR PRIMARY KEY,
     project    VARCHAR,

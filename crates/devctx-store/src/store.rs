@@ -58,6 +58,35 @@ impl Store {
         self.dim
     }
 
+    /// The vector width actually recorded in the `vectors` table on disk, or
+    /// `None` when the table is absent or its type cannot be parsed.
+    ///
+    /// The schema is created with `IF NOT EXISTS`, so opening an existing
+    /// database with a different [`dimension`](Self::dimension) silently leaves
+    /// the old column in place and every write fails later, far from the cause.
+    /// Callers that open a store whose model may have changed should compare the
+    /// two up front and refuse.
+    pub fn stored_dimension(&self) -> Result<Option<usize>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT data_type FROM information_schema.columns
+             WHERE table_name = 'vectors' AND column_name = 'vector'",
+        )?;
+        let ty: std::result::Result<String, _> = stmt.query_row([], |r| r.get(0));
+        let ty = match ty {
+            Ok(t) => t,
+            Err(duckdb::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // e.g. `FLOAT[384]`
+        let Some(open) = ty.find('[') else {
+            return Ok(None);
+        };
+        let Some(close) = ty[open..].find(']') else {
+            return Ok(None);
+        };
+        Ok(ty[open + 1..open + close].trim().parse().ok())
+    }
+
     /// Open another connection to the *same* in-process database. Unlike
     /// [`open`](Self::open), this shares the already-open database instance, so
     /// it does not take a second file lock — the way to hand concurrent

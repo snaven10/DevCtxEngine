@@ -27,6 +27,7 @@ devctx-search = { path = "../devctx-search" }
 devctx-summarize = { path = "../devctx-summarize" }
 devctx-api = { path = "../devctx-api" }
 devctx-tui = { path = "../devctx-tui" }
+devctx-central = { path = "../devctx-central" }
 anyhow.workspace = true
 clap.workspace = true
 serde_yaml.workspace = true

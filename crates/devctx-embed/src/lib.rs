@@ -62,6 +62,27 @@ impl EmbedSettings {
     }
 }
 
+/// The vector dimension for a provider/model pair, resolved from the registry
+/// **without loading the model**.
+///
+/// This is what lets a store be opened (its `FLOAT[dim]` column is fixed at
+/// creation) before deciding whether the embedder is even needed — the lazy-load
+/// path every server takes. The `custom` provider has no registry entry, so its
+/// dimension comes from `DEVCTX_EMBED_DIMENSION`.
+pub fn dimension_for(provider: &str, model: &str) -> usize {
+    match provider {
+        "openai" => registry::openai_dimension(model).unwrap_or(1536),
+        "voyage" => registry::voyage_dimension(model).unwrap_or(1024),
+        "custom" => std::env::var("DEVCTX_EMBED_DIMENSION")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(384),
+        _ => registry::find_local(model)
+            .map(|m| m.dimension)
+            .unwrap_or(384),
+    }
+}
+
 /// Construct an embedding provider from resolved settings.
 pub fn create_provider(s: &EmbedSettings) -> Result<Box<dyn EmbeddingProvider>> {
     match s.provider.as_str() {

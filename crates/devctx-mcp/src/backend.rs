@@ -22,7 +22,7 @@ pub struct ServerConn {
 }
 
 /// A thin blocking HTTP client for the shared server's endpoints.
-struct RemoteClient {
+pub struct RemoteClient {
     base: String,
     token: Option<String>,
 }
