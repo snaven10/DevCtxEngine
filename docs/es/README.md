@@ -6,7 +6,7 @@
 
 - [Introducción](01-introduccion.md) — Qué es DevAI, el problema que resuelve, inicio rápido
 - [Arquitectura](02-arquitectura.md) — Diagrama del sistema, componentes, flujo de datos
-- [Configuración](11-configuracion.md) — config.yaml, conexión del cliente MCP, variables de entorno, hooks de auto-index
+- [Configuración](11-configuracion.md) — config del proyecto y central, variables de entorno, cliente MCP, modo servidor
 
 ## Conceptos fundamentales
 
@@ -33,5 +33,6 @@
 - [Decisiones de diseño](08-decisiones-de-diseno.md) — Registros de decisiones de arquitectura con tradeoffs
 - [Modelos y tuning](09-modelos-embeddings-y-tuning.md) — Modelos de embeddings comparados, estrategias de summarizer y presupuesto de tokens, config por hardware
 - [Benchmark de tokens y costo (MCP)](10-benchmark-tokens-mcp.md) — A/B real: recuperación filtrada MCP vs volcado bruto
-- [Store central multi-repo](12-multi-repo-store-central.md) — Un índice compartido entre varios repos vía hooks
+- [El store central](12-store-central.md) — Registro de proyectos y memoria global compartida entre repos
+- [Mantener el índice al día](13-mantener-el-indice-al-dia.md) — hooks, watch, reindex y el planificador
 - [Changelog](../../CHANGELOG.md) — Historial de cambios

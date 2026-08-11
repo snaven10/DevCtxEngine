@@ -1,302 +1,153 @@
-> 🇪🇸 [Leer en español](es/11-configuracion.md)
-
 # Configuration
 
-How DevAI is configured: the `config.yaml` files, how the MCP server is wired into AI clients
-(Claude Code, Cursor, …), the environment variables, and the git auto-index hooks.
+> 🇪🇸 [Leer en español](es/11-configuracion.md)
 
-> For embedding-model choices, summarizer/token-budget strategies, and hardware-based tuning, see
-> [Models & Tuning](09-models-and-tuning.md). This page is the **configuration mechanics** reference.
+There are two config files. The project one describes a repository; the central
+one describes this machine.
 
 ---
 
-## 1. `config.yaml` — project configuration
+## 1. Project config — `.devctx/config.yaml`
 
-`devai init` creates `.devai/config.yaml` in the repo. The CLI (`devai index`, `devai server …`) and the
-MCP server read it to resolve the model, state directory, storage mode and excludes.
-
-### 1.1 Full schema
+Written by `devctx init` (or `devctx projects add --init`) at the repository
+root. Found by walking up from the working directory, so any subdirectory works.
 
 ```yaml
 project:
-  name: my-repo                 # human-friendly alias
-  path: /full/path/to/repo
+  name: myproj                 # the name agents refer to it by
+  path: /home/you/code/myproj  # absolute repository root
 
-state_dir: /full/path/to/.devai/state   # where vectors + graph + memory live
-language: en                    # en | es  (affects model descriptions / TUI)
+state_dir: ''                  # empty => .devctx/state/ inside the repo
+language: en                   # en | es — UI and summary language
 
 embeddings:
-  provider: local               # local | openai | voyage | custom
-  model: minilm-l6              # registry key — see Models & Tuning
-  offline: auto                 # auto (cache, no Hub check) | true | false
+  provider: local              # local | openai | voyage | custom
+  model: minilm-l6             # registry key; see docs/09
+  model_dir: ''                # directory of a user-defined ONNX model
+  offline: auto                # auto | "true" | "false"
 
 storage:
-  mode: local                   # local | shared | hybrid
-  qdrant_url: localhost:6334    # only for shared / hybrid
-  qdrant_api_key: ""            # only for shared / hybrid
-  local_db_path: ""             # override the LanceDB path (optional)
+  db_path: ''                  # empty => {state_dir}/index.duckdb
+  hnsw: false                  # approximate vector index (needs the VSS extension)
+  fts: false                   # BM25 keyword index (needs the FTS extension)
 
 indexing:
-  exclude:                      # glob patterns skipped during indexing
-    - "node_modules/**"
-    - "vendor/**"
-    - ".git/**"
-    - "dist/**"
-    - "build/**"
-    - "*.min.js"
-    - "*.lock"
+  exclude: []                  # .gitignore-style patterns; see docs/13
 
-runtime:
-  python_path: ""               # explicit python binary (optional; auto-detected)
+reranking:
+  enabled: true
+  model: bge-base              # bge-base | bge-v2-m3 (multilingual)
+
+summarization:
+  provider: extractive         # extractive | openai | noop
+  require_local: true          # block non-local providers
+  target_tokens: 200
+  model: gpt-4o-mini           # for API providers
 ```
 
-### 1.2 The three locations (and how they're found)
+**Where the database ends up.** `storage.db_path` wins; then
+`{state_dir}/index.duckdb`; then `.devctx/state/index.duckdb` under the project
+path. `devctx init` leaves both empty, so the index lives inside the repository —
+and writes `.devctx/.gitignore` with `state/` so it is not committed. The config
+beside it *is* worth tracking.
 
-DevAI looks for `.devai/config.yaml` by **walking up** from the current directory (`FindConfigFile`). In a
-multi-repo workspace you typically end up with several:
+**Changing the embedding model** changes the vector width, which is fixed when
+the database is created. Indexing detects the mismatch and re-indexes from
+scratch rather than corrupting the store.
 
-| File | Read when | Drives |
-|------|-----------|--------|
-| `<repo>/.devai/config.yaml` | `devai index` run **inside that repo** | model + excludes for that repo |
-| `<workspace>/.devai/config.yaml` | `devai server mcp` run from the workspace root | model for the MCP service |
-| `<workspace>/.devai/state/config.yaml` | shared-state resolution | the shared `state_dir` |
+## 2. Central config — `~/.config/devctx/config.yaml`
 
-> **Keep the `embeddings.model` identical across all of them.** They are independent files; if one drifts,
-> tools that run from that directory will index/query with the wrong (or empty-dimension) model.
+Machine-wide. Written with defaults the first time anything touches the central
+store. Full reference in [The Central Store §6](12-central-store.md#6-configuration).
 
-### 1.3 Precedence: `config.yaml` wins over the env var
+```yaml
+memory:
+  provider: local
+  model: minilm-l6       # pins the global memory vector space — a constraint,
+                         # not a default: it cannot vary per project
+defaults:                # what `projects add --init` writes into a new project
+  embeddings:
+    provider: local
+    model: minilm-l6
+  reranking:
+    enabled: true
+    model: bge-base
+reindex:
+  every_seconds: 0       # background sweep; 0 = off
+```
 
-This is the single most common surprise. The **Go CLI and MCP read `embeddings.model` from the nearest
-`config.yaml` and pass it to the Python service, overriding `DEVAI_EMBEDDING_MODEL`.** Setting only the env
-var is **not** enough to change the model — change it in `config.yaml` (or with `devai model use <key>`,
-which edits the file for you). See the migration runbook in [Models & Tuning](09-models-and-tuning.md#7-gotchas-when-migrating-models-learned-in-production).
+**Precedence** for anything both files can express:
 
-Env vars *do* take effect for parameters that have no `config.yaml` field (token budget, summarizer, rerank,
-idle timeout — see §3).
+```
+.devctx/config.yaml  ›  central defaults  ›  built-in defaults
+```
 
----
+The central `defaults` are a starting point, copied into a project's config when
+it is created. Editing them later does not change existing projects — edit the
+project's own config, then `devctx projects refresh <name>` to update the
+registry's copy.
 
-## 2. MCP configuration — wiring DevAI into AI clients
+## 3. Environment variables
 
-DevAI talks to AI agents over the **Model Context Protocol** on **stdio**. The client launches
-`devai server mcp` as a subprocess and calls the tools over JSON-RPC.
+| Variable | Effect |
+|---|---|
+| `DEVCTX_HOME` | Relocates the central store *and* config under one directory. Primarily for tests and CI. |
+| `DEVCTX_MODEL_CACHE` | Where downloaded models are cached. Default: `{data dir}/models`. |
+| `DEVCTX_NO_AUTOSERVE` | Never auto-spawn a server; commands open the store directly. |
+| `DEVCTX_API_TOKEN` | Bearer token required by `serve` / `api` on every route except `/health`. |
+| `DEVCTX_MODEL_DIR` | Directory of a user-defined ONNX model. `embeddings.model_dir` wins over it. |
+| `DEVCTX_EMBED_ENDPOINT` | Base URL for the `custom` embedding provider. |
+| `DEVCTX_EMBED_DIMENSION` | Vector width for the `custom` provider, which has no registry entry. |
+| `OPENAI_API_KEY` / `VOYAGE_API_KEY` | Credentials for the API embedding providers. |
 
-### 2.1 Automatic: `devai server configure`
+`$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` are honoured when set.
+
+## 4. Registering with an AI client
 
 ```bash
-devai server configure --all      # Claude Code + Cursor (default)
-devai server configure --claude   # only Claude Code
-devai server configure --show     # preview without writing
-devai server configure --remove   # remove the devai entry
-devai server configure --claude --scope project   # write a project .mcp.json instead of the global ~/.claude.json
-devai server configure --claude --env DEVAI_EMBEDDING_MODEL=ml-mpnet  # pin tuning vars into the entry
+devctx mcp configure --client claude-code --scope project
+devctx mcp configure --client cursor --scope global
+devctx mcp configure --client claude-desktop --scope global
+devctx mcp configure --client claude-code --remove
+devctx mcp configure --client cursor --show      # print without writing
 ```
 
-It (a) resolves the absolute `devai` binary path, (b) detects the project `config.yaml` + state dir, (c)
-writes the MCP server entry into each client config, and (d) generates `.devai/AGENT.md` (tool-usage
-instructions for the agent).
+| Client | Project scope | Global scope |
+|---|---|---|
+| `claude-code` | `.mcp.json` | `~/.claude.json` |
+| `cursor` | `.cursor/mcp.json` | `~/.cursor/mcp.json` |
+| `claude-desktop` | — | `claude_desktop_config.json` |
 
-| Client | File written | Key |
-|--------|--------------|-----|
-| Claude Code | `~/.claude.json` | `mcpServers.devai` |
-| Cursor / Windsurf | `~/.cursor/mcp.json` | `mcpServers.devai` |
+The entry is written into `mcpServers` alongside whatever is already there.
+`--env KEY=VALUE` (repeatable) adds environment entries.
 
-> `--scope project` writes the Claude entry to `<projectRoot>/.mcp.json` (merged non-destructively, Claude Code only).
-> `--env KEY=VALUE` is repeatable and merges on top of the defaults (`DEVAI_STATE_DIR`, Qdrant).
->
-> **Note on the model and `--env`:** by default `server configure` does *not* write `DEVAI_EMBEDDING_MODEL`
-> into `env` — the model is resolved from `config.yaml` (§1.3). When you pass it explicitly (e.g. the
-> installer's `--env DEVAI_EMBEDDING_MODEL=…`), it *is* pinned into the entry and acts as the effective
-> model until a `config.yaml` exists (which then overrides it again, per §1.3).
+Project-scoped files land in the repository — check whether you want them
+committed before doing so.
 
-The entry it writes:
+## 5. Server mode
 
-```json
-{
-  "type": "stdio",
-  "command": "/abs/path/to/devai",
-  "args": ["server", "mcp"],
-  "env": {
-    "DEVAI_STATE_DIR": "/abs/path/.devai/state"
-  }
-}
-```
-
-> **Note — the model is *not* written into `env`.** `server configure` only sets `DEVAI_STATE_DIR` (plus
-> `DEVAI_STORAGE_MODE` / Qdrant vars when storage mode is `shared`/`hybrid`). The embedding model is resolved
-> from `config.yaml` (§1.3). If you want to pin tuning parameters (summarizer, token strategy, rerank), add
-> them to the `env` block manually — see §3.
-
-### 2.2 Project-scoped config: `.mcp.json`
-
-Claude Code also supports a **project-level** `.mcp.json` at the repo/workspace root, which is the right
-place to pin per-project tuning. Same structure as the entry above, e.g.:
-
-```json
-{
-  "mcpServers": {
-    "devai": {
-      "command": "/abs/path/to/devai",
-      "args": ["server", "mcp"],
-      "env": {
-        "DEVAI_STATE_DIR": "/abs/path/.devai/state",
-        "DEVAI_EMBEDDING_MODEL": "ml-mpnet",
-        "DEVAI_TOKEN_STRATEGY": "summarize",
-        "DEVAI_SUMMARIZER_PROVIDER": "extractive",
-        "DEVAI_MAX_OUTPUT_TOKENS": "4000"
-      }
-    }
-  }
-}
-```
-
-After any change, **restart / reconnect the MCP** in your client for it to take effect.
-
-### 2.3 `.devai/AGENT.md`
-
-`server configure` also drops an `AGENT.md` telling the agent to prefer DevAI tools (`search`,
-`build_context`, `read_symbol`, `get_references`, `recall`/`remember`) over manual file reads. Point your
-agent's instructions at it, or paste its contents into your project rules.
-
-### 2.4 The installer wizard
-
-`scripts/install.sh` is **TTY-aware**. Run from a terminal it walks you through a short wizard; piped
-(`curl … | bash`) it runs non-interactively with defaults + flags and never blocks on a prompt.
-
-| Prompt | Default | Flag |
-|--------|---------|------|
-| Install directory | `~/.local/share/devai` | `--install-dir DIR` |
-| State directory (`DEVAI_STATE_DIR`) | `<install-dir>/state` | `--state-dir DIR` |
-| PyTorch CPU or GPU | CPU | `--gpu` |
-| Embedding model | `minilm-l6` (or `ml-mpnet`) | `--model KEY` |
-| Configure AI client | `claude` (or `cursor` / `both` / `none`) | `--client NAME` |
-| Claude config scope | `global` (or `project`) | `--scope SCOPE` |
-| Install git auto-index hook | yes | `--hooks` / `--no-hooks` |
-| Accept all defaults, no prompts | — | `--yes` (implied when no TTY) |
-
-After installing, the wizard delegates client wiring to `devai server configure` and (optionally) installs
-the git hook via `devai hooks install` — it never writes client JSON itself.
-
----
-
-## 3. Environment Variables
-
-Read by the Python ML service at startup. Useful in the MCP `env` block or your shell. (Names are the
-authoritative ones from the service config.)
-
-**Core / paths**
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `DEVAI_STATE_DIR` | Where vectors/graph/memory live | `~/.local/share/devai/state` |
-| `DEVAI_LOCAL_DB_PATH` | Override the LanceDB vectors path | `<state_dir>/vectors` |
-| `DEVAI_PYTHON` | Explicit python binary for the ML service | auto-detected |
-
-**Embeddings**
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `DEVAI_EMBEDDING_MODEL` | Embedding model key *(overridden by `config.yaml`, §1.3)* | `minilm-l6` |
-| `DEVAI_EMBEDDING_PROVIDER` | `local` \| `openai` \| `voyage` \| `custom` | `local` |
-| `DEVAI_EMBEDDING_DEVICE` | `cpu` \| `cuda` | `cpu` |
-| `DEVAI_EMBEDDING_API_KEY` | API key for remote embedding providers | — |
-| `DEVAI_EMBEDDINGS_OFFLINE` | `auto` \| `true` \| `false` | `auto` |
-| `DEVAI_EMBED_MAX_CHARS` | RAM guard — max chars fed to the encoder per text (NOT the model's context limit). Lower (e.g. `2048`) on low-RAM machines to avoid OOM on minified/large non-code chunks. | `4096` |
-| `DEVAI_EMBED_BATCH_SIZE` | Texts per embedding batch. Lower (e.g. `8`) to reduce peak RAM. | `16` |
-
-**Token budget & summarizer**
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `DEVAI_TOKEN_STRATEGY` | `drop` \| `soft_truncate` \| `hard_truncate` \| `summarize` | `drop` |
-| `DEVAI_MAX_OUTPUT_TOKENS` | Token budget for tool responses | `4000` |
-| `DEVAI_TOKEN_ENCODING` | Tokenizer encoding name | `cl100k_base` |
-| `DEVAI_SUMMARIZER_PROVIDER` | `noop` \| `extractive` \| `flan-t5` \| `openai` | `extractive` |
-| `DEVAI_SUMMARIZER_MODEL` | Model id for non-extractive summarizers (e.g. `google/flan-t5-small`) | provider-specific |
-| `DEVAI_SUMMARIZER_DEVICE` | `cpu` \| `cuda` for local summarizers | `cpu` |
-| `DEVAI_SUMMARIZER_API_KEY` | API key for `openai` summarizer | — |
-| `DEVAI_SUMMARIZER_TARGET_TOKENS` | Target length for summaries | `200` |
-| `DEVAI_SUMMARIZER_REQUIRE_LOCAL` | Block non-local providers (fail instead of using a remote summarizer) | `true` |
-
-**Rerank**
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `DEVAI_RERANK_ENABLED` | Toggle reranking on/off | `true` |
-| `DEVAI_RERANK_PROVIDER` | `noop` \| `flashrank` | `flashrank` |
-| `DEVAI_RERANK_MODEL` | flashrank model; `ms-marco-MultiBERT-L-12` for **multilingual** | `ms-marco-MiniLM-L-12-v2` |
-| `DEVAI_RERANK_TOP_K_FETCH` | Candidates pulled before reranking | `15` |
-| `DEVAI_RERANK_CACHE_DIR` | Where flashrank model files are cached | `<install>/flashrank` |
-
-**Chunking**
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `DEVAI_MAX_CHUNK_TOKENS` | Upper bound on a code chunk | `512` |
-| `DEVAI_MIN_CHUNK_TOKENS` | Lower bound on a code chunk | `64` |
-| `DEVAI_LARGE_FUNCTION_THRESHOLD` | Token size above which a function is split | `1024` |
-
-**Storage & service**
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `DEVAI_STORAGE_MODE` | `local` \| `shared` \| `hybrid` | `local` |
-| `DEVAI_QDRANT_URL` / `DEVAI_QDRANT_API_KEY` | Shared/hybrid Qdrant | — |
-| `DEVAI_ML_IDLE_TIMEOUT_SEC` | Idle seconds before the ML service exits (`0` disables) | `1800` |
-| `DEVAI_API_TOKEN` | Bearer token for the HTTP server mode (`devai server http`) | — |
-
-> **Not user-configurable env vars** — these strings appear in the codebase but are **not** read from the
-> environment, so do **not** treat them as tunables:
-> - `DEVAI_ML_READY` — set by the runtime to signal the ML service is up.
-> - `DEVAI_AUTO_INDEX` — the begin/end **marker text** of the git post-commit hook block (see §4), not a variable.
-> - `DEVAI_UUID_NAMESPACE` — a hardcoded UUID **constant** in the Qdrant store, not an env var.
-
-> Long re-index runs (large repos on CPU) can exceed the idle watchdog. Set `DEVAI_ML_IDLE_TIMEOUT_SEC=0`
-> while re-indexing — see [Models & Tuning](09-models-and-tuning.md#7-gotchas-when-migrating-models-learned-in-production).
-
-See [Models & Tuning §3–§4](09-models-and-tuning.md) for the full set of summarizer/token-budget/rerank
-variables and their trade-offs.
-
----
-
-## 4. Git Auto-Index Hooks
-
-`devai hooks install` adds a **git post-commit hook** that re-indexes the repo (incrementally, in the
-background) after each commit, so the index never goes stale.
+DuckDB allows one writing process per database file, so `devctx serve` becomes
+the sole owner of a project's store and every other command routes to it over
+HTTP. It is spawned automatically on first use and idles out after 15 minutes.
 
 ```bash
-devai hooks install [repo-path]     # install or update (defaults to current repo)
-devai hooks uninstall [repo-path]   # remove only the devai section
+devctx serve                 # foreground, this project
+devctx serve --stop
+devctx serve --central       # the central store instead; see docs/12
+DEVCTX_NO_AUTOSERVE=1 devctx search "…"    # open the store directly instead
 ```
 
-### What it writes
+Because the server holds the loaded code, **a rebuilt binary does not take effect
+until the running server is restarted** — `devctx serve --stop` before testing a
+change.
 
-A **delimited block** in `.git/hooks/post-commit`:
+## 6. Quick recap
 
-```sh
-# >>> DEVAI_AUTO_INDEX >>>
-# Auto-index after each commit. Managed by 'devai hooks install/uninstall' — do not edit by hand.
-( cd "$(git rev-parse --show-toplevel)" && DEVAI_STATE_DIR="…/.devai/state" "/abs/devai" index --incremental ) >/dev/null 2>&1 &
-# <<< DEVAI_AUTO_INDEX <<<
-```
-
-- **`cd "$(git rev-parse --show-toplevel)"`** — runs from the repo root so the indexer resolves the real
-  repo name.
-- **`>/dev/null 2>&1 &`** — backgrounded and silenced; the commit is never blocked or polluted by logs.
-- **Coexists with other hooks.** The block is delimited by BEGIN/END markers: re-running `install` replaces
-  only that block, and `uninstall` removes only that block — any other post-commit logic is preserved. If
-  the file ends up with just a shebang, `uninstall` removes it entirely.
-
-> Tip: combine with `DEVAI_STATE_DIR` pointing at a **shared workspace state** so several repos keep a single
-> unified index.
-
----
-
-## 5. Quick Recap
-
-1. **Model & excludes** → `.devai/config.yaml` (per repo). `config.yaml` beats `DEVAI_EMBEDDING_MODEL`.
-2. **Wire into an AI client** → `devai server configure --all` (writes `mcpServers.devai`), or a project
-   `.mcp.json` for per-project tuning.
-3. **Tuning** (summarizer, token budget, rerank, idle timeout) → env vars in the MCP `env` block.
-4. **Keep the index fresh** → `devai hooks install`.
-5. **Reconnect the MCP** after changing any client config or env.
+| Want to… | Do |
+|---|---|
+| Change a project's model | Edit `embeddings.model`, then `devctx index --full` |
+| Keep files out of the index | `.gitignore`, or `indexing.exclude` for tracked files |
+| Move the index out of the repo | Set `state_dir` (or `storage.db_path`) |
+| Move models off the system disk | `DEVCTX_MODEL_CACHE` |
+| See what a project is configured with | `devctx projects show <name>` |
+| Share a lesson between projects | `devctx remember … --scope global` |

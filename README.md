@@ -5,26 +5,56 @@ indexing, hybrid search, an MCP server, an HTTP API and a TUI. See
 [`docs/rust-rewrite-plan.md`](docs/rust-rewrite-plan.md) for the architecture and
 phased plan.
 
-> **Status: complete.** `devctx init`, `index` and `search` work end-to-end: the
-> incremental pipeline indexes a repo and semantic search returns ranked results
-> using a real local model. All rewrite phases (F0–F9) are done.
-
 ```bash
 devctx init --name myproj
 devctx index                       # git diff → parse → chunk → embed → store
 devctx search "connect to a database" --limit 5
-devctx search "greet a user" --format json
 devctx remember "We chose Postgres for JSONB" --type decision --topic db-engine
 devctx recall "which database did we pick"
-devctx memory-stats
 devctx mcp                         # MCP server over stdio (for AI agents/editors)
 devctx mcp configure --client cursor --scope project   # register in an AI client
-devctx tui                         # terminal UI: search + call-graph + memories (F1/F2/F3)
+devctx tui                         # terminal UI: search, call-graph, memories, projects
 devctx web                         # web dashboard: interactive call-graph + memories
-devctx serve                       # long-lived server that owns the DB (server mode)
 ```
 
-**Server mode.** DuckDB allows a single read-write process. Run `devctx serve`
+## Across projects
+
+Each repository keeps its own index. What is shared lives in a **central store**:
+a registry of every project, and the memory worth carrying between them — so an
+agent working in one repository knows the others exist and can recall what was
+learned there.
+
+```bash
+devctx projects add ~/code/api     # register a repository (init does this too)
+devctx projects list               # name · model · index freshness · path
+
+devctx remember "always verify webhook signatures" --scope global
+devctx recall "how do I validate a webhook"        # this project + the shared ones
+devctx recall "..." --scope global --repo api      # only what `api` contributed
+```
+
+A global memory saved from one repository is recalled from any other, and the
+same lesson saved twice converges on one memory rather than two. Anything left
+`local` — the default — never leaves its project.
+
+Over MCP this is `list_projects`, `search_project`, and `scope` on
+`recall`/`remember`. See [The Central Store](docs/12-central-store.md).
+
+## Keeping the index fresh
+
+```bash
+devctx hooks install               # re-index after each commit
+devctx watch                       # re-index files as they are saved
+devctx reindex --all               # every registered project
+```
+
+The index mirrors the **work tree**, not the last commit: a file you have written
+but not committed is indexed like any other, and a full re-index does not throw it
+away. See [Keeping the index fresh](docs/13-keeping-the-index-fresh.md).
+
+## Server mode
+
+DuckDB allows a single read-write process. Run `devctx serve`
 and it becomes the sole owner of the database; every other `devctx` command
 discovers it (via `.devctx/state/serve.json`) and routes over HTTP instead of
 opening the file, so concurrent CLI/editor/web use never hits a lock. When no
@@ -41,9 +71,17 @@ so repeated commands return in milliseconds. The daemon idles out after 15
 minutes; stop it explicitly with `devctx serve --stop`, or disable auto-spawn
 with `DEVCTX_NO_AUTOSERVE=1`.
 
+The central store is a singleton and follows the same pattern: `devctx serve
+--central` owns it, auto-spawned on demand.
+
 `devctx web` serves a self-contained dashboard (call-graph via a vendored,
 offline cytoscape build + a memories browser) and opens it in your browser.
-`devctx tui` is the terminal equivalent, with three views switched by F1/F2/F3.
+`devctx tui` is the terminal equivalent, with four views on F1–F4: search, graph,
+memories (with a scope selector) and projects — where you can register and index
+a repository without leaving the UI.
+
+Because the server holds the loaded code, a rebuilt binary does not take effect
+until the running server is restarted (`devctx serve --stop`).
 
 ## Crates
 
@@ -62,9 +100,17 @@ offline cytoscape build + a memories browser) and opens it in your browser.
 | `devctx-memory` | memory engine: remember (dedup) + recall (intro/chunk blend) | F7 |
 | `devctx-summarize` | summarization: extractive (default) + OpenAI + local flan-t5 | F9 |
 | `devctx-api` | HTTP REST API (axum) reusing the MCP engine, Bearer-token auth | F9 |
-| `devctx-tui` | interactive terminal UI (ratatui): live vector/keyword/hybrid search | F9 |
+| `devctx-tui` | interactive terminal UI (ratatui): search, graph, memories, projects | F9 |
+| `devctx-central` | central store: project registry, global memories, daemon client | — |
 
-All rewrite phases (F0–F9) are complete.
+## Documentation
+
+- [Configuration](docs/11-configuration.md) — project and central config, environment variables, MCP clients
+- [The Central Store](docs/12-central-store.md) — registry, global memories, the daemon
+- [Keeping the index fresh](docs/13-keeping-the-index-fresh.md) — hooks, watch, reindex, exclusions
+- [Architecture](docs/02-architecture.md) · [Models & tuning](docs/09-models-and-tuning.md) · [Design decisions](docs/08-design-decisions.md)
+
+🇪🇸 [Documentación en español](docs/es/README.md)
 
 The `flan-t5` feature (off by default) adds a local abstractive summarizer via
 candle — build with `--features flan-t5` (heavy; downloads the model on first use).
