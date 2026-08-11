@@ -44,6 +44,7 @@ fn router(api: CentralApi) -> Router {
         .route("/projects/:name", get(show_project))
         .route("/projects/:name", delete(remove_project))
         .route("/projects/:name/refresh", post(refresh_project))
+        .route("/projects/indexed", post(record_index))
         .route("/remember", post(remember))
         .route("/recall", post(recall))
         .route("/memories", get(memories))
@@ -124,6 +125,22 @@ struct ListQuery {
 struct RemoveQuery {
     #[serde(default)]
     deactivate: bool,
+}
+
+#[derive(Deserialize)]
+struct IndexedBody {
+    /// Absolute repository path — the key the registry is looked up by.
+    path: String,
+    #[serde(default)]
+    commit: String,
+    #[serde(default)]
+    branch: String,
+    #[serde(default)]
+    files: i64,
+    #[serde(default)]
+    symbols: i64,
+    #[serde(default)]
+    chunks: i64,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +249,26 @@ async fn remove_project(
             return Err(format!("no registered project named `{name}`"));
         }
         Ok(json!({ "removed": name, "deactivated": q.deactivate }).to_string())
+    })
+    .await
+}
+
+async fn record_index(State(api): State<CentralApi>, Json(b): Json<IndexedBody>) -> Response {
+    run(api, move |c| {
+        let recorded = c
+            .record_index(
+                &b.path,
+                &devctx_store::ProjectIndexStats {
+                    commit: b.commit,
+                    branch: b.branch,
+                    files: b.files,
+                    symbols: b.symbols,
+                    chunks: b.chunks,
+                },
+                &devctx_central::now_stamp(),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "recorded": recorded }).to_string())
     })
     .await
 }

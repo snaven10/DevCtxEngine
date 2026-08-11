@@ -237,6 +237,25 @@ impl CentralClient {
         )
     }
 
+    /// Report an indexing outcome so `projects list` reflects reality.
+    pub fn record_index(
+        &self,
+        path: &str,
+        commit: &str,
+        branch: &str,
+        files: i64,
+        symbols: i64,
+        chunks: i64,
+    ) -> Result<Value> {
+        self.post(
+            "/projects/indexed",
+            serde_json::json!({
+                "path": path, "commit": commit, "branch": branch,
+                "files": files, "symbols": symbols, "chunks": chunks,
+            }),
+        )
+    }
+
     pub fn show(&self, name: &str) -> Result<Value> {
         self.get(&format!("/projects/{}", urlencode(name)))
     }

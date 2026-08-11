@@ -4,6 +4,7 @@
 //! embedder pulls in fastembed/ort (the `local` provider) and downloads the
 //! model on first use.
 
+mod hooks;
 mod mcp_configure;
 mod remote;
 
@@ -201,11 +202,39 @@ enum Command {
         #[arg(long)]
         central: bool,
     },
+    /// Install or remove the git hook that re-indexes after each commit.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
+    /// Re-index registered projects (incremental by default).
+    Reindex {
+        /// Every active project in the registry.
+        #[arg(long)]
+        all: bool,
+        /// Named project(s); repeatable. Defaults to the current project.
+        #[arg(long = "project")]
+        projects: Vec<String>,
+        /// Force a full reindex instead of incremental.
+        #[arg(long)]
+        full: bool,
+    },
     /// Manage the central registry of projects DevCtxEngine knows about.
     Projects {
         #[command(subcommand)]
         action: ProjectsAction,
     },
+}
+
+/// Actions under `devctx hooks`.
+#[derive(Debug, Subcommand)]
+enum HooksAction {
+    /// Install the `post-commit` hook (safe to re-run).
+    Install,
+    /// Remove the hook, leaving any of your own hook code in place.
+    Uninstall,
+    /// Report whether the hook is installed.
+    Status,
 }
 
 /// Actions under `devctx projects`.
@@ -372,8 +401,127 @@ fn main() -> Result<()> {
                 cmd_serve(addr, token, idle, stop)
             }
         }
+        Command::Hooks { action } => cmd_hooks(action),
+        Command::Reindex {
+            all,
+            projects,
+            full,
+        } => cmd_reindex(all, projects, full),
         Command::Projects { action } => cmd_projects(action),
     }
+}
+
+/// `devctx hooks` — manage the post-commit indexing hook.
+fn cmd_hooks(action: HooksAction) -> Result<()> {
+    let cfg = load_project()?;
+    let root = project_root(&cfg)?;
+    match action {
+        HooksAction::Install => {
+            let path = hooks::install(&root)?;
+            println!("Installed the post-commit hook at {}", path.display());
+            println!("This repository now re-indexes itself after each commit.");
+        }
+        HooksAction::Uninstall => {
+            if hooks::uninstall(&root)? {
+                println!("Removed the post-commit hook.");
+            } else {
+                println!("No DevCtxEngine hook was installed.");
+            }
+        }
+        HooksAction::Status => {
+            if hooks::installed(&root)? {
+                println!("Installed: this repository re-indexes after each commit.");
+            } else {
+                println!("Not installed (run `devctx hooks install`).");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `devctx reindex` — re-index projects from the registry.
+///
+/// Each project is indexed through its own server, so this never takes a second
+/// lock on a database another process already owns. One project failing does not
+/// stop the rest: the failures are collected and reported at the end.
+fn cmd_reindex(all: bool, names: Vec<String>, full: bool) -> Result<()> {
+    let targets = reindex_targets(all, names)?;
+    if targets.is_empty() {
+        println!("Nothing to re-index.");
+        return Ok(());
+    }
+
+    let mut failed = Vec::new();
+    for (name, path) in &targets {
+        println!("→ {name} ({})", path.display());
+        match reindex_one(path, full) {
+            Ok(summary) => println!("  {summary}"),
+            Err(e) => {
+                eprintln!("  failed: {e}");
+                failed.push(name.clone());
+            }
+        }
+    }
+
+    println!(
+        "\n{} of {} project(s) re-indexed.",
+        targets.len() - failed.len(),
+        targets.len()
+    );
+    if !failed.is_empty() {
+        bail!("failed: {}", failed.join(", "));
+    }
+    Ok(())
+}
+
+/// Resolve which projects to re-index: the registry, named ones, or just this one.
+fn reindex_targets(all: bool, names: Vec<String>) -> Result<Vec<(String, PathBuf)>> {
+    if !all && names.is_empty() {
+        let cfg = load_project()?;
+        return Ok(vec![(project_name(&cfg), project_root(&cfg)?)]);
+    }
+
+    let registered = with_central(|c| c.list(false))?;
+    let pick = |v: &serde_json::Value| (field(v, "name"), PathBuf::from(field(v, "path")));
+    if all {
+        return Ok(registered.iter().map(pick).collect());
+    }
+
+    let mut out = Vec::new();
+    for name in names {
+        let found = registered
+            .iter()
+            .find(|p| field(p, "name") == name)
+            .ok_or_else(|| anyhow::anyhow!("no registered project named `{name}`"))?;
+        out.push(pick(found));
+    }
+    Ok(out)
+}
+
+/// Index one project through its server, returning a one-line summary.
+fn reindex_one(root: &std::path::Path, full: bool) -> Result<String> {
+    let cfg_path = root.join(devctx_core::CONFIG_FILE_NAME);
+    let cfg = ProjectConfig::load(&cfg_path)
+        .with_context(|| format!("reading {}", cfg_path.display()))?;
+
+    let Some(r) = remote::ensure(&cfg) else {
+        bail!("could not reach or start a server for this project");
+    };
+    let raw = r.index(full)?;
+    let v: serde_json::Value = serde_json::from_str(&raw).context("parsing the index result")?;
+    Ok(format!(
+        "{} @ {} — {} files, {} symbols, {} chunks ({} skipped)",
+        if v["full_reindex"].as_bool().unwrap_or(false) {
+            "full reindex"
+        } else {
+            "incremental"
+        },
+        short_commit(&field(&v, "commit")),
+        num(&v, "files_indexed"),
+        num(&v, "symbols"),
+        num(&v, "chunks"),
+        num(&v, "files_skipped"),
+    ))
 }
 
 /// `devctx projects` — the central registry.
@@ -1323,12 +1471,8 @@ fn cmd_init(path: Option<PathBuf>, name: Option<String>) -> Result<()> {
         ..Default::default()
     };
 
-    let yaml = serde_yaml::to_string(&cfg).context("serializing config")?;
-    if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(&cfg_path, yaml).with_context(|| format!("writing {}", cfg_path.display()))?;
+    devctx_central::write_project_config(&cfg_path, &cfg)
+        .with_context(|| format!("writing {}", cfg_path.display()))?;
 
     println!("Initialized DevCtxEngine project at {}", cfg_path.display());
     register_centrally(&root);
@@ -1411,8 +1555,10 @@ fn cmd_index(full: bool) -> Result<()> {
         incremental: !full,
         model_name: &cfg.embeddings.model,
         progress: Some(&progress),
+        paths: None,
     })?;
     progress.finish();
+    devctx_mcp::state::report_index(&root, &res);
 
     println!(
         "Indexed {} ({}) @ {}",

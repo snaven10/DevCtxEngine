@@ -304,6 +304,25 @@ impl Central {
         Ok(record)
     }
 
+    /// Record what an indexing run produced, locating the project by its
+    /// repository path so the caller need not know its registered name.
+    ///
+    /// Returns `false` when the repository is not registered — indexing an
+    /// unregistered repo is perfectly legal, it just has nowhere to report.
+    pub fn record_index(
+        &self,
+        repo_path: &str,
+        stats: &devctx_store::ProjectIndexStats,
+        now: &str,
+    ) -> Result<bool> {
+        let Some(project) = self.store.find_project_by_path(repo_path)? else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .update_project_index_stats(&project.name, stats, now)?)
+    }
+
     /// Re-read a registered project's config from disk and update its row — the
     /// way an edit to `.devctx/config.yaml` reaches the registry.
     pub fn refresh(&self, name: &str, now: &str) -> Result<ProjectRecord> {
@@ -359,12 +378,33 @@ impl Central {
 }
 
 /// Write a project config, creating `.devctx/` as needed.
-fn write_project_config(path: &Path, cfg: &ProjectConfig) -> Result<()> {
+pub fn write_project_config(path: &Path, cfg: &ProjectConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| CentralError::Io(e, parent.to_path_buf()))?;
+        ignore_state_dir(parent);
     }
     let yaml = serde_yaml::to_string(cfg)?;
     std::fs::write(path, yaml).map_err(|e| CentralError::Io(e, path.to_path_buf()))
+}
+
+/// Keep the index out of git.
+///
+/// `state/` holds a DuckDB file that grows to megabytes and changes on every
+/// index, so a plain `git add -A` after `devctx init` would commit a binary
+/// database — and keep committing it. The config beside it *is* worth tracking,
+/// so the ignore lives inside `.devctx/` and names only `state/`.
+///
+/// Best-effort, and never overwrites an existing file: this is a courtesy, not
+/// a reason to fail an otherwise good init.
+fn ignore_state_dir(devctx_dir: &Path) {
+    let path = devctx_dir.join(".gitignore");
+    if path.exists() {
+        return;
+    }
+    let _ = std::fs::write(
+        &path,
+        "# The index is a build artefact: large, binary, and rebuilt from the repo.\nstate/\n",
+    );
 }
 
 /// Prefer a caller-supplied value, falling back to what was already stored, so
@@ -680,6 +720,39 @@ mod tests {
 
     /// A relative path resolved by the store rather than the caller would point
     /// at whatever repository the daemon happens to be sitting in.
+    /// The index is a binary artefact that must not end up in git.
+    #[test]
+    fn init_keeps_the_index_out_of_git() {
+        let tmp = Tmp::new("gitignore");
+        let repo = tmp.join("alpha");
+        std::fs::create_dir_all(&repo).unwrap();
+        let central = Central::open_in(&tmp.join("home")).unwrap();
+        central
+            .register(&RegisterRequest {
+                create_config: true,
+                ..req(repo.clone())
+            })
+            .unwrap();
+
+        let ignore = repo.join(".devctx/.gitignore");
+        let body = std::fs::read_to_string(&ignore).unwrap();
+        assert!(body.contains("state/"), "got: {body}");
+        assert!(
+            !body.contains("config.yaml"),
+            "the config is worth tracking: {body}"
+        );
+
+        // An existing ignore file is the user's; leave it alone.
+        std::fs::write(&ignore, "mine\n").unwrap();
+        central
+            .register(&RegisterRequest {
+                create_config: true,
+                ..req(repo.clone())
+            })
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "mine\n");
+    }
+
     #[test]
     fn a_relative_path_is_refused() {
         let tmp = Tmp::new("relative");

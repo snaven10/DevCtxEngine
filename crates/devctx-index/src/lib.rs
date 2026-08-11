@@ -91,6 +91,7 @@ mod tests {
             incremental: true,
             model_name: "minilm-l6",
             progress: None,
+            paths: None,
         })
         .unwrap()
     }
@@ -185,6 +186,7 @@ mod tests {
             incremental: false,
             model_name: "minilm-l6",
             progress: None,
+            paths: None,
         })
         .unwrap();
 
@@ -274,6 +276,106 @@ mod tests {
             .filter(|h| h.point.metadata.file == "src/extra.rs")
             .count();
         assert_eq!(remaining, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Index exactly these paths, whatever git thinks changed.
+    fn index_paths(store: &Store, root: &Path, paths: &[String]) -> IndexResult {
+        run(IndexRequest {
+            store,
+            embedder: &FakeEmbedder,
+            repo_root: root,
+            incremental: true,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: Some(paths),
+        })
+        .unwrap()
+    }
+
+    /// A file watcher fires on *save*, when HEAD has not moved — so the
+    /// commit-diff path sees nothing. An explicit path list is what lets the
+    /// pipeline index work that has not been committed yet.
+    #[test]
+    fn explicit_paths_index_uncommitted_work() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_paths_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "src/lib.rs", "pub fn alpha() -> i32 { 1 }\n");
+        commit_all(&dir, "initial");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        assert_eq!(index(&store, &dir).files_indexed, 1);
+
+        let repo_path = std::fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let branch = GitRepo::open(&dir).unwrap().state().branch;
+        let committed = store
+            .get_index_record(&repo_path, &branch)
+            .unwrap()
+            .unwrap()
+            .last_commit;
+
+        // Edit without committing: the commit diff is empty, so a normal
+        // incremental run does nothing at all.
+        write(
+            &dir,
+            "src/lib.rs",
+            "pub fn alpha() -> i32 { 1 }\npub fn beta() -> i32 { 2 }\n",
+        );
+        assert_eq!(
+            index(&store, &dir).files_indexed,
+            0,
+            "a commit diff cannot see a save"
+        );
+
+        // Naming the file directly does index it.
+        let paths = vec!["src/lib.rs".to_string()];
+        let targeted = index_paths(&store, &dir, &paths);
+        assert_eq!(targeted.files_indexed, 1);
+        assert!(!targeted.full_reindex);
+        assert_eq!(targeted.symbols, 2, "the uncommitted symbol was picked up");
+
+        // Re-running with unchanged content is a no-op, via the hash check.
+        let again = index_paths(&store, &dir, &paths);
+        assert_eq!(again.files_indexed, 0);
+        assert_eq!(again.files_skipped, 1);
+
+        // The recorded commit must not have advanced to HEAD: this run covered
+        // uncommitted work, so the next incremental still needs that diff.
+        let after = store
+            .get_index_record(&repo_path, &branch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.last_commit, committed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A named path that has vanished from the work tree is a deletion.
+    #[test]
+    fn an_explicit_path_that_is_gone_is_removed_from_the_index() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_pathdel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "src/lib.rs", "pub fn alpha() -> i32 { 1 }\n");
+        commit_all(&dir, "initial");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        index(&store, &dir);
+        assert!(store.count(&SearchFilter::default()).unwrap() > 0);
+
+        std::fs::remove_file(dir.join("src/lib.rs")).unwrap();
+        let res = index_paths(&store, &dir, &["src/lib.rs".to_string()]);
+        assert_eq!(res.files_deleted, 1);
+        assert_eq!(store.count(&SearchFilter::default()).unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

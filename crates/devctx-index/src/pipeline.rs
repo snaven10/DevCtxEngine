@@ -32,6 +32,15 @@ pub struct IndexRequest<'a> {
     pub repo_root: &'a Path,
     /// Attempt an incremental (diff-based) index when possible.
     pub incremental: bool,
+    /// Index exactly these repo-relative paths instead of asking git what
+    /// changed between commits.
+    ///
+    /// File *selection* is the only commit-bound part of the pipeline —
+    /// `read_file` already reads the work tree, and `index_file` already skips
+    /// unchanged content by hash. Handing the list in directly is therefore all
+    /// it takes to index work that has not been committed yet, which is what a
+    /// file watcher or an editor integration needs.
+    pub paths: Option<&'a [String]>,
     /// Model name recorded in `index_state` (drives model-change reindex).
     pub model_name: &'a str,
     /// Optional progress reporter.
@@ -78,6 +87,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let repo_path = git.root().to_string_lossy().to_string();
     let branch = state.branch.clone();
 
+    let explicit_paths = req.paths.filter(|p| !p.is_empty());
     let prev = req.store.get_index_record(&repo_path, &branch)?;
     let model_changed = prev.as_ref().is_some_and(|p| {
         p.model_name != req.model_name || p.model_dimension as usize != req.embedder.dimension()
@@ -91,7 +101,9 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     } else {
         None
     };
-    let full_reindex = from.is_none();
+    // An explicit path list is never a full reindex, whatever the commit state:
+    // it says exactly which files to look at.
+    let full_reindex = from.is_none() && explicit_paths.is_none();
 
     // Snapshot the previously-indexed files so a full reindex can prune any that
     // vanished (git diff can't detect them when we list all tracked files).
@@ -121,7 +133,21 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         ..Default::default()
     };
 
-    let changes = git.changes(from)?;
+    let changes = match explicit_paths {
+        // A path that no longer exists on disk was deleted; everything else is
+        // re-read and dropped by the content-hash check if it did not change.
+        Some(paths) => paths
+            .iter()
+            .map(|p| {
+                if git.root().join(p).exists() {
+                    Change::Modified(p.clone())
+                } else {
+                    Change::Deleted(p.clone())
+                }
+            })
+            .collect(),
+        None => git.changes(from)?,
+    };
     if let Some(p) = req.progress {
         p.start(changes.len());
     }
@@ -153,15 +179,33 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         }
     }
 
+    // A path-list run indexes uncommitted work, so HEAD is not what it covered:
+    // advancing `last_commit` would make the next incremental diff start after
+    // commits whose other files were never looked at. Its counts are equally
+    // meaningless as totals, so the previous record's are carried forward.
+    let (last_commit, counts) = match (&explicit_paths, &prev) {
+        (Some(_), Some(p)) => (
+            p.last_commit.clone(),
+            (p.file_count, p.symbol_count, p.chunk_count),
+        ),
+        _ => (
+            state.commit.clone(),
+            (
+                result.files_indexed as i64,
+                result.symbols as i64,
+                result.chunks as i64,
+            ),
+        ),
+    };
     req.store.save_index_record(&IndexRecord {
         repo_path,
         branch,
-        last_commit: state.commit,
+        last_commit,
         model_name: req.model_name.to_string(),
         model_dimension: req.embedder.dimension() as i64,
-        file_count: result.files_indexed as i64,
-        symbol_count: result.symbols as i64,
-        chunk_count: result.chunks as i64,
+        file_count: counts.0,
+        symbol_count: counts.1,
+        chunk_count: counts.2,
         indexed_at: now_stamp(),
     })?;
 

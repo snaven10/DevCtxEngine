@@ -193,8 +193,10 @@ pub fn do_index(state: &AppState, full: bool) -> Result<String, String> {
         incremental: !full,
         model_name: &state.cfg.embeddings.model,
         progress: None,
+        paths: None,
     })
     .map_err(|e| e.to_string())?;
+    report_index(&state.root, &res);
     Ok(json!({
         "commit": res.commit,
         "branch": res.branch,
@@ -404,6 +406,27 @@ pub fn do_graph(
         "edges": out_edges,
     })
     .to_string())
+}
+
+/// Tell the registry what an indexing run produced, so `projects list` reflects
+/// reality instead of always reading "never indexed".
+///
+/// Best-effort: a repository need not be registered at all, and a central store
+/// that cannot be reached is no reason to fail an index that already succeeded.
+pub fn report_index(root: &std::path::Path, res: &devctx_index::IndexResult) {
+    let Ok(path) = std::fs::canonicalize(root) else {
+        return;
+    };
+    if let Ok(c) = central() {
+        let _ = c.record_index(
+            &path.to_string_lossy(),
+            &res.commit,
+            &res.branch,
+            res.files_indexed as i64,
+            res.symbols as i64,
+            res.chunks as i64,
+        );
+    }
 }
 
 /// Reach the central store, auto-spawning the daemon if needed.
