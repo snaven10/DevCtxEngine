@@ -568,6 +568,8 @@ fn cmd_projects(action: ProjectsAction) -> Result<()> {
             // otherwise silently register whatever repository it happens to sit in.
             let root = std::fs::canonicalize(&root)
                 .with_context(|| format!("resolving {}", root.display()))?;
+            // Checked after registering, so the warning is the last thing seen.
+            let is_repo = is_git_repo(&root);
             let rec = match &remote {
                 Some(r) => r.add(&root, name.as_deref(), &description, &tags, init)?,
                 None => project_json(&direct()?.register(&RegisterRequest {
@@ -593,6 +595,9 @@ fn cmd_projects(action: ProjectsAction) -> Result<()> {
             println!("  Store:  {}", field(&rec, "db_path"));
             if field(&rec, "last_indexed_at").is_empty() {
                 println!("  Index:  not indexed yet — run `devctx index` in the repo");
+            }
+            if !is_repo {
+                warn_not_a_repo(&field(&rec, "path"));
             }
             Ok(())
         }
@@ -1479,8 +1484,79 @@ fn cmd_init(path: Option<PathBuf>, name: Option<String>) -> Result<()> {
         .with_context(|| format!("writing {}", cfg_path.display()))?;
 
     println!("Initialized DevCtxEngine project at {}", cfg_path.display());
+    warn_if_not_a_repo(&root);
     register_centrally(&root);
     Ok(())
+}
+
+/// A stderr ticker for work happening somewhere this process cannot observe.
+struct Heartbeat {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Heartbeat {
+    fn start(what: &str) -> Self {
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        let label = what.to_string();
+        let handle = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let frames = ['|', '/', '-', '\\'];
+            let mut i = 0usize;
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                eprint!(
+                    "\r{} {label}… {}s ",
+                    frames[i % frames.len()],
+                    start.elapsed().as_secs()
+                );
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            eprint!("\r{}\r", " ".repeat(label.len() + 24));
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Whether `path` sits inside a git work tree.
+///
+/// Indexing is built on `git diff`, so a directory outside one can be
+/// registered and configured but never indexed. Saying so at the moment of
+/// registering costs nothing and saves a confusing failure later.
+fn is_git_repo(path: &std::path::Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn warn_if_not_a_repo(path: &std::path::Path) {
+    if !is_git_repo(path) {
+        warn_not_a_repo(&path.display().to_string());
+    }
+}
+
+fn warn_not_a_repo(path: &str) {
+    eprintln!(
+        "· {path} is not a git repository, so it cannot be indexed yet.\n  \
+         Run `git init` there (and commit something), then `devctx index`."
+    );
 }
 
 /// Add a freshly initialized repo to the central registry so it is discoverable
@@ -1534,7 +1610,13 @@ fn cmd_status() -> Result<()> {
 fn cmd_index(full: bool) -> Result<()> {
     let cfg = load_project()?;
     if let Some(r) = remote::ensure(&cfg) {
-        println!("{}", r.index(full)?);
+        // The server does the work, so the local progress bar sees nothing. Show
+        // elapsed time instead: without it a large repository looks hung for
+        // minutes, which is indistinguishable from actually being hung.
+        let ticker = Heartbeat::start("indexing on the server");
+        let out = r.index(full);
+        ticker.stop();
+        println!("{}", out?);
         return Ok(());
     }
     let root = project_root(&cfg)?;

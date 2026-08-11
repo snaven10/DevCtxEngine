@@ -233,12 +233,12 @@ impl Remote {
 
     fn get(&self, path: &str) -> Result<String> {
         let req = self.auth(self.agent().get(&format!("{}{path}", self.base)));
-        Ok(req.call().map_err(box_err)?.into_string()?)
+        read(req.call())
     }
 
     fn post(&self, path: &str, body: Value) -> Result<String> {
         let req = self.auth(self.agent().post(&format!("{}{path}", self.base)));
-        Ok(req.send_json(body).map_err(box_err)?.into_string()?)
+        read(req.send_json(body))
     }
 
     // --- typed endpoints (return the server's JSON string) ---
@@ -332,9 +332,27 @@ impl Remote {
     }
 }
 
-/// ureq errors aren't `Send + Sync + 'static` friendly for anyhow directly; flatten.
-fn box_err(e: ureq::Error) -> anyhow::Error {
-    anyhow::anyhow!(e.to_string())
+/// Read a response body, surfacing the server's own message on a failure status.
+///
+/// Without this a routed command reports only `status code 500` and throws away
+/// the explanation the server already wrote — which is exactly the information
+/// needed to act on it.
+fn read(r: std::result::Result<ureq::Response, ureq::Error>) -> Result<String> {
+    match r {
+        Ok(resp) => Ok(resp.into_string()?),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or(body);
+            if msg.trim().is_empty() {
+                anyhow::bail!("the server returned status {code}");
+            }
+            anyhow::bail!("{}", msg.trim())
+        }
+        Err(e) => Err(anyhow::anyhow!(e.to_string())),
+    }
 }
 
 /// Minimal percent-encoding for a path/query segment.
