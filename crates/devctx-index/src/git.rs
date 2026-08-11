@@ -71,23 +71,40 @@ impl GitRepo {
         GitState { commit, branch }
     }
 
-    /// List changes since `from` (a commit), or all tracked files as `Added`
-    /// when `from` is `None` (initial / full index).
+    /// List what to index: everything in the work tree when `from` is `None`
+    /// (initial / full index), otherwise the diff since that commit.
+    ///
+    /// Both include files git is not tracking yet, as long as it is not ignoring
+    /// them. The index mirrors the **work tree**, not the last commit: a file you
+    /// have written but not `git add`ed is exactly the code you are most likely
+    /// to ask about, and a full reindex that dropped it would silently undo what
+    /// the watcher had picked up.
     pub fn changes(&self, from: Option<&str>) -> Result<Vec<Change>> {
-        match from {
+        let mut changes = match from {
             None => {
                 let out = run(&self.root, &["ls-files"])?;
-                Ok(out
-                    .lines()
+                out.lines()
                     .filter(|l| !l.is_empty())
                     .map(|l| Change::Added(l.to_string()))
-                    .collect())
+                    .collect()
             }
             Some(commit) => {
                 let out = run(&self.root, &["diff", "--name-status", "-M", commit, "HEAD"])?;
-                Ok(parse_name_status(&out))
+                parse_name_status(&out)
             }
-        }
+        };
+
+        // `--exclude-standard` honours .gitignore, .git/info/exclude and the
+        // user's global excludes, so build output stays out.
+        let untracked = run(&self.root, &["ls-files", "--others", "--exclude-standard"])?;
+        let already: std::collections::HashSet<&str> = changes.iter().map(change_path).collect();
+        let new: Vec<Change> = untracked
+            .lines()
+            .filter(|l| !l.is_empty() && !already.contains(l))
+            .map(|l| Change::Added(l.to_string()))
+            .collect();
+        changes.extend(new);
+        Ok(changes)
     }
 
     /// True if `commit` exists in the repo.
@@ -105,6 +122,14 @@ impl GitRepo {
     /// Read a file's content from the work tree.
     pub fn read_file(&self, rel: &str) -> Result<String> {
         Ok(std::fs::read_to_string(self.root.join(rel))?)
+    }
+}
+
+/// The path a change refers to (the destination, for a rename).
+fn change_path(c: &Change) -> &str {
+    match c {
+        Change::Added(p) | Change::Modified(p) | Change::Deleted(p) => p,
+        Change::Renamed { to, .. } => to,
     }
 }
 

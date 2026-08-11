@@ -379,4 +379,105 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A full reindex must not throw away work that is written but not
+    /// committed: that is exactly the code you are most likely to ask about,
+    /// and the watcher had already put it in the index.
+    #[test]
+    fn a_full_reindex_keeps_uncommitted_files() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_untracked_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, ".gitignore", "target/\n*.log\n");
+        write(&dir, "src/lib.rs", "pub fn tracked() -> i32 { 1 }\n");
+        commit_all(&dir, "initial");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        index(&store, &dir);
+
+        // A brand-new file, never `git add`ed, plus ignored noise beside it.
+        write(&dir, "src/draft.rs", "pub fn drafted() -> i32 { 2 }\n");
+        write(&dir, "build.log", "noise\n");
+        write(&dir, "target/gen.rs", "pub fn generated() -> i32 { 3 }\n");
+
+        let full = run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: false,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+        })
+        .unwrap();
+        assert!(full.full_reindex);
+        assert_eq!(full.files_pruned, 0, "nothing should have been pruned");
+
+        let indexed = indexed_files(&store);
+        assert!(indexed.contains(&"src/lib.rs".to_string()));
+        assert!(
+            indexed.contains(&"src/draft.rs".to_string()),
+            "uncommitted work must survive a full reindex: {indexed:?}"
+        );
+        assert!(
+            !indexed.iter().any(|f| f.starts_with("target/")),
+            "git-ignored files must stay out: {indexed:?}"
+        );
+        assert!(!indexed.contains(&"build.log".to_string()));
+        assert!(
+            !indexed.iter().any(|f| f.starts_with(".devctx/")),
+            "the index must not swallow its own state: {indexed:?}"
+        );
+        assert!(
+            !indexed.iter().any(|f| f.starts_with(".fastembed_cache/")),
+            "nor the downloaded model cache: {indexed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An incremental run picks up a new file too, so `index` behaves the same
+    /// way whether or not it happens to be doing a full pass.
+    #[test]
+    fn an_incremental_run_picks_up_a_new_untracked_file() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_incr_new_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "src/lib.rs", "pub fn tracked() -> i32 { 1 }\n");
+        commit_all(&dir, "initial");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        index(&store, &dir);
+
+        write(&dir, "src/draft.rs", "pub fn drafted() -> i32 { 2 }\n");
+        let r = index(&store, &dir);
+        assert!(!r.full_reindex);
+        assert_eq!(r.files_indexed, 1);
+        assert!(indexed_files(&store).contains(&"src/draft.rs".to_string()));
+
+        // Running again changes nothing: the content hash still matches.
+        let again = index(&store, &dir);
+        assert_eq!(again.files_indexed, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every distinct file currently present in the index.
+    fn indexed_files(store: &Store) -> Vec<String> {
+        let hits = store
+            .search(&[0.1; DIM], &SearchFilter::default(), 100)
+            .unwrap();
+        let mut files: Vec<String> = hits
+            .into_iter()
+            .map(|h| h.point.metadata.file)
+            .filter(|f| !f.is_empty())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
 }

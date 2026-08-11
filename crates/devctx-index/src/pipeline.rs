@@ -212,6 +212,22 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     Ok(result)
 }
 
+/// DevCtxEngine's own working directories, which must never be indexed.
+///
+/// This is not a convenience filter — it is load-bearing. The work tree now
+/// includes files git is not tracking, and our state directory and downloaded
+/// model cache both live there: without this the index would swallow its own
+/// database and a few hundred megabytes of tokenizer JSON, and then answer
+/// questions with it.
+const OWN_ARTIFACTS: &[&str] = &[".devctx", ".fastembed_cache", ".git"];
+
+fn is_own_artifact(path: &Path) -> bool {
+    path.components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+        .is_some_and(|first| OWN_ARTIFACTS.contains(&first))
+}
+
 struct Ctx<'a> {
     store: &'a Store,
     embedder: &'a dyn EmbeddingProvider,
@@ -241,6 +257,10 @@ impl Ctx<'_> {
 
     fn index_file(&mut self, file: &str, result: &mut IndexResult) -> Result<()> {
         let path = Path::new(file);
+        if is_own_artifact(path) {
+            result.files_skipped += 1;
+            return Ok(());
+        }
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
