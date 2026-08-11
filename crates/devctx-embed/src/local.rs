@@ -95,6 +95,12 @@ impl EmbeddingProvider for LocalProvider {
 fn load_builtin(builtin: &str, spec: &LocalModelSpec) -> Result<TextEmbedding> {
     let model = builtin_model(builtin)?;
     let mut opts = InitOptions::new(model).with_show_download_progress(false);
+    // Without this fastembed caches relative to the working directory, so the
+    // models land in whatever repository happened to be current — hundreds of
+    // megabytes of them, re-downloaded per checkout.
+    if let Some(cache) = devctx_core::dirs::model_cache_dir() {
+        opts = opts.with_cache_dir(cache);
+    }
     if let Some(max) = spec.max_input_tokens {
         opts = opts.with_max_length(max);
     }

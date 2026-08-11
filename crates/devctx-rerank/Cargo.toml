@@ -13,5 +13,6 @@ default = ["local"]
 local = ["dep:fastembed"]
 
 [dependencies]
+devctx-core.workspace = true
 thiserror.workspace = true
 fastembed = { version = "4", optional = true }

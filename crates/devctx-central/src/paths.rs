@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{CentralError, Result};
 
 /// Relocates the entire central home — data *and* config — to one directory.
-pub const HOME_ENV: &str = "DEVCTX_HOME";
+pub use devctx_core::dirs::HOME_ENV;
 
 /// Resolved locations of everything the central store owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,17 +28,8 @@ pub struct CentralPaths {
 impl CentralPaths {
     /// Resolve from the environment: [`HOME_ENV`] wins, then XDG, then `$HOME`.
     pub fn resolve() -> Result<Self> {
-        if let Some(home) = std::env::var_os(HOME_ENV).filter(|v| !v.is_empty()) {
-            return Ok(Self::rooted_at(Path::new(&home)));
-        }
-        let data = match env_dir("XDG_DATA_HOME") {
-            Some(d) => d.join("devctx"),
-            None => home_dir()?.join(".local").join("share").join("devctx"),
-        };
-        let config = match env_dir("XDG_CONFIG_HOME") {
-            Some(d) => d.join("devctx"),
-            None => home_dir()?.join(".config").join("devctx"),
-        };
+        let data = devctx_core::dirs::data_dir().ok_or(CentralError::NoHome)?;
+        let config = devctx_core::dirs::config_dir().ok_or(CentralError::NoHome)?;
         Ok(Self {
             config: config.join("config.yaml"),
             db: data.join("central.duckdb"),
@@ -56,20 +47,6 @@ impl CentralPaths {
             dir: dir.to_path_buf(),
         }
     }
-}
-
-fn env_dir(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-}
-
-fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .ok_or(CentralError::NoHome)
 }
 
 #[cfg(test)]

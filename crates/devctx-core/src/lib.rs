@@ -4,6 +4,7 @@
 //! dependency-light on purpose: every other crate builds on top of it.
 
 pub mod config;
+pub mod dirs;
 pub mod error;
 pub mod rank;
 pub mod types;

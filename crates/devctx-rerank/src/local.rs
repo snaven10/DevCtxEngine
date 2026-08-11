@@ -22,7 +22,11 @@ impl LocalReranker {
     /// Load the reranker named by `key` (downloads/caches on first use).
     pub fn load(key: &str) -> Result<Self> {
         let model = model_for(key)?;
-        let opts = RerankInitOptions::new(model).with_show_download_progress(false);
+        let mut opts = RerankInitOptions::new(model).with_show_download_progress(false);
+        // Shared with the embedding models: see `devctx_core::dirs`.
+        if let Some(cache) = devctx_core::dirs::model_cache_dir() {
+            opts = opts.with_cache_dir(cache);
+        }
         let text_rerank =
             TextRerank::try_new(opts).map_err(|e| RerankError::Backend(e.to_string()))?;
         Ok(Self {

@@ -225,6 +225,8 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
 /// model cache both live there: without this the index would swallow its own
 /// database and a few hundred megabytes of tokenizer JSON, and then answer
 /// questions with it.
+/// `.fastembed_cache` is legacy: models now live under
+/// [`devctx_core::dirs::model_cache_dir`], but older checkouts still carry one.
 const OWN_ARTIFACTS: &[&str] = &[".devctx", ".fastembed_cache", ".git"];
 
 /// Compile `indexing.exclude` into a matcher.
