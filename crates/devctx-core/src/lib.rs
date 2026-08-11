@@ -5,10 +5,12 @@
 
 pub mod config;
 pub mod error;
+pub mod rank;
 pub mod types;
 
 pub use config::{ProjectConfig, CONFIG_FILE_NAME};
 pub use error::{Error, Result};
+pub use rank::{fuse_by_rank, rank_score};
 pub use types::{SearchFilter, SearchResult, VectorMetadata, VectorPoint};
 
 /// The DevCtxEngine version, sourced from the crate's `Cargo.toml`.

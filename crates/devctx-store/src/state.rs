@@ -51,6 +51,28 @@ pub struct FileState {
 }
 
 impl Store {
+    /// What the index currently holds for a (repo_path, branch): files, symbols
+    /// and chunks, summed across `file_state`.
+    ///
+    /// These are *totals*, unlike an [`IndexResult`](crate::IndexRecord)'s
+    /// per-run counts. An incremental run that finds nothing changed touches
+    /// zero files — reporting that as the project's size would read as "this
+    /// project is empty" rather than "nothing moved".
+    pub fn index_totals(&self, repo_path: &str, branch: &str) -> Result<(i64, i64, i64)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT count(*), coalesce(sum(symbol_count), 0), coalesce(sum(chunk_count), 0)
+             FROM file_state WHERE repo_path = ? AND branch = ?",
+        )?;
+        let row = stmt.query_row(params![repo_path, branch], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        Ok(row)
+    }
+
     /// Fetch the index record for a (repo_path, branch), if any.
     pub fn get_index_record(&self, repo_path: &str, branch: &str) -> Result<Option<IndexRecord>> {
         let mut stmt = self.conn.prepare(
@@ -186,6 +208,37 @@ mod tests {
         };
         store.save_index_record(&rec).unwrap();
         assert_eq!(store.get_index_record("/repo", "main").unwrap(), Some(rec));
+    }
+
+    /// Totals must survive a run that changed nothing: an incremental index
+    /// touching zero files does not mean the project is empty.
+    #[test]
+    fn index_totals_sum_the_whole_index() {
+        let store = Store::open_in_memory(4).unwrap();
+        assert_eq!(store.index_totals("/repo", "main").unwrap(), (0, 0, 0));
+
+        for (file, symbols, chunks) in [("a.rs", 3, 7), ("b.rs", 2, 5)] {
+            store
+                .save_file_state(&FileState {
+                    repo_path: "/repo".into(),
+                    branch: "main".into(),
+                    file_path: file.into(),
+                    content_hash: "h".into(),
+                    language: "rust".into(),
+                    symbol_count: symbols,
+                    chunk_count: chunks,
+                })
+                .unwrap();
+        }
+        assert_eq!(store.index_totals("/repo", "main").unwrap(), (2, 5, 12));
+
+        // Scoped to the branch and repository, not global.
+        assert_eq!(store.index_totals("/repo", "other").unwrap(), (0, 0, 0));
+        assert_eq!(store.index_totals("/elsewhere", "main").unwrap(), (0, 0, 0));
+
+        // A deleted file leaves the totals correct.
+        store.delete_file_state("/repo", "main", "a.rs").unwrap();
+        assert_eq!(store.index_totals("/repo", "main").unwrap(), (1, 2, 5));
     }
 
     #[test]

@@ -14,6 +14,7 @@ devctx-embed = { path = "../devctx-embed" }
 devctx-search = { path = "../devctx-search" }
 devctx-index = { path = "../devctx-index" }
 devctx-memory = { path = "../devctx-memory" }
+devctx-central = { path = "../devctx-central" }
 anyhow.workspace = true
 ratatui = "0.29"
 ureq = { version = "2", features = ["json"] }

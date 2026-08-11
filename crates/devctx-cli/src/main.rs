@@ -1091,30 +1091,16 @@ fn fuse_memory_lists(
     lists: Vec<Vec<serde_json::Value>>,
     limit: usize,
 ) -> Vec<(serde_json::Value, &'static str)> {
-    const RRF_K: f32 = 60.0;
     let origins = ["local", "global"];
-    let mut scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    let mut items: std::collections::HashMap<String, (serde_json::Value, &'static str)> =
-        std::collections::HashMap::new();
-
-    for (idx, list) in lists.into_iter().enumerate() {
-        let origin = origins.get(idx).copied().unwrap_or("local");
-        for (rank, hit) in list.into_iter().enumerate() {
-            let id = field(&hit, "id");
-            *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
-            items.entry(id).or_insert((hit, origin));
-        }
-    }
-
-    let mut out: Vec<(String, (serde_json::Value, &'static str))> = items.into_iter().collect();
-    out.sort_by(|a, b| {
-        let (sa, sb) = (scores[&a.0], scores[&b.0]);
-        sb.partial_cmp(&sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    out.truncate(limit);
-    out.into_iter().map(|(_, v)| v).collect()
+    let tagged: Vec<Vec<(serde_json::Value, &'static str)>> = lists
+        .into_iter()
+        .enumerate()
+        .map(|(i, list)| {
+            let origin = origins.get(i).copied().unwrap_or("local");
+            list.into_iter().map(|v| (v, origin)).collect()
+        })
+        .collect();
+    devctx_core::fuse_by_rank(tagged, |(v, _)| field(v, "id"), limit)
 }
 
 /// The short repo name and branch for the active project, empty when not a repo.
@@ -1558,7 +1544,7 @@ fn cmd_index(full: bool) -> Result<()> {
         paths: None,
     })?;
     progress.finish();
-    devctx_mcp::state::report_index(&root, &res);
+    devctx_mcp::state::report_index(&store, &root, &res);
 
     println!(
         "Indexed {} ({}) @ {}",

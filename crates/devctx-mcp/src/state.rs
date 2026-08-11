@@ -196,7 +196,7 @@ pub fn do_index(state: &AppState, full: bool) -> Result<String, String> {
         paths: None,
     })
     .map_err(|e| e.to_string())?;
-    report_index(&state.root, &res);
+    report_index(&store, &state.root, &res);
     Ok(json!({
         "commit": res.commit,
         "branch": res.branch,
@@ -413,19 +413,18 @@ pub fn do_graph(
 ///
 /// Best-effort: a repository need not be registered at all, and a central store
 /// that cannot be reached is no reason to fail an index that already succeeded.
-pub fn report_index(root: &std::path::Path, res: &devctx_index::IndexResult) {
+pub fn report_index(store: &Store, root: &std::path::Path, res: &devctx_index::IndexResult) {
     let Ok(path) = std::fs::canonicalize(root) else {
         return;
     };
+    let repo_path = path.to_string_lossy().into_owned();
+    // Totals, not this run's deltas: an incremental run that found nothing
+    // changed would otherwise report the project as empty.
+    let (files, symbols, chunks) = store
+        .index_totals(&repo_path, &res.branch)
+        .unwrap_or((0, 0, 0));
     if let Ok(c) = central() {
-        let _ = c.record_index(
-            &path.to_string_lossy(),
-            &res.commit,
-            &res.branch,
-            res.files_indexed as i64,
-            res.symbols as i64,
-            res.chunks as i64,
-        );
+        let _ = c.record_index(&repo_path, &res.commit, &res.branch, files, symbols, chunks);
     }
 }
 
@@ -539,40 +538,32 @@ pub fn do_recall_scoped(
     serde_json::to_string_pretty(&json!({ "memories": fused })).map_err(|e| e.to_string())
 }
 
-/// Reciprocal rank fusion over labelled result lists, tagging each survivor with
-/// the scope it came from.
+/// Fuse labelled result lists by rank, tagging each survivor with the scope it
+/// came from so an agent can tell a project memory from a shared one.
 fn fuse_by_rank(lists: Vec<(Vec<Value>, &str)>, limit: usize) -> Vec<Value> {
-    const RRF_K: f32 = 60.0;
-    let mut scores: HashMap<String, f32> = HashMap::new();
-    let mut items: HashMap<String, Value> = HashMap::new();
-
-    for (list, origin) in lists {
-        for (rank, hit) in list.into_iter().enumerate() {
-            let id = hit
-                .get("id")
-                .and_then(|v| v.as_str())
+    let tagged: Vec<Vec<Value>> = lists
+        .into_iter()
+        .map(|(list, origin)| {
+            list.into_iter()
+                .map(|mut v| {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("scope".to_string(), json!(origin));
+                    }
+                    v
+                })
+                .collect()
+        })
+        .collect();
+    devctx_core::fuse_by_rank(
+        tagged,
+        |v| {
+            v.get("id")
+                .and_then(|x| x.as_str())
                 .unwrap_or_default()
-                .to_string();
-            *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
-            items.entry(id).or_insert_with(|| {
-                let mut v = hit;
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("scope".to_string(), json!(origin));
-                }
-                v
-            });
-        }
-    }
-
-    let mut out: Vec<(String, Value)> = items.into_iter().collect();
-    out.sort_by(|a, b| {
-        scores[&b.0]
-            .partial_cmp(&scores[&a.0])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    out.truncate(limit);
-    out.into_iter().map(|(_, v)| v).collect()
+                .to_string()
+        },
+        limit,
+    )
 }
 
 /// `memory_stats` tool: memory counts for the project.

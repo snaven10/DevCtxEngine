@@ -21,11 +21,6 @@ pub use error::{MemoryError, Result};
 /// Blend weight for the intro vector vs the best body chunk.
 const BLEND_ALPHA: f32 = 0.5;
 
-/// RRF constant, matching `devctx-search`. Kept local because the two fuse
-/// different types (`RecalledMemory` vs `SearchResult`) and the formula is
-/// three lines — a shared generic would cost more clarity than it saves.
-const RRF_K: f32 = 60.0;
-
 /// Scope value for a memory that belongs to one repository only.
 pub const SCOPE_LOCAL: &str = "local";
 
@@ -352,32 +347,24 @@ pub fn memory_stats(store: &Store, project: &str) -> Result<MemoryStats> {
 /// looks at position, so it stays correct across that boundary, and a memory
 /// surfacing in both lists is rewarded for it.
 pub fn fuse(lists: Vec<Vec<RecalledMemory>>, limit: usize) -> Vec<RecalledMemory> {
-    let mut scores: HashMap<String, f32> = HashMap::new();
-    let mut best: HashMap<String, RecalledMemory> = HashMap::new();
-
-    for list in lists {
-        for (rank, hit) in list.into_iter().enumerate() {
-            let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
-            *scores.entry(hit.memory.id.clone()).or_insert(0.0) += contribution;
-            best.entry(hit.memory.id.clone()).or_insert(hit);
+    // Positions per memory, so the surviving entries can carry a fused score
+    // rather than whichever store's incomparable one happened to win.
+    let mut positions: HashMap<String, Vec<usize>> = HashMap::new();
+    for list in &lists {
+        for (rank, hit) in list.iter().enumerate() {
+            positions
+                .entry(hit.memory.id.clone())
+                .or_default()
+                .push(rank);
         }
     }
-
-    let mut out: Vec<RecalledMemory> = best
-        .into_values()
-        .map(|mut m| {
-            m.score = scores.get(&m.memory.id).copied().unwrap_or(0.0);
-            m
-        })
-        .collect();
-    // Ties broken by id so the order is stable across runs.
-    out.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.memory.id.cmp(&b.memory.id))
-    });
-    out.truncate(limit);
+    let mut out = devctx_core::fuse_by_rank(lists, |h| h.memory.id.clone(), limit);
+    for hit in &mut out {
+        hit.score = positions
+            .get(&hit.memory.id)
+            .map(|p| devctx_core::rank_score(p))
+            .unwrap_or(0.0);
+    }
     out
 }
 
