@@ -1740,6 +1740,8 @@ fn cmd_search(
         Some(create_reranker(&RerankSettings {
             enabled: true,
             model: cfg.reranking.model.clone(),
+            model_dir: (!cfg.reranking.model_dir.is_empty())
+                .then(|| PathBuf::from(&cfg.reranking.model_dir)),
         })?)
     } else {
         None

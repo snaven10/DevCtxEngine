@@ -19,8 +19,11 @@ pub use provider::{NoopReranker, Ranked, Reranker};
 pub struct RerankSettings {
     /// Whether reranking is enabled (else a no-op reranker is used).
     pub enabled: bool,
-    /// Model key (`bge-base` default, `bge-v2-m3` multilingual, `jina-*`).
+    /// Model key (`bge-base` default, `bge-v2-m3` multilingual, `jina-*`), or
+    /// `custom` to load `model_dir`.
     pub model: String,
+    /// Directory of a user-supplied cross-encoder (ONNX + tokenizer files).
+    pub model_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for RerankSettings {
@@ -28,6 +31,7 @@ impl Default for RerankSettings {
         Self {
             enabled: true,
             model: default_model().to_string(),
+            model_dir: None,
         }
     }
 }
@@ -48,12 +52,12 @@ pub fn create_reranker(settings: &RerankSettings) -> Result<Box<dyn Reranker>> {
     if !settings.enabled {
         return Ok(Box::new(NoopReranker));
     }
-    create_local(&settings.model)
+    create_local(&settings.model, settings.model_dir.as_deref())
 }
 
 #[cfg(feature = "local")]
-fn create_local(model: &str) -> Result<Box<dyn Reranker>> {
-    Ok(Box::new(local::LocalReranker::load(model)?))
+fn create_local(model: &str, model_dir: Option<&std::path::Path>) -> Result<Box<dyn Reranker>> {
+    Ok(Box::new(local::LocalReranker::load(model, model_dir)?))
 }
 
 #[cfg(not(feature = "local"))]
@@ -68,6 +72,7 @@ mod tests {
     #[test]
     fn disabled_yields_noop() {
         let r = create_reranker(&RerankSettings {
+            model_dir: None,
             enabled: false,
             model: "bge-base".into(),
         })

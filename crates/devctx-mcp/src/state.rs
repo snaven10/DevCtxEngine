@@ -47,6 +47,8 @@ impl AppState {
         let rerank_settings = RerankSettings {
             enabled: rerank_enabled,
             model: cfg.reranking.model.clone(),
+            model_dir: (!cfg.reranking.model_dir.is_empty())
+                .then(|| PathBuf::from(&cfg.reranking.model_dir)),
         };
         let root = if cfg.project.path.is_empty() {
             std::env::current_dir()?

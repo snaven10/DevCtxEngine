@@ -124,9 +124,21 @@ pub struct Reranking {
     /// Whether to rerank search results with a cross-encoder.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Reranker model key (`bge-base` default, `bge-v2-m3` multilingual).
+    /// Reranker model key (`bge-base` default, `bge-v2-m3` multilingual,
+    /// `jina-turbo` fastest of the built-ins), or `custom` to load your own
+    /// from `model_dir`.
     #[serde(default = "default_reranker")]
     pub model: String,
+    /// Directory holding a user-supplied cross-encoder: the ONNX file plus
+    /// `tokenizer.json`/`config.json`.
+    ///
+    /// The built-in choices are all large — `bge-reranker-base` is an
+    /// XLM-RoBERTa carrying a 250k-token vocabulary, over a gigabyte on disk —
+    /// because fastembed ships no lightweight cross-encoder. This is the way to
+    /// use one anyway: point it at, say, an ONNX export of
+    /// `ms-marco-MiniLM-L-12-v2`, which is an order of magnitude smaller.
+    #[serde(default)]
+    pub model_dir: String,
 }
 
 impl Default for Reranking {
@@ -134,6 +146,7 @@ impl Default for Reranking {
         Self {
             enabled: true,
             model: default_reranker(),
+            model_dir: String::new(),
         }
     }
 }
