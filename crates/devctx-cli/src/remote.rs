@@ -182,10 +182,28 @@ pub fn stop_server(cfg: &ProjectConfig) -> Result<()> {
     let info: ServeInfo = serde_json::from_slice(&raw).context("parsing serve.json")?;
     if let Some(pid) = info.pid {
         kill_pid(pid);
+        // Wait for it to actually exit. Returning while it still holds the DuckDB
+        // file means the next command spawns a server that cannot open the
+        // database, and then waits out the full auto-spawn poll — a measured 61
+        // seconds — before giving up and falling back to a local open.
+        if !wait_for_exit(pid) {
+            eprintln!("· server {pid} did not exit promptly; the next command may be slow");
+        }
         println!("Stopped server (pid {pid}).");
     }
     remove_serve_file(cfg);
     Ok(())
+}
+
+/// Wait for a process to disappear, up to a few seconds. Returns whether it did.
+fn wait_for_exit(pid: u32) -> bool {
+    for _ in 0..50 {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 /// Discover a running server for this project and confirm it is reachable.
