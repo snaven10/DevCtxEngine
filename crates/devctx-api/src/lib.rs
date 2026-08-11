@@ -16,8 +16,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_graph, do_impact, do_index, do_index_status, do_list_projects, do_memory_context,
-    do_memory_stats, do_read_file, do_recall_scoped, do_references, do_remember,
+    do_graph, do_impact, do_index, do_index_paths, do_index_status, do_list_projects,
+    do_memory_context, do_memory_stats, do_read_file, do_recall_scoped, do_references, do_remember,
     do_remember_global, do_routes_for_handler, do_search, do_search_routes, do_summarize,
     parse_mode, AppState,
 };
@@ -139,6 +139,9 @@ struct SearchBody {
 struct IndexBody {
     #[serde(default)]
     full: Option<bool>,
+    /// Index exactly these repo-relative paths instead of a commit diff.
+    #[serde(default)]
+    paths: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -285,6 +288,9 @@ async fn search(State(api): State<Api>, Json(b): Json<SearchBody>) -> Response {
 }
 
 async fn index(State(api): State<Api>, Json(b): Json<IndexBody>) -> Response {
+    if let Some(paths) = b.paths.filter(|p| !p.is_empty()) {
+        return run(api.state, move |s| do_index_paths(s, &paths)).await;
+    }
     run(api.state, move |s| do_index(s, b.full.unwrap_or(false))).await
 }
 

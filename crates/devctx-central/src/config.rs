@@ -53,6 +53,18 @@ pub struct Defaults {
     pub reranking: Reranking,
 }
 
+/// `reindex:` section — the daemon's optional background refresh.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Reindex {
+    /// Seconds between sweeps. `0` (the default) disables it entirely.
+    ///
+    /// Off by default on purpose: silently indexing every repository you have
+    /// ever registered is surprising, and on a laptop it is expensive. Turn it
+    /// on when you want the index warm without thinking about it.
+    #[serde(default)]
+    pub every_seconds: u64,
+}
+
 /// The full central configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CentralConfig {
@@ -62,6 +74,9 @@ pub struct CentralConfig {
     /// `defaults:` section.
     #[serde(default)]
     pub defaults: Defaults,
+    /// `reindex:` section.
+    #[serde(default)]
+    pub reindex: Reindex,
 }
 
 impl CentralConfig {
@@ -134,6 +149,13 @@ defaults:
         assert_eq!(cfg.memory_dimension(), 768);
         assert_eq!(cfg.defaults.embeddings.model, "ml-granite");
         assert!(!cfg.defaults.reranking.enabled);
+    }
+
+    #[test]
+    fn background_reindex_is_off_unless_asked_for() {
+        assert_eq!(CentralConfig::default().reindex.every_seconds, 0);
+        let cfg = CentralConfig::from_yaml("reindex:\n  every_seconds: 900\n").unwrap();
+        assert_eq!(cfg.reindex.every_seconds, 900);
     }
 
     #[test]

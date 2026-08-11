@@ -184,6 +184,20 @@ pub fn do_read_file(
 
 /// `index_repo` tool: run the pipeline and return a summary.
 pub fn do_index(state: &AppState, full: bool) -> Result<String, String> {
+    do_index_inner(state, full, None)
+}
+
+/// Index exactly these repo-relative paths — what a file watcher needs, since a
+/// save moves no commit and the commit diff would therefore be empty.
+pub fn do_index_paths(state: &AppState, paths: &[String]) -> Result<String, String> {
+    do_index_inner(state, false, Some(paths))
+}
+
+fn do_index_inner(
+    state: &AppState,
+    full: bool,
+    paths: Option<&[String]>,
+) -> Result<String, String> {
     let store = state.open_store()?;
     let embedder = state.embedder()?;
     let res = index_run(IndexRequest {
@@ -193,7 +207,7 @@ pub fn do_index(state: &AppState, full: bool) -> Result<String, String> {
         incremental: !full,
         model_name: &state.cfg.embeddings.model,
         progress: None,
-        paths: None,
+        paths,
     })
     .map_err(|e| e.to_string())?;
     report_index(&store, &state.root, &res);
@@ -438,6 +452,60 @@ fn central() -> Result<devctx_central::CentralClient, String> {
         "no central store daemon and one could not be started; run `devctx serve --central`"
             .to_string()
     })
+}
+
+/// Search a *different* registered project.
+///
+/// Federating here is the right call, unlike for memory recall: the caller has
+/// named one project, so this wakes exactly one server rather than all of them.
+/// The project's own server owns its database and keeps its model warm, so the
+/// search runs where it is cheapest.
+pub fn do_search_project(
+    project: &str,
+    query: &str,
+    limit: usize,
+    language: Option<String>,
+    mode: &str,
+) -> Result<String, String> {
+    let row = central()?
+        .show(project)
+        .map_err(|e| format!("{project}: {e}"))?;
+    let path = row
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("no path recorded for `{project}`"))?;
+
+    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .args([
+            "search",
+            query,
+            "--limit",
+            &limit.to_string(),
+            "--format",
+            "json",
+        ])
+        .args(language.iter().flat_map(|l| ["--language", l]))
+        .args(match mode {
+            "keyword" => vec!["--keyword"],
+            "hybrid" => vec!["--hybrid"],
+            _ => vec![],
+        })
+        .current_dir(path)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err
+            .trim()
+            .lines()
+            .last()
+            .unwrap_or("search failed")
+            .to_string());
+    }
+    let hits: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&json!({ "project": project, "path": path, "hits": hits }))
+        .map_err(|e| e.to_string())
 }
 
 /// `list_projects` tool: every repository DevCtxEngine knows about.

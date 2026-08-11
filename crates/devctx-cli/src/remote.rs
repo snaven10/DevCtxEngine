@@ -251,6 +251,11 @@ impl Remote {
         self.post("/index", serde_json::json!({ "full": full }))
     }
 
+    /// Index an explicit path list (what the watcher sends).
+    pub fn index_paths(&self, paths: &[String]) -> Result<String> {
+        self.post("/index", serde_json::json!({ "paths": paths }))
+    }
+
     pub fn search(
         &self,
         query: &str,

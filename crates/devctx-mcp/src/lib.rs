@@ -99,6 +99,25 @@ struct RecallReq {
     repo: Option<String>,
 }
 
+/// Parameters for the `search_project` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct SearchProjectReq {
+    /// Project name, as reported by list_projects.
+    project: String,
+    /// The search query.
+    query: String,
+    /// Maximum results (default 10).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Restrict to a language.
+    #[serde(default)]
+    language: Option<String>,
+    /// "vector" (default), "keyword", or "hybrid".
+    #[serde(default)]
+    mode: Option<String>,
+}
+
 /// Parameters for the `list_projects` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -260,6 +279,27 @@ impl DevctxServer {
                 req.limit.unwrap_or(5),
                 req.scope.as_deref().unwrap_or("all"),
                 req.repo.as_deref(),
+            )
+        })
+        .await
+    }
+
+    /// Search a different project's code.
+    #[tool(description = "Search the code of another registered project by name \
+        (see list_projects). Use this when the answer lives in a different \
+        repository than the one you are working in. Returns JSON.")]
+    async fn search_project(
+        &self,
+        Parameters(req): Parameters<SearchProjectReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.backend.clone();
+        run_blocking(move || {
+            backend.search_project(
+                &req.project,
+                &req.query,
+                req.limit.unwrap_or(10),
+                req.language,
+                req.mode,
             )
         })
         .await

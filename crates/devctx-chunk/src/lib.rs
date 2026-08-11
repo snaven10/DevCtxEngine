@@ -90,6 +90,10 @@ fn c() {}
             .collect();
         assert_eq!(grouped.len(), 1, "levels: {:?}", levels(&chunks));
         assert_eq!(grouped[0].level, "function");
+        assert!(
+            !grouped[0].symbol_name.is_empty(),
+            "a grouped chunk must still say what is in it"
+        );
         // No individual function chunks for the tiny fns.
         assert!(chunks.iter().all(|c| c.symbol_name != "a"));
     }

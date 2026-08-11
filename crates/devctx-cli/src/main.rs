@@ -7,6 +7,7 @@
 mod hooks;
 mod mcp_configure;
 mod remote;
+mod watch;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -201,6 +202,12 @@ enum Command {
         /// Own the central store (registry + global memories) instead of a project.
         #[arg(long)]
         central: bool,
+    },
+    /// Watch the work tree and re-index files as they are saved.
+    Watch {
+        /// Seconds to wait after the last change before indexing.
+        #[arg(long, default_value_t = 3)]
+        debounce: u64,
     },
     /// Install or remove the git hook that re-indexes after each commit.
     Hooks {
@@ -401,6 +408,7 @@ fn main() -> Result<()> {
                 cmd_serve(addr, token, idle, stop)
             }
         }
+        Command::Watch { debounce } => cmd_watch(debounce),
         Command::Hooks { action } => cmd_hooks(action),
         Command::Reindex {
             all,
@@ -409,6 +417,16 @@ fn main() -> Result<()> {
         } => cmd_reindex(all, projects, full),
         Command::Projects { action } => cmd_projects(action),
     }
+}
+
+/// `devctx watch` — re-index saved files until interrupted.
+///
+/// Complements the post-commit hook rather than replacing it: the hook covers
+/// committed work, this covers what you have written but not committed yet.
+fn cmd_watch(debounce: u64) -> Result<()> {
+    let cfg = load_project()?;
+    let root = project_root(&cfg)?;
+    watch::run(&cfg, &root, std::time::Duration::from_secs(debounce.max(1)))
 }
 
 /// `devctx hooks` — manage the post-commit indexing hook.

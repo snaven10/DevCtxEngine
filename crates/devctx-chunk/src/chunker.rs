@@ -40,6 +40,7 @@ pub fn chunk_file(path: &str, source: &str, parsed: &ParsedFile, cfg: &ChunkConf
             small_tokens += estimate_tokens(&text);
             small.push(PendingSmall {
                 text,
+                name: sym.name.clone(),
                 start: sym.start_line,
                 end: sym.end_line,
             });
@@ -116,6 +117,7 @@ pub fn chunk_raw_text(path: &str, content: &str, cfg: &ChunkConfig) -> Vec<Chunk
 
 struct PendingSmall {
     text: String,
+    name: String,
     start: u32,
     end: u32,
 }
@@ -224,6 +226,9 @@ fn snap_to_blank(lines: &[&str], idx: usize, window: usize) -> usize {
     idx
 }
 
+/// How many names a grouped chunk lists before summarising the rest as `+n`.
+const GROUPED_NAME_CAP: usize = 4;
+
 fn flush_small(chunks: &mut Vec<Chunk>, small: &mut Vec<PendingSmall>, tokens: &mut usize) {
     if small.is_empty() {
         return;
@@ -235,10 +240,24 @@ fn flush_small(chunks: &mut Vec<Chunk>, small: &mut Vec<PendingSmall>, tokens: &
         .map(|p| p.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
+    // Name the group after what is in it. Small functions are common enough
+    // that leaving this blank would strip the symbol from a large share of all
+    // search hits — the one field that tells a reader what they found.
+    let names: Vec<&str> = small
+        .iter()
+        .map(|p| p.name.as_str())
+        .filter(|n| !n.is_empty())
+        .take(GROUPED_NAME_CAP)
+        .collect();
+    let symbol = if names.len() < small.len() {
+        format!("{} +{}", names.join(", "), small.len() - names.len())
+    } else {
+        names.join(", ")
+    };
     chunks.push(Chunk::new(
         text,
         "function",
-        "",
+        symbol,
         "grouped",
         start,
         end,
@@ -265,4 +284,52 @@ fn basename(path: &str) -> &str {
 
 fn slice(source: &str, start: usize, end: usize) -> &str {
     source.get(start..end).unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(n: u32) -> Vec<PendingSmall> {
+        (1..=n)
+            .map(|i| PendingSmall {
+                text: format!("fn f{i}() {{}}"),
+                name: format!("f{i}"),
+                start: i,
+                end: i,
+            })
+            .collect()
+    }
+
+    /// A grouped chunk must still say what is inside it: small functions are
+    /// common, so leaving the symbol blank would strip the name from a large
+    /// share of all search hits.
+    #[test]
+    fn a_grouped_chunk_is_named_after_its_contents() {
+        let (mut chunks, mut tokens) = (Vec::new(), 0);
+        let mut small = pending(3);
+        flush_small(&mut chunks, &mut small, &mut tokens);
+
+        assert_eq!(chunks[0].symbol_name, "f1, f2, f3");
+        assert_eq!(chunks[0].symbol_type, "grouped");
+        assert_eq!((chunks[0].start_line, chunks[0].end_line), (1, 3));
+        assert!(small.is_empty(), "the pending set is drained");
+        assert_eq!(tokens, 0);
+    }
+
+    /// Long groups are summarised rather than producing an unbounded label.
+    #[test]
+    fn a_long_group_summarises_the_tail() {
+        let (mut chunks, mut tokens) = (Vec::new(), 0);
+        let mut many = pending(7);
+        flush_small(&mut chunks, &mut many, &mut tokens);
+        assert_eq!(chunks[0].symbol_name, "f1, f2, f3, f4 +3");
+    }
+
+    #[test]
+    fn flushing_nothing_produces_nothing() {
+        let (mut chunks, mut tokens) = (Vec::new(), 0);
+        flush_small(&mut chunks, &mut Vec::new(), &mut tokens);
+        assert!(chunks.is_empty());
+    }
 }

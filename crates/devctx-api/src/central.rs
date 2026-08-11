@@ -65,6 +65,11 @@ pub async fn serve(
         central: Arc::new(Mutex::new(central)),
         token,
     };
+    let sweep_every = {
+        let guard = api.central.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        guard.config().reindex.every_seconds
+    };
+    let registry = api.central.clone();
     let activity = Arc::new(Mutex::new(Instant::now()));
     let app = router(api).layer(middleware::from_fn_with_state(activity.clone(), track));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -83,8 +88,77 @@ pub async fn serve(
         });
     }
 
+    if sweep_every > 0 {
+        eprintln!("Background reindex: every {sweep_every}s");
+        tokio::spawn(async move {
+            let period = Duration::from_secs(sweep_every);
+            loop {
+                tokio::time::sleep(period).await;
+                let stale = tokio::task::spawn_blocking({
+                    let registry = registry.clone();
+                    move || stale_projects(&registry)
+                })
+                .await
+                .unwrap_or_default();
+                for (name, path) in stale {
+                    eprintln!("Reindexing {name} (HEAD moved)");
+                    let _ = tokio::task::spawn_blocking(move || index_project(&path)).await;
+                }
+            }
+        });
+    }
+
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Registered projects whose HEAD has moved since they were last indexed.
+///
+/// Deliberately compares `git rev-parse HEAD` against the recorded commit
+/// rather than opening any database: the sweep must be cheap enough to run on a
+/// timer without touching projects that have nothing to do.
+fn stale_projects(registry: &Arc<Mutex<Central>>) -> Vec<(String, String)> {
+    let Ok(guard) = registry.lock() else {
+        return Vec::new();
+    };
+    let Ok(projects) = guard.list(false) else {
+        return Vec::new();
+    };
+    projects
+        .into_iter()
+        .filter(|p| match head_commit(&p.path) {
+            Some(head) => head != p.last_commit,
+            None => false,
+        })
+        .map(|p| (p.name, p.path))
+        .collect()
+}
+
+fn head_commit(path: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|c| !c.is_empty())
+}
+
+/// Index a project by running `devctx index` inside it, so the work goes
+/// through that project's own server rather than this process.
+fn index_project(path: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .arg("index")
+        .current_dir(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Blocking entry point: build a Tokio runtime and serve.

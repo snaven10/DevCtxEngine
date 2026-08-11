@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use crate::state::{
     do_impact, do_index, do_index_status, do_list_projects, do_memory_stats, do_read_file,
     do_recall_scoped, do_references, do_remember, do_remember_global, do_routes_for_handler,
-    do_search, do_search_routes, do_summarize, parse_mode, AppState,
+    do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -112,6 +112,25 @@ impl Backend {
                         "mode": mode.unwrap_or_else(|| "vector".into()) }),
             ),
         }
+    }
+
+    /// Search another registered project. Independent of this session's project,
+    /// so both backends take the same path.
+    pub fn search_project(
+        &self,
+        project: &str,
+        query: &str,
+        limit: usize,
+        language: Option<String>,
+        mode: Option<String>,
+    ) -> Result<String, String> {
+        do_search_project(
+            project,
+            query,
+            limit,
+            language,
+            mode.as_deref().unwrap_or("vector"),
+        )
     }
 
     pub fn read_file(
