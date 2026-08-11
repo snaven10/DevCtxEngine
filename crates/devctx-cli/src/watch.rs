@@ -43,7 +43,7 @@ const ALWAYS_SKIP: &[&str] = &[
 /// of files at once. Coalescing avoids re-embedding the same file three times a
 /// second.
 pub fn run(cfg: &ProjectConfig, root: &Path, debounce: Duration) -> Result<()> {
-    let ignore = build_ignore(root);
+    let ignore = build_ignore(root, &cfg.indexing.exclude);
     let (tx, rx) = mpsc::channel();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -170,11 +170,17 @@ fn is_editor_noise(path: &Path) -> bool {
         || name.contains("___jb_")
 }
 
-/// Load the repository's ignore rules, so a build does not trigger a reindex.
-fn build_ignore(root: &Path) -> Gitignore {
+/// Load the repository's ignore rules plus the project's `indexing.exclude`, so
+/// a build does not trigger a reindex and an excluded file does not even wake
+/// the watcher. The pipeline enforces the same patterns, so this is an
+/// optimisation rather than the guarantee.
+fn build_ignore(root: &Path, exclude: &[String]) -> Gitignore {
     let mut b = GitignoreBuilder::new(root);
     let _ = b.add(root.join(".gitignore"));
     let _ = b.add(root.join(".devctx/.gitignore"));
+    for pattern in exclude {
+        let _ = b.add_line(None, pattern);
+    }
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 

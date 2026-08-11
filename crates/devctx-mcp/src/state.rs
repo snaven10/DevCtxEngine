@@ -208,6 +208,7 @@ fn do_index_inner(
         model_name: &state.cfg.embeddings.model,
         progress: None,
         paths,
+        exclude: &state.cfg.indexing.exclude,
     })
     .map_err(|e| e.to_string())?;
     report_index(&store, &state.root, &res);

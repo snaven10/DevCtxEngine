@@ -106,7 +106,14 @@ pub struct Storage {
 /// `indexing:` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Indexing {
-    /// Glob patterns to exclude from indexing.
+    /// Paths to keep out of the index, written as `.gitignore` patterns
+    /// (`target/`, `*.generated.ts`, `docs/vendor/**`).
+    ///
+    /// Same syntax and same matcher as `.gitignore`, so a pattern behaves the
+    /// same here as it would there — and identically whether a file arrives via
+    /// `index`, the post-commit hook, or `watch`. This is for code git *does*
+    /// track but that is not worth searching; anything already git-ignored is
+    /// excluded without needing a rule here.
     #[serde(default)]
     pub exclude: Vec<String>,
 }

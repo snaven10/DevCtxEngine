@@ -16,3 +16,4 @@ devctx-chunk = { path = "../devctx-chunk" }
 devctx-embed = { path = "../devctx-embed", default-features = false }
 thiserror.workspace = true
 sha2.workspace = true
+ignore = "0.4"

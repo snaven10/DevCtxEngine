@@ -1560,6 +1560,7 @@ fn cmd_index(full: bool) -> Result<()> {
         model_name: &cfg.embeddings.model,
         progress: Some(&progress),
         paths: None,
+        exclude: &cfg.indexing.exclude,
     })?;
     progress.finish();
     devctx_mcp::state::report_index(&store, &root, &res);

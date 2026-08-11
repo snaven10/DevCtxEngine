@@ -9,6 +9,7 @@ use devctx_core::types::{VectorMetadata, VectorPoint};
 use devctx_embed::EmbeddingProvider;
 use devctx_parse::{detect_lang, extract_routes, parse, raw_text_language};
 use devctx_store::{FileState, IndexRecord, Store, StoredEdge, StoredRoute};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::error::{IndexError, Result};
 use crate::git::{Change, GitRepo};
@@ -45,6 +46,9 @@ pub struct IndexRequest<'a> {
     pub model_name: &'a str,
     /// Optional progress reporter.
     pub progress: Option<&'a dyn ProgressSink>,
+    /// `.gitignore`-style patterns for paths to keep out of the index
+    /// (`indexing.exclude` in the project config).
+    pub exclude: &'a [String],
 }
 
 /// Summary of an indexing run.
@@ -81,6 +85,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         });
     }
 
+    let excluded = build_exclude(req.exclude);
     let git = GitRepo::open(req.repo_root)?;
     let state = git.state();
     let repo_short = git.short_name();
@@ -124,6 +129,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         full_reindex,
         cfg: ChunkConfig::default(),
         indexed: HashSet::new(),
+        excluded,
     };
 
     let mut result = IndexResult {
@@ -221,6 +227,24 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
 /// questions with it.
 const OWN_ARTIFACTS: &[&str] = &[".devctx", ".fastembed_cache", ".git"];
 
+/// Compile `indexing.exclude` into a matcher.
+///
+/// Reusing the gitignore engine rather than a plain glob is deliberate: a rule
+/// like `target/` then covers everything beneath it, and `*.log` matches at any
+/// depth — which is what anyone writing these patterns expects. An unparseable
+/// pattern is dropped rather than failing the run; refusing to index because one
+/// line of config is malformed helps nobody.
+fn build_exclude(patterns: &[String]) -> Gitignore {
+    if patterns.is_empty() {
+        return Gitignore::empty();
+    }
+    let mut b = GitignoreBuilder::new("");
+    for p in patterns {
+        let _ = b.add_line(None, p);
+    }
+    b.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
 fn is_own_artifact(path: &Path) -> bool {
     path.components()
         .next()
@@ -240,6 +264,8 @@ struct Ctx<'a> {
     cfg: ChunkConfig,
     /// Files that were (re)indexed this run — used to prune stale files.
     indexed: HashSet<String>,
+    /// Compiled `indexing.exclude` patterns.
+    excluded: Gitignore,
 }
 
 impl Ctx<'_> {
@@ -257,7 +283,12 @@ impl Ctx<'_> {
 
     fn index_file(&mut self, file: &str, result: &mut IndexResult) -> Result<()> {
         let path = Path::new(file);
-        if is_own_artifact(path) {
+        if is_own_artifact(path)
+            || self
+                .excluded
+                .matched_path_or_any_parents(path, false)
+                .is_ignore()
+        {
             result.files_skipped += 1;
             return Ok(());
         }

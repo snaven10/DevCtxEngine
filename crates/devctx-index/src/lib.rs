@@ -92,6 +92,7 @@ mod tests {
             model_name: "minilm-l6",
             progress: None,
             paths: None,
+            exclude: &[],
         })
         .unwrap()
     }
@@ -187,6 +188,7 @@ mod tests {
             model_name: "minilm-l6",
             progress: None,
             paths: None,
+            exclude: &[],
         })
         .unwrap();
 
@@ -290,6 +292,7 @@ mod tests {
             model_name: "minilm-l6",
             progress: None,
             paths: Some(paths),
+            exclude: &[],
         })
         .unwrap()
     }
@@ -410,6 +413,7 @@ mod tests {
             model_name: "minilm-l6",
             progress: None,
             paths: None,
+            exclude: &[],
         })
         .unwrap();
         assert!(full.full_reindex);
@@ -479,5 +483,115 @@ mod tests {
         files.sort();
         files.dedup();
         files
+    }
+
+    fn index_excluding(store: &Store, root: &Path, exclude: &[String]) -> IndexResult {
+        run(IndexRequest {
+            store,
+            embedder: &FakeEmbedder,
+            repo_root: root,
+            incremental: true,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+            exclude,
+        })
+        .unwrap()
+    }
+
+    /// `indexing.exclude` keeps tracked-but-uninteresting code out, using the
+    /// same pattern syntax as `.gitignore`.
+    #[test]
+    fn configured_excludes_keep_files_out_of_the_index() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_exclude_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "src/lib.rs", "pub fn kept() -> i32 { 1 }\n");
+        write(
+            &dir,
+            "src/api.generated.rs",
+            "pub fn generated() -> i32 { 2 }\n",
+        );
+        write(
+            &dir,
+            "vendor/dep/mod.rs",
+            "pub fn vendored() -> i32 { 3 }\n",
+        );
+        write(&dir, "docs/notes.md", "# Notes\n\nsome prose\n");
+        commit_all(&dir, "initial");
+
+        // A directory rule covers everything beneath it; a `*` rule matches at
+        // any depth. Both are gitignore semantics, not literal globs.
+        let exclude = vec![
+            "vendor/".to_string(),
+            "*.generated.rs".to_string(),
+            "docs/notes.md".to_string(),
+        ];
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_excluding(&store, &dir, &exclude);
+
+        let indexed = indexed_files(&store);
+        assert_eq!(
+            indexed,
+            vec!["src/lib.rs".to_string()],
+            "only the non-excluded file should be indexed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Adding an exclude retroactively removes what it now covers, so the config
+    /// is the whole truth rather than only applying to future files.
+    #[test]
+    fn a_new_exclude_prunes_what_it_now_covers() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_exclude2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "src/lib.rs", "pub fn kept() -> i32 { 1 }\n");
+        write(&dir, "vendor/dep.rs", "pub fn vendored() -> i32 { 2 }\n");
+        commit_all(&dir, "initial");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_excluding(&store, &dir, &[]);
+        assert_eq!(indexed_files(&store).len(), 2);
+
+        let res = run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: false,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+            exclude: &["vendor/".to_string()],
+        })
+        .unwrap();
+        assert_eq!(res.files_pruned, 1);
+        assert_eq!(indexed_files(&store), vec!["src/lib.rs".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A malformed pattern must not take the whole index down with it.
+    #[test]
+    fn a_broken_pattern_is_dropped_not_fatal() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_exclude3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "src/lib.rs", "pub fn kept() -> i32 { 1 }\n");
+        commit_all(&dir, "initial");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        let r = index_excluding(&store, &dir, &["[".to_string()]);
+        assert_eq!(r.files_indexed, 1, "a bad pattern must not stop indexing");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
