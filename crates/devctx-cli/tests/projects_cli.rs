@@ -35,12 +35,31 @@ impl Tmp {
 
 impl Drop for Tmp {
     fn drop(&mut self) {
+        // Stop any daemon this test auto-spawned before the directory (and its
+        // database) disappears underneath it, so tests never leak processes.
+        let _ = Command::new(env!("CARGO_BIN_EXE_devctx"))
+            .env("DEVCTX_HOME", self.home())
+            .args(["serve", "--central", "--stop"])
+            .output();
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-/// Run `devctx` with the central home pointed at `home`.
+/// Run `devctx` against `home` with the store opened directly.
+///
+/// Auto-spawn is off so these exercise the no-daemon path deterministically;
+/// [`devctx_routed`] covers the daemon.
 fn devctx(home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", home)
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .args(args)
+        .output()
+        .expect("running devctx")
+}
+
+/// Run `devctx` with auto-spawn enabled, so the call routes through the daemon.
+fn devctx_routed(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_devctx"))
         .env("DEVCTX_HOME", home)
         .args(args)
@@ -233,4 +252,105 @@ fn init_registers_the_repo_centrally() {
     );
 
     assert!(ok(&home, &["projects", "list"]).contains("epsilon"));
+}
+
+/// The reason the daemon exists: DuckDB permits one writing process per file, so
+/// without it concurrent registry commands knock each other over. With it, they
+/// queue behind a single owner.
+#[test]
+fn the_daemon_serializes_concurrent_writers() {
+    let tmp = Tmp::new("concurrent");
+    let home = tmp.home();
+
+    // The first routed call auto-spawns the daemon and advertises it.
+    let out = devctx_routed(&home, &["projects", "list"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        home.join("serve.json").is_file(),
+        "a routed call should have spawned and advertised a daemon"
+    );
+
+    // Four writers and a reader, all at once.
+    let repos: Vec<PathBuf> = ["w1", "w2", "w3", "w4"]
+        .iter()
+        .map(|n| tmp.repo(n))
+        .collect();
+    let handles: Vec<_> = repos
+        .into_iter()
+        .map(|repo| {
+            let home = home.clone();
+            std::thread::spawn(move || {
+                let out = devctx_routed(
+                    &home,
+                    &["projects", "add", repo.to_str().unwrap(), "--init"],
+                );
+                (
+                    out.status.success(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                )
+            })
+        })
+        .chain(std::iter::once({
+            let home = home.clone();
+            std::thread::spawn(move || {
+                let out = devctx_routed(&home, &["projects", "list"]);
+                (
+                    out.status.success(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                )
+            })
+        }))
+        .collect();
+
+    for h in handles {
+        let (ok, err) = h.join().expect("thread panicked");
+        assert!(ok, "a concurrent command failed: {err}");
+    }
+
+    let json = devctx_routed(&home, &["projects", "list", "--format", "json"]);
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("valid JSON");
+    assert_eq!(
+        parsed.as_array().unwrap().len(),
+        4,
+        "every concurrent write should have landed"
+    );
+}
+
+/// Routed and direct reads must agree — the daemon is a transport, not a
+/// different source of truth.
+#[test]
+fn routed_and_direct_reads_agree() {
+    let tmp = Tmp::new("agreement");
+    let home = tmp.home();
+    ok(
+        &home,
+        &[
+            "projects",
+            "add",
+            tmp.repo("zeta").to_str().unwrap(),
+            "--init",
+        ],
+    );
+
+    let direct = ok(&home, &["projects", "show", "zeta"]);
+    let routed = devctx_routed(&home, &["projects", "show", "zeta"]);
+    assert!(routed.status.success());
+    assert_eq!(direct, String::from_utf8_lossy(&routed.stdout));
+}
+
+/// A second daemon for the same home is refused rather than racing the first.
+#[test]
+fn a_second_daemon_is_refused() {
+    let tmp = Tmp::new("singleton");
+    let home = tmp.home();
+    devctx_routed(&home, &["projects", "list"]); // spawns one
+
+    let out = devctx_routed(&home, &["serve", "--central"]);
+    assert!(!out.status.success(), "a second daemon must not start");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("already running"), "got: {err}");
 }

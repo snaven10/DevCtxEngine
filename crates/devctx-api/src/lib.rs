@@ -22,6 +22,8 @@ use devctx_mcp::state::{
 };
 use serde::Deserialize;
 
+pub mod central;
+
 /// Vendored web dashboard (served at `/`) and its cytoscape bundle.
 const DASHBOARD_HTML: &str = include_str!("../assets/index.html");
 const CYTOSCAPE_JS: &str = include_str!("../assets/cytoscape.min.js");
@@ -92,7 +94,11 @@ pub async fn serve(
 }
 
 /// Middleware: record the time of the last non-health request (for idle-shutdown).
-async fn track(State(act): State<Arc<Mutex<Instant>>>, req: Request, next: Next) -> Response {
+pub(crate) async fn track(
+    State(act): State<Arc<Mutex<Instant>>>,
+    req: Request,
+    next: Next,
+) -> Response {
     if req.uri().path() != "/health" {
         if let Ok(mut t) = act.lock() {
             *t = Instant::now();
@@ -370,11 +376,11 @@ where
     }
 }
 
-fn json_ok(body: String) -> Response {
+pub(crate) fn json_ok(body: String) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
-fn json_err(code: StatusCode, msg: String) -> Response {
+pub(crate) fn json_err(code: StatusCode, msg: String) -> Response {
     let body = serde_json::json!({ "error": msg }).to_string();
     (code, [(header::CONTENT_TYPE, "application/json")], body).into_response()
 }

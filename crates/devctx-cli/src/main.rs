@@ -4,6 +4,7 @@
 //! embedder pulls in fastembed/ort (the `local` provider) and downloads the
 //! model on first use.
 
+mod central_remote;
 mod mcp_configure;
 mod remote;
 
@@ -13,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use devctx_central::{project_json, Central, RegisterRequest};
+use devctx_central::{project_json, Central, CentralPaths, RegisterRequest};
 use devctx_core::config::{find_config_file, Project, ProjectConfig};
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
@@ -188,6 +189,9 @@ enum Command {
         /// Stop a running server for this project instead of starting one.
         #[arg(long)]
         stop: bool,
+        /// Own the central store (registry + global memories) instead of a project.
+        #[arg(long)]
+        central: bool,
     },
     /// Manage the central registry of projects DevCtxEngine knows about.
     Projects {
@@ -335,13 +339,25 @@ fn main() -> Result<()> {
             token,
             idle,
             stop,
-        } => cmd_serve(addr, token, idle, stop),
+            central,
+        } => {
+            if central {
+                cmd_serve_central(addr, token, idle, stop)
+            } else {
+                cmd_serve(addr, token, idle, stop)
+            }
+        }
         Command::Projects { action } => cmd_projects(action),
     }
 }
 
 /// `devctx projects` — the central registry.
 fn cmd_projects(action: ProjectsAction) -> Result<()> {
+    let paths = CentralPaths::resolve().context("resolving the central store location")?;
+    // Route through the daemon so concurrent commands don't fight over the
+    // single-writer DuckDB file. Falling back to a direct open keeps a lone
+    // command working when no daemon can be spawned.
+    let remote = central_remote::ensure(&paths);
     let direct = || Central::open().context("opening the central store");
 
     match action {
@@ -356,14 +372,17 @@ fn cmd_projects(action: ProjectsAction) -> Result<()> {
                 Some(p) => p,
                 None => std::env::current_dir().context("resolving current directory")?,
             };
-            let rec = project_json(&direct()?.register(&RegisterRequest {
-                root,
-                name,
-                description,
-                tags,
-                create_config: init,
-                now: devctx_central::now_stamp(),
-            })?);
+            let rec = match &remote {
+                Some(r) => r.add(&root, name.as_deref(), &description, &tags, init)?,
+                None => project_json(&direct()?.register(&RegisterRequest {
+                    root,
+                    name,
+                    description,
+                    tags,
+                    create_config: init,
+                    now: devctx_central::now_stamp(),
+                })?),
+            };
             println!(
                 "Registered `{}` at {}",
                 field(&rec, "name"),
@@ -383,8 +402,10 @@ fn cmd_projects(action: ProjectsAction) -> Result<()> {
         }
 
         ProjectsAction::List { all, format } => {
-            let projects: Vec<serde_json::Value> =
-                direct()?.list(all)?.iter().map(project_json).collect();
+            let projects = match &remote {
+                Some(r) => r.list(all)?,
+                None => direct()?.list(all)?.iter().map(project_json).collect(),
+            };
             if format == OutputFormat::Json {
                 println!("{}", serde_json::to_string_pretty(&projects)?);
                 return Ok(());
@@ -425,9 +446,12 @@ fn cmd_projects(action: ProjectsAction) -> Result<()> {
         }
 
         ProjectsAction::Show { name } => {
-            let p = match direct()?.get(&name)? {
-                Some(rec) => project_json(&rec),
-                None => bail!("no registered project named `{name}`"),
+            let p = match &remote {
+                Some(r) => r.show(&name)?,
+                None => match direct()?.get(&name)? {
+                    Some(rec) => project_json(&rec),
+                    None => bail!("no registered project named `{name}`"),
+                },
             };
             println!("{}", field(&p, "name"));
             println!("  Path:        {}", field(&p, "path"));
@@ -468,7 +492,10 @@ fn cmd_projects(action: ProjectsAction) -> Result<()> {
         }
 
         ProjectsAction::Refresh { name } => {
-            let rec = project_json(&direct()?.refresh(&name, &devctx_central::now_stamp())?);
+            let rec = match &remote {
+                Some(r) => r.refresh(&name)?,
+                None => project_json(&direct()?.refresh(&name, &devctx_central::now_stamp())?),
+            };
             println!(
                 "Refreshed `{}` from {} — model {} ({}d)",
                 field(&rec, "name"),
@@ -480,14 +507,21 @@ fn cmd_projects(action: ProjectsAction) -> Result<()> {
         }
 
         ProjectsAction::Rm { name, deactivate } => {
-            let c = direct()?;
-            let done = if deactivate {
-                c.deactivate(&name, &devctx_central::now_stamp())?
-            } else {
-                c.remove(&name)?
-            };
-            if !done {
-                bail!("no registered project named `{name}`");
+            match &remote {
+                Some(r) => {
+                    r.remove(&name, deactivate)?;
+                }
+                None => {
+                    let c = direct()?;
+                    let done = if deactivate {
+                        c.deactivate(&name, &devctx_central::now_stamp())?
+                    } else {
+                        c.remove(&name)?
+                    };
+                    if !done {
+                        bail!("no registered project named `{name}`");
+                    }
+                }
             }
             let verb = if deactivate { "Deactivated" } else { "Removed" };
             println!("{verb} `{name}` (the repository itself was not touched)");
@@ -562,6 +596,49 @@ fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Resu
     let idle = (idle > 0).then(|| std::time::Duration::from_secs(idle));
     let result = devctx_api::run_blocking(cfg.clone(), socket, token, idle);
     remote::remove_serve_file(&cfg);
+    result
+}
+
+/// `devctx serve --central` — the single owner of the central store.
+///
+/// Unlike a project server this is a singleton: the central database is shared
+/// by every project, and DuckDB permits one writing process per file. Binding a
+/// second one is therefore refused rather than raced.
+fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool) -> Result<()> {
+    let paths = CentralPaths::resolve().context("resolving the central store location")?;
+    if stop {
+        return central_remote::stop(&paths);
+    }
+    if central_remote::discover(&paths).is_some() {
+        bail!(
+            "a central daemon is already running for {} (stop it with \
+             `devctx serve --central --stop`)",
+            paths.dir.display()
+        );
+    }
+
+    // `--addr` defaults to the project-server port, which would be wrong here;
+    // when it is left at that default, use the per-home address instead.
+    let addr = if addr == DEFAULT_ADDR {
+        central_remote::default_addr(&paths)
+    } else {
+        addr
+    };
+    let socket: SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid --addr `{addr}`"))?;
+    let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
+
+    let central = Central::open().context("opening the central store")?;
+    central_remote::write_serve_file(&paths, socket, token.as_deref())?;
+    println!("DevCtxEngine central store → http://{addr}");
+    println!("  Database: {}", paths.db.display());
+    println!("  Config:   {}", paths.config.display());
+    println!("Registry commands will route through it while it runs. Ctrl-C to stop.");
+
+    let idle = (idle > 0).then(|| std::time::Duration::from_secs(idle));
+    let result = devctx_api::central::run_blocking(central, socket, token, idle);
+    central_remote::remove_serve_file(&paths);
     result
 }
 
