@@ -1,0 +1,32 @@
+# Retrieval bench: query | file that should answer it
+#
+# Targets written before measuring, deliberately: choosing them afterwards is
+# how you talk yourself into whichever result you got. Each names the file a
+# reader would have to open to answer the question. Lines starting with # are
+# comments.
+#
+# Natural-language questions about code — the case that was failing.
+where do we run the indexing pipeline|devctx-index/src/pipeline.rs
+how are memories deduplicated|devctx-memory/src/lib.rs
+what happens when two processes open the same database|devctx-cli/src/remote.rs
+how are ranked lists fused together|devctx-search/src/lib.rs
+how is a file split into chunks|devctx-chunk/src/chunker.rs
+where do we detect a file's programming language|devctx-parse/src/lib.rs
+how does the watcher decide which files to reindex|devctx-cli/src/watch.rs
+where is the git hook written to disk|devctx-cli/src/hooks.rs
+how do we talk to the central store|devctx-central/src/client.rs
+where are HTTP routes extracted from source|devctx-parse/src/routes.rs
+#
+# Term-shaped queries — should be easy for keyword and vector alike.
+reciprocal rank fusion|devctx-core/src/rank.rs
+cosine distance vector search|devctx-store/src/store.rs
+post-commit hook install uninstall|devctx-cli/src/hooks.rs
+project registry table|devctx-store/src/projects.rs
+memory scope local global|devctx-memory/src/lib.rs
+#
+# Spanish — the multilingual case the reranker debate turned on.
+cómo se configura el modelo de embeddings|devctx-core/src/config.rs
+dónde se guardan los modelos descargados|devctx-core/src/dirs.rs
+cómo se registra un proyecto nuevo|devctx-central/src/lib.rs
+qué hace el servidor cuando está inactivo|devctx-api/src/lib.rs
+cómo se calcula el hash de una memoria|devctx-memory/src/lib.rs
