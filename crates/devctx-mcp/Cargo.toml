@@ -27,3 +27,7 @@ serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 rmcp = { version = "3", features = ["server", "transport-io", "macros", "schemars"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+
+[target.'cfg(target_env = "gnu")'.dependencies]
+# Only for `malloc_trim`: see `AppState::release_idle_models`.
+libc = "0.2"

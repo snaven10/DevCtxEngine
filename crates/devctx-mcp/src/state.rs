@@ -21,6 +21,28 @@ use devctx_store::Store;
 use devctx_summarize::{create_summarizer, SummarizeSettings};
 use serde_json::{json, Value};
 
+/// Hand freed pages back to the kernel after a model is dropped.
+///
+/// Dropping the model frees its allocations, but glibc keeps the pages on its
+/// own free lists rather than returning them, so the process's resident size
+/// barely moves and the memory stays unavailable to everything else on the
+/// machine — which is the whole point of releasing it. `malloc_trim` asks for
+/// the top of each arena back.
+///
+/// glibc only; elsewhere the drop stands on whatever the allocator chooses to
+/// do with it.
+#[cfg(target_env = "gnu")]
+fn trim_allocator() {
+    // SAFETY: `malloc_trim` takes no pointers and touches only the allocator's
+    // own bookkeeping. It is callable from any thread at any time.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn trim_allocator() {}
+
 /// A model held in memory, with the last time it was handed to a caller.
 ///
 /// Loading one costs seconds; holding one costs hundreds of megabytes for as
@@ -150,6 +172,9 @@ impl AppState {
                 *guard = None;
                 released.push("reranker");
             }
+        }
+        if !released.is_empty() {
+            trim_allocator();
         }
         released
     }
