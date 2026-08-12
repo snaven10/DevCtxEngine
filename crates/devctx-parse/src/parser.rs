@@ -159,6 +159,7 @@ impl LanguageParser {
                     kind = "method".to_string();
                 }
 
+                let head = doc_head(def, bytes);
                 out.push(Symbol {
                     name: name.to_string(),
                     kind,
@@ -167,6 +168,8 @@ impl LanguageParser {
                     end_line: def.end_position().row as u32 + 1,
                     start_byte: def.start_byte(),
                     end_byte: def.end_byte(),
+                    doc_start_line: head.start_position().row as u32 + 1,
+                    doc_start_byte: head.start_byte(),
                     parent,
                 });
             }
@@ -192,6 +195,88 @@ impl LanguageParser {
         out.sort_by_key(|i| i.line);
         out
     }
+}
+
+/// Where a symbol's text really begins: at the doc comment above it, not at
+/// the keyword.
+///
+/// Tree-sitter's definition node starts at `fn`/`class`/`func`, which leaves
+/// the `///` explanation directly above it inside no symbol at all — so the one
+/// place we wrote *why* the code exists never reaches the index, and questions
+/// phrased as behaviour ("what happens when two processes open the same file")
+/// have nothing to match but identifiers.
+///
+/// Walks back over the run of comments and attributes/decorators sitting
+/// immediately above `def`, and returns the first of them. The run ends at a
+/// blank line, at anything that is not a comment or an attribute, at a trailing
+/// comment sharing a line with the previous item, or at a module-level `//!`
+/// doc, which belongs to the file rather than to this symbol.
+fn doc_head<'t>(def: Node<'t>, bytes: &[u8]) -> Node<'t> {
+    let mut head = def;
+    let mut cur = def;
+    while let Some(prev) = cur.prev_sibling() {
+        let kind = prev.kind();
+        let is_comment = kind.contains("comment");
+        if !is_comment && !kind.contains("attribute") && !kind.contains("decorator") {
+            break;
+        }
+        if !starts_its_own_line(prev.start_byte(), bytes) {
+            break;
+        }
+        if breaks_the_run(
+            trimmed_end(prev.end_byte(), bytes),
+            head.start_byte(),
+            bytes,
+        ) {
+            break;
+        }
+        if is_comment && is_inner_doc(prev, bytes) {
+            break;
+        }
+        head = prev;
+        cur = prev;
+    }
+    head
+}
+
+/// Is `at` preceded only by indentation on its line? A comment that shares a
+/// line with the code before it is a trailing remark about *that* code.
+fn starts_its_own_line(at: usize, bytes: &[u8]) -> bool {
+    bytes[..at]
+        .iter()
+        .rev()
+        .take_while(|b| **b != b'\n')
+        .all(|b| b.is_ascii_whitespace())
+}
+
+/// Back up over trailing whitespace. Grammars disagree on whether a line
+/// comment's node swallows its newline — tree-sitter-rust does, tree-sitter-go
+/// does not — so trim it off before measuring the gap and both behave alike.
+fn trimmed_end(end: usize, bytes: &[u8]) -> usize {
+    let mut e = end;
+    while e > 0 && bytes[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    e
+}
+
+/// Does what sits between two nodes end the run? Anything but a single line
+/// break does: a blank line means the comment above is a section heading rather
+/// than this symbol's doc, and non-whitespace means something else is in there.
+fn breaks_the_run(from: usize, to: usize, bytes: &[u8]) -> bool {
+    match bytes.get(from..to) {
+        Some(gap) => {
+            !gap.iter().all(u8::is_ascii_whitespace)
+                || gap.iter().filter(|b| **b == b'\n').count() > 1
+        }
+        None => true,
+    }
+}
+
+/// A module-level doc (`//!`, `/*!`) documents the file, not the symbol below.
+fn is_inner_doc(node: Node<'_>, bytes: &[u8]) -> bool {
+    node.utf8_text(bytes)
+        .is_ok_and(|t| t.starts_with("//!") || t.starts_with("/*!"))
 }
 
 /// The nearest enclosing function/method definition node, if any.

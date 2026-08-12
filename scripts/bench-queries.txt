@@ -6,27 +6,36 @@
 # comments.
 #
 # Natural-language questions about code — the case that was failing.
-where do we run the indexing pipeline|devctx-index/src/pipeline.rs
-how are memories deduplicated|devctx-memory/src/lib.rs
-what happens when two processes open the same database|devctx-cli/src/remote.rs
-how are ranked lists fused together|devctx-search/src/lib.rs
-how is a file split into chunks|devctx-chunk/src/chunker.rs
-where do we detect a file's programming language|devctx-parse/src/lib.rs
-how does the watcher decide which files to reindex|devctx-cli/src/watch.rs
-where is the git hook written to disk|devctx-cli/src/hooks.rs
-how do we talk to the central store|devctx-central/src/client.rs
-where are HTTP routes extracted from source|devctx-parse/src/routes.rs
+where do we run the indexing pipeline|devctx-index/src/pipeline.rs|en
+how are memories deduplicated|devctx-memory/src/lib.rs|en
+what happens when two processes open the same database|devctx-cli/src/remote.rs|en
+how are ranked lists fused together|devctx-search/src/lib.rs|en
+how is a file split into chunks|devctx-chunk/src/chunker.rs|en
+where do we detect a file's programming language|devctx-parse/src/lib.rs|en
+how does the watcher decide which files to reindex|devctx-cli/src/watch.rs|en
+where is the git hook written to disk|devctx-cli/src/hooks.rs|en
+how do we talk to the central store|devctx-central/src/client.rs|en
+where are HTTP routes extracted from source|devctx-parse/src/routes.rs|en
 #
 # Term-shaped queries — should be easy for keyword and vector alike.
-reciprocal rank fusion|devctx-core/src/rank.rs
-cosine distance vector search|devctx-store/src/store.rs
-post-commit hook install uninstall|devctx-cli/src/hooks.rs
-project registry table|devctx-store/src/projects.rs
-memory scope local global|devctx-memory/src/lib.rs
+reciprocal rank fusion|devctx-core/src/rank.rs|en
+cosine distance vector search|devctx-store/src/store.rs|en
+post-commit hook install uninstall|devctx-cli/src/hooks.rs|en
+project registry table|devctx-store/src/projects.rs|en
+memory scope local global|devctx-memory/src/lib.rs|en
 #
 # Spanish — the multilingual case the reranker debate turned on.
-cómo se configura el modelo de embeddings|devctx-core/src/config.rs
-dónde se guardan los modelos descargados|devctx-core/src/dirs.rs
-cómo se registra un proyecto nuevo|devctx-central/src/lib.rs
-qué hace el servidor cuando está inactivo|devctx-api/src/lib.rs
-cómo se calcula el hash de una memoria|devctx-memory/src/lib.rs
+cómo se configura el modelo de embeddings|devctx-core/src/config.rs|es
+dónde se guardan los modelos descargados|devctx-core/src/dirs.rs|es
+cómo se registra un proyecto nuevo|devctx-central/src/lib.rs|es
+qué hace el servidor cuando está inactivo|devctx-api/src/lib.rs|es
+cómo se calcula el hash de una memoria|devctx-memory/src/lib.rs|es
+#
+# Questions whose right answer is prose, not code. Without these the bench
+# cannot tell "code ranks better" from "documentation stopped being findable",
+# and any change that favours one would look like a free win.
+how do I install devctx and index my first repository|docs/01-getting-started|en
+what is the overall architecture of the system|docs/02-architecture|en
+how do I point the reranker at a model I downloaded myself|docs/09|en
+which design decisions were made and why|docs/08-design-decisions|en
+cómo mantengo el índice al día automáticamente|docs/es/13-mantener|es

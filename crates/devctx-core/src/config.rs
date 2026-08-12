@@ -139,6 +139,16 @@ pub struct Reranking {
     /// `ms-marco-MiniLM-L-12-v2`, which is an order of magnitude smaller.
     #[serde(default)]
     pub model_dir: String,
+    /// How many candidates the cross-encoder is shown.
+    ///
+    /// This is the ceiling on everything reranking could ever fix: it can only
+    /// reorder what it is handed, so an answer ranked below the pool is
+    /// invisible to it however good the model is. It is also the whole cost —
+    /// the cross-encoder is the slowest stage by two orders of magnitude, and
+    /// this multiplies it. Deep pool with a small fast model, or shallow pool
+    /// with a large one; deep and large is unusably slow.
+    #[serde(default = "default_rerank_pool")]
+    pub pool: usize,
 }
 
 impl Default for Reranking {
@@ -147,12 +157,18 @@ impl Default for Reranking {
             enabled: true,
             model: default_reranker(),
             model_dir: String::new(),
+            pool: default_rerank_pool(),
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Candidates shown to the cross-encoder by default.
+fn default_rerank_pool() -> usize {
+    100
 }
 
 fn default_reranker() -> String {

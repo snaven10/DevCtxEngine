@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 pub struct Chunk {
     /// Chunk text (context header + body).
     pub text: String,
-    /// Chunk level: `file` / `class` / `function` / `block`.
+    /// Chunk level: `file` / `class` / `doc` / `function` / `block`.
     pub level: String,
     /// Symbol name this chunk represents (empty for the file chunk).
     pub symbol_name: String,

@@ -22,6 +22,8 @@ pub struct RerankSettings {
     /// Model key (`bge-base` default, `bge-v2-m3` multilingual, `jina-*`), or
     /// `custom` to load `model_dir`.
     pub model: String,
+    /// How many candidates to show the cross-encoder (the pool it reorders).
+    pub pool: usize,
     /// Directory of a user-supplied cross-encoder (ONNX + tokenizer files).
     pub model_dir: Option<std::path::PathBuf>,
 }
@@ -30,6 +32,7 @@ impl Default for RerankSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            pool: 100,
             model: default_model().to_string(),
             model_dir: None,
         }
@@ -52,16 +55,30 @@ pub fn create_reranker(settings: &RerankSettings) -> Result<Box<dyn Reranker>> {
     if !settings.enabled {
         return Ok(Box::new(NoopReranker));
     }
-    create_local(&settings.model, settings.model_dir.as_deref())
+    create_local(
+        &settings.model,
+        settings.model_dir.as_deref(),
+        settings.pool,
+    )
 }
 
 #[cfg(feature = "local")]
-fn create_local(model: &str, model_dir: Option<&std::path::Path>) -> Result<Box<dyn Reranker>> {
-    Ok(Box::new(local::LocalReranker::load(model, model_dir)?))
+fn create_local(
+    model: &str,
+    model_dir: Option<&std::path::Path>,
+    pool: usize,
+) -> Result<Box<dyn Reranker>> {
+    Ok(Box::new(
+        local::LocalReranker::load(model, model_dir)?.with_pool(pool),
+    ))
 }
 
 #[cfg(not(feature = "local"))]
-fn create_local(_model: &str) -> Result<Box<dyn Reranker>> {
+fn create_local(
+    _model: &str,
+    _model_dir: Option<&std::path::Path>,
+    _pool: usize,
+) -> Result<Box<dyn Reranker>> {
     Ok(Box::new(NoopReranker))
 }
 
@@ -72,6 +89,7 @@ mod tests {
     #[test]
     fn disabled_yields_noop() {
         let r = create_reranker(&RerankSettings {
+            pool: 100,
             model_dir: None,
             enabled: false,
             model: "bge-base".into(),

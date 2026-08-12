@@ -79,12 +79,22 @@ fn read_tokenizer_files(dir: &Path) -> Result<TokenizerFiles> {
 }
 
 /// A fastembed cross-encoder reranker.
+/// Candidates shown to the cross-encoder unless configured otherwise.
+const DEFAULT_POOL: usize = 100;
+
 pub struct LocalReranker {
     model: TextRerank,
     name: String,
+    pool: usize,
 }
 
 impl LocalReranker {
+    /// Set how many candidates this reranker asks to be shown.
+    pub fn with_pool(mut self, pool: usize) -> Self {
+        self.pool = pool;
+        self
+    }
+
     /// Load the reranker named by `key` (downloads/caches on first use).
     pub fn load(key: &str, model_dir: Option<&Path>) -> Result<Self> {
         // A directory wins over the key: it is the only way to run a
@@ -109,6 +119,7 @@ impl LocalReranker {
         Ok(Self {
             model: text_rerank,
             name: key.to_string(),
+            pool: DEFAULT_POOL,
         })
     }
 
@@ -127,6 +138,7 @@ impl LocalReranker {
         Ok(Self {
             model: text_rerank,
             name: key.to_string(),
+            pool: DEFAULT_POOL,
         })
     }
 }
@@ -158,6 +170,10 @@ impl Reranker for LocalReranker {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn pool(&self) -> usize {
+        self.pool
     }
 }
 

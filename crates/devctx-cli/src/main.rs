@@ -1830,6 +1830,7 @@ fn cmd_search(
         eprintln!("Loading reranker ({})…", cfg.reranking.model);
         Some(create_reranker(&RerankSettings {
             enabled: true,
+            pool: cfg.reranking.pool,
             model: cfg.reranking.model.clone(),
             model_dir: (!cfg.reranking.model_dir.is_empty())
                 .then(|| PathBuf::from(&cfg.reranking.model_dir)),

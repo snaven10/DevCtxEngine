@@ -318,6 +318,66 @@ public class Svc {
         );
     }
 
+    /// The prose above a function is where its purpose is written; without it
+    /// a chunk carries only identifiers, and a question phrased as behaviour
+    /// has nothing to match.
+    #[test]
+    fn a_symbol_starts_at_its_doc_comment() {
+        let src = "\
+/// Waits for the lock holder to exit.
+/// Returns false if it outlives the timeout.
+#[inline]
+fn wait_for_exit() {}
+";
+        let sym = &parse_ok(Lang::Rust, src).symbols[0];
+        assert_eq!(sym.doc_start_line, 1, "starts at the first `///` line");
+        assert_eq!(sym.start_line, 4, "the definition itself is unmoved");
+        assert!(src[sym.doc_start_byte..sym.end_byte].contains("lock holder"));
+    }
+
+    /// A comment separated by a blank line is a section heading; one sharing a
+    /// line with the code above it is a remark about *that* code; and `//!`
+    /// documents the file. None of them belong to the symbol below.
+    #[test]
+    fn only_the_comment_directly_above_is_taken() {
+        let blank = "/// Belongs to nothing.\n\nfn f() {}\n";
+        assert_eq!(parse_ok(Lang::Rust, blank).symbols[0].doc_start_line, 3);
+
+        let trailing = "fn a() {} // unrelated\nfn f() {}\n";
+        assert_eq!(parse_ok(Lang::Rust, trailing).symbols[1].doc_start_line, 2);
+
+        let module = "//! The parser.\nfn f() {}\n";
+        assert_eq!(parse_ok(Lang::Rust, module).symbols[0].doc_start_line, 2);
+    }
+
+    /// Every language we parse writes docs above the definition, whatever the
+    /// comment syntax.
+    #[test]
+    fn doc_comments_are_found_in_every_language() {
+        let cases = [
+            (Lang::Python, "# Greets.\ndef greet():\n    pass\n", "greet"),
+            (
+                Lang::Go,
+                "package m\n\n// Greets.\nfunc Greet() {}\n",
+                "Greet",
+            ),
+            (
+                Lang::TypeScript,
+                "/** Greets. */\nfunction greet() {}\n",
+                "greet",
+            ),
+            (Lang::Java, "// Greets.\nclass Greeter {}\n", "Greeter"),
+        ];
+        for (lang, src, name) in cases {
+            let pf = parse_ok(lang, src);
+            let sym = find(&pf, name);
+            assert!(
+                src[sym.doc_start_byte..sym.end_byte].contains("Greets"),
+                "{lang:?} dropped the doc comment"
+            );
+        }
+    }
+
     #[test]
     fn detects_language_from_path() {
         assert_eq!(detect_lang(Path::new("a/b/foo.py")), Some(Lang::Python));

@@ -18,6 +18,13 @@ pub struct Symbol {
     pub start_byte: usize,
     /// Byte offset of the definition end.
     pub end_byte: usize,
+    /// 1-based first line of the doc comment above the definition, or
+    /// `start_line` when there is none.
+    pub doc_start_line: u32,
+    /// Byte offset of the doc comment above the definition, or `start_byte`
+    /// when there is none. Chunks slice from here so the prose that explains a
+    /// symbol travels with it.
+    pub doc_start_byte: usize,
     /// Enclosing symbol name (class/impl/…), if any.
     pub parent: Option<String>,
 }

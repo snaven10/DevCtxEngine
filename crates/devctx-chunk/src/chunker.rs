@@ -24,6 +24,8 @@ pub fn chunk_file(path: &str, source: &str, parsed: &ParsedFile, cfg: &ChunkConf
         chunks.push(class_chunk(path, source, sym, parsed));
     }
 
+    chunks.extend(doc_chunks(path, source, parsed));
+
     let mut small: Vec<PendingSmall> = Vec::new();
     let mut small_tokens = 0usize;
 
@@ -113,6 +115,55 @@ pub fn chunk_raw_text(path: &str, content: &str, cfg: &ChunkConfig) -> Vec<Chunk
         i = end;
     }
     out
+}
+
+/// Shortest doc comment worth its own chunk, in characters. `/// The name.`
+/// restates the signature; a sentence about what happens does not.
+const MIN_DOC_CHARS: usize = 60;
+
+/// One chunk per documented symbol, holding the prose above it.
+///
+/// Measured on this repository, questions that name a thing — an identifier, a
+/// term — are found 13 times in 14. Questions about behaviour, "what happens
+/// when two processes open the same database", are found 5 times in 10, in
+/// English and Spanish alike. The reason is that nothing in the index describes
+/// behaviour: the answering code says `pid_alive` and `elapsed`, and shares no
+/// word with the question. The doc comment above it is the only place anyone
+/// wrote what the code *does*.
+///
+/// Kept apart from the code rather than folded into it. Prepending the prose to
+/// the body was tried first and measured worse — a code chunk carrying a
+/// paragraph reads like the documentation it now competes with, and both lose.
+/// Separate chunks let a behaviour question match prose and an identifier
+/// question match code, which is what each is good at.
+fn doc_chunks(path: &str, source: &str, parsed: &ParsedFile) -> Vec<Chunk> {
+    parsed
+        .symbols
+        .iter()
+        .filter_map(|sym| {
+            let doc = slice(source, sym.doc_start_byte, sym.start_byte).trim();
+            if doc.len() < MIN_DOC_CHARS {
+                return None;
+            }
+            let header = context_header(path, sym.parent.as_deref(), &sym.name);
+            // The signature travels with the prose: it is what ties "what
+            // happens when the lock is held" to the function that does it.
+            let signature = slice(source, sym.start_byte, sym.end_byte)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_end();
+            Some(Chunk::new(
+                format!("{header}\n{doc}\n{signature}"),
+                "doc",
+                &sym.name,
+                &sym.kind,
+                sym.doc_start_line,
+                sym.start_line,
+                header,
+            ))
+        })
+        .collect()
 }
 
 struct PendingSmall {
@@ -324,6 +375,40 @@ mod tests {
         let mut many = pending(7);
         flush_small(&mut chunks, &mut many, &mut tokens);
         assert_eq!(chunks[0].symbol_name, "f1, f2, f3, f4 +3");
+    }
+
+    /// Behaviour lives in prose, not in identifiers: the code that answers
+    /// "what happens when the lock is held" says `pid_alive`, and the sentence
+    /// above it is the only place the answer is written in words.
+    #[test]
+    fn a_documented_symbol_gets_a_chunk_for_its_prose() {
+        let src = "\
+/// Waits for the process holding the lock to exit, so the next command does
+/// not open a database another process still owns.
+fn wait_for_exit(pid: u32) -> bool { true }
+";
+        let parsed = devctx_parse::parse(devctx_parse::Lang::Rust, src).unwrap();
+        let chunks = chunk_file("remote.rs", src, &parsed, &ChunkConfig::default());
+        let doc = chunks
+            .iter()
+            .find(|c| c.level == "doc")
+            .expect("a documented symbol produces a doc chunk");
+        assert!(doc.text.contains("another process still owns"));
+        assert!(
+            doc.text.contains("fn wait_for_exit"),
+            "the signature ties the prose to the code"
+        );
+        assert_eq!(doc.symbol_name, "wait_for_exit");
+    }
+
+    /// A doc comment that only restates the name is noise: it adds a chunk that
+    /// competes with the code while saying nothing the code does not.
+    #[test]
+    fn a_doc_that_restates_the_name_is_not_worth_a_chunk() {
+        let src = "/// The name.\nfn name() {}\n";
+        let parsed = devctx_parse::parse(devctx_parse::Lang::Rust, src).unwrap();
+        let chunks = chunk_file("a.rs", src, &parsed, &ChunkConfig::default());
+        assert!(!chunks.iter().any(|c| c.level == "doc"));
     }
 
     #[test]

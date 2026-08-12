@@ -11,8 +11,9 @@ use devctx_embed::EmbeddingProvider;
 use devctx_rerank::Reranker;
 use devctx_store::Store;
 
-/// Candidate pool fetched from each retriever before fusion/rerank.
+/// Candidate pool fetched from each retriever when the retriever order is final.
 const POOL: usize = 20;
+
 /// RRF constant (standard default).
 const RRF_K: f32 = 60.0;
 
@@ -60,7 +61,14 @@ pub fn search(
     embedder: Option<&dyn EmbeddingProvider>,
     reranker: Option<&dyn Reranker>,
 ) -> Result<Vec<SearchResult>> {
-    let pool = limit.max(POOL);
+    // A reranker asks for the pool it can afford; everything else takes the
+    // shallow one, since without reordering a deeper fetch is thrown away.
+    //
+    // The pool is the ceiling on everything reranking could ever fix — it
+    // reorders what it is handed and nothing else. Measured here, the chunk
+    // answering a behaviour question sits at rank 27–52, so a pool of 20 meant
+    // no model, however good, was ever shown it.
+    let pool = limit.max(reranker.map_or(POOL, |r| r.pool().max(POOL)));
     let candidates = match mode {
         SearchMode::Keyword => store.keyword_search(query, filter, pool)?,
         SearchMode::Vector => {
@@ -206,6 +214,66 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    /// Counts what it was handed, and promotes the last candidate — standing in
+    /// for a cross-encoder that finds the answer deep in the pool.
+    struct Recording(std::sync::Mutex<usize>);
+    impl devctx_rerank::Reranker for Recording {
+        fn rerank(
+            &self,
+            _query: &str,
+            candidates: &[String],
+            top_k: usize,
+        ) -> devctx_rerank::Result<Vec<devctx_rerank::Ranked>> {
+            *self.0.lock().unwrap() = candidates.len();
+            Ok((0..candidates.len())
+                .rev()
+                .take(top_k)
+                .map(|index| devctx_rerank::Ranked { index, score: 1.0 })
+                .collect())
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn pool(&self) -> usize {
+            100
+        }
+    }
+
+    /// A cross-encoder can only reorder what it is given, so the pool is the
+    /// ceiling on everything it could ever fix. Handing it `limit` candidates
+    /// made reranking structurally unable to help: the chunk that answers a
+    /// behaviour question sits well past the first twenty, and no model can
+    /// promote what it was never shown.
+    #[test]
+    fn the_reranker_is_given_a_pool_deeper_than_the_limit() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let points: Vec<VectorPoint> = (0..60)
+            .map(|i| point(&format!("p{i}"), "database pool", [0.0, 1.0, 0.0, 0.0]))
+            .collect();
+        store.upsert(&points).unwrap();
+
+        let seen = Recording(std::sync::Mutex::new(0));
+        let hits = search(
+            &store,
+            "database",
+            &SearchFilter::default(),
+            5,
+            SearchMode::Vector,
+            Some(&KwEmbedder),
+            Some(&seen),
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 5, "still returns what was asked for");
+        let n = *seen.0.lock().unwrap();
+        assert!(
+            n > POOL,
+            "the reranker saw {n} candidates, no deeper than the un-reranked pool"
+        );
+        assert_eq!(n, 60, "every stored chunk fits inside the rerank pool here");
     }
 
     #[test]

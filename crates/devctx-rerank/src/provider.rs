@@ -19,6 +19,16 @@ pub trait Reranker: Send + Sync {
 
     /// Human-readable model identifier.
     fn name(&self) -> &str;
+
+    /// How many candidates this reranker should be shown.
+    ///
+    /// The pool is the ceiling on everything reranking could fix — it reorders
+    /// what it is handed and nothing else — and simultaneously the whole of its
+    /// cost. A reranker that reorders nothing wants no pool at all, which is
+    /// why the no-op answers zero.
+    fn pool(&self) -> usize {
+        0
+    }
 }
 
 /// A reranker that preserves the input order (used when reranking is disabled or
