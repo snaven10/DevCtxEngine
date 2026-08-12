@@ -125,7 +125,10 @@ mod tests {
         assert_eq!(cfg.memory.model, "minilm-l6");
         assert_eq!(cfg.memory_dimension(), 384);
         assert_eq!(cfg.defaults.embeddings.provider, "local");
-        assert!(cfg.defaults.reranking.enabled);
+        // Reranking is opt-in: a cross-encoder pass costs seconds and gigabytes
+        // to reorder a list the retriever already ranked well. See
+        // `devctx_core::config::Reranking::enabled` for the measurements.
+        assert!(!cfg.defaults.reranking.enabled);
     }
 
     #[test]

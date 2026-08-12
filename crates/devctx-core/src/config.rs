@@ -122,7 +122,18 @@ pub struct Indexing {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reranking {
     /// Whether to rerank search results with a cross-encoder.
-    #[serde(default = "default_true")]
+    ///
+    /// Off by default, on measurement rather than principle. On this repository
+    /// a search costs 30 ms and 406 MB resident; the cheapest cross-encoder
+    /// takes it to 8.6 s and 2.4 GB, and `bge-reranker-base` to 30 s and
+    /// 3.4 GB. What that buys is reordering a list the retriever already had
+    /// right — and the one model measured across the whole bench made it worse,
+    /// demoting an answer from first place to twenty-first.
+    ///
+    /// Turn it on when ordering matters more than latency and the machine has
+    /// the memory to spare. Everything the retrieval stage returns is available
+    /// either way.
+    #[serde(default = "default_rerank_enabled")]
     pub enabled: bool,
     /// Reranker model key (`bge-base` default, `bge-v2-m3` multilingual,
     /// `jina-turbo` fastest of the built-ins), or `custom` to load your own
@@ -154,7 +165,7 @@ pub struct Reranking {
 impl Default for Reranking {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: default_rerank_enabled(),
             model: default_reranker(),
             model_dir: String::new(),
             pool: default_rerank_pool(),
@@ -164,6 +175,11 @@ impl Default for Reranking {
 
 fn default_true() -> bool {
     true
+}
+
+/// Reranking is opt-in: see [`Reranking::enabled`].
+fn default_rerank_enabled() -> bool {
+    false
 }
 
 /// Candidates shown to the cross-encoder by default.
