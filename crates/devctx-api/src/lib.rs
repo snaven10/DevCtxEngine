@@ -72,27 +72,58 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let state = Arc::new(AppState::build(cfg)?);
     let activity = Arc::new(Mutex::new(Instant::now()));
-    let app =
-        router(Api { state, token }).layer(middleware::from_fn_with_state(activity.clone(), track));
+    let app = router(Api {
+        state: state.clone(),
+        token,
+    })
+    .layer(middleware::from_fn_with_state(activity.clone(), track));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("DevCtxEngine API listening on http://{addr}");
 
     if let Some(timeout) = idle {
         let act = activity.clone();
+        let closing = state.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 let idle_for = act.lock().map(|t| t.elapsed()).unwrap_or_default();
                 if idle_for >= timeout {
                     eprintln!("DevCtxEngine server idle for {idle_for:?}; shutting down.");
+                    // `exit` runs no destructors, so the database would keep a
+                    // write-ahead log no process is ever going to fold in.
+                    closing.checkpoint();
                     std::process::exit(0);
                 }
             }
         });
     }
 
-    axum::serve(listener, app).await?;
+    // `devctx serve --stop` sends a plain TERM, whose default action is just as
+    // abrupt as `exit`. Catching it buys the one thing that matters: a
+    // checkpoint before the connection disappears.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = terminate().await;
+            eprintln!("DevCtxEngine server terminating; checkpointing.");
+        })
+        .await?;
+    state.checkpoint();
     Ok(())
+}
+
+/// Resolves when the process is asked to stop (SIGTERM, or Ctrl-C).
+async fn terminate() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 /// Middleware: record the time of the last non-health request (for idle-shutdown).

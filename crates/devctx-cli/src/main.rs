@@ -58,6 +58,8 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Repair an index left inconsistent by an unclean shutdown.
+    Repair,
     /// Semantic search across the indexed code.
     Search {
         /// The search query.
@@ -345,6 +347,7 @@ fn main() -> Result<()> {
         Command::Init { path, name } => cmd_init(path, name),
         Command::Status => cmd_status(),
         Command::Index { full } => cmd_index(full),
+        Command::Repair => cmd_repair(),
         Command::Search {
             query,
             limit,
@@ -1700,6 +1703,48 @@ fn cmd_index(full: bool) -> Result<()> {
     }
     Ok(())
 }
+
+/// `devctx repair` — rebuild an index whose constraints no longer match its rows.
+///
+/// A server killed without closing its connection leaves a write-ahead log, and
+/// DuckDB's replay of one does not restore the ART index behind a `PRIMARY KEY`
+/// or `UNIQUE`. Everything still reads correctly; the first delete does not, and
+/// since indexing begins by deleting, the repository can no longer be reindexed.
+/// Rebuilding each table from its own rows puts the two back in agreement.
+fn cmd_repair() -> Result<()> {
+    let cfg = load_project()?;
+    let path = cfg.db_path();
+    if !path.exists() {
+        println!("Nothing to repair: no index at {}.", path.display());
+        return Ok(());
+    }
+    // The rebuild drops and recreates tables, so nothing else may hold the file.
+    if remote::reclaim_db(&cfg) {
+        println!("Stopped the server holding this index.");
+    }
+    // Any dimension opens an existing database — the schema is only created when
+    // absent — and the rebuild reads the real width off the stored column.
+    let store = open_store(&cfg, DEFAULT_DIM)?;
+    let dim = store.stored_dimension()?;
+    println!("Repairing {}…", path.display());
+    let repaired = store.rebuild_indexes()?;
+    println!(
+        "  rebuilt {} table{} ({})",
+        repaired.len(),
+        if repaired.len() == 1 { "" } else { "s" },
+        repaired.join(", ")
+    );
+    match dim {
+        Some(d) => println!("  vector width preserved: {d}"),
+        None => println!("  no vectors table was present"),
+    }
+    println!("Run `devctx index` to confirm.");
+    Ok(())
+}
+
+/// Placeholder width for opening a database that already exists. The schema is
+/// created only when absent, so this never reaches disk in that case.
+const DEFAULT_DIM: usize = 768;
 
 /// `devctx search` — vector / keyword / hybrid search, then optional rerank.
 fn cmd_search(

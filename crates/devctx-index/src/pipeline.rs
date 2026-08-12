@@ -224,6 +224,11 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     if had_fts {
         req.store.rebuild_fts()?;
     }
+    // An indexing run is where the write-ahead log comes from, and a WAL that
+    // outlives its process leaves the ART indexes behind every PRIMARY KEY and
+    // UNIQUE missing entries — see `Store::checkpoint`. Fold it in now, while a
+    // connection is still open to do it.
+    req.store.checkpoint();
 
     Ok(result)
 }

@@ -314,6 +314,36 @@ mod tests {
         assert!(down.contains(&("c".to_string(), 2)));
     }
 
+    /// The repair path for a database whose ART indexes lost their entries to a
+    /// replayed write-ahead log: it has to put the rows back untouched, and the
+    /// constraints they came with have to work afterwards — a rebuild that
+    /// quietly dropped the `UNIQUE` would look like a success and corrupt the
+    /// graph on the next run.
+    #[test]
+    fn rebuilding_indexes_keeps_the_rows_and_the_constraints() {
+        let store = seeded();
+        let before = store.graph_edges("repo", "main", None, None, 0).unwrap();
+
+        let repaired = store.rebuild_indexes().unwrap();
+        assert!(
+            repaired.iter().any(|t| t == "graph_edges"),
+            "rebuilt: {repaired:?}"
+        );
+
+        let after = store.graph_edges("repo", "main", None, None, 0).unwrap();
+        assert_eq!(before, after, "the rows must survive untouched");
+
+        // Replacing a file's edges deletes and re-inserts: the operation that
+        // fails on a damaged index, and the reason repair exists.
+        store
+            .replace_file_edges("repo", "main", "a.rs", &[edge("a", "b", "a.rs", 9)])
+            .unwrap();
+        let a_edges = store
+            .graph_edges("repo", "main", None, Some("a.rs"), 0)
+            .unwrap();
+        assert_eq!(a_edges.len(), 1, "the delete half took effect");
+    }
+
     #[test]
     fn graph_edges_bulk_export_and_filters() {
         let store = seeded();

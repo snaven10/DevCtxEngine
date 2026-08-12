@@ -190,6 +190,75 @@ impl Store {
         Ok(())
     }
 
+    /// Fold the write-ahead log into the database file.
+    ///
+    /// DuckDB replays the WAL when it opens a database, but a replayed append
+    /// does not restore the entries of an ART index — the structure behind every
+    /// `PRIMARY KEY` and `UNIQUE` in our schema. The table then holds rows the
+    /// index has never heard of, and the next `DELETE` touching them aborts with
+    /// *"Failed to delete all rows from index"* and takes the whole connection
+    /// down with it, permanently: reindexing cannot fix it, because reindexing
+    /// begins by deleting.
+    ///
+    /// So the WAL must not outlive the process that wrote it. Every path that
+    /// ends the server checkpoints first, and so does the end of an indexing
+    /// run, which is where nearly all of the WAL comes from.
+    ///
+    /// Best-effort: a checkpoint can legitimately fail while another connection
+    /// has an open transaction, and that is not worth failing a run over.
+    pub fn checkpoint(&self) {
+        let _ = self.conn.execute_batch("CHECKPOINT;");
+    }
+
+    /// Rebuild every table, restoring index structures from the rows themselves.
+    ///
+    /// The repair for the damage [`checkpoint`](Self::checkpoint) prevents: copy
+    /// each table aside, drop it, recreate it from the schema, and write the rows
+    /// back. Recreating the table builds its ART index from the data, so index
+    /// and table agree again.
+    ///
+    /// Needs exclusive access — stop any server on this database first.
+    pub fn rebuild_indexes(&self) -> Result<Vec<String>> {
+        // Both derived indexes are dropped rather than carried across: `vectors`
+        // is about to be recreated underneath them, and each is rebuilt on demand
+        // by the next indexing run.
+        self.drop_fts()?;
+        self.drop_hnsw()?;
+        // Read the width off the stored column, not from whatever this process
+        // was configured with: a repair must not quietly change the schema.
+        let dim = self.stored_dimension()?.unwrap_or(self.dim);
+        let mut repaired = Vec::new();
+        for table in self.table_names()? {
+            let tmp = format!("devctx_repair_{table}");
+            self.conn
+                .execute_batch(&format!("DROP TABLE IF EXISTS {tmp};"))?;
+            self.conn.execute_batch(&format!(
+                "CREATE TABLE {tmp} AS SELECT * FROM {table};
+                 DROP TABLE {table};"
+            ))?;
+            schema::init_schema(&self.conn, dim)?;
+            self.conn.execute_batch(&format!(
+                "INSERT INTO {table} SELECT * FROM {tmp};
+                 DROP TABLE {tmp};"
+            ))?;
+            repaired.push(table);
+        }
+        self.checkpoint();
+        Ok(repaired)
+    }
+
+    /// The store's own tables, in catalog order.
+    fn table_names(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT table_name FROM information_schema.tables
+             WHERE table_schema = 'main' AND table_type = 'BASE TABLE'
+               AND table_name NOT LIKE 'devctx_repair_%'
+             ORDER BY table_name",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
     /// BM25 keyword search over chunk text, with the same equality filters as
     /// [`search`](Self::search). Requires a prior [`rebuild_fts`](Self::rebuild_fts).
     /// Scores are BM25 relevance (higher is better), not cosine similarity.

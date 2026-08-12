@@ -93,6 +93,16 @@ impl AppState {
         Ok(r)
     }
 
+    /// Fold the write-ahead log into the database file before the process goes
+    /// away. A WAL that outlives its writer leaves the ART indexes behind every
+    /// `PRIMARY KEY` and `UNIQUE` missing entries, and the next delete then
+    /// fails for good — see [`Store::checkpoint`].
+    pub fn checkpoint(&self) {
+        if let Ok(store) = self.primary.lock() {
+            store.checkpoint();
+        }
+    }
+
     fn open_store(&self) -> Result<Store, String> {
         // Hand out a fresh connection to the same in-process database; the mutex
         // is held only for the cheap clone, not for the query.
