@@ -112,9 +112,31 @@ pub fn chunk_raw_text(path: &str, content: &str, cfg: &ChunkConfig) -> Vec<Chunk
             end as u32,
             String::new(),
         ));
-        i = end;
+        if end >= lines.len() {
+            break;
+        }
+        // Step back a little, so a paragraph that straddles the cut survives
+        // whole on one side of it. `max(i + 1)` is what guarantees the loop
+        // still advances when the overlap is as large as the block.
+        i = end.saturating_sub(overlap_lines(target)).max(i + 1);
     }
     out
+}
+
+/// How far each raw-text block reaches back into the one before it.
+///
+/// Code is cut where the language says a symbol ends, so its boundaries carry
+/// meaning and losing nothing across them is free. Prose is cut at whatever
+/// blank line falls near the target size, which is an arbitrary place: a
+/// sentence explaining a decision can begin in one block and finish in the
+/// next, leaving neither able to answer the question it addresses. Repeating a
+/// few lines on each side is the standard remedy.
+///
+/// It is not free. Every overlapped line is indexed twice, and a larger index
+/// means more chunks competing for the same top-20 — which is measurable here,
+/// so this stays small enough to rescue a paragraph and no larger.
+fn overlap_lines(target: usize) -> usize {
+    (target / 8).clamp(1, 6)
 }
 
 /// Shortest doc comment worth its own chunk, in characters. `/// The name.`
@@ -409,6 +431,36 @@ fn wait_for_exit(pid: u32) -> bool { true }
         let parsed = devctx_parse::parse(devctx_parse::Lang::Rust, src).unwrap();
         let chunks = chunk_file("a.rs", src, &parsed, &ChunkConfig::default());
         assert!(!chunks.iter().any(|c| c.level == "doc"));
+    }
+
+    /// Prose is cut at an arbitrary place, so a sentence can begin in one block
+    /// and end in the next. Overlapping the cut keeps it whole on one side.
+    #[test]
+    fn raw_text_blocks_overlap_their_neighbour() {
+        let cfg = ChunkConfig::default();
+        // Long enough to split, with no blank lines to snap to.
+        let content: String = (1..=400)
+            .map(|i| format!("line {i} of a document that has to be split somewhere\n"))
+            .collect();
+        let chunks = chunk_raw_text("guide.md", &content, &cfg);
+        assert!(chunks.len() > 1, "the fixture must actually split");
+
+        for pair in chunks.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            assert!(
+                b.start_line <= a.end_line,
+                "block {} starts after {} ends",
+                b.start_line,
+                a.end_line
+            );
+            assert!(b.start_line > a.start_line, "each block must advance");
+        }
+        let last = chunks.last().unwrap();
+        assert_eq!(
+            last.end_line as usize,
+            content.lines().count(),
+            "the tail is covered"
+        );
     }
 
     #[test]
