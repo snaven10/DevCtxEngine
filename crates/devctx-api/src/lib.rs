@@ -61,6 +61,22 @@ fn router(api: Api) -> Router {
         .with_state(api)
 }
 
+/// How long a loaded model may go unused before it is dropped, when
+/// `DEVCTX_MODEL_IDLE_SECS` says nothing. Comfortably shorter than the usual
+/// idle-shutdown window, so a server that is only waiting around stops paying
+/// for models it is not using.
+const DEFAULT_MODEL_IDLE_SECS: u64 = 300;
+
+/// How long an unused model is kept. `DEVCTX_MODEL_IDLE_SECS=0` keeps models
+/// for the life of the process, which is what this used to do unconditionally.
+fn model_idle() -> Option<Duration> {
+    let secs: u64 = std::env::var("DEVCTX_MODEL_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MODEL_IDLE_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 /// Serve the API until the process is stopped. When `idle` is `Some`, the
 /// process exits after that long with no non-health request — used by
 /// auto-spawned servers so they don't linger forever.
@@ -104,6 +120,30 @@ pub async fn serve(
                     // write-ahead log no process is ever going to fold in.
                     closing.checkpoint();
                     std::process::exit(0);
+                }
+            }
+        });
+    }
+
+    // Staying warm for the next command is the point of the server; holding a
+    // cross-encoder the whole time is not. See `AppState::release_idle_models`.
+    if let Some(max_idle) = model_idle() {
+        let sweeping = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let s = sweeping.clone();
+                // Dropping a model frees hundreds of megabytes and is not
+                // instant, so it does not belong on an async worker thread.
+                let released = tokio::task::spawn_blocking(move || s.release_idle_models(max_idle))
+                    .await
+                    .unwrap_or_default();
+                if !released.is_empty() {
+                    eprintln!(
+                        "Released the {} after {}s unused.",
+                        released.join(" and the "),
+                        max_idle.as_secs()
+                    );
                 }
             }
         });

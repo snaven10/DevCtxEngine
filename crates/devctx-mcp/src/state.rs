@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult};
@@ -19,6 +20,25 @@ use devctx_search::SearchMode;
 use devctx_store::Store;
 use devctx_summarize::{create_summarizer, SummarizeSettings};
 use serde_json::{json, Value};
+
+/// A model held in memory, with the last time it was handed to a caller.
+///
+/// Loading one costs seconds; holding one costs hundreds of megabytes for as
+/// long as the process lives. The timestamp is what lets
+/// [`AppState::release_idle_models`] tell a model still in the working set from
+/// one nobody has asked for since.
+struct Cached<T> {
+    value: T,
+    last_used: Instant,
+}
+
+impl<T: Clone> Cached<T> {
+    /// Hand out the value and record that it was wanted.
+    fn touch(&mut self) -> T {
+        self.last_used = Instant::now();
+        self.value.clone()
+    }
+}
 
 /// Server state shared across tool calls. Models are loaded on first use.
 pub struct AppState {
@@ -32,10 +52,12 @@ pub struct AppState {
     embed_settings: EmbedSettings,
     rerank_settings: RerankSettings,
     rerank_enabled: bool,
-    /// Built on first use (see [`AppState::embedder`]).
-    embedder: Mutex<Option<Arc<dyn EmbeddingProvider>>>,
-    /// Built on first use (see [`AppState::reranker`]).
-    reranker: Mutex<Option<Arc<dyn Reranker>>>,
+    /// Built on first use (see [`AppState::embedder`]), dropped again when it
+    /// goes unused (see [`AppState::release_idle_models`]).
+    embedder: Mutex<Option<Cached<Arc<dyn EmbeddingProvider>>>>,
+    /// Built on first use (see [`AppState::reranker`]), dropped again when it
+    /// goes unused.
+    reranker: Mutex<Option<Cached<Arc<dyn Reranker>>>>,
 }
 
 impl AppState {
@@ -73,25 +95,63 @@ impl AppState {
     /// The embedding provider, built (and cached) on first use.
     fn embedder(&self) -> Result<Arc<dyn EmbeddingProvider>, String> {
         let mut guard = self.embedder.lock().map_err(|e| e.to_string())?;
-        if let Some(e) = guard.as_ref() {
-            return Ok(e.clone());
+        if let Some(c) = guard.as_mut() {
+            return Ok(c.touch());
         }
         let e: Arc<dyn EmbeddingProvider> =
             Arc::from(create_provider(&self.embed_settings).map_err(|e| e.to_string())?);
-        *guard = Some(e.clone());
+        *guard = Some(Cached {
+            value: e.clone(),
+            last_used: Instant::now(),
+        });
         Ok(e)
     }
 
     /// The reranker, built (and cached) on first use. Only called when enabled.
     fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
         let mut guard = self.reranker.lock().map_err(|e| e.to_string())?;
-        if let Some(r) = guard.as_ref() {
-            return Ok(r.clone());
+        if let Some(c) = guard.as_mut() {
+            return Ok(c.touch());
         }
         let r: Arc<dyn Reranker> =
             Arc::from(create_reranker(&self.rerank_settings).map_err(|e| e.to_string())?);
-        *guard = Some(r.clone());
+        *guard = Some(Cached {
+            value: r.clone(),
+            last_used: Instant::now(),
+        });
         Ok(r)
+    }
+
+    /// Drop any model that has not been asked for in `max_idle`, and name what
+    /// went. Returns empty when there was nothing to release.
+    ///
+    /// A server stays up for its whole idle window so the next command finds it
+    /// warm, but "warm" need not mean holding a cross-encoder the whole time.
+    /// One server per project path means several coexist, and each was keeping
+    /// its models for the life of the process: an embedder is hundreds of
+    /// megabytes and a cross-encoder gigabytes, so a few projects touched in the
+    /// same quarter of an hour added up to more memory than the machine had.
+    /// Empty, a server costs about fifty megabytes.
+    ///
+    /// The cost of getting it wrong is one reload — seconds on the next request
+    /// — so this errs towards releasing. A model handed out and still in use is
+    /// safe regardless: the caller holds an `Arc`, and dropping this one only
+    /// means the *next* caller builds a fresh one.
+    pub fn release_idle_models(&self, max_idle: Duration) -> Vec<&'static str> {
+        let mut released = Vec::new();
+        if let Ok(mut guard) = self.embedder.lock() {
+            if guard.as_ref().is_some_and(|c| c.last_used.elapsed() >= max_idle) {
+                *guard = None;
+                released.push("embedding model");
+            }
+        }
+        if let Ok(mut guard) = self.reranker.lock() {
+            if guard.as_ref().is_some_and(|c| c.last_used.elapsed() >= max_idle) {
+                *guard = None;
+                released.push("reranker");
+            }
+        }
+        released
     }
 
     /// Fold the write-ahead log into the database file before the process goes
@@ -951,6 +1011,29 @@ fn slice_lines(content: &str, start: Option<usize>, end: Option<usize>) -> Strin
 mod tests {
     use super::*;
     use devctx_core::{VectorMetadata, VectorPoint};
+
+    /// The timestamp is the whole mechanism behind
+    /// [`AppState::release_idle_models`]: a model handed out again has to look
+    /// fresh, or the sweep would drop one that is in active use and make every
+    /// other request pay to reload it.
+    #[test]
+    fn handing_out_a_cached_model_resets_its_clock() {
+        let mut cached = Cached {
+            value: Arc::new(7u32),
+            last_used: Instant::now()
+                .checked_sub(Duration::from_secs(600))
+                .expect("an instant ten minutes ago"),
+        };
+        assert!(cached.last_used.elapsed() >= Duration::from_secs(600));
+
+        let handed_out = cached.touch();
+
+        assert_eq!(*handed_out, 7, "the caller still gets the model");
+        assert!(
+            cached.last_used.elapsed() < Duration::from_secs(1),
+            "and it no longer looks idle"
+        );
+    }
 
     #[test]
     fn slice_lines_ranges() {
