@@ -516,7 +516,7 @@ mod tests {
         );
         write(
             &dir,
-            "vendor/dep/mod.rs",
+            "legacy/dep/mod.rs",
             "pub fn vendored() -> i32 { 3 }\n",
         );
         write(&dir, "docs/notes.md", "# Notes\n\nsome prose\n");
@@ -525,7 +525,7 @@ mod tests {
         // A directory rule covers everything beneath it; a `*` rule matches at
         // any depth. Both are gitignore semantics, not literal globs.
         let exclude = vec![
-            "vendor/".to_string(),
+            "legacy/".to_string(),
             "*.generated.rs".to_string(),
             "docs/notes.md".to_string(),
         ];
@@ -553,7 +553,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init", "-q"]);
         write(&dir, "src/lib.rs", "pub fn kept() -> i32 { 1 }\n");
-        write(&dir, "vendor/dep.rs", "pub fn vendored() -> i32 { 2 }\n");
+        write(&dir, "legacy/dep.rs", "pub fn vendored() -> i32 { 2 }\n");
         commit_all(&dir, "initial");
 
         let store = Store::open_in_memory(DIM).unwrap();
@@ -568,7 +568,7 @@ mod tests {
             model_name: "minilm-l6",
             progress: None,
             paths: None,
-            exclude: &["vendor/".to_string()],
+            exclude: &["legacy/".to_string()],
         })
         .unwrap();
         assert_eq!(res.files_pruned, 1);

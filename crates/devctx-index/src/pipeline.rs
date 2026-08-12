@@ -262,6 +262,51 @@ fn build_exclude(patterns: &[String]) -> Gitignore {
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
+/// Directories whose contents are somebody else's code, checked in for
+/// convenience. Nobody asks a question whose answer is in `node_modules`.
+const VENDOR_DIRS: &[&str] = &[
+    "node_modules",
+    "vendor",
+    "third_party",
+    "dist",
+    "bower_components",
+];
+
+/// A minified line is longer than any line a person writes. 1,000 characters is
+/// far past the widest hand-written line and far below a bundle's single line,
+/// so the threshold does not need to be delicate.
+const MINIFIED_LINE: usize = 1_000;
+
+/// Is this a file a machine wrote?
+///
+/// Vendored bundles and generated data are the loudest possible noise in a
+/// semantic index: they are enormous, so they produce many chunks, and their
+/// content resembles nothing, so it sits at a middling distance from every
+/// query and crowds the top of the results for all of them. One 900 KB
+/// `cytoscape.min.js` in this repository produced 43 chunks — more than
+/// `state.rs` — and surfaced above the file a question was actually about.
+///
+/// Detection is by shape rather than by name: `*.min.js` is the convention, but
+/// a single 200,000-character line is the fact, and it catches generated JSON,
+/// bundled CSS and vendored blobs that follow no naming convention at all.
+fn is_generated(path: &Path, content: &str) -> bool {
+    if path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .any(|c| VENDOR_DIRS.contains(&c))
+    {
+        return true;
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if name.contains(".min.") || name.contains(".bundle.") || name.ends_with("-lock.json") {
+        return true;
+    }
+    content.lines().any(|l| l.len() > MINIFIED_LINE)
+}
+
 fn is_own_artifact(path: &Path) -> bool {
     path.components()
         .next()
@@ -330,6 +375,10 @@ impl Ctx<'_> {
             result.files_skipped += 1;
             return Ok(());
         };
+        if is_generated(path, &content) {
+            result.files_skipped += 1;
+            return Ok(());
+        }
         let hash = content_hash(&content);
 
         if !self.full_reindex {
@@ -478,4 +527,51 @@ fn now_stamp() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A vendored bundle is the loudest noise a semantic index can hold: huge,
+    /// so it produces many chunks, and resembling nothing, so it sits at a
+    /// middling distance from every query and crowds all of them.
+    #[test]
+    fn machine_written_files_are_recognised() {
+        let long = "a".repeat(MINIFIED_LINE + 1);
+        assert!(is_generated(Path::new("assets/cytoscape.min.js"), "x"));
+        assert!(is_generated(Path::new("web/app.bundle.js"), "x"));
+        assert!(is_generated(
+            Path::new("node_modules/left-pad/index.js"),
+            "x"
+        ));
+        assert!(is_generated(Path::new("package-lock.json"), "x"));
+        assert!(
+            is_generated(Path::new("src/data.json"), &long),
+            "one impossible line is enough, whatever the name"
+        );
+    }
+
+    /// The shape test must not catch code people wrote. A long-ish line, a
+    /// minified-sounding word in a path, a file that merely lives near assets —
+    /// none of those are machine output.
+    #[test]
+    fn hand_written_files_are_left_alone() {
+        assert!(!is_generated(
+            Path::new("crates/devctx-index/src/pipeline.rs"),
+            "fn main() {}\n"
+        ));
+        assert!(!is_generated(
+            Path::new("src/minify.js"),
+            "export function minify() {}\n"
+        ));
+        assert!(!is_generated(Path::new("docs/vendors.md"), "# Vendors\n"));
+        assert!(
+            !is_generated(
+                Path::new("src/wide.rs"),
+                &format!("// {}\n", "x".repeat(300))
+            ),
+            "a wide line is still a line someone typed"
+        );
+    }
 }
