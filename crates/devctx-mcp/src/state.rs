@@ -13,13 +13,65 @@ use std::time::{Duration, Instant};
 use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
-use devctx_index::{run as index_run, GitRepo, IndexRequest};
+use devctx_index::{run as index_run, GitRepo, IndexRequest, ProgressSink};
 use devctx_memory::{memory_context, memory_stats, recall, remember, RecallQuery, RememberRequest};
 use devctx_rerank::{create_reranker, RerankSettings, Reranker};
 use devctx_search::SearchMode;
 use devctx_store::Store;
 use devctx_summarize::{create_summarizer, SummarizeSettings};
 use serde_json::{json, Value};
+
+/// How far an indexing run has got, for anyone who asks while it runs.
+///
+/// The work happens inside the server, so the client that asked for it sees
+/// nothing until the whole run answers — minutes, on a large repository, that
+/// look exactly like a hang. This is what a caller polls to tell the two apart.
+#[derive(Clone, Default)]
+pub struct IndexProgress {
+    /// Whether a run is in flight right now.
+    pub running: bool,
+    /// Changes the run expects to process, known once it has diffed.
+    pub total: usize,
+    /// Changes it has started on. Started, not finished: the sink is called
+    /// before each file, so this counts what is under way.
+    pub done: usize,
+    /// The file it reached last.
+    pub file: String,
+}
+
+/// Writes an indexing run's progress where a request handler can read it.
+struct SharedProgress(Arc<Mutex<IndexProgress>>);
+
+impl SharedProgress {
+    /// A poisoned lock must never take an indexing run down with it: this is a
+    /// counter for a progress bar, not part of the work. Recover and carry on,
+    /// the same way [`AppState::checkpoint`] does.
+    fn lock(&self) -> std::sync::MutexGuard<'_, IndexProgress> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Mark the run finished, keeping the final counts for whoever polls last.
+    fn finish(&self) {
+        self.lock().running = false;
+    }
+}
+
+impl ProgressSink for SharedProgress {
+    fn start(&self, total: usize) {
+        let mut p = self.lock();
+        p.running = true;
+        p.total = total;
+        p.done = 0;
+        p.file.clear();
+    }
+
+    fn file(&self, path: &str) {
+        let mut p = self.lock();
+        p.done += 1;
+        p.file.clear();
+        p.file.push_str(path);
+    }
+}
 
 /// Hand freed pages back to the kernel after a model is dropped.
 ///
@@ -80,6 +132,8 @@ pub struct AppState {
     /// Built on first use (see [`AppState::reranker`]), dropped again when it
     /// goes unused.
     reranker: Mutex<Option<Cached<Arc<dyn Reranker>>>>,
+    /// How far the current indexing run has got, for `/index/progress`.
+    index_progress: Arc<Mutex<IndexProgress>>,
 }
 
 impl AppState {
@@ -111,6 +165,7 @@ impl AppState {
             rerank_enabled,
             embedder: Mutex::new(None),
             reranker: Mutex::new(None),
+            index_progress: Arc::new(Mutex::new(IndexProgress::default())),
         })
     }
 
@@ -330,17 +385,21 @@ fn do_index_inner(
 ) -> Result<String, String> {
     let store = state.open_store()?;
     let embedder = state.embedder()?;
-    let res = index_run(IndexRequest {
+    let sink = SharedProgress(state.index_progress.clone());
+    let run = index_run(IndexRequest {
         store: &store,
         embedder: embedder.as_ref(),
         repo_root: &state.root,
         incremental: !full,
         model_name: &state.cfg.embeddings.model,
-        progress: None,
+        progress: Some(&sink),
         paths,
         exclude: &state.cfg.indexing.exclude,
-    })
-    .map_err(|e| e.to_string())?;
+    });
+    // Before the `?`: a run that fails still has to stop reporting itself as
+    // running, or the next poller waits on something that is already over.
+    sink.finish();
+    let res = run.map_err(|e| e.to_string())?;
     report_index(&store, &state.root, &res);
     Ok(json!({
         "commit": res.commit,
@@ -353,6 +412,27 @@ fn do_index_inner(
         "files_renamed": res.files_renamed,
         "symbols": res.symbols,
         "chunks": res.chunks,
+    })
+    .to_string())
+}
+
+/// How far the indexing run in this server has got.
+///
+/// Deliberately cheap: it copies four fields under a short lock and touches no
+/// database. It is polled *while* an index is running, so anything heavier
+/// would queue behind the very work it reports on and arrive too late to be
+/// worth reporting.
+pub fn do_index_progress(state: &AppState) -> Result<String, String> {
+    let p = state
+        .index_progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    Ok(json!({
+        "running": p.running,
+        "total": p.total,
+        "done": p.done,
+        "file": p.file,
     })
     .to_string())
 }

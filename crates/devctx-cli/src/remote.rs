@@ -25,6 +25,19 @@ pub struct ServeInfo {
     pub pid: Option<u32>,
 }
 
+/// A snapshot of the indexing run happening inside the server.
+#[derive(Debug, Default, Deserialize)]
+pub struct IndexProgress {
+    /// Whether a run is in flight right now.
+    pub running: bool,
+    /// Changes the run expects to process.
+    pub total: usize,
+    /// Changes it has started on.
+    pub done: usize,
+    /// The file it reached last.
+    pub file: String,
+}
+
 /// Path of the discovery file (`serve.json`) next to the DB.
 pub fn serve_file(cfg: &ProjectConfig) -> PathBuf {
     let db = cfg.db_path();
@@ -54,6 +67,7 @@ pub fn remove_serve_file(cfg: &ProjectConfig) {
 }
 
 /// A reachable server we can route requests to.
+#[derive(Clone)]
 pub struct Remote {
     base: String,
     token: Option<String>,
@@ -272,6 +286,22 @@ impl Remote {
     /// Index an explicit path list (what the watcher sends).
     pub fn index_paths(&self, paths: &[String]) -> Result<String> {
         self.post("/index", serde_json::json!({ "paths": paths }))
+    }
+
+    /// How far the server's current indexing run has got.
+    ///
+    /// Builds its own short-timeout agent rather than reusing [`Self::agent`]:
+    /// that one waits an hour, which is right for the index request itself and
+    /// wrong for a poll behind a progress bar. A progress call that hangs
+    /// should give up quickly and let the bar fall back, not freeze with no
+    /// explanation.
+    pub fn index_progress(&self) -> Result<IndexProgress> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(2))
+            .build();
+        let req = self.auth(agent.get(&format!("{}/index/progress", self.base)));
+        let body = read(req.call())?;
+        serde_json::from_str(&body).context("parsing the server's index progress")
     }
 
     pub fn search(

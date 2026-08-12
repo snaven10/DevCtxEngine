@@ -16,7 +16,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_graph, do_impact, do_index, do_index_paths, do_index_status, do_list_projects,
+    do_graph, do_impact, do_index, do_index_paths, do_index_progress, do_index_status,
+    do_list_projects,
     do_memory_context, do_memory_stats, do_read_file, do_recall_scoped, do_references, do_remember,
     do_remember_global, do_routes_for_handler, do_search, do_search_routes, do_summarize,
     parse_mode, AppState,
@@ -44,6 +45,7 @@ fn router(api: Api) -> Router {
         .route("/health", get(health))
         .route("/search", post(search))
         .route("/index", post(index))
+        .route("/index/progress", get(index_progress))
         .route("/status", get(status))
         .route("/remember", post(remember))
         .route("/recall", post(recall))
@@ -381,6 +383,20 @@ async fn index(State(api): State<Api>, Json(b): Json<IndexBody>) -> Response {
         return run(api.state, move |s| do_index_paths(s, &paths)).await;
     }
     run(api.state, move |s| do_index(s, b.full.unwrap_or(false))).await
+}
+
+/// How far the current indexing run has got.
+///
+/// Deliberately **not** routed through [`run`]. That helper hands work to
+/// `spawn_blocking`, and the blocking pool is exactly where a long index is
+/// already sitting — a progress request queued behind it would answer only once
+/// the run it was reporting on had finished. Reading the counters takes a short
+/// lock and no database, so it belongs on the async executor.
+async fn index_progress(State(api): State<Api>) -> Response {
+    match do_index_progress(&api.state) {
+        Ok(body) => json_ok(body),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }
 
 async fn status(State(api): State<Api>) -> Response {

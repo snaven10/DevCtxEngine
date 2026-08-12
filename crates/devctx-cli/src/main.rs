@@ -1322,6 +1322,19 @@ impl IndexBar {
     }
 }
 
+impl IndexBar {
+    /// Place the bar at an absolute position, for a run being *observed*
+    /// rather than driven.
+    ///
+    /// [`ProgressSink::file`] advances by one because the local path calls it
+    /// once per file. A poller instead receives the server's running total, and
+    /// incrementing on each poll would count the same file once per tick.
+    fn set(&self, done: usize, file: &str) {
+        self.bar.set_position(done as u64);
+        self.bar.set_message(file.to_string());
+    }
+}
+
 impl ProgressSink for IndexBar {
     fn start(&self, total: usize) {
         self.bar.set_length(total as u64);
@@ -1522,33 +1535,80 @@ fn cmd_init(path: Option<PathBuf>, name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// A stderr ticker for work happening somewhere this process cannot observe.
-struct Heartbeat {
+/// Draws an indexing run that is happening inside the server.
+///
+/// The local path drives [`IndexBar`] straight from the pipeline. A routed
+/// index runs in another process, so there is nothing to drive it with: this
+/// polls `/index/progress` and places the bar at whatever the server reports.
+///
+/// Until the server has diffed there is no total to draw, and a server built
+/// before that endpoint existed never answers at all. Both cases fall back to
+/// the spinner and elapsed seconds that came before — because a progress bar
+/// must never be the reason an index fails or looks broken.
+struct ServerProgress {
     done: Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Heartbeat {
-    fn start(what: &str) -> Self {
+impl ServerProgress {
+    /// How long to wait between polls. Fast enough to feel live against a run
+    /// measured in minutes, slow enough to be free.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+    /// Consecutive failures after which we stop asking and just spin. Three
+    /// covers a request lost to a busy moment; a server without the endpoint
+    /// fails every time and settles here.
+    const GIVE_UP_AFTER: u32 = 3;
+
+    fn start(remote: remote::Remote, label: &str) -> Self {
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = done.clone();
-        let label = what.to_string();
+        let label = label.to_string();
         let handle = std::thread::spawn(move || {
             let start = std::time::Instant::now();
             let frames = ['|', '/', '-', '\\'];
-            let mut i = 0usize;
+            let (mut tick, mut failures) = (0usize, 0u32);
+            let mut bar: Option<IndexBar> = None;
+
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                eprint!(
-                    "\r{} {label}… {}s ",
-                    frames[i % frames.len()],
-                    start.elapsed().as_secs()
-                );
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-                i += 1;
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                if failures < Self::GIVE_UP_AFTER {
+                    match remote.index_progress() {
+                        // `running` matters as much as the count: when a run
+                        // ends its final totals stay behind for whoever polls
+                        // last, so a second index would otherwise draw the
+                        // previous run's finished bar until this one resets it.
+                        Ok(p) if p.running && p.total > 0 => {
+                            failures = 0;
+                            let b = bar.get_or_insert_with(|| {
+                                let b = IndexBar::new();
+                                b.start(p.total);
+                                b
+                            });
+                            b.set(p.done, &p.file);
+                        }
+                        // Reachable but not counting yet: still diffing.
+                        Ok(_) => failures = 0,
+                        Err(_) => failures += 1,
+                    }
+                }
+                if bar.is_none() {
+                    eprint!(
+                        "\r{} {label}… {}s ",
+                        frames[tick % frames.len()],
+                        start.elapsed().as_secs()
+                    );
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                tick += 1;
+                std::thread::sleep(Self::POLL);
             }
-            eprint!("\r{}\r", " ".repeat(label.len() + 24));
-            let _ = std::io::Write::flush(&mut std::io::stderr());
+
+            match bar {
+                Some(b) => b.finish(),
+                None => {
+                    eprint!("\r{}\r", " ".repeat(label.len() + 24));
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+            }
         });
         Self {
             done,
@@ -1659,10 +1719,11 @@ fn cmd_status() -> Result<()> {
 fn cmd_index(full: bool) -> Result<()> {
     let cfg = load_project()?;
     if let Some(r) = remote::ensure(&cfg) {
-        // The server does the work, so the local progress bar sees nothing. Show
-        // elapsed time instead: without it a large repository looks hung for
-        // minutes, which is indistinguishable from actually being hung.
-        let ticker = Heartbeat::start("indexing on the server");
+        // The server does the work, so nothing local can drive the bar. Poll it
+        // instead: elapsed seconds alone cannot tell a run that is nearly done
+        // from one that has barely started, and on a large repository both look
+        // exactly like a hang.
+        let ticker = ServerProgress::start(r.clone(), "indexing on the server");
         let out = r.index(full);
         ticker.stop();
         println!("{}", out?);
