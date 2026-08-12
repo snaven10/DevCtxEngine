@@ -82,6 +82,20 @@ fn read_tokenizer_files(dir: &Path) -> Result<TokenizerFiles> {
 /// Candidates shown to the cross-encoder unless configured otherwise.
 const DEFAULT_POOL: usize = 100;
 
+/// Candidates scored per forward pass.
+///
+/// fastembed defaults to 256, which puts a whole pool in one pass: the batch is
+/// padded to its longest member, so peak memory is `pool × 512 tokens` of
+/// activations through every layer. Measured here, a server reranking 100
+/// candidates with `bge-reranker-base` — XLM-RoBERTa, whose 250k-token
+/// vocabulary alone is most of a gigabyte — reached 5.7 GB resident and helped
+/// push a 15 GB machine into the OOM killer.
+///
+/// Batching trades a little speed for a bound on that. The text itself is not
+/// the problem: fastembed already truncates each candidate to the model's
+/// maximum length, so trimming it first would change nothing.
+const BATCH: usize = 16;
+
 pub struct LocalReranker {
     model: TextRerank,
     name: String,
@@ -151,7 +165,7 @@ impl Reranker for LocalReranker {
         let docs: Vec<&str> = candidates.iter().map(String::as_str).collect();
         let mut results = self
             .model
-            .rerank(query, docs, false, None)
+            .rerank(query, docs, false, Some(BATCH))
             .map_err(|e| RerankError::Backend(e.to_string()))?;
         results.sort_by(|a, b| {
             b.score
