@@ -23,6 +23,41 @@ const COLS: &str = r#"id, text, vector, repo, branch, "commit", file, symbol,
 /// and bound-parameter count while collapsing many single-row writes into few.
 const UPSERT_BATCH: usize = 256;
 
+/// DuckDB's own defaults assume it owns the machine: `memory_limit` is 80% of
+/// physical RAM and `threads` is one per core. DevCtxEngine does not own the
+/// machine — it runs one server per project path (see
+/// `devctx-cli::remote::auto_addr`), so several are alive at once, each
+/// entitled to 80% of the same box. Three of them on a 16 GB laptop is 38 GB of
+/// intent, and the kernel's OOM killer arrives long before DuckDB feels any
+/// pressure. Worse, that killer does not pick the greedy process: it picks
+/// whatever has the highest `oom_score`, which on a systemd session is the
+/// user's own desktop services, so the visible symptom is a dead panel and
+/// closed windows rather than a slow query.
+///
+/// A modest per-process budget costs a spill to disk on the largest queries and
+/// buys a machine that stays usable. Override with `DEVCTX_DB_MEMORY_LIMIT`
+/// (any DuckDB size literal, e.g. `8GB`) and `DEVCTX_DB_THREADS`.
+const DEFAULT_MEMORY_LIMIT: &str = "2GB";
+const DEFAULT_THREADS: usize = 4;
+
+/// Whether `v` is a DuckDB size literal (`512MB`, `2GB`, `1.5GiB`) and nothing
+/// else. The value reaches `SET` by interpolation, and DuckDB takes no bound
+/// parameter there; a size literal cannot carry a quote, so refusing everything
+/// that is not one keeps the statement safe by construction rather than by
+/// escaping.
+fn is_size_literal(v: &str) -> bool {
+    !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+}
+
+/// Read a `usize` from the environment, falling back to `default` when the
+/// variable is absent or does not parse.
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 /// A DuckDB-backed store. Holds one connection and the fixed vector dimension.
 pub struct Store {
     pub(crate) conn: Connection,
@@ -38,8 +73,9 @@ impl Store {
             }
         }
         let conn = Connection::open(path)?;
-        schema::init_schema(&conn, dim)?;
         let store = Self { conn, dim };
+        store.apply_resource_limits(); // before any query can allocate against the defaults
+        schema::init_schema(&store.conn, dim)?;
         store.load_extensions(); // best-effort, so existing HNSW/FTS indexes are usable
         Ok(store)
     }
@@ -47,8 +83,9 @@ impl Store {
     /// Open an in-memory store (for tests).
     pub fn open_in_memory(dim: usize) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        schema::init_schema(&conn, dim)?;
         let store = Self { conn, dim };
+        store.apply_resource_limits();
+        schema::init_schema(&store.conn, dim)?;
         store.load_extensions();
         Ok(store)
     }
@@ -100,6 +137,25 @@ impl Store {
         };
         store.load_extensions();
         Ok(store)
+    }
+
+    /// Cap what this database may take from the machine — see
+    /// [`DEFAULT_MEMORY_LIMIT`].
+    ///
+    /// Best-effort: a rejected setting leaves DuckDB on its own defaults, which
+    /// is no worse than never having asked. Called only where a database
+    /// instance is created; [`try_clone`](Self::try_clone) shares that instance
+    /// and inherits both settings, so it pays for no extra statements per
+    /// request.
+    fn apply_resource_limits(&self) {
+        let limit = std::env::var("DEVCTX_DB_MEMORY_LIMIT")
+            .ok()
+            .filter(|v| is_size_literal(v))
+            .unwrap_or_else(|| DEFAULT_MEMORY_LIMIT.to_string());
+        let threads = env_usize("DEVCTX_DB_THREADS", DEFAULT_THREADS).max(1);
+        let _ = self.conn.execute_batch(&format!(
+            "SET memory_limit = '{limit}'; SET threads = {threads};"
+        ));
     }
 
     /// Best-effort load of the optional DuckDB extensions (VSS for HNSW, FTS for
@@ -583,6 +639,48 @@ fn value_to_f32_vec(v: Value) -> Vec<f32> {
             _ => 0.0,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn size_literals_are_accepted_and_anything_quotable_is_not() {
+        assert!(is_size_literal("2GB"));
+        assert!(is_size_literal("512MB"));
+        assert!(is_size_literal("1.5GiB"));
+        assert!(!is_size_literal(""));
+        // The value is interpolated into `SET`, where DuckDB takes no bound
+        // parameter, so nothing that could close the quote may pass.
+        assert!(!is_size_literal("2GB'; DROP TABLE vectors; --"));
+        assert!(!is_size_literal("2 GB"));
+    }
+
+    #[test]
+    fn env_usize_falls_back_when_absent() {
+        assert_eq!(env_usize("DEVCTX_TEST_DEFINITELY_UNSET", 4), 4);
+    }
+
+    /// The whole point of [`Store::apply_resource_limits`]: a fresh store must
+    /// not inherit DuckDB's one-thread-per-core default, because several
+    /// servers run at once and none of them owns the machine.
+    #[test]
+    fn a_new_store_caps_its_own_thread_count() {
+        let store = Store::open_in_memory(8).expect("opening an in-memory store");
+        let threads: i64 = store
+            .conn
+            .query_row(
+                "SELECT value::BIGINT FROM duckdb_settings() WHERE name = 'threads'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("reading the thread count back");
+        // Derived the same way the setter derives it, so an operator running the
+        // suite with `DEVCTX_DB_THREADS` set does not see a spurious failure.
+        let expected = env_usize("DEVCTX_DB_THREADS", DEFAULT_THREADS).max(1) as i64;
+        assert_eq!(threads, expected);
+    }
 }
 
 #[cfg(test)]
