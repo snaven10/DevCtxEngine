@@ -893,27 +893,57 @@ fn open_browser(url: &str) {
 
 /// `devctx mcp` — run the MCP server over stdio.
 fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
-    let cfg = match project {
-        Some(root) => ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
-            .with_context(|| format!("loading project at {}", root.display()))?,
-        None => load_project()?,
+    // Registering this server globally is the normal thing to do, and it means
+    // the client launches it from whatever directory it happens to be in —
+    // usually the user's home, which is inside no repository at all. Refusing to
+    // start there would reach the user as a bare transport error, so instead the
+    // server comes up unbound and says which projects exist.
+    let cfg = match &project {
+        Some(root) => Some(
+            ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
+                .with_context(|| format!("loading project at {}", root.display()))?,
+        ),
+        None => load_project().ok(),
     };
-    // Route through a shared server (auto-spawned if needed) so many MCP
-    // sessions + web/TUI/CLI of the same project coexist without lock fights.
-    // Fall back to owning the DB locally only when no server is available.
+    let backend = match cfg {
+        Some(cfg) => Some(mcp_backend(cfg)?),
+        None => {
+            eprintln!(
+                "Starting DevCtxEngine MCP server (stdio, no project here); \
+                 use the use_project tool to bind one."
+            );
+            None
+        }
+    };
+    devctx_mcp::run_stdio(
+        backend,
+        std::sync::Arc::new(|root: &std::path::Path| {
+            let cfg = ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
+                .map_err(|e| format!("loading project at {}: {e}", root.display()))?;
+            mcp_backend(cfg).map_err(|e| e.to_string())
+        }),
+    )
+}
+
+/// A tool backend for one project.
+///
+/// Routes through a shared server (auto-spawned if needed) so many MCP sessions
+/// plus the web/CLI/TUI of the same project coexist without lock fights; owning
+/// the database here is the fallback when no server can be reached.
+fn mcp_backend(cfg: ProjectConfig) -> Result<devctx_mcp::Backend> {
     let server = match remote::ensure(&cfg) {
         Some(r) => {
             let (base, token) = r.into_parts();
-            eprintln!("Starting DevCtxEngine MCP server (stdio) → routing to {base}");
+            eprintln!("DevCtxEngine MCP → routing to {base}");
             Some(devctx_mcp::ServerConn { base, token })
         }
         None => {
             remote::reclaim_db(&cfg);
-            eprintln!("Starting DevCtxEngine MCP server (stdio, local DB)…");
+            eprintln!("DevCtxEngine MCP → local database");
             None
         }
     };
-    devctx_mcp::run_stdio(cfg, server)
+    devctx_mcp::backend_for(cfg, server)
 }
 
 /// `devctx mcp configure` — register DevCtxEngine as an MCP server in an AI client.

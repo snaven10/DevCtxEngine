@@ -493,6 +493,87 @@ fn central() -> Result<devctx_central::CentralClient, String> {
     })
 }
 
+/// The root directory of a registered project, given its name or its path.
+///
+/// Accepting either is deliberate: an agent that has just read `list_projects`
+/// has the name, and one repeating a path a human typed has the path. A bare
+/// name is looked up in the registry and never treated as a directory, because
+/// interpreting it as one would resolve it against this process's working
+/// directory — which for a globally-registered server is an accident of how the
+/// client was launched, and could bind a same-named directory that happens to
+/// sit there. Whatever comes back is absolute.
+pub fn resolve_project_root(name_or_path: &str) -> Result<PathBuf, String> {
+    let expanded = shellexpand(name_or_path);
+    let as_path = PathBuf::from(&expanded);
+    let looks_like_path =
+        as_path.is_absolute() || expanded.contains(std::path::MAIN_SEPARATOR) || expanded == ".";
+    if looks_like_path {
+        return absolute(&as_path);
+    }
+    let row = central()?
+        .show(name_or_path)
+        .map_err(|e| format!("{name_or_path}: {e}"))?;
+    let path = row
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("no path recorded for `{name_or_path}`"))?;
+    absolute(std::path::Path::new(path))
+}
+
+/// Resolve a project directory, insisting it holds a config and an absolute path.
+fn absolute(path: &std::path::Path) -> Result<PathBuf, String> {
+    let root = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !root.join(devctx_core::CONFIG_FILE_NAME).exists() {
+        return Err(format!(
+            "{} is not a DevCtxEngine project (no {})",
+            root.display(),
+            devctx_core::CONFIG_FILE_NAME
+        ));
+    }
+    Ok(root)
+}
+
+/// Expand a leading `~` — paths reach us as text an agent copied from a table.
+fn shellexpand(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => format!("{}/{rest}", home.to_string_lossy()),
+            None => path.to_string(),
+        },
+        None => path.to_string(),
+    }
+}
+
+/// What to tell an agent whose server was started outside any project.
+///
+/// This has to be a tool result, never a startup failure: a server that refuses
+/// to start reports itself to the client as a bare transport error, and a bare
+/// transport error is the one kind nobody can act on.
+pub fn unbound_help(cwd: &std::path::Path) -> String {
+    let listed = match central().and_then(|c| c.list(false).map_err(|e| e.to_string())) {
+        Ok(rows) if !rows.is_empty() => rows
+            .iter()
+            .filter_map(|r| {
+                let name = r.get("name")?.as_str()?;
+                let path = r.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                Some(format!("  · {name} — {path}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Ok(_) => "  (none registered yet — run `devctx init` in a repository)".to_string(),
+        Err(e) => format!("  (the registry could not be read: {e})"),
+    };
+    format!(
+        "This MCP server is not bound to a project: it was started in {}, which \
+         is not inside a DevCtxEngine repository.\n\nRegistered projects:\n{listed}\n\n\
+         Call `use_project` with one of those names to bind this session, or \
+         restart the server as `devctx mcp --project <path>`.",
+        cwd.display()
+    )
+}
+
 /// Search a *different* registered project.
 ///
 /// Federating here is the right call, unlike for memory recall: the caller has
@@ -643,6 +724,18 @@ pub fn do_recall_scoped(
 
     let fused = fuse_by_rank(vec![(local, "local"), (global, "global")], limit);
     serde_json::to_string_pretty(&json!({ "memories": fused })).map_err(|e| e.to_string())
+}
+
+/// Recall from the central store alone, for a session with no project bound.
+///
+/// Global memories are the ones written down precisely because they outlive the
+/// project that learned them, so they are worth reaching without one.
+pub fn do_recall_global(query: &str, limit: usize, repo: Option<&str>) -> Result<String, String> {
+    let global = central()?
+        .recall(query, limit, repo)
+        .map_err(|e| e.to_string())?;
+    let tagged = fuse_by_rank(vec![(global, "global")], limit);
+    serde_json::to_string_pretty(&json!({ "memories": tagged })).map_err(|e| e.to_string())
 }
 
 /// Fuse labelled result lists by rank, tagging each survivor with the scope it

@@ -7,7 +7,7 @@
 pub mod backend;
 pub mod state;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use devctx_core::config::ProjectConfig;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -132,6 +132,14 @@ struct ListProjectsReq {
     include_inactive: Option<bool>,
 }
 
+/// Parameters for the `use_project` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct UseProjectReq {
+    /// Project name (as reported by list_projects) or a path to its root.
+    project: String,
+}
+
 /// Parameters for the `impact_analysis` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -185,21 +193,53 @@ struct SummarizeReq {
     max_tokens: Option<usize>,
 }
 
-/// The DevCtxEngine MCP server. The backend is either a local DB owner or a
-/// client of a shared server.
+/// Builds a backend for a project root.
+///
+/// Supplied by the CLI, which owns the parts the MCP crate cannot see: finding
+/// or auto-spawning that project's shared server, its port and its token.
+pub type Connect = Arc<dyn Fn(&std::path::Path) -> Result<Backend, String> + Send + Sync>;
+
+/// The DevCtxEngine MCP server.
+///
+/// The backend is either a local DB owner or a client of a shared server — and
+/// it is optional, because a globally-registered server is launched from
+/// whatever directory the client happens to be in. Starting unbound and saying
+/// so through a tool beats dying during the handshake, which reaches the user
+/// as an unattributable transport error.
 #[derive(Clone)]
 pub struct DevctxServer {
-    backend: Arc<Backend>,
+    backend: Arc<Mutex<Option<Arc<Backend>>>>,
+    connect: Connect,
+    cwd: std::path::PathBuf,
     tool_router: ToolRouter<Self>,
 }
 
 impl DevctxServer {
-    /// Create a server over the given backend.
-    pub fn new(backend: Arc<Backend>) -> Self {
+    /// Create a server, bound to `backend` when one could be resolved at start.
+    pub fn new(backend: Option<Arc<Backend>>, connect: Connect) -> Self {
         Self {
-            backend,
+            backend: Arc::new(Mutex::new(backend)),
+            connect,
+            cwd: std::env::current_dir().unwrap_or_default(),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The bound backend, or an explanation of how to bind one.
+    fn bound(&self) -> Result<Arc<Backend>, ErrorData> {
+        match self.backend.lock().ok().and_then(|b| b.clone()) {
+            Some(b) => Ok(b),
+            None => Err(ErrorData::invalid_request(
+                state::unbound_help(&self.cwd),
+                None,
+            )),
+        }
+    }
+
+    /// The bound backend, if any — for the tools that read the registry rather
+    /// than a project, and so work perfectly well without one.
+    fn maybe_bound(&self) -> Option<Arc<Backend>> {
+        self.backend.lock().ok().and_then(|b| b.clone())
     }
 }
 
@@ -212,7 +252,7 @@ impl DevctxServer {
         chunks (file, lines, symbol, text) as JSON."
     )]
     async fn search(&self, Parameters(req): Parameters<SearchReq>) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || {
             backend.search(
                 &req.query,
@@ -232,7 +272,7 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ReadFileReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || backend.read_file(&req.path, req.start_line, req.end_line)).await
     }
 
@@ -240,7 +280,7 @@ impl DevctxServer {
     #[tool(description = "Index the repository: git diff -> parse -> chunk -> \
         embed -> store. Returns a summary.")]
     async fn index_repo(&self, Parameters(req): Parameters<IndexReq>) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || backend.index(req.full.unwrap_or(false))).await
     }
 
@@ -248,7 +288,7 @@ impl DevctxServer {
     #[tool(description = "Report the last-indexed commit/counts for the current \
         repo and branch, and whether the index is up to date.")]
     async fn index_status(&self) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || backend.index_status()).await
     }
 
@@ -263,7 +303,7 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<RememberReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || {
             backend.remember(
                 req.content,
@@ -283,7 +323,18 @@ impl DevctxServer {
         central store by default; each hit is tagged with the scope it came \
         from. Returns JSON.")]
     async fn recall(&self, Parameters(req): Parameters<RecallReq>) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        // Global memories are written down because they outlive the project that
+        // learned them, so an unbound session can still reach them. Only the
+        // local half genuinely needs a project.
+        let Some(backend) = self.maybe_bound() else {
+            if req.scope.as_deref() == Some("local") {
+                self.bound()?;
+            }
+            return run_blocking(move || {
+                state::do_recall_global(&req.query, req.limit.unwrap_or(5), req.repo.as_deref())
+            })
+            .await;
+        };
         run_blocking(move || {
             backend.recall(
                 &req.query,
@@ -303,7 +354,21 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<SearchProjectReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        // Naming another project is enough to answer: this needs the registry,
+        // not a project of our own. It therefore works while unbound, which is
+        // exactly when an agent reaches for it.
+        let Some(backend) = self.maybe_bound() else {
+            return run_blocking(move || {
+                state::do_search_project(
+                    &req.project,
+                    &req.query,
+                    req.limit.unwrap_or(10),
+                    req.language,
+                    req.mode.as_deref().unwrap_or("vector"),
+                )
+            })
+            .await;
+        };
         run_blocking(move || {
             backend.search_project(
                 &req.project,
@@ -327,8 +392,39 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ListProjectsReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
-        run_blocking(move || backend.list_projects(req.include_inactive.unwrap_or(false))).await
+        let all = req.include_inactive.unwrap_or(false);
+        // The registry is what an unbound server is *for*: this is the tool that
+        // tells an agent which projects exist and what to bind to.
+        match self.maybe_bound() {
+            Some(backend) => run_blocking(move || backend.list_projects(all)).await,
+            None => run_blocking(move || state::do_list_projects(all)).await,
+        }
+    }
+
+    /// Bind this session to a registered project.
+    #[tool(description = "Bind this session to a project, by name (see \
+        list_projects) or by path. Needed when the server was started outside \
+        any repository — a globally-registered MCP server inherits whatever \
+        directory the client was launched from. Also switches an already-bound \
+        session to a different project.")]
+    async fn use_project(
+        &self,
+        Parameters(req): Parameters<UseProjectReq>,
+    ) -> Result<String, ErrorData> {
+        let connect = self.connect.clone();
+        let slot = self.backend.clone();
+        let target = req.project.clone();
+        run_blocking(move || {
+            let root = state::resolve_project_root(&target)?;
+            let backend = connect(&root)?;
+            *slot.lock().map_err(|e| e.to_string())? = Some(Arc::new(backend));
+            Ok(serde_json::json!({
+                "bound": target,
+                "path": root.to_string_lossy(),
+            })
+            .to_string())
+        })
+        .await
     }
 
     /// Memory counts for the current project.
@@ -337,7 +433,7 @@ impl DevctxServer {
         per type)."
     )]
     async fn memory_stats(&self) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || backend.memory_stats()).await
     }
 
@@ -350,7 +446,7 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ImpactReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3))).await
     }
 
@@ -363,7 +459,7 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ReferencesReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || backend.references(&req.symbol)).await
     }
 
@@ -376,7 +472,7 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<SearchRoutesReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || backend.search_routes(req.method, req.path)).await
     }
 
@@ -386,7 +482,7 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<RoutesForHandlerReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || backend.routes_for_handler(&req.handler)).await
     }
 
@@ -399,7 +495,7 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<SummarizeReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.backend.clone();
+        let backend = self.bound()?;
         run_blocking(move || {
             backend.summarize(&req.content, req.query, req.max_tokens.unwrap_or(200))
         })
@@ -416,7 +512,10 @@ impl ServerHandler for DevctxServer {
             )
             .with_instructions(
                 "DevCtxEngine: semantic code search, file reading, and incremental indexing \
-                 over your git repository.",
+                 over your git repository. If a tool reports that no project is bound, call \
+                 list_projects to see what is registered and use_project to bind one — a \
+                 globally-registered server starts in whatever directory the client was \
+                 launched from, which is often none of them.",
             )
     }
 }
@@ -433,15 +532,21 @@ where
     }
 }
 
+/// Build a backend for a project already resolved to a config: route through
+/// its shared server when there is one, else own the database here.
+pub fn backend_for(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Result<Backend> {
+    Ok(match server {
+        Some(conn) => Backend::remote(conn),
+        None => Backend::local(Arc::new(AppState::build(cfg)?)),
+    })
+}
+
 /// Serve the DevCtxEngine MCP server over stdio until the client disconnects.
-/// When `server` is `Some`, every tool routes to that shared server (no direct
-/// DB access); otherwise the MCP owns the DB locally.
-pub async fn serve_stdio(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Result<()> {
-    let backend = match server {
-        Some(conn) => Arc::new(Backend::remote(conn)),
-        None => Arc::new(Backend::local(Arc::new(AppState::build(cfg)?))),
-    };
-    let service = DevctxServer::new(backend)
+///
+/// `backend` is `None` when no project could be resolved at start — the server
+/// still comes up, and `list_projects`/`use_project` are how a session gets one.
+pub async fn serve_stdio(backend: Option<Backend>, connect: Connect) -> anyhow::Result<()> {
+    let service = DevctxServer::new(backend.map(Arc::new), connect)
         .serve(rmcp::transport::stdio())
         .await?;
     service.waiting().await?;
@@ -449,9 +554,9 @@ pub async fn serve_stdio(cfg: ProjectConfig, server: Option<ServerConn>) -> anyh
 }
 
 /// Blocking entry point: build a Tokio runtime and serve over stdio.
-pub fn run_stdio(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Result<()> {
+pub fn run_stdio(backend: Option<Backend>, connect: Connect) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve_stdio(cfg, server))
+    rt.block_on(serve_stdio(backend, connect))
 }
