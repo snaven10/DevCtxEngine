@@ -86,6 +86,12 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     }
 
     let excluded = build_exclude(req.exclude);
+    // The BM25 index cannot survive the row deletions this run will make, so it
+    // comes down first and goes back up at the end if it was there.
+    let had_fts = req.store.has_fts();
+    if had_fts {
+        req.store.drop_fts()?;
+    }
     let git = GitRepo::open(req.repo_root)?;
     let state = git.state();
     let repo_short = git.short_name();
@@ -214,6 +220,10 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         chunk_count: counts.2,
         indexed_at: now_stamp(),
     })?;
+
+    if had_fts {
+        req.store.rebuild_fts()?;
+    }
 
     Ok(result)
 }

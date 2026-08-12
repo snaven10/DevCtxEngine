@@ -29,10 +29,12 @@ fi
 # "label|model key|model_dir"   — an empty model_dir means a fastembed built-in.
 CANDIDATES=(
   "sin rerank|off|"
-  "bge-base (built-in)|bge-base|"
-  "TinyBERT-L-2|custom|$MODELS_DIR/ms-marco-TinyBERT-L-2-v2"
-  # "MultiBERT-L-12|custom|$MODELS_DIR/ms-marco-MultiBERT-L-12"
-  # "jina-turbo (built-in)|jina-turbo|"
+  "bge-base (built-in, 1.1 GB)|bge-base|"
+  "bge-v2-m3 (built-in, multilingual)|bge-v2-m3|"
+  "jina-turbo (built-in, English)|jina-turbo|"
+  "jina-v2 (built-in, multilingual)|jina-v2|"
+  "ms-marco-MultiBERT-L-12 (162 MB)|custom|$MODELS_DIR/ms-marco-MultiBERT-L-12"
+  "ms-marco-TinyBERT-L-2 (4.8 MB)|custom|$MODELS_DIR/ms-marco-TinyBERT-L-2-v2"
 )
 
 # --- queries ---------------------------------------------------------------

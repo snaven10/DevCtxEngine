@@ -176,6 +176,22 @@ impl Store {
                 .is_ok()
     }
 
+    /// Drop the BM25 index if present.
+    ///
+    /// DuckDB cannot maintain an FTS index across row deletions on the indexed
+    /// table: a reindex that deletes rows aborts with "Failed to delete all rows
+    /// from index". So it is dropped before any run that deletes and rebuilt
+    /// after — the same shape as [`drop_hnsw`](Self::drop_hnsw), for the same
+    /// reason. Best-effort: absent index or extension is a no-op.
+    pub fn drop_fts(&self) -> Result<()> {
+        if self.load_fts() {
+            let _ = self
+                .conn
+                .execute_batch("PRAGMA drop_fts_index('vectors');");
+        }
+        Ok(())
+    }
+
     /// BM25 keyword search over chunk text, with the same equality filters as
     /// [`search`](Self::search). Requires a prior [`rebuild_fts`](Self::rebuild_fts).
     /// Scores are BM25 relevance (higher is better), not cosine similarity.
