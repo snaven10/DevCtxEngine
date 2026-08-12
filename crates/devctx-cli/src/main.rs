@@ -1566,15 +1566,31 @@ fn warn_not_a_repo(path: &str) {
 /// home, or a daemon holding the file) must not make `devctx init` fail — the
 /// project config, which is what actually matters here, is already written.
 fn register_centrally(root: &std::path::Path) {
-    let result = Central::open().and_then(|c| {
-        c.register(&RegisterRequest {
-            root: root.to_path_buf(),
-            now: devctx_central::now_stamp(),
-            ..Default::default()
-        })
-    });
-    match result {
-        Ok(rec) => println!("Registered in the central store as `{}`", rec.name),
+    // Route through the daemon exactly as `projects add` does. Opening the
+    // central store directly would take a second lock on a file another project
+    // may already hold — which is the whole reason the daemon exists, and which
+    // `init` was quietly bypassing.
+    let name = match CentralPaths::resolve() {
+        Ok(paths) => match devctx_central::client::ensure(&paths) {
+            Some(r) => r
+                .add(root, None, "", "", false)
+                .map(|v| field(&v, "name"))
+                .map_err(|e| e.to_string()),
+            None => Central::open()
+                .and_then(|c| {
+                    c.register(&RegisterRequest {
+                        root: root.to_path_buf(),
+                        now: devctx_central::now_stamp(),
+                        ..Default::default()
+                    })
+                })
+                .map(|rec| rec.name)
+                .map_err(|e| e.to_string()),
+        },
+        Err(e) => Err(e.to_string()),
+    };
+    match name {
+        Ok(name) => println!("Registered in the central store as `{name}`"),
         Err(e) => eprintln!("· not registered centrally ({e}); run `devctx projects add` later"),
     }
 }

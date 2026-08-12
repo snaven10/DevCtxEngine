@@ -185,9 +185,7 @@ impl Store {
     /// reason. Best-effort: absent index or extension is a no-op.
     pub fn drop_fts(&self) -> Result<()> {
         if self.load_fts() {
-            let _ = self
-                .conn
-                .execute_batch("PRAGMA drop_fts_index('vectors');");
+            let _ = self.conn.execute_batch("PRAGMA drop_fts_index('vectors');");
         }
         Ok(())
     }
