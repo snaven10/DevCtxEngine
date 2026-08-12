@@ -86,7 +86,18 @@ pub async fn serve(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                let idle_for = act.lock().map(|t| t.elapsed()).unwrap_or_default();
+                // A poisoned lock means a thread panicked holding it, not that a
+                // request just arrived. Reading that as `unwrap_or_default()` —
+                // `Duration::ZERO`, i.e. "busy right now" — silenced this timer
+                // for the rest of the process's life, which is the exact runaway
+                // it exists to prevent: the server then lingers forever, holding
+                // an embedding model and a reranker in memory. A panic cannot
+                // leave an `Instant` half-written, so the value behind the lock
+                // is still sound. Take it and carry on.
+                let idle_for = match act.lock() {
+                    Ok(t) => t.elapsed(),
+                    Err(poisoned) => poisoned.into_inner().elapsed(),
+                };
                 if idle_for >= timeout {
                     eprintln!("DevCtxEngine server idle for {idle_for:?}; shutting down.");
                     // `exit` runs no destructors, so the database would keep a
@@ -133,9 +144,11 @@ pub(crate) async fn track(
     next: Next,
 ) -> Response {
     if req.uri().path() != "/health" {
-        if let Ok(mut t) = act.lock() {
-            *t = Instant::now();
-        }
+        // Recover from poisoning rather than skip the write: dropping it would
+        // freeze the clock at the last successful request, and a busy server
+        // would then look idle and shut down under load.
+        let mut t = act.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *t = Instant::now();
     }
     next.run(req).await
 }

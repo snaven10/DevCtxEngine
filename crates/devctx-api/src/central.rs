@@ -79,7 +79,12 @@ pub async fn serve(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                let idle_for = activity.lock().map(|t| t.elapsed()).unwrap_or_default();
+                // See the same loop in `lib.rs::serve`: a poisoned lock read as
+                // `Duration::ZERO` makes this server immortal instead of idle.
+                let idle_for = match activity.lock() {
+                    Ok(t) => t.elapsed(),
+                    Err(poisoned) => poisoned.into_inner().elapsed(),
+                };
                 if idle_for >= timeout {
                     eprintln!("Central store idle for {idle_for:?}; shutting down.");
                     std::process::exit(0);

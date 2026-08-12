@@ -99,9 +99,15 @@ impl AppState {
     /// `PRIMARY KEY` and `UNIQUE` missing entries, and the next delete then
     /// fails for good — see [`Store::checkpoint`].
     pub fn checkpoint(&self) {
-        if let Ok(store) = self.primary.lock() {
-            store.checkpoint();
-        }
+        // Recover from a poisoned lock rather than return quietly. This runs on
+        // the way out, and the panic that poisoned the mutex is exactly the kind
+        // of exit that leaves a WAL behind — skipping the fold here would drop
+        // it in the one case it matters most.
+        let store = self
+            .primary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.checkpoint();
     }
 
     fn open_store(&self) -> Result<Store, String> {
