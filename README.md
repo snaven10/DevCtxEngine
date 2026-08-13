@@ -5,6 +5,10 @@ indexing, hybrid search, an MCP server, an HTTP API and a TUI. See
 [`docs/rust-rewrite-plan.md`](docs/rust-rewrite-plan.md) for the architecture and
 phased plan.
 
+> **This is the Rust rewrite of [snaven10/devai-context-engine](https://github.com/snaven10/devai-context-engine)**
+> — the original Go + Python implementation. See [Lineage](#lineage) for what
+> changed and why.
+
 ```bash
 devctx init --name myproj
 devctx index                       # git diff → parse → chunk → embed → store
@@ -126,3 +130,43 @@ cargo build
 cargo test
 cargo run -p devctx-cli -- status
 ```
+
+## Lineage
+
+DevCtxEngine is a ground-up rewrite of
+**[snaven10/devai-context-engine](https://github.com/snaven10/devai-context-engine)**
+(*DevAI*), which remains the reference implementation. The commit history here
+carries over from that project, so the migration is visible in the log rather
+than squashed away.
+
+**What DevAI was** — a hybrid, ~20k LOC across two runtimes:
+
+| Layer | Size | Responsibility |
+|-------|------|----------------|
+| Go | ~10.4k LOC | Thin orchestrator: CLI (cobra), MCP server (21 tools), HTTP API, TUI (Bubble Tea), config/storage routing |
+| Python (`devai_ml`) | ~9.7k LOC | The actual work: embeddings, chunking, tree-sitter parsers, retrieval/reranking, summarization, stores |
+
+The real contract between them was a **JSON-RPC 2.0 bridge over stdio** — about
+27 methods — with Python running as a sidecar process.
+
+**What the rewrite changes:**
+
+- **One binary, no bridge.** The JSON-RPC-over-stdio hop and the Python sidecar
+  are gone; every call is now in-process. That removes the interpreter startup,
+  the respawn watchdog, the 120s timeout, and all the cross-process
+  serialization.
+- **One database.** DuckDB replaces LanceDB + Qdrant + SQLite — vectors (VSS)
+  and relational tables (graph, routes, memories, index state) live in a single
+  file.
+- **Rust ML stack.** `fastembed-rs` + `ort` (ONNX Runtime) for local models;
+  OpenAI/Voyage/custom over HTTP. Embedding dimension is parameterized rather
+  than pinned at 384.
+- **Incremental, with parity.** Built module by module, each phase verified
+  against the Go/Python binary as the reference.
+
+The full reasoning, the dependency mapping, and the phase breakdown live in
+[`docs/rust-rewrite-plan.md`](docs/rust-rewrite-plan.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
