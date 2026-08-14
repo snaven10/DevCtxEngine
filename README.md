@@ -21,6 +21,39 @@ devctx tui                         # terminal UI: search, call-graph, memories, 
 devctx web                         # web dashboard: interactive call-graph + memories
 ```
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/snaven10/DevCtxEngine/main/install.sh | sh
+```
+
+Linux x86_64 and macOS arm64; anywhere else, `cargo build --release` (it
+compiles DuckDB from source, so allow 20–25 minutes). The script installs the
+binary to `~/.local/bin` and stops there — it writes no configuration and
+downloads no model, because those are decisions, and the embedding model in
+particular cannot be changed after indexing without redoing it.
+
+### Let an agent set it up
+
+The steps that follow — choosing a model, registering repositories, migrating
+memories from an older DevAI install, indexing — are written out in
+[`AGENTS.md`](AGENTS.md) for a coding agent to carry out. Paste this to yours:
+
+> Set up DevCtxEngine on this machine for me. Read
+> https://raw.githubusercontent.com/snaven10/DevCtxEngine/main/AGENTS.md and
+> follow it in order, verifying each step the way it says to.
+>
+> Before you start, ask me: what language are the code and comments mostly in
+> (that decides the embedding model, and changing it later means re-indexing
+> everything); which repositories to register, and whether they are one product
+> that should share a memory group; and whether there is an existing `devai`
+> install whose memories should be migrated.
+>
+> Several failures in this system are silent — a model whose name matches but
+> whose vectors do not, an index that is never built, a reranker pointed at the
+> wrong model. Do not report a step as done because a command exited zero; run
+> the verification the document gives and show me its output.
+
 ## Across projects
 
 Each repository keeps its own index. What is shared lives in a **central store**:
