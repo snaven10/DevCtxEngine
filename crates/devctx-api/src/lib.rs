@@ -17,10 +17,9 @@ use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
     do_graph, do_impact, do_index, do_index_paths, do_index_progress, do_index_status,
-    do_list_projects,
-    do_memory_context, do_memory_stats, do_read_file, do_recall_scoped, do_references, do_remember,
-    do_remember_global, do_routes_for_handler, do_search, do_search_routes, do_summarize,
-    parse_mode, AppState,
+    do_list_projects, do_memory_context, do_memory_stats, do_read_file, do_recall_scoped,
+    do_references, do_remember, do_remember_shared, do_routes_for_handler, do_search,
+    do_search_routes, do_summarize, parse_mode, AppState,
 };
 use serde::Deserialize;
 
@@ -117,6 +116,14 @@ pub async fn serve(
                     Err(poisoned) => poisoned.into_inner().elapsed(),
                 };
                 if idle_for >= timeout {
+                    // "No requests lately" is not the same as "nothing to do".
+                    // Indexing runs inside this process and can take far longer
+                    // than the idle window; the client that asked for it stops
+                    // polling as soon as its own read times out, and exiting
+                    // here discarded a nearly complete run.
+                    if closing.is_indexing() {
+                        continue;
+                    }
                     eprintln!("DevCtxEngine server idle for {idle_for:?}; shutting down.");
                     // `exit` runs no destructors, so the database would keep a
                     // write-ahead log no process is ever going to fold in.
@@ -409,8 +416,16 @@ async fn remember(State(api): State<Api>, Json(b): Json<RememberBody>) -> Respon
         let memory_type = b.memory_type.unwrap_or_else(|| "note".to_string());
         let topic = b.topic.unwrap_or_default();
         let tags = b.tags.unwrap_or_default();
-        if devctx_memory::is_global(b.scope.as_deref().unwrap_or("local")) {
-            return do_remember_global(s, &b.content, &title, &memory_type, &topic, &tags);
+        let scope = b.scope.as_deref().unwrap_or("local");
+        // `group` and `global` both live in the central store; only the space
+        // they land in differs.
+        if devctx_memory::is_global(scope) || devctx_memory::is_group(scope) {
+            let group = if devctx_memory::is_group(scope) {
+                s.group_name()
+            } else {
+                String::new()
+            };
+            return do_remember_shared(s, &b.content, &title, &memory_type, &topic, &tags, &group);
         }
         do_remember(s, b.content, title, memory_type, topic, tags)
     })
@@ -433,7 +448,7 @@ async fn recall(State(api): State<Api>, Json(b): Json<RecallBody>) -> Response {
 /// The registry, proxied so a routed MCP session can reach it without opening
 /// the central database itself.
 async fn list_projects(Query(q): Query<ListProjectsQuery>) -> Response {
-    match tokio::task::spawn_blocking(move || do_list_projects(q.all)).await {
+    match tokio::task::spawn_blocking(move || do_list_projects(None, "", q.all)).await {
         Ok(Ok(body)) => json_ok(body),
         Ok(Err(e)) => json_err(StatusCode::BAD_REQUEST, e),
         Err(e) => json_err(

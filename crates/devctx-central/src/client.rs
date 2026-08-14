@@ -122,6 +122,18 @@ pub fn ensure(paths: &CentralPaths) -> Option<CentralClient> {
     None
 }
 
+/// Where a spawned daemon's stderr goes: `serve.log` beside the database,
+/// appended to. Falls back to discarding it if the file cannot be opened —
+/// losing the log is not a reason to refuse to start the daemon.
+fn log_sink(paths: &CentralPaths) -> std::process::Stdio {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.dir.join("serve.log"))
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null())
+}
+
 /// Launch `devctx serve --central` detached, with an idle timeout.
 fn spawn(paths: &CentralPaths) -> Result<()> {
     let exe_path =
@@ -137,7 +149,11 @@ fn spawn(paths: &CentralPaths) -> Result<()> {
     ])
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
+    // Not `/dev/null`: when the daemon dies on startup — a lock it could not
+    // take, a config that no longer matches the store — the caller sees only
+    // "could not be started", and the one line explaining why is discarded with
+    // it. Appending to a file next to the database keeps that line.
+    .stderr(log_sink(paths));
     // The daemon resolves its own paths from the environment, so pass the home
     // through explicitly rather than relying on the parent's cwd.
     cmd.env(crate::HOME_ENV, &paths.dir);
@@ -146,8 +162,18 @@ fn spawn(paths: &CentralPaths) -> Result<()> {
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
     }
-    cmd.spawn()
+    let child = cmd
+        .spawn()
         .map_err(|e| CentralError::Io(e, exe_path.clone()))?;
+    // A `Child` that is dropped is never waited on, so the daemon becomes a
+    // zombie the moment it exits — and it does exit: on its idle timeout, or
+    // immediately when another daemon already owns the database. In a long-lived
+    // parent (an MCP server that outlives many of them) those corpses
+    // accumulate, one per attempt. Reap it wherever it ends.
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -278,6 +304,7 @@ impl CentralClient {
         project: &str,
         repo: &str,
         branch: &str,
+        group: &str,
     ) -> Result<Value> {
         self.post(
             "/remember",
@@ -285,14 +312,26 @@ impl CentralClient {
                 "content": content, "title": title, "type": memory_type,
                 "topic": topic, "tags": tags,
                 "project": project, "repo": repo, "branch": branch,
+                "group": group,
             }),
         )
     }
 
     pub fn recall(&self, query: &str, limit: usize, repo: Option<&str>) -> Result<Vec<Value>> {
+        self.recall_scoped(query, limit, repo, None)
+    }
+
+    /// Recall from one group's space when `group` is set, else the global one.
+    pub fn recall_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        repo: Option<&str>,
+        group: Option<&str>,
+    ) -> Result<Vec<Value>> {
         let v = self.post(
             "/recall",
-            serde_json::json!({ "query": query, "limit": limit, "repo": repo }),
+            serde_json::json!({ "query": query, "limit": limit, "repo": repo, "group": group }),
         )?;
         Ok(v.get("memories")
             .and_then(|m| m.as_array())

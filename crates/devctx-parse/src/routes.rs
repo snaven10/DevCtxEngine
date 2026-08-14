@@ -355,7 +355,7 @@ fn quarkus(source: &str, file: &str) -> Vec<Route> {
         .map(|c| {
             let m = c.get(0).unwrap();
             // A method-level @Path following the HTTP annotation (within ~200 bytes).
-            let window = &source[m.end()..(m.end() + 200).min(source.len())];
+            let window = window_after(source, m.end(), 200);
             let sub = RE_PATH
                 .captures(window)
                 .map(|p| p[1].to_string())
@@ -413,6 +413,23 @@ fn join_path(prefix: &str, sub: &str) -> String {
         parts.push(s);
     }
     format!("/{}", parts.join("/"))
+}
+
+/// The `len` bytes of `source` following `start`, clamped to a char boundary.
+///
+/// Slicing at `start + len` directly panics whenever that offset lands inside a
+/// multi-byte character — which any accented word ("configuración") makes
+/// routine in a non-English codebase. Walking the end back to the nearest
+/// boundary keeps the window slightly shorter instead of aborting the index.
+fn window_after(source: &str, start: usize, len: usize) -> &str {
+    if start >= source.len() {
+        return "";
+    }
+    let mut end = (start + len).min(source.len());
+    while end > start && !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    &source[start..end]
 }
 
 #[cfg(test)]
@@ -555,6 +572,29 @@ export class CatsController {
         assert_eq!(r[0].handler_symbol, "CatsController.findAll");
         assert_eq!(r[1].path, "/cats/create");
         assert_eq!(r[1].handler_method, "create");
+    }
+
+    #[test]
+    fn window_after_stops_at_a_char_boundary() {
+        // 'ó' occupies two bytes, so a window ending at byte 2 would split it.
+        let s = "aó";
+        assert_eq!(window_after(s, 0, 2), "a");
+        assert_eq!(window_after(s, 0, 3), "aó");
+        assert_eq!(window_after(s, 0, 99), "aó");
+        assert_eq!(window_after(s, 99, 10), "");
+    }
+
+    #[test]
+    fn jaxrs_routes_survive_accents_in_the_lookahead_window() {
+        // The @Path lookahead reads ~200 bytes past the annotation; padding it
+        // with accented text puts a multi-byte character on that boundary,
+        // which used to panic and abort the whole index.
+        let padding = "ó".repeat(150);
+        let src = format!(
+            "@Path(\"/orders\")\npublic class R {{\n  // {padding}\n  @GET\n  @Path(\"/search\")\n  public String search() {{ return null; }}\n}}\n"
+        );
+        let r = routes(&src, "R.java");
+        assert!(r.iter().any(|x| x.path.contains("orders")));
     }
 
     #[test]

@@ -195,20 +195,15 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // advancing `last_commit` would make the next incremental diff start after
     // commits whose other files were never looked at. Its counts are equally
     // meaningless as totals, so the previous record's are carried forward.
-    let (last_commit, counts) = match (&explicit_paths, &prev) {
-        (Some(_), Some(p)) => (
-            p.last_commit.clone(),
-            (p.file_count, p.symbol_count, p.chunk_count),
-        ),
-        _ => (
-            state.commit.clone(),
-            (
-                result.files_indexed as i64,
-                result.symbols as i64,
-                result.chunks as i64,
-            ),
-        ),
+    // The counts recorded are what the store holds, not what this run touched:
+    // an incremental pass over three files used to overwrite the summary with
+    // `files = 3`, so `status` reported a complete index as nearly empty.
+    let totals = req.store.index_totals(&repo_path, &branch)?;
+    let last_commit = match (&explicit_paths, &prev) {
+        (Some(_), Some(p)) => p.last_commit.clone(),
+        _ => state.commit.clone(),
     };
+    let counts = totals;
     req.store.save_index_record(&IndexRecord {
         repo_path,
         branch,

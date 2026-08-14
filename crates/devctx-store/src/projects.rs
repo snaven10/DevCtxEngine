@@ -113,7 +113,12 @@ impl Store {
         let where_clause = if include_inactive {
             ""
         } else {
-            "WHERE active = true"
+            // `active = true` — not `WHERE active` — stopped matching rows once
+            // the database had been written to heavily: every row still reads
+            // back `true`, and `WHERE active`, `IS TRUE` and `CAST(active AS
+            // INTEGER) = 1` all find them, but the equality is pruned away and
+            // the registry looks empty. Test the column directly.
+            "WHERE active"
         };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {PROJ_COLS} FROM projects {where_clause} ORDER BY name"
@@ -230,6 +235,36 @@ mod tests {
             active: true,
             ..Default::default()
         }
+    }
+
+    /// `projects` must carry no index. They are worthless on a table this size
+    /// and were observed to break equality lookups outright — `WHERE path = ?`
+    /// and `WHERE active = true` returning nothing while the rows sat there —
+    /// which emptied `projects list` and made every `record_index` a silent
+    /// no-op. Re-adding one would bring all of that back.
+    #[test]
+    fn the_projects_table_carries_no_index() {
+        let store = Store::open_in_memory(4).unwrap();
+        store
+            .upsert_project(&proj("alpha", "/repos/alpha"))
+            .unwrap();
+        let mut stmt = store
+            .conn
+            .prepare("SELECT index_name FROM duckdb_indexes() WHERE table_name = 'projects'")
+            .unwrap();
+        let found: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(found.is_empty(), "projects must stay unindexed: {found:?}");
+
+        // The lookups that the indexes used to break.
+        assert!(store
+            .find_project_by_path("/repos/alpha")
+            .unwrap()
+            .is_some());
+        assert_eq!(store.list_projects(false).unwrap().len(), 1);
     }
 
     #[test]

@@ -12,7 +12,21 @@ use crate::error::Result;
 pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
     conn.execute_batch(&vectors_ddl(dim))?;
     conn.execute_batch(RELATIONAL_DDL)?;
+    drop_broken_project_indexes(conn);
     Ok(())
+}
+
+/// Remove the `projects` indexes an older schema created.
+///
+/// They are not merely useless on a table this small — they silently break it:
+/// once present, equality lookups stop matching rows that are demonstrably
+/// there. A database created before this change keeps them until something
+/// drops them, and every open is the natural place. Best-effort: a store that
+/// cannot drop them is no worse off than before.
+fn drop_broken_project_indexes(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_projects_path; DROP INDEX IF EXISTS idx_projects_active;",
+    );
 }
 
 fn vectors_ddl(dim: usize) -> String {
@@ -141,8 +155,15 @@ CREATE TABLE IF NOT EXISTS projects (
     updated_at      VARCHAR,
     active          BOOLEAN
 );
-CREATE INDEX IF NOT EXISTS idx_projects_path ON projects (path);
-CREATE INDEX IF NOT EXISTS idx_projects_active ON projects (active);
+-- No indexes on `projects` — deliberately. The table holds one row per tracked
+-- repository (tens, at the very most), where a scan is already free, and the
+-- indexes actively broke it: after enough writes, `WHERE path = ?` and
+-- `WHERE active = true` matched nothing at all, while `LIKE`, `trim(path) = ?`
+-- and `length(path) = ?` — the forms that cannot use an index — still found
+-- every row. The registry looked empty (`projects list` printed nothing) and
+-- every `record_index` silently reported "project not found", so a fully
+-- indexed repository was listed as never indexed. Dropping both indexes
+-- restores all of it; see the migration in `init_schema`.
 
 CREATE TABLE IF NOT EXISTS sessions (
     id         VARCHAR PRIMARY KEY,
