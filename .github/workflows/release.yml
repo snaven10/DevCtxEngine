@@ -48,7 +48,11 @@ jobs:
           cp "target/${{ matrix.target }}/release/devctx" "dist/$name/"
           cp README.md LICENSE AGENTS.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
-          shasum -a 256 "dist/$name.tar.gz" | awk '{print $1"  "'"$name"'".tar.gz"}' > "dist/$name.tar.gz.sha256"
+          # Run it from inside `dist` so the checksum file names the archive
+          # relative to itself — `shasum -c` looks for exactly the path written
+          # here, and a path with a directory in it cannot be found from the
+          # directory the installer unpacks into.
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
 
       - uses: actions/upload-artifact@v4
         with:
