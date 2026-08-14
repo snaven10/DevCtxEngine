@@ -1,6 +1,8 @@
 # Rust
 /target
-Cargo.lock
+
+# Cargo.lock IS committed: this workspace builds a binary, not a library, and
+# the release workflow builds it with --locked so what ships is what was tested.
 
 # DevCtxEngine local state / caches
 .devctx/
