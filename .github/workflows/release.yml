@@ -1,0 +1,81 @@
+name: release
+
+# Tag-driven: `git tag v0.2.0 && git push --tags` publishes the binaries.
+#
+# Built on GitHub's runners rather than a developer's machine on purpose — the
+# build compiles DuckDB from source and pulls the ONNX Runtime, which is twenty
+# minutes and a working network, neither of which belongs in the path between
+# "I want to install this" and having it.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # A tarball rather than a bare binary: it keeps the executable bit through
+      # the download, which a raw asset does not.
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="devctx-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/devctx" "dist/$name/"
+          cp README.md LICENSE AGENTS.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          shasum -a 256 "dist/$name.tar.gz" | awk '{print $1"  "'"$name"'".tar.gz"}' > "dist/$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devctx-${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Install:
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            Then follow `AGENTS.md` — it is written for a coding agent, and
+            covers choosing an embedding model, migrating memories from an older
+            DevAI install, and the failures that are silent.
