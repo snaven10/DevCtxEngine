@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use devctx_central::{project_json, Central, CentralPaths, RegisterRequest};
 use devctx_core::config::{find_config_file, Project, ProjectConfig};
@@ -49,6 +49,10 @@ enum Command {
         /// Project name (defaults to the directory name).
         #[arg(long)]
         name: Option<String>,
+        /// Group this repository belongs to: a product spanning several repos,
+        /// which then share a memory tier between them.
+        #[arg(long)]
+        group: Option<String>,
     },
     /// Show repository and index status.
     Status,
@@ -127,6 +131,22 @@ enum Command {
     },
     /// Show memory counts for the project.
     MemoryStats,
+    /// Permanently delete one memory by id, wherever it lives.
+    MemoryForget {
+        /// The memory id, as reported by `recall` or `remember`.
+        id: String,
+    },
+    /// Permanently delete every memory stored under one `project` key, and the
+    /// vectors that belong to them.
+    MemoryPurge {
+        /// The key to purge, e.g. `@global` for rows an import left in the
+        /// wrong store. Not a project *name* — the reserved key as stored.
+        #[arg(long)]
+        project: String,
+        /// Report what would go without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Import memories from an old DevAI SQLite DB into DuckDB (re-embedded).
     Migrate {
         /// Old SQLite DB path (default: this project's `.devai`, then the global one).
@@ -177,7 +197,12 @@ enum Command {
         token: Option<String>,
     },
     /// Open the interactive terminal UI (search, graph & memories).
-    Tui,
+    Tui {
+        /// Project to open, by registered name or path. Without it: the project
+        /// in the current directory, else the only registered one.
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Serve the web dashboard (call-graph + memories) in a browser.
     Web {
         /// Address to bind (host:port).
@@ -300,9 +325,11 @@ enum ProjectsAction {
 enum MemoryScope {
     /// This project only.
     Local,
+    /// The repositories of this project's group (see `project.group`).
+    Group,
     /// The shared central store, visible from every project.
     Global,
-    /// Both, fused by rank.
+    /// Every tier that applies, fused by rank.
     All,
 }
 
@@ -344,7 +371,7 @@ enum McpAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { path, name } => cmd_init(path, name),
+        Command::Init { path, name, group } => cmd_init(path, name, group),
         Command::Status => cmd_status(),
         Command::Index { full } => cmd_index(full),
         Command::Repair => cmd_repair(),
@@ -383,6 +410,8 @@ fn main() -> Result<()> {
             repo,
         } => cmd_recall(query, limit, scope, repo),
         Command::MemoryStats => cmd_memory_stats(),
+        Command::MemoryForget { id } => cmd_memory_forget(id),
+        Command::MemoryPurge { project, dry_run } => cmd_memory_purge(project, dry_run),
         Command::Migrate {
             from,
             dry_run,
@@ -396,7 +425,7 @@ fn main() -> Result<()> {
             tokens,
         } => cmd_summarize(path, query, tokens),
         Command::Api { addr, token } => cmd_api(addr, token),
-        Command::Tui => cmd_tui(),
+        Command::Tui { project } => cmd_tui(project),
         Command::Web { addr, no_open } => cmd_web(addr, no_open),
         Command::Serve {
             addr,
@@ -748,8 +777,8 @@ fn num(v: &serde_json::Value, key: &str) -> i64 {
 }
 
 /// `devctx tui` — open the interactive terminal UI.
-fn cmd_tui() -> Result<()> {
-    let cfg = load_project()?;
+fn cmd_tui(project: Option<String>) -> Result<()> {
+    let cfg = tui_project(project)?;
     // Route through the server (auto-spawned if needed) so the TUI never opens
     // the DB itself and coexists with other processes. Fall back to local only
     // when no server is available.
@@ -764,6 +793,65 @@ fn cmd_tui() -> Result<()> {
         }
     };
     devctx_tui::run(cfg, server)
+}
+
+/// The machine's default embeddings and reranking for a new project.
+///
+/// Read straight from the central config file rather than through the daemon:
+/// `init` runs before any project exists, and needing a daemon up to create one
+/// would be a circular requirement. A machine with no central config yet falls
+/// back to the built-in defaults, which is the correct answer for a first run.
+fn central_defaults() -> devctx_central::Defaults {
+    CentralPaths::resolve()
+        .ok()
+        .and_then(|p| devctx_central::CentralConfig::load_or_default(&p.config).ok())
+        .map(|c| c.defaults)
+        .unwrap_or_default()
+}
+
+/// Which project the TUI opens on.
+///
+/// Refusing to start outside a repository is the wrong answer for a UI whose
+/// whole job is browsing what is registered: the projects view, the memories
+/// view and the global scope selector are all reachable once it is up, and any
+/// project will do as an entry point. So a bare `devctx tui` from a home
+/// directory opens the registry's project rather than erroring, and says which
+/// one it picked.
+fn tui_project(project: Option<String>) -> Result<ProjectConfig> {
+    if let Some(name) = project {
+        let root = devctx_mcp::state::resolve_project_root(&name).map_err(|e| anyhow!(e))?;
+        return ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
+            .with_context(|| format!("loading project at {}", root.display()));
+    }
+    if let Ok(cfg) = load_project() {
+        return Ok(cfg);
+    }
+
+    let paths = CentralPaths::resolve().context("resolving the central store location")?;
+    let registered: Vec<String> = match devctx_central::client::ensure(&paths) {
+        Some(c) => c
+            .list(false)?
+            .iter()
+            .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect(),
+        None => Central::open()?
+            .list(false)?
+            .into_iter()
+            .map(|p| p.name)
+            .collect(),
+    };
+    let Some(first) = registered.first() else {
+        bail!("no DevCtxEngine project here and none registered (run `devctx init` first)");
+    };
+    if registered.len() > 1 {
+        eprintln!(
+            "No project here; opening `{first}`. Others: {}. Switch with F4 or --project.",
+            registered[1..].join(", ")
+        );
+    }
+    let root = devctx_mcp::state::resolve_project_root(first).map_err(|e| anyhow!(e))?;
+    ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
+        .with_context(|| format!("loading project at {}", root.display()))
 }
 
 /// `devctx api` — serve the HTTP REST API.
@@ -981,8 +1069,20 @@ fn cmd_remember(
 ) -> Result<()> {
     let cfg = load_project()?;
 
-    // A global memory belongs to the central store, which only the daemon may
-    // write — so this path never touches a project database.
+    // A shared memory — group or global — belongs to the central store, which
+    // only the daemon may write, so this path never touches a project database.
+    if scope == MemoryScope::Group && cfg.project.group.is_empty() {
+        bail!(
+            "this project declares no group; set `project.group` in {} or use \
+             `--scope global`",
+            cfg.project.name
+        );
+    }
+    let group = if scope == MemoryScope::Group {
+        cfg.project.group.clone()
+    } else {
+        String::new()
+    };
     if scope != MemoryScope::Local {
         // Provenance must never be blank: a directory that is not a git repo
         // still belongs to a named project, and "which project taught me this"
@@ -1004,10 +1104,16 @@ fn cmd_remember(
                 &project,
                 &repo,
                 &branch,
+                &group,
             )
         })?;
+        let tier = if group.is_empty() {
+            "global".to_string()
+        } else {
+            format!("group:{group}")
+        };
         println!(
-            "{}: {} — {} [global]",
+            "{}: {} — {} [{tier}]",
             field(&out, "status"),
             field(&out, "id"),
             title_or_untitled(&field(&out, "title")),
@@ -1059,19 +1165,31 @@ fn cmd_remember(
 fn cmd_recall(query: String, limit: usize, scope: MemoryScope, repo: Option<String>) -> Result<()> {
     let cfg = load_project()?;
 
-    let global: Vec<serde_json::Value> = if scope == MemoryScope::Local {
-        Vec::new()
-    } else {
+    let wants = |t: MemoryScope| scope == t || scope == MemoryScope::All;
+
+    let global: Vec<serde_json::Value> = if wants(MemoryScope::Global) {
         with_central(|c| c.recall(&query, limit, repo.as_deref()))?
-    };
-
-    let local = if scope == MemoryScope::Global {
-        Vec::new()
     } else {
-        local_recall(&cfg, &query, limit)?
+        Vec::new()
     };
 
-    let hits = fuse_memory_lists(vec![local, global], limit);
+    // The group tier only exists for a repository that declares one; for a
+    // standalone repo `--scope all` stays the two-tier search it was.
+    let group: Vec<serde_json::Value> =
+        if wants(MemoryScope::Group) && !cfg.project.group.is_empty() {
+            let g = cfg.project.group.clone();
+            with_central(|c| c.recall_scoped(&query, limit, repo.as_deref(), Some(&g)))?
+        } else {
+            Vec::new()
+        };
+
+    let local = if wants(MemoryScope::Local) {
+        local_recall(&cfg, &query, limit)?
+    } else {
+        Vec::new()
+    };
+
+    let hits = fuse_memory_lists(vec![local, group, global], limit);
     if hits.is_empty() {
         println!("No memories.");
         return Ok(());
@@ -1142,12 +1260,13 @@ fn title_or_untitled(title: &str) -> String {
     }
 }
 
-/// Fuse local and global recall results by rank, tagging each with its origin.
+/// Fuse local, group and global recall results by rank, tagging each with its
+/// origin. Callers pass the lists in that order.
 fn fuse_memory_lists(
     lists: Vec<Vec<serde_json::Value>>,
     limit: usize,
 ) -> Vec<(serde_json::Value, &'static str)> {
-    let origins = ["local", "global"];
+    let origins = ["local", "group", "global"];
     let tagged: Vec<Vec<(serde_json::Value, &'static str)>> = lists
         .into_iter()
         .enumerate()
@@ -1346,6 +1465,64 @@ impl ProgressSink for IndexBar {
 }
 
 /// `devctx memory-stats` — show memory counts for the project.
+/// `devctx memory-forget` — remove a single memory, wherever it lives.
+///
+/// Looks in this project's store and then the central one, because the caller
+/// has an id from a `recall` that already blended the tiers and has no reason
+/// to know which of them answered.
+fn cmd_memory_forget(id: String) -> Result<()> {
+    let cfg = load_project()?;
+    let store = open_store(&cfg, configured_dimension(&cfg)).context(
+        "opening the store (if a `devctx serve` is running, stop it first: `devctx serve --stop`)",
+    )?;
+    if store.forget_memory(&id)? {
+        println!("Forgot {id} (project `{}`).", cfg.project.name);
+        return Ok(());
+    }
+    let central = Central::open().context(
+        "opening the central store (if a central daemon is running, stop it first: \
+         `devctx serve --central --stop`)",
+    )?;
+    if central.store().forget_memory(&id)? {
+        println!("Forgot {id} (central store).");
+        return Ok(());
+    }
+    bail!("no memory with id `{id}` in this project or the central store");
+}
+
+/// `devctx memory-purge` — drop memories that were written under a key this
+/// store has no business holding, and the vectors that came with them.
+///
+/// Goes straight at the database rather than through a running server: this is
+/// destructive and rare, and having to stop the server first is a feature.
+fn cmd_memory_purge(project: String, dry_run: bool) -> Result<()> {
+    let cfg = load_project()?;
+    let store = open_store(&cfg, configured_dimension(&cfg)).context(
+        "opening the store (if a `devctx serve` is running, stop it first: `devctx serve --stop`)",
+    )?;
+    let n = store.count_memories_for_project(&project)?;
+    if n == 0 {
+        println!(
+            "No memories stored under `{project}` in {}.",
+            cfg.project.name
+        );
+        return Ok(());
+    }
+    if dry_run {
+        println!(
+            "{n} memories under `{project}` would be deleted from {} (dry run).",
+            cfg.project.name
+        );
+        return Ok(());
+    }
+    let removed = store.purge_memories_for_project(&project)?;
+    println!(
+        "Deleted {removed} memories under `{project}` from {}, with their vectors.",
+        cfg.project.name
+    );
+    Ok(())
+}
+
 fn cmd_memory_stats() -> Result<()> {
     let cfg = load_project()?;
     if let Some(r) = remote::ensure(&cfg) {
@@ -1448,6 +1625,31 @@ fn cmd_migrate(from: Option<PathBuf>, dry_run: bool, keep_project: bool) -> Resu
     // are imported under the current project so they're immediately findable.
     let target_project = project_name(&cfg);
     let (mut created, mut dup) = (0usize, 0usize);
+    let mut to_central = 0usize;
+
+    // Old stores had two scopes and used the shared one by default, so nearly
+    // every row claims to be shared with the whole world when it is really
+    // shared with this product's repositories. When the project declares a
+    // group, that is where those memories belong.
+    let group = cfg.project.group.clone();
+    let shared_scope = if group.is_empty() {
+        devctx_memory::SCOPE_GLOBAL
+    } else {
+        devctx_memory::SCOPE_GROUP
+    };
+
+    // Opened directly rather than through the daemon client, whose `remember`
+    // takes a flat argument list and would drop each memory's original author,
+    // files and timestamp — the history this import exists to preserve.
+    let central = if mems.iter().any(|m| devctx_memory::is_global(&m.scope)) {
+        Some(Central::open().context(
+            "opening the central store (if a central daemon is running, stop it first: \
+             `devctx serve --central --stop`)",
+        )?)
+    } else {
+        None
+    };
+
     for m in &mems {
         let project = if keep_project && !m.project.is_empty() {
             m.project.clone()
@@ -1461,18 +1663,50 @@ fn cmd_migrate(from: Option<PathBuf>, dry_run: bool, keep_project: bool) -> Resu
             project,
             topic_key: m.topic_key.clone(),
             tags: m.tags.clone(),
-            scope: m.scope.clone(),
+            scope: if devctx_memory::is_global(&m.scope) {
+                shared_scope.to_string()
+            } else {
+                m.scope.clone()
+            },
+            group: group.clone(),
             author: m.author.clone(),
-            repo: m.repo.clone(),
+            // Old stores left `repo` empty on almost every row, which would
+            // strand the imported globals: `recall --scope global --repo X`
+            // filters on it. The originating project is the best attribution
+            // available, so fall back to it rather than importing them blind.
+            repo: if m.repo.is_empty() {
+                m.project.clone()
+            } else {
+                m.repo.clone()
+            },
             branch: m.branch.clone(),
             files: m.files.clone(),
             session_id: String::new(),
             now: m.created_at.clone(),
         };
-        match remember(&store, embedder.as_ref(), &req)?.status {
+        // A globally-scoped memory belongs to the central store, which is the
+        // source of truth for it. Writing it to the project store instead left
+        // it unreachable: `recall` looks for globals in the central store, and
+        // the local path filters by project — which a global row never matches.
+        let shared = devctx_memory::is_global(&req.scope) || devctx_memory::is_group(&req.scope);
+        let status = if let (true, Some(c)) = (shared, central.as_ref()) {
+            to_central += 1;
+            c.remember(&req)?.status
+        } else {
+            remember(&store, embedder.as_ref(), &req)?.status
+        };
+        match status {
             devctx_memory::RememberStatus::Duplicate => dup += 1,
             _ => created += 1,
         }
+    }
+    if to_central > 0 {
+        let tier = if group.is_empty() {
+            "the global space".to_string()
+        } else {
+            format!("group `{group}`")
+        };
+        println!("{to_central} shared memories went to the central store, in {tier}.");
     }
     println!(
         "Imported {created} memories ({dup} duplicates skipped), embedded with `{}`.",
@@ -1498,7 +1732,7 @@ fn default_old_db() -> Option<PathBuf> {
 }
 
 /// `devctx init` — write a `.devctx/config.yaml` for the target repo.
-fn cmd_init(path: Option<PathBuf>, name: Option<String>) -> Result<()> {
+fn cmd_init(path: Option<PathBuf>, name: Option<String>, group: Option<String>) -> Result<()> {
     let root = match path {
         Some(p) => p,
         None => std::env::current_dir().context("resolving current directory")?,
@@ -1518,11 +1752,25 @@ fn cmd_init(path: Option<PathBuf>, name: Option<String>) -> Result<()> {
             .unwrap_or_else(|| "project".to_string())
     });
 
+    // Inherit the machine's defaults — the embedding model, its directory, the
+    // reranker — rather than the built-in ones.
+    //
+    // `projects add --init` already did this and `init` did not, so the two
+    // ways of registering a repository produced different projects. The
+    // difference was invisible where it mattered most: a machine configured for
+    // a 384-dimensional multilingual model would get a *different*
+    // 384-dimensional English one here, and nothing errors, because the widths
+    // agree. The repository simply indexes itself into another vector space
+    // than every other repository on the machine.
+    let defaults = central_defaults();
     let cfg = ProjectConfig {
         project: Project {
             name,
             path: root.to_string_lossy().into_owned(),
+            group: group.unwrap_or_default(),
         },
+        embeddings: defaults.embeddings,
+        reranking: defaults.reranking,
         ..Default::default()
     };
 
@@ -1779,8 +2027,15 @@ fn cmd_index(full: bool) -> Result<()> {
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);
 
     if cfg.storage.hnsw {
-        if store.enable_hnsw()? {
-            println!("  HNSW index ready (VSS)");
+        if store.enable_hnsw(&cfg.storage.metric)? {
+            println!(
+                "  HNSW index ready (VSS, metric {})",
+                if cfg.storage.metric.is_empty() {
+                    "cosine"
+                } else {
+                    &cfg.storage.metric
+                }
+            );
         } else {
             eprintln!("  HNSW requested but the VSS extension is unavailable; using brute-force");
         }

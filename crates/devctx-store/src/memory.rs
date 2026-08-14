@@ -138,6 +138,66 @@ impl Store {
         Ok(())
     }
 
+    /// Permanently remove one memory and the vectors that belong to it — its
+    /// own row and its `<id>_cN` body chunks. Returns whether it existed.
+    ///
+    /// Distinct from [`delete_memory`](Self::delete_memory), which only writes a
+    /// tombstone: a memory saved by mistake should leave nothing behind, and a
+    /// tombstoned one keeps its vectors and goes on competing for the recall
+    /// budget it was never meant to occupy.
+    pub fn forget_memory(&self, id: &str) -> Result<bool> {
+        let existed: i64 = self.conn.query_row(
+            "SELECT count(*) FROM memories WHERE id = ?",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if existed == 0 {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "DELETE FROM vectors WHERE id = ? OR id LIKE ? || '_c%'",
+            params![id, id],
+        )?;
+        self.conn
+            .execute("DELETE FROM memories WHERE id = ?", params![id])?;
+        Ok(true)
+    }
+
+    /// How many memories are stored under `project`, deleted ones included.
+    pub fn count_memories_for_project(&self, project: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM memories WHERE project = ?",
+            params![project],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Permanently remove every memory stored under `project`, with the vectors
+    /// that belong to them — the memory's own row and its `<id>_cN` chunks.
+    ///
+    /// Unlike [`Store::delete_memory`] this is not a soft delete: it exists for
+    /// rows that should never have been written to this store at all, where a
+    /// tombstone would leave the vectors behind and the space still spent.
+    /// Returns how many memories were removed.
+    pub fn purge_memories_for_project(&self, project: &str) -> Result<usize> {
+        let n = self.count_memories_for_project(project)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        self.conn.execute(
+            "DELETE FROM vectors WHERE EXISTS (
+                 SELECT 1 FROM memories m
+                 WHERE m.project = ?
+                   AND (vectors.id = m.id OR vectors.id LIKE m.id || '_c%')
+             )",
+            params![project],
+        )?;
+        self.conn
+            .execute("DELETE FROM memories WHERE project = ?", params![project])?;
+        Ok(n)
+    }
+
     /// Live memory counts for a project (total + per type).
     pub fn memory_stats(&self, project: &str) -> Result<MemoryStats> {
         let mut stmt = self.conn.prepare(
@@ -219,6 +279,57 @@ mod tests {
             .find_memory_by_topic("proj", "nope")
             .unwrap()
             .is_none());
+    }
+
+    /// Purging a key takes the memories *and* their vectors — the parent row and
+    /// its body chunks — while leaving every other key untouched.
+    #[test]
+    fn purge_takes_memories_with_their_chunk_vectors() {
+        let store = Store::open_in_memory(3).unwrap();
+        let point = |id: &str| devctx_core::VectorPoint {
+            id: id.into(),
+            vector: vec![0.1, 0.2, 0.3],
+            text: format!("text {id}"),
+            metadata: Default::default(),
+        };
+
+        let mut stray = mem("mem_stray", "", "note");
+        stray.project = "@global".into();
+        let mut keep = mem("mem_keep", "", "note");
+        keep.project = "proj".into();
+        store.upsert_memory(&stray).unwrap();
+        store.upsert_memory(&keep).unwrap();
+        store
+            .upsert(&[
+                point("mem_stray"),
+                point("mem_stray_c1"),
+                point("mem_stray_c2"),
+                point("mem_keep"),
+                point("mem_keep_c1"),
+            ])
+            .unwrap();
+
+        assert_eq!(store.count_memories_for_project("@global").unwrap(), 1);
+        assert_eq!(store.purge_memories_for_project("@global").unwrap(), 1);
+
+        assert!(store.get_memory("mem_stray").unwrap().is_none());
+        assert!(store.get_memory("mem_keep").unwrap().is_some());
+        let mut stmt = store
+            .conn
+            .prepare("SELECT id FROM vectors ORDER BY id")
+            .unwrap();
+        let left: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["mem_keep".to_string(), "mem_keep_c1".to_string()]
+        );
+
+        // Purging a key with nothing under it is a no-op, not an error.
+        assert_eq!(store.purge_memories_for_project("@global").unwrap(), 0);
     }
 
     #[test]

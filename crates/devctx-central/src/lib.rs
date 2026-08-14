@@ -24,7 +24,7 @@ use devctx_memory::{RecallQuery, RecalledMemory, RememberRequest, RememberResult
 use devctx_store::{Memory, ProjectRecord, Store};
 
 pub use client::{CentralClient, ServeInfo};
-pub use config::CentralConfig;
+pub use config::{CentralConfig, Defaults};
 pub use error::{CentralError, Result};
 pub use paths::{CentralPaths, HOME_ENV};
 
@@ -133,9 +133,19 @@ impl Central {
 
     /// Settings for the embedder that owns the global vector space.
     pub fn memory_embed_settings(&self) -> EmbedSettings {
+        // `model_dir` must be carried through: a user-defined ONNX model (e.g.
+        // Granite) cannot be loaded without it, and dropping it here made the
+        // central embedder depend on `DEVCTX_MODEL_DIR` being exported into
+        // whatever process happened to auto-spawn the daemon.
+        let model_dir = if self.config.memory.model_dir.is_empty() {
+            self.config.defaults.embeddings.model_dir.clone()
+        } else {
+            self.config.memory.model_dir.clone()
+        };
         EmbedSettings::from_config(&Embeddings {
             provider: self.config.memory.provider.clone(),
             model: self.config.memory.model.clone(),
+            model_dir,
             ..Default::default()
         })
     }
@@ -164,9 +174,12 @@ impl Central {
     pub fn remember(&self, req: &RememberRequest) -> Result<RememberResult> {
         let embedder = self.embedder()?;
         let mut req = req.clone();
-        // Whatever the caller passed, a memory reaching the central store is
-        // global by definition.
-        req.scope = devctx_memory::SCOPE_GLOBAL.to_string();
+        // A memory reaching the central store is shared: either with one
+        // group of repositories, or with everything. Anything else is
+        // normalized to global.
+        if !(devctx_memory::is_group(&req.scope) && !req.group.is_empty()) {
+            req.scope = devctx_memory::SCOPE_GLOBAL.to_string();
+        }
         Ok(devctx_memory::remember(
             &self.store,
             embedder.as_ref(),
@@ -182,13 +195,25 @@ impl Central {
         repo: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RecalledMemory>> {
+        self.recall_in(devctx_memory::GLOBAL_PROJECT, query, repo, limit)
+    }
+
+    /// Recall from one reserved key of the central store: the global space, or
+    /// a single group's (`@group:<name>`).
+    pub fn recall_in(
+        &self,
+        project_key: &str,
+        query: &str,
+        repo: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RecalledMemory>> {
         let embedder = self.embedder()?;
         Ok(devctx_memory::recall(
             &self.store,
             embedder.as_ref(),
             &RecallQuery {
                 query,
-                project: Some(devctx_memory::GLOBAL_PROJECT),
+                project: Some(project_key),
                 repo,
                 limit,
             },
@@ -369,6 +394,9 @@ impl Central {
                     .map(str::to_string)
                     .unwrap_or_else(|| dir_name(root)),
                 path: root.to_string_lossy().into_owned(),
+                // Group membership is a deliberate statement about a product,
+                // not something a new repository should inherit by accident.
+                group: String::new(),
             },
             embeddings: self.config.defaults.embeddings.clone(),
             reranking: self.config.defaults.reranking.clone(),
@@ -487,6 +515,7 @@ mod tests {
             project: Project {
                 name: name.to_string(),
                 path: root.to_string_lossy().into_owned(),
+                group: String::new(),
             },
             embeddings: devctx_core::config::Embeddings {
                 model: model.to_string(),

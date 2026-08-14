@@ -81,8 +81,9 @@ struct RememberReq {
     /// Comma-separated tags (optional).
     #[serde(default)]
     tags: Option<String>,
-    /// Where the memory belongs: "local" (this project, the default) or
-    /// "global" (the central store, recallable from every other project).
+    /// Where the memory belongs: "local" (this repository, the default),
+    /// "group" (every repository of this product — see `project.group`), or
+    /// "global" (every project on the machine).
     #[serde(default)]
     scope: Option<String>,
 }
@@ -96,7 +97,9 @@ struct RecallReq {
     /// Maximum results (default 5).
     #[serde(default)]
     limit: Option<usize>,
-    /// Which memories to search: "local", "global", or "all" (the default).
+    /// Which memories to search: "local" (this repository), "group" (this
+    /// product's repositories), "global" (every project), or "all" — the
+    /// default, which searches every tier that applies and fuses them by rank.
     #[serde(default)]
     scope: Option<String>,
     /// Only global memories contributed by this repository (see list_projects).
@@ -295,9 +298,20 @@ impl DevctxServer {
     /// Save a memory (decision, insight, note) for later recall.
     #[tool(
         description = "Save a memory (decision/insight/note/bug/…) so it can be \
-        recalled across sessions. Deduplicated by topic key or content. Use \
-        scope=\"global\" for a lesson worth carrying to other projects; it is \
-        then deduplicated across all of them."
+        recalled across sessions. Deduplicated by topic key or content.\n\n\
+        Pick the scope by asking who needs this later:\n\
+        · \"local\" (default) — true of this repository only: a file, a \
+        symbol, a fix in this codebase.\n\
+        · \"group\" — true of this product, whose repositories are listed by \
+        list_projects and share a `project.group`. A backend contract the \
+        frontend must honour, a decision spanning services, a bug whose cause \
+        is in one repo and whose symptom is in another. If the project belongs \
+        to a group, this is usually the right answer for anything a sibling \
+        repository would want.\n\
+        · \"global\" — true regardless of project: a lesson about a language, \
+        a tool, a way of working. Rare. Everything saved here is recalled by \
+        every unrelated project forever, so prefer \"group\" when the knowledge \
+        is about one product."
     )]
     async fn remember(
         &self,
@@ -319,9 +333,12 @@ impl DevctxServer {
 
     /// Recall memories relevant to a query.
     #[tool(description = "Recall previously saved memories relevant to a query \
-        (semantic + intro/chunk blend). Searches this project and the shared \
-        central store by default; each hit is tagged with the scope it came \
-        from. Returns JSON.")]
+        (semantic + intro/chunk blend). Searches every tier by default — this \
+        repository, this product's group, and the global store — and tags each \
+        hit with the one it came from. When the budget cannot fit them all, the \
+        least relevant are dropped and their titles are returned under \
+        omitted_for_budget, so ask again with a narrower query if one of those \
+        titles is what you needed. Returns JSON.")]
     async fn recall(&self, Parameters(req): Parameters<RecallReq>) -> Result<String, ErrorData> {
         // Global memories are written down because they outlive the project that
         // learned them, so an unbound session can still reach them. Only the
@@ -397,7 +414,7 @@ impl DevctxServer {
         // tells an agent which projects exist and what to bind to.
         match self.maybe_bound() {
             Some(backend) => run_blocking(move || backend.list_projects(all)).await,
-            None => run_blocking(move || state::do_list_projects(all)).await,
+            None => run_blocking(move || state::do_list_projects(None, "", all)).await,
         }
     }
 
@@ -536,7 +553,17 @@ where
 /// its shared server when there is one, else own the database here.
 pub fn backend_for(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Result<Backend> {
     Ok(match server {
-        Some(conn) => Backend::remote(conn),
+        Some(conn) => Backend::remote(
+            conn,
+            crate::backend::ProjectIdentity {
+                name: if cfg.project.name.is_empty() {
+                    "default".to_string()
+                } else {
+                    cfg.project.name.clone()
+                },
+                group: cfg.project.group.clone(),
+            },
+        ),
         None => Backend::local(Arc::new(AppState::build(cfg)?)),
     })
 }

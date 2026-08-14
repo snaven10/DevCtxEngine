@@ -23,6 +23,16 @@ pub struct Memory {
     /// Model key used to embed global memories.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Directory holding a user-defined ONNX model (e.g. Granite). Empty falls
+    /// back to `defaults.embeddings.model_dir`, then to `DEVCTX_MODEL_DIR`.
+    ///
+    /// Without this the central embedder could only be pointed at a
+    /// user-defined model through the environment, so a daemon auto-spawned by
+    /// a process that lacked the variable silently fell back to the default
+    /// model — embedding queries in a different vector space than the stored
+    /// memories, with no error because the dimensions matched.
+    #[serde(default)]
+    pub model_dir: String,
 }
 
 impl Default for Memory {
@@ -30,6 +40,7 @@ impl Default for Memory {
         Self {
             provider: default_provider(),
             model: default_model(),
+            model_dir: String::new(),
         }
     }
 }

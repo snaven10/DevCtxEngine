@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn hnsw_index_supports_search_insert_delete() {
         let store = Store::open_in_memory(DIM).unwrap();
-        if !store.enable_hnsw().unwrap() {
+        if !store.enable_hnsw("cosine").unwrap() {
             return; // VSS extension unavailable (e.g. offline): brute-force path.
         }
         store
@@ -115,7 +115,19 @@ mod tests {
         assert_eq!(store.count(&SearchFilter::default()).unwrap(), 1);
 
         // enable_hnsw is idempotent.
-        assert!(store.enable_hnsw().unwrap());
+        assert!(store.enable_hnsw("cosine").unwrap());
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+
+        // Switching metric replaces the index rather than leaving both, and the
+        // search follows it: a distance function that disagrees with the index
+        // would quietly stop using it.
+        assert!(store.enable_hnsw("ip").unwrap());
+        assert_eq!(store.hnsw_metric().as_deref(), Some("ip"));
+        let hits = store
+            .search(&[0.0, 0.0, 1.0], &SearchFilter::default(), 2)
+            .unwrap();
+        assert_eq!(hits[0].point.id, "a", "unit vectors rank the same under ip");
+        assert!(hits[0].score > 0.99, "score was {}", hits[0].score);
     }
 
     #[test]

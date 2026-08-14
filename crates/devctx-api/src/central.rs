@@ -240,6 +240,9 @@ struct RememberBody {
     repo: String,
     #[serde(default)]
     branch: String,
+    /// Group to share this memory with. Empty means the global space.
+    #[serde(default)]
+    group: String,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +253,9 @@ struct RecallBody {
     /// Narrow to memories contributed by one repository.
     #[serde(default)]
     repo: Option<String>,
+    /// Recall from one group's space instead of the global one.
+    #[serde(default)]
+    group: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -369,6 +375,12 @@ async fn remember(State(api): State<CentralApi>, Json(b): Json<RememberBody>) ->
                 repo: b.repo,
                 branch: b.branch,
                 now: devctx_central::now_stamp(),
+                scope: if b.group.is_empty() {
+                    String::new()
+                } else {
+                    devctx_memory::SCOPE_GROUP.to_string()
+                },
+                group: b.group,
                 ..Default::default()
             })
             .map_err(|e| e.to_string())?;
@@ -388,9 +400,20 @@ async fn remember(State(api): State<CentralApi>, Json(b): Json<RememberBody>) ->
 
 async fn recall(State(api): State<CentralApi>, Json(b): Json<RecallBody>) -> Response {
     run(api, move |c| {
-        let hits = c
-            .recall(&b.query, b.repo.as_deref(), b.limit.unwrap_or(5))
-            .map_err(|e| e.to_string())?;
+        let limit = b.limit.unwrap_or(5);
+        let hits = match b.group.as_deref().filter(|g| !g.is_empty()) {
+            Some(g) => c
+                .recall_in(
+                    &devctx_memory::group_project(g),
+                    &b.query,
+                    b.repo.as_deref(),
+                    limit,
+                )
+                .map_err(|e| e.to_string())?,
+            None => c
+                .recall(&b.query, b.repo.as_deref(), limit)
+                .map_err(|e| e.to_string())?,
+        };
         Ok(json!({
             "memories": hits.iter().map(|h| json!({
                 "id": h.memory.id,

@@ -47,7 +47,9 @@ impl SharedProgress {
     /// counter for a progress bar, not part of the work. Recover and carry on,
     /// the same way [`AppState::checkpoint`] does.
     fn lock(&self) -> std::sync::MutexGuard<'_, IndexProgress> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Mark the run finished, keeping the final counts for whoever polls last.
@@ -217,13 +219,19 @@ impl AppState {
     pub fn release_idle_models(&self, max_idle: Duration) -> Vec<&'static str> {
         let mut released = Vec::new();
         if let Ok(mut guard) = self.embedder.lock() {
-            if guard.as_ref().is_some_and(|c| c.last_used.elapsed() >= max_idle) {
+            if guard
+                .as_ref()
+                .is_some_and(|c| c.last_used.elapsed() >= max_idle)
+            {
                 *guard = None;
                 released.push("embedding model");
             }
         }
         if let Ok(mut guard) = self.reranker.lock() {
-            if guard.as_ref().is_some_and(|c| c.last_used.elapsed() >= max_idle) {
+            if guard
+                .as_ref()
+                .is_some_and(|c| c.last_used.elapsed() >= max_idle)
+            {
                 *guard = None;
                 released.push("reranker");
             }
@@ -261,12 +269,17 @@ impl AppState {
     }
 
     /// Project name for memory scoping.
-    fn project(&self) -> String {
+    pub fn project(&self) -> String {
         if self.cfg.project.name.is_empty() {
             "default".to_string()
         } else {
             self.cfg.project.name.clone()
         }
+    }
+
+    /// The group this repository belongs to, empty when it stands alone.
+    pub fn group_name(&self) -> String {
+        self.cfg.project.group.clone()
     }
 
     /// The short repo name + branch (for graph queries), from git.
@@ -364,7 +377,65 @@ pub fn do_read_file(
     let full = state.root.join(path);
     let content =
         std::fs::read_to_string(&full).map_err(|e| format!("reading {}: {e}", full.display()))?;
-    Ok(slice_lines(&content, start_line, end_line))
+    // A caller that named a range has already decided how much it wants; capping
+    // that would silently deliver less than was asked for. The budget exists for
+    // the blind case — "read this file" against something that turns out to be
+    // twenty thousand lines, which arrives as a six-figure token bill nobody
+    // chose to pay.
+    if start_line.is_some() || end_line.is_some() {
+        return Ok(slice_lines(&content, start_line, end_line));
+    }
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    Ok(cap_whole_file(&content, budget))
+}
+
+/// Characters per token, roughly, for budgeting. Deliberately crude: the cost of
+/// a real tokenizer here is not worth the precision, and the budget is a guard
+/// rail rather than an accounting figure.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Read a `usize` from the environment, falling back when absent or unparseable.
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Default budget for a whole-file read, in tokens. `0` disables the cap.
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8000;
+
+/// Trim a whole-file read to the output budget, on line boundaries.
+///
+/// Cut *lines*, never bytes: a fragment of a line is unreadable as code, and the
+/// line numbers of what survives have to stay meaningful for the follow-up range
+/// request. The trailing note carries the file's real length, which is the one
+/// fact the caller needs to ask for the rest — without it a truncated read looks
+/// exactly like a short file, and an agent reasons on half a class believing it
+/// has seen all of it.
+/// `budget_tokens` is passed in rather than read here: the environment is
+/// process-global, and tests that set it race each other.
+fn cap_whole_file(content: &str, budget_tokens: usize) -> String {
+    if budget_tokens == 0 || content.len() <= budget_tokens * CHARS_PER_TOKEN {
+        return content.to_string();
+    }
+    let budget = budget_tokens * CHARS_PER_TOKEN;
+    let mut out = String::with_capacity(budget + 160);
+    let mut kept = 0usize;
+    for line in content.lines() {
+        if out.len() + line.len() + 1 > budget {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        kept += 1;
+    }
+    let total = content.lines().count();
+    out.push_str(&format!(
+        "\n[devctx] truncated: lines 1-{kept} of {total}. \
+         Request the rest with start_line/end_line.\n"
+    ));
+    out
 }
 
 /// `index_repo` tool: run the pipeline and return a summary.
@@ -422,6 +493,20 @@ fn do_index_inner(
 /// database. It is polled *while* an index is running, so anything heavier
 /// would queue behind the very work it reports on and arrive too late to be
 /// worth reporting.
+impl AppState {
+    /// Whether an indexing run is in flight right now.
+    ///
+    /// The idle watchdog asks before shutting the server down: indexing happens
+    /// *inside* the server, so a run whose client has stopped asking about it is
+    /// still real work, and exiting would throw away everything it has done.
+    pub fn is_indexing(&self) -> bool {
+        self.index_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .running
+    }
+}
+
 pub fn do_index_progress(state: &AppState) -> Result<String, String> {
     let p = state
         .index_progress
@@ -649,7 +734,31 @@ pub fn report_index(store: &Store, root: &std::path::Path, res: &devctx_index::I
         .index_totals(&repo_path, &res.branch)
         .unwrap_or((0, 0, 0));
     if let Ok(c) = central() {
-        let _ = c.record_index(&repo_path, &res.commit, &res.branch, files, symbols, chunks);
+        if c.record_index(&repo_path, &res.commit, &res.branch, files, symbols, chunks)
+            .is_ok()
+        {
+            return;
+        }
+    }
+    // No daemon to route through — `DEVCTX_NO_AUTOSERVE`, or one that refused to
+    // start. Opening the central store here is safe precisely because nothing
+    // else holds it, and the alternative is worse than it sounds: the registry
+    // keeps reporting "never indexed" for a fully indexed project, which reads
+    // as a broken index rather than an unsent report.
+    let stats = devctx_store::ProjectIndexStats {
+        commit: res.commit.clone(),
+        branch: res.branch.clone(),
+        files,
+        symbols,
+        chunks,
+    };
+    match devctx_central::Central::open() {
+        Ok(central) => {
+            if let Err(e) = central.record_index(&repo_path, &stats, &devctx_central::now_stamp()) {
+                eprintln!("warning: could not record the index in the central registry: {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: could not record the index in the central registry: {e}"),
     }
 }
 
@@ -804,22 +913,51 @@ pub fn do_search_project(
 ///
 /// This is what lets an agent working in one repo discover the others without
 /// being told they exist.
-pub fn do_list_projects(include_inactive: bool) -> Result<String, String> {
+pub fn do_list_projects(
+    project: Option<&str>,
+    group: &str,
+    include_inactive: bool,
+) -> Result<String, String> {
     let projects = central()?
         .list(include_inactive)
         .map_err(|e| e.to_string())?;
-    serde_json::to_string_pretty(&json!({ "projects": projects })).map_err(|e| e.to_string())
+    // Which project is bound, and what group it belongs to, decide where a
+    // memory should be saved — and until now nothing reported either, so an
+    // agent had to guess a scope it could not see the options for.
+    let bound = project.map(|name| {
+        json!({
+            "project": name,
+            "group": group,
+            "remember_hint": if group.is_empty() {
+                "This repository is in no group: use scope=\"local\" unless the \
+                 lesson is true of every project, which is scope=\"global\"."
+                    .to_string()
+            } else {
+                format!(
+                    "This repository belongs to group `{group}`: save with \
+                     scope=\"group\" anything a sibling repository of that \
+                     product would need, scope=\"local\" for what is true only \
+                     here, and scope=\"global\" only for what holds beyond this \
+                     product."
+                )
+            },
+        })
+    });
+    serde_json::to_string_pretty(&json!({ "projects": projects, "bound": bound }))
+        .map_err(|e| e.to_string())
 }
 
-/// `remember` with `scope: global`: store in the shared central memory instead
-/// of this project's, so every other project can recall it.
-pub fn do_remember_global(
+/// `remember` with `scope: global` or `scope: group`: store in the shared
+/// central memory instead of this project's, so the other repositories — the
+/// group's, or every one of them — can recall it.
+pub fn do_remember_shared(
     state: &AppState,
     content: &str,
     title: &str,
     memory_type: &str,
     topic: &str,
     tags: &str,
+    group: &str,
 ) -> Result<String, String> {
     let project = state.project();
     let (repo, branch) = state.repo_branch().unwrap_or_default();
@@ -841,6 +979,7 @@ pub fn do_remember_global(
             &project,
             &repo,
             &branch,
+            group,
         )
         .map_err(|e| e.to_string())?;
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
@@ -856,8 +995,12 @@ pub fn do_recall_scoped(
     scope: &str,
     repo: Option<&str>,
 ) -> Result<String, String> {
-    let want_local = scope != "global";
-    let want_global = scope != "local";
+    // Anything that is not one single tier means "every tier", preserving the
+    // permissive default an unset or unknown scope has always had.
+    let every = !matches!(scope, "local" | "global" | "group");
+    let want_local = every || scope == "local";
+    let want_global = every || scope == "global";
+    let want_group = (every || scope == "group") && !state.group_name().is_empty();
 
     let local: Vec<Value> = if want_local {
         let store = state.open_store()?;
@@ -894,8 +1037,27 @@ pub fn do_recall_scoped(
         Vec::new()
     };
 
-    let fused = fuse_by_rank(vec![(local, "local"), (global, "global")], limit);
-    serde_json::to_string_pretty(&json!({ "memories": fused })).map_err(|e| e.to_string())
+    let group: Vec<Value> = if want_group {
+        central()?
+            .recall_scoped(query, limit, repo, Some(&state.group_name()))
+            .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+
+    let fused = fuse_by_rank(
+        vec![(local, "local"), (group, "group"), (global, "global")],
+        limit,
+    );
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (fused, dropped) = fit_memories(fused, budget, |content, target| {
+        do_summarize(state, content, Some(query.to_string()), target).ok()
+    });
+    serde_json::to_string_pretty(&json!({
+        "memories": fused,
+        "omitted_for_budget": { "count": dropped.len(), "titles": dropped },
+    }))
+    .map_err(|e| e.to_string())
 }
 
 /// Recall from the central store alone, for a session with no project bound.
@@ -907,7 +1069,131 @@ pub fn do_recall_global(query: &str, limit: usize, repo: Option<&str>) -> Result
         .recall(query, limit, repo)
         .map_err(|e| e.to_string())?;
     let tagged = fuse_by_rank(vec![(global, "global")], limit);
-    serde_json::to_string_pretty(&json!({ "memories": tagged })).map_err(|e| e.to_string())
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    // No project is bound here, so there is no embedder to summarize with: the
+    // fallback truncation is the only option, and says so.
+    let (tagged, dropped) = fit_memories(tagged, budget, |_, _| None);
+    serde_json::to_string_pretty(&json!({
+        "memories": tagged,
+        "omitted_for_budget": { "count": dropped.len(), "titles": dropped },
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// Fit ranked memories into the output budget, returning what survived and the
+/// titles of what did not.
+///
+/// The budget is split evenly across the memories rather than spent on the
+/// first ones: a memory that fits its share arrives byte-for-byte, and one that
+/// does not is summarized against the caller's own query — prose is exactly
+/// what an extractive summary handles well, and losing a memory whole loses
+/// more than abridging it.
+///
+/// Summaries are capped ([`MAX_SUMMARIES`]) because each costs an embedding
+/// pass over the text — seconds, not milliseconds. Past the cap, memories are
+/// dropped rather than silently making every recall slow, and their **titles**
+/// come back with the count: a title is enough for the caller to decide whether
+/// it needs to ask for that one specifically, which a bare number is not.
+fn fit_memories(
+    memories: Vec<Value>,
+    budget_tokens: usize,
+    shorten: impl Fn(&str, usize) -> Option<String>,
+) -> (Vec<Value>, Vec<String>) {
+    if budget_tokens == 0 || memories.is_empty() {
+        return (memories, Vec::new());
+    }
+    // Below this a "share" is too small to say anything useful, so a long tail
+    // of memories yields to a few readable ones rather than all being minced.
+    const MIN_SHARE_TOKENS: usize = 128;
+    let share = (budget_tokens / memories.len()).max(MIN_SHARE_TOKENS);
+
+    let mut kept: Vec<Value> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    let mut summaries = 0usize;
+    for m in memories {
+        let cost = m
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(|c| c.len() / CHARS_PER_TOKEN)
+            .unwrap_or(0);
+        if cost <= share {
+            kept.push(m);
+            continue;
+        }
+        if summaries < MAX_SUMMARIES {
+            summaries += 1;
+            kept.push(shorten_memory(m, share, &shorten));
+            continue;
+        }
+        dropped.push(memory_label(&m));
+    }
+    (kept, dropped)
+}
+
+/// How many memories one recall may summarize before it starts dropping them.
+const MAX_SUMMARIES: usize = 3;
+
+/// A memory's title, or its id when it has none — what a caller needs to ask
+/// for it by name.
+fn memory_label(m: &Value) -> String {
+    let field = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let title = field("title");
+    if title.is_empty() {
+        let id = field("id");
+        if id.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            id
+        }
+    } else {
+        title
+    }
+}
+
+/// Shrink one memory to `share` tokens, summarizing when that is possible.
+///
+/// Truncation is the fallback for when there is no summarizer to hand — an
+/// unbound session, a provider that refused — because something readable beats
+/// an error. Either way the memory says which happened: a shortened memory that
+/// looked complete would be read as the whole argument, and acted on as one.
+fn shorten_memory(
+    mut m: Value,
+    share_tokens: usize,
+    shorten: &impl Fn(&str, usize) -> Option<String>,
+) -> Value {
+    let budget = share_tokens * CHARS_PER_TOKEN;
+    let Some(obj) = m.as_object_mut() else {
+        return m;
+    };
+    let Some(content) = obj.get("content").and_then(|c| c.as_str()) else {
+        return m;
+    };
+    // Leave room for the note itself.
+    let target = share_tokens.saturating_sub(40).max(1);
+    if let Some(summary) = shorten(content, target) {
+        // The summarizer may overshoot its target; the budget is the promise.
+        let summary = if summary.len() > budget {
+            summary.chars().take(budget).collect()
+        } else {
+            summary
+        };
+        let marked = format!(
+            "{summary}\n\n[devctx] summarized: this memory exceeded its share of the output budget.\n"
+        );
+        obj.insert("content".to_string(), json!(marked));
+        return m;
+    }
+    let mut out = String::with_capacity(budget + 96);
+    for line in content.lines() {
+        if out.len() + line.len() + 1 > budget {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("\n[devctx] truncated: this memory exceeded its share of the output budget.\n");
+    obj.insert("content".to_string(), json!(out));
+    m
 }
 
 /// Fuse labelled result lists by rank, tagging each survivor with the scope it
@@ -1116,6 +1402,130 @@ fn slice_lines(content: &str, start: Option<usize>, end: Option<usize>) -> Strin
 mod tests {
     use super::*;
     use devctx_core::{VectorMetadata, VectorPoint};
+
+    fn mem(id: &str, content_len: usize) -> Value {
+        json!({ "id": id, "title": id, "content": "x".repeat(content_len) })
+    }
+
+    /// Under budget, nothing is touched and nothing is reported missing.
+    #[test]
+    fn memories_that_fit_are_all_returned() {
+        let (kept, dropped) = fit_memories(vec![mem("a", 100), mem("b", 100)], 8000, |_, _| None);
+        assert_eq!(kept.len(), 2);
+        assert!(dropped.is_empty());
+        assert_eq!(kept[0]["content"].as_str().unwrap(), "x".repeat(100));
+    }
+
+    /// The budget is shared out, so a memory within its slice survives intact
+    /// even when a *later* one is enormous — the first ones no longer eat the
+    /// whole allowance.
+    #[test]
+    fn a_memory_within_its_share_is_untouched_however_big_its_neighbours_are() {
+        let mems = vec![mem("small", 100), mem("huge", 200_000)];
+        let (kept, dropped) = fit_memories(mems, 8000, |_, _| Some("gist".into()));
+        assert_eq!(kept.len(), 2, "both come back");
+        assert!(dropped.is_empty());
+        assert_eq!(kept[0]["content"].as_str().unwrap(), "x".repeat(100));
+        assert!(kept[1]["content"].as_str().unwrap().starts_with("gist"));
+    }
+
+    /// Past the summary cap, memories are dropped rather than making every
+    /// recall pay for another embedding pass — and their titles come back, so
+    /// the caller can ask for one by name instead of guessing what it missed.
+    #[test]
+    fn beyond_the_cap_memories_are_dropped_and_named() {
+        let big = 200_000;
+        let mems: Vec<Value> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|n| mem(n, big))
+            .collect();
+        let calls = std::cell::Cell::new(0);
+        let (kept, dropped) = fit_memories(mems, 8000, |_, _| {
+            calls.set(calls.get() + 1);
+            Some("gist".into())
+        });
+        assert_eq!(calls.get(), MAX_SUMMARIES, "the cap bounds the cost");
+        assert_eq!(kept.len(), MAX_SUMMARIES);
+        assert_eq!(dropped, vec!["d".to_string(), "e".to_string()]);
+    }
+
+    /// With no summarizer, an oversized memory is truncated and says so — the
+    /// two outcomes must never look alike.
+    #[test]
+    fn without_a_summarizer_an_oversized_memory_is_truncated_and_says_so() {
+        let big = json!({ "id": "a", "title": "a", "content": "line\n".repeat(5000) });
+        let (kept, dropped) = fit_memories(vec![big], 200, |_, _| None);
+        assert!(dropped.is_empty());
+        let content = kept[0]["content"].as_str().unwrap();
+        assert!(content.contains("[devctx] truncated"), "{content:?}");
+        assert!(!content.contains("summarized"));
+    }
+
+    /// With one, it is summarized against the caller's query instead — the
+    /// difference between "the first paragraph" and "what this says about what
+    /// you asked".
+    #[test]
+    fn an_oversized_memory_is_summarized_when_a_summarizer_exists() {
+        let big = json!({ "id": "a", "title": "a", "content": "line\n".repeat(5000) });
+        let (kept, _) = fit_memories(vec![big], 200, |content, target| {
+            assert!(!content.is_empty());
+            assert!(target > 0, "the summarizer needs room for the note");
+            Some("the gist of the whole thing".to_string())
+        });
+        let content = kept[0]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("the gist of the whole thing"),
+            "{content:?}"
+        );
+        assert!(content.contains("[devctx] summarized"), "{content:?}");
+        assert!(!content.contains("truncated"), "must not claim it was cut");
+    }
+
+    /// A memory with no title falls back to its id: the point of the list is to
+    /// be able to ask for one, and an empty string cannot be asked for.
+    #[test]
+    fn a_dropped_memory_without_a_title_is_named_by_id() {
+        assert_eq!(
+            memory_label(&json!({ "id": "mem_x", "title": "" })),
+            "mem_x"
+        );
+        assert_eq!(memory_label(&json!({ "title": "T" })), "T");
+    }
+
+    /// A file that fits comes back byte-for-byte: the cap must be invisible
+    /// until it is needed.
+    #[test]
+    fn a_small_file_is_returned_whole() {
+        let src = "fn main() {\n    println!(\"hi\");\n}\n";
+        assert_eq!(cap_whole_file(src, 8000), src);
+    }
+
+    /// Over budget, the cut lands on a line boundary and the note carries the
+    /// file's real length — the one fact needed to ask for the rest.
+    #[test]
+    fn an_oversized_file_is_cut_on_a_line_and_says_what_is_missing() {
+        let src: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let out = cap_whole_file(&src, 10); // ~40 chars
+
+        let body: Vec<&str> = out.lines().take_while(|l| l.starts_with("line ")).collect();
+        assert!(!body.is_empty(), "kept nothing");
+        assert!(body.len() < 200, "kept everything: {}", body.len());
+        // Whole lines only — never a fragment of one.
+        assert_eq!(body[0], "line 1");
+        assert_eq!(body[body.len() - 1], format!("line {}", body.len()));
+        assert!(out.contains("of 200"), "note must carry the total: {out:?}");
+        assert!(
+            out.contains("start_line"),
+            "note must say how to get the rest"
+        );
+    }
+
+    /// `0` is the escape hatch for anyone who wants the old behaviour back.
+    #[test]
+    fn a_zero_budget_disables_the_cap() {
+        let src: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+        assert_eq!(cap_whole_file(&src, 0), src);
+    }
 
     /// The timestamp is the whole mechanism behind
     /// [`AppState::release_idle_models`]: a model handed out again has to look

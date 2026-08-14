@@ -46,6 +46,15 @@ pub struct Project {
     /// Absolute path to the project root.
     #[serde(default)]
     pub path: String,
+    /// Group this repository belongs to: a product built from several
+    /// repositories that share knowledge without it being universal.
+    ///
+    /// A four-repository product has memories that are neither `local` (a
+    /// sibling repo needs them) nor `global` (an unrelated project does not).
+    /// Naming the group here puts them in a tier of their own. Empty means the
+    /// repository stands alone and only `local`/`global` apply.
+    #[serde(default)]
+    pub group: String,
 }
 
 /// `embeddings:` section.
@@ -87,6 +96,10 @@ fn default_model() -> String {
     "minilm-l6".to_string()
 }
 
+fn default_metric() -> String {
+    "cosine".to_string()
+}
+
 /// `storage:` section. Solo-local: a single DuckDB file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Storage {
@@ -97,6 +110,16 @@ pub struct Storage {
     /// indexing (requires the DuckDB VSS extension). Off => brute-force cosine.
     #[serde(default)]
     pub hnsw: bool,
+    /// Distance metric for the HNSW index: `cosine` (default) or `ip`.
+    ///
+    /// `ip` (inner product) skips the norm computation cosine pays on every
+    /// comparison, so it is measurably cheaper — but the two only rank
+    /// identically when the embeddings are **unit-normalized**. The local
+    /// providers normalize; an API or custom provider that does not would
+    /// silently rank by magnitude instead of direction, which is why this is
+    /// opt-in rather than the default.
+    #[serde(default = "default_metric")]
+    pub metric: String,
     /// Build a BM25 full-text index over chunk text after indexing, enabling
     /// `search --keyword` (requires the DuckDB FTS extension).
     #[serde(default)]

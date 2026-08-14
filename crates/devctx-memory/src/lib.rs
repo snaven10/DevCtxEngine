@@ -36,15 +36,39 @@ pub const SCOPE_GLOBAL: &str = "global";
 /// repository that contributed one stays in `repo` as provenance.
 pub const GLOBAL_PROJECT: &str = "@global";
 
+/// Scope value for a memory shared by the repositories of one product.
+pub const SCOPE_GROUP: &str = "group";
+
+/// Prefix of the reserved `project` value for group-scoped memories.
+///
+/// Group rows live in the central store beside the global ones, keyed
+/// `@group:<name>` so each product's shared knowledge stays its own space:
+/// deduplication still collapses the same lesson learned in two sibling
+/// repositories, without leaking it to unrelated projects the way `@global`
+/// does.
+pub const GROUP_PREFIX: &str = "@group:";
+
 /// Whether a scope string means "global" (`shared` is the legacy spelling).
 pub fn is_global(scope: &str) -> bool {
     scope == SCOPE_GLOBAL || scope == "shared"
+}
+
+/// Whether a scope string means "shared within a group".
+pub fn is_group(scope: &str) -> bool {
+    scope == SCOPE_GROUP
+}
+
+/// The reserved `project` key holding one group's memories.
+pub fn group_project(group: &str) -> String {
+    format!("{GROUP_PREFIX}{group}")
 }
 
 /// The `project` a memory is stored under, given its requested scope.
 fn identity_project(req: &RememberRequest) -> String {
     if is_global(&req.scope) {
         GLOBAL_PROJECT.to_string()
+    } else if is_group(&req.scope) && !req.group.is_empty() {
+        group_project(&req.group)
     } else {
         req.project.clone()
     }
@@ -94,8 +118,10 @@ pub struct RememberRequest {
     pub topic_key: String,
     /// Comma-separated tags.
     pub tags: String,
-    /// Scope (`shared`/`local`).
+    /// Scope (`local`/`group`/`global`; `shared` is the legacy spelling of global).
     pub scope: String,
+    /// Group name, used when `scope` is `group`. Empty otherwise.
+    pub group: String,
     /// Author.
     pub author: String,
     /// Repo.
@@ -587,6 +613,39 @@ mod tests {
         );
         assert_eq!(b.memory.id, a.memory.id);
         assert_eq!(store.memory_stats(GLOBAL_PROJECT).unwrap().total, 1);
+    }
+
+    /// A group is a tier of its own: two repositories of one product converge
+    /// on a single row, and that row stays out of the global space.
+    #[test]
+    fn group_memories_converge_within_the_group_and_stay_out_of_global() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mk = |project: &str, group: &str| RememberRequest {
+            title: "Order ids".into(),
+            content: "order ids are minted by the billing service".into(),
+            memory_type: "insight".into(),
+            project: project.into(),
+            repo: project.into(),
+            scope: SCOPE_GROUP.into(),
+            group: group.into(),
+            now: "100".into(),
+            ..Default::default()
+        };
+
+        let a = remember(&store, &KwEmbedder, &mk("shop-api", "shop")).unwrap();
+        assert_eq!(a.status, RememberStatus::Created);
+        assert_eq!(a.memory.project, group_project("shop"));
+        assert_eq!(a.memory.repo, "shop-api", "provenance preserved");
+
+        // The sibling repository contributes the same lesson: one row, not two.
+        let b = remember(&store, &KwEmbedder, &mk("shop-web", "shop")).unwrap();
+        assert_eq!(b.status, RememberStatus::Duplicate);
+        assert_eq!(b.memory.id, a.memory.id);
+        assert_eq!(store.memory_stats(&group_project("shop")).unwrap().total, 1);
+
+        // An unrelated product must not see it, and neither must the global space.
+        assert_eq!(store.memory_stats(&group_project("crm")).unwrap().total, 0);
+        assert_eq!(store.memory_stats(GLOBAL_PROJECT).unwrap().total, 0);
     }
 
     /// Local memories keep their per-project identity, so the same note in two

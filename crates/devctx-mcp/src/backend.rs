@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::state::{
     do_impact, do_index, do_index_status, do_list_projects, do_memory_stats, do_read_file,
-    do_recall_scoped, do_references, do_remember, do_remember_global, do_routes_for_handler,
+    do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
     do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
 };
 
@@ -82,7 +82,18 @@ fn read(r: Result<ureq::Response, ureq::Error>) -> Result<String, String> {
 /// Where the MCP tools run: locally (owns the DB) or via a shared server.
 pub enum Backend {
     Local(Arc<AppState>),
-    Remote(RemoteClient),
+    /// Routed to a shared server. The project's identity travels with it:
+    /// the server owns the database, but *which* project this session is in —
+    /// and the group it belongs to — is what decides where a memory is saved,
+    /// and the HTTP client alone cannot answer it.
+    Remote(RemoteClient, ProjectIdentity),
+}
+
+/// The bound project as the agent needs to see it.
+#[derive(Clone, Default)]
+pub struct ProjectIdentity {
+    pub name: String,
+    pub group: String,
 }
 
 impl Backend {
@@ -90,11 +101,14 @@ impl Backend {
         Backend::Local(state)
     }
 
-    pub fn remote(conn: ServerConn) -> Self {
-        Backend::Remote(RemoteClient {
-            base: conn.base,
-            token: conn.token,
-        })
+    pub fn remote(conn: ServerConn, identity: ProjectIdentity) -> Self {
+        Backend::Remote(
+            RemoteClient {
+                base: conn.base,
+                token: conn.token,
+            },
+            identity,
+        )
     }
 
     pub fn search(
@@ -114,7 +128,7 @@ impl Backend {
                 parse_mode(mode.as_deref()),
                 rerank,
             ),
-            Backend::Remote(r) => r.post(
+            Backend::Remote(r, _) => r.post(
                 "/search",
                 json!({ "query": query, "limit": limit, "language": language,
                         "mode": mode.unwrap_or_else(|| "vector".into()), "rerank": rerank }),
@@ -149,7 +163,7 @@ impl Backend {
     ) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_read_file(s, path, start, end),
-            Backend::Remote(r) => r.post(
+            Backend::Remote(r, _) => r.post(
                 "/read_file",
                 json!({ "path": path, "start_line": start, "end_line": end }),
             ),
@@ -159,14 +173,14 @@ impl Backend {
     pub fn index(&self, full: bool) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_index(s, full),
-            Backend::Remote(r) => r.post("/index", json!({ "full": full })),
+            Backend::Remote(r, _) => r.post("/index", json!({ "full": full })),
         }
     }
 
     pub fn index_status(&self) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_index_status(s),
-            Backend::Remote(r) => r.get("/status"),
+            Backend::Remote(r, _) => r.get("/status"),
         }
     }
 
@@ -180,13 +194,20 @@ impl Backend {
         tags: String,
         scope: String,
     ) -> Result<String, String> {
-        let global = devctx_memory::is_global(&scope);
+        // `group` routes to the central store like `global` does, but into the
+        // space of the product this repository belongs to.
+        let shared = devctx_memory::is_global(&scope) || devctx_memory::is_group(&scope);
         match self {
-            Backend::Local(s) if global => {
-                do_remember_global(s, &content, &title, &memory_type, &topic, &tags)
+            Backend::Local(s) if shared => {
+                let group = if devctx_memory::is_group(&scope) {
+                    s.group_name()
+                } else {
+                    String::new()
+                };
+                do_remember_shared(s, &content, &title, &memory_type, &topic, &tags, &group)
             }
             Backend::Local(s) => do_remember(s, content, title, memory_type, topic, tags),
-            Backend::Remote(r) => r.post(
+            Backend::Remote(r, _) => r.post(
                 "/remember",
                 json!({ "content": content, "title": title, "type": memory_type,
                         "topic": topic, "tags": tags, "scope": scope }),
@@ -203,7 +224,7 @@ impl Backend {
     ) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_recall_scoped(s, query, limit, scope, repo),
-            Backend::Remote(r) => r.post(
+            Backend::Remote(r, _) => r.post(
                 "/recall",
                 json!({ "query": query, "limit": limit, "scope": scope, "repo": repo }),
             ),
@@ -213,27 +234,34 @@ impl Backend {
     /// The project registry. Independent of which project this session is in —
     /// both backends ask the central daemon, since neither may open its database.
     pub fn list_projects(&self, include_inactive: bool) -> Result<String, String> {
-        do_list_projects(include_inactive)
+        // The bound project travels with the answer so the agent can see which
+        // group it is in — the fact that decides where a memory belongs.
+        match self {
+            Backend::Local(s) => {
+                do_list_projects(Some(&s.project()), &s.group_name(), include_inactive)
+            }
+            Backend::Remote(_, id) => do_list_projects(Some(&id.name), &id.group, include_inactive),
+        }
     }
 
     pub fn memory_stats(&self) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_memory_stats(s),
-            Backend::Remote(r) => r.get("/memory/stats"),
+            Backend::Remote(r, _) => r.get("/memory/stats"),
         }
     }
 
     pub fn impact(&self, symbol: &str, depth: usize) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_impact(s, symbol, depth),
-            Backend::Remote(r) => r.get(&format!("/impact/{}?depth={depth}", urlencode(symbol))),
+            Backend::Remote(r, _) => r.get(&format!("/impact/{}?depth={depth}", urlencode(symbol))),
         }
     }
 
     pub fn references(&self, symbol: &str) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_references(s, symbol),
-            Backend::Remote(r) => r.get(&format!("/references/{}", urlencode(symbol))),
+            Backend::Remote(r, _) => r.get(&format!("/references/{}", urlencode(symbol))),
         }
     }
 
@@ -244,7 +272,7 @@ impl Backend {
     ) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_search_routes(s, method, path),
-            Backend::Remote(r) => {
+            Backend::Remote(r, _) => {
                 let mut q = Vec::new();
                 if let Some(m) = &method {
                     q.push(format!("method={}", urlencode(m)));
@@ -265,7 +293,7 @@ impl Backend {
     pub fn routes_for_handler(&self, handler: &str) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_routes_for_handler(s, handler),
-            Backend::Remote(r) => r.get(&format!("/routes/handler/{}", urlencode(handler))),
+            Backend::Remote(r, _) => r.get(&format!("/routes/handler/{}", urlencode(handler))),
         }
     }
 
@@ -277,7 +305,7 @@ impl Backend {
     ) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_summarize(s, content, query, max_tokens),
-            Backend::Remote(r) => r.post(
+            Backend::Remote(r, _) => r.post(
                 "/summarize",
                 json!({ "content": content, "query": query, "max_tokens": max_tokens }),
             ),

@@ -62,6 +62,13 @@ fn env_usize(name: &str, default: usize) -> usize {
 pub struct Store {
     pub(crate) conn: Connection,
     dim: usize,
+    /// Metric of the HNSW index, resolved once.
+    ///
+    /// Reading it from the catalog costs a `duckdb_indexes()` scan (~2 ms) —
+    /// nothing next to indexing, but paid on *every* search it would be a
+    /// larger slice than the vector scan it exists to speed up. Invalidated
+    /// whenever the index is created or dropped.
+    metric_cache: std::sync::Mutex<Option<Option<String>>>,
 }
 
 impl Store {
@@ -73,7 +80,11 @@ impl Store {
             }
         }
         let conn = Connection::open(path)?;
-        let store = Self { conn, dim };
+        let store = Self {
+            conn,
+            dim,
+            metric_cache: std::sync::Mutex::new(None),
+        };
         store.apply_resource_limits(); // before any query can allocate against the defaults
         schema::init_schema(&store.conn, dim)?;
         store.load_extensions(); // best-effort, so existing HNSW/FTS indexes are usable
@@ -83,7 +94,11 @@ impl Store {
     /// Open an in-memory store (for tests).
     pub fn open_in_memory(dim: usize) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let store = Self { conn, dim };
+        let store = Self {
+            conn,
+            dim,
+            metric_cache: std::sync::Mutex::new(None),
+        };
         store.apply_resource_limits();
         schema::init_schema(&store.conn, dim)?;
         store.load_extensions();
@@ -134,6 +149,7 @@ impl Store {
         let store = Self {
             conn,
             dim: self.dim,
+            metric_cache: std::sync::Mutex::new(None),
         };
         store.load_extensions();
         Ok(store)
@@ -180,18 +196,66 @@ impl Store {
         self.conn.execute_batch("INSTALL fts; LOAD fts;").is_ok()
     }
 
-    /// Create the HNSW (cosine) index on the `vectors` table for approximate
+    /// Create the HNSW index on the `vectors` table for approximate
     /// nearest-neighbor search. Requires the VSS extension; returns `Ok(false)`
     /// (leaving brute-force search intact) when it is unavailable.
-    pub fn enable_hnsw(&self) -> Result<bool> {
+    ///
+    /// `metric` is `cosine` (always correct) or `ip` (inner product — cheaper,
+    /// but only equivalent to cosine when the embeddings are unit-normalized).
+    ///
+    /// The metric is encoded in the index *name* because DuckDB's catalog does
+    /// not report it: `duckdb_indexes()` shows the `CREATE INDEX` without its
+    /// `WITH (metric = …)` clause. A search whose distance function disagrees
+    /// with the index silently falls back to a full scan — or, worse, orders by
+    /// the wrong measure — so [`hnsw_metric`](Self::hnsw_metric) reads it back
+    /// from the name and the query is built to match.
+    pub fn enable_hnsw(&self, metric: &str) -> Result<bool> {
         if !self.load_vss() {
             return Ok(false);
         }
-        self.conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw \
-             ON vectors USING HNSW (vector) WITH (metric = 'cosine');",
-        )?;
+        let metric = normalize_metric(metric);
+        // Only one may exist: two indexes on the same column would both be
+        // maintained on every insert, for no gain.
+        self.drop_hnsw()?;
+        self.conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw_{metric} \
+             ON vectors USING HNSW (vector) WITH (metric = '{metric}');",
+        ))?;
+        self.invalidate_metric_cache();
         Ok(true)
+    }
+
+    /// The metric of the HNSW index on `vectors`, or `None` when there is none.
+    /// Resolved once per connection; see `metric_cache`.
+    pub fn hnsw_metric(&self) -> Option<String> {
+        if let Ok(mut guard) = self.metric_cache.lock() {
+            if let Some(cached) = guard.as_ref() {
+                return cached.clone();
+            }
+            let fresh = self.read_hnsw_metric();
+            *guard = Some(fresh.clone());
+            return fresh;
+        }
+        self.read_hnsw_metric()
+    }
+
+    /// Uncached catalog read behind [`hnsw_metric`](Self::hnsw_metric).
+    fn read_hnsw_metric(&self) -> Option<String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT index_name FROM duckdb_indexes() \
+                 WHERE table_name = 'vectors' AND index_name LIKE 'idx_vectors_hnsw%'",
+            )
+            .ok()?;
+        let mut rows = stmt.query([]).ok()?;
+        let row = rows.next().ok()??;
+        let name: String = row.get(0).ok()?;
+        // Legacy indexes carry no suffix and were always cosine.
+        Some(match name.rsplit_once("hnsw_") {
+            Some((_, m)) => m.to_string(),
+            None => "cosine".to_string(),
+        })
     }
 
     /// Drop the HNSW index if present. DuckDB maintains an HNSW index on every
@@ -200,9 +264,12 @@ impl Store {
     /// far faster than loading into an indexed table. Best-effort no-op when the
     /// VSS extension or index is absent.
     pub fn drop_hnsw(&self) -> Result<()> {
-        let _ = self
-            .conn
-            .execute_batch("DROP INDEX IF EXISTS idx_vectors_hnsw;");
+        let _ = self.conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_vectors_hnsw; \
+             DROP INDEX IF EXISTS idx_vectors_hnsw_cosine; \
+             DROP INDEX IF EXISTS idx_vectors_hnsw_ip;",
+        );
+        self.invalidate_metric_cache();
         Ok(())
     }
 
@@ -430,8 +497,16 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let (where_clause, params) = build_where(filter);
+        // The distance function must be the one the index was built with, or
+        // the VSS optimizer will not match it.
+        let ip = self.hnsw_metric().as_deref() == Some("ip");
+        let func = if ip {
+            "array_negative_inner_product"
+        } else {
+            "array_cosine_distance"
+        };
         let dist_expr = format!(
-            "array_cosine_distance(vector, {qv}::FLOAT[{dim}])",
+            "{func}(vector, {qv}::FLOAT[{dim}])",
             qv = self.vec_literal(query),
             dim = self.dim,
         );
@@ -450,9 +525,12 @@ impl Store {
         let mut out = Vec::new();
         for r in rows {
             let (point, dist) = r?;
+            // Scores stay comparable across metrics: cosine distance is
+            // `1 - similarity`, negative inner product is `-similarity`, and on
+            // unit-normalized vectors both similarities are the same number.
             out.push(SearchResult {
                 point,
-                score: 1.0 - dist,
+                score: if ip { -dist } else { 1.0 - dist },
             });
         }
         Ok(out)
@@ -641,9 +719,40 @@ fn value_to_f32_vec(v: Value) -> Vec<f32> {
         .collect()
 }
 
+impl Store {
+    /// Forget the resolved metric so the next search re-reads it.
+    fn invalidate_metric_cache(&self) {
+        if let Ok(mut g) = self.metric_cache.lock() {
+            *g = None;
+        }
+    }
+}
+
+/// Accept only the metrics this store knows how to query, defaulting to the
+/// always-correct one. The value reaches SQL by interpolation — both in the
+/// index name and in `WITH (metric = …)` — so anything unrecognized is mapped
+/// to `cosine` rather than passed through.
+fn normalize_metric(metric: &str) -> &'static str {
+    match metric.trim().to_ascii_lowercase().as_str() {
+        "ip" | "inner_product" => "ip",
+        _ => "cosine",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_known_metrics_reach_sql() {
+        assert_eq!(normalize_metric("ip"), "ip");
+        assert_eq!(normalize_metric("Inner_Product"), "ip");
+        assert_eq!(normalize_metric("cosine"), "cosine");
+        assert_eq!(normalize_metric(""), "cosine");
+        assert_eq!(normalize_metric("l2sq"), "cosine");
+        // Nothing quotable can be smuggled into the interpolated statement.
+        assert_eq!(normalize_metric("ip'); DROP TABLE vectors; --"), "cosine");
+    }
 
     #[test]
     fn size_literals_are_accepted_and_anything_quotable_is_not() {
