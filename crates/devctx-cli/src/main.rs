@@ -6,6 +6,8 @@
 
 mod hooks;
 mod mcp_configure;
+mod models;
+mod update_check;
 mod remote;
 mod watch;
 
@@ -53,7 +55,21 @@ enum Command {
         /// which then share a memory tier between them.
         #[arg(long)]
         group: Option<String>,
+        /// Embedding model (see `devctx models`). On the first project it also
+        /// becomes the machine's default and the vector space of shared
+        /// memories; afterwards it applies to this project only.
+        #[arg(long)]
+        model: Option<String>,
     },
+    /// List the embedding models available, or download one that needs files.
+    Models {
+        /// Download a user-defined ONNX model (e.g. `ml-granite`) into the
+        /// shared model cache. Without it, the models are listed.
+        #[arg(long)]
+        download: Option<String>,
+    },
+    /// Replace this binary with the latest published release.
+    Update,
     /// Show repository and index status.
     Status,
     /// Index the current repository (git diff → parse → chunk → embed → store).
@@ -371,7 +387,14 @@ enum McpAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { path, name, group } => cmd_init(path, name, group),
+        Command::Init {
+            path,
+            name,
+            group,
+            model,
+        } => cmd_init(path, name, group, model),
+        Command::Models { download } => cmd_models(download),
+        Command::Update => models::self_update("snaven10/DevCtxEngine", env!("CARGO_PKG_VERSION")),
         Command::Status => cmd_status(),
         Command::Index { full } => cmd_index(full),
         Command::Repair => cmd_repair(),
@@ -778,6 +801,7 @@ fn num(v: &serde_json::Value, key: &str) -> i64 {
 
 /// `devctx tui` — open the interactive terminal UI.
 fn cmd_tui(project: Option<String>) -> Result<()> {
+    note_update();
     let cfg = tui_project(project)?;
     // Route through the server (auto-spawned if needed) so the TUI never opens
     // the DB itself and coexists with other processes. Fall back to local only
@@ -793,6 +817,119 @@ fn cmd_tui(project: Option<String>) -> Result<()> {
         }
     };
     devctx_tui::run(cfg, server)
+}
+
+/// Resolve `--model` into an embeddings config, refusing what cannot work.
+///
+/// A user-defined ONNX model needs its files on disk, and the failure without
+/// them arrives later, at the first index. Checking here turns it into a
+/// sentence about running `models download`.
+fn choose_model(
+    key: &str,
+    base: &devctx_core::config::Embeddings,
+) -> Result<devctx_core::config::Embeddings> {
+    let spec = devctx_embed::registry::find_local(key).ok_or_else(|| {
+        anyhow!("unknown model `{key}`; run `devctx models` to see what there is")
+    })?;
+    let mut out = base.clone();
+    out.provider = "local".to_string();
+    out.model = key.to_string();
+    out.model_dir = if spec.builtin.is_some() {
+        String::new()
+    } else {
+        let dir = models::local_dir(key).ok_or_else(|| {
+            anyhow!(
+                "`{key}` is a user-defined ONNX model and its files are not on this \
+                 machine yet. Run `devctx models download {key}` first."
+            )
+        })?;
+        dir.to_string_lossy().into_owned()
+    };
+    Ok(out)
+}
+
+/// Make this project's model the machine's default, and the vector space that
+/// shared memories live in.
+///
+/// The first project on a machine is where the decision is actually made, and
+/// leaving the central store on its own built-in default is how a machine ends
+/// up with repositories indexed one way and their shared memories embedded
+/// another — with no error, because the widths agree.
+///
+/// Only when the central store holds no memories yet: after that, `memory.model`
+/// is not a preference but the space existing vectors live in, and changing it
+/// would silently strand every one of them.
+fn adopt_as_machine_default(embeddings: &devctx_core::config::Embeddings) {
+    let Ok(paths) = CentralPaths::resolve() else {
+        return;
+    };
+    let Ok(mut cfg) = devctx_central::CentralConfig::load_or_default(&paths.config) else {
+        return;
+    };
+    let already = cfg.memory.model == embeddings.model;
+    // "Are there memories?" decides whether the shared vector space may be
+    // repointed, so an unknown answer must count as yes. Reading it can easily
+    // fail for a reason that says nothing about the store — the daemon holds
+    // the file, most of the time — and treating that as "no memories" repoints
+    // the space every existing vector lives in, which is silent and total: the
+    // store keeps its 384-wide rows and the next open refuses them.
+    let has_memories = match Central::open() {
+        Ok(c) => c.memory_stats().map(|s| s.total > 0).unwrap_or(true),
+        // Most often: a daemon owns the file. That says nothing about whether
+        // the store is empty, so it cannot license repointing it.
+        Err(_) => true,
+    };
+
+    cfg.defaults.embeddings = embeddings.clone();
+    if !already && has_memories {
+        eprintln!(
+            "note: shared memories are already embedded with `{}`, so that stays the \
+             central memory model; this project uses `{}` for its own index. New \
+             projects will inherit `{}`.",
+            cfg.memory.model, embeddings.model, embeddings.model
+        );
+    } else {
+        cfg.memory.provider = embeddings.provider.clone();
+        cfg.memory.model = embeddings.model.clone();
+        cfg.memory.model_dir = embeddings.model_dir.clone();
+        if !already {
+            println!(
+                "  set the machine default and shared-memory model to `{}`",
+                embeddings.model
+            );
+        }
+    }
+    if let Err(e) = cfg.save(&paths.config) {
+        eprintln!("warning: could not write {}: {e}", paths.config.display());
+    }
+}
+
+/// The repository releases are published from.
+const RELEASE_REPO: &str = "snaven10/DevCtxEngine";
+
+/// Print a one-line notice when a newer release exists. Silent otherwise, and
+/// silent on failure — see `update_check`.
+fn note_update() {
+    if let Some(v) = update_check::available(RELEASE_REPO, env!("CARGO_PKG_VERSION")) {
+        eprintln!(
+            "A newer devctx is available ({v}; this is {}). Update with `devctx update`.",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+}
+
+/// `devctx models` — list what can be embedded with, or fetch one.
+fn cmd_models(download: Option<String>) -> Result<()> {
+    match download {
+        Some(key) => {
+            models::download(&key)?;
+            Ok(())
+        }
+        None => {
+            let configured = central_defaults().embeddings.model;
+            models::list((!configured.is_empty()).then_some(configured.as_str()))
+        }
+    }
 }
 
 /// The machine's default embeddings and reranking for a new project.
@@ -981,6 +1118,12 @@ fn open_browser(url: &str) {
 
 /// `devctx mcp` — run the MCP server over stdio.
 fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
+    // Checked once here, at startup, and handed to the tools through the
+    // environment: a per-call check would put a network round-trip on the path
+    // of every `list_projects`, and the answer changes at most daily.
+    if let Some(v) = update_check::available(RELEASE_REPO, env!("CARGO_PKG_VERSION")) {
+        std::env::set_var("DEVCTX_UPDATE_AVAILABLE", v);
+    }
     // Registering this server globally is the normal thing to do, and it means
     // the client launches it from whatever directory it happens to be in —
     // usually the user's home, which is inside no repository at all. Refusing to
@@ -1732,7 +1875,12 @@ fn default_old_db() -> Option<PathBuf> {
 }
 
 /// `devctx init` — write a `.devctx/config.yaml` for the target repo.
-fn cmd_init(path: Option<PathBuf>, name: Option<String>, group: Option<String>) -> Result<()> {
+fn cmd_init(
+    path: Option<PathBuf>,
+    name: Option<String>,
+    group: Option<String>,
+    model: Option<String>,
+) -> Result<()> {
     let root = match path {
         Some(p) => p,
         None => std::env::current_dir().context("resolving current directory")?,
@@ -1762,7 +1910,17 @@ fn cmd_init(path: Option<PathBuf>, name: Option<String>, group: Option<String>) 
     // 384-dimensional English one here, and nothing errors, because the widths
     // agree. The repository simply indexes itself into another vector space
     // than every other repository on the machine.
-    let defaults = central_defaults();
+    let mut defaults = central_defaults();
+    // `--model` decides it outright; otherwise ask, when there is someone to
+    // ask. A non-interactive run keeps the machine default silently, which is
+    // what a script or an agent needs.
+    let model = match model {
+        Some(key) => Some(key),
+        None => models::prompt(&defaults.embeddings.model)?,
+    };
+    if let Some(key) = &model {
+        defaults.embeddings = choose_model(key, &defaults.embeddings)?;
+    }
     let cfg = ProjectConfig {
         project: Project {
             name,
@@ -1776,6 +1934,9 @@ fn cmd_init(path: Option<PathBuf>, name: Option<String>, group: Option<String>) 
 
     devctx_central::write_project_config(&cfg_path, &cfg)
         .with_context(|| format!("writing {}", cfg_path.display()))?;
+    if model.is_some() {
+        adopt_as_machine_default(&cfg.embeddings);
+    }
 
     println!("Initialized DevCtxEngine project at {}", cfg_path.display());
     warn_if_not_a_repo(&root);
@@ -1938,6 +2099,7 @@ fn register_centrally(root: &std::path::Path) {
 
 /// `devctx status` — discover and summarize the active project config.
 fn cmd_status() -> Result<()> {
+    note_update();
     let cwd = std::env::current_dir().context("resolving current directory")?;
     let Some(cfg_path) = find_config_file(&cwd) else {
         println!("No DevCtxEngine project found (run `devctx init` first).");

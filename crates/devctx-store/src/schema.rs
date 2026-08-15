@@ -16,7 +16,7 @@ pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
     Ok(())
 }
 
-/// Remove the `projects` indexes an older schema created.
+/// Remove the `projects` and `memories` indexes an older schema created.
 ///
 /// They are not merely useless on a table this small — they silently break it:
 /// once present, equality lookups stop matching rows that are demonstrably
@@ -25,7 +25,12 @@ pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
 /// cannot drop them is no worse off than before.
 fn drop_broken_project_indexes(conn: &Connection) {
     let _ = conn.execute_batch(
-        "DROP INDEX IF EXISTS idx_projects_path; DROP INDEX IF EXISTS idx_projects_active;",
+        "DROP INDEX IF EXISTS idx_projects_path;
+         DROP INDEX IF EXISTS idx_projects_active;
+         DROP INDEX IF EXISTS idx_memories_topic;
+         DROP INDEX IF EXISTS idx_memories_hash;
+         DROP INDEX IF EXISTS idx_memories_type;
+         DROP INDEX IF EXISTS idx_memories_project;",
     );
 }
 
@@ -116,10 +121,12 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at      VARCHAR,
     deleted_at      VARCHAR
 );
-CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories (topic_key);
-CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories (normalized_hash);
-CREATE INDEX IF NOT EXISTS idx_memories_type ON memories (memory_type);
-CREATE INDEX IF NOT EXISTS idx_memories_project ON memories (project);
+-- No indexes on `memories` either, for the reason given above `projects`, and
+-- observed there too: `WHERE project = '@global'` returned 0 against three rows
+-- that `WHERE trim(project) = '@global'` found, while the same query for another
+-- key on the same column answered correctly. An index that is right for most
+-- values and silently wrong for some is worse than no index at all, and a scan
+-- over a few thousand rows costs nothing in a columnar engine.
 
 CREATE TABLE IF NOT EXISTS memory_symbol_references (
     memory_id VARCHAR,

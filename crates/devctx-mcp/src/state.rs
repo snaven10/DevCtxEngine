@@ -943,8 +943,22 @@ pub fn do_list_projects(
             },
         })
     });
-    serde_json::to_string_pretty(&json!({ "projects": projects, "bound": bound }))
-        .map_err(|e| e.to_string())
+    // An agent is the one caller that will never look at a terminal, so a
+    // notice printed there reaches nobody. It rides along with the call an
+    // agent makes to orient itself, and stays a statement of fact: updating is
+    // a decision for the person, not something a tool call should perform
+    // underneath a running session.
+    let update = std::env::var("DEVCTX_UPDATE_AVAILABLE").ok().map(|v| {
+        json!({
+            "latest": v,
+            "note": "A newer devctx is published. Tell the user they can run \
+                     `devctx update`; do not update anything yourself.",
+        })
+    });
+    serde_json::to_string_pretty(
+        &json!({ "projects": projects, "bound": bound, "update": update }),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// `remember` with `scope: global` or `scope: group`: store in the shared
