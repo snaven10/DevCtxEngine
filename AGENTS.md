@@ -51,8 +51,9 @@ Changing it later means re-indexing everything from scratch, so decide now.
 choice** and nothing will tell you: it produces valid embeddings of Spanish text,
 just poor ones.
 
-`ml-granite` and `ml-granite-lg` are *user-defined ONNX* models: nothing
-downloads them for you. The directory must contain the ONNX file plus
+`ml-granite` and `ml-granite-lg` are *user-defined ONNX* models: unlike the
+others, they are not built into the embedding library, so their files have to
+be on disk before anything can use them. The directory holds the ONNX file plus
 `tokenizer.json` and `config.json`:
 
 ```
@@ -64,10 +65,24 @@ downloads them for you. The directory must contain the ONNX file plus
   tokenizer_config.json           (optional)
 ```
 
-Fetch them from the HuggingFace repo named in `docs/09-models-and-tuning.md`
-and put them wherever you like — `~/.local/share/devctx/models/ml-granite` is
-the convention. **Without `model_dir` set, loading fails with a clear error**;
-this one is not silent.
+Two commands handle that:
+
+```bash
+devctx models                          # the same table, on this machine:
+                                       # which model is configured, which need files
+devctx models --download ml-granite    # fetch one into the shared model cache
+```
+
+`devctx init` asks which to use — showing what the machine's other repositories
+already use — and downloads the choice if it must. **Run without a terminal it
+asks nothing** and takes the machine default, which is your case: run it like
+any other command and it will not block. Be explicit with `--model`, `--group`
+and `--state-dir`, or use `--yes` to skip the questions on a terminal too.
+
+Only if you must place the files yourself: fetch them from the HuggingFace repo
+named in `docs/09-models-and-tuning.md` into a directory of your choosing, and
+point `embeddings.model_dir` at it. **Without `model_dir` set, loading fails
+with a clear error** — this one is not silent.
 
 ## 3. Set the machine's defaults
 
@@ -147,6 +162,34 @@ devctx recall "something you know is in there"
 Results should be tagged `[group]` and be about what you asked. If they are
 unrelated, the query and the stored vectors are in different spaces — check
 that `memory.model` matches what the migration used.
+
+### Moving memories between machines
+
+Export writes JSONL — one memory per line, greppable and readable by any
+version, unlike a database file:
+
+```bash
+devctx memories export --scope group  > product.jsonl
+devctx memories export --scope local  > project.jsonl
+devctx memories export --scope global > global.jsonl
+devctx memories export --scope group --repo api    # only what one repo contributed
+
+devctx memories import product.jsonl --dry-run     # see the outcome first
+devctx memories import product.jsonl
+devctx memories import product.jsonl --scope local # land them all here instead
+```
+
+**Import only ever adds.** A memory whose content is already present is
+skipped; one whose topic key belongs to a *different* local memory is kept
+alongside it rather than replacing it, and named in the summary. Nothing here
+can be lost by importing the wrong file.
+
+Embeddings in the file are reused only when the model **and** width match
+exactly, and recomputed otherwise — roughly a minute per 45 memories. The
+import says which of the two happened.
+
+Both commands open the databases directly, so stop the servers first:
+`devctx serve --stop` and `devctx serve --central --stop`.
 
 ## 6. Index
 
