@@ -1831,12 +1831,21 @@ fn cmd_memories_import(file: &std::path::Path, scope: Option<&str>, dry_run: boo
 /// to know which of them answered.
 fn cmd_memory_forget(id: String) -> Result<()> {
     let cfg = load_project()?;
-    let store = open_store(&cfg, configured_dimension(&cfg)).context(
-        "opening the store (if a `devctx serve` is running, stop it first: `devctx serve --stop`)",
-    )?;
-    if store.forget_memory(&id)? {
-        println!("Forgot {id} (project `{}`).", cfg.project.name);
-        return Ok(());
+    // A locked project store is not a reason to give up: the memory is as
+    // likely to be in the central one, and refusing because an unrelated
+    // server holds this project's file would make deleting a shared memory
+    // depend on stopping something that has nothing to do with it.
+    match open_store(&cfg, configured_dimension(&cfg)) {
+        Ok(store) => {
+            if store.forget_memory(&id)? {
+                println!("Forgot {id} (project `{}`).", cfg.project.name);
+                return Ok(());
+            }
+        }
+        Err(e) => eprintln!(
+            "note: could not open this project's store ({e}); looking in the central one. \
+             Stop its server with `devctx serve --stop` if the memory is a local one."
+        ),
     }
     let central = Central::open().context(
         "opening the central store (if a central daemon is running, stop it first: \
