@@ -8,6 +8,8 @@ mod hooks;
 mod mcp_configure;
 mod models;
 mod remote;
+mod transfer;
+mod transfer_apply;
 mod update_check;
 mod watch;
 
@@ -151,6 +153,11 @@ enum Command {
     MemoryForget {
         /// The memory id, as reported by `recall` or `remember`.
         id: String,
+    },
+    /// Export or import memories as JSONL.
+    Memories {
+        #[command(subcommand)]
+        action: MemoriesAction,
     },
     /// Permanently delete every memory stored under one `project` key, and the
     /// vectors that belong to them.
@@ -337,6 +344,31 @@ enum ProjectsAction {
 }
 
 /// Which memories a command applies to.
+/// What `devctx memories` can do.
+#[derive(Debug, Subcommand)]
+enum MemoriesAction {
+    /// Write memories to stdout, one JSON object per line.
+    Export {
+        /// Which memories: `local`, `group`, or `global`.
+        #[arg(long, default_value = "local")]
+        scope: String,
+        /// Within a shared scope, only what this repository contributed.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Read memories from a JSONL file. Only ever adds; never overwrites.
+    Import {
+        /// The file to read.
+        file: PathBuf,
+        /// Put every memory in this scope, whatever the file says.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Report what would happen without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum MemoryScope {
     /// This project only.
@@ -433,6 +465,14 @@ fn main() -> Result<()> {
             repo,
         } => cmd_recall(query, limit, scope, repo),
         Command::MemoryStats => cmd_memory_stats(),
+        Command::Memories { action } => match action {
+            MemoriesAction::Export { scope, repo } => cmd_memories_export(&scope, repo.as_deref()),
+            MemoriesAction::Import {
+                file,
+                scope,
+                dry_run,
+            } => cmd_memories_import(&file, scope.as_deref(), dry_run),
+        },
         Command::MemoryForget { id } => cmd_memory_forget(id),
         Command::MemoryPurge { project, dry_run } => cmd_memory_purge(project, dry_run),
         Command::Migrate {
@@ -1607,7 +1647,183 @@ impl ProgressSink for IndexBar {
     }
 }
 
-/// `devctx memory-stats` — show memory counts for the project.
+/// Resolve a scope name to the project key its memories are stored under, and
+/// whether that key lives in the central store rather than this project's.
+fn scope_key(cfg: &ProjectConfig, scope: &str) -> Result<(String, bool)> {
+    match scope {
+        "local" => Ok((project_name(cfg), false)),
+        "global" => Ok((devctx_memory::GLOBAL_PROJECT.to_string(), true)),
+        "group" => {
+            if cfg.project.group.is_empty() {
+                bail!(
+                    "this project declares no group; set `project.group` in its config, \
+                     or use --scope local or --scope global"
+                );
+            }
+            Ok((devctx_memory::group_project(&cfg.project.group), true))
+        }
+        other => bail!("unknown scope `{other}`; expected local, group or global"),
+    }
+}
+
+/// Open whichever store holds `key`.
+///
+/// The daemon must be stopped either way: DuckDB allows one writing process,
+/// and these commands are rare enough that saying so is better than routing
+/// bulk reads and writes through HTTP.
+fn store_for_key(cfg: &ProjectConfig, central: bool) -> Result<Store> {
+    if central {
+        Ok(Central::open()
+            .context(
+                "opening the central store (stop a running daemon first: \
+                 `devctx serve --central --stop`)",
+            )?
+            .store()
+            .try_clone()?)
+    } else {
+        open_store(cfg, configured_dimension(cfg))
+            .context("opening the store (stop a running server first: `devctx serve --stop`)")
+    }
+}
+
+/// `devctx memories export` — write a scope's memories to stdout as JSONL.
+fn cmd_memories_export(scope: &str, repo: Option<&str>) -> Result<()> {
+    let cfg = load_project()?;
+    let (key, central) = scope_key(&cfg, scope)?;
+    let store = store_for_key(&cfg, central)?;
+
+    let model = cfg.embeddings.model.clone();
+    let dim = configured_dimension(&cfg);
+    let mut written = 0usize;
+    for m in store.all_memories(&key)? {
+        if let Some(r) = repo {
+            if m.repo != r {
+                continue;
+            }
+        }
+        let embedding = store
+            .vector_by_id(&m.id)?
+            .map(|vector| transfer::Embedding {
+                model: model.clone(),
+                dim,
+                vector,
+            });
+        println!("{}", transfer::to_line(&m, embedding)?);
+        written += 1;
+    }
+    // stderr, so it does not land in the file being redirected.
+    eprintln!("Exported {written} memories from `{key}`.");
+    Ok(())
+}
+
+/// `devctx memories import` — add memories from a JSONL file.
+fn cmd_memories_import(file: &std::path::Path, scope: Option<&str>, dry_run: bool) -> Result<()> {
+    let cfg = load_project()?;
+    let raw =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+
+    let mut lines: Vec<transfer::TransferLine> = Vec::new();
+    for (n, l) in raw.lines().enumerate() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        lines
+            .push(transfer::from_line(l).with_context(|| format!("{}:{}", file.display(), n + 1))?);
+    }
+
+    // Grouped by destination first: a file may carry memories of several
+    // scopes, and each destination is a different store.
+    let mut by_key: std::collections::BTreeMap<String, Vec<transfer::TransferLine>> =
+        Default::default();
+    for line in lines {
+        let key = match scope {
+            Some(s) => scope_key(&cfg, s)?.0,
+            None => line.memory.project.clone(),
+        };
+        by_key.entry(key).or_default().push(line);
+    }
+
+    let model = cfg.embeddings.model.clone();
+    let dim = configured_dimension(&cfg);
+    for (key, incoming) in by_key {
+        let central = key.starts_with('@');
+        let store = store_for_key(&cfg, central)?;
+        let mut existing = store.all_memories(&key)?;
+        let mut report = transfer_apply::ImportReport::default();
+        let (mut reused, mut recomputed) = (0usize, 0usize);
+        let mut embedder = None;
+
+        for line in incoming {
+            let outcome = transfer_apply::decide(&line.memory, &existing);
+            report.record(&line.memory, outcome);
+            if outcome == transfer_apply::Outcome::AlreadyPresent || dry_run {
+                continue;
+            }
+            let mut m = transfer_apply::prepare(&line.memory, outcome);
+            m.project = key.clone();
+            m.vector_id = m.id.clone();
+
+            // Reuse the embedding only on an exact match. The same model name
+            // across two implementations produced vectors 0.76-0.87 apart from
+            // each other's — close enough to look right, wrong enough to rank
+            // everything incorrectly.
+            let vector = match &line.embedding {
+                Some(e) if e.model == model && e.dim == dim => {
+                    reused += 1;
+                    e.vector.clone()
+                }
+                _ => {
+                    recomputed += 1;
+                    if embedder.is_none() {
+                        embedder = Some(build_embedder(&cfg)?);
+                    }
+                    let e = embedder.as_ref().expect("just built");
+                    e.embed(&[m.content.clone()])?.remove(0)
+                }
+            };
+
+            store.upsert_memory(&m)?;
+            store.upsert(&[devctx_core::VectorPoint {
+                id: m.id.clone(),
+                vector,
+                text: m.content.clone(),
+                metadata: devctx_core::VectorMetadata {
+                    repo: m.repo.clone(),
+                    branch: m.branch.clone(),
+                    symbol: m.title.clone(),
+                    symbol_type: m.memory_type.clone(),
+                    language: "memory".to_string(),
+                    chunk_level: "memory".to_string(),
+                    memory_type: m.memory_type.clone(),
+                    memory_scope: m.scope.clone(),
+                    memory_tags: m.tags.clone(),
+                    ..Default::default()
+                },
+            }])?;
+            existing.push(m);
+        }
+
+        let verb = if dry_run { "would import" } else { "imported" };
+        println!(
+            "{verb} {} memories into `{key}` · {} already present",
+            report.added, report.already
+        );
+        if reused > 0 || recomputed > 0 {
+            println!("  embeddings: {reused} reused ({model}/{dim}), {recomputed} recomputed");
+        }
+        if !report.collisions.is_empty() {
+            println!(
+                "  {} topic collisions kept separately:",
+                report.collisions.len()
+            );
+            for t in &report.collisions {
+                println!("    · {t}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `devctx memory-forget` — remove a single memory, wherever it lives.
 ///
 /// Looks in this project's store and then the central one, because the caller
@@ -1666,6 +1882,7 @@ fn cmd_memory_purge(project: String, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// `devctx memory-stats` — show memory counts for the project.
 fn cmd_memory_stats() -> Result<()> {
     let cfg = load_project()?;
     if let Some(r) = remote::ensure(&cfg) {
