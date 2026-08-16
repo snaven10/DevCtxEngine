@@ -74,6 +74,17 @@ A global memory saved from one repository is recalled from any other, and the
 same lesson saved twice converges on one memory rather than two. Anything left
 `local` — the default — never leaves its project.
 
+Memories move between machines as JSONL, which any version can read:
+
+```bash
+devctx memories export --scope group > product.jsonl   # one product's memories
+devctx memories import product.jsonl                   # only ever adds
+```
+
+Import never overwrites: content already present is skipped, and a memory whose
+topic key belongs to a different local one is kept beside it rather than
+replacing it.
+
 Over MCP this is `list_projects`, `search_project`, and `scope` on
 `recall`/`remember`. See [The Central Store](docs/12-central-store.md).
 

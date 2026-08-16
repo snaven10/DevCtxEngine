@@ -6,7 +6,11 @@ use crate::error::Result;
 use crate::store::Store;
 
 /// A stored memory row.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Serializable so it can be exported: the transfer format is one of these per
+/// line, which is what lets memories reach a machine running a different build.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Memory {
     /// Deterministic id (`mem_<hash>`).
     pub id: String,
@@ -136,6 +140,23 @@ impl Store {
             params![now, id],
         )?;
         Ok(())
+    }
+
+    /// Every live memory stored under `project`, oldest first.
+    ///
+    /// Unlike [`recent_memories`](Self::recent_memories) this takes no limit: it
+    /// backs export, where a cap would quietly hand someone a file missing the
+    /// rows past it. Oldest first so replaying the file preserves the order the
+    /// memories were written in.
+    pub fn all_memories(&self, project: &str) -> Result<Vec<Memory>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MEM_COLS} FROM memories
+             WHERE project = ? AND deleted_at IS NULL
+             ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map(params![project], row_to_memory)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Permanently remove one memory and the vectors that belong to it — its
@@ -279,6 +300,36 @@ mod tests {
             .find_memory_by_topic("proj", "nope")
             .unwrap()
             .is_none());
+    }
+
+    /// Export needs the whole set, not a page of it: `recent_memories` caps at a
+    /// limit, and a cap silently truncates the file someone is trusting to hold
+    /// everything.
+    #[test]
+    fn all_memories_returns_every_live_row_for_a_project() {
+        let store = Store::open_in_memory(3).unwrap();
+        for i in 0..5 {
+            let mut m = mem(&format!("mem_{i}"), "", "note");
+            m.created_at = format!("{i}");
+            store.upsert_memory(&m).unwrap();
+        }
+        let mut other = mem("mem_other", "", "note");
+        other.project = "elsewhere".into();
+        store.upsert_memory(&other).unwrap();
+
+        let got = store.all_memories("proj").unwrap();
+        assert_eq!(got.len(), 5, "every row, and only this project's");
+        assert_eq!(
+            got[0].id, "mem_0",
+            "oldest first, so an import replays in order"
+        );
+
+        store.delete_memory("mem_2", "999").unwrap();
+        assert_eq!(
+            store.all_memories("proj").unwrap().len(),
+            4,
+            "tombstoned rows are not exported"
+        );
     }
 
     /// Purging a key takes the memories *and* their vectors — the parent row and

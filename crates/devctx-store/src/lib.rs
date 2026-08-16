@@ -90,6 +90,20 @@ mod tests {
         assert!(hits[0].score >= hits[1].score);
     }
 
+    /// Export carries embeddings so an import between matching machines does not
+    /// pay to recompute them — measured at 46 minutes for 2090 memories.
+    #[test]
+    fn a_vector_can_be_read_back_by_id() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        store
+            .upsert(&[point("mem_a", [0.5, 0.25, 0.125], "a.rs", "rust")])
+            .unwrap();
+
+        let got = store.vector_by_id("mem_a").unwrap().expect("stored");
+        assert_eq!(got, vec![0.5, 0.25, 0.125]);
+        assert!(store.vector_by_id("mem_missing").unwrap().is_none());
+    }
+
     #[test]
     fn hnsw_index_supports_search_insert_delete() {
         let store = Store::open_in_memory(DIM).unwrap();
