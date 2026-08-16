@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "DuckDB-backed storage for DevCtxEngine: vectors + graph + memories."
 
 [dependencies]
+serde = { workspace = true }
 devctx-core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
