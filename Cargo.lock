@@ -1222,6 +1222,7 @@ dependencies = [
  "anyhow",
  "devctx-core",
  "duckdb",
+ "serde",
  "thiserror 2.0.20",
 ]
 
