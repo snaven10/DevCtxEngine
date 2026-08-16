@@ -5,6 +5,7 @@
 //! model on first use.
 
 mod hooks;
+mod init_wizard;
 mod mcp_configure;
 mod models;
 mod remote;
@@ -62,6 +63,12 @@ enum Command {
         /// memories; afterwards it applies to this project only.
         #[arg(long)]
         model: Option<String>,
+        /// Directory for this project's index. Default: inside the repository.
+        #[arg(long)]
+        state_dir: Option<String>,
+        /// Take the defaults without asking, and without confirming.
+        #[arg(long)]
+        yes: bool,
     },
     /// List the embedding models available, or download one that needs files.
     Models {
@@ -424,7 +431,9 @@ fn main() -> Result<()> {
             name,
             group,
             model,
-        } => cmd_init(path, name, group, model),
+            state_dir,
+            yes,
+        } => cmd_init(path, name, group, model, state_dir, yes),
         Command::Models { download } => cmd_models(download),
         Command::Update => models::self_update("snaven10/DevCtxEngine", env!("CARGO_PKG_VERSION")),
         Command::Status => cmd_status(),
@@ -970,6 +979,57 @@ fn cmd_models(download: Option<String>) -> Result<()> {
             models::list((!configured.is_empty()).then_some(configured.as_str()))
         }
     }
+}
+
+/// How many registered projects use each embedding model, commonest first.
+///
+/// Read from the registry rather than by opening each project: the registry
+/// already caches every project's model, and a wizard that opened four
+/// databases to print one line would be slow for no reason. It can be stale if
+/// someone edited a config by hand — `projects refresh` is the cure.
+fn models_in_use() -> Vec<(String, usize)> {
+    let Ok(central) = Central::open() else {
+        return Vec::new();
+    };
+    let Ok(projects) = central.list(false) else {
+        return Vec::new();
+    };
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for p in projects {
+        if !p.embed_model.is_empty() {
+            *counts.entry(p.embed_model).or_default() += 1;
+        }
+    }
+    let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+    // Commonest first: the answer someone most likely wants is the one most of
+    // their repositories already gave.
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// The groups already in use, with how many repositories each holds.
+///
+/// Read from each project's config, not the registry: the registry caches the
+/// model but not the group.
+fn groups_in_use() -> Vec<(String, usize)> {
+    let Ok(central) = Central::open() else {
+        return Vec::new();
+    };
+    let Ok(projects) = central.list(false) else {
+        return Vec::new();
+    };
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for p in projects {
+        let Ok(cfg) = ProjectConfig::load(std::path::Path::new(&p.config_path)) else {
+            continue;
+        };
+        if !cfg.project.group.is_empty() {
+            *counts.entry(cfg.project.group).or_default() += 1;
+        }
+    }
+    let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
 }
 
 /// The machine's default embeddings and reranking for a new project.
@@ -2106,6 +2166,8 @@ fn cmd_init(
     name: Option<String>,
     group: Option<String>,
     model: Option<String>,
+    state_dir: Option<String>,
+    yes: bool,
 ) -> Result<()> {
     let root = match path {
         Some(p) => p,
@@ -2137,22 +2199,46 @@ fn cmd_init(
     // agree. The repository simply indexes itself into another vector space
     // than every other repository on the machine.
     let mut defaults = central_defaults();
-    // `--model` decides it outright; otherwise ask, when there is someone to
-    // ask. A non-interactive run keeps the machine default silently, which is
-    // what a script or an agent needs.
-    let model = match model {
-        Some(key) => Some(key),
-        None => models::prompt(&defaults.embeddings.model)?,
+    // Flags decide outright; otherwise ask, when there is someone to ask. A
+    // non-interactive run keeps the machine defaults silently, which is what a
+    // script or an agent needs — and `--yes` is how to get that on a terminal.
+    let answers = if yes {
+        init_wizard::Answers {
+            model: model.clone(),
+            state_dir: state_dir.clone(),
+            group: group.clone(),
+        }
+    } else {
+        let asked = init_wizard::ask(&defaults.embeddings, &models_in_use(), &groups_in_use())?;
+        init_wizard::Answers {
+            // A flag that was passed was meant; it wins over the answer.
+            model: model.clone().or(asked.model),
+            state_dir: state_dir.clone().or(asked.state_dir),
+            group: group.clone().or(asked.group),
+        }
     };
-    if let Some(key) = &model {
+    if let Some(key) = &answers.model {
         defaults.embeddings = choose_model(key, &defaults.embeddings)?;
     }
+
+    if !yes {
+        println!(
+            "\n{}",
+            init_wizard::summary(&name, &answers, &defaults.embeddings.model)
+        );
+        if !init_wizard::confirm() {
+            println!("Nothing written.");
+            return Ok(());
+        }
+    }
+
     let cfg = ProjectConfig {
         project: Project {
             name,
             path: root.to_string_lossy().into_owned(),
-            group: group.unwrap_or_default(),
+            group: answers.group.clone().unwrap_or_default(),
         },
+        state_dir: answers.state_dir.clone().unwrap_or_default(),
         embeddings: defaults.embeddings,
         reranking: defaults.reranking,
         ..Default::default()
@@ -2160,7 +2246,7 @@ fn cmd_init(
 
     devctx_central::write_project_config(&cfg_path, &cfg)
         .with_context(|| format!("writing {}", cfg_path.display()))?;
-    if model.is_some() {
+    if answers.model.is_some() {
         adopt_as_machine_default(&cfg.embeddings);
     }
 
