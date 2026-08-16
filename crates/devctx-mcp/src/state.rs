@@ -955,10 +955,8 @@ pub fn do_list_projects(
                      `devctx update`; do not update anything yourself.",
         })
     });
-    serde_json::to_string_pretty(
-        &json!({ "projects": projects, "bound": bound, "update": update }),
-    )
-    .map_err(|e| e.to_string())
+    serde_json::to_string_pretty(&json!({ "projects": projects, "bound": bound, "update": update }))
+        .map_err(|e| e.to_string())
 }
 
 /// `remember` with `scope: global` or `scope: group`: store in the shared

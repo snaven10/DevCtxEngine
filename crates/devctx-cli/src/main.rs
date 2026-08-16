@@ -7,8 +7,8 @@
 mod hooks;
 mod mcp_configure;
 mod models;
-mod update_check;
 mod remote;
+mod update_check;
 mod watch;
 
 use std::net::SocketAddr;

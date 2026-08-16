@@ -43,7 +43,11 @@ fn newer(latest: &str, current: &str) -> Option<String> {
     let parse = |v: &str| -> Vec<u64> {
         v.trim_start_matches('v')
             .split('.')
-            .map(|p| p.chars().take_while(char::is_ascii_digit).collect::<String>())
+            .map(|p| {
+                p.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
             .map(|p| p.parse().unwrap_or(0))
             .collect()
     };
@@ -54,7 +58,9 @@ fn fetch_latest(repo: &str) -> Option<String> {
     let resp = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(4))
         .build()
-        .get(&format!("https://api.github.com/repos/{repo}/releases/latest"))
+        .get(&format!(
+            "https://api.github.com/repos/{repo}/releases/latest"
+        ))
         .set("User-Agent", "devctx")
         .call()
         .ok()?;
@@ -105,7 +111,10 @@ mod tests {
         assert_eq!(newer("v0.1.10", "0.1.9").as_deref(), Some("v0.1.10"));
         assert_eq!(newer("v0.2.0", "0.1.99").as_deref(), Some("v0.2.0"));
         assert!(newer("v0.1.1", "0.1.1").is_none());
-        assert!(newer("v0.1.0", "0.1.1").is_none(), "never suggest downgrading");
+        assert!(
+            newer("v0.1.0", "0.1.1").is_none(),
+            "never suggest downgrading"
+        );
         // Garbage must not be read as a new release.
         assert!(newer("not-a-version", "0.1.1").is_none());
     }
