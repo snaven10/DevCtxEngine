@@ -1007,6 +1007,17 @@ fn models_in_use() -> Vec<(String, usize)> {
     out
 }
 
+/// The names of every registered project, for the "copy from" offer.
+fn registered_project_names() -> Vec<String> {
+    let Ok(central) = Central::open() else {
+        return Vec::new();
+    };
+    central
+        .list(false)
+        .map(|ps| ps.into_iter().map(|p| p.name).collect())
+        .unwrap_or_default()
+}
+
 /// The groups already in use, with how many repositories each holds.
 ///
 /// Read from each project's config, not the registry: the registry caches the
@@ -2207,18 +2218,44 @@ fn cmd_init(
             model: model.clone(),
             state_dir: state_dir.clone(),
             group: group.clone(),
+            ..Default::default()
         }
     } else {
-        let asked = init_wizard::ask(&defaults.embeddings, &models_in_use(), &groups_in_use())?;
+        let asked = init_wizard::ask(
+            &defaults.embeddings,
+            &models_in_use(),
+            &groups_in_use(),
+            &registered_project_names(),
+        )?;
         init_wizard::Answers {
             // A flag that was passed was meant; it wins over the answer.
             model: model.clone().or(asked.model),
             state_dir: state_dir.clone().or(asked.state_dir),
             group: group.clone().or(asked.group),
+            ..asked
         }
     };
+
+    // Copying takes everything but this repository's own identity: the name and
+    // path are what make it a different project, and the group is a claim about
+    // this repository that the source cannot make for it.
+    let mut copied: Option<ProjectConfig> = None;
+    if let Some(src) = &answers.copy_from {
+        let root = devctx_mcp::state::resolve_project_root(src).map_err(|e| anyhow!(e))?;
+        let cfg = ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
+            .with_context(|| format!("reading the configuration of `{src}`"))?;
+        defaults.embeddings = cfg.embeddings.clone();
+        defaults.reranking = cfg.reranking.clone();
+        copied = Some(cfg);
+    }
     if let Some(key) = &answers.model {
         defaults.embeddings = choose_model(key, &defaults.embeddings)?;
+    }
+    if let Some(o) = answers.offline {
+        defaults.embeddings.offline = o;
+    }
+    if let Some(r) = &answers.reranking {
+        defaults.reranking = r.clone();
     }
 
     if !yes {
@@ -2232,16 +2269,20 @@ fn cmd_init(
         }
     }
 
+    let base = copied.unwrap_or_default();
     let cfg = ProjectConfig {
         project: Project {
             name,
             path: root.to_string_lossy().into_owned(),
             group: answers.group.clone().unwrap_or_default(),
         },
-        state_dir: answers.state_dir.clone().unwrap_or_default(),
+        state_dir: answers.state_dir.clone().unwrap_or(base.state_dir),
+        language: answers.language.unwrap_or(base.language),
         embeddings: defaults.embeddings,
+        storage: answers.storage.clone().unwrap_or(base.storage),
+        indexing: answers.indexing.clone().unwrap_or(base.indexing),
         reranking: defaults.reranking,
-        ..Default::default()
+        summarization: answers.summarization.clone().unwrap_or(base.summarization),
     };
 
     devctx_central::write_project_config(&cfg_path, &cfg)
