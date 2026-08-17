@@ -66,6 +66,7 @@ pub fn ask(
         Language::En
     };
     let t = Text::new(lang);
+    prompt_ui::set_hint(t.keys_hint());
 
     // Then: copying, because answering it answers everything else. Setting up
     // the fourth repository of one product should not mean walking a
@@ -85,7 +86,7 @@ pub fn ask(
         }
     }
 
-    let model = models::prompt(&defaults.model, in_use)?;
+    let model = models::prompt(&defaults.model, in_use, &t)?;
 
     println!("\n{}", t.storage_heading());
     println!("{}", t.index_dir_note());

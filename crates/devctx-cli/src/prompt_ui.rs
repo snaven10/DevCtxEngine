@@ -41,6 +41,22 @@ fn interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// How the list says it can be driven.
+///
+/// Set once at the start of the wizard so the hint follows the language chosen
+/// there. A global rather than a parameter because every question would
+/// otherwise thread it through, and there is exactly one wizard per process.
+static HINT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+pub fn set_hint(hint: &'static str) {
+    // A second call is the caller's business, not an error worth failing on.
+    let _ = HINT.set(hint);
+}
+
+fn hint() -> &'static str {
+    HINT.get().copied().unwrap_or("(↑↓, Enter)")
+}
+
 /// Ask one of `choices`, returning the chosen value.
 ///
 /// `default_index` is where the cursor starts and what Enter accepts, so the
@@ -71,7 +87,7 @@ pub fn confirm(question: &str, default: bool, yes: &str, no: &str) -> bool {
 
 /// Free text, with a default. Always typed: there is nothing to choose from.
 pub fn input(question: &str, default: &str) -> String {
-    print!("{question} [{default}]: ");
+    print!("\n{question} [{default}]: ");
     std::io::stdout().flush().ok();
     let mut s = String::new();
     if std::io::stdin().read_line(&mut s).is_err() {
@@ -130,7 +146,8 @@ fn select_interactive(question: &str, choices: &[Choice], default_index: usize) 
 
     // Collapse the list to one line: the transcript should read as a record of
     // what was decided, not as the menu it was decided from.
-    let painted = choices.len() as u16 + 1;
+    // +1 for the question, +1 for the blank line opened before it.
+    let painted = choices.len() as u16 + 2;
     let _ = execute!(
         out,
         cursor::MoveToPreviousLine(painted),
@@ -139,6 +156,7 @@ fn select_interactive(question: &str, choices: &[Choice], default_index: usize) 
     let _ = terminal::disable_raw_mode();
 
     if let Some(v) = &chosen {
+        println!();
         let label = choices
             .iter()
             .find(|c| &c.value == v)
@@ -156,7 +174,12 @@ fn draw(
     cursor_at: usize,
     first: bool,
 ) {
-    if !first {
+    if first {
+        // A blank line before each question: run together, the answered lines
+        // and the next prompt read as one paragraph, and the eye has nowhere to
+        // rest between decisions.
+        let _ = write!(out, "\r\n");
+    } else {
         let _ = execute!(
             out,
             cursor::MoveToPreviousLine(choices.len() as u16 + 1),
@@ -164,7 +187,7 @@ fn draw(
         );
     }
     // Raw mode means \n does not return the carriage, so every line ends \r\n.
-    let _ = write!(out, "{question}  (↑↓ to move, Enter to choose)\r\n");
+    let _ = write!(out, "{question}  {}\r\n", hint());
     for (i, c) in choices.iter().enumerate() {
         let mark = if i == cursor_at { "❯" } else { " " };
         let note = if i == cursor_at && !c.note.is_empty() {

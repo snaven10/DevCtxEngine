@@ -158,28 +158,6 @@ pub fn download(key: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// One line naming the models this machine already indexes with.
-///
-/// Empty for a first project: a header over nothing reads as "no other project
-/// uses a model", which is a different and wrong claim.
-pub fn in_use_summary(in_use: &[(String, usize)]) -> String {
-    if in_use.is_empty() {
-        return String::new();
-    }
-    let parts: Vec<String> = in_use
-        .iter()
-        .map(|(model, n)| {
-            let repos = if *n == 1 {
-                "repository"
-            } else {
-                "repositories"
-            };
-            format!("{model} ({n} {repos})")
-        })
-        .collect();
-    format!("Already in use on this machine: {}", parts.join(", "))
-}
-
 /// Ask which model to use, offering the registry and fetching what is chosen.
 ///
 /// Returns `None` when there is nobody to ask — no terminal, which is the case
@@ -191,18 +169,22 @@ pub fn in_use_summary(in_use: &[(String, usize)]) -> String {
 /// running `devctx init` in a Spanish codebase should be shown that the default
 /// is English-only *before* the first index, not discover it in poor results
 /// months later.
-pub fn prompt(default_key: &str, in_use: &[(String, usize)]) -> Result<Option<String>> {
+pub fn prompt(
+    default_key: &str,
+    in_use: &[(String, usize)],
+    t: &crate::wizard_text::Text,
+) -> Result<Option<String>> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() {
         return Ok(None);
     }
-    let summary = in_use_summary(in_use);
-    if !summary.is_empty() {
-        println!("{summary}");
-        println!(
-            "Matching one of those keeps a single model in memory for any process \
-             that touches both a project and the shared memories."
-        );
+    if !in_use.is_empty() {
+        let parts: Vec<String> = in_use
+            .iter()
+            .map(|(model, n)| format!("{model} ({n})"))
+            .collect();
+        println!("\n{} {}", t.models_in_use_prefix(), parts.join(", "));
+        println!("{}", t.models_in_use_note());
     }
 
     // The list is the table: showing one to read and then asking for the name
@@ -234,11 +216,7 @@ pub fn prompt(default_key: &str, in_use: &[(String, usize)]) -> Result<Option<St
         .position(|s| s.key == default_key)
         .unwrap_or(0);
 
-    let key = crate::prompt_ui::select(
-        "Embedding model — cannot change after indexing",
-        &choices,
-        default_index,
-    );
+    let key = crate::prompt_ui::select(t.model_question(), &choices, default_index);
     let spec = find_local(&key).ok_or_else(|| {
         anyhow!("unknown model `{key}`; run `devctx models` to see what there is")
     })?;
@@ -376,31 +354,4 @@ pub fn self_update(repo: &str, current: &str) -> Result<()> {
          in each project, and reconnect any MCP client."
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The line above the table is the point of asking at all: someone setting
-    /// up their fifth repository should be told what the other four use before
-    /// being offered eight alternatives.
-    #[test]
-    fn the_summary_names_the_models_already_in_use() {
-        let s = in_use_summary(&[("ml-granite".to_string(), 4), ("bge-base".to_string(), 1)]);
-        assert!(s.contains("ml-granite"), "{s}");
-        assert!(s.contains('4'), "the count is what makes it an answer: {s}");
-        assert!(
-            s.contains("bge-base"),
-            "every model in use, not just the commonest: {s}"
-        );
-        assert!(s.contains("repository"), "singular for the one: {s}");
-    }
-
-    /// A first project has nothing to compare against and must not be shown an
-    /// empty header pretending otherwise.
-    #[test]
-    fn a_first_project_gets_no_summary() {
-        assert!(in_use_summary(&[]).is_empty());
-    }
 }

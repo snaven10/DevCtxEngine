@@ -41,6 +41,30 @@ impl Text {
         "for these questions, and for summaries · para estas preguntas y los resúmenes"
     }
 
+    /// How to drive a list, shown beside every question.
+    pub fn keys_hint(&self) -> &'static str {
+        self.pick(
+            "(↑↓ to move, Enter to choose)",
+            "(↑↓ para moverte, Enter para elegir)",
+        )
+    }
+    /// The line above the model table, in the reader's language.
+    pub fn models_in_use_prefix(&self) -> &'static str {
+        self.pick("Already in use here:", "Ya en uso en esta máquina:")
+    }
+    pub fn models_in_use_note(&self) -> &'static str {
+        self.pick(
+            "Matching one keeps a single model in memory for anything that touches both a project and the shared memories.",
+            "Elegir el mismo mantiene un solo modelo en memoria para todo lo que toque un proyecto y las memorias compartidas.",
+        )
+    }
+    pub fn model_question(&self) -> &'static str {
+        self.pick(
+            "Embedding model — cannot change after indexing",
+            "Modelo de embeddings — no se puede cambiar después de indexar",
+        )
+    }
+
     // ── copying an existing configuration ─────────────────────────────────
     pub fn copy_question(&self) -> &'static str {
         self.pick(
