@@ -14,6 +14,15 @@ pub enum IndexError {
     #[error("failed to run git: {0}")]
     GitSpawn(#[from] std::io::Error),
 
+    /// `--branch` named a branch this repository does not have.
+    ///
+    /// Reported rather than created: `index` reads a repository, and a read
+    /// command that quietly makes a branch is a surprise to undo by hand.
+    #[error(
+        "this repository has no branch `{0}` — create it with git first, or pass one that exists"
+    )]
+    UnknownBranch(String),
+
     /// A store operation failed.
     #[error(transparent)]
     Store(#[from] devctx_store::StoreError),

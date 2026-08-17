@@ -89,6 +89,12 @@ enum Command {
         /// Force a full reindex instead of incremental.
         #[arg(long)]
         full: bool,
+        /// The branch to index, which need not be the one checked out — a
+        /// repository with worktrees has several live at once and only one on
+        /// disk. Defaults to the first entry of `indexing.branches`, then to
+        /// whatever is checked out. The branch must exist in git.
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// Repair an index left inconsistent by an unclean shutdown.
     Repair,
@@ -491,7 +497,7 @@ fn main() -> Result<()> {
         Command::Models { download } => cmd_models(download),
         Command::Update => models::self_update("snaven10/DevCtxEngine", env!("CARGO_PKG_VERSION")),
         Command::Status => cmd_status(),
-        Command::Index { full } => cmd_index(full),
+        Command::Index { full, branch } => cmd_index(full, branch),
         Command::Repair => cmd_repair(),
         Command::Search {
             query,
@@ -2495,6 +2501,7 @@ fn cmd_init(
         }
     } else {
         let asked = init_wizard::ask(
+            &root,
             &defaults.embeddings,
             &models_in_use(),
             &groups_in_use(),
@@ -2755,8 +2762,12 @@ fn cmd_status() -> Result<()> {
 }
 
 /// `devctx index` — run the indexing pipeline.
-fn cmd_index(full: bool) -> Result<()> {
+fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
     let cfg = load_project()?;
+    // An explicit `--branch` wins; otherwise the project's declared default;
+    // otherwise whatever is checked out, which is what the pipeline does with
+    // `None`.
+    let branch = branch.or_else(|| cfg.indexing.default_branch().map(str::to_string));
     if let Some(r) = remote::ensure(&cfg) {
         // The server does the work, so nothing local can drive the bar. Poll it
         // instead: elapsed seconds alone cannot tell a run that is nearly done
@@ -2792,6 +2803,7 @@ fn cmd_index(full: bool) -> Result<()> {
         progress: Some(&progress),
         paths: None,
         exclude: &cfg.indexing.exclude,
+        branch: branch.as_deref(),
     })?;
     progress.finish();
     devctx_mcp::state::report_index(&store, &root, &res);

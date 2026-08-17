@@ -42,6 +42,14 @@ pub struct IndexRequest<'a> {
     /// it takes to index work that has not been committed yet, which is what a
     /// file watcher or an editor integration needs.
     pub paths: Option<&'a [String]>,
+
+    /// The branch to index. `None` means the checked-out one.
+    ///
+    /// Naming another branch reads it out of git rather than off disk, so a
+    /// repository can keep several branches indexed from wherever it happens to
+    /// be checked out — which is the only way a worktree layout works, since
+    /// only one branch is on disk at a time.
+    pub branch: Option<&'a str>,
     /// Model name recorded in `index_state` (drives model-change reindex).
     pub model_name: &'a str,
     /// Optional progress reporter.
@@ -96,7 +104,27 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let state = git.state();
     let repo_short = git.short_name();
     let repo_path = git.root().to_string_lossy().to_string();
-    let branch = state.branch.clone();
+    // The branch this run is *about*, which is not always the one on disk.
+    let branch = match req.branch {
+        Some(b) if b != state.branch => {
+            if !git.has_branch(b) {
+                return Err(IndexError::UnknownBranch(b.to_string()));
+            }
+            b.to_string()
+        }
+        _ => state.branch.clone(),
+    };
+    // Reading off disk is right only for the checked-out branch, and it is
+    // better than reading git there: the work tree includes files written but
+    // not committed, which is exactly the code someone is about to ask about.
+    // For any other branch the work tree holds someone else's content, so the
+    // objects are the only honest source.
+    let read_from = (branch != state.branch).then(|| branch.clone());
+    let head_commit = if read_from.is_some() {
+        git.commit_of(&branch).unwrap_or_default()
+    } else {
+        state.commit.clone()
+    };
 
     let explicit_paths = req.paths.filter(|p| !p.is_empty());
     let prev = req.store.get_index_record(&repo_path, &branch)?;
@@ -131,7 +159,8 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         repo_short: &repo_short,
         repo_path: &repo_path,
         branch: &branch,
-        commit: &state.commit,
+        commit: &head_commit,
+        read_from: read_from.clone(),
         full_reindex,
         cfg: ChunkConfig::default(),
         indexed: HashSet::new(),
@@ -139,7 +168,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     };
 
     let mut result = IndexResult {
-        commit: state.commit.clone(),
+        commit: head_commit.clone(),
         branch: branch.clone(),
         full_reindex,
         ..Default::default()
@@ -158,7 +187,10 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 }
             })
             .collect(),
-        None => git.changes(from)?,
+        None => match &read_from {
+            Some(b) => git.changes_at(b, from)?,
+            None => git.changes(from)?,
+        },
     };
     if let Some(p) = req.progress {
         p.start(changes.len());
@@ -201,7 +233,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let totals = req.store.index_totals(&repo_path, &branch)?;
     let last_commit = match (&explicit_paths, &prev) {
         (Some(_), Some(p)) => p.last_commit.clone(),
-        _ => state.commit.clone(),
+        _ => head_commit.clone(),
     };
     let counts = totals;
     req.store.save_index_record(&IndexRecord {
@@ -313,6 +345,8 @@ struct Ctx<'a> {
     store: &'a Store,
     embedder: &'a dyn EmbeddingProvider,
     git: &'a GitRepo,
+    /// Read file content from this branch's objects; `None` reads the work tree.
+    read_from: Option<String>,
     repo_short: &'a str,
     repo_path: &'a str,
     branch: &'a str,
@@ -365,7 +399,11 @@ impl Ctx<'_> {
             return Ok(());
         }
 
-        let Ok(content) = self.git.read_file(file) else {
+        let read = match &self.read_from {
+            Some(b) => self.git.read_file_at(b, file),
+            None => self.git.read_file(file),
+        };
+        let Ok(content) = read else {
             // Unreadable / non-UTF-8 (binary): skip.
             result.files_skipped += 1;
             return Ok(());
@@ -391,6 +429,41 @@ impl Ctx<'_> {
         // Replace any existing vectors for this file.
         self.store
             .delete_by_file(self.repo_short, self.branch, file)?;
+
+        // Branches share commits: a feature branch differs from its base in a
+        // handful of files and is byte-identical in the other thousand. When
+        // some other branch already holds this exact content, its chunks are
+        // the chunks this branch would produce — so copy them and skip the
+        // embedding, which is the expensive half by orders of magnitude
+        // (minutes against milliseconds).
+        //
+        // Safe because the key is the content hash: identical bytes, identical
+        // chunks. What differs between the two rows is only which branch they
+        // are filed under.
+        if let Some(src) =
+            self.store
+                .branch_with_same_content(self.repo_path, file, &hash, self.branch)?
+        {
+            let (language, symbols, chunks) =
+                self.store
+                    .copy_file_rows(self.repo_short, &src, self.branch, file)?;
+            if chunks > 0 {
+                self.store.save_file_state(&devctx_store::FileState {
+                    repo_path: self.repo_path.to_string(),
+                    branch: self.branch.to_string(),
+                    file_path: file.to_string(),
+                    content_hash: hash,
+                    language,
+                    symbol_count: symbols as i64,
+                    chunk_count: chunks as i64,
+                })?;
+                self.indexed.insert(file.to_string());
+                result.files_indexed += 1;
+                result.symbols += symbols;
+                result.chunks += chunks;
+                return Ok(());
+            }
+        }
 
         let (language, symbol_count, chunk_count) = match lang {
             // Parseable code: chunk + embed, plus call-graph edges and routes.

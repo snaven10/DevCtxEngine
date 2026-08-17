@@ -282,8 +282,17 @@ impl AppState {
         self.cfg.project.group.clone()
     }
 
+    /// The branch this project keeps indexed by default, if it declares one.
+    ///
+    /// What search falls back to when the checked-out branch has never been
+    /// indexed — the ordinary state of a branch created five minutes ago, and
+    /// of every linked worktree in a repository that indexes only its trunk.
+    pub fn default_branch(&self) -> Option<String> {
+        self.cfg.indexing.default_branch().map(str::to_string)
+    }
+
     /// The short repo name + branch (for graph queries), from git.
-    fn repo_branch(&self) -> Result<(String, String), String> {
+    pub fn repo_branch(&self) -> Result<(String, String), String> {
         let git = GitRepo::open(&self.root).map_err(|e| e.to_string())?;
         Ok((git.short_name(), git.state().branch))
     }
@@ -308,7 +317,7 @@ pub fn do_search(
     let filter = SearchFilter {
         languages: language.into_iter().collect(),
         exclude_deletions: true,
-        ..Default::default()
+        ..search_branch(state, &store)
     };
     // Keyword search needs the BM25 index, which is opt-in and therefore usually
     // absent. Building it here — the user has just asked for the feature — turns
@@ -356,6 +365,70 @@ pub fn do_search(
     )
     .map_err(|e| e.to_string())?;
     serde_json::to_string_pretty(&hits_to_json(&hits)).map_err(|e| e.to_string())
+}
+
+/// Drop rows for branches the config no longer lists. Returns rows removed.
+///
+/// Never runs when the list is empty: that means "track whatever is checked
+/// out", and treating it as "track nothing" would delete the entire index of
+/// every project that has not configured this.
+fn prune_untracked_branches(state: &AppState, store: &devctx_store::Store) -> usize {
+    if state.cfg.indexing.branches.is_empty() {
+        return 0;
+    }
+    let Ok((repo, current)) = state.repo_branch() else {
+        return 0;
+    };
+    let repo_path = state.root.to_string_lossy().to_string();
+    let Ok(indexed) = store.indexed_branches(&repo_path) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for b in indexed {
+        // The checked-out branch is spared even when untracked: someone is
+        // standing in it, and deleting the index under their feet mid-session
+        // is not a tidy-up.
+        if b == current || state.cfg.indexing.tracks(&b) {
+            continue;
+        }
+        removed += store.drop_branch(&repo, &repo_path, &b).unwrap_or(0);
+    }
+    removed
+}
+
+/// Narrow a search to one branch — when, and only when, that is meaningful.
+///
+/// A store may hold several branches at once, and mixing them answers with two
+/// versions of the same file and no way to tell which is which. But narrowing
+/// blindly is worse: a branch nobody has indexed would return nothing at all,
+/// which is what a freshly created branch always is, and the moment someone
+/// most wants to search.
+///
+/// So: the checked-out branch if it has rows, else the configured default if it
+/// has rows, else no filter — which is exactly the behaviour of every version
+/// before branches were tracked, and correct for the single-branch store that
+/// most repositories are.
+fn search_branch(state: &AppState, store: &devctx_store::Store) -> SearchFilter {
+    let unfiltered = SearchFilter::default();
+    let Ok((repo, branch)) = state.repo_branch() else {
+        return unfiltered;
+    };
+    let has = |b: &str| store.has_branch_rows(&repo, b).unwrap_or(false);
+    if has(&branch) {
+        return SearchFilter {
+            repo: Some(repo),
+            branch: Some(branch),
+            ..unfiltered
+        };
+    }
+    match state.default_branch().filter(|b| has(b)) {
+        Some(b) => SearchFilter {
+            repo: Some(repo),
+            branch: Some(b),
+            ..unfiltered
+        },
+        None => unfiltered,
+    }
 }
 
 /// Parse an optional mode string into a [`SearchMode`] (default vector).
@@ -457,6 +530,11 @@ fn do_index_inner(
     let store = state.open_store()?;
     let embedder = state.embedder()?;
     let sink = SharedProgress(state.index_progress.clone());
+    // Which branch this run is about. Declared config wins over what happens to
+    // be checked out, so running `index` from a linked worktree keeps the
+    // repository's trunk fresh instead of quietly indexing the worktree's
+    // branch into the same store — which is how two branches end up mixed.
+    let target_branch = state.default_branch();
     let run = index_run(IndexRequest {
         store: &store,
         embedder: embedder.as_ref(),
@@ -466,12 +544,22 @@ fn do_index_inner(
         progress: Some(&sink),
         paths,
         exclude: &state.cfg.indexing.exclude,
+        branch: target_branch.as_deref(),
     });
     // Before the `?`: a run that fails still has to stop reporting itself as
     // running, or the next poller waits on something that is already over.
     sink.finish();
     let res = run.map_err(|e| e.to_string())?;
+
+    // Anything the config no longer declares is dropped now. Doing it here,
+    // rather than in a command someone has to remember, is what keeps a branch
+    // list from being a suggestion: merged-and-deleted branches leave, and a
+    // name reused later cannot inherit their rows.
+    let pruned = prune_untracked_branches(state, &store);
     report_index(&store, &state.root, &res);
+    if pruned > 0 {
+        eprintln!("· dropped {pruned} row(s) of branches this project no longer tracks");
+    }
     Ok(json!({
         "commit": res.commit,
         "branch": res.branch,

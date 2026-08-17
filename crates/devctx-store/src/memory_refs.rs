@@ -56,6 +56,7 @@ use duckdb::params;
 use crate::error::Result;
 use crate::memory::{row_to_memory, Memory, MEM_COLS};
 use crate::store::Store;
+use crate::store::{row_to_point, COLS};
 
 /// The repository's indexed paths, for resolving what a memory names.
 ///
@@ -315,6 +316,124 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Copy one file's rows from `from_branch` to `to_branch`, without
+    /// re-embedding. Returns `(language, symbols, chunks)`.
+    ///
+    /// The point of the whole multi-branch design: two branches that share a
+    /// commit share the file's bytes, so they share its chunks and its vectors.
+    /// Recomputing them is the expensive half of indexing; copying is a SQL
+    /// insert. A feature branch of twelve changed files then costs twelve
+    /// files, not the whole repository.
+    ///
+    /// Ids carry the branch so the two copies stay distinct rows — the store is
+    /// keyed by id, and reusing one would have the second branch overwrite the
+    /// first rather than sit beside it.
+    pub fn copy_file_rows(
+        &self,
+        repo: &str,
+        from_branch: &str,
+        to_branch: &str,
+        file: &str,
+    ) -> Result<(String, usize, usize)> {
+        let tag = |s: &str| format!("{s}@{to_branch}");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM vectors
+             WHERE repo = ? AND branch = ? AND file = ?"
+        ))?;
+        let rows = stmt.query_map(params![repo, from_branch, file], row_to_point)?;
+        let mut points = Vec::new();
+        let mut language = String::new();
+        let mut symbols = std::collections::HashSet::new();
+        for r in rows {
+            let mut p = r?;
+            p.id = tag(&p.id);
+            p.metadata.branch = to_branch.to_string();
+            if language.is_empty() {
+                language = p.metadata.language.clone();
+            }
+            if !p.metadata.symbol.is_empty() {
+                symbols.insert(p.metadata.symbol.clone());
+            }
+            points.push(p);
+        }
+        if points.is_empty() {
+            return Ok((String::new(), 0, 0));
+        }
+        let chunks = points.len();
+        self.upsert(&points)?;
+
+        // The call graph travels with the code: a branch whose file is
+        // byte-identical has the same calls in it, and leaving them behind
+        // would make `impact` answer "nothing calls this" on that branch.
+        self.conn.execute(
+            "INSERT INTO graph_edges
+                 (source, target, kind, source_file, target_file, line, repo, branch, metadata)
+             SELECT source, target, kind, source_file, target_file, line, repo, ?, metadata
+             FROM graph_edges
+             WHERE repo = ? AND branch = ? AND source_file = ?",
+            params![to_branch, repo, from_branch, file],
+        )?;
+        self.conn.execute(
+            "INSERT INTO routes
+                 (framework, http_method, path, handler_class, handler_method,
+                  handler_symbol, file, line, repo, branch, indexed_at)
+             SELECT framework, http_method, path, handler_class, handler_method,
+                    handler_symbol, file, line, repo, ?, indexed_at
+             FROM routes
+             WHERE repo = ? AND branch = ? AND file = ?",
+            params![to_branch, repo, from_branch, file],
+        )?;
+        Ok((language, symbols.len(), chunks))
+    }
+
+    /// Remove every trace of a branch: its chunks, edges, routes and file state.
+    ///
+    /// The counterpart of a declared branch list. Without it the index only
+    /// grows: a branch merged and deleted six weeks ago keeps its rows for
+    /// ever, and — worse than the disk — a branch name reused later inherits
+    /// them, so a fresh branch starts out answering with someone else's code.
+    pub fn drop_branch(&self, repo: &str, repo_path: &str, branch: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM vectors WHERE repo = ? AND branch = ?",
+            params![repo, branch],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "DELETE FROM vectors WHERE repo = ? AND branch = ?",
+            params![repo, branch],
+        )?;
+        self.conn.execute(
+            "DELETE FROM graph_edges WHERE repo = ? AND branch = ?",
+            params![repo, branch],
+        )?;
+        self.conn.execute(
+            "DELETE FROM routes WHERE repo = ? AND branch = ?",
+            params![repo, branch],
+        )?;
+        // Keyed by the absolute path, not the short name, like the rest of
+        // `file_state` and `index_state`.
+        self.conn.execute(
+            "DELETE FROM file_state WHERE repo_path = ? AND branch = ?",
+            params![repo_path, branch],
+        )?;
+        self.conn.execute(
+            "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
+            params![repo_path, branch],
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Whether this repository has any rows for `branch` — what search asks
+    /// before narrowing to it.
+    pub fn has_branch_rows(&self, repo: &str, branch: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM vectors WHERE repo = ? AND branch = ? LIMIT 1",
+            params![repo, branch],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// Which of `files` this repository actually has indexed.

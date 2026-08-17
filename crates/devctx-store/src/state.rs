@@ -167,6 +167,50 @@ impl Store {
     }
 
     /// Delete a file-state row (on file deletion).
+    /// Another branch that already has this exact file content indexed.
+    ///
+    /// Branches share commits — a feature branch differs from its base in a
+    /// handful of files and is identical in the other thousand. Embedding is
+    /// the expensive half of indexing (measured in tens of minutes for a large
+    /// corpus, against milliseconds to copy a row), so a second branch should
+    /// pay only for what actually differs.
+    ///
+    /// `content_hash` is what makes that safe: identical bytes give an
+    /// identical hash, so a hit means the chunks already in the store are the
+    /// chunks this branch would have produced.
+    pub fn branch_with_same_content(
+        &self,
+        repo_path: &str,
+        file: &str,
+        content_hash: &str,
+        except_branch: &str,
+    ) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT branch FROM file_state
+             WHERE repo_path = ? AND file_path = ? AND content_hash = ? AND branch <> ?
+             LIMIT 1",
+        )?;
+        match stmt.query_row(
+            duckdb::params![repo_path, file, content_hash, except_branch],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(b) => Ok(Some(b)),
+            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every branch this repository has rows for, so a caller can tell which
+    /// ones are no longer wanted.
+    pub fn indexed_branches(&self, repo_path: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT branch FROM file_state WHERE repo_path = ?")?;
+        let rows = stmt.query_map(duckdb::params![repo_path], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn delete_file_state(&self, repo_path: &str, branch: &str, file: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",

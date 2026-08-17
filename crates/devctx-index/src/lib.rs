@@ -93,8 +93,187 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            branch: None,
         })
         .unwrap()
+    }
+
+    fn index_branch(store: &Store, root: &Path, branch: &str, full: bool) -> IndexResult {
+        run(IndexRequest {
+            store,
+            embedder: &FakeEmbedder,
+            repo_root: root,
+            incremental: !full,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+            exclude: &[],
+            branch: Some(branch),
+        })
+        .unwrap()
+    }
+
+    /// A repository with `main` and a feature branch that changes one file.
+    fn two_branch_repo(tag: &str) -> PathBuf {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_branch_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write(&dir, "a.py", "def alpha():\n    return 1\n");
+        write(&dir, "b.py", "def beta():\n    return 2\n");
+        commit_all(&dir, "main");
+
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        write(&dir, "b.py", "def beta():\n    return 22\n");
+        commit_all(&dir, "feature");
+        git(&dir, &["checkout", "-q", "main"]);
+        dir
+    }
+
+    fn files_on(store: &Store, branch: &str) -> Vec<String> {
+        let mut v: Vec<String> = store
+            .search(
+                &[0.1; DIM],
+                &SearchFilter {
+                    branch: Some(branch.to_string()),
+                    ..Default::default()
+                },
+                100,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|h| h.point.metadata.file)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The point of the whole design: a branch that is not checked out can be
+    /// indexed, from git rather than from disk, and its rows stay its own.
+    #[test]
+    fn a_branch_that_is_not_checked_out_can_be_indexed() {
+        let dir = two_branch_repo("notout");
+        let store = Store::open_in_memory(DIM).unwrap();
+
+        let main = index_branch(&store, &dir, "main", true);
+        assert_eq!(main.branch, "main");
+        let feat = index_branch(&store, &dir, "feature", true);
+        assert_eq!(feat.branch, "feature", "the run is about the named branch");
+
+        assert_eq!(files_on(&store, "main"), vec!["a.py", "b.py"]);
+        assert_eq!(files_on(&store, "feature"), vec!["a.py", "b.py"]);
+
+        // And the content differs where the branches differ.
+        let on = |branch: &str| -> String {
+            store
+                .search(
+                    &[0.1; DIM],
+                    &SearchFilter {
+                        branch: Some(branch.into()),
+                        ..Default::default()
+                    },
+                    100,
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|h| h.point.metadata.file == "b.py")
+                .map(|h| h.point.text)
+                .collect()
+        };
+        assert!(on("main").contains("return 2"), "{}", on("main"));
+        assert!(on("feature").contains("return 22"), "{}", on("feature"));
+    }
+
+    /// Branches share commits, so the file they share must not be embedded
+    /// twice — that is what makes keeping several branches indexed affordable.
+    #[test]
+    fn an_unchanged_file_is_copied_rather_than_re_embedded() {
+        let dir = two_branch_repo("dedup");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+
+        // `a.py` is byte-identical on both branches; `b.py` is not.
+        let hash_a = store
+            .get_file_hash(&dir.to_string_lossy(), "main", "a.py")
+            .unwrap()
+            .expect("indexed on main");
+        assert_eq!(
+            store
+                .branch_with_same_content(&dir.to_string_lossy(), "a.py", &hash_a, "main")
+                .unwrap(),
+            None,
+            "only main has it so far"
+        );
+
+        index_branch(&store, &dir, "feature", true);
+
+        // Now the shared file resolves across branches, and the changed one does not.
+        assert_eq!(
+            store
+                .branch_with_same_content(&dir.to_string_lossy(), "a.py", &hash_a, "feature")
+                .unwrap()
+                .as_deref(),
+            Some("main"),
+            "the shared file was recognised as already indexed"
+        );
+        let hash_b_main = store
+            .get_file_hash(&dir.to_string_lossy(), "main", "b.py")
+            .unwrap()
+            .unwrap();
+        let hash_b_feat = store
+            .get_file_hash(&dir.to_string_lossy(), "feature", "b.py")
+            .unwrap()
+            .unwrap();
+        assert_ne!(hash_b_main, hash_b_feat, "the changed file must differ");
+    }
+
+    /// Dropping a branch takes its rows and nothing else. A branch merged and
+    /// deleted must not leave rows a reused name would inherit.
+    #[test]
+    fn dropping_a_branch_leaves_the_others_intact() {
+        let dir = two_branch_repo("drop");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        index_branch(&store, &dir, "feature", true);
+
+        let repo = dir.file_name().unwrap().to_string_lossy().to_string();
+        let removed = store
+            .drop_branch(&repo, &dir.to_string_lossy(), "feature")
+            .unwrap();
+        assert!(removed > 0, "the branch had rows");
+
+        assert!(
+            files_on(&store, "feature").is_empty(),
+            "the dropped branch must have no rows left"
+        );
+        assert_eq!(files_on(&store, "main"), vec!["a.py", "b.py"]);
+        assert!(!store.has_branch_rows(&repo, "feature").unwrap());
+        assert!(store.has_branch_rows(&repo, "main").unwrap());
+    }
+
+    /// A branch git does not have is reported, never created.
+    #[test]
+    fn indexing_an_unknown_branch_is_an_error() {
+        let dir = two_branch_repo("unknown");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let err = run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: false,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+            exclude: &[],
+            branch: Some("no-such-branch"),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, IndexError::UnknownBranch(ref b) if b == "no-such-branch"),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -189,6 +368,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            branch: None,
         })
         .unwrap();
 
@@ -293,6 +473,7 @@ mod tests {
             progress: None,
             paths: Some(paths),
             exclude: &[],
+            branch: None,
         })
         .unwrap()
     }
@@ -414,6 +595,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            branch: None,
         })
         .unwrap();
         assert!(full.full_reindex);
@@ -495,6 +677,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude,
+            branch: None,
         })
         .unwrap()
     }
@@ -569,6 +752,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &["legacy/".to_string()],
+            branch: None,
         })
         .unwrap();
         assert_eq!(res.files_pruned, 1);

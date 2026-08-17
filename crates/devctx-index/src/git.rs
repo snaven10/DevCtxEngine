@@ -123,6 +123,59 @@ impl GitRepo {
     pub fn read_file(&self, rel: &str) -> Result<String> {
         Ok(std::fs::read_to_string(self.root.join(rel))?)
     }
+
+    /// Whether `branch` exists as a local branch.
+    ///
+    /// Indexing a branch git does not have is an error, not something to
+    /// create: `index` reads a repository, and a read command that quietly
+    /// makes a branch would be a surprise nobody asked for and a mess to undo.
+    pub fn has_branch(&self, branch: &str) -> bool {
+        run(
+            &self.root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .is_ok()
+    }
+
+    /// The commit a branch points at.
+    pub fn commit_of(&self, branch: &str) -> Option<String> {
+        run(&self.root, &["rev-parse", branch])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// What to index for `branch`, read from git rather than from disk.
+    ///
+    /// Used when the branch is not the checked-out one — the case a repository
+    /// with worktrees is in most of the time. Unlike [`changes`](Self::changes)
+    /// this cannot see untracked files, and that is correct rather than a
+    /// limitation: a file you have not committed exists only in the worktree
+    /// you wrote it in, and does not belong to the branch as anyone else would
+    /// find it.
+    pub fn changes_at(&self, branch: &str, from: Option<&str>) -> Result<Vec<Change>> {
+        Ok(match from {
+            None => run(&self.root, &["ls-tree", "-r", "--name-only", branch])?
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| Change::Added(l.to_string()))
+                .collect(),
+            Some(commit) => parse_name_status(&run(
+                &self.root,
+                &["diff", "--name-status", "-M", commit, branch],
+            )?),
+        })
+    }
+
+    /// Read a file as it is on `branch`, without checking it out.
+    pub fn read_file_at(&self, branch: &str, rel: &str) -> Result<String> {
+        run(&self.root, &["show", &format!("{branch}:{rel}")])
+    }
 }
 
 /// The path a change refers to (the destination, for a rename).

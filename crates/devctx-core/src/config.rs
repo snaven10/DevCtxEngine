@@ -157,6 +157,46 @@ pub struct Indexing {
     /// excluded without needing a rule here.
     #[serde(default)]
     pub exclude: Vec<String>,
+
+    /// The branches to keep indexed, in priority order. Empty means "whatever
+    /// is checked out", which is how this behaved before the field existed.
+    ///
+    /// Declared rather than inferred, and that is the whole point. A repository
+    /// with worktrees has several branches live at once, and nothing about the
+    /// checked-out one says which of the others matter. Guessing a base from
+    /// the git graph gets it wrong in the ordinary case — two feature branches
+    /// off the same parent — and gets it wrong silently, answering searches
+    /// with another branch's code.
+    ///
+    /// It is also what makes pruning safe: this list is the definition of what
+    /// belongs in the index, so anything else can be dropped. Without it there
+    /// is no way to tell a branch worth keeping from one merged and deleted six
+    /// weeks ago, and the index only ever grows.
+    ///
+    /// The first entry is the default: what `devctx index` targets with no
+    /// `--branch`, and what search falls back to when the checked-out branch is
+    /// not indexed.
+    #[serde(default)]
+    pub branches: Vec<String>,
+}
+
+impl Indexing {
+    /// The branch to act on when none was named.
+    ///
+    /// `None` means "use whatever is checked out" — the behaviour of every
+    /// version before `branches` existed, and still correct for a repository
+    /// with one branch and no worktrees.
+    pub fn default_branch(&self) -> Option<&str> {
+        self.branches.first().map(String::as_str)
+    }
+
+    /// Whether `branch` is one this repository keeps indexed.
+    ///
+    /// An empty list tracks everything, so that a repository which never
+    /// configured this does not suddenly have its index declared invalid.
+    pub fn tracks(&self, branch: &str) -> bool {
+        self.branches.is_empty() || self.branches.iter().any(|b| b == branch)
+    }
 }
 
 /// `reranking:` section.
@@ -353,13 +393,109 @@ pub fn find_config_file(start_dir: &Path) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
-        dir = dir.parent()?.to_path_buf();
+        let Some(parent) = dir.parent() else {
+            // Nothing above: try the repository this might be a worktree of.
+            return main_worktree(start_dir).and_then(|root| {
+                let candidate = root.join(CONFIG_FILE_NAME);
+                candidate.is_file().then_some(candidate)
+            });
+        };
+        dir = parent.to_path_buf();
     }
+}
+
+/// The main worktree of the repository `dir` belongs to, when `dir` is a linked
+/// worktree; `None` otherwise.
+///
+/// A linked worktree is the same repository checked out twice, so it must reach
+/// the same index — a memory saved from it, and the code it indexes, belong to
+/// one project. But `.devctx/` is not tracked in git, so walking up from a
+/// worktree finds no config and the tool concludes there is no project, which
+/// is how committing in a worktree came to index nothing at all.
+///
+/// `--git-common-dir` is what distinguishes them: in the main worktree it is
+/// `.git`, and in a linked one it is an absolute path to the main worktree's
+/// `.git`. Its parent is the root we want.
+fn main_worktree(dir: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let common = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    // Relative (`.git`) means this *is* the main worktree, and the walk above
+    // already looked there.
+    if common.is_relative() {
+        return None;
+    }
+    common.parent().map(Path::to_path_buf)
+}
+
+/// `main` or `master`, whichever this repository actually has — the sensible
+/// first entry for `indexing.branches`.
+///
+/// Returns `None` when neither exists, in which case the caller should fall
+/// back to the checked-out branch rather than invent one: a repository whose
+/// trunk is called `development` or `trunk` is not unusual, and writing a name
+/// nothing matches would leave every search falling through to a branch that is
+/// never indexed.
+pub fn detect_default_branch(repo: &Path) -> Option<String> {
+    for name in ["main", "master"] {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{name}"),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first entry is the default; an empty list keeps the old behaviour of
+    /// following whatever is checked out, so an existing repository does not
+    /// change meaning by upgrading.
+    #[test]
+    fn the_first_branch_is_the_default_and_empty_means_whatever_is_checked_out() {
+        let none = Indexing::default();
+        assert_eq!(none.default_branch(), None);
+        assert!(none.tracks("anything"), "an unset list must not exclude");
+
+        let set = Indexing {
+            branches: vec!["main".into(), "development".into()],
+            ..Default::default()
+        };
+        assert_eq!(set.default_branch(), Some("main"));
+        assert!(set.tracks("development"));
+        assert!(!set.tracks("feature/x"), "an untracked branch is prunable");
+    }
+
+    /// Parsed from YAML, since that is how anyone will actually set it.
+    #[test]
+    fn branches_round_trip_through_yaml() {
+        let cfg = ProjectConfig::from_yaml(
+            "project:\n  name: demo\n  path: /tmp/demo\nindexing:\n  branches:\n    - main\n    - qa\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.indexing.default_branch(), Some("main"));
+        assert!(cfg.indexing.tracks("qa"));
+    }
 
     /// A new project should start on the fast path. HNSW measured 84 ms → 49 ms
     /// on a 17k-vector store with recall@10 unchanged at 100%, so defaulting it

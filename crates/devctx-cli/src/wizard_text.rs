@@ -157,6 +157,40 @@ impl Text {
     pub fn indexing_heading(&self) -> &'static str {
         self.pick("── Indexing ──", "── Indexado ──")
     }
+    pub fn branches_heading(&self) -> &'static str {
+        self.pick(
+            "── Branches to keep indexed ─────────────────────────────",
+            "── Ramas que se mantienen indexadas ─────────────────────",
+        )
+    }
+    pub fn branches_detected(&self, branch: &str) -> String {
+        match self.lang {
+            Language::En => format!(
+                "  Trunk detected: {branch}. It is indexed by default, and searches
+                   from a branch that has never been indexed fall back to it."
+            ),
+            Language::Es => format!(
+                "  Trunk detectado: {branch}. Se indexa por defecto, y las búsquedas
+                   desde una rama nunca indexada caen a ella."
+            ),
+        }
+    }
+    pub fn branches_none(&self) -> &'static str {
+        self.pick(
+            "  No `main` or `master` here, so the checked-out branch is indexed —
+               which is how this has always worked. Set `indexing.branches` later
+               if you want several branches live at once.",
+            "  No hay `main` ni `master`, así que se indexa la rama checkouteada —
+               que es como funcionó siempre. Podés poner `indexing.branches` después
+               si querés varias ramas vivas a la vez.",
+        )
+    }
+    pub fn branches_question(&self) -> &'static str {
+        self.pick(
+            "Other branches to keep indexed, comma-separated — or Enter for none",
+            "Otras ramas a mantener indexadas, separadas por coma — o Enter para ninguna",
+        )
+    }
     pub fn exclude_question(&self) -> &'static str {
         self.pick(
             "Exclude patterns, comma-separated — or Enter for none",

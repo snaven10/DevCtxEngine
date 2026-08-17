@@ -41,6 +41,7 @@ pub struct Answers {
 
 /// Ask everything — or nothing, when there is no terminal.
 pub fn ask(
+    repo: &std::path::Path,
     defaults: &Embeddings,
     in_use: &[(String, usize)],
     groups: &[(String, usize)],
@@ -130,6 +131,33 @@ pub fn ask(
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect();
+
+    // The trunk this repository keeps indexed. Detected rather than asked when
+    // git can answer, because `main` or `master` is right almost always and a
+    // question whose answer is already on disk is a question not worth asking.
+    // Left empty when neither exists: a repository whose trunk is called
+    // something else is better served following whatever is checked out than by
+    // a name that matches nothing.
+    println!("\n{}", t.branches_heading());
+    let detected = devctx_core::config::detect_default_branch(repo);
+    let branches: Vec<String> = match &detected {
+        Some(b) => {
+            println!("{}", t.branches_detected(b));
+            let extra = prompt_ui::input(t.branches_question(), "");
+            let mut v = vec![b.clone()];
+            v.extend(
+                extra
+                    .split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty() && x != b),
+            );
+            v
+        }
+        None => {
+            println!("{}", t.branches_none());
+            Vec::new()
+        }
+    };
 
     println!("\n{}", t.memories_heading());
     let group = {
@@ -225,7 +253,7 @@ pub fn ask(
             metric,
             fts,
         }),
-        indexing: Some(Indexing { exclude }),
+        indexing: Some(Indexing { exclude, branches }),
         reranking: Some(Reranking {
             enabled: rerank_enabled,
             model: rerank_model,

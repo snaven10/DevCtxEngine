@@ -15,7 +15,7 @@ use crate::schema;
 const DELETE_CHUNK_SWEEP: usize = 256;
 
 /// The 19 `vectors` columns, in the canonical order used by every query.
-const COLS: &str = r#"id, text, vector, repo, branch, "commit", file, symbol,
+pub(crate) const COLS: &str = r#"id, text, vector, repo, branch, "commit", file, symbol,
     symbol_type, language, start_line, end_line, chunk_level, content_hash,
     is_deletion, memory_type, memory_scope, memory_tags, indexed_at"#;
 
@@ -739,7 +739,7 @@ fn build_where(f: &SearchFilter) -> (String, Vec<String>) {
 }
 
 /// Decode the first 19 columns of a row into a `VectorPoint`.
-fn row_to_point(row: &duckdb::Row<'_>) -> duckdb::Result<VectorPoint> {
+pub(crate) fn row_to_point(row: &duckdb::Row<'_>) -> duckdb::Result<VectorPoint> {
     let id: String = row.get(0)?;
     let text: String = row.get(1)?;
     let vector = value_to_f32_vec(row.get(2)?);
