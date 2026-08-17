@@ -305,6 +305,7 @@ impl CentralClient {
         repo: &str,
         branch: &str,
         group: &str,
+        files: &str,
     ) -> Result<Value> {
         self.post(
             "/remember",
@@ -312,7 +313,7 @@ impl CentralClient {
                 "content": content, "title": title, "type": memory_type,
                 "topic": topic, "tags": tags,
                 "project": project, "repo": repo, "branch": branch,
-                "group": group,
+                "group": group, "files": files,
             }),
         )
     }
@@ -332,6 +333,43 @@ impl CentralClient {
         let v = self.post(
             "/recall",
             serde_json::json!({ "query": query, "limit": limit, "repo": repo, "group": group }),
+        )?;
+        Ok(v.get("memories")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// The most recently updated shared memories, without a query.
+    pub fn recent_memories(&self, limit: usize) -> Result<Vec<Value>> {
+        let v = self.get(&format!("/memories?limit={limit}"))?;
+        Ok(v.get("memories")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Fetch specific memories by id, skipping any that are gone.
+    ///
+    /// Used to resolve memory↔graph links: the junction row is written next to
+    /// the graph in a project store, and the memory it names may live here.
+    pub fn memories_by_id(&self, ids: &[String]) -> Result<Vec<Value>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let v = self.post("/memories/by-id", serde_json::json!({ "ids": ids }))?;
+        Ok(v.get("memories")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Shared memories mentioning `label` literally — the fallback for a symbol
+    /// the junction never linked.
+    pub fn memories_mentioning(&self, label: &str, limit: usize) -> Result<Vec<Value>> {
+        let v = self.post(
+            "/memories/mentioning",
+            serde_json::json!({ "label": label, "limit": limit }),
         )?;
         Ok(v.get("memories")
             .and_then(|m| m.as_array())

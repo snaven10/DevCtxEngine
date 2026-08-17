@@ -558,8 +558,10 @@ pub fn do_remember(
     memory_type: String,
     topic: String,
     tags: String,
+    files: String,
 ) -> Result<String, String> {
     let store = state.open_store()?;
+    let (repo, branch) = state.repo_branch().unwrap_or_default();
     let req = RememberRequest {
         title,
         content,
@@ -567,15 +569,22 @@ pub fn do_remember(
         project: state.project(),
         topic_key: topic,
         tags,
+        files,
+        repo,
+        branch,
         now: now_epoch(),
         ..Default::default()
     };
     let embedder = state.embedder()?;
     let res = remember(&store, embedder.as_ref(), &req).map_err(|e| e.to_string())?;
+    // Link after saving, never before: the memory is the thing worth keeping,
+    // and a repository with no graph yet must not turn a save into a failure.
+    let links = devctx_memory::links::link_memory(&store, &res.memory);
     Ok(json!({
         "status": format!("{:?}", res.status).to_lowercase(),
         "id": res.memory.id,
         "title": res.memory.title,
+        "linked_symbols": links,
     })
     .to_string())
 }
@@ -606,27 +615,6 @@ pub fn do_recall(state: &AppState, query: &str, limit: usize) -> Result<String, 
                 "type": h.memory.memory_type,
                 "tags": h.memory.tags,
                 "content": h.memory.content,
-            })
-        })
-        .collect();
-    serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
-}
-
-/// `memory_context` tool: the most recent memories for the project (no query).
-pub fn do_memory_context(state: &AppState, limit: usize) -> Result<String, String> {
-    let store = state.open_store()?;
-    let mems = memory_context(&store, &state.project(), limit).map_err(|e| e.to_string())?;
-    let arr: Vec<Value> = mems
-        .iter()
-        .map(|m| {
-            json!({
-                "id": m.id,
-                "title": m.title,
-                "type": m.memory_type,
-                "tags": m.tags,
-                "content": m.content,
-                "created_at": m.created_at,
-                "updated_at": m.updated_at,
             })
         })
         .collect();
@@ -962,6 +950,7 @@ pub fn do_list_projects(
 /// `remember` with `scope: global` or `scope: group`: store in the shared
 /// central memory instead of this project's, so the other repositories — the
 /// group's, or every one of them — can recall it.
+#[allow(clippy::too_many_arguments)]
 pub fn do_remember_shared(
     state: &AppState,
     content: &str,
@@ -970,6 +959,7 @@ pub fn do_remember_shared(
     topic: &str,
     tags: &str,
     group: &str,
+    files: &str,
 ) -> Result<String, String> {
     let project = state.project();
     let (repo, branch) = state.repo_branch().unwrap_or_default();
@@ -992,8 +982,33 @@ pub fn do_remember_shared(
             &repo,
             &branch,
             group,
+            files,
         )
         .map_err(|e| e.to_string())?;
+
+    // The memory now lives centrally; its link to the code must not. The graph
+    // is per-repository, so the junction row goes in *this* project's store,
+    // carrying only the id — which is what makes a group-wide decision findable
+    // from the symbol it was made about.
+    let mut out = out;
+    if let Some(id) = out.get("id").and_then(|i| i.as_str()) {
+        if let Ok(store) = state.open_store() {
+            let linked = devctx_memory::links::link_memory(
+                &store,
+                &devctx_store::Memory {
+                    id: id.to_string(),
+                    content: content.to_string(),
+                    files: files.to_string(),
+                    repo: repo.clone(),
+                    branch: branch.clone(),
+                    ..Default::default()
+                },
+            );
+            if let Some(o) = out.as_object_mut() {
+                o.insert("linked_symbols".into(), json!(linked));
+            }
+        }
+    }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
@@ -1248,6 +1263,44 @@ pub fn do_memory_stats(state: &AppState) -> Result<String, String> {
     Ok(json!({ "total": stats.total, "by_type": by_type }).to_string())
 }
 
+/// `memory_context` tool: the most recent memories, with no query.
+///
+/// The recovery path, not the search path. After a context reset an agent does
+/// not yet know what to ask about — asking `recall` requires already having the
+/// words. This answers "what has been going on here" instead, which is the
+/// question you actually have at that moment.
+pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<String, String> {
+    let mut out: Vec<Value> = Vec::new();
+
+    if scope != "global" && scope != "group" {
+        let store = state.open_store()?;
+        for m in memory_context(&store, &state.project(), limit).map_err(|e| e.to_string())? {
+            out.push(memory_json(&m, "local"));
+        }
+    }
+    if scope != "local" {
+        // Shared memories live behind the daemon; losing it costs that half of
+        // the answer, not the whole call.
+        if let Ok(c) = central() {
+            for v in c.recent_memories(limit).unwrap_or_default() {
+                out.push(value_json(v, "shared"));
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        let key = |v: &Value| {
+            v.get("updated_at")
+                .and_then(|u| u.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        key(b).cmp(&key(a))
+    });
+    out.truncate(limit);
+    Ok(json!({ "scope": scope, "memories": out }).to_string())
+}
+
 /// `impact_analysis` tool: blast radius (transitive callers/callees) of a symbol.
 pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String, String> {
     let store = state.open_store()?;
@@ -1266,6 +1319,370 @@ pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String,
         "downstream": to_json(&impact.downstream),
     })
     .to_string())
+}
+
+/// `build_context` tool: one budgeted brief assembled for a question.
+///
+/// Three passes, in this order because each narrows what the next needs to say:
+///
+/// 1. **Recalled memories.** What was already decided about this area. First
+///    because it is the part no amount of reading the code recovers, and
+///    because it is small.
+/// 2. **Code.** The chunks the search ranks highest, skipping files a memory
+///    already brought in.
+/// 3. **Linked memories.** Memories attached to the *files that pass one and
+///    two chose* — the knowledge documented against exactly this code, which a
+///    semantic recall on the question's wording would never have surfaced. This
+///    is what the memory↔graph junction is for.
+///
+/// Returns prose rather than JSON: the result is meant to be read into a
+/// model's context, and a JSON envelope around code and prose spends budget on
+/// punctuation. The budget is a hard stop; whatever did not fit is named at the
+/// end rather than silently dropped.
+pub fn do_build_context(
+    state: &AppState,
+    query: &str,
+    max_tokens: usize,
+    include_memories: bool,
+) -> Result<String, String> {
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut dropped = 0usize;
+    let budget_chars = max_tokens * CHARS_PER_TOKEN;
+
+    // Append if it fits, else count it as dropped. Returns whether it fit.
+    let push = |out: &mut String, used: &mut usize, dropped: &mut usize, s: &str| -> bool {
+        if *used + s.len() > budget_chars {
+            *dropped += 1;
+            return false;
+        }
+        out.push_str(s);
+        *used += s.len();
+        true
+    };
+
+    let mut memory_files: Vec<String> = Vec::new();
+    if include_memories {
+        if let Ok(raw) = do_recall_scoped(state, query, 5, "all", None) {
+            let mems = parse_memories(&raw);
+            if !mems.is_empty() {
+                push(
+                    &mut out,
+                    &mut used,
+                    &mut dropped,
+                    "## What is already known\n\n",
+                );
+            }
+            for m in &mems {
+                let title = m.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let files = m.get("files").and_then(|v| v.as_str()).unwrap_or("");
+                for f in files.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+                    memory_files.push(f.to_string());
+                }
+                push(
+                    &mut out,
+                    &mut used,
+                    &mut dropped,
+                    &format!("[memory] {title}\n{content}\n\n"),
+                );
+            }
+        }
+    }
+
+    // Fetch more than will fit: the budget, not the limit, decides where to stop.
+    let raw = do_search(state, query, 30, None, SearchMode::Vector, false)?;
+    let hits: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let mut code_files: Vec<String> = Vec::new();
+    if !hits.is_empty() {
+        push(&mut out, &mut used, &mut dropped, "## Code\n\n");
+    }
+    for h in &hits {
+        let file = h.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
+        let text = h.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        // A file a memory already pulled in is not worth paying for twice.
+        if memory_files.iter().any(|f| f == file) {
+            continue;
+        }
+        if !code_files.iter().any(|f| f == file) {
+            code_files.push(file.to_string());
+        }
+        if !push(
+            &mut out,
+            &mut used,
+            &mut dropped,
+            &format!("// {file}:{line}\n{text}\n\n"),
+        ) {
+            break;
+        }
+    }
+
+    if include_memories {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut header = false;
+        for file in code_files.iter().take(5) {
+            let Ok(raw) = do_memories_by_file(state, file, 5) else {
+                continue;
+            };
+            for m in parse_memories(&raw) {
+                let id = m
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !seen.insert(id) {
+                    continue;
+                }
+                if !header {
+                    push(
+                        &mut out,
+                        &mut used,
+                        &mut dropped,
+                        "## Recorded against this code\n\n",
+                    );
+                    header = true;
+                }
+                let title = m.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let src = m.get("link_sources").and_then(|v| v.as_str()).unwrap_or("");
+                push(
+                    &mut out,
+                    &mut used,
+                    &mut dropped,
+                    &format!("[memory · {src} · about {file}] {title}\n{content}\n\n"),
+                );
+            }
+        }
+    }
+
+    if dropped > 0 {
+        out.push_str(&format!(
+            "\n[devctx] {dropped} further item(s) did not fit in {max_tokens} tokens. \
+             Raise max_tokens, or narrow the query.\n"
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("[devctx] nothing indexed matched this query.\n");
+    }
+    Ok(out)
+}
+
+/// Pull the `memories` array out of one of our own JSON answers.
+///
+/// The recall and by-file answers differ in shape — one is a bare array, the
+/// other wraps it — so both are accepted rather than making the caller care.
+fn parse_memories(raw: &str) -> Vec<Value> {
+    let parsed: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    if let Some(a) = parsed.as_array() {
+        return a.clone();
+    }
+    parsed
+        .get("memories")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `read_symbol` tool: a symbol's definition and code.
+///
+/// Distinct from `search`, which answers "what code is about this idea" with
+/// ranked fragments. Here the caller already knows the name and wants the thing
+/// itself — so an exact name beats a similar one, and a miss is reported as a
+/// miss rather than padded with the nearest neighbours.
+pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<String, String> {
+    let store = state.open_store()?;
+    let (repo, branch) = state.repo_branch()?;
+    let found = store
+        .symbol_definitions(&repo, &branch, name, limit)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "symbol": name,
+        "definitions": found.iter().map(|p| json!({
+            "symbol": p.metadata.symbol,
+            "type": p.metadata.symbol_type,
+            "language": p.metadata.language,
+            "file": p.metadata.file,
+            "start_line": p.metadata.start_line,
+            "end_line": p.metadata.end_line,
+            "code": p.text,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string())
+}
+
+/// `memories_by_symbol` tool: the decisions recorded about a symbol.
+///
+/// Answers the question a call graph cannot: not "what calls this" but "what
+/// did we decide about this, and why". Reaches both stores because the graph is
+/// per-repository while a global or group memory is not — see
+/// `devctx_memory::links` for why the junction row lives with the graph.
+pub fn do_memories_by_symbol(
+    state: &AppState,
+    symbol: &str,
+    limit: usize,
+) -> Result<String, String> {
+    let store = state.open_store()?;
+    let (repo, branch) = state.repo_branch().unwrap_or_default();
+    let linked = store
+        .memory_ids_for_symbol(symbol, &repo, &branch, limit)
+        .map_err(|e| e.to_string())?;
+    linked_response(
+        &store,
+        symbol,
+        linked,
+        devctx_store::short_label(symbol),
+        limit,
+    )
+}
+
+/// `memories_by_file` tool: the decisions recorded about a file.
+pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result<String, String> {
+    let store = state.open_store()?;
+    let linked = store
+        .memory_ids_for_file(file, limit)
+        .map_err(|e| e.to_string())?;
+    linked_response(&store, file, linked, file, limit)
+}
+
+/// `memory_refs` tool: the inverse — what code one memory concerns.
+pub fn do_memory_refs(state: &AppState, memory_id: &str) -> Result<String, String> {
+    let store = state.open_store()?;
+    let refs = store.memory_refs(memory_id).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "memory_id": memory_id,
+        "references": refs.iter().map(|r| json!({
+            "symbol": r.symbol,
+            "file": r.file,
+            "line": r.line,
+            "repo": r.repo,
+            "branch": r.branch,
+            "source": r.source,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string())
+}
+
+/// Resolve junction hits into memories, falling back to a literal text search
+/// when the junction has nothing.
+///
+/// `link_sources` is in every result on purpose: `files-field` and
+/// `content-mention` mean something connected this memory to this code at write
+/// time, while `inference` means only that the words match. A caller weighing
+/// how much to trust a memory needs to see the difference.
+fn linked_response(
+    store: &devctx_store::Store,
+    subject: &str,
+    linked: Vec<(String, String)>,
+    fallback_label: &str,
+    limit: usize,
+) -> Result<String, String> {
+    let mut out: Vec<Value> = Vec::new();
+
+    // Resolve locally first; whatever is left is a shared memory, which only
+    // the central daemon may read.
+    let mut unresolved: Vec<String> = Vec::new();
+    let mut sources_of: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (id, sources) in linked {
+        sources_of.insert(id.clone(), sources.clone());
+        match store.get_memory(&id) {
+            Ok(Some(m)) if m.deleted_at.is_none() => out.push(memory_json(&m, &sources)),
+            _ => unresolved.push(id),
+        }
+    }
+    if !unresolved.is_empty() {
+        // A central store that cannot be reached costs the shared half of the
+        // answer, not the whole answer.
+        if let Ok(c) = central() {
+            for v in c.memories_by_id(&unresolved).unwrap_or_default() {
+                let id = v.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+                let sources = sources_of.get(id).cloned().unwrap_or_default();
+                out.push(value_json(v, &sources));
+            }
+        }
+    }
+
+    let mut fallback_used = false;
+    if out.is_empty() {
+        fallback_used = true;
+        let mut seen = std::collections::HashSet::new();
+        for m in store
+            .memories_mentioning(fallback_label, limit)
+            .unwrap_or_default()
+        {
+            if seen.insert(m.id.clone()) {
+                out.push(memory_json(&m, "inference"));
+            }
+        }
+        if let Ok(c) = central() {
+            for v in c
+                .memories_mentioning(fallback_label, limit)
+                .unwrap_or_default()
+            {
+                let id = v.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+                if seen.insert(id.to_string()) {
+                    out.push(value_json(v, "inference"));
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        let key = |v: &Value| {
+            v.get("updated_at")
+                .and_then(|u| u.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        key(b).cmp(&key(a))
+    });
+    out.truncate(limit);
+
+    Ok(json!({
+        "subject": subject,
+        "memories": out,
+        // Named so a reader knows the results are word matches, not recorded links.
+        "matched_by": if fallback_used { "text-inference" } else { "junction" },
+    })
+    .to_string())
+}
+
+fn memory_json(m: &devctx_store::Memory, sources: &str) -> Value {
+    json!({
+        "id": m.id,
+        "title": m.title,
+        "content": m.content,
+        "type": m.memory_type,
+        "scope": m.scope,
+        "project": m.project,
+        "tags": m.tags,
+        "repo": m.repo,
+        "files": m.files,
+        "updated_at": m.updated_at,
+        "link_sources": sources,
+    })
+}
+
+/// The same shape, from a memory the central daemon serialized.
+fn value_json(v: Value, sources: &str) -> Value {
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default();
+    json!({
+        "id": s("id"),
+        "title": s("title"),
+        "content": s("content"),
+        "type": s("memory_type"),
+        "scope": s("scope"),
+        "project": s("project"),
+        "tags": s("tags"),
+        "repo": s("repo"),
+        "files": s("files"),
+        "updated_at": s("updated_at"),
+        "link_sources": sources,
+    })
 }
 
 /// `get_references` tool: all call sites of a symbol.

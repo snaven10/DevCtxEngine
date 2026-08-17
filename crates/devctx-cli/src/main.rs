@@ -4,6 +4,7 @@
 //! embedder pulls in fastembed/ort (the `local` provider) and downloads the
 //! model on first use.
 
+mod help_map;
 mod hooks;
 mod init_wizard;
 mod mcp_configure;
@@ -141,6 +142,11 @@ enum Command {
         /// Where the memory belongs: this project, or every project.
         #[arg(long, value_enum, default_value_t = MemoryScope::Local)]
         scope: MemoryScope,
+        /// Comma-separated files this memory is about. Fill it in and the
+        /// memory becomes findable from the symbols in those files, via
+        /// `memories_by_symbol`; leave it out and it is findable only by text.
+        #[arg(long)]
+        files: Option<String>,
     },
     /// Recall memories relevant to a query.
     Recall {
@@ -190,6 +196,26 @@ enum Command {
         /// Keep each memory's original project name instead of the current one.
         #[arg(long)]
         keep_project: bool,
+    },
+    /// Read a symbol's definition and code.
+    Symbol {
+        /// The symbol name. Bare (`charge`) or qualified (`Card.charge`).
+        name: String,
+        /// Maximum definitions to show.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
+    /// Assemble one budgeted brief for a question: what is already known, the
+    /// code that ranks highest, and the memories recorded against those files.
+    Context {
+        /// What context is needed, in natural language.
+        query: String,
+        /// Token budget for the whole brief.
+        #[arg(long, default_value_t = 4096)]
+        max_tokens: usize,
+        /// Leave memories out and return code only.
+        #[arg(long)]
+        no_memories: bool,
     },
     /// Show the blast radius (transitive callers/callees) of a symbol.
     Impact {
@@ -426,7 +452,14 @@ enum McpAction {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parsed through the builder rather than `Cli::parse()` so the command map
+    // can be chosen at run time: it is the one part of the help that is
+    // translated, and the language lives in the project's config.
+    let cli = {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let cmd = Cli::command().after_help(help_map::text(help_map::language()));
+        Cli::from_arg_matches(&cmd.get_matches())?
+    };
     match cli.command {
         Command::Init {
             path,
@@ -468,7 +501,8 @@ fn main() -> Result<()> {
             topic,
             tags,
             scope,
-        } => cmd_remember(content, title, memory_type, topic, tags, scope),
+            files,
+        } => cmd_remember(content, title, memory_type, topic, tags, scope, files),
         Command::Recall {
             query,
             limit,
@@ -491,6 +525,12 @@ fn main() -> Result<()> {
             dry_run,
             keep_project,
         } => cmd_migrate(from, dry_run, keep_project),
+        Command::Symbol { name, limit } => cmd_symbol(name, limit),
+        Command::Context {
+            query,
+            max_tokens,
+            no_memories,
+        } => cmd_context(query, max_tokens, !no_memories),
         Command::Impact { symbol, depth } => cmd_impact(symbol, depth),
         Command::Routes { method, path } => cmd_routes(method, path),
         Command::Summarize {
@@ -1339,6 +1379,41 @@ fn cmd_mcp_configure(
     })
 }
 
+/// Link a memory that was stored centrally to this repository's call graph.
+///
+/// Best-effort throughout: the memory is already saved, and a project whose
+/// store cannot be opened — because a server holds it, because the repository
+/// was never indexed — loses only the shortcut from symbol to decision.
+fn link_shared_memory(
+    cfg: &ProjectConfig,
+    id: String,
+    content: &str,
+    files: &str,
+    repo: &str,
+    branch: &str,
+) {
+    if id.is_empty() || files.is_empty() {
+        return;
+    }
+    let Ok(embedder) = build_embedder(cfg) else {
+        return;
+    };
+    let Ok(store) = open_store(cfg, embedder.dimension()) else {
+        return;
+    };
+    devctx_memory::links::link_memory(
+        &store,
+        &devctx_store::Memory {
+            id,
+            content: content.to_string(),
+            files: files.to_string(),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            ..Default::default()
+        },
+    );
+}
+
 /// `devctx remember` — save a memory.
 fn cmd_remember(
     content: String,
@@ -1347,8 +1422,10 @@ fn cmd_remember(
     topic: Option<String>,
     tags: Option<String>,
     scope: MemoryScope,
+    files: Option<String>,
 ) -> Result<()> {
     let cfg = load_project()?;
+    let files = files.unwrap_or_default();
 
     // A shared memory — group or global — belongs to the central store, which
     // only the daemon may write, so this path never touches a project database.
@@ -1386,8 +1463,12 @@ fn cmd_remember(
                 &repo,
                 &branch,
                 &group,
+                &files,
             )
         })?;
+        // The memory lives centrally; its link to this repository's code does
+        // not — see `devctx_memory::links`.
+        link_shared_memory(&cfg, field(&out, "id"), &content, &files, &repo, &branch);
         let tier = if group.is_empty() {
             "global".to_string()
         } else {
@@ -1411,6 +1492,7 @@ fn cmd_remember(
                 &memory_type,
                 topic.as_deref().unwrap_or(""),
                 tags.as_deref().unwrap_or(""),
+                &files,
             )?
         );
         return Ok(());
@@ -1425,10 +1507,14 @@ fn cmd_remember(
         project: project_name(&cfg),
         topic_key: topic.unwrap_or_default(),
         tags: tags.unwrap_or_default(),
+        files,
+        repo: repo_branch(&cfg).0,
+        branch: repo_branch(&cfg).1,
         now: now_epoch(),
         ..Default::default()
     };
     let res = remember(&store, embedder.as_ref(), &req)?;
+    devctx_memory::links::link_memory(&store, &res.memory);
     let title = if res.memory.title.is_empty() {
         "(untitled)"
     } else {
@@ -1573,6 +1659,55 @@ fn repo_branch(cfg: &ProjectConfig) -> (String, String) {
 }
 
 /// `devctx impact` — show the blast radius of a symbol.
+/// `devctx symbol` — a symbol's definition and code.
+fn cmd_symbol(name: String, limit: usize) -> Result<()> {
+    let cfg = load_project()?;
+    let raw = match remote::ensure(&cfg) {
+        Some(r) => r.read_symbol(&name, limit)?,
+        None => {
+            let store = open_store(&cfg, configured_dimension(&cfg))?;
+            let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
+            let branch = git.state().branch;
+            let found = store.symbol_definitions(&git.short_name(), &branch, &name, limit)?;
+            if found.is_empty() {
+                println!("No definition of `{name}` is indexed.");
+                return Ok(());
+            }
+            for p in &found {
+                println!(
+                    "\n{} ({}) — {}:{}-{}",
+                    p.metadata.symbol,
+                    p.metadata.symbol_type,
+                    p.metadata.file,
+                    p.metadata.start_line,
+                    p.metadata.end_line
+                );
+                println!("{}", p.text);
+            }
+            return Ok(());
+        }
+    };
+    println!("{raw}");
+    Ok(())
+}
+
+/// `devctx context` — one budgeted brief for a question.
+///
+/// Always routed through the server when one is up: the brief needs the
+/// embedder, the central store and this project's graph at once, and the server
+/// is the process that already holds all three.
+fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Result<()> {
+    let cfg = load_project()?;
+    let Some(r) = remote::ensure(&cfg) else {
+        bail!(
+            "`context` needs this project's server; start one with `devctx serve` \
+             (or run any indexing command, which spawns it)"
+        );
+    };
+    println!("{}", r.build_context(&query, max_tokens, include_memories)?);
+    Ok(())
+}
+
 fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     let cfg = load_project()?;
     if let Some(r) = remote::ensure(&cfg) {

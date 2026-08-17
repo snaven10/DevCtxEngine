@@ -328,12 +328,13 @@ impl Remote {
         memory_type: &str,
         topic: &str,
         tags: &str,
+        files: &str,
     ) -> Result<String> {
         self.post(
             "/remember",
             serde_json::json!({
                 "content": content, "title": title, "type": memory_type,
-                "topic": topic, "tags": tags,
+                "topic": topic, "tags": tags, "files": files,
             }),
         )
     }
@@ -351,6 +352,23 @@ impl Remote {
 
     pub fn impact(&self, symbol: &str, depth: usize) -> Result<String> {
         self.get(&format!("/impact/{}?depth={depth}", urlencode(symbol)))
+    }
+
+    pub fn read_symbol(&self, name: &str, limit: usize) -> Result<String> {
+        self.get(&format!("/symbol/{}?limit={limit}", urlencode(name)))
+    }
+
+    pub fn build_context(
+        &self,
+        query: &str,
+        max_tokens: usize,
+        include_memories: bool,
+    ) -> Result<String> {
+        self.post(
+            "/context",
+            serde_json::json!({ "query": query, "max_tokens": max_tokens,
+                                "include_memories": include_memories }),
+        )
     }
 
     pub fn routes(&self, method: Option<&str>, path: Option<&str>) -> Result<String> {

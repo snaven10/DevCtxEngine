@@ -16,10 +16,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_graph, do_impact, do_index, do_index_paths, do_index_progress, do_index_status,
-    do_list_projects, do_memory_context, do_memory_stats, do_read_file, do_recall_scoped,
-    do_references, do_remember, do_remember_shared, do_routes_for_handler, do_search,
-    do_search_routes, do_summarize, parse_mode, AppState,
+    do_build_context, do_graph, do_impact, do_index, do_index_paths, do_index_progress,
+    do_index_status, do_list_projects, do_memories_by_file, do_memories_by_symbol,
+    do_memory_context, do_memory_refs, do_memory_stats, do_read_file, do_read_symbol,
+    do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
+    do_search, do_search_routes, do_summarize, parse_mode, AppState,
 };
 use serde::Deserialize;
 
@@ -54,6 +55,12 @@ fn router(api: Api) -> Router {
         .route("/graph", get(graph))
         .route("/impact/:symbol", get(impact))
         .route("/references/:symbol", get(references))
+        .route("/memories/by-symbol/:symbol", get(memories_by_symbol))
+        .route("/memories/by-file/:file", get(memories_by_file))
+        .route("/memory/:id/refs", get(memory_refs))
+        .route("/symbol/:name", get(read_symbol))
+        .route("/memory/context", get(memory_context))
+        .route("/context", post(build_context))
         .route("/routes", get(routes))
         .route("/routes/handler/:handler", get(routes_for_handler))
         .route("/read_file", post(read_file))
@@ -255,6 +262,9 @@ struct RememberBody {
     /// `local` (default) or `global` — global goes to the central store.
     #[serde(default)]
     scope: Option<String>,
+    /// Comma-separated files the memory is about, used to link it to the graph.
+    #[serde(default)]
+    files: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -321,6 +331,24 @@ struct GraphQuery {
 }
 
 #[derive(Deserialize)]
+struct MemoryContextQuery {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Body for `POST /context`.
+#[derive(Deserialize)]
+struct ContextBody {
+    query: String,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    include_memories: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct MemoriesQuery {
     #[serde(default)]
     limit: Option<usize>,
@@ -366,7 +394,9 @@ async fn graph(State(api): State<Api>, Query(q): Query<GraphQuery>) -> Response 
 
 async fn memories(State(api): State<Api>, Query(q): Query<MemoriesQuery>) -> Response {
     run(api.state, move |s| {
-        do_memory_context(s, q.limit.unwrap_or(25))
+        // Explicitly local: this endpoint predates the shared tier and its
+        // callers expect this project's memories, not everyone's.
+        do_memory_context(s, "local", q.limit.unwrap_or(25))
     })
     .await
 }
@@ -417,6 +447,7 @@ async fn remember(State(api): State<Api>, Json(b): Json<RememberBody>) -> Respon
         let topic = b.topic.unwrap_or_default();
         let tags = b.tags.unwrap_or_default();
         let scope = b.scope.as_deref().unwrap_or("local");
+        let files = b.files.clone().unwrap_or_default();
         // `group` and `global` both live in the central store; only the space
         // they land in differs.
         if devctx_memory::is_global(scope) || devctx_memory::is_group(scope) {
@@ -425,9 +456,18 @@ async fn remember(State(api): State<Api>, Json(b): Json<RememberBody>) -> Respon
             } else {
                 String::new()
             };
-            return do_remember_shared(s, &b.content, &title, &memory_type, &topic, &tags, &group);
+            return do_remember_shared(
+                s,
+                &b.content,
+                &title,
+                &memory_type,
+                &topic,
+                &tags,
+                &group,
+                &files,
+            );
         }
-        do_remember(s, b.content, title, memory_type, topic, tags)
+        do_remember(s, b.content, title, memory_type, topic, tags, files)
     })
     .await
 }
@@ -471,6 +511,72 @@ async fn impact(
         do_impact(s, &symbol, q.depth.unwrap_or(3))
     })
     .await
+}
+
+/// The most recent memories, with no query.
+async fn memory_context(State(api): State<Api>, Query(q): Query<MemoryContextQuery>) -> Response {
+    run(api.state, move |s| {
+        do_memory_context(
+            s,
+            q.scope.as_deref().unwrap_or("all"),
+            q.limit.unwrap_or(20),
+        )
+    })
+    .await
+}
+
+/// A symbol's definition and code.
+async fn read_symbol(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    Query(q): Query<MemoriesQuery>,
+) -> Response {
+    run(api.state, move |s| {
+        do_read_symbol(s, &name, q.limit.unwrap_or(5))
+    })
+    .await
+}
+
+/// One budgeted brief assembled for a question.
+async fn build_context(State(api): State<Api>, Json(b): Json<ContextBody>) -> Response {
+    run(api.state, move |s| {
+        do_build_context(
+            s,
+            &b.query,
+            b.max_tokens.unwrap_or(4096),
+            b.include_memories.unwrap_or(true),
+        )
+    })
+    .await
+}
+
+/// The memories recorded about a symbol — the memory↔graph join.
+async fn memories_by_symbol(
+    State(api): State<Api>,
+    Path(symbol): Path<String>,
+    Query(q): Query<MemoriesQuery>,
+) -> Response {
+    run(api.state, move |s| {
+        do_memories_by_symbol(s, &symbol, q.limit.unwrap_or(10))
+    })
+    .await
+}
+
+/// The memories recorded about a file.
+async fn memories_by_file(
+    State(api): State<Api>,
+    Path(file): Path<String>,
+    Query(q): Query<MemoriesQuery>,
+) -> Response {
+    run(api.state, move |s| {
+        do_memories_by_file(s, &file, q.limit.unwrap_or(10))
+    })
+    .await
+}
+
+/// The inverse: what code one memory concerns.
+async fn memory_refs(State(api): State<Api>, Path(id): Path<String>) -> Response {
+    run(api.state, move |s| do_memory_refs(s, &id)).await
 }
 
 async fn references(State(api): State<Api>, Path(symbol): Path<String>) -> Response {

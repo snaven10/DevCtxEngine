@@ -48,6 +48,8 @@ fn router(api: CentralApi) -> Router {
         .route("/remember", post(remember))
         .route("/recall", post(recall))
         .route("/memories", get(memories))
+        .route("/memories/by-id", post(memories_by_id))
+        .route("/memories/mentioning", post(memories_mentioning))
         .route("/memory/stats", get(memory_stats))
         .layer(middleware::from_fn_with_state(api.clone(), auth))
         .with_state(api)
@@ -243,6 +245,10 @@ struct RememberBody {
     /// Group to share this memory with. Empty means the global space.
     #[serde(default)]
     group: String,
+    /// Comma-separated files the memory concerns. Carried so the contributing
+    /// project can link the memory to the code it is about.
+    #[serde(default)]
+    files: String,
 }
 
 #[derive(Deserialize)]
@@ -260,6 +266,21 @@ struct RecallBody {
 
 #[derive(Deserialize)]
 struct MemoriesQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Bodies for `POST /memories/by-id`.
+#[derive(Deserialize)]
+struct ByIdBody {
+    #[serde(default)]
+    ids: Vec<String>,
+}
+
+/// Body for `POST /memories/mentioning`.
+#[derive(Deserialize)]
+struct MentioningBody {
+    label: String,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -374,6 +395,7 @@ async fn remember(State(api): State<CentralApi>, Json(b): Json<RememberBody>) ->
                 tags: b.tags,
                 repo: b.repo,
                 branch: b.branch,
+                files: b.files,
                 now: devctx_central::now_stamp(),
                 scope: if b.group.is_empty() {
                     String::new()
@@ -427,6 +449,59 @@ async fn recall(State(api): State<CentralApi>, Json(b): Json<RecallBody>) -> Res
             })).collect::<Vec<_>>()
         })
         .to_string())
+    })
+    .await
+}
+
+/// Fetch specific memories by id.
+///
+/// The memory↔graph junction lives in the project store while a global or group
+/// memory lives here, so resolving a link means asking this daemon for a
+/// handful of ids. By id rather than by scan because the caller already knows
+/// exactly which ones it wants, and because opening this database directly to
+/// read them is not available — the daemon exists precisely because DuckDB
+/// permits one writer and this is it.
+///
+/// Ids that no longer exist are simply absent from the answer: a junction row
+/// outliving the memory it points at is expected, not an error.
+async fn memories_by_id(State(api): State<CentralApi>, Json(body): Json<ByIdBody>) -> Response {
+    run(api, move |c| {
+        let mut out = Vec::new();
+        for id in &body.ids {
+            match c.store().get_memory(id) {
+                Ok(Some(m)) if m.deleted_at.is_none() => {
+                    out.push(serde_json::to_value(&m).map_err(|e| e.to_string())?)
+                }
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Ok(json!({ "memories": out }).to_string())
+    })
+    .await
+}
+
+/// Shared memories whose text or `files` field mentions `label`.
+///
+/// The fallback half of a symbol lookup. Literal rather than semantic on
+/// purpose: the caller has an exact identifier and wants the memories that
+/// contain it, not the ones that are vaguely about the same area — semantic
+/// recall on a bare name like `charge` returns everything about payments.
+async fn memories_mentioning(
+    State(api): State<CentralApi>,
+    Json(body): Json<MentioningBody>,
+) -> Response {
+    run(api, move |c| {
+        let found = c
+            .store()
+            .memories_mentioning(&body.label, body.limit.unwrap_or(20))
+            .map_err(|e| e.to_string())?;
+        let out: Vec<_> = found
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "memories": out }).to_string())
     })
     .await
 }

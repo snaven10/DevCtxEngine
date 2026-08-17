@@ -86,6 +86,11 @@ struct RememberReq {
     /// "global" (every project on the machine).
     #[serde(default)]
     scope: Option<String>,
+    /// Comma-separated files this memory is about. Worth filling in: it is what
+    /// links the memory to the symbols in those files, so `memories_by_symbol`
+    /// can surface it to whoever lands on that code later.
+    #[serde(default)]
+    files: Option<String>,
 }
 
 /// Parameters for the `recall` tool.
@@ -152,6 +157,65 @@ struct ImpactReq {
     /// Traversal depth (default 3).
     #[serde(default)]
     depth: Option<usize>,
+}
+
+/// Parameters for the `memory_context` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct MemoryContextReq {
+    /// Which memories: "local", "global"/"group", or "all" (the default).
+    #[serde(default)]
+    scope: Option<String>,
+    /// Maximum memories to return (default 20).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Parameters for the `read_symbol` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ReadSymbolReq {
+    /// The symbol name. A bare name (`charge`) or a qualified one
+    /// (`Card.charge`, `src/pay.rs::charge`) both work.
+    name: String,
+    /// Maximum definitions to return (default 5) — a name can be defined more
+    /// than once across a repository.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Parameters for the `build_context` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct BuildContextReq {
+    /// What context is needed, in natural language.
+    query: String,
+    /// Token budget for the whole brief (default 4096). A hard stop: whatever
+    /// does not fit is counted and named, never silently dropped.
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    /// Include recalled and linked memories (default true).
+    #[serde(default)]
+    include_memories: Option<bool>,
+}
+
+/// Parameters for `memories_by_symbol` / `memories_by_file`.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct MemoriesForReq {
+    /// The symbol, or the file path.
+    subject: String,
+    /// Maximum memories to return (default 10).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Parameters for the `memory_refs` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct MemoryRefsReq {
+    /// The memory id, as reported by `remember` or `recall`.
+    memory_id: String,
 }
 
 /// Parameters for the `get_references` tool.
@@ -326,6 +390,7 @@ impl DevctxServer {
                 req.topic.unwrap_or_default(),
                 req.tags.unwrap_or_default(),
                 req.scope.unwrap_or_else(|| "local".to_string()),
+                req.files.unwrap_or_default(),
             )
         })
         .await
@@ -465,6 +530,105 @@ impl DevctxServer {
     ) -> Result<String, ErrorData> {
         let backend = self.bound()?;
         run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3))).await
+    }
+
+    /// The most recent memories, with no query.
+    #[tool(
+        description = "The most recently written memories, with no query — for \
+        recovering context after a reset, when you do not yet know what to ask \
+        `recall` about. Returns JSON."
+    )]
+    async fn memory_context(
+        &self,
+        Parameters(req): Parameters<MemoryContextReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.bound()?;
+        run_blocking(move || {
+            backend.memory_context(
+                req.scope.as_deref().unwrap_or("all"),
+                req.limit.unwrap_or(20),
+            )
+        })
+        .await
+    }
+
+    /// A symbol's definition and code.
+    #[tool(
+        description = "Read a symbol's definition: its code, file, line range \
+        and kind. Use this when you know the name and want the thing itself; \
+        use `search` when you want code about an idea. Returns JSON."
+    )]
+    async fn read_symbol(
+        &self,
+        Parameters(req): Parameters<ReadSymbolReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.bound()?;
+        run_blocking(move || backend.read_symbol(&req.name, req.limit.unwrap_or(5))).await
+    }
+
+    /// One budgeted brief assembled for a question.
+    #[tool(description = "Assemble one budgeted brief for a question: what is \
+        already known (recalled memories), the code that ranks highest, and the \
+        memories recorded against exactly those files. Returns prose ready to \
+        read into context, capped at `max_tokens`.")]
+    async fn build_context(
+        &self,
+        Parameters(req): Parameters<BuildContextReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.bound()?;
+        run_blocking(move || {
+            backend.build_context(
+                &req.query,
+                req.max_tokens.unwrap_or(4096),
+                req.include_memories.unwrap_or(true),
+            )
+        })
+        .await
+    }
+
+    /// Memories recorded about a symbol.
+    #[tool(
+        description = "The decisions, bugs and insights recorded about a symbol \
+        — why the code is the way it is, which the call graph cannot answer. \
+        Searches both this project's memories and the shared ones. Each result \
+        carries `link_sources`: `files-field`/`content-mention` mean a link was \
+        recorded when the memory was written, `inference` means only that the \
+        text mentions the name. Returns JSON."
+    )]
+    async fn memories_by_symbol(
+        &self,
+        Parameters(req): Parameters<MemoriesForReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.bound()?;
+        run_blocking(move || backend.memories_by_symbol(&req.subject, req.limit.unwrap_or(10)))
+            .await
+    }
+
+    /// Memories recorded about a file.
+    #[tool(
+        description = "The memories recorded about a file. Same result shape and \
+        same `link_sources` semantics as `memories_by_symbol`. Returns JSON."
+    )]
+    async fn memories_by_file(
+        &self,
+        Parameters(req): Parameters<MemoriesForReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.bound()?;
+        run_blocking(move || backend.memories_by_file(&req.subject, req.limit.unwrap_or(10))).await
+    }
+
+    /// What code a memory concerns.
+    #[tool(
+        description = "The inverse of `memories_by_symbol`: given a memory id, \
+        the symbols and files it concerns, and how each link was derived. \
+        Returns JSON."
+    )]
+    async fn memory_refs(
+        &self,
+        Parameters(req): Parameters<MemoryRefsReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.bound()?;
+        run_blocking(move || backend.memory_refs(&req.memory_id)).await
     }
 
     /// All call sites (references) of a symbol.

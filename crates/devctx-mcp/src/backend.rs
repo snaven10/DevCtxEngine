@@ -8,9 +8,11 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::state::{
-    do_impact, do_index, do_index_status, do_list_projects, do_memory_stats, do_read_file,
-    do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
-    do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
+    do_build_context, do_impact, do_index, do_index_status, do_list_projects, do_memories_by_file,
+    do_memories_by_symbol, do_memory_context, do_memory_refs, do_memory_stats, do_read_file,
+    do_read_symbol, do_recall_scoped, do_references, do_remember, do_remember_shared,
+    do_routes_for_handler, do_search, do_search_project, do_search_routes, do_summarize,
+    parse_mode, AppState,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -193,6 +195,7 @@ impl Backend {
         topic: String,
         tags: String,
         scope: String,
+        files: String,
     ) -> Result<String, String> {
         // `group` routes to the central store like `global` does, but into the
         // space of the product this repository belongs to.
@@ -204,13 +207,22 @@ impl Backend {
                 } else {
                     String::new()
                 };
-                do_remember_shared(s, &content, &title, &memory_type, &topic, &tags, &group)
+                do_remember_shared(
+                    s,
+                    &content,
+                    &title,
+                    &memory_type,
+                    &topic,
+                    &tags,
+                    &group,
+                    &files,
+                )
             }
-            Backend::Local(s) => do_remember(s, content, title, memory_type, topic, tags),
+            Backend::Local(s) => do_remember(s, content, title, memory_type, topic, tags, files),
             Backend::Remote(r, _) => r.post(
                 "/remember",
                 json!({ "content": content, "title": title, "type": memory_type,
-                        "topic": topic, "tags": tags, "scope": scope }),
+                        "topic": topic, "tags": tags, "scope": scope, "files": files }),
             ),
         }
     }
@@ -255,6 +267,69 @@ impl Backend {
         match self {
             Backend::Local(s) => do_impact(s, symbol, depth),
             Backend::Remote(r, _) => r.get(&format!("/impact/{}?depth={depth}", urlencode(symbol))),
+        }
+    }
+
+    /// The most recent memories, with no query.
+    pub fn memory_context(&self, scope: &str, limit: usize) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_memory_context(s, scope, limit),
+            Backend::Remote(r, _) => r.get(&format!("/memory/context?scope={scope}&limit={limit}")),
+        }
+    }
+
+    /// A symbol's definition and code.
+    pub fn read_symbol(&self, name: &str, limit: usize) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_read_symbol(s, name, limit),
+            Backend::Remote(r, _) => r.get(&format!("/symbol/{}?limit={limit}", urlencode(name))),
+        }
+    }
+
+    /// One budgeted brief assembled for a question.
+    pub fn build_context(
+        &self,
+        query: &str,
+        max_tokens: usize,
+        include_memories: bool,
+    ) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_build_context(s, query, max_tokens, include_memories),
+            Backend::Remote(r, _) => r.post(
+                "/context",
+                json!({ "query": query, "max_tokens": max_tokens,
+                        "include_memories": include_memories }),
+            ),
+        }
+    }
+
+    /// Memories recorded about a symbol — the memory↔graph join.
+    pub fn memories_by_symbol(&self, symbol: &str, limit: usize) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_memories_by_symbol(s, symbol, limit),
+            Backend::Remote(r, _) => r.get(&format!(
+                "/memories/by-symbol/{}?limit={limit}",
+                urlencode(symbol)
+            )),
+        }
+    }
+
+    /// Memories recorded about a file.
+    pub fn memories_by_file(&self, file: &str, limit: usize) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_memories_by_file(s, file, limit),
+            Backend::Remote(r, _) => r.get(&format!(
+                "/memories/by-file/{}?limit={limit}",
+                urlencode(file)
+            )),
+        }
+    }
+
+    /// The inverse: what code one memory concerns.
+    pub fn memory_refs(&self, memory_id: &str) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_memory_refs(s, memory_id),
+            Backend::Remote(r, _) => r.get(&format!("/memory/{}/refs", urlencode(memory_id))),
         }
     }
 
