@@ -509,7 +509,9 @@ async fn memories_mentioning(
 async fn memories(State(api): State<CentralApi>, Query(q): Query<MemoriesQuery>) -> Response {
     run(api, move |c| {
         let mems = c
-            .recent_memories(q.limit.unwrap_or(20))
+            // limit=0 means every shared memory, for a backfill sweep that
+            // must not stop at the newest page.
+            .shared_memories(q.limit.unwrap_or(20))
             .map_err(|e| e.to_string())?;
         Ok(json!({
             "memories": mems.iter().map(|m| json!({
@@ -519,6 +521,11 @@ async fn memories(State(api): State<CentralApi>, Query(q): Query<MemoriesQuery>)
                 "type": m.memory_type,
                 "tags": m.tags,
                 "repo": m.repo,
+                // Carried for the linker: without `files` a backfill has
+                // nothing to resolve, and without `branch` the junction rows it
+                // writes cannot be narrowed by branch afterwards.
+                "files": m.files,
+                "branch": m.branch,
                 "updated_at": m.updated_at,
             })).collect::<Vec<_>>()
         })

@@ -349,6 +349,19 @@ impl CentralClient {
             .unwrap_or_default())
     }
 
+    /// Every live shared memory, for a backfill sweep.
+    ///
+    /// Unlike `recent_memories` this takes no limit: a sweep that silently
+    /// stopped at the newest twenty would report success having linked a
+    /// fraction of the corpus.
+    pub fn all_shared_memories(&self) -> Result<Vec<Value>> {
+        let v = self.get("/memories?limit=0")?;
+        Ok(v.get("memories")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Fetch specific memories by id, skipping any that are gone.
     ///
     /// Used to resolve memory↔graph links: the junction row is written next to

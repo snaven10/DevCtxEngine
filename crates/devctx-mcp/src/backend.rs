@@ -8,9 +8,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::state::{
-    do_build_context, do_impact, do_index, do_index_status, do_list_projects, do_memories_by_file,
-    do_memories_by_symbol, do_memory_context, do_memory_refs, do_memory_stats, do_read_file,
-    do_read_symbol, do_recall_scoped, do_references, do_remember, do_remember_shared,
+    do_backfill_links, do_build_context, do_impact, do_index, do_index_status, do_list_projects,
+    do_memories_by_file, do_memories_by_symbol, do_memory_context, do_memory_refs, do_memory_stats,
+    do_read_file, do_read_symbol, do_recall_scoped, do_references, do_remember, do_remember_shared,
     do_routes_for_handler, do_search, do_search_project, do_search_routes, do_summarize,
     parse_mode, AppState,
 };
@@ -267,6 +267,17 @@ impl Backend {
         match self {
             Backend::Local(s) => do_impact(s, symbol, depth),
             Backend::Remote(r, _) => r.get(&format!("/impact/{}?depth={depth}", urlencode(symbol))),
+        }
+    }
+
+    /// Link memories saved before the junction existed.
+    pub fn backfill_links(&self, dry_run: bool, from_text: bool) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_backfill_links(s, dry_run, from_text),
+            Backend::Remote(r, _) => r.post(
+                "/memories/backfill-links",
+                json!({ "dry_run": dry_run, "from_text": from_text }),
+            ),
         }
     }
 

@@ -160,6 +160,32 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Live memories in every *shared* space: the global one and every group.
+    ///
+    /// The central store keys memories by a reserved project — `@global`, or
+    /// `@group:<name>` — and a query for one of them silently excludes the
+    /// others. That is right for recall, which is asked about a specific tier,
+    /// and wrong for anything that means "everything shared": a machine whose
+    /// memories all live in one group would report none at all.
+    ///
+    /// `limit` of zero means no limit, for sweeps that must not stop early.
+    pub fn shared_memories(&self, limit: usize) -> Result<Vec<Memory>> {
+        let cap = if limit == 0 {
+            String::new()
+        } else {
+            format!(" LIMIT {limit}")
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MEM_COLS} FROM memories
+             WHERE deleted_at IS NULL
+               AND (project = '@global' OR starts_with(project, '@group:'))
+             ORDER BY updated_at DESC{cap}"
+        ))?;
+        let rows = stmt.query_map([], row_to_memory)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Permanently remove one memory and the vectors that belong to it — its
     /// own row and its `<id>_cN` body chunks. Returns whether it existed.
     ///

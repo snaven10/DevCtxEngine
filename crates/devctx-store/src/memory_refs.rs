@@ -23,6 +23,31 @@
 //! the memory itself lives centrally. A global memory about this repository's
 //! `charge()` is findable from this repository, which is where someone reading
 //! `charge()` is standing.
+//!
+//! ## What `content-mention` gets wrong, measured
+//!
+//! Audited against a real corpus: 251 `content-mention` links across a sample
+//! of 34 memories, every risky one read by hand. **One was wrong** — a memory
+//! whose prose said "…*buscar* TODAS las queries con la misma forma", where
+//! `buscar` is the ordinary Spanish verb and also a method in the file the
+//! memory names. 0.4% net.
+//!
+//! The failure mode is specific and worth naming: a symbol whose short label is
+//! a single lowercase word that is also a common word **in the language the
+//! code is named in**. A Spanish-named codebase collides on `buscar`, `crear`,
+//! `agrupar`; an English one on `process`, `handle`, `send`. Scoping the match
+//! to the memory's own files is what keeps this rare — the same word matched
+//! against the whole repository would be noise rather than a rounding error.
+//!
+//! Requiring a technical marker (a backtick, a `(`, a `.`) around such labels
+//! was considered and rejected: it would take the one wrong link and cost every
+//! plain-prose mention that is right, of which "charge is idempotent now" is
+//! the ordinary shape. And the wrong link is benign — that memory genuinely
+//! concerns that file, so a reader gets a relevant memory attributed to one
+//! method too many, never someone else's memory.
+//!
+//! `link_sources` exists so a caller can weigh this: `content-mention` is a
+//! derivation, not a fact, and the distinction is in every result.
 
 use std::collections::HashSet;
 
@@ -31,6 +56,67 @@ use duckdb::params;
 use crate::error::Result;
 use crate::memory::{row_to_memory, Memory, MEM_COLS};
 use crate::store::Store;
+
+/// The repository's indexed paths, for resolving what a memory names.
+///
+/// Holds the exact paths and an index from bare file name to them, because a
+/// memory says `NombreUtil.java` far more often than the full path, and both
+/// spellings have to land on the same file.
+pub struct FileIndex {
+    exact: HashSet<String>,
+    by_name: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl FileIndex {
+    pub fn new(files: Vec<String>) -> Self {
+        let mut by_name: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for f in &files {
+            let name = f.rsplit('/').next().unwrap_or(f).to_string();
+            by_name.entry(name).or_default().push(f.clone());
+        }
+        Self {
+            exact: files.into_iter().collect(),
+            by_name,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+    }
+
+    /// The indexed paths matching `candidates`, in the spelling the index uses.
+    ///
+    /// A bare name that several files share resolves to none of them: a memory
+    /// naming `index.ts` in a repository with forty of them has said nothing
+    /// about any particular one, and linking it to all forty would bury every
+    /// real link under noise.
+    pub fn resolve(&self, candidates: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in candidates {
+            let hit = if self.exact.contains(c) {
+                Some(c.clone())
+            } else {
+                match self.by_name.get(c.rsplit('/').next().unwrap_or(c)) {
+                    // Ambiguous, or the candidate is a path that no indexed file
+                    // ends with — either way there is nothing safe to link.
+                    Some(paths) if paths.len() == 1 && !c.contains('/') => Some(paths[0].clone()),
+                    Some(paths) => paths
+                        .iter()
+                        .find(|p| p.ends_with(&format!("/{c}")))
+                        .cloned(),
+                    None => None,
+                }
+            };
+            if let Some(h) = hit {
+                if !out.contains(&h) {
+                    out.push(h);
+                }
+            }
+        }
+        out
+    }
+}
 
 /// One derived link between a memory and a place in the code.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -229,6 +315,48 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Which of `files` this repository actually has indexed.
+    ///
+    /// The gate that makes backfilling safe. A memory's `files` field is prose
+    /// someone typed: it names files from other repositories in the same
+    /// product, files since deleted, and — when the paths are recovered from a
+    /// memory's text — library names that merely look like paths (`Shepherd.js`)
+    /// and documents that are not code. Linking on the strength of the string
+    /// alone would fill the junction with rows pointing at nothing, and a
+    /// junction nobody can trust is worse than an empty one, because an empty
+    /// one is visibly empty.
+    ///
+    /// Matching is on the exact stored path first, then on a trailing-path
+    /// basis, so a memory that names `NombreUtil.java` still finds
+    /// `src/main/java/.../NombreUtil.java`. The suffix must start at a
+    /// separator, or `Util.java` would match every file ending in those bytes.
+    pub fn indexed_files(&self, files: &[String]) -> Result<Vec<String>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self.file_index()?.resolve(files))
+    }
+
+    /// Every distinct file this repository has indexed, ready to match against.
+    ///
+    /// Read in one query and matched in memory. A query per candidate is the
+    /// obvious shape and does not survive contact with a real corpus: the
+    /// suffix match is a scan, and a sweep over two thousand memories with a
+    /// handful of candidates each turns into thousands of scans over every
+    /// chunk in the repository. Measured: it did not finish in two minutes,
+    /// where one read of a few thousand paths is milliseconds.
+    pub fn file_index(&self) -> Result<FileIndex> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT file FROM vectors WHERE NOT is_deletion AND file <> ''")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut files = Vec::new();
+        for r in rows {
+            files.push(r?);
+        }
+        Ok(FileIndex::new(files))
     }
 
     /// Every link recorded for one memory — the inverse direction: given a

@@ -222,11 +222,17 @@ impl Central {
 
     /// The most recently updated global memories (no query).
     pub fn recent_memories(&self, limit: usize) -> Result<Vec<Memory>> {
-        Ok(devctx_memory::memory_context(
-            &self.store,
-            devctx_memory::GLOBAL_PROJECT,
-            limit,
-        )?)
+        self.shared_memories(limit)
+    }
+
+    /// Live memories across every shared space — the global one and every
+    /// group. `limit` of zero means all of them.
+    ///
+    /// Not just `@global`: a machine where every memory belongs to one product
+    /// keeps them all under `@group:<name>`, and asking only for the global
+    /// space answered "none" over thousands of rows.
+    pub fn shared_memories(&self, limit: usize) -> Result<Vec<Memory>> {
+        Ok(self.store.shared_memories(limit)?)
     }
 
     /// Counts of global memories, total and per type.

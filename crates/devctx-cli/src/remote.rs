@@ -356,6 +356,13 @@ impl Remote {
         self.get(&format!("/impact/{}?depth={depth}", urlencode(symbol)))
     }
 
+    pub fn backfill_links(&self, dry_run: bool, from_text: bool) -> Result<String> {
+        self.post(
+            "/memories/backfill-links",
+            serde_json::json!({ "dry_run": dry_run, "from_text": from_text }),
+        )
+    }
+
     pub fn read_symbol(&self, name: &str, limit: usize) -> Result<String> {
         self.get(&format!("/symbol/{}?limit={limit}", urlencode(name)))
     }

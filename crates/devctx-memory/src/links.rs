@@ -23,6 +23,174 @@ pub fn link_memory(graph_store: &Store, m: &Memory) -> usize {
     graph_store.extract_symbol_refs(m).unwrap_or(0)
 }
 
+/// File paths a memory's prose names, for memories whose `files` field is empty.
+///
+/// Half a real corpus carries no `files` at all — the field was added after the
+/// memories were, or whoever wrote them named the file in a sentence instead.
+/// Those are the memories a symbol lookup most wants and least finds.
+///
+/// This is a *candidate* list and nothing more. It over-matches by design and
+/// is safe only because the caller checks every candidate against the index
+/// before linking: measured on a real corpus, the pattern that finds
+/// `apps/registry/src/app/components/firmar-registro.ts` also finds
+/// `Shepherd.js`, which is a library nobody indexed, and `CLAUDE.md`, which is
+/// not code. The index is what tells them apart, never the pattern.
+pub fn paths_in_text(text: &str) -> Vec<String> {
+    const EXTS: [&str; 17] = [
+        "java",
+        "ts",
+        "tsx",
+        "js",
+        "jsx",
+        "html",
+        "scss",
+        "css",
+        "py",
+        "rs",
+        "go",
+        "sql",
+        "yaml",
+        "yml",
+        "xml",
+        "properties",
+        "kt",
+    ];
+    // Split on whitespace and the punctuation that wraps a path in prose, but
+    // never on `.` or `/`, which are part of the path itself.
+    const BREAKS: &[char] = &[
+        '`', '"', '\'', '(', ')', '[', ']', '{', '}', ',', ';', ':', '<', '>', '|', '*',
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split(|c: char| c.is_whitespace() || BREAKS.contains(&c)) {
+        // A path at the end of a sentence keeps the full stop; a path in a list
+        // keeps the comma. Neither is part of it.
+        let tok = raw.trim_end_matches('.');
+        let Some((stem, ext)) = tok.rsplit_once('.') else {
+            continue;
+        };
+        // A bare `.ts`, or `src/.ts`, names nothing.
+        if !EXTS.contains(&ext) || stem.is_empty() || stem.ends_with('/') {
+            continue;
+        }
+        let tok = tok.to_string();
+        if !out.contains(&tok) {
+            out.push(tok);
+        }
+    }
+    out
+}
+
+/// What a backfill pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackfillReport {
+    /// Memories considered.
+    pub examined: usize,
+    /// Memories that named at least one file this repository has indexed.
+    pub matched: usize,
+    /// Memories that gained at least one symbol-level link.
+    pub linked: usize,
+    /// Junction rows written in total.
+    pub rows: usize,
+    /// Memories skipped for naming no file this repository has — because their
+    /// `files` field was empty and, when the text pass ran, their prose named
+    /// nothing indexed either.
+    pub without_files: usize,
+    /// Memories linked from paths recovered from their prose rather than from a
+    /// `files` field. Counted apart because the derivation is weaker, and
+    /// anyone deciding how far to trust the sweep needs to see the split.
+    pub from_text: usize,
+    /// Memories whose every named file is unknown to this repository — normally
+    /// another repo's memory seen from here, not an error.
+    pub not_in_repo: usize,
+}
+
+/// Link memories that were saved before the junction existed.
+///
+/// Migration and import write memories without linking them, and every memory
+/// that predates the junction has no rows at all — so `memories_by_symbol`
+/// answers for them by text inference or not at all, which reads as "nothing is
+/// recorded about this code" when a great deal is.
+///
+/// Runs against one repository and links only the files that repository has
+/// indexed, so calling it in each project distributes a shared memory's links
+/// to whichever repositories its files actually live in. Re-running is free:
+/// linking a memory rebuilds its rows rather than adding to them.
+///
+/// `dry_run` reports what would happen and writes nothing, because the first
+/// question about a sweep over two thousand memories is what it is about to do.
+pub fn backfill_links(
+    graph_store: &Store,
+    memories: &[Memory],
+    dry_run: bool,
+    from_text: bool,
+) -> BackfillReport {
+    let mut r = BackfillReport {
+        examined: memories.len(),
+        ..Default::default()
+    };
+    // Read once. Resolving each candidate with its own query is the obvious
+    // shape and does not survive a real corpus — the suffix match is a scan, and
+    // thousands of them over every chunk in the repository did not finish in two
+    // minutes. One read of a few thousand paths is milliseconds.
+    let Ok(index) = graph_store.file_index() else {
+        return r;
+    };
+    for m in memories {
+        let named: Vec<String> = m
+            .files
+            .split(',')
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
+
+        // The `files` field first, always: it is what someone stated, and a
+        // path recovered from prose can only ever be a guess about it. The text
+        // pass runs only for memories that stated nothing — never to second-
+        // guess a field whose files this repository simply does not have.
+        let mut present = if named.is_empty() {
+            Vec::new()
+        } else {
+            index.resolve(&named)
+        };
+        let mut recovered = false;
+        if named.is_empty() && from_text {
+            present = index.resolve(&paths_in_text(&m.content));
+            recovered = !present.is_empty();
+        }
+
+        if present.is_empty() {
+            if named.is_empty() {
+                r.without_files += 1;
+            } else {
+                r.not_in_repo += 1;
+            }
+            continue;
+        }
+        r.matched += 1;
+        if recovered {
+            r.from_text += 1;
+        }
+
+        // Link the resolved paths, not what was typed: the field may hold a bare
+        // file name, and the junction has to carry the path the index uses or
+        // `memories_by_file` will not find it again.
+        let mut resolved = m.clone();
+        resolved.files = present.join(",");
+        if dry_run {
+            continue;
+        }
+        let n = link_memory(graph_store, &resolved);
+        if n > 0 {
+            r.rows += n;
+            // One row per file is the floor; more means a symbol matched.
+            if n > present.len() {
+                r.linked += 1;
+            }
+        }
+    }
+    r
+}
+
 /// Memories that discuss `symbol`, most recently updated first.
 ///
 /// Two stages, and the caller can tell them apart by `link_sources`:
@@ -250,6 +418,192 @@ mod tests {
         let hits = memories_by_symbol(&project, None, "src/pay.rs::charge", "", "", 10);
         let ids: Vec<_> = hits.iter().map(|h| h.memory.id.as_str()).collect();
         assert_eq!(ids, vec!["mem_new"]);
+    }
+
+    // --- backfill ---------------------------------------------------------
+
+    /// The case the backfill exists for: memories that carry `files` but no
+    /// junction rows, because they were migrated before the junction existed.
+    #[test]
+    fn backfilling_links_memories_that_were_never_linked() {
+        let project = project_store();
+        let m = memory("mem_old", "charge is idempotent now", "src/pay.rs", "100");
+        project.upsert_memory(&m).unwrap();
+        assert!(project.memory_refs("mem_old").unwrap().is_empty());
+
+        let r = backfill_links(&project, &[m], false, false);
+        assert_eq!(r.matched, 1);
+        assert_eq!(r.linked, 1, "a symbol link, not just the file");
+        assert_eq!(r.rows, 2);
+
+        let hits = memories_by_symbol(&project, None, "src/pay.rs::charge", "", "", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].link_sources, "content-mention");
+    }
+
+    /// A file this repository does not have must not be linked here. Shared
+    /// memories name files from every repository of a product, and a junction
+    /// full of rows pointing at nothing is worse than an empty one.
+    #[test]
+    fn a_file_this_repo_does_not_index_is_not_linked() {
+        let project = project_store();
+        let m = memory(
+            "mem_other",
+            "the web app does it here",
+            "web/src/app.ts",
+            "100",
+        );
+        project.upsert_memory(&m).unwrap();
+
+        let r = backfill_links(&project, &[m], false, false);
+        assert_eq!(r.not_in_repo, 1);
+        assert_eq!(r.matched, 0);
+        assert!(project.memory_refs("mem_other").unwrap().is_empty());
+    }
+
+    /// A bare file name has to resolve to the indexed path, or the link is
+    /// written against a path `memories_by_file` will never be asked about.
+    #[test]
+    fn a_bare_file_name_resolves_to_the_indexed_path() {
+        let project = project_store();
+        let m = memory("mem_bare", "charge is idempotent now", "pay.rs", "100");
+        project.upsert_memory(&m).unwrap();
+
+        assert_eq!(backfill_links(&project, &[m], false, false).matched, 1);
+        let refs = project.memory_refs("mem_bare").unwrap();
+        assert!(
+            refs.iter().all(|r| r.file == "src/pay.rs"),
+            "links must carry the indexed path, got {:?}",
+            refs.iter().map(|r| &r.file).collect::<Vec<_>>()
+        );
+    }
+
+    /// A dry run answers the question and changes nothing.
+    #[test]
+    fn a_dry_run_reports_without_writing() {
+        let project = project_store();
+        let m = memory("mem_old", "charge is idempotent now", "src/pay.rs", "100");
+        project.upsert_memory(&m).unwrap();
+
+        let r = backfill_links(&project, std::slice::from_ref(&m), true, false);
+        assert_eq!(r.matched, 1);
+        assert_eq!(r.rows, 0);
+        assert!(project.memory_refs("mem_old").unwrap().is_empty());
+    }
+
+    /// Memories with nothing to go on are counted, not silently dropped: the
+    /// gap between "examined" and "matched" is the whole reason to run a
+    /// second, heuristic pass, and it has to be visible.
+    #[test]
+    fn memories_without_files_are_counted() {
+        let project = project_store();
+        let m = memory("mem_nofiles", "charge broke once", "", "100");
+        project.upsert_memory(&m).unwrap();
+
+        let r = backfill_links(&project, &[m], false, false);
+        assert_eq!(r.examined, 1);
+        assert_eq!(r.without_files, 1);
+        assert_eq!(r.matched, 0);
+    }
+
+    /// The pattern must find a real path in prose and reject the things that
+    /// merely look like one. Both examples are taken from a real corpus.
+    #[test]
+    fn paths_are_recovered_from_prose_and_junk_comes_with_them() {
+        let found = paths_in_text(
+            "el control vive en apps/registry/src/app/firmar-registro.ts y usamos              Shepherd.js para el tour; ver CLAUDE.md. Roto en NombreUtil.java.",
+        );
+        assert!(found.contains(&"apps/registry/src/app/firmar-registro.ts".to_string()));
+        assert!(found.contains(&"NombreUtil.java".to_string()), "{found:?}");
+        // Deliberately still here: the pattern cannot tell a library from a
+        // file, so it must not try. The index rejects it, and the next test
+        // proves that it does.
+        assert!(found.contains(&"Shepherd.js".to_string()));
+        // Not code, and not in the extension list.
+        assert!(!found.iter().any(|f| f.ends_with(".md")));
+    }
+
+    /// Trailing punctuation is prose, not path.
+    #[test]
+    fn a_path_at_the_end_of_a_sentence_keeps_its_path() {
+        assert_eq!(paths_in_text("roto en pay.rs."), vec!["pay.rs"]);
+        assert_eq!(paths_in_text("ver `src/pay.rs`,"), vec!["src/pay.rs"]);
+        assert!(paths_in_text("solo .rs suelto").is_empty());
+        assert!(paths_in_text("y src/.rs tampoco").is_empty());
+    }
+
+    /// The whole safety argument for the text pass: a candidate the index does
+    /// not know is never linked, however much it looks like a path.
+    #[test]
+    fn a_recovered_path_the_index_does_not_know_is_not_linked() {
+        let project = project_store();
+        let m = memory(
+            "mem_lib",
+            "usamos Shepherd.js para el tour de la pantalla",
+            "",
+            "100",
+        );
+        project.upsert_memory(&m).unwrap();
+
+        let r = backfill_links(&project, std::slice::from_ref(&m), false, true);
+        assert_eq!(r.matched, 0);
+        assert_eq!(r.without_files, 1);
+        assert!(project.memory_refs("mem_lib").unwrap().is_empty());
+    }
+
+    /// A memory with no `files` but a real path in its prose gets linked, and
+    /// is reported as text-derived so the weaker provenance stays visible.
+    #[test]
+    fn a_memory_with_no_files_is_linked_from_its_prose() {
+        let project = project_store();
+        let m = memory(
+            "mem_prose",
+            "el bug estaba en src/pay.rs — charge cobraba dos veces",
+            "",
+            "100",
+        );
+        project.upsert_memory(&m).unwrap();
+
+        let r = backfill_links(&project, std::slice::from_ref(&m), false, true);
+        assert_eq!(r.matched, 1);
+        assert_eq!(r.from_text, 1, "text-derived links must be counted apart");
+
+        let hits = memories_by_symbol(&project, None, "src/pay.rs::charge", "", "", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].link_sources, "content-mention");
+    }
+
+    /// Off by default: the same memory yields nothing without the flag, so the
+    /// weaker pass is never something a caller gets by accident.
+    #[test]
+    fn the_text_pass_is_opt_in() {
+        let project = project_store();
+        let m = memory("mem_prose", "el bug estaba en src/pay.rs", "", "100");
+        project.upsert_memory(&m).unwrap();
+
+        let r = backfill_links(&project, std::slice::from_ref(&m), false, false);
+        assert_eq!(r.matched, 0);
+        assert_eq!(r.from_text, 0);
+    }
+
+    /// A stated `files` field is never second-guessed: when it names only files
+    /// this repository lacks, that is the answer, and the prose does not get a
+    /// vote. Otherwise a memory about another repo would be dragged in here by
+    /// a path that happens to appear in its text.
+    #[test]
+    fn a_stated_files_field_is_not_second_guessed_by_the_prose() {
+        let project = project_store();
+        let m = memory(
+            "mem_other",
+            "el equivalente acá es src/pay.rs pero el cambio fue en el web",
+            "web/src/app.ts",
+            "100",
+        );
+        project.upsert_memory(&m).unwrap();
+
+        let r = backfill_links(&project, std::slice::from_ref(&m), false, true);
+        assert_eq!(r.not_in_repo, 1);
+        assert_eq!(r.matched, 0);
     }
 
     /// A memory linked to a file, found by that file.

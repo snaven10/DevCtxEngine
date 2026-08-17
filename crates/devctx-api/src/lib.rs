@@ -16,11 +16,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_build_context, do_graph, do_impact, do_index, do_index_paths, do_index_progress,
-    do_index_status, do_list_projects, do_memories_by_file, do_memories_by_symbol,
-    do_memory_context, do_memory_refs, do_memory_stats, do_read_file, do_read_symbol,
-    do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
-    do_search, do_search_routes, do_summarize, parse_mode, AppState,
+    do_backfill_links, do_build_context, do_graph, do_impact, do_index, do_index_paths,
+    do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
+    do_memories_by_symbol, do_memory_context, do_memory_refs, do_memory_stats, do_read_file,
+    do_read_symbol, do_recall_scoped, do_references, do_remember, do_remember_shared,
+    do_routes_for_handler, do_search, do_search_routes, do_summarize, parse_mode, AppState,
 };
 use serde::Deserialize;
 
@@ -60,6 +60,7 @@ fn router(api: Api) -> Router {
         .route("/memory/:id/refs", get(memory_refs))
         .route("/symbol/:name", get(read_symbol))
         .route("/memory/context", get(memory_context))
+        .route("/memories/backfill-links", post(backfill_links))
         .route("/context", post(build_context))
         .route("/routes", get(routes))
         .route("/routes/handler/:handler", get(routes_for_handler))
@@ -338,6 +339,16 @@ struct MemoryContextQuery {
     limit: Option<usize>,
 }
 
+/// Body for `POST /memories/backfill-links`.
+#[derive(Deserialize)]
+struct BackfillBody {
+    #[serde(default)]
+    dry_run: Option<bool>,
+    /// Also recover paths from a memory's prose when it names no files.
+    #[serde(default)]
+    from_text: Option<bool>,
+}
+
 /// Body for `POST /context`.
 #[derive(Deserialize)]
 struct ContextBody {
@@ -509,6 +520,14 @@ async fn impact(
 ) -> Response {
     run(api.state, move |s| {
         do_impact(s, &symbol, q.depth.unwrap_or(3))
+    })
+    .await
+}
+
+/// Link memories saved before the junction existed.
+async fn backfill_links(State(api): State<Api>, Json(b): Json<BackfillBody>) -> Response {
+    run(api.state, move |s| {
+        do_backfill_links(s, b.dry_run.unwrap_or(false), b.from_text.unwrap_or(false))
     })
     .await
 }

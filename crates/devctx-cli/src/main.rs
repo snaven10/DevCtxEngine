@@ -391,6 +391,25 @@ enum MemoriesAction {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Link memories to the code they name, for memories saved before the
+    /// junction existed — migrated, imported, or written by an older build.
+    ///
+    /// Run it once per repository: it links only the files this one has
+    /// indexed, so a shared memory's links land wherever its files actually
+    /// live. Safe to repeat.
+    BackfillLinks {
+        /// Report what would happen without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also recover file paths from a memory's own text, for memories that
+        /// name no files at all — about half of a corpus written before the
+        /// field existed. Every recovered path is checked against the index
+        /// before it is linked, so a library name that looks like a file is
+        /// dropped rather than linked to nothing. Off by default: the
+        /// derivation is weaker than a stated `files` field.
+        #[arg(long)]
+        from_text: bool,
+    },
     /// Read memories from a JSONL file. Only ever adds; never overwrites.
     Import {
         /// The file to read.
@@ -517,6 +536,9 @@ fn main() -> Result<()> {
                 scope,
                 dry_run,
             } => cmd_memories_import(&file, scope.as_deref(), dry_run),
+            MemoriesAction::BackfillLinks { dry_run, from_text } => {
+                cmd_backfill_links(dry_run, from_text)
+            }
         },
         Command::MemoryForget { id } => cmd_memory_forget(id),
         Command::MemoryPurge { project, dry_run } => cmd_memory_purge(project, dry_run),
@@ -1678,6 +1700,76 @@ fn repo_branch(cfg: &ProjectConfig) -> (String, String) {
 }
 
 /// `devctx impact` — show the blast radius of a symbol.
+/// `devctx memories backfill-links` — link memories saved before the junction.
+///
+/// Routed through the project server, which owns both the store the links are
+/// written into and the client for the shared memories that need linking.
+fn cmd_backfill_links(dry_run: bool, from_text: bool) -> Result<()> {
+    let cfg = load_project()?;
+    let Some(r) = remote::ensure(&cfg) else {
+        bail!(
+            "backfilling needs this project's server; start one with `devctx serve` \
+             (or run any indexing command, which spawns it)"
+        );
+    };
+    let raw = r.backfill_links(dry_run, from_text)?;
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+
+    if dry_run {
+        println!("Dry run — nothing was written.");
+    }
+    println!(
+        "Examined {} memories ({} of this project, {} shared).",
+        n("examined"),
+        v.pointer("/sources/local")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        v.pointer("/sources/shared")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+    );
+    // A dry run stops before linking, so it has no symbol counts to give.
+    // Printing them as zero would read as "matched, but nothing linkable" —
+    // the opposite of what a dry run is saying.
+    if dry_run {
+        println!(
+            "  {} name a file this repository indexes and would be linked.",
+            n("matched"),
+        );
+    } else {
+        println!(
+            "  {} name a file this repository indexes; {} of those gained symbol \
+             links ({} rows).",
+            n("matched"),
+            n("linked_with_symbols"),
+            n("rows_written"),
+        );
+        // Reported separately because it is the weaker derivation: a path read
+        // out of a sentence, not one anybody stated. Folding it into the total
+        // would hide how much of the sweep rests on it.
+        if n("linked_from_text") > 0 {
+            println!(
+                "  Of those, {} were matched from the memory's own text rather \
+                 than a `files` field.",
+                n("linked_from_text"),
+            );
+        }
+    }
+    // The two skip counts mean different things, and collapsing them would hide
+    // the one that is actionable: files belonging to another repository are
+    // expected, while memories with no files at all are the gap a second pass
+    // over their text would close.
+    println!(
+        "  Skipped: {} name no file this repository has{}, {} name only files \
+         this repository does not index.",
+        n("skipped_no_files"),
+        if from_text { "" } else { " (try --from-text)" },
+        n("skipped_not_in_this_repo"),
+    );
+    Ok(())
+}
+
 /// `devctx symbol` — a symbol's definition and code.
 fn cmd_symbol(name: String, limit: usize) -> Result<()> {
     let cfg = load_project()?;

@@ -1263,6 +1263,64 @@ pub fn do_memory_stats(state: &AppState) -> Result<String, String> {
     Ok(json!({ "total": stats.total, "by_type": by_type }).to_string())
 }
 
+/// Link memories saved before the junction existed.
+///
+/// Sweeps this project's own memories and the shared ones, since a group
+/// memory about this repository's code is exactly the case the junction was
+/// built for, and it is stored where this process cannot reach it except
+/// through the daemon.
+pub fn do_backfill_links(
+    state: &AppState,
+    dry_run: bool,
+    from_text: bool,
+) -> Result<String, String> {
+    let store = state.open_store()?;
+    let mut memories = store.all_memories(&state.project()).unwrap_or_default();
+    let local = memories.len();
+
+    // The shared half arrives as JSON from the daemon; only the fields the
+    // linker reads are needed, so a partial `Memory` is honest here.
+    let mut shared = 0usize;
+    if let Ok(c) = central() {
+        for v in c.all_shared_memories().unwrap_or_default() {
+            let s = |k: &str| {
+                v.get(k)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let id = s("id");
+            if id.is_empty() {
+                continue;
+            }
+            shared += 1;
+            memories.push(devctx_store::Memory {
+                id,
+                content: s("content"),
+                files: s("files"),
+                repo: s("repo"),
+                branch: s("branch"),
+                ..Default::default()
+            });
+        }
+    }
+
+    let r = devctx_memory::links::backfill_links(&store, &memories, dry_run, from_text);
+    Ok(json!({
+        "dry_run": dry_run,
+        "from_text": from_text,
+        "sources": { "local": local, "shared": shared },
+        "examined": r.examined,
+        "matched": r.matched,
+        "linked_with_symbols": r.linked,
+        "rows_written": r.rows,
+        "linked_from_text": r.from_text,
+        "skipped_no_files": r.without_files,
+        "skipped_not_in_this_repo": r.not_in_repo,
+    })
+    .to_string())
+}
+
 /// `memory_context` tool: the most recent memories, with no query.
 ///
 /// The recovery path, not the search path. After a context reset an agent does
@@ -1533,9 +1591,23 @@ pub fn do_memories_by_symbol(
 /// `memories_by_file` tool: the decisions recorded about a file.
 pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result<String, String> {
     let store = state.open_store()?;
-    let linked = store
+    let mut linked = store
         .memory_ids_for_file(file, limit)
         .map_err(|e| e.to_string())?;
+
+    // The junction stores the path the index uses, and a caller who has a bare
+    // file name — which is how anyone refers to a file in conversation — would
+    // otherwise get nothing while the links sit right there. Resolve the name
+    // the same way the writer did, so both spellings reach the same rows.
+    if linked.is_empty() && !file.contains('/') {
+        if let Ok(index) = store.file_index() {
+            if let Some(resolved) = index.resolve(&[file.to_string()]).into_iter().next() {
+                linked = store
+                    .memory_ids_for_file(&resolved, limit)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
     linked_response(&store, file, linked, file, limit)
 }
 
