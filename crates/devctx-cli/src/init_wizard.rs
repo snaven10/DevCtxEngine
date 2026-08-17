@@ -89,6 +89,7 @@ pub fn ask(
 
     println!("\n{}", t.storage_heading());
     println!("{}", t.index_dir_note());
+    println!("{}", t.index_dir_example());
     let state_dir = {
         let d = prompt_ui::input(t.index_dir_question(), "");
         (!d.trim().is_empty()).then_some(d)
@@ -122,6 +123,7 @@ pub fn ask(
 
     println!("\n{}", t.indexing_heading());
     println!("{}", t.exclude_note());
+    println!("{}", t.exclude_example());
     let exclude: Vec<String> = prompt_ui::input(t.exclude_question(), "")
         .split(',')
         .map(|p| p.trim().to_string())

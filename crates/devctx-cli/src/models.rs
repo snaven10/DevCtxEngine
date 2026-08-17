@@ -16,6 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+
+use crate::prompt_ui::Choice;
 use devctx_embed::registry::{find_local, LOCAL_MODELS};
 
 /// What a model is good for, in the terms the choice is actually made in.
@@ -190,7 +192,7 @@ pub fn in_use_summary(in_use: &[(String, usize)]) -> String {
 /// is English-only *before* the first index, not discover it in poor results
 /// months later.
 pub fn prompt(default_key: &str, in_use: &[(String, usize)]) -> Result<Option<String>> {
-    use std::io::{IsTerminal as _, Write as _};
+    use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() {
         return Ok(None);
     }
@@ -199,21 +201,44 @@ pub fn prompt(default_key: &str, in_use: &[(String, usize)]) -> Result<Option<St
         println!("{summary}");
         println!(
             "Matching one of those keeps a single model in memory for any process \
-             that touches both a project and the shared memories.\n"
+             that touches both a project and the shared memories."
         );
     }
-    list(Some(default_key))?;
-    print!("\nModel to use [{default_key}]: ");
-    std::io::stdout().flush().ok();
 
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return Ok(None);
-    }
-    let key = match line.trim() {
-        "" => default_key.to_string(),
-        chosen => chosen.to_string(),
-    };
+    // The list is the table: showing one to read and then asking for the name
+    // to be typed made the reader do the lookup twice, and the answers were
+    // there to be pointed at.
+    let choices: Vec<Choice> = LOCAL_MODELS
+        .iter()
+        .map(|spec| {
+            let (langs, note) = notes(spec.key);
+            let files = if spec.builtin.is_some() {
+                "downloads itself"
+            } else if local_dir(spec.key).is_some() {
+                "ready"
+            } else {
+                "will be downloaded"
+            };
+            Choice::new(
+                spec.key,
+                &format!(
+                    "{:<15} {:>4}d  {:<14} {}",
+                    spec.key, spec.dimension, langs, files
+                ),
+                note,
+            )
+        })
+        .collect();
+    let default_index = LOCAL_MODELS
+        .iter()
+        .position(|s| s.key == default_key)
+        .unwrap_or(0);
+
+    let key = crate::prompt_ui::select(
+        "Embedding model — cannot change after indexing",
+        &choices,
+        default_index,
+    );
     let spec = find_local(&key).ok_or_else(|| {
         anyhow!("unknown model `{key}`; run `devctx models` to see what there is")
     })?;

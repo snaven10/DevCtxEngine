@@ -67,8 +67,17 @@ impl Text {
     }
     pub fn index_dir_question(&self) -> &'static str {
         self.pick(
-            "Index directory (blank = inside the repository)",
-            "Directorio del índice (vacío = dentro del repositorio)",
+            "Index directory — an absolute path, or Enter to keep it in the repository",
+            "Directorio del índice — una ruta absoluta, o Enter para dejarlo en el repositorio",
+        )
+    }
+    /// An example, because the shape of an answer is the part a prompt usually
+    /// leaves out: someone who has never seen this cannot tell whether it wants
+    /// a path, a name, or a flag.
+    pub fn index_dir_example(&self) -> &'static str {
+        self.pick(
+            "e.g. /mnt/disk/devctx/myproject — useful when the repository sits on a small disk, or when several worktrees would each carry a copy.",
+            "ej. /mnt/disco/devctx/miproyecto — sirve cuando el repositorio está en un disco chico, o cuando varios worktrees cargarían cada uno su copia.",
         )
     }
     pub fn index_dir_note(&self) -> &'static str {
@@ -119,7 +128,17 @@ impl Text {
         self.pick("── Indexing ──", "── Indexado ──")
     }
     pub fn exclude_question(&self) -> &'static str {
-        self.pick("Exclude patterns", "Patrones a excluir")
+        self.pick(
+            "Exclude patterns, comma-separated — or Enter for none",
+            "Patrones a excluir, separados por coma — o Enter para ninguno",
+        )
+    }
+    /// Real patterns rather than a description of patterns.
+    pub fn exclude_example(&self) -> &'static str {
+        self.pick(
+            "e.g.  dist/, *.generated.ts, docs/vendor/**, **/__snapshots__/**\n     A trailing / means a directory; ** crosses directories; * does not.",
+            "ej.  dist/, *.generated.ts, docs/vendor/**, **/__snapshots__/**\n     La / final indica un directorio; ** cruza carpetas; * no.",
+        )
     }
     pub fn exclude_note(&self) -> &'static str {
         self.pick(
