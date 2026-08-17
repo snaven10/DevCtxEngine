@@ -11,9 +11,32 @@ use crate::error::Result;
 /// column width; it must equal the active embedding model's dimension.
 pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
     conn.execute_batch(&vectors_ddl(dim))?;
+    drop_legacy_memory_ref_pk(conn);
     conn.execute_batch(RELATIONAL_DDL)?;
     drop_broken_project_indexes(conn);
     Ok(())
+}
+
+/// Drop `memory_symbol_references` if it still carries the PRIMARY KEY an
+/// earlier schema gave it, so the DDL below recreates it without one.
+///
+/// Dropping rather than altering because the table holds only derived data:
+/// every row is recoverable by re-linking the memories that produced it, and a
+/// column-preserving rewrite would cost more than the rebuild it protects.
+/// Runs before the DDL so the recreate lands in the same open.
+fn drop_legacy_memory_ref_pk(conn: &Connection) {
+    let has_pk = conn
+        .query_row(
+            "SELECT count(*) > 0 FROM duckdb_constraints()
+             WHERE table_name = 'memory_symbol_references'
+               AND constraint_type = 'PRIMARY KEY'",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if has_pk {
+        let _ = conn.execute_batch("DROP TABLE IF EXISTS memory_symbol_references;");
+    }
 }
 
 /// Remove the `projects` and `memories` indexes an older schema created.
@@ -128,6 +151,14 @@ CREATE TABLE IF NOT EXISTS memories (
 -- values and silently wrong for some is worse than no index at all, and a scan
 -- over a few thousand rows costs nothing in a columnar engine.
 
+-- Which memories talk about which symbols. Derived at remember() time, never
+-- declared; see `memory_refs.rs` for how the links are found.
+--
+-- No PRIMARY KEY, for the same reason `memories` above has no index: the ART
+-- index a PK creates is exactly the one that answered `WHERE project = ?` with
+-- zero rows over three matching ones. Uniqueness is enforced in Rust instead —
+-- the writer rebuilds a memory's rows wholesale and de-duplicates before
+-- inserting, so there is nothing for a constraint to catch.
 CREATE TABLE IF NOT EXISTS memory_symbol_references (
     memory_id VARCHAR,
     symbol    VARCHAR,
@@ -135,8 +166,7 @@ CREATE TABLE IF NOT EXISTS memory_symbol_references (
     line      INTEGER,
     repo      VARCHAR,
     branch    VARCHAR,
-    source    VARCHAR,
-    PRIMARY KEY (memory_id, symbol, file, branch)
+    source    VARCHAR
 );
 
 -- The project registry. Only ever populated in the *central* store, which is

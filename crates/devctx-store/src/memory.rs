@@ -63,7 +63,8 @@ pub struct MemoryStats {
     pub by_type: Vec<(String, i64)>,
 }
 
-const MEM_COLS: &str = "id, title, content, memory_type, scope, project, topic_key, tags, \
+pub(crate) const MEM_COLS: &str =
+    "id, title, content, memory_type, scope, project, topic_key, tags, \
     author, repo, branch, files, revision_count, duplicate_count, normalized_hash, \
     vector_id, session_id, created_at, updated_at, deleted_at";
 
@@ -243,7 +244,7 @@ fn opt_row(r: duckdb::Result<Memory>) -> Result<Option<Memory>> {
     }
 }
 
-fn row_to_memory(r: &duckdb::Row<'_>) -> duckdb::Result<Memory> {
+pub(crate) fn row_to_memory(r: &duckdb::Row<'_>) -> duckdb::Result<Memory> {
     Ok(Memory {
         id: r.get(0)?,
         title: r.get(1)?,

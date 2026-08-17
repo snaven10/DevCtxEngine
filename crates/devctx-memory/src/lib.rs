@@ -7,6 +7,7 @@
 //! plan §3/§5. Symbol references are a follow-up.
 
 pub mod error;
+pub mod links;
 
 use std::collections::HashMap;
 

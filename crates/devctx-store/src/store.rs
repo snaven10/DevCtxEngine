@@ -604,6 +604,57 @@ impl Store {
         Ok(out)
     }
 
+    /// Chunks that define a symbol, by name.
+    ///
+    /// Two passes, because a caller has a name and the index has ids. An exact
+    /// hit on `symbol` is what a name typed from memory produces; the suffix
+    /// pass catches the qualified spellings the parsers emit for methods
+    /// (`Card.charge`, `path/pay.rs::charge`), which is what a caller
+    /// copy-pasting from `impact` or `get_references` has in hand. Doing the
+    /// exact pass first means the common case never pays for the scan.
+    ///
+    /// Definitions only — chunks whose `chunk_level` is not a call site — so the
+    /// answer is the code of the symbol rather than every place it appears.
+    pub fn symbol_definitions(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<VectorPoint>> {
+        let exact = format!(
+            "SELECT {COLS} FROM vectors
+             WHERE repo = ? AND branch = ? AND symbol = ? AND NOT is_deletion
+             ORDER BY file, start_line LIMIT {limit}"
+        );
+        let mut stmt = self.conn.prepare(&exact)?;
+        let rows = stmt.query_map([repo, branch, name], row_to_point)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+
+        // `Card.charge` and `pay.rs::charge` both end in `charge`; anchoring on
+        // the separator keeps `recharge` out.
+        let dot = format!("%.{name}");
+        let colons = format!("%::{name}");
+        let sql = format!(
+            "SELECT {COLS} FROM vectors
+             WHERE repo = ? AND branch = ? AND NOT is_deletion
+               AND (symbol LIKE ? OR symbol LIKE ?)
+             ORDER BY file, start_line LIMIT {limit}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([repo, branch, dot.as_str(), colons.as_str()], row_to_point)?;
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Render a slice of floats as a DuckDB fixed-size array literal.
     fn vec_literal(&self, v: &[f32]) -> String {
         let mut s = String::with_capacity(v.len() * 8 + 16);

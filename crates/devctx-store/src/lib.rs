@@ -8,6 +8,7 @@
 mod error;
 mod graph;
 mod memory;
+mod memory_refs;
 mod projects;
 mod routes;
 mod schema;
@@ -17,6 +18,7 @@ mod store;
 pub use error::{Result, StoreError};
 pub use graph::{GraphEdge, ImpactResult, Reference, StoredEdge};
 pub use memory::{Memory, MemoryStats};
+pub use memory_refs::{short_label, LinkedMemory, SymbolRef};
 pub use projects::{ProjectIndexStats, ProjectRecord};
 pub use routes::StoredRoute;
 pub use schema::init_schema;
