@@ -14,12 +14,12 @@
 //! * `files-field` — the memory named the file. Structural, and as reliable as
 //!   whatever wrote the field.
 //! * `content-mention` — the memory's prose contains the short label of a
-//!   symbol that the graph says lives in one of those files. Narrower than
-//!   grepping the whole graph for every identifier in the text: "process" or
+//!   symbol the index places in one of those files. Narrower than matching
+//!   every identifier in the text against the whole repository: "process" or
 //!   "handler" appear in a thousand memories and mean nothing, but "process"
 //!   in a memory that also names `orders/pipeline.rs` is about that one.
 //!
-//! Rows live in the store that owns the graph — the project store — even when
+//! Rows live in the store that owns the code — the project store — even when
 //! the memory itself lives centrally. A global memory about this repository's
 //! `charge()` is findable from this repository, which is where someone reading
 //! `charge()` is standing.
@@ -166,24 +166,24 @@ impl Store {
         Ok(rows.len())
     }
 
-    /// Symbols the graph places in `files` whose short label the memory's prose
-    /// mentions.
+    /// Symbols defined in `files` whose short label the memory's prose mentions.
+    ///
+    /// Read from `vectors`, not `graph_edges`. The graph only knows a symbol if
+    /// it takes part in a call, so a leaf utility — static helpers that call
+    /// nothing indexed and are called through paths the parser does not follow —
+    /// has no rows there at all. Measured on a real repository: a file with
+    /// three public methods, all of them in `vectors`, had zero graph edges, and
+    /// linking against the graph silently produced no symbol links for it.
+    /// `vectors` holds every symbol the indexer chunked, which is the inventory
+    /// this question is actually asking about.
     fn mentioned_symbols(&self, m: &Memory, files: &[&str]) -> Result<Vec<SymbolRef>> {
         let placeholders = vec!["?"; files.len()].join(",");
         let sql = format!(
-            "SELECT DISTINCT symbol, file, line, repo, branch FROM (
-                 SELECT source AS symbol, source_file AS file, line, repo, branch
-                 FROM graph_edges WHERE source_file IN ({placeholders})
-                 UNION
-                 SELECT target AS symbol, source_file AS file, line, repo, branch
-                 FROM graph_edges WHERE source_file IN ({placeholders})
-             )"
+            "SELECT DISTINCT symbol, file, start_line AS line, repo, branch
+             FROM vectors
+             WHERE file IN ({placeholders}) AND symbol <> '' AND NOT is_deletion"
         );
-        let args: Vec<&dyn duckdb::ToSql> = files
-            .iter()
-            .chain(files.iter())
-            .map(|f| f as &dyn duckdb::ToSql)
-            .collect();
+        let args: Vec<&dyn duckdb::ToSql> = files.iter().map(|f| f as &dyn duckdb::ToSql).collect();
 
         let mut stmt = self.conn.prepare(&sql)?;
         let found = stmt.query_map(args.as_slice(), |r| {
@@ -368,8 +368,35 @@ mod tests {
 
     use crate::graph::StoredEdge;
 
+    /// A chunk as the indexer writes it: this is where symbols actually live.
+    fn chunk(id: &str, symbol: &str, file: &str) -> devctx_core::types::VectorPoint {
+        devctx_core::types::VectorPoint {
+            id: id.into(),
+            vector: vec![0.0; 3],
+            text: format!("code of {symbol}"),
+            metadata: devctx_core::types::VectorMetadata {
+                repo: "shop-api".into(),
+                branch: "main".into(),
+                file: file.into(),
+                symbol: symbol.into(),
+                symbol_type: "function".into(),
+                language: "rust".into(),
+                start_line: 1,
+                end_line: 10,
+                ..Default::default()
+            },
+        }
+    }
+
     fn seeded_store() -> Store {
         let store = Store::open_in_memory(3).unwrap();
+        store
+            .upsert(&[
+                chunk("v1", "src/pay.rs::charge", "src/pay.rs"),
+                chunk("v2", "src/pay.rs::settle", "src/pay.rs"),
+                chunk("v3", "src/pay.rs::refund", "src/pay.rs"),
+            ])
+            .unwrap();
         store
             .replace_file_edges(
                 "shop-api",
@@ -491,6 +518,40 @@ mod tests {
             .memory_ids_for_symbol("src/pay.rs::charge", "", "", 10)
             .unwrap()
             .is_empty());
+    }
+
+    /// The failure this module shipped with, found by running it against a real
+    /// repository: a leaf utility takes part in no calls, so the call graph has
+    /// no rows for its file — but its symbols are indexed all the same, and a
+    /// memory naming them must still link. Reading the inventory from the graph
+    /// produced a file link and nothing else, silently.
+    #[test]
+    fn a_file_with_symbols_but_no_call_edges_still_links_them() {
+        let store = Store::open_in_memory(3).unwrap();
+        store
+            .upsert(&[chunk("v1", "separarApellidos", "util/names.java")])
+            .unwrap();
+        // Deliberately no edges: nothing calls it, it calls nothing indexed.
+
+        let m = Memory {
+            id: "mem_leaf".into(),
+            content: "separarApellidos parte el string de apellidos".into(),
+            files: "util/names.java".into(),
+            repo: "shop-api".into(),
+            branch: "main".into(),
+            ..Default::default()
+        };
+        store.upsert_memory(&m).unwrap();
+        assert_eq!(
+            store.extract_symbol_refs(&m).unwrap(),
+            2,
+            "the file link plus the symbol the prose names"
+        );
+        let hits = store
+            .memory_ids_for_symbol("separarApellidos", "shop-api", "main", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "a leaf symbol must be reachable");
+        assert_eq!(hits[0].1, "content-mention");
     }
 
     /// A memory written before the repository was ever indexed has no links,

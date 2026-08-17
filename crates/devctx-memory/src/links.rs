@@ -139,8 +139,34 @@ mod tests {
         }
     }
 
+    /// A chunk as the indexer writes it. Symbols live here, not in the graph:
+    /// the graph only knows the ones that take part in a call.
+    fn chunk(id: &str, symbol: &str, file: &str) -> devctx_core::types::VectorPoint {
+        devctx_core::types::VectorPoint {
+            id: id.into(),
+            vector: vec![0.0; 3],
+            text: format!("code of {symbol}"),
+            metadata: devctx_core::types::VectorMetadata {
+                repo: "shop-api".into(),
+                branch: "main".into(),
+                file: file.into(),
+                symbol: symbol.into(),
+                symbol_type: "function".into(),
+                language: "rust".into(),
+                start_line: 1,
+                end_line: 10,
+                ..Default::default()
+            },
+        }
+    }
+
     fn project_store() -> Store {
         let s = Store::open_in_memory(3).unwrap();
+        s.upsert(&[
+            chunk("v1", "src/pay.rs::charge", "src/pay.rs"),
+            chunk("v2", "src/pay.rs::settle", "src/pay.rs"),
+        ])
+        .unwrap();
         s.replace_file_edges(
             "shop-api",
             "main",

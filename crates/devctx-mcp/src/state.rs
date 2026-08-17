@@ -1365,14 +1365,11 @@ pub fn do_build_context(
     if include_memories {
         if let Ok(raw) = do_recall_scoped(state, query, 5, "all", None) {
             let mems = parse_memories(&raw);
-            if !mems.is_empty() {
-                push(
-                    &mut out,
-                    &mut used,
-                    &mut dropped,
-                    "## What is already known\n\n",
-                );
-            }
+            // The heading rides with the first item that fits. Emitted on its
+            // own it survives a budget the items underneath did not, and an
+            // empty section reads as "nothing here" — the one thing it must
+            // never mean.
+            let mut head = "## What is already known\n\n";
             for m in &mems {
                 let title = m.get("title").and_then(|v| v.as_str()).unwrap_or("");
                 let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -1380,12 +1377,14 @@ pub fn do_build_context(
                 for f in files.split(',').map(str::trim).filter(|f| !f.is_empty()) {
                     memory_files.push(f.to_string());
                 }
-                push(
+                if push(
                     &mut out,
                     &mut used,
                     &mut dropped,
-                    &format!("[memory] {title}\n{content}\n\n"),
-                );
+                    &format!("{head}[memory] {title}\n{content}\n\n"),
+                ) {
+                    head = "";
+                }
             }
         }
     }
@@ -1394,9 +1393,7 @@ pub fn do_build_context(
     let raw = do_search(state, query, 30, None, SearchMode::Vector, false)?;
     let hits: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
     let mut code_files: Vec<String> = Vec::new();
-    if !hits.is_empty() {
-        push(&mut out, &mut used, &mut dropped, "## Code\n\n");
-    }
+    let mut head = "## Code\n\n";
     for h in &hits {
         let file = h.get("file").and_then(|v| v.as_str()).unwrap_or("");
         let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1412,15 +1409,16 @@ pub fn do_build_context(
             &mut out,
             &mut used,
             &mut dropped,
-            &format!("// {file}:{line}\n{text}\n\n"),
+            &format!("{head}// {file}:{line}\n{text}\n\n"),
         ) {
             break;
         }
+        head = "";
     }
 
     if include_memories {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut header = false;
+        let mut head = "## Recorded against this code\n\n";
         for file in code_files.iter().take(5) {
             let Ok(raw) = do_memories_by_file(state, file, 5) else {
                 continue;
@@ -1434,24 +1432,17 @@ pub fn do_build_context(
                 if !seen.insert(id) {
                     continue;
                 }
-                if !header {
-                    push(
-                        &mut out,
-                        &mut used,
-                        &mut dropped,
-                        "## Recorded against this code\n\n",
-                    );
-                    header = true;
-                }
                 let title = m.get("title").and_then(|v| v.as_str()).unwrap_or("");
                 let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let src = m.get("link_sources").and_then(|v| v.as_str()).unwrap_or("");
-                push(
+                if push(
                     &mut out,
                     &mut used,
                     &mut dropped,
-                    &format!("[memory · {src} · about {file}] {title}\n{content}\n\n"),
-                );
+                    &format!("{head}[memory · {src} · about {file}] {title}\n{content}\n\n"),
+                ) {
+                    head = "";
+                }
             }
         }
     }

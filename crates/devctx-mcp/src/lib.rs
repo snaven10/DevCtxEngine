@@ -199,12 +199,28 @@ struct BuildContextReq {
     include_memories: Option<bool>,
 }
 
-/// Parameters for `memories_by_symbol` / `memories_by_file`.
+/// Parameters for the `memories_by_symbol` tool.
+///
+/// Named for what it takes rather than sharing one generic struct with
+/// `memories_by_file`: the parameter name is what an agent reads to decide what
+/// to pass, and `subject` tells it nothing about whether a symbol or a path
+/// belongs there.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
-struct MemoriesForReq {
-    /// The symbol, or the file path.
-    subject: String,
+struct MemoriesBySymbolReq {
+    /// The symbol name. Bare (`charge`) or qualified (`src/pay.rs::charge`).
+    symbol: String,
+    /// Maximum memories to return (default 10).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Parameters for the `memories_by_file` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct MemoriesByFileReq {
+    /// Repository-relative path, as reported by `search` or `read_symbol`.
+    file: String,
     /// Maximum memories to return (default 10).
     #[serde(default)]
     limit: Option<usize>,
@@ -597,11 +613,10 @@ impl DevctxServer {
     )]
     async fn memories_by_symbol(
         &self,
-        Parameters(req): Parameters<MemoriesForReq>,
+        Parameters(req): Parameters<MemoriesBySymbolReq>,
     ) -> Result<String, ErrorData> {
         let backend = self.bound()?;
-        run_blocking(move || backend.memories_by_symbol(&req.subject, req.limit.unwrap_or(10)))
-            .await
+        run_blocking(move || backend.memories_by_symbol(&req.symbol, req.limit.unwrap_or(10))).await
     }
 
     /// Memories recorded about a file.
@@ -611,10 +626,10 @@ impl DevctxServer {
     )]
     async fn memories_by_file(
         &self,
-        Parameters(req): Parameters<MemoriesForReq>,
+        Parameters(req): Parameters<MemoriesByFileReq>,
     ) -> Result<String, ErrorData> {
         let backend = self.bound()?;
-        run_blocking(move || backend.memories_by_file(&req.subject, req.limit.unwrap_or(10))).await
+        run_blocking(move || backend.memories_by_file(&req.file, req.limit.unwrap_or(10))).await
     }
 
     /// What code a memory concerns.

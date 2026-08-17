@@ -1379,6 +1379,18 @@ fn cmd_mcp_configure(
     })
 }
 
+/// The wire name of a scope, as `/remember` expects it.
+fn scope_name(scope: MemoryScope) -> &'static str {
+    match scope {
+        MemoryScope::Local => "local",
+        MemoryScope::Group => "group",
+        MemoryScope::Global => "global",
+        // `all` is a recall filter, not a place to write to; the server treats
+        // anything it does not recognize as local, and so do we, explicitly.
+        MemoryScope::All => "local",
+    }
+}
+
 /// Link a memory that was stored centrally to this repository's call graph.
 ///
 /// Best-effort throughout: the memory is already saved, and a project whose
@@ -1441,6 +1453,27 @@ fn cmd_remember(
     } else {
         String::new()
     };
+    // A running server owns this project's database, and it is also the process
+    // that can link the memory to the code — so hand it the whole job, scope and
+    // all, rather than doing the central half here and then failing to open a
+    // store something else holds. Found by smoke test: the link was skipped in
+    // silence whenever a server happened to be up, which is the normal case.
+    if let Some(r) = remote::ensure(&cfg) {
+        println!(
+            "{}",
+            r.remember(
+                &content,
+                title.as_deref().unwrap_or(""),
+                &memory_type,
+                topic.as_deref().unwrap_or(""),
+                tags.as_deref().unwrap_or(""),
+                &files,
+                scope_name(scope),
+            )?
+        );
+        return Ok(());
+    }
+
     if scope != MemoryScope::Local {
         // Provenance must never be blank: a directory that is not a git repo
         // still belongs to a named project, and "which project taught me this"
@@ -1483,20 +1516,6 @@ fn cmd_remember(
         return Ok(());
     }
 
-    if let Some(r) = remote::ensure(&cfg) {
-        println!(
-            "{}",
-            r.remember(
-                &content,
-                title.as_deref().unwrap_or(""),
-                &memory_type,
-                topic.as_deref().unwrap_or(""),
-                tags.as_deref().unwrap_or(""),
-                &files,
-            )?
-        );
-        return Ok(());
-    }
     let embedder = build_embedder(&cfg)?;
     let store = open_store(&cfg, embedder.dimension())?;
 

@@ -321,6 +321,7 @@ impl Remote {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn remember(
         &self,
         content: &str,
@@ -329,12 +330,13 @@ impl Remote {
         topic: &str,
         tags: &str,
         files: &str,
+        scope: &str,
     ) -> Result<String> {
         self.post(
             "/remember",
             serde_json::json!({
                 "content": content, "title": title, "type": memory_type,
-                "topic": topic, "tags": tags, "files": files,
+                "topic": topic, "tags": tags, "files": files, "scope": scope,
             }),
         )
     }
