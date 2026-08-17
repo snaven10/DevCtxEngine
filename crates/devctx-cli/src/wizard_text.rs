@@ -114,12 +114,18 @@ impl Text {
         )
     }
     pub fn fts_question(&self) -> &'static str {
-        self.pick("Keyword index (BM25)", "Índice de palabras clave (BM25)")
+        self.pick(
+            "Also search by exact words, not only by meaning?",
+            "¿Buscar también por palabra exacta, no solo por significado?",
+        )
     }
+    /// Named by what it is for, not by its algorithm. Someone deciding here has
+    /// no reason to know what BM25 is, and every reason to know that searching
+    /// for a symbol by name is otherwise poor.
     pub fn fts_note(&self) -> &'static str {
         self.pick(
-            "lets `search --keyword` match exact identifiers",
-            "permite que `search --keyword` encuentre identificadores exactos",
+            "Semantic search finds code that means what you asked; it is weak at finding a name you already know. This adds `--mode keyword` and `--mode hybrid`, which fuses both. Costs disk and a few seconds per index.",
+            "La búsqueda semántica encuentra código que significa lo que pediste; es floja para encontrar un nombre que ya conocés. Esto agrega `--mode keyword` y `--mode hybrid`, que fusiona las dos. Cuesta disco y unos segundos por indexado.",
         )
     }
 
