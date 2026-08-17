@@ -23,15 +23,24 @@ devctx web                         # web dashboard: interactive call-graph + mem
 
 ## Install
 
+macOS and Linux:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/snaven10/DevCtxEngine/main/install.sh | sh
 ```
 
-Linux x86_64 and macOS arm64; anywhere else, `cargo build --release` (it
-compiles DuckDB from source, so allow 20–25 minutes). The script installs the
-binary to `~/.local/bin` and stops there — it writes no configuration and
-downloads no model, because those are decisions, and the embedding model in
-particular cannot be changed after indexing without redoing it.
+Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/snaven10/DevCtxEngine/main/install.ps1 | iex
+```
+
+Linux x86_64, macOS arm64 and Windows x64; anywhere else, `cargo build --release`
+(it compiles DuckDB from source, so allow 20–25 minutes). The script installs the
+binary — `~/.local/bin` on Unix, `%LOCALAPPDATA%\devctx\bin` on Windows — and
+stops there. It writes no configuration and downloads no model, because those
+are decisions, and the embedding model in particular cannot be changed after
+indexing without redoing it.
 
 ### Let an agent set it up
 
@@ -53,6 +62,49 @@ memories from an older DevAI install, indexing — are written out in
 > whose vectors do not, an index that is never built, a reranker pointed at the
 > wrong model. Do not report a step as done because a command exited zero; run
 > the verification the document gives and show me its output.
+
+### Connect it to your agent
+
+`devctx mcp configure` writes the MCP server entry for you — Claude Code, Cursor,
+Codex and Windsurf all read a `mcpServers` block, and the command knows where
+each one keeps it. Paste this to your agent and it will do the whole thing:
+
+> Register DevCtxEngine as an MCP server for me.
+>
+> Run `devctx mcp configure --help` first and use the flags it actually has;
+> do not hand-write JSON into a config file unless that command cannot do it.
+> Pick the client I am running, and project scope unless I say otherwise.
+>
+> Then verify it: restart the client, list the available tools, and confirm
+> `search`, `recall`, `remember`, `memories_by_symbol` and `build_context` are
+> present. A configure command that exits zero proves the file was written, not
+> that the server starts — so call one read-only tool (`list_projects`) and show
+> me the result.
+>
+> If no project is bound, that is expected for a globally-registered server:
+> call `list_projects` to see what is registered and `use_project` to bind one.
+
+### Teach it when to remember
+
+Having the tools is not the same as knowing when to use them. An agent with
+`remember` available and no policy either saves nothing, or saves a diary nobody
+can search — and the next session re-derives what the last one already knew.
+
+[`MEMORY-PROTOCOL.md`](MEMORY-PROTOCOL.md) is that policy, written to be handed
+to an agent verbatim. Paste this:
+
+> Read https://raw.githubusercontent.com/snaven10/DevCtxEngine/main/MEMORY-PROTOCOL.md
+> and follow it for the rest of our work together. It covers when to search
+> before starting, when to save afterwards, and what to put in each field.
+>
+> The part that is easiest to get wrong: `remember` takes a `files` parameter,
+> and it is what links the memory to the code, so a memory saved without it can
+> only ever be found by text search. Fill it in, and name the symbols in the
+> prose too — that is what the linker matches against.
+
+If your setup supports a persistent instruction file — `CLAUDE.md`, `AGENTS.md`,
+a system prompt — put the pointer there instead, so it survives past this
+conversation.
 
 ## Across projects
 

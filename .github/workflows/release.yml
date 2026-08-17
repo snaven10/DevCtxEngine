@@ -25,6 +25,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +43,8 @@ jobs:
       # A tarball rather than a bare binary: it keeps the executable bit through
       # the download, which a raw asset does not.
       - name: Package
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           set -euo pipefail
           name="devctx-${{ matrix.target }}"
@@ -54,10 +58,29 @@ jobs:
           # directory the installer unpacks into.
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
 
+      # A .zip on Windows: there is no executable bit to preserve, and
+      # Expand-Archive is present on every machine while a gzip-capable tar is
+      # not. The checksum file keeps the same `<hash>  <name>` shape the other
+      # platforms write, so one parser serves both installers.
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "devctx-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$name" -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/devctx.exe" "dist/$name/"
+          Copy-Item README.md, LICENSE, AGENTS.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -NoNewline -Path "dist/$name.zip.sha256"
+
       - uses: actions/upload-artifact@v4
         with:
           name: devctx-${{ matrix.target }}
-          path: dist/*.tar.gz*
+          path: |
+            dist/*.tar.gz*
+            dist/*.zip*
 
   publish:
     needs: build
@@ -74,10 +97,16 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            Install:
+            Install — macOS / Linux:
 
             ```bash
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            Windows (PowerShell):
+
+            ```powershell
+            irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
             ```
 
             Then follow `AGENTS.md` — it is written for a coding agent, and
