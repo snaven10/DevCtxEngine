@@ -8,11 +8,13 @@ mod hooks;
 mod init_wizard;
 mod mcp_configure;
 mod models;
+mod prompt_ui;
 mod remote;
 mod transfer;
 mod transfer_apply;
 mod update_check;
 mod watch;
+mod wizard_text;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -988,16 +990,10 @@ fn cmd_models(download: Option<String>) -> Result<()> {
 /// databases to print one line would be slow for no reason. It can be stale if
 /// someone edited a config by hand — `projects refresh` is the cure.
 fn models_in_use() -> Vec<(String, usize)> {
-    let Ok(central) = Central::open() else {
-        return Vec::new();
-    };
-    let Ok(projects) = central.list(false) else {
-        return Vec::new();
-    };
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-    for p in projects {
-        if !p.embed_model.is_empty() {
-            *counts.entry(p.embed_model).or_default() += 1;
+    for (_, model, _) in registry_snapshot() {
+        if !model.is_empty() {
+            *counts.entry(model).or_default() += 1;
         }
     }
     let mut out: Vec<(String, usize)> = counts.into_iter().collect();
@@ -1009,13 +1005,50 @@ fn models_in_use() -> Vec<(String, usize)> {
 
 /// The names of every registered project, for the "copy from" offer.
 fn registered_project_names() -> Vec<String> {
-    let Ok(central) = Central::open() else {
-        return Vec::new();
+    registry_snapshot()
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect()
+}
+
+/// The registry as `(name, embedding model, config path)`, or empty when it
+/// cannot be read.
+///
+/// Routed through the daemon when one is up. Opening the file directly fails
+/// whenever a daemon holds it — which is most of the time — and every caller
+/// here treats failure as "nothing registered", so the questions that depend on
+/// the registry silently vanished exactly when the machine had projects to
+/// report.
+fn registry_snapshot() -> Vec<(String, String, String)> {
+    let field = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
     };
-    central
-        .list(false)
-        .map(|ps| ps.into_iter().map(|p| p.name).collect())
-        .unwrap_or_default()
+    if let Ok(paths) = CentralPaths::resolve() {
+        if let Some(client) = devctx_central::client::ensure(&paths) {
+            if let Ok(list) = client.list(false) {
+                return list
+                    .iter()
+                    .map(|p| {
+                        (
+                            field(p, "name"),
+                            field(p, "embed_model"),
+                            field(p, "config_path"),
+                        )
+                    })
+                    .collect();
+            }
+        }
+    }
+    match Central::open().and_then(|c| c.list(false)) {
+        Ok(ps) => ps
+            .into_iter()
+            .map(|p| (p.name, p.embed_model, p.config_path))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// The groups already in use, with how many repositories each holds.
@@ -1023,15 +1056,9 @@ fn registered_project_names() -> Vec<String> {
 /// Read from each project's config, not the registry: the registry caches the
 /// model but not the group.
 fn groups_in_use() -> Vec<(String, usize)> {
-    let Ok(central) = Central::open() else {
-        return Vec::new();
-    };
-    let Ok(projects) = central.list(false) else {
-        return Vec::new();
-    };
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-    for p in projects {
-        let Ok(cfg) = ProjectConfig::load(std::path::Path::new(&p.config_path)) else {
+    for (_, _, config_path) in registry_snapshot() {
+        let Ok(cfg) = ProjectConfig::load(std::path::Path::new(&config_path)) else {
             continue;
         };
         if !cfg.project.group.is_empty() {
@@ -2263,8 +2290,11 @@ fn cmd_init(
             "\n{}",
             init_wizard::summary(&name, &answers, &defaults.embeddings.model)
         );
-        if !init_wizard::confirm() {
-            println!("Nothing written.");
+        if !init_wizard::confirm(answers.language.unwrap_or_default()) {
+            println!(
+                "{}",
+                wizard_text::Text::new(answers.language.unwrap_or_default()).nothing_written()
+            );
             return Ok(());
         }
     }

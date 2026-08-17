@@ -16,6 +16,7 @@ path = "src/main.rs"
 flan-t5 = ["devctx-summarize/flan-t5", "devctx-mcp/flan-t5"]
 
 [dependencies]
+crossterm = "0.28"
 devctx-core.workspace = true
 devctx-store = { path = "../devctx-store" }
 devctx-embed = { path = "../devctx-embed" }

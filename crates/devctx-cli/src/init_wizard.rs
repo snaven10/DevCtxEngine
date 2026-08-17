@@ -12,7 +12,7 @@
 //! `init` with no TTY, and a prompt it cannot answer would hang the setup it was
 //! told to perform.
 
-use std::io::{IsTerminal as _, Write as _};
+use std::io::IsTerminal as _;
 
 use anyhow::Result;
 use devctx_core::config::{
@@ -20,6 +20,8 @@ use devctx_core::config::{
 };
 
 use crate::models;
+use crate::prompt_ui::{self, Choice};
+use crate::wizard_text::Text;
 
 /// Everything the wizard collected. `None` means "leave the default alone".
 #[derive(Debug, Default, Clone)]
@@ -37,54 +39,6 @@ pub struct Answers {
     pub summarization: Option<Summarization>,
 }
 
-/// One line offering the groups that already exist.
-pub fn groups_line(groups: &[(String, usize)]) -> String {
-    if groups.is_empty() {
-        return String::new();
-    }
-    let parts: Vec<String> = groups.iter().map(|(g, n)| format!("{g} ({n})")).collect();
-    format!("Groups on this machine: {}", parts.join(", "))
-}
-
-/// Read one line, returning the trimmed answer or `None` when it was empty.
-fn ask_line(question: &str, default: &str) -> Option<String> {
-    print!("{question} [{default}]: ");
-    std::io::stdout().flush().ok();
-    let mut s = String::new();
-    if std::io::stdin().read_line(&mut s).is_err() {
-        return None;
-    }
-    let s = s.trim();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
-    }
-}
-
-/// A yes/no question. Anything unrecognized keeps the default rather than
-/// asking again: a wizard that argues with a typo is worse than one that
-/// proceeds sensibly and shows its summary.
-fn ask_bool(question: &str, default: bool) -> bool {
-    let hint = if default { "Y/n" } else { "y/N" };
-    match ask_line(question, hint) {
-        None => default,
-        Some(s) => match s.to_ascii_lowercase().as_str() {
-            "y" | "yes" => true,
-            "n" | "no" => false,
-            _ => default,
-        },
-    }
-}
-
-/// A number, keeping the default when the answer is not one.
-fn ask_usize(question: &str, default: usize) -> usize {
-    match ask_line(question, &default.to_string()) {
-        None => default,
-        Some(s) => s.trim().parse().unwrap_or(default),
-    }
-}
-
 /// Ask everything — or nothing, when there is no terminal.
 pub fn ask(
     defaults: &Embeddings,
@@ -96,119 +50,163 @@ pub fn ask(
         return Ok(Answers::default());
     }
 
-    // First, because answering it answers everything else. Setting up the
-    // fourth repository of one product should not mean walking a questionnaire
-    // whose right answers are all "the same as the last three".
+    // Asked first, and in both languages, because everything after it is
+    // printed in whatever this answers.
+    let lang = if prompt_ui::select(
+        Text::language_question(),
+        &[
+            Choice::new("en", Text::language_en(), Text::language_note()),
+            Choice::new("es", Text::language_es(), Text::language_note()),
+        ],
+        0,
+    ) == "es"
+    {
+        Language::Es
+    } else {
+        Language::En
+    };
+    let t = Text::new(lang);
+
+    // Then: copying, because answering it answers everything else. Setting up
+    // the fourth repository of one product should not mean walking a
+    // questionnaire whose right answers are all "the same as the last three".
     if !projects.is_empty() {
-        println!("Registered projects: {}", projects.join(", "));
-        if let Some(name) = ask_line(
-            "Copy configuration from one of them (blank to configure this one)",
-            "configure",
-        )
-        .filter(|s| s != "configure")
-        {
+        let mut choices = vec![Choice::new("", t.copy_configure(), "")];
+        for p in projects {
+            choices.push(Choice::new(p, p, t.copy_note()));
+        }
+        let picked = prompt_ui::select(t.copy_question(), &choices, 0);
+        if !picked.is_empty() {
             return Ok(Answers {
-                copy_from: Some(name),
+                copy_from: Some(picked),
+                language: Some(lang),
                 ..Default::default()
             });
         }
-        println!();
     }
 
     let model = models::prompt(&defaults.model, in_use)?;
 
-    println!("\n── Storage ──");
-    println!(
-        "The index is a build artefact — large, binary, rebuilt from the \
-         repository — so it lives inside it by default, and is git-ignored."
-    );
-    let state_dir =
-        ask_line("Index directory (blank = inside the repository)", "repo").filter(|s| s != "repo");
+    println!("\n{}", t.storage_heading());
+    println!("{}", t.index_dir_note());
+    let state_dir = {
+        let d = prompt_ui::input(t.index_dir_question(), "");
+        (!d.trim().is_empty()).then_some(d)
+    };
 
     let d = Storage::default();
-    println!(
-        "\nHNSW is an approximate index: measured 84 ms → 49 ms per search on a \
-         17k-vector store, with recall unchanged."
-    );
-    let hnsw = ask_bool("Build an HNSW index", d.hnsw);
+    let hnsw = prompt_ui::select(
+        t.hnsw_question(),
+        &[
+            Choice::new("y", t.hnsw_on(), t.hnsw_note()),
+            Choice::new("n", t.hnsw_off(), t.hnsw_note()),
+        ],
+        if d.hnsw { 0 } else { 1 },
+    ) == "y";
     let metric = if hnsw {
-        println!(
-            "`cosine` is always correct. `ip` is cheaper but only equivalent \
-             when the embeddings are unit-normalized — the local models are."
-        );
-        ask_line("Distance metric (cosine/ip)", &d.metric).unwrap_or(d.metric.clone())
+        prompt_ui::select(
+            t.metric_question(),
+            &[
+                Choice::new("cosine", "cosine", t.metric_cosine_note()),
+                Choice::new("ip", "ip (inner product)", t.metric_ip_note()),
+            ],
+            0,
+        )
     } else {
         d.metric.clone()
     };
-    println!("\nBM25 lets `search --keyword` match exact identifiers.");
-    let fts = ask_bool("Build a keyword index too", d.fts);
-
-    println!("\n── Indexing ──");
-    println!(
-        "Anything git already ignores is excluded. This is for code git tracks \
-         but that is not worth searching — `.gitignore` syntax, comma-separated."
-    );
-    let exclude: Vec<String> = ask_line("Exclude patterns", "none")
-        .filter(|s| s != "none")
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
-        .unwrap_or_default();
-
-    println!("\n── Memories ──");
-    println!("Memories can be shared between the repositories of one product.");
-    let line = groups_line(groups);
-    if !line.is_empty() {
-        println!("{line}");
+    let fts = prompt_ui::confirm(t.fts_question(), d.fts, t.on(), t.off());
+    if fts {
+        println!("  {}", t.fts_note());
     }
-    let group = ask_line("Group for this repository", "none").filter(|g| g != "none");
 
-    println!("\n── Search quality ──");
+    println!("\n{}", t.indexing_heading());
+    println!("{}", t.exclude_note());
+    let exclude: Vec<String> = prompt_ui::input(t.exclude_question(), "")
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    println!("\n{}", t.memories_heading());
+    let group = {
+        let mut choices = vec![Choice::new("", t.group_none(), "")];
+        for (g, n) in groups {
+            choices.push(Choice::new(g, &format!("{g} ({n})"), t.group_note()));
+        }
+        choices.push(Choice::new("\u{1}new", t.group_new(), t.group_note()));
+        let picked = prompt_ui::select(t.group_question(), &choices, 0);
+        match picked.as_str() {
+            "" => None,
+            "\u{1}new" => {
+                let name = prompt_ui::input(t.group_name_question(), "");
+                (!name.trim().is_empty()).then_some(name)
+            }
+            g => Some(g.to_string()),
+        }
+    };
+
+    println!("\n{}", t.rerank_heading());
     let r = Reranking::default();
-    println!(
-        "A cross-encoder reorders results. Measured here: 1–2 s per search \
-         becomes 180 s, for an ordering the retriever mostly had right."
-    );
-    let rerank_enabled = ask_bool("Enable reranking", r.enabled);
+    let rerank_enabled = prompt_ui::select(
+        t.rerank_question(),
+        &[
+            Choice::new("n", t.rerank_off(), t.rerank_note()),
+            Choice::new("y", t.rerank_on(), t.rerank_note()),
+        ],
+        if r.enabled { 1 } else { 0 },
+    ) == "y";
     let (rerank_model, rerank_pool) = if rerank_enabled {
-        let m = ask_line("Reranker model (bge-base/bge-v2-m3/jina-turbo)", &r.model)
-            .unwrap_or(r.model.clone());
-        println!("The pool is how many candidates it sees — and the whole cost.");
-        (m, ask_usize("Candidate pool", r.pool))
+        let m = prompt_ui::select(
+            t.rerank_model_question(),
+            &[
+                Choice::new("bge-base", "bge-base", "English"),
+                Choice::new("bge-v2-m3", "bge-v2-m3", "multilingual"),
+                Choice::new("jina-turbo", "jina-turbo", "fastest"),
+            ],
+            0,
+        );
+        let pool = prompt_ui::input(t.rerank_pool_question(), &r.pool.to_string())
+            .parse()
+            .unwrap_or(r.pool);
+        (m, pool)
     } else {
         (r.model.clone(), r.pool)
     };
 
-    println!("\n── Summarization ──");
+    println!("\n{}", t.summary_heading());
     let s = Summarization::default();
-    println!(
-        "`extractive` ranks sentences with the embedding model, offline and \
-         free. `openai` is abstractive and sends the text away. `noop` truncates."
+    let sum_provider = prompt_ui::select(
+        t.summarizer_question(),
+        &[
+            Choice::new(
+                "extractive",
+                t.summarizer_extractive(),
+                t.summarizer_extractive_note(),
+            ),
+            Choice::new("openai", t.summarizer_openai(), ""),
+            Choice::new("noop", t.summarizer_noop(), ""),
+        ],
+        0,
     );
-    let sum_provider =
-        ask_line("Summarizer (extractive/openai/noop)", &s.provider).unwrap_or(s.provider.clone());
-    let sum_target = ask_usize("Target length in tokens", s.target_tokens);
-    let require_local = if sum_provider == "extractive" || sum_provider == "noop" {
-        s.require_local
-    } else {
-        println!("`require_local` blocks any provider that sends text off this machine.");
-        ask_bool(
-            "Keep require_local on (this will refuse the provider above)",
-            s.require_local,
-        )
-    };
+    let sum_target = prompt_ui::input(t.target_tokens_question(), &s.target_tokens.to_string())
+        .parse()
+        .unwrap_or(s.target_tokens);
 
-    println!("\n── Language ──");
-    let language = match ask_line("Language for summaries and UI (en/es)", "en") {
-        Some(l) if l.eq_ignore_ascii_case("es") => Some(Language::Es),
-        Some(_) => Some(Language::En),
-        None => None,
-    };
-
-    println!("\nOffline mode decides whether a missing model may be downloaded.");
-    let offline = match ask_line("Offline (auto/true/false)", "auto") {
-        Some(o) if o.eq_ignore_ascii_case("true") => Some(Offline::True),
-        Some(o) if o.eq_ignore_ascii_case("false") => Some(Offline::False),
-        Some(_) => Some(Offline::Auto),
-        None => None,
+    let offline = match prompt_ui::select(
+        t.offline_question(),
+        &[
+            Choice::new("auto", t.offline_auto(), ""),
+            Choice::new("true", t.offline_never(), ""),
+            Choice::new("false", t.offline_always(), ""),
+        ],
+        0,
+    )
+    .as_str()
+    {
+        "true" => Some(Offline::True),
+        "false" => Some(Offline::False),
+        _ => Some(Offline::Auto),
     };
 
     Ok(Answers {
@@ -216,7 +214,7 @@ pub fn ask(
         model,
         state_dir,
         group,
-        language,
+        language: Some(lang),
         offline,
         storage: Some(Storage {
             db_path: String::new(),
@@ -233,7 +231,7 @@ pub fn ask(
         }),
         summarization: Some(Summarization {
             provider: sum_provider,
-            require_local,
+            require_local: s.require_local,
             target_tokens: sum_target,
             model: s.model,
         }),
@@ -247,12 +245,17 @@ pub fn ask(
 /// setting omitted because it kept its default is exactly the kind that gets
 /// discovered months later.
 pub fn summary(name: &str, a: &Answers, model: &str) -> String {
+    let t = Text::new(a.language.unwrap_or_default());
     if let Some(src) = &a.copy_from {
-        return format!("  project   {name}\n  config    copied from `{src}`");
+        return format!(
+            "  {} {name}\n  config   {} `{src}`",
+            t.label_project(),
+            t.copied_from()
+        );
     }
     let group = match &a.group {
-        Some(g) => format!("{g}  → memories shared with that product's repositories"),
-        None => "none".to_string(),
+        Some(g) => format!("{g}  {}", t.shared_with_group()),
+        None => t.none().to_string(),
     };
     let index = match &a.state_dir {
         Some(d) => d.clone(),
@@ -262,40 +265,47 @@ pub fn summary(name: &str, a: &Answers, model: &str) -> String {
     let rr = a.reranking.clone().unwrap_or_default();
     let sm = a.summarization.clone().unwrap_or_default();
     let ix = a.indexing.clone().unwrap_or_default();
-    let tiers = match &a.group {
-        Some(g) => {
-            format!(
-                "local → this repository · group ({g}) → central store · global → central store"
-            )
-        }
-        None => "local → this repository · global → central store".to_string(),
+    let tiers = if a.group.is_some() {
+        t.tiers_with_group()
+    } else {
+        t.tiers_without_group()
     };
     let exclude = if ix.exclude.is_empty() {
-        "none".to_string()
+        t.none().to_string()
     } else {
         ix.exclude.join(", ")
     };
     let rerank = if rr.enabled {
         format!("{} (pool {})", rr.model, rr.pool)
     } else {
-        "off".to_string()
+        t.off().to_string()
     };
+    let onoff = |b: bool| if b { t.on() } else { t.off() };
     format!(
-        "  project   {name}\n  \
-         group     {group}\n  \
-         model     {model}\n  \
-         index     {index}\n  \
-         hnsw      {} ({})\n  \
-         keyword   {}\n  \
-         exclude   {exclude}\n  \
-         rerank    {rerank}\n  \
-         summary   {} · {} tokens\n  \
-         memories  {tiers}",
-        if st.hnsw { "on" } else { "off" },
+        "  {} {name}\n  \
+         {} {group}\n  \
+         {} {model}\n  \
+         {} {index}\n  \
+         hnsw     {} ({})\n  \
+         {} {}\n  \
+         {} {exclude}\n  \
+         {} {rerank}\n  \
+         {} {} · {} tokens\n  \
+         {} {tiers}",
+        t.label_project(),
+        t.label_group(),
+        t.label_model(),
+        t.label_index(),
+        onoff(st.hnsw),
         st.metric,
-        if st.fts { "on" } else { "off" },
+        t.label_keyword(),
+        onoff(st.fts),
+        t.label_exclude(),
+        t.label_rerank(),
+        t.label_summary(),
         sm.provider,
         sm.target_tokens,
+        t.label_memories(),
     )
 }
 
@@ -303,17 +313,12 @@ pub fn summary(name: &str, a: &Answers, model: &str) -> String {
 ///
 /// `true` without a terminal: there is nobody to ask, and the caller asked for
 /// this by running the command.
-pub fn confirm() -> bool {
+pub fn confirm(lang: Language) -> bool {
     if !std::io::stdin().is_terminal() {
         return true;
     }
-    print!("\nWrite this? [Y/n]: ");
-    std::io::stdout().flush().ok();
-    let mut s = String::new();
-    if std::io::stdin().read_line(&mut s).is_err() {
-        return true;
-    }
-    !matches!(s.trim().to_ascii_lowercase().as_str(), "n" | "no")
+    let t = Text::new(lang);
+    prompt_ui::confirm(t.write_question(), true, t.write_yes(), t.write_no())
 }
 
 #[cfg(test)]
@@ -377,17 +382,20 @@ mod tests {
         assert!(!s.contains("rerank"), "nothing here was chosen: {s}");
     }
 
-    /// Groups are offered from what exists, so joining one is a choice from a
-    /// list rather than a name that has to be remembered exactly.
+    /// The summary follows the language that was chosen. Answering in Spanish
+    /// and being shown an English summary would leave the choice looking
+    /// ignored at the one moment it is being checked.
     #[test]
-    fn known_groups_are_offered() {
-        let s = groups_line(&[("REVFA".to_string(), 4)]);
-        assert!(s.contains("REVFA"), "{s}");
-        assert!(s.contains('4'), "{s}");
-        assert!(
-            groups_line(&[]).is_empty(),
-            "nothing to offer on a fresh machine"
-        );
+    fn the_summary_is_written_in_the_chosen_language() {
+        let a = Answers {
+            language: Some(Language::Es),
+            group: Some("REVFA".into()),
+            ..Default::default()
+        };
+        let s = summary("demo", &a, "ml-granite");
+        assert!(s.contains("memorias"), "{s}");
+        assert!(s.contains("compartidas"), "{s}");
+        assert!(!s.contains("shared with"), "{s}");
     }
 
     /// A named directory replaces the default line entirely: showing both would
