@@ -155,8 +155,10 @@ Dos cosas que entender antes de encenderlo:
   con modelo chico y rápido, o pool corto con modelo grande. Profundo *y* grande
   es inusable.
 
-El pool por defecto es 20. `--no-rerank` lo desactiva para una búsqueda sin
-importar la configuración.
+El `reranking.pool` por defecto es 100. Cuando no corre ningún reranker, el
+recuperador trae un pool corto de 20 en su lugar — una búsqueda más profunda se
+tiraría sin reordenamiento. `--no-rerank` desactiva el reranking para una
+búsqueda sin importar la configuración.
 
 Rerankers incluidos: `bge-base` (default), `bge-v2-m3` (multilingüe),
 `jina-turbo` (el más rápido). Poné `reranking.model_dir` para cargar tu propio
@@ -165,8 +167,13 @@ los incluidos pasan todos del gigabyte.
 
 ## Modelos de embedding
 
-`devctx models` lista lo disponible. El default actual para proyectos nuevos es
-`ml-granite` (384 dimensiones, multilingüe, la mejor recuperación en CPU).
+`devctx models` lista lo disponible. El default que viene es `minilm-l6` (384
+dimensiones, inglés). Para código que no está en inglés, `ml-granite` (384,
+multilingüe) midió mejor en CPU.
+
+El asterisco en `devctx models` marca lo que *esta máquina* está configurada
+para darle a los proyectos nuevos, que podés cambiar en la config central — no
+lo que viene de fábrica.
 
 **Elegí antes del primer índice.** Cambiar el modelo después significa
 re-indexar cada archivo y re-embeber cada memoria, porque los vectores de dos

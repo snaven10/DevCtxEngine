@@ -146,8 +146,9 @@ re-embedded, memories included.
   exists**, rather than failing.
 
 Reranking is optional and off by default. The candidate pool is
-`max(limit, reranker.pool, 20)`; the pool is both the ceiling on what reranking
-can fix and the entirety of its cost. Any reranker failure degrades to retriever
+`max(limit, reranker.pool, 20)` — `reranking.pool` defaults to 100, and 20 is
+the floor used when no reranker runs. The pool is both the ceiling on what
+reranking can fix and the entirety of its cost. Any reranker failure degrades to retriever
 order.
 
 ### Memory recall

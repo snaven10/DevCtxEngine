@@ -149,8 +149,10 @@ Two things to understand before turning it on:
   two orders of magnitude, and pool size multiplies it. Deep pool with a small
   fast model, or shallow pool with a large one. Deep *and* large is unusable.
 
-The default pool is 20. `--no-rerank` disables it for one search regardless of
-config.
+The default `reranking.pool` is 100. When no reranker runs, the retriever
+fetches a shallow pool of 20 instead — a deeper fetch would be thrown away
+without reordering. `--no-rerank` disables reranking for one search regardless
+of config.
 
 Built-in rerankers: `bge-base` (default), `bge-v2-m3` (multilingual),
 `jina-turbo` (fastest). Set `reranking.model_dir` to load your own ONNX
@@ -159,8 +161,12 @@ built-ins are all over a gigabyte.
 
 ## Embedding models
 
-`devctx models` lists what is available. The current default for new projects is
-`ml-granite` (384 dimensions, multilingual, best recall on CPU).
+`devctx models` lists what is available. The shipped default is `minilm-l6`
+(384 dimensions, English). For non-English code, `ml-granite` (384,
+multilingual) measured best on CPU.
+
+The asterisk in `devctx models` marks what *this machine* is configured to give
+new projects, which you can change in the central config — not what ships.
 
 **Choose before your first index.** Changing the model afterwards means
 re-indexing every file and re-embedding every memory, because vectors from two

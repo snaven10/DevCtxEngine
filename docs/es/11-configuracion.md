@@ -17,6 +17,7 @@ funciona desde cualquier subdirectorio.
 project:
   name: miproy                 # el nombre por el que los agentes se refieren a él
   path: /home/tu/code/miproy   # raíz absoluta del repositorio
+  group: ''                    # repos de un mismo producto que comparten memorias
 
 state_dir: ''                  # vacío => .devctx/state/ dentro del repo
 language: en                   # en | es — idioma de la UI y los resúmenes
@@ -29,15 +30,19 @@ embeddings:
 
 storage:
   db_path: ''                  # vacío => {state_dir}/index.duckdb
-  hnsw: false                  # índice vectorial aproximado (requiere la extensión VSS)
+  hnsw: true                   # índice vectorial aproximado (requiere la extensión VSS)
+  metric: cosine               # cosine | ip — ip exige vectores normalizados
   fts: false                   # índice BM25 de palabras clave (requiere la extensión FTS)
 
 indexing:
   exclude: []                  # patrones estilo .gitignore; ver docs/13
+  branches: []                 # ramas rastreadas; vacío => la que esté en checkout
 
 reranking:
-  enabled: true
-  model: bge-base              # bge-base | bge-v2-m3 (multilingüe)
+  enabled: false               # opt-in; ver docs/08 ADR-15 para las mediciones
+  model: bge-base              # bge-base | bge-v2-m3 | jina-turbo | custom
+  model_dir: ''                # tu propio cross-encoder ONNX
+  pool: 100                    # candidatos que ve el cross-encoder
 
 summarization:
   provider: extractive         # extractive | openai | noop
@@ -72,7 +77,7 @@ defaults:                # lo que `projects add --init` escribe en un proyecto n
     provider: local
     model: minilm-l6
   reranking:
-    enabled: true
+    enabled: false      # opt-in; ver ADR-15 para las mediciones
     model: bge-base
 reindex:
   every_seconds: 0       # barrido en segundo plano; 0 = apagado
@@ -100,9 +105,34 @@ la copia del registro.
 | `DEVCTX_MODEL_DIR` | Directorio de un modelo ONNX propio. `embeddings.model_dir` manda sobre ella. |
 | `DEVCTX_EMBED_ENDPOINT` | URL base para el provider de embeddings `custom`. |
 | `DEVCTX_EMBED_DIMENSION` | Ancho de vector para el provider `custom`, que no está en el registro. |
+| `DEVCTX_EMBED_MAX_CHARS` | Caracteres por texto que se le pasa al encoder. Default `4096`; `0` lo desactiva. Bajalo (ej. `2048`) en una máquina justa — ataca el relleno del lote, que es de donde viene el pico de memoria. |
+| `DEVCTX_EMBED_BATCH_SIZE` | Textos por lote del encoder. Default `32`. |
+| `DEVCTX_DB_MEMORY_LIMIT` | Presupuesto de memoria de DuckDB por proceso, cualquier literal de tamaño de DuckDB. Default `2GB`. |
+| `DEVCTX_DB_THREADS` | Hilos de trabajo de DuckDB. Default `4`. |
+| `DEVCTX_MODEL_IDLE_SECS` | Cuánto se mantiene cargado un modelo sin uso. Default `300`; `0` lo mantiene mientras viva el proceso. |
+| `DEVCTX_MAX_OUTPUT_TOKENS` | Tope de un `read_file` completo sin rango de líneas. Default `8000`; `0` lo desactiva. |
+| `DEVCTX_NO_UPDATE_CHECK` | Optar por no hacer la verificación de releases en segundo plano. |
+| `DEVCTX_LANG` | Idioma del resumen agrupado de `--help` (`en` / `es`). |
 | `OPENAI_API_KEY` / `VOYAGE_API_KEY` | Credenciales de los providers de embeddings por API. |
 
 Se respetan `$XDG_DATA_HOME` y `$XDG_CONFIG_HOME` si están definidas.
+
+### Por qué existen los límites de la base
+
+DuckDB por defecto toma el 80% de la memoria del sistema. Eso es correcto para
+un proceso en una máquina y está mal acá, porque cada proyecto tiene su propio
+store: tres servidores en una laptop de 16 GB son 38 GB de intención, y el OOM
+killer del kernel llega mucho antes de que DuckDB sienta presión.
+
+Peor: ese killer no elige al proceso glotón — elige el `oom_score` más alto, que
+en una sesión systemd suele ser los servicios de escritorio del propio usuario.
+El síntoma visible es un panel muerto y ventanas cerradas, no una consulta
+lenta. Un presupuesto modesto por proceso cuesta un volcado a disco en las
+consultas más grandes y compra una máquina que sigue usable.
+
+`DEVCTX_UPDATE_AVAILABLE` también existe, pero la pone el CLI *para* sus propios
+subprocesos, no vos.
+
 
 ## 4. Registrarlo en un cliente de IA
 

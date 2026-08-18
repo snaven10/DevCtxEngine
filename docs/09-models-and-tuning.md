@@ -31,7 +31,7 @@ devctx models
 | `bge-base` | 768 | English | Best English precision; 768-wide, so a larger store |
 | `ml-minilm` | 384 | 50+ | Fast multilingual, no files to fetch |
 | `ml-mpnet` | 768 | 50+ | 768-wide; **128-token input cap** |
-| `ml-granite` | 384 | multilingual | **Default for new projects.** Best multilingual on CPU: top recall, fastest indexing |
+| `ml-granite` | 384 | multilingual | **Recommended for non-English code.** Best multilingual on CPU: top recall, fastest indexing |
 | `ml-granite-lg` | 768 | multilingual | 768-wide sibling; `ml-granite` matches it on CPU |
 
 ### How to choose
@@ -65,7 +65,7 @@ fetches nothing.
 ```yaml
 embeddings:
   provider: local        # local (default) | openai | voyage | custom
-  model: ml-granite
+  model: ml-granite        # registry key; ships as minilm-l6
   model_dir: ""          # a directory holding your own ONNX model
   offline: auto          # auto (default) | true | false
 ```
@@ -135,7 +135,7 @@ reranking:
   enabled: false        # off by default
   model: bge-base       # bge-base | bge-v2-m3 | jina-turbo | custom
   model_dir: ""
-  pool: 20
+  pool: 100
 ```
 
 Off by default because it was measured: 30 ms → 8.6 s at best, 30 s with
