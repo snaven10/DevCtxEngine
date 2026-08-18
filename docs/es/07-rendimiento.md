@@ -1,215 +1,205 @@
-> 🌐 [English version](../07-performance.md)
-
 # Rendimiento
 
-> **Nota — parte de esta página es anterior a la reescritura en Rust.** Las
-> cifras y la configuración de abajo se midieron sobre la implementación previa
-> en Go + Python, que ya no existe: parseo, chunking, embeddings y reranking
-> corren ahora en proceso, y las variables `DEVAI_*` que aquí se nombran nunca se
-> portaron. Toma los números como no verificados hasta volver a medirlos.
-> Referencias actuales: [Arquitectura](02-arquitectura.md),
-> [Configuración](11-configuracion.md).
+> 🇬🇧 [Read in English](../07-performance.md)
 
-Este documento cubre qué podés esperar de DevAI en términos de velocidad, uso de recursos y cómo optimizar para tu carga de trabajo.
+Qué cuesta qué, cuáles cifras se midieron de verdad, y cómo medir las tuyas.
 
 ---
 
-## Rendimiento de Indexación
+## Leé esto primero
 
-### Qué Afecta la Velocidad de Indexación
+Cada número de esta página se midió en una sola máquina de desarrollo — una caja
+WSL2 solo-CPU — contra repositorios reales. **Son órdenes de magnitud, no
+garantías.** Donde una cifra no se midió, esta página lo dice en vez de
+estimarla.
 
-Tres factores dominan:
+Lo único que generaliza: **el embedding domina el indexado, y todo lo demás es
+ruido al lado.** Optimizá la cantidad de fragmentos que embebés y ya optimizaste
+el indexado.
 
-1. **Tamaño del repositorio** — Más archivos significa más parseo, chunking y embedding. Relación lineal.
-2. **Mix de lenguajes** — La velocidad de parseo de tree-sitter varía según la complejidad de la gramática. Las gramáticas de TypeScript/TSX son más pesadas que las de Go o Python. Importa a escala (10K+ archivos).
-3. **Proveedor de embeddings** — El cuello de botella. Los embeddings locales son CPU-bound. Los embeddings por API son network-bound.
+## Indexado
 
-### Benchmarks de Throughput
+### Qué maneja el costo
 
-| Proveedor | Velocidad | Notas |
-|----------|-------|-------|
-| Local (minilm-l6-v2) | ~100-500 archivos/minuto | Depende del CPU. Más rápido en máquinas con soporte AVX2. |
-| OpenAI API | ~200-1000 archivos/minuto | Network-bound. Los rate limits pueden limitar. |
-| Local con GPU | ~500-2000 archivos/minuto | Si PyTorch detecta CUDA/MPS. |
+En orden descendente de impacto:
 
-Estos son aproximados. "Archivos por minuto" varía según el tamaño del archivo y la cantidad de chunks — un archivo Go de 50 líneas produce 1-2 chunks, un componente React de 500 líneas produce 10-15.
+1. **Fragmentos embebidos.** Es todo el juego.
+2. **Si el índice HNSW está presente durante la carga.** Ver abajo — pesa más de
+   lo que la mayoría espera.
+3. **Ancho del modelo.** Un modelo de 768 dimensiones es aproximadamente el
+   doble de trabajo vectorial y el doble de almacenamiento que uno de 384.
+4. Parseo y chunking. Reales, pero chicos.
 
-### Indexación Incremental vs Completa
+### El efecto HNSW
 
-**La indexación incremental** (predeterminada) procesa solo los archivos que cambiaron desde el último índice, determinado por `git diff`. Para un commit típico que toca 5-20 archivos, la indexación se completa en segundos.
+DuckDB mantiene un índice HNSW en cada insert. Medido en un backend Java de
+~1,300 archivos, misma máquina, misma forma de corrida:
 
-**Una reindexación completa** se dispara por:
-- Primer índice de un repositorio
-- Cambio de modelo de embedding (las dimensiones del vector difieren)
-- Solicitud explícita del usuario (`devai index --full`)
-- Vector store corrupto o eliminado
+| Índice durante la carga | Rendimiento |
+|---|---|
+| HNSW presente | ~7 archivos/min |
+| HNSW eliminado, reconstruido después | ~58 archivos/min |
 
-La indexación incremental es la funcionalidad de rendimiento más importante. Es lo que hace que DevAI sea práctico para uso continuo durante el desarrollo.
+Una diferencia de 8×. Por eso el indexado tira los índices derivados y los
+reconstruye al final, y por eso no deberías construir un índice HNSW y después
+cargarle datos en masa.
 
----
+### Incremental vs completo
 
-## Rendimiento de Búsqueda
+El indexado incremental es la característica de rendimiento más importante,
+porque el caso común es un puñado de archivos cambiados, no el repositorio.
 
-Todos los benchmarks a continuación son para almacenamiento local (LanceDB + SQLite). Los stores conectados por red (Qdrant) agregan latencia.
+```bash
+devctx index              # incremental: solo lo que git dice que cambió
+devctx index --full       # todo
+devctx index --branch x   # una rama concreta
+```
 
-### Búsqueda Vectorial
+Un fragmento cuyo `content_hash` no cambió no se vuelve a embeber, así que una
+corrida incremental sobre un commit que toca tres archivos cuesta tres archivos
+de embedding, no el repositorio.
 
-- **Latencia típica**: <100ms para repos de hasta 100K chunks
-- **Cómo funciona**: El texto de consulta se transforma en embedding, luego se ejecuta una búsqueda de vecinos más cercanos aproximada contra el vector store
-- **Escalamiento**: LanceDB usa indexación IVF. El rendimiento degrada gradualmente — un repo de 500K chunks podría tener consultas de 150-200ms
-- **Arranque en frío**: La primera consulta después de iniciar el proceso puede ser más lenta (carga del índice). Las consultas subsiguientes se benefician de índices cacheados.
+**El indexado lee el árbol de trabajo, no el último commit.** `--full` no
+descarta el trabajo sin commitear.
 
-### Consultas de Grafo
+### Multi-rama
 
-- **Latencia típica**: <50ms
-- **Cómo funciona**: SQLite con columnas indexadas para nombres de símbolos, rutas de archivos y tipos de relación
-- **Caso de uso**: "¿Qué llama a esta función?", "¿Qué importa este módulo?", "Mostrá la jerarquía de clases"
-- **Escalamiento**: SQLite maneja millones de aristas sin problema. El grafo es disperso en relación al vector store.
+Indexar una segunda rama es mucho más barato que indexar un repositorio, porque
+el mismo hashing de contenido que abarata las corridas incrementales hace que
+las ramas compartan filas. Medido en tres repositorios:
 
-### Búsqueda de Memoria
+| Tamaño del repositorio | Archivos | Copiados en vez de embebidos |
+|---|---|---|
+| ~1,400 archivos (TypeScript) | 1,406 | 1,343 (96%) |
+| ~1,300 archivos (Java) | 1,297 | 1,251 (96%) |
+| ~150 archivos (Java) | 153 | 146 (95%) |
 
-- **Latencia típica**: <200ms
-- **Cómo funciona**: Búsqueda híbrida combinando similitud semántica (vector) con filtrado de metadata (tipo, proyecto, alcance)
-- **Por qué más lenta**: Dos etapas — búsqueda vectorial para candidatos, luego filtrado de metadata y ranking
+Así que el costo marginal de una segunda rama declarada ronda el 4–5% de un
+índice completo, no el 100%.
 
-### build_context (Agregado)
+## Búsqueda
 
-- **Latencia típica**: 200-500ms
-- **Cómo funciona**: Ejecuta búsqueda vectorial + recorrido de grafo + búsqueda de memoria en paralelo, luego combina y rankea resultados
-- **Esta es la herramienta que más usan los agentes.** Está optimizada para consumo por agentes — retorna contexto formateado, no resultados crudos.
+Medido en este repositorio (128 archivos, 2,333 fragmentos, modelo de 384
+dimensiones):
 
----
+| Configuración | Latencia | Memoria residente |
+|---|---|---|
+| Búsqueda vectorial, sin reranking | ~30 ms | ~406 MB |
+| Con el cross-encoder más barato | ~8.6 s | ~2.4 GB |
+| Con `bge-reranker-base` | ~30 s | ~3.4 GB |
+
+El reranking está apagado por defecto por esta tabla, y porque el único modelo
+medido contra todo el banco empeoró los resultados — bajó una respuesta correcta
+del primer puesto al vigésimo primero. Ver
+[Decisiones de diseño ADR-15](08-decisiones-de-diseno.md).
+
+La búsqueda por palabra clave (BM25) y la híbrida no se midieron por separado.
+La híbrida corre los dos recuperadores, así que tratala como al menos el costo
+del camino vectorial.
 
 ## Almacenamiento
 
-### Costos Por Chunk
+Cifras reales del store de este repositorio:
 
-| Componente | Tamaño por chunk | Qué almacena |
-|-----------|---------------|----------------|
-| Embedding vectorial | ~768 bytes (384 dims x float16) | Representación semántica |
-| Metadata | ~200-500 bytes | Ruta de archivo, nombre de símbolo, rango de líneas, lenguaje |
-| Contenido | ~200-2000 bytes | Texto de código fuente crudo |
-| **Total por chunk** | **~1KB promedio** | |
+| Cantidad | Valor |
+|---|---|
+| Archivos indexados | 128 |
+| Fragmentos | 2,333 |
+| Símbolos | 1,599 |
+| Store en disco | 17 MB |
 
-### Tamaños Típicos de Repositorio
+Lo que da aproximadamente **18 fragmentos por archivo** y **~7 KB por
+fragmento** a 384 dimensiones. Un vector `f32` de 384 dimensiones son 1.5 KB de
+eso; el resto es texto del fragmento, filas del grafo y estructuras de índice.
 
-| Tamaño del repo | Chunks estimados | Tamaño del vector store | SQLite (grafo + memoria) |
-|-----------|-----------------|-------------------|------------------------|
-| 1K archivos | ~5K chunks | ~5MB | ~2MB |
-| 10K archivos | ~50K chunks | ~50MB | ~10MB |
-| 50K archivos | ~250K chunks | ~250MB | ~40MB |
-| 100K archivos | ~500K chunks | ~500MB | ~80MB |
+Duplicar el ancho del modelo duplica aproximadamente la porción vectorial. No
+duplica el texto.
 
-Estas son estimaciones aproximadas. Los números reales dependen del tamaño de los archivos y el lenguaje (un codebase en Go produce menos chunks por archivo que un codebase React con JSX).
+### Dónde vive
 
-### Ubicación de Almacenamiento
+| Ruta | Guarda |
+|---|---|
+| `.devctx/` en el repositorio | El índice y la configuración de ese proyecto |
+| `~/.local/share/devctx/` | Registro de proyectos, memorias globales y de grupo, archivos de modelos |
 
-Por defecto, DevAI almacena datos en `.devai/` dentro de la raíz del repositorio. Este directorio debería agregarse a `.gitignore`.
+`.devctx/` debería estar en `.gitignore`. El directorio central también guarda
+los archivos de modelos descargados, que suele ser la mayor parte de su tamaño —
+verificá antes de suponer que tus memorias son grandes.
 
-```
-.devai/
-  vectors/     # Archivos de LanceDB
-  graph.db     # SQLite — grafo de código
-  memory.db    # SQLite — memorias persistentes
-  config.yaml  # Configuración específica del repositorio
-```
+## Ajuste
 
----
+### Excluí lo que nunca preguntarías
 
-## Tips de Optimización
-
-### Usá Indexación Incremental
-
-Está activada por defecto. No la desactives. Si te encontrás corriendo reindexaciones completas frecuentemente, algo anda mal — abrí un issue.
-
-### Excluí Archivos Generados
-
-Los archivos generados grandes (bundles, salida compilada, directorios de vendor) desperdician tiempo de indexación y contaminan los resultados de búsqueda. Configurá exclusiones:
+El ajuste de mayor apalancamiento, porque elimina fragmentos en vez de
+abaratarlos.
 
 ```yaml
-# config.yaml
 indexing:
   exclude:
-    - "vendor/**"
-    - "dist/**"
-    - "node_modules/**"
-    - "*.min.js"
-    - "*.generated.go"
-    - "*.pb.go"
+    - "**/node_modules/**"
+    - "**/target/**"
+    - "**/dist/**"
+    - "**/*.min.js"
+    - "**/*.lock"
 ```
 
-DevAI respeta `.gitignore` por defecto, pero las exclusiones explícitas en la configuración te dan control más fino.
+`.gitignore` se aplica primero y es la herramienta gruesa; `exclude` es para lo
+que git sí rastrea pero vos nunca preguntás — código vendorizado, clientes
+generados, fixtures.
 
-### Elegí el Proveedor de Embeddings Correcto
+**Caveat conocido:** cambiar `exclude` entre corridas no se refleja en el hash de
+contenido, así que la deduplicación de copia por rama puede arrastrar filas que
+las nuevas exclusiones habrían descartado. Corré `devctx index --full` después de
+cambiarlo.
 
-| Escenario | Recomendado | Por qué |
-|----------|-------------|-----|
-| Desarrollo local, sensible a privacidad | `local` (minilm-l6) | Sin red, suficientemente rápido, buena calidad para código |
-| Índice inicial grande (50K+ archivos) | `local` con GPU | El embedding por lotes aprovecha bien la GPU |
-| Índice compartido del equipo | `openai` o API compatible | Resultados consistentes entre máquinas |
-| Entorno air-gapped | `local` | Única opción, funciona bien |
+### Elegí el modelo una sola vez
 
-### Modo Watch
+Los modelos de 384 dimensiones indexan más rápido y ocupan menos. El default
+para proyectos nuevos es `ml-granite` (384, multilingüe), que en CPU midió mejor
+tanto en recuperación como en velocidad de indexado entre las opciones
+multilingües.
 
-Para el ciclo de feedback más rápido, usá el modo watch. DevAI monitorea cambios de archivos y re-indexa automáticamente:
+Cambiar el modelo después de indexar significa re-indexar cada archivo *y*
+re-embeber cada memoria, porque los vectores de dos modelos no son comparables.
+Elegí antes del primer índice.
+
+### Mantené el índice fresco barato
 
 ```bash
-devai watch
+devctx hooks install     # re-indexa al commitear; no cuesta nada en reposo
+devctx watch             # re-indexa al guardar; un proceso, pero inmediato
 ```
 
-Esto re-indexa archivos individuales al guardar. Latencia desde guardar hasta que sea buscable: típicamente 1-3 segundos.
+El hook es la automatización más barata que funciona. Ver
+[Mantener el índice al día](13-mantener-el-indice-al-dia.md) para las cuatro
+opciones.
 
-### Batch vs Streaming
+## Uso de recursos
 
-Al indexar, DevAI agrupa las solicitudes de embedding en lotes (tamaño de lote predeterminado: 32 textos). Si estás viendo errores de OOM durante la indexación:
-- Reducí el tamaño del lote en la configuración
-- Asegurate de no estar indexando archivos generados masivos
-- Verificá que los patrones de exclusión estén funcionando
+**Un solo proceso.** Parseo, chunking, embeddings y reranking son Rust en
+proceso — no hay sidecar sosteniendo una segunda copia de nada, ni límite de
+serialización entre etapas.
 
----
+La memoria residente la domina el modelo cargado. La cifra de ~406 MB de arriba
+es un modelo de embeddings de 384 dimensiones más el store; habilitar un
+cross-encoder agrega gigabytes, que es la razón real de que venga apagado.
 
-## Uso de Recursos
+**Solo-CPU es el caso asumido.** Nada de acá requiere GPU.
 
-### Servicio ML de Python
+**Red:** solo descargas de modelos en el primer uso, y solo para modelos cuyos
+archivos no estén ya presentes. `devctx models` muestra cuáles aplican. Con un
+proveedor de embeddings local, indexar y buscar no hacen llamadas de red.
 
-| Estado | RAM | CPU | Notas |
-|-------|-----|-----|-------|
-| Idle (modelo cargado) | ~200MB | Casi cero | El modelo se mantiene en memoria para consultas rápidas |
-| Indexando (embed por lotes) | ~400-800MB | Alto (1-2 cores) | Picos durante lotes de embedding |
-| Consulta de búsqueda | ~250MB | Pico breve | Embedding de la consulta + búsqueda |
-| Arranque en frío | ~150MB -> 200MB | Moderado | La carga del modelo toma 2-5 segundos |
+## Medir lo tuyo
 
-### Proceso Go
+```bash
+devctx status                  # archivos, fragmentos, símbolos, modelo, frescura
+devctx projects list           # cada repositorio, tamaño y antigüedad del índice
+time devctx index --full       # tu rendimiento de indexado
+time devctx search "..."       # tu latencia de búsqueda
+```
 
-| Estado | RAM | CPU |
-|-------|-----|-----|
-| Idle | ~20MB | Casi cero |
-| Manejando request MCP | ~25-30MB | Pico breve |
-| Inicio | ~15MB | Mínimo |
-
-El proceso Go es liviano por diseño. Es un servidor MCP delgado que reenvía al servicio Python.
-
-### I/O de Disco
-
-- **Indexación**: Escritura intensiva. Upserts de vectores e inserts en SQLite.
-- **Búsqueda**: Lectura intensiva. Escaneo de índice vectorial y consultas SQLite.
-- **SSD fuertemente recomendado.** El rendimiento de LanceDB en discos mecánicos es significativamente peor.
-
-### Red
-
-- **Embeddings locales**: Cero uso de red.
-- **Embeddings por API**: ~1KB por solicitud de embedding, ~3KB de respuesta. Para un repo de 10K archivos, el índice inicial envía ~50K llamadas API (en lotes).
-- **Qdrant (si se usa)**: Llamadas de red por búsqueda/upsert. La latencia depende de la ubicación del deployment.
-
----
-
-## Monitoreo
-
-DevAI loguea el progreso de indexación a stderr. Métricas clave a observar:
-
-- **Archivos procesados / total**: Muestra el progreso de indexación
-- **Chunks creados**: Si es mucho más alto de lo esperado, verificá que no haya archivos grandes colándose entre las exclusiones
-- **Tiempo de embedding**: Si domina, considerá cambiar de proveedor o agregar GPU
-- **Errores/omisiones**: Archivos que fallaron al parsear (generalmente archivos binarios que se colaron en la detección)
-
-Para monitoreo programático, el método JSON-RPC `devai/status` retorna el estado actual de indexación y estadísticas.
+`devctx status` emite JSON, así que es scriptable. Si tus cifras difieren
+salvajemente de esta página, las causas usuales son el ancho del modelo, un
+índice HNSW presente durante una carga masiva, o un repositorio lleno de código
+vendorizado que `exclude` debería estar eliminando.

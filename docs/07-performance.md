@@ -2,213 +2,199 @@
 
 > 🇪🇸 [Leer en español](es/07-rendimiento.md)
 
-> **Note — parts of this page predate the Rust rewrite.** Figures and
-> configuration below were measured against the earlier Go + Python
-> implementation, which no longer exists: parsing, chunking, embedding and
-> reranking now run in-process, and the `DEVAI_*` variables named here were never
-> ported. Treat the numbers as unverified until re-measured. Current references:
-> [Architecture](02-architecture.md), [Configuration](11-configuration.md).
-
-This document covers what to expect from DevAI in terms of speed, resource usage, and how to optimize for your workload.
+What costs what, which figures were actually measured, and how to measure your
+own.
 
 ---
 
-## Indexing Performance
+## Read this first
 
-### What Affects Indexing Speed
+Every number on this page was measured on one developer machine — a CPU-only
+WSL2 box — against real repositories. **They are orders of magnitude, not
+guarantees.** Where a figure was not measured, this page says so rather than
+estimating.
 
-Three factors dominate:
+The one thing that generalises: **embedding dominates indexing, and everything
+else is noise next to it.** Optimise the number of chunks you embed and you have
+optimised indexing.
 
-1. **Repository size** — More files means more parsing, chunking, and embedding. Linear relationship.
-2. **Language mix** — Tree-sitter parsing speed varies by grammar complexity. TypeScript/TSX grammars are heavier than Go or Python. Matters at scale (10K+ files).
-3. **Embedding provider** — The bottleneck. Local embeddings are CPU-bound. API-based embeddings are network-bound.
+## Indexing
 
-### Throughput Benchmarks
+### What drives the cost
 
-| Provider | Speed | Notes |
-|----------|-------|-------|
-| Local (minilm-l6-v2) | ~100-500 files/minute | CPU-dependent. Faster on machines with AVX2 support. |
-| OpenAI API | ~200-1000 files/minute | Network-bound. Rate limits may throttle. |
-| Local with GPU | ~500-2000 files/minute | If PyTorch detects CUDA/MPS. |
+In descending order of impact:
 
-These are approximate. "Files per minute" varies by file size and chunk count — a 50-line Go file produces 1-2 chunks, a 500-line React component produces 10-15.
+1. **Chunks embedded.** The whole game.
+2. **Whether the HNSW index is present during the load.** See below — this is a
+   larger factor than most people expect.
+3. **Model width.** A 768-dimension model is roughly twice the vector work and
+   twice the storage of a 384-dimension one.
+4. Parsing and chunking. Real, but small.
 
-### Incremental vs Full Indexing
+### The HNSW effect
 
-**Incremental indexing** (default) processes only files changed since the last index, determined by `git diff`. For a typical commit touching 5-20 files, indexing completes in seconds.
+DuckDB maintains an HNSW index on every insert. Measured on a ~1,300-file Java
+backend, same machine, same run shape:
 
-**Full reindex** is triggered by:
-- First index of a repository
-- Embedding model change (vector dimensions differ)
-- Explicit user request (`devai index --full`)
-- Corrupted or deleted vector store
+| Index during load | Throughput |
+|---|---|
+| HNSW present | ~7 files/min |
+| HNSW dropped, rebuilt after | ~58 files/min |
 
-Incremental indexing is the single most important performance feature. It makes DevAI practical for continuous use during development.
+An 8× difference. This is why indexing drops the derived indexes and rebuilds
+them at the end, and why you should not build an HNSW index and then bulk-load
+into it.
 
----
+### Incremental vs full
 
-## Search Performance
+Incremental indexing is the single most important performance feature, because
+the common case is a handful of changed files rather than the repository.
 
-All benchmarks below are for local storage (LanceDB + SQLite). Network-attached stores (Qdrant) add latency.
+```bash
+devctx index              # incremental: only what git says changed
+devctx index --full       # everything
+devctx index --branch x   # a named branch
+```
 
-### Vector Search
+A chunk whose `content_hash` is unchanged is not re-embedded, so an incremental
+run over a commit touching three files costs three files' worth of embedding,
+not the repository's.
 
-- **Typical latency**: <100ms for repos up to 100K chunks
-- **How it works**: Query text is embedded, then approximate nearest neighbor search runs against the vector store
-- **Scaling**: LanceDB uses IVF indexing. Performance degrades gracefully — a 500K chunk repo might see 150-200ms queries
-- **Cold start**: First query after process start may be slower (index loading). Subsequent queries benefit from cached indices.
+**Indexing reads the work tree, not the last commit.** `--full` does not discard
+uncommitted work.
 
-### Graph Queries
+### Multi-branch
 
-- **Typical latency**: <50ms
-- **How it works**: SQLite with indexed columns for symbol names, file paths, and relationship types
-- **Use case**: "What calls this function?", "What does this module import?", "Show the class hierarchy"
-- **Scaling**: SQLite handles millions of edges without issue. The graph is sparse relative to the vector store.
+Indexing a second branch is far cheaper than indexing a repository, because the
+same content hashing that makes incremental runs cheap also means branches share
+rows. Measured on three repositories:
 
-### Memory Search
+| Repository size | Files | Copied instead of embedded |
+|---|---|---|
+| ~1,400 files (TypeScript) | 1,406 | 1,343 (96%) |
+| ~1,300 files (Java) | 1,297 | 1,251 (96%) |
+| ~150 files (Java) | 153 | 146 (95%) |
 
-- **Typical latency**: <200ms
-- **How it works**: Hybrid search combining semantic similarity (vector) with metadata filtering (type, project, scope)
-- **Why slower**: Two-stage — vector search for candidates, then metadata filtering and ranking
+So the marginal cost of a second declared branch is roughly 4–5% of a full
+index, not 100%.
 
-### build_context (Aggregated)
+## Search
 
-- **Typical latency**: 200-500ms
-- **How it works**: Runs vector search + graph traversal + memory search in parallel, then merges and ranks results
-- **This is the tool agents use most.** It is optimized for agent consumption — returns formatted context, not raw results.
+Measured on this repository (128 files, 2,333 chunks, 384-dimension model):
 
----
+| Configuration | Latency | Resident memory |
+|---|---|---|
+| Vector search, no reranking | ~30 ms | ~406 MB |
+| With the cheapest cross-encoder | ~8.6 s | ~2.4 GB |
+| With `bge-reranker-base` | ~30 s | ~3.4 GB |
+
+Reranking is off by default because of this table, and because the one model
+measured across the whole bench made results *worse* — it demoted a correct
+answer from first place to twenty-first. See
+[Design Decisions ADR-15](08-design-decisions.md).
+
+Keyword (BM25) and hybrid search were not separately benchmarked. Hybrid runs
+both retrievers, so treat it as at least the cost of the vector path.
 
 ## Storage
 
-### Per-Chunk Costs
+Real figures from this repository's store:
 
-| Component | Size per chunk | What it stores |
-|-----------|---------------|----------------|
-| Vector embedding | ~768 bytes (384 dims x float16) | Semantic representation |
-| Metadata | ~200-500 bytes | File path, symbol name, line range, language |
-| Content | ~200-2000 bytes | Raw source code text |
-| **Total per chunk** | **~1KB average** | |
+| Quantity | Value |
+|---|---|
+| Files indexed | 128 |
+| Chunks | 2,333 |
+| Symbols | 1,599 |
+| Store on disk | 17 MB |
 
-### Typical Repository Sizes
+Which works out to roughly **18 chunks per file** and **~7 KB per chunk** at 384
+dimensions. A 384-dimension `f32` vector is 1.5 KB of that; the rest is chunk
+text, graph rows and index structures.
 
-| Repo size | Estimated chunks | Vector store size | SQLite (graph + memory) |
-|-----------|-----------------|-------------------|------------------------|
-| 1K files | ~5K chunks | ~5MB | ~2MB |
-| 10K files | ~50K chunks | ~50MB | ~10MB |
-| 50K files | ~250K chunks | ~250MB | ~40MB |
-| 100K files | ~500K chunks | ~500MB | ~80MB |
+Doubling the model width roughly doubles the vector portion. It does not double
+the text.
 
-These are rough estimates. Actual numbers depend on file sizes and language (a Go codebase produces fewer chunks per file than a React codebase with JSX).
+### Where it lives
 
-### Storage Location
+| Path | Holds |
+|---|---|
+| `.devctx/` in the repository | That project's index and config |
+| `~/.local/share/devctx/` | Project registry, global and group memories, model files |
 
-By default, DevAI stores data in `.devai/` within the repository root. This directory should be added to `.gitignore`.
+`.devctx/` should be gitignored. The central directory also holds downloaded
+model files, which is usually most of its size — check before assuming your
+memories are large.
 
-```
-.devai/
-  vectors/     # LanceDB files
-  graph.db     # SQLite — code graph
-  memory.db    # SQLite — persistent memories
-  config.yaml  # Repository-specific config
-```
+## Tuning
 
----
+### Exclude what you would never ask about
 
-## Optimization Tips
-
-### Use Incremental Indexing
-
-It is on by default. Do not disable it. If you find yourself running full reindexes frequently, something is wrong — file an issue.
-
-### Exclude Generated Files
-
-Large generated files (bundles, compiled output, vendor directories) waste indexing time and pollute search results. Configure exclusions:
+The highest-leverage setting, because it removes chunks rather than making them
+cheaper.
 
 ```yaml
-# config.yaml
 indexing:
   exclude:
-    - "vendor/**"
-    - "dist/**"
-    - "node_modules/**"
-    - "*.min.js"
-    - "*.generated.go"
-    - "*.pb.go"
+    - "**/node_modules/**"
+    - "**/target/**"
+    - "**/dist/**"
+    - "**/*.min.js"
+    - "**/*.lock"
 ```
 
-DevAI respects `.gitignore` by default, but explicit exclusions in config give you finer control.
+`.gitignore` is applied first and is the coarser tool; `exclude` is for things
+git tracks but you never ask about — vendored code, generated clients, fixtures.
 
-### Choose the Right Embedding Provider
+**Known caveat:** changing `exclude` between runs is not reflected in the
+content hash, so branch-copy dedup can carry over rows the new exclusions would
+have dropped. Run `devctx index --full` after changing it.
 
-| Scenario | Recommended | Why |
-|----------|-------------|-----|
-| Local development, privacy-sensitive | `local` (minilm-l6) | No network, fast enough, good quality for code |
-| Large initial index (50K+ files) | `local` with GPU | Batch embedding is GPU-friendly |
-| Shared team index | `openai` or compatible API | Consistent results across machines |
-| Air-gapped environment | `local` | Only option, works well |
+### Pick the model once
 
-### Watch Mode
+384-dimension models index faster and store smaller. The default for new
+projects is `ml-granite` (384, multilingual), which on CPU measured best on both
+recall and indexing speed of the multilingual options.
 
-For the fastest feedback loop, use watch mode. DevAI monitors file changes and re-indexes automatically:
+Changing the model after indexing means re-indexing every file *and* re-embedding
+every memory, because vectors from two models are not comparable. Choose before
+the first index.
+
+### Keep the index fresh cheaply
 
 ```bash
-devai watch
+devctx hooks install     # re-index on commit; costs nothing when idle
+devctx watch             # re-index on save; a process, but immediate
 ```
 
-This re-indexes individual files on save. Latency from save to searchable: typically 1-3 seconds.
+The hook is the cheapest automation that works. See
+[Keeping the Index Fresh](13-keeping-the-index-fresh.md) for all four options.
 
-### Batch vs Streaming
+## Resource usage
 
-When indexing, DevAI batches embedding requests (default batch size: 32 texts). If you are seeing OOM errors during indexing:
-- Reduce batch size in config
-- Ensure you are not indexing massive generated files
-- Check that exclusion patterns are working
+**One process.** Parsing, chunking, embedding and reranking are in-process
+Rust — there is no sidecar holding a second copy of anything, and no
+serialization boundary between stages.
 
----
+Resident memory is dominated by the loaded model. The ~406 MB figure above is a
+384-dimension embedding model plus the store; enabling a cross-encoder adds
+gigabytes, which is the real reason it defaults off.
 
-## Resource Usage
+**CPU-only is the assumed case.** Nothing here requires a GPU.
 
-### Python ML Service
+**Network:** only model downloads on first use, and only for models whose files
+are not already present. `devctx models` shows which of those apply. With a
+local embedding provider, indexing and search make no network calls.
 
-| State | RAM | CPU | Notes |
-|-------|-----|-----|-------|
-| Idle (model loaded) | ~200MB | Near zero | Model stays in memory for fast queries |
-| Indexing (batch embed) | ~400-800MB | High (1-2 cores) | Spikes during embedding batches |
-| Search query | ~250MB | Brief spike | Embedding the query + search |
-| Cold start | ~150MB → 200MB | Moderate | Model loading takes 2-5 seconds |
+## Measuring your own
 
-### Go Process
+```bash
+devctx status                  # files, chunks, symbols, model, freshness
+devctx projects list           # every repository, size, and index age
+time devctx index --full       # your indexing throughput
+time devctx search "..."       # your search latency
+```
 
-| State | RAM | CPU |
-|-------|-----|-----|
-| Idle | ~20MB | Near zero |
-| Handling MCP request | ~25-30MB | Brief spike |
-| Startup | ~15MB | Minimal |
-
-The Go process is lightweight by design. It is a thin MCP server that forwards to the Python service.
-
-### Disk I/O
-
-- **Indexing**: Write-heavy. Vector upserts and SQLite inserts.
-- **Search**: Read-heavy. Vector index scan and SQLite queries.
-- **SSD strongly recommended.** LanceDB performance on spinning disks is significantly worse.
-
-### Network
-
-- **Local embeddings**: Zero network usage.
-- **API embeddings**: ~1KB per embedding request, ~3KB response. For a 10K file repo, initial index sends ~50K API calls (batched).
-- **Qdrant (if used)**: Network calls per search/upsert. Latency depends on deployment location.
-
----
-
-## Monitoring
-
-DevAI logs indexing progress to stderr. Key metrics to watch:
-
-- **Files processed / total**: Shows indexing progress
-- **Chunks created**: If this is much higher than expected, check for large files slipping through exclusions
-- **Embedding time**: If this dominates, consider switching providers or adding GPU
-- **Errors/skips**: Files that failed to parse (usually binary files that slipped through detection)
-
-For programmatic monitoring, the `devai/status` JSON-RPC method returns current indexing state and statistics.
+`devctx status` emits JSON, so it is scriptable. If your figures differ wildly
+from this page, the usual causes are model width, an HNSW index present during a
+bulk load, or a repository full of vendored code that `exclude` should be
+removing.

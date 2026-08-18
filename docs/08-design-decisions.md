@@ -2,282 +2,231 @@
 
 > 🇪🇸 [Leer en español](es/08-decisiones-de-diseno.md)
 
-> **Note — this page predates the Rust rewrite** and describes the earlier
-> Go + Python implementation. The concepts largely still apply; the commands,
-> file layout and `DEVAI_*` variables do not. Current references:
-> [Architecture](02-architecture.md), [Configuration](11-configuration.md).
-
-Architecture Decision Records (ADRs) for DevAI. Each entry documents what was decided, why, and what tradeoffs were accepted.
-
-Read this if you are a contributor wondering "why is it built this way?" These are the answers.
+Why the system is shaped the way it is. Each entry states the decision, the
+reasoning, and what it costs — decisions without costs are advertising.
 
 ---
 
-## ADR-01: Hybrid Go + Python Architecture
+## ADR-01: One Rust binary, no sidecar
 
-**Decision**: Split DevAI into a Go CLI/MCP server and a Python ML service.
+**Decision.** Parsing, chunking, embedding, reranking, storage and the MCP
+server all live in one process. The only external program invoked is `git`.
 
-**Context**: DevAI needs both high-performance CLI/server capabilities and access to the Python ML ecosystem (tree-sitter, sentence-transformers, LanceDB, PyTorch). No single language covers both well.
+**Why.** The predecessor split the work across two runtimes joined by a JSON-RPC
+bridge over stdio. That bought language-native ML libraries and cost a process
+lifecycle to manage, a serialization boundary on every call, ~880 MB resident
+per client because the sidecar could not be shared, and a class of failure where
+one half was alive and the other was not.
 
-**Options Considered**:
-- **Pure Python**: Simple. Single process. But Python CLIs are slow to start (200-500ms), MCP server would be heavier than necessary, and distribution is painful (virtualenvs, pip dependency hell).
-- **Pure Go**: Fast CLI, easy distribution (single binary). But Go's ML ecosystem is immature — no good tree-sitter bindings, no sentence-transformers equivalent, embedding models would need CGO or external services.
-- **Go + Python hybrid**: Go handles CLI, MCP protocol, and process management. Python handles ML — parsing, embedding, vector search. Communication via JSON-RPC over stdio.
+**Cost.** The Rust ML ecosystem is narrower. Some models exist in Python and not
+here, and ONNX export is sometimes the only path.
 
-**Choice**: Hybrid. Go for the interface layer, Python for the intelligence layer. They communicate over JSON-RPC on stdio pipes.
+## ADR-02: MCP over stdio, no network service
 
-**Tradeoffs**:
-- Two languages to maintain, two build systems
-- Process management complexity (Go must start, monitor, and restart the Python service)
-- Serialization overhead on every call (negligible in practice — JSON-RPC is fast for the payload sizes involved)
-- Contributors need to know both languages
+**Decision.** The MCP server speaks JSON-RPC 2.0 over stdin/stdout. Everything
+else that listens — `api`, `web` — binds to loopback.
 
-**Status**: Current. The split has proven correct — Go gives us fast startup and easy distribution (single binary + Python wheel), Python gives us the entire ML ecosystem.
+**Why.** The client already manages the child process lifecycle, so stdio gets
+process isolation and cleanup for free. There is no port to collide, no
+credential to store, and no authentication to get wrong: the trust boundary is
+the process boundary.
 
----
+**Cost.** One server per client. Remote use is not supported.
 
-## ADR-02: JSON-RPC 2.0 over Stdio
+## ADR-03: DuckDB for everything
 
-**Decision**: Use JSON-RPC 2.0 over stdio pipes for Go-Python communication.
+**Decision.** One embedded database holds vectors, full-text index, symbol
+graph, routes and memories. No separate vector store.
 
-**Context**: The Go process needs to call Python functions and get structured results back. Need a protocol that is simple, low-overhead, and does not require network ports.
+**Why.** The alternative — a vector store beside a relational one — means two
+lifecycles, two backup stories, and no way to filter vectors by a relational
+predicate without pulling both sides into memory. DuckDB does vector search
+(VSS/HNSW), BM25 (FTS) and ordinary SQL over the same rows, so a filtered
+semantic search is one query.
 
-**Options Considered**:
-- **gRPC**: Type-safe, fast binary serialization, streaming support. But requires protobuf compilation, adds build complexity, and is overkill for a local process-to-process channel.
-- **HTTP/REST**: Familiar, debuggable. But requires a port (conflicts possible), HTTP overhead is unnecessary for local IPC, and adds a web server dependency to the Python side.
-- **Embedded Python (CGO)**: No IPC needed — call Python directly from Go. But CGO is fragile, cross-compilation breaks, and Python GIL makes concurrency painful.
-- **JSON-RPC over stdio**: Simple. The Go process spawns Python as a subprocess, writes JSON to stdin, reads JSON from stdout. No ports, no sockets, no service discovery.
+**Cost.** DuckDB allows **one writer per file**. This constraint shapes ADR-04.
 
-**Choice**: JSON-RPC 2.0 over stdio. The protocol is a single-page spec. Implementation is ~100 lines on each side.
+## ADR-04: A long-lived server owns the database
 
-**Tradeoffs**:
-- No streaming (request-response only). Not needed for current use cases.
-- JSON parsing overhead vs binary protocols. Irrelevant — payloads are small, and the real work (embedding, search) dwarfs serialization cost.
-- Debugging requires log inspection (no curl-able endpoint). Acceptable for a local tool.
-- Single connection — no parallel requests over one pipe. Solved by request queuing in the Go client.
+**Decision.** `devctx serve` holds the connection; CLI commands and MCP sessions
+route to it rather than opening the file themselves.
 
-**Status**: Current. Simple, reliable, zero configuration.
+**Why.** Direct consequence of ADR-03. Without an owner, an indexing run and a
+search contend for the same lock and one of them fails.
 
----
+**Cost.** A process to supervise. It is spawned on demand and idles out, and the
+`serve.json` handshake file has to be written and removed carefully — a server
+that deletes the file on its way out can strand a healthy one, which is a bug
+this project has actually shipped and fixed.
 
-## ADR-03: LanceDB as Default Vector Store
+## ADR-05: The WAL must not outlive the process that wrote it
 
-**Decision**: Use LanceDB as the default vector storage backend.
+**Decision.** Every path that ends the server checkpoints first, and so does the
+end of an indexing run.
 
-**Context**: Need a vector database that works locally, requires zero setup, and handles the scale of typical codebases (10K-100K files, 50K-500K chunks).
+**Why.** This is the sharpest edge in the system. DuckDB replays the WAL on
+open, but **a replayed append does not restore the entries of an ART index** —
+the structure behind every `PRIMARY KEY` and `UNIQUE` in the schema. The table
+then holds rows the index has never heard of, and the next `DELETE` touching
+them aborts with *"Failed to delete all rows from index"* and takes the
+connection down permanently. Re-indexing cannot fix it, because re-indexing
+begins by deleting.
 
-**Options Considered**:
-- **ChromaDB**: Popular, Python-native. But adds a heavy dependency (SQLite + DuckDB + its own embedding layer), and had stability issues in early versions. Opinionated about embedding — we want to control that ourselves.
-- **Qdrant**: Production-grade, excellent performance. But requires a running server (Docker or binary). Not suitable as a default for a CLI tool that should work with zero setup. Supported as an optional backend for shared/team use.
-- **FAISS**: Facebook's vector search library. Fast, well-tested. But no persistence out of the box — you manage serialization yourself. No metadata filtering. Low-level.
-- **LanceDB**: Embedded (no server), file-based (easy to inspect/delete/backup), supports metadata filtering, good performance up to millions of vectors. Apache Arrow-based — efficient columnar storage.
+**Cost.** A checkpoint at the end of every run. `devctx repair` exists for
+databases already in that state: it copies each table aside, drops it, recreates
+it from the schema and writes the rows back, so the ART index is rebuilt from
+the data.
 
-**Choice**: LanceDB as default. Qdrant supported as an optional backend for shared deployments.
+## ADR-06: Drop the derived indexes during a bulk load
 
-**Tradeoffs**:
-- LanceDB is younger than FAISS/Qdrant — less battle-tested at extreme scale
-- File-based storage means no concurrent writes from multiple processes (not a problem — DevAI is single-user per repo)
-- Smaller community than ChromaDB (but cleaner API and fewer surprises)
+**Decision.** HNSW and FTS indexes are dropped before a large indexing run and
+rebuilt after.
 
-**Status**: Current. LanceDB has been reliable. The file-based model fits perfectly — `.devai/vectors/` is just files you can delete and rebuild.
+**Why.** DuckDB maintains an HNSW index on **every insert**, which is
+catastrophic during a bulk load — measured at 7 files/minute with the index
+present against 58 files/minute without it, on the same repository. FTS has a
+harder version of the problem: DuckDB cannot maintain an FTS index across row
+deletions on the indexed table, so a re-index that deletes rows aborts outright.
 
----
+**Cost.** A rebuild at the end, and a window during the run where approximate
+search is unavailable.
 
-## ADR-04: SQLite for Structured Data
+## ADR-07: Per-project stores; share only what has no owner
 
-**Decision**: Use SQLite for the code graph and persistent memories.
+**Decision.** Each repository gets its own database. A central store holds only
+the project registry and the memories that are explicitly global or
+group-scoped.
 
-**Context**: Need structured storage for relationships (function calls, imports, class hierarchies) and user memories (decisions, discoveries, session summaries). Must work locally with zero setup.
+**Why.** An earlier design pointed every repository at one database. Per-project
+stores mean re-indexing one repository never blocks another, each may use a
+different embedding model, and no search needs a repository filter to be
+correct.
 
-**Options Considered**:
-- **PostgreSQL**: Full-featured, great for teams. But requires a running server. Absurd for a CLI tool's local data.
-- **In-memory only**: Fastest possible. But data lost on restart — unacceptable for memories, and rebuilding the code graph is expensive.
-- **SQLite**: Embedded, zero-config, single-file database. Handles millions of rows. ACID-compliant. Available everywhere.
+**Cost.** Cross-project search is an explicit call (`search_project`), not a
+default.
 
-**Choice**: SQLite. Two databases: `graph.db` for code relationships, `memory.db` for persistent memories.
+## ADR-08: Branch copies, driven by content hash
 
-**Tradeoffs**:
-- No concurrent writes (WAL mode helps but does not eliminate). Fine — single-user tool.
-- No network access (cannot share a SQLite file across machines easily). Shared deployments use Qdrant for vectors; graph/memory remain local.
-- Schema migrations must be handled manually. Acceptable at current scale.
+**Decision.** Chunks are stored per `(repo, branch)`. Indexing a second branch
+copies rows for files whose content hash matches instead of re-embedding them.
 
-**Status**: Current. SQLite is the right tool for this job. It will remain the default for local storage.
+**Why.** *This reverses an earlier design.* The predecessor used a branch
+overlay: one base index plus a diff. Overlays are elegant and wrong here — every
+read pays a merge, and the merge has to know which side wins for a file touched
+on both. Copies make a read a plain filtered query.
 
----
+Copying is affordable because embedding is the expensive part, not storage, and
+branches share almost all of their content. Measured across three real
+repositories: **95–96% of files copied rather than re-embedded**.
 
-## ADR-05: Deterministic Vector IDs
+**Cost.** Storage grows roughly linearly with declared branches. And a known
+caveat: changing `indexing.exclude` between runs is not reflected in the content
+hash, so dedup can copy rows that the new exclusions would have dropped.
 
-**Decision**: Generate vector IDs deterministically from content identity (file path + chunk range + branch), not randomly.
+## ADR-09: AST-aware chunking, never split a symbol
 
-**Context**: When a file changes, its chunks need to be updated in the vector store. Need to know which existing chunks to replace.
+**Decision.** Chunk boundaries come from tree-sitter parses, at file / class /
+doc / function / block level.
 
-**Options Considered**:
-- **UUIDs**: Simple, no collisions. But you cannot look up "the chunk for lines 10-50 of main.go" without a secondary index. Updates require delete-by-metadata + insert (two operations, race-prone).
-- **Auto-increment**: Even worse — no way to correlate chunks across reindexes.
-- **Deterministic (hash of path + range + branch)**: The same logical chunk always has the same ID. Upsert is a single operation. No orphaned vectors after reindex.
+**Why.** Fixed-window chunking splits a function across two chunks, and neither
+half embeds as the thing the function does. Symbol boundaries are the units
+people ask questions about.
 
-**Choice**: Deterministic IDs. Formula: `hash(repo + file_path + chunk_start + chunk_end + branch)`.
+**Cost.** A grammar per language. Files in unsupported languages fall back to
+raw-text chunks with overlap.
 
-**Tradeoffs**:
-- If chunking boundaries change (e.g., a function grows), old chunk IDs become orphans. Solved by cleanup during incremental reindex.
-- Hash collisions are theoretically possible. SHA-256 truncation makes this negligible.
-- Slightly more complex ID generation vs `uuid4()`. Worth it for clean upsert semantics.
+## ADR-10: Incremental indexing from the git diff, against the work tree
 
-**Status**: Current. This decision eliminates an entire class of data consistency bugs.
+**Decision.** Indexing computes what changed via git, but indexes the **work
+tree**, not the last commit.
 
----
+**Why.** A file you have written but not committed is exactly the code you are
+most likely to ask about.
 
-## ADR-06: Branch Overlay, Not Copies
+**Cost.** Anything git ignores never reaches the index — `.gitignore` is the
+first place to control what gets indexed, which surprises people once.
 
-**Decision**: Handle branches by overlaying branch-specific changes on top of the main index, not by maintaining separate indexes per branch.
+## ADR-11: Memory identity by topic key, falling back to content hash
 
-**Context**: Developers switch branches frequently. Maintaining a full index per branch would multiply storage and indexing time.
+**Decision.** `--topic` upserts. Without it, identity is a hash over normalized
+content.
 
-**Options Considered**:
-- **Per-branch index**: Each branch gets its own complete vector store. Clean isolation. But storage grows linearly with branches, and indexing a new branch means full reindex.
-- **Ignore branches**: Index only the current HEAD. Simple. But switching branches invalidates search results until reindex completes.
-- **Branch overlay**: Maintain one base index (main/default branch). When on a feature branch, overlay changed files on top. Search merges base + overlay results.
+**Why.** Two different failure modes need two different answers. A decision that
+gets revised must replace itself or the store accumulates contradictory
+versions — that is the topic key. An observation saved twice by an eager agent
+must not become two rows — that is the content hash.
 
-**Choice**: Branch overlay. The base index covers the majority of code (unchanged files). Only branch-specific diffs are indexed separately.
+**Cost.** Whoever writes the memory has to decide which case they are in.
 
-**Tradeoffs**:
-- Search merging adds complexity — must handle "file deleted in branch" and "chunk replaced in branch" correctly
-- Stale base index (if main moves ahead) can return slightly outdated results for unchanged files. Acceptable — code search is approximate anyway.
-- Overlay cleanup needed when branches are merged/deleted
+## ADR-12: Global and group memories are re-keyed, not tagged
 
-**Status**: Current. Dramatically reduces storage and makes branch switching near-instant.
+**Decision.** Global rows carry the reserved project `@global`; group rows carry
+`@group:<name>`. The contributing repository survives in `repo`.
 
----
+**Why.** Identity derives from project + content hash. If a global row kept its
+contributing project, the same lesson learned in two repositories would land as
+two rows — dedup failing exactly where sharing matters most.
 
-## ADR-07: AST-Aware Chunking
+**Cost.** `project` is no longer a plain foreign key, and code reading it has to
+know about the reserved values.
 
-**Decision**: Use tree-sitter ASTs to create semantically meaningful chunks, not arbitrary line or token splits.
+## ADR-13: The junction row lives in the project store
 
-**Context**: Code search quality depends heavily on chunk quality. A chunk should be a coherent unit of code — a function, a class method, a type definition. Splitting mid-function destroys semantic meaning.
+**Decision.** A memory↔symbol link is written to the **project** database and
+carries only the memory's id, even when the memory itself lives centrally.
 
-**Options Considered**:
-- **Line-based (fixed N lines)**: Simple. But splits functions in half, mixes unrelated code in one chunk, produces poor embeddings.
-- **Token-based (fixed N tokens)**: Better than lines for embedding models. Same fundamental problem — no awareness of code structure.
-- **File-level (one chunk per file)**: Preserves all context. But large files exceed embedding model limits, and search returns entire files instead of relevant sections.
-- **AST-aware**: Parse the code, identify natural boundaries (functions, classes, blocks), chunk along those boundaries. Each chunk is a complete semantic unit.
+**Why.** The call graph is per-repository; a global memory is not. A memory
+about this repository's `charge()` must be findable from `charge()` regardless
+of which store holds its text. Resolving the id looks locally first, then
+centrally.
 
-**Choice**: AST-aware chunking via tree-sitter. Functions and methods become individual chunks. Classes are split per-method with class context preserved. Top-level code is grouped by logical blocks.
+**Cost.** A lookup indirection. The alternative — copying memory text into every
+project that mentions it — would leave stale copies behind every edit.
 
-**Tradeoffs**:
-- Requires a parser for each language (tree-sitter grammars). Currently 25+ languages supported. Unsupported languages fall back to line-based chunking.
-- Parse errors in broken code can produce poor chunks. Tree-sitter is error-tolerant, so this is rare.
-- More complex than line splitting. Worth it — search quality improvement is dramatic.
-- Chunk sizes vary (a 5-line utility function vs a 200-line method). Large chunks are split at logical sub-boundaries.
+## ADR-14: Link provenance is returned, not hidden
 
-**Status**: Current. This is one of DevAI's core differentiators. AST-aware chunking produces significantly better search results than naive splitting.
+**Decision.** Every memory-by-code result carries `link_sources`: `files-field`,
+`content-mention`, or `inference`.
 
----
+**Why.** The first two mean something connected the memory to the code at write
+time. The third means only that words matched. Collapsing them into one
+"related" flag would present a guess with the same confidence as a fact.
 
-## ADR-08: Incremental Indexing via Git Diff
+**Cost.** Callers have to read a field to know how much to trust a result.
 
-**Decision**: Use `git diff` to determine which files changed, and only reindex those files.
+## ADR-15: Reranking off by default
 
-**Context**: Full reindexing a large repo takes minutes. Developers change a few files per commit. Reindexing everything on every change is wasteful.
+**Decision.** The cross-encoder is disabled unless configured on.
 
-**Options Considered**:
-- **Full reindex every time**: Simple, always correct. But 5-10 minutes for a large repo on every save is unacceptable.
-- **File watcher (fsnotify)**: Real-time, catches every change. But noisy (editor temp files, build artifacts), misses changes made outside the editor, and does not handle branch switches.
-- **Git diff**: Precise. Knows exactly what changed. Works across branch switches (diff between current HEAD and last indexed commit). Handles renames, deletes, and moves correctly.
+**Why.** Measurement, not principle. On this repository a search costs 30 ms and
+406 MB resident; the cheapest cross-encoder takes it to 8.6 s and 2.4 GB, and
+`bge-reranker-base` to 30 s and 3.4 GB. What that buys is reordering a list the
+retriever already had right — and the one model measured across the whole bench
+made it worse, demoting a correct answer from first to twenty-first.
 
-**Choice**: Git diff as the change detection mechanism. The indexer stores the last indexed commit SHA and diffs against it.
+**Cost.** Ordering is retriever ordering. Everything the retrieval stage found
+is still returned.
 
-**Tradeoffs**:
-- Only works in git repos. Non-git directories require full reindex. Acceptable — DevAI is built for development workflows.
-- Uncommitted changes require diffing against the working tree (slightly more complex than commit-to-commit diff). Implemented.
-- Cannot detect changes to files outside the repo (external config, shared libraries). By design — those are not part of the repo.
+## ADR-16: Graceful degradation over hard failure
 
-**Status**: Current. This makes DevAI practical for continuous development use.
+**Decision.** Hybrid search falls back to vector-only when the FTS index is
+absent. Linking is best-effort and returns a count rather than an error.
 
----
+**Why.** These are enrichments. A repository not yet fully indexed must not turn
+a successful `remember` into a failure, and a missing keyword index should
+narrow results rather than break the query.
 
-## ADR-09: Agent-Agnostic MCP Interface
+**Cost.** Silent degradation is a real hazard — it is acceptable here only
+because the degraded result is still correct, just less good. Where truncation
+would be *misleading* rather than merely worse, the system says so instead: see
+`build_context`, which names what did not fit.
 
-**Decision**: Expose DevAI capabilities as MCP (Model Context Protocol) tools, not a custom protocol.
+## ADR-17: `build_context` returns prose
 
-**Context**: DevAI needs to be usable by AI agents (Claude, GPT, Copilot, custom agents). Each agent platform has its own integration mechanism. Building custom integrations for each is unsustainable.
+**Decision.** One tool returns text rather than JSON.
 
-**Options Considered**:
-- **Custom protocol**: Maximum control over the interface. But every agent needs a custom adapter. N agents = N adapters to maintain.
-- **HTTP API**: Universal, any client can call it. But agents need specific tool schemas to know what is available. HTTP is too low-level — you end up building a tool layer on top anyway.
-- **MCP (Model Context Protocol)**: Standardized protocol for exposing tools to AI agents. Agents that support MCP can use DevAI immediately. Schema-first — tools are self-describing.
+**Why.** Its output is meant to be read straight into a model's context. A JSON
+envelope around code and prose spends budget on punctuation and buys structure
+nobody parses.
 
-**Choice**: MCP. DevAI exposes 21 tools via MCP. Any MCP-compatible agent can use them without custom integration code.
-
-**Tradeoffs**:
-- MCP is still evolving — spec changes may require updates
-- Not all agents support MCP yet (but adoption is growing fast)
-- MCP's tool schema is less expressive than a custom TypeScript/Python SDK
-- Agents that do not support MCP need a wrapper (but that wrapper is thinner than a full custom integration)
-
-**Status**: Current. MCP adoption is accelerating. This was the right bet.
-
----
-
-## ADR-10: Memory Deduplication via Content Hashing
-
-**Decision**: Automatically deduplicate memories using content hashing, not manual cleanup.
-
-**Context**: AI agents store memories frequently — session summaries, decisions, discoveries. Without dedup, the memory store fills with near-identical entries. Manual cleanup is unrealistic (agents cannot be trusted to manage their own memory hygiene).
-
-**Options Considered**:
-- **Append-only**: Every `remember` call creates a new entry. Simple. But memory search returns 15 copies of the same decision, drowning useful results.
-- **Manual cleanup**: Rely on the agent or user to delete old memories. Never happens in practice.
-- **Content hash dedup**: Hash the memory content. If a memory with the same hash exists, skip the insert. Combined with topic_key upserts (ADR-12) for evolving topics.
-
-**Choice**: Automatic dedup via content hashing. Same content = same memory, not a duplicate.
-
-**Tradeoffs**:
-- Minor content changes (whitespace, formatting) produce different hashes. Acceptable — semantically different content should be stored.
-- Hash computation adds negligible overhead
-- Cannot store intentionally duplicated content (no valid use case for this)
-
-**Status**: Current. Memory quality improved dramatically after implementing this.
-
----
-
-## ADR-11: Graceful Hybrid Degradation
-
-**Decision**: When the shared backend (Qdrant) is unavailable, degrade gracefully to local-only storage instead of failing.
-
-**Context**: DevAI supports both local (LanceDB/SQLite) and shared (Qdrant) storage. In team setups, the Qdrant server may be temporarily unreachable (network issues, server restart, VPN disconnect).
-
-**Options Considered**:
-- **Fail-fast**: If configured for shared storage and it is unavailable, throw an error. Clear behavior. But blocks the developer — they cannot use DevAI at all until the server is back.
-- **Local-only mode**: Never use shared storage. Simple. But loses the team knowledge sharing that makes shared storage valuable.
-- **Graceful degradation**: Try shared storage. If unavailable, fall back to local. Log a warning. Sync when shared storage comes back.
-
-**Choice**: Graceful degradation. Local always works. Shared is best-effort.
-
-**Tradeoffs**:
-- Stale local data when shared is updated by teammates. Acceptable — code search is approximate.
-- Sync-on-reconnect adds complexity. But the alternative (blocking the developer) is worse.
-- Silent fallback might confuse users who expect shared results. Solved by logging warnings.
-
-**Status**: Current. Developers should never be blocked by infrastructure issues in a local-first tool.
-
----
-
-## ADR-12: Topic Key Upserts for Memory
-
-**Decision**: Use topic_key-based upserts for memory updates. Same topic_key = update existing memory, not create a new one.
-
-**Context**: Some memories represent evolving knowledge — architecture decisions that get refined, bug patterns that accumulate examples, session summaries that supersede previous ones. Append-only creates clutter. Versioned history adds complexity without clear value.
-
-**Options Considered**:
-- **Versioned history**: Keep every version of a topic, tagged with timestamps. Full audit trail. But memory search returns all versions, and agents cannot meaningfully use version history.
-- **Manual dedup**: Require the caller to delete-then-insert. Error-prone — if delete fails or is forgotten, duplicates accumulate.
-- **Topic key upsert**: If a memory with the same `topic_key` exists, replace its content. One topic = one memory entry, always current.
-
-**Choice**: Topic key upserts. `remember(topic_key="architecture/auth-model", ...)` always updates the same memory entry.
-
-**Tradeoffs**:
-- No history — previous versions are overwritten. If history is needed, the caller should use a different topic_key (e.g., `architecture/auth-model/v2`). This is intentionally not automated.
-- Topic key collisions between different projects are possible. Mitigated by including project name in queries.
-- Requires discipline in topic_key naming. Documented conventions help (see memory protocol).
-
-**Status**: Current. Combined with content hash dedup (ADR-10), this keeps the memory store clean and current without manual intervention.
+**Cost.** Inconsistent with the other 22 tools, which return JSON.
