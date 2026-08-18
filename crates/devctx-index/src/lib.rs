@@ -186,6 +186,81 @@ mod tests {
         assert!(on("feature").contains("return 22"), "{}", on("feature"));
     }
 
+    /// Counts how many texts were embedded, so a test can prove the pipeline
+    /// actually took the copy path rather than that a query would have allowed
+    /// it to.
+    struct CountingEmbedder(std::sync::atomic::AtomicUsize);
+    impl EmbeddingProvider for CountingEmbedder {
+        fn embed(&self, texts: &[String]) -> EmbedResult<Vec<Vec<f32>>> {
+            self.0
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    (0..DIM)
+                        .map(|j| ((t.len() + j) % 10) as f32 / 10.0)
+                        .collect()
+                })
+                .collect())
+        }
+        fn dimension(&self) -> usize {
+            DIM
+        }
+        fn model_name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    /// The claim the whole design rests on, measured rather than assumed: the
+    /// second branch must not re-embed what the first already has.
+    ///
+    /// An earlier test asserted only that the lookup *would* find the shared
+    /// content, which proves the query and not the pipeline. Counting the
+    /// embedder is what distinguishes the two.
+    #[test]
+    fn the_second_branch_embeds_only_what_actually_differs() {
+        let dir = two_branch_repo("noreembed");
+        let store = Store::open_in_memory(DIM).unwrap();
+
+        let first = CountingEmbedder(std::sync::atomic::AtomicUsize::new(0));
+        run(IndexRequest {
+            store: &store,
+            embedder: &first,
+            repo_root: &dir,
+            incremental: false,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+            exclude: &[],
+            branch: Some("main"),
+        })
+        .unwrap();
+        let on_main = first.0.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(on_main > 0, "main had to embed something");
+
+        // `feature` changes b.py and leaves a.py byte-identical.
+        let second = CountingEmbedder(std::sync::atomic::AtomicUsize::new(0));
+        run(IndexRequest {
+            store: &store,
+            embedder: &second,
+            repo_root: &dir,
+            incremental: false,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+            exclude: &[],
+            branch: Some("feature"),
+        })
+        .unwrap();
+        let on_feature = second.0.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            on_feature < on_main,
+            "the second branch embedded {on_feature} chunks against {on_main} for the \
+             first, so nothing was reused"
+        );
+    }
+
     /// Branches share commits, so the file they share must not be embedded
     /// twice — that is what makes keeping several branches indexed affordable.
     #[test]

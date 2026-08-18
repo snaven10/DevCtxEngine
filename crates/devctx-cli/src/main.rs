@@ -2829,6 +2829,15 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         res.files_pruned,
         res.files_renamed,
     );
+    // Named because the saving is the entire argument for keeping several
+    // branches indexed, and a saving nobody can see is one nobody can tell has
+    // stopped working.
+    if res.files_copied > 0 {
+        println!(
+            "  {} of those were copied from another branch, not embedded",
+            res.files_copied
+        );
+    }
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);
 
     if cfg.storage.hnsw {

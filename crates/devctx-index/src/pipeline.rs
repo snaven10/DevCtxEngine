@@ -78,6 +78,13 @@ pub struct IndexResult {
     pub files_pruned: usize,
     /// Files renamed.
     pub files_renamed: usize,
+    /// Files whose chunks were copied from another branch instead of embedded,
+    /// because that branch already had the identical content.
+    ///
+    /// Reported because the saving is the entire argument for keeping several
+    /// branches indexed, and an argument nobody can see the effect of is one
+    /// nobody can tell has stopped working.
+    pub files_copied: usize,
     /// Total symbols across indexed files.
     pub symbols: usize,
     /// Total chunks stored.
@@ -99,6 +106,24 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let had_fts = req.store.has_fts();
     if had_fts {
         req.store.drop_fts()?;
+    }
+    // The HNSW index has to come down for the same reason, and for a larger
+    // one: unlike FTS it survives the writes, so nothing forces the issue —
+    // it just makes every single insert pay to maintain the graph. Measured on
+    // a 1368-file branch of a real repository: 7 files a minute, an ETA of 108
+    // minutes, against minutes for the same work with the index absent and
+    // rebuilt once at the end.
+    //
+    // This is not specific to indexing a second branch. Every incremental run
+    // after the first has been paying it; a three-file commit hides the cost,
+    // and a large one does not.
+    //
+    // Searches fall back to brute force while it is down, which is what FTS
+    // already does and is the right trade: a slower search during an index
+    // beats an index that does not finish.
+    let had_hnsw = req.store.hnsw_metric();
+    if had_hnsw.is_some() {
+        req.store.drop_hnsw()?;
     }
     let git = GitRepo::open(req.repo_root)?;
     let state = git.state();
@@ -248,6 +273,9 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         indexed_at: now_stamp(),
     })?;
 
+    if let Some(metric) = &had_hnsw {
+        req.store.enable_hnsw(metric)?;
+    }
     if had_fts {
         req.store.rebuild_fts()?;
     }
@@ -459,6 +487,7 @@ impl Ctx<'_> {
                 })?;
                 self.indexed.insert(file.to_string());
                 result.files_indexed += 1;
+                result.files_copied += 1;
                 result.symbols += symbols;
                 result.chunks += chunks;
                 return Ok(());

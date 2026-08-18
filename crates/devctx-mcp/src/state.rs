@@ -569,6 +569,7 @@ fn do_index_inner(
         "files_deleted": res.files_deleted,
         "files_pruned": res.files_pruned,
         "files_renamed": res.files_renamed,
+        "files_copied": res.files_copied,
         "symbols": res.symbols,
         "chunks": res.chunks,
     })
