@@ -3,398 +3,149 @@
 > Back to [README](../README.md)
 > 🇪🇸 [Leer en español](es/04-flujo-de-trabajo-del-agente.md)
 
-> **Note — parts of this page predate the Rust rewrite.** Figures and
-> configuration below were measured against the earlier Go + Python
-> implementation, which no longer exists: parsing, chunking, embedding and
-> reranking now run in-process, and the `DEVAI_*` variables named here were never
-> ported. Treat the numbers as unverified until re-measured. Current references:
-> [Architecture](02-architecture.md), [Configuration](11-configuration.md).
+How an agent should actually use these tools during a task — which one answers
+which question, and in what order.
+
+For memory specifically — when to save, what to put in it — see
+[MEMORY-PROTOCOL.md](../MEMORY-PROTOCOL.md). For first-time setup, see
+[AGENTS.md](../AGENTS.md).
 
 ---
 
-## Mental Model
+## The problem this solves
 
-DevAI is Jarvis to the AI agent's Tony Stark.
+An agent dropped into an unfamiliar repository has a context window and no idea
+what is in it. The naive approach — read files until something looks relevant —
+spends the window on retrieval and still misses the reasoning, because reasoning
+is not in the code.
 
-The agent has the intelligence. It can reason, plan, write code, debug. What it lacks is *situational awareness* — it cannot see the full battlefield. DevAI provides the heads-up display: structural code maps, semantic search, cross-reference navigation, and persistent memory across sessions.
+What the code cannot tell you: that the obvious approach was tried and abandoned,
+that this function is load-bearing for a caller three modules away, that the
+weird branch exists because of a production incident.
 
-Without DevAI, an agent navigating a large codebase is a surgeon operating blindfolded, reading the patient's chart one line at a time. With DevAI, the agent has the full chart, the X-rays, and notes from every previous surgery.
+## Choosing a tool
 
----
+| The question you have | The tool |
+|---|---|
+| Where is the code about X? | `search` |
+| I know the name — show me the thing | `read_symbol` |
+| What calls this? | `get_references` |
+| What breaks if I change it? | `impact_analysis` |
+| Why is it written this way? | `memories_by_symbol` / `memories_by_file` |
+| What do we know about X? | `recall` |
+| What should I read before answering? | `build_context` |
+| Which HTTP route serves this? | `search_routes` / `routes_for_handler` |
+| The answer is in another repository | `search_project` |
+| I just lost my context | `memory_context` |
 
-## How MCP Works
+The two rows people skip are the expensive ones to skip: `impact_analysis`
+before changing anything public, and `memories_by_symbol` before assuming code
+is wrong.
 
-The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is a standard for connecting AI agents to external tools. DevAI uses it as its primary interface.
+## The loop
 
-**Transport:** stdio. The AI agent's host process spawns `devai server mcp` as a subprocess. Communication happens over stdin/stdout using JSON-RPC 2.0. No HTTP, no ports, no authentication.
+### Start with `build_context`
 
-**Lifecycle:**
-
-```
-Agent Host                          DevAI MCP Server
-    │                                      │
-    │──── spawn devai server mcp ─────────▶│
-    │                                      │── spawn Python ML service
-    │◀──── initialize (capabilities) ──────│
-    │                                      │
-    │───── tools/list ────────────────────▶│
-    │◀──── [21 tool definitions] ──────────│
-    │                                      │
-    │───── tools/call (search, ...) ──────▶│──── JSON-RPC ──▶ Python
-    │◀──── result ─────────────────────────│◀─── result ─────┘
-    │                                      │
-    │      ... (session continues) ...     │
-    │                                      │
-    │───── shutdown ──────────────────────▶│
-    │                                      │── terminate Python
-```
-
-**Registration:** When the agent calls `tools/list`, DevAI returns all 21 tool definitions with JSON Schema parameters. The agent's runtime validates parameters before each call. No tool discovery at runtime — everything is declared upfront.
-
----
-
-## The Typical Agent Workflow
-
-A well-configured agent follows a predictable pattern when working with DevAI:
+If you are about to do real work in an area you do not know, one call replaces
+the first three or four:
 
 ```
-1. ORIENT     recall prior context, search for relevant code
-2. UNDERSTAND read symbols, trace references, build full context
-3. ACT        write code, fix bugs, implement features
-4. PERSIST    remember decisions, discoveries, conventions
+build_context("how do we decide a token is expired", max_tokens=4096)
 ```
 
-### Phase 1: Orient
+It returns, in one budgeted brief: what was already decided about this area, the
+code that ranks highest, and the memories recorded against exactly those files.
+That last part is the one manual retrieval never reaches — a memory whose words
+do not match your question but whose *files* do.
 
-The agent receives a user task. Before writing a single line of code, it orients itself.
+It tells you what did not fit, so you know whether to raise the budget or narrow
+the question.
 
-```
-User: "Fix the race condition in the session store"
+### Then narrow
 
-Agent thinks: I need to understand the session store first.
-
-Agent calls: recall(query: "session store race condition")
-  → Returns: Previous session found a data race in SessionStore.Get
-             when concurrent requests hit the same session ID.
-             Mutex was added to Set but not Get. File: internal/store/session.go
-
-Agent calls: search(query: "session store concurrent access")
-  → Returns: 3 results ranked by relevance
-             1. internal/store/session.go — SessionStore struct, Get/Set methods
-             2. internal/store/session_test.go — TestConcurrentAccess (currently failing)
-             3. internal/middleware/auth.go — calls SessionStore.Get in request handler
-```
-
-The agent now knows *where* to look, *what* was tried before, and *what the codebase looks like* around the problem — all before reading a single file.
-
-### Phase 2: Understand
-
-With search results pointing to the right area, the agent dives deeper.
+`build_context` orients. It does not replace reading. Once you know which
+symbols matter:
 
 ```
-Agent calls: read_symbol(name: "SessionStore")
-  → Returns: Full struct definition with all methods
-             type SessionStore struct { mu sync.Mutex; data map[string]*Session }
-             func (s *SessionStore) Get(id string) (*Session, error)
-             func (s *SessionStore) Set(id string, sess *Session) error
-             func (s *SessionStore) Delete(id string) error
-
-Agent calls: get_references(symbol: "SessionStore.Get")
-  → Returns: 4 call sites
-             internal/middleware/auth.go:47      — auth middleware, called per request
-             internal/handler/dashboard.go:23    — dashboard handler
-             internal/handler/api.go:89          — API handler
-             internal/store/session_test.go:34   — test file
+read_symbol("verify_token")      → the definition
+get_references("verify_token")   → every call site
+impact_analysis("verify_token")  → the blast radius, transitively
 ```
 
-Now the agent has structural understanding — not just text matches, but the actual symbol graph.
+`impact_analysis` results are a **superset to review, not a proof**. Call
+resolution is name-based, so two methods called `save()` can collapse into one
+node, and dynamic dispatch leaves no edge at all. Treat a clean impact report as
+"nothing obvious", not "nothing".
 
-### Phase 3: Act
+### Before you decide the code is wrong
 
-The agent writes the fix. This phase is the agent's core competency — DevAI steps back.
+Run `memories_by_symbol` on it. The most expensive mistake an agent makes is
+"fixing" a deliberate decision, and the call graph cannot warn you — only the
+memory can.
 
-### Phase 4: Persist
+Read `link_sources` on the result. `files-field` and `content-mention` mean
+someone connected that memory to that code deliberately. `inference` means only
+that the words matched, and deserves less weight.
 
-After completing the fix, the agent persists what it learned.
+### After you finish
 
-```
-Agent calls: remember(
-  title: "Fixed race condition in SessionStore.Get",
-  content: "Added RLock to SessionStore.Get. The Set method had a
-            Mutex but Get was unprotected, causing data races under
-            concurrent request load. All callers (auth middleware,
-            dashboard, API handlers) are now safe.",
-  type: "bugfix",
-  project: "devai",
-  topic_key: "bugfix/session-store-race"
-)
-```
+Record what the next session will need. The bar is: **would someone re-derive
+this, at cost, if it were not written down?**
 
-The next session — or the next agent — can `recall` this and avoid re-discovering the same issue.
+Bug fixes with a root cause, decisions with reasoning, gotchas, conventions.
+Not: what the diff already says.
 
----
+Always pass `files`. A memory without it is findable only by text, which
+requires already knowing what to ask. With it, the memory reaches anyone who
+lands on that code. Details in
+[MEMORY-PROTOCOL.md](../MEMORY-PROTOCOL.md).
 
-## Tool Selection Patterns
+## Working across repositories
 
-Use this decision tree to pick the right tool for each situation:
+`list_projects` shows what this machine tracks. `search_project` searches
+another one by name without leaving your session — the backend question you hit
+while editing the frontend.
 
-| Agent needs... | Tool | Why this one |
-|----------------|------|-------------|
-| Find code related to a concept | `search` | Semantic vector search. Finds code by meaning, not just keywords. Returns ranked chunks with file paths and scores. |
-| Comprehensive context for a topic | `build_context` | Assembles search results + symbol info + memory into a single token-budgeted block. Use when the agent needs a full picture, not just a pointer. |
-| Full definition of a specific symbol | `read_symbol` | Returns the complete source of a function, class, struct, or type. Faster and more precise than reading an entire file. |
-| All places a symbol is used | `get_references` | Returns every call site, import, and usage. Essential for understanding impact of changes. |
-| Read a specific file | `read_file` | When you know the exact path. Supports optional line ranges to avoid loading entire files. |
-| Save a decision or discovery | `remember` | Persists to SQLite with dedup and topic-key upsert. Survives across sessions and context resets. |
-| Check if something was discussed before | `recall` | Searches memory by query. Returns full content, not truncated summaries. |
-| Review past actions in this session | `get_session_history` | Returns the tool call log for the current session. Useful for agents reviewing their own work. |
-| Index or reindex files | `index` | Triggers incremental indexing. Only reprocesses changed files via git diff. |
+If a lesson turns out to apply beyond one repository, `memory_move` promotes it
+to `group` or `global` rather than making you rewrite it.
 
-### Anti-Patterns
+## When nothing is bound
 
-- **Do not use `search` when you know the exact symbol name.** Use `read_symbol` instead. Search is for discovery; `read_symbol` is for retrieval.
-- **Do not use `read_file` to explore a codebase.** Use `search` or `build_context` first to find what matters, then `read_file` for the specific section.
-- **Do not skip `recall` at session start.** Five seconds of memory lookup saves five minutes of re-exploration.
-- **Do not forget to `remember`.** If the agent made a non-obvious decision, fixed a subtle bug, or discovered a gotcha — persist it. Future sessions depend on it.
-
----
-
-## End-to-End Example: Debugging a Bug in a Large Codebase
-
-**Scenario:** User reports "API returns 500 on /api/users when the database is under load." The codebase has 200+ files across 15 packages.
-
-### Step 1: Check memory for prior context
-
-```json
-{
-  "tool": "recall",
-  "params": {
-    "query": "API 500 error users database load",
-    "project": "myapp"
-  }
-}
-```
-
-**Result:** No prior memory found. This is a new issue.
-
-### Step 2: Semantic search for the error surface
-
-```json
-{
-  "tool": "search",
-  "params": {
-    "query": "API users endpoint handler error handling",
-    "top_k": 5
-  }
-}
-```
-
-**Result:**
+A globally-registered MCP server starts in whatever directory the client was
+launched from, which is frequently no repository at all. Tools then report that
+no project is bound.
 
 ```
-1. internal/handler/users.go:45     score: 0.87  "func (h *UserHandler) List(...)"
-2. internal/handler/users.go:82     score: 0.81  "func (h *UserHandler) Create(...)"
-3. internal/service/user_service.go  score: 0.76  "func (s *UserService) GetAll(...)"
-4. internal/middleware/recovery.go   score: 0.71  "panic recovery middleware"
-5. internal/db/pool.go              score: 0.68  "connection pool configuration"
+list_projects        → what exists
+use_project <name>   → bind this session
 ```
 
-### Step 3: Read the handler symbol
+This is a normal state, not a broken install.
 
-```json
-{
-  "tool": "read_symbol",
-  "params": {
-    "name": "UserHandler.List"
-  }
-}
-```
+## When the index is stale
 
-**Result:**
+`index_status` reports the last-indexed commit and whether the index is current.
+If it is behind, `index_repo` catches it up incrementally — only what changed.
 
-```go
-func (h *UserHandler) List(w http.ResponseWriter, r *http.Request) {
-    users, err := h.service.GetAll(r.Context())
-    if err != nil {
-        http.Error(w, "internal error", 500)  // no error wrapping, no logging
-        return
-    }
-    json.NewEncoder(w).Encode(users)
-}
-```
+The index mirrors the **work tree**, not the last commit, so uncommitted code is
+searchable. Anything git ignores is not, which is the usual reason a file you
+can see is not findable.
 
-### Step 4: Trace the call chain
+## Anti-patterns
 
-```json
-{
-  "tool": "get_references",
-  "params": {
-    "symbol": "UserService.GetAll"
-  }
-}
-```
+**Reading files to find things.** That is what `search` is for. Reading is for
+after you know which file.
 
-**Result:**
+**Skipping `impact_analysis` because the change looks small.** Size of diff has
+no relationship to size of blast radius.
 
-```
-internal/handler/users.go:46        — UserHandler.List
-internal/handler/admin.go:112       — AdminHandler.ExportUsers
-internal/job/daily_report.go:34     — DailyReportJob.Run
-```
+**Trusting a search that returned nothing.** Check `index_status` first — an
+empty result from a stale or unbuilt index looks identical to an empty result
+from code that does not exist.
 
-### Step 5: Read the service implementation
+**Saving a memory without `files`.** It costs one field and determines whether
+the memory is ever found again from the code.
 
-```json
-{
-  "tool": "read_symbol",
-  "params": {
-    "name": "UserService.GetAll"
-  }
-}
-```
-
-**Result:**
-
-```go
-func (s *UserService) GetAll(ctx context.Context) ([]User, error) {
-    return s.repo.FindAll(ctx)  // no timeout, no retry, no connection check
-}
-```
-
-### Step 6: Build full context for the database layer
-
-```json
-{
-  "tool": "build_context",
-  "params": {
-    "query": "database connection pool timeout retry",
-    "max_tokens": 6000
-  }
-}
-```
-
-**Result:** Assembled context including the connection pool config (max 10 connections, no timeout), the repository implementation (raw SQL with no context deadline), and related memory entries.
-
-### Step 7: Agent diagnoses and fixes
-
-The agent now has the full picture:
-
-```
-Root cause: UserService.GetAll passes context without a deadline to
-the repository. Under database load, queries hang indefinitely. The
-connection pool exhausts its 10 connections, and subsequent requests
-get a "connection pool exhausted" error that surfaces as a 500.
-
-Fix: Add context.WithTimeout in the service layer, add retry with
-backoff in the repository, increase pool size, add proper error
-wrapping in the handler.
-```
-
-### Step 8: Persist the finding
-
-```json
-{
-  "tool": "remember",
-  "params": {
-    "title": "Fixed 500 errors under DB load in /api/users",
-    "content": "Root cause: no context deadline on DB queries. Under load, connection pool (max 10) exhausted. Fix: added 5s timeout in UserService, retry with backoff in repo, increased pool to 25, added structured error logging in handler.",
-    "type": "bugfix",
-    "project": "myapp",
-    "topic_key": "bugfix/users-500-db-load"
-  }
-}
-```
-
-### Data Flow Summary
-
-```
-recall ──▶ (no prior context)
-              │
-search ──▶ handler/users.go, service/user_service.go, db/pool.go
-              │
-read_symbol ──▶ UserHandler.List source
-              │
-get_references ──▶ 3 call sites for UserService.GetAll
-              │
-read_symbol ──▶ UserService.GetAll source (no timeout visible)
-              │
-build_context ──▶ full DB layer context (pool config, repo impl)
-              │
-    ┌─────────┘
-    ▼
-Agent reasoning: no deadline + small pool = exhaustion under load
-    │
-    ▼
-Agent writes fix ──▶ 4 files modified
-    │
-    ▼
-remember ──▶ persisted for future sessions
-```
-
----
-
-## Session History
-
-DevAI tracks every tool call within a session. Agents can review their own actions using `get_session_history`.
-
-**Why this matters:** When an agent's context is compacted (the LLM's conversation is summarized to save tokens), it loses the detailed record of what it did. Session history provides a ground-truth log that survives compaction.
-
-**What is recorded:**
-
-- Tool name and parameters for each call
-- Timestamp
-- Result summary
-- Session ID (stable across the session, changes between sessions)
-
-**Typical usage:**
-
-```json
-{
-  "tool": "get_session_history",
-  "params": {
-    "session_id": "current",
-    "limit": 20
-  }
-}
-```
-
-This returns the last 20 tool calls in the current session. The agent can use this to:
-
-- Verify it has not already searched for something (avoid duplicate work)
-- Review what it found earlier before context was compacted
-- Build a summary of actions taken for the user
-
----
-
-## Configuring Agent Access
-
-### Automatic Setup
-
-```bash
-devai server configure claude    # Claude Code
-devai server configure cursor    # Cursor
-devai server configure --all     # All detected clients
-```
-
-This writes the MCP server entry to the client's configuration file. The agent can call DevAI tools immediately — no manual JSON editing required.
-
-### What Gets Configured
-
-- MCP server command: `devai server mcp`
-- Working directory: the current repository root
-- Environment: `DEVAI_STATE_DIR` pointing to `.devai/state/`
-- Storage mode: auto-detected from `.devai/config.yaml`
-
-### Verifying the Connection
-
-After configuration, ask the agent to run a simple tool call:
-
-```
-"Search for the main function in this codebase"
-```
-
-If DevAI is connected, the agent will call `search(query: "main function entry point")` and return results. If not, it will fall back to file reads — a clear signal that the MCP connection is not active.
-
----
-
-> **DevAI is in alpha.** Tool parameters and response schemas may change between versions. See the [MCP Tools Reference](03-core-concepts/mcp-integration.md) for current schemas.
+**Assuming reranking would help.** It is off by default because it was measured:
+two orders of magnitude slower, and the one model benchmarked across the suite
+made results worse. See [ADR-15](08-design-decisions.md).

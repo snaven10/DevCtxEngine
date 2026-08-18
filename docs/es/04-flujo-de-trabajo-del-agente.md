@@ -1,403 +1,151 @@
-> 🌐 [English version](../04-agent-workflow.md)
-
-# Flujo de Trabajo del Agente
+# Flujo de trabajo del agente
 
 > Volver al [README](../../README.md)
+> 🇬🇧 [Read in English](../04-agent-workflow.md)
 
-> **Nota — parte de esta página es anterior a la reescritura en Rust.** Las
-> cifras y la configuración de abajo se midieron sobre la implementación previa
-> en Go + Python, que ya no existe: parseo, chunking, embeddings y reranking
-> corren ahora en proceso, y las variables `DEVAI_*` que aquí se nombran nunca se
-> portaron. Toma los números como no verificados hasta volver a medirlos.
-> Referencias actuales: [Arquitectura](02-arquitectura.md),
-> [Configuración](11-configuracion.md).
+Cómo debería un agente usar realmente estas herramientas durante una tarea: cuál
+responde qué pregunta, y en qué orden.
 
----
-
-## Modelo Mental
-
-DevAI es Jarvis para el Tony Stark del agente de IA.
-
-El agente tiene la inteligencia. Puede razonar, planificar, escribir código, debuggear. Lo que le falta es *conciencia situacional* — no puede ver el campo de batalla completo. DevAI provee el heads-up display: mapas estructurales de código, búsqueda semántica, navegación de referencias cruzadas y memoria persistente entre sesiones.
-
-Sin DevAI, un agente navegando un codebase grande es un cirujano operando con los ojos vendados, leyendo la historia clínica del paciente una línea a la vez. Con DevAI, el agente tiene la historia completa, las radiografías y las notas de cada cirugía anterior.
+Para memoria en concreto — cuándo guardar, qué poner — ver
+[MEMORY-PROTOCOL.md](../../MEMORY-PROTOCOL.md). Para la configuración inicial,
+ver [AGENTS.md](../../AGENTS.md).
 
 ---
 
-## Cómo Funciona MCP
+## El problema que esto resuelve
 
-El [Model Context Protocol](https://modelcontextprotocol.io) (MCP) es un estándar para conectar agentes de IA con herramientas externas. DevAI lo usa como su interfaz principal.
+Un agente soltado en un repositorio desconocido tiene una ventana de contexto y
+ninguna idea de qué hay adentro. El enfoque ingenuo — leer archivos hasta que
+algo parezca relevante — gasta la ventana en recuperación y aun así se pierde el
+razonamiento, porque el razonamiento no está en el código.
 
-**Transporte:** stdio. El proceso host del agente de IA lanza `devai server mcp` como un subproceso. La comunicación ocurre sobre stdin/stdout usando JSON-RPC 2.0. Sin HTTP, sin puertos, sin autenticación.
+Lo que el código no te puede decir: que el enfoque obvio se probó y se abandonó,
+que esta función es crítica para un llamador tres módulos más allá, que la rama
+rara existe por un incidente en producción.
 
-**Ciclo de vida:**
+## Elegir herramienta
 
-```
-Agent Host                          DevAI MCP Server
-    │                                      │
-    │──── spawn devai server mcp ─────────▶│
-    │                                      │── spawn Python ML service
-    │◀──── initialize (capabilities) ──────│
-    │                                      │
-    │───── tools/list ────────────────────▶│
-    │◀──── [21 tool definitions] ──────────│
-    │                                      │
-    │───── tools/call (search, ...) ──────▶│──── JSON-RPC ──▶ Python
-    │◀──── result ─────────────────────────│◀─── result ─────┘
-    │                                      │
-    │      ... (la sesión continúa) ...    │
-    │                                      │
-    │───── shutdown ──────────────────────▶│
-    │                                      │── terminate Python
-```
+| La pregunta que tenés | La herramienta |
+|---|---|
+| ¿Dónde está el código sobre X? | `search` |
+| Sé el nombre — mostrame la cosa | `read_symbol` |
+| ¿Qué llama a esto? | `get_references` |
+| ¿Qué se rompe si lo cambio? | `impact_analysis` |
+| ¿Por qué está escrito así? | `memories_by_symbol` / `memories_by_file` |
+| ¿Qué sabemos de X? | `recall` |
+| ¿Qué debería leer antes de responder? | `build_context` |
+| ¿Qué ruta HTTP sirve esto? | `search_routes` / `routes_for_handler` |
+| La respuesta está en otro repositorio | `search_project` |
+| Acabo de perder mi contexto | `memory_context` |
 
-**Registro:** Cuando el agente llama a `tools/list`, DevAI devuelve las 21 definiciones de herramientas con parámetros JSON Schema. El runtime del agente valida los parámetros antes de cada llamada. Sin descubrimiento de herramientas en runtime — todo se declara de entrada.
+Las dos filas que la gente saltea son las caras de saltear: `impact_analysis`
+antes de cambiar algo público, y `memories_by_symbol` antes de suponer que el
+código está mal.
 
----
+## El bucle
 
-## El Flujo de Trabajo Típico del Agente
+### Empezá con `build_context`
 
-Un agente bien configurado sigue un patrón predecible cuando trabaja con DevAI:
-
-```
-1. ORIENTARSE     recall del contexto previo, buscar código relevante
-2. ENTENDER       leer símbolos, rastrear referencias, construir contexto completo
-3. ACTUAR         escribir código, corregir bugs, implementar funcionalidades
-4. PERSISTIR      remember de decisiones, descubrimientos, convenciones
-```
-
-### Fase 1: Orientarse
-
-El agente recibe una tarea del usuario. Antes de escribir una sola línea de código, se orienta.
+Si vas a hacer trabajo real en un área que no conocés, una llamada reemplaza las
+primeras tres o cuatro:
 
 ```
-Usuario: "Corregí la race condition en el session store"
-
-El agente piensa: Necesito entender el session store primero.
-
-El agente llama: recall(query: "session store race condition")
-  → Devuelve: La sesión anterior encontró un data race en SessionStore.Get
-              cuando requests concurrentes golpean el mismo session ID.
-              Se agregó Mutex a Set pero no a Get. Archivo: internal/store/session.go
-
-El agente llama: search(query: "session store concurrent access")
-  → Devuelve: 3 resultados rankeados por relevancia
-              1. internal/store/session.go — struct SessionStore, métodos Get/Set
-              2. internal/store/session_test.go — TestConcurrentAccess (fallando actualmente)
-              3. internal/middleware/auth.go — llama a SessionStore.Get en el request handler
+build_context("cómo decidimos que un token expiró", max_tokens=4096)
 ```
 
-El agente ahora sabe *dónde* mirar, *qué se intentó antes* y *cómo se ve el codebase* alrededor del problema — todo antes de leer un solo archivo.
+Devuelve, en un solo brief con presupuesto: qué se decidió ya sobre esta área,
+el código que mejor rankea, y las memorias registradas contra exactamente esos
+archivos. Esa última parte es la que la recuperación manual nunca alcanza — una
+memoria cuyas palabras no coinciden con tu pregunta pero cuyos *archivos* sí.
 
-### Fase 2: Entender
+Te dice qué no entró, así sabés si subir el presupuesto o acotar la pregunta.
 
-Con los resultados de búsqueda apuntando al área correcta, el agente profundiza.
+### Después acotá
 
-```
-El agente llama: read_symbol(name: "SessionStore")
-  → Devuelve: Definición completa del struct con todos los métodos
-              type SessionStore struct { mu sync.Mutex; data map[string]*Session }
-              func (s *SessionStore) Get(id string) (*Session, error)
-              func (s *SessionStore) Set(id string, sess *Session) error
-              func (s *SessionStore) Delete(id string) error
-
-El agente llama: get_references(symbol: "SessionStore.Get")
-  → Devuelve: 4 sitios de llamada
-              internal/middleware/auth.go:47      — middleware de autenticación, llamado por request
-              internal/handler/dashboard.go:23    — handler del dashboard
-              internal/handler/api.go:89          — handler de la API
-              internal/store/session_test.go:34   — archivo de tests
-```
-
-Ahora el agente tiene comprensión estructural — no solo coincidencias de texto, sino el grafo de símbolos real.
-
-### Fase 3: Actuar
-
-El agente escribe la corrección. Esta fase es la competencia central del agente — DevAI se hace a un lado.
-
-### Fase 4: Persistir
-
-Después de completar la corrección, el agente persiste lo que aprendió.
+`build_context` orienta. No reemplaza leer. Una vez que sabés qué símbolos
+importan:
 
 ```
-El agente llama: remember(
-  title: "Fixed race condition in SessionStore.Get",
-  content: "Added RLock to SessionStore.Get. The Set method had a
-            Mutex but Get was unprotected, causing data races under
-            concurrent request load. All callers (auth middleware,
-            dashboard, API handlers) are now safe.",
-  type: "bugfix",
-  project: "devai",
-  topic_key: "bugfix/session-store-race"
-)
+read_symbol("verify_token")      → la definición
+get_references("verify_token")   → cada sitio de llamada
+impact_analysis("verify_token")  → el radio de impacto, transitivo
 ```
 
-La próxima sesión — o el próximo agente — puede hacer `recall` de esto y evitar redescubrir el mismo problema.
+Los resultados de `impact_analysis` son un **superconjunto a revisar, no una
+prueba**. La resolución de llamadas es por nombre, así que dos métodos llamados
+`save()` pueden colapsar en un nodo, y el despacho dinámico no deja arista del
+todo. Tratá un reporte de impacto limpio como "nada obvio", no como "nada".
 
----
+### Antes de decidir que el código está mal
 
-## Patrones de Selección de Herramientas
+Corré `memories_by_symbol` sobre él. El error más caro que comete un agente es
+"arreglar" una decisión deliberada, y el grafo de llamadas no puede avisarte —
+solo la memoria puede.
 
-Usá este árbol de decisión para elegir la herramienta correcta en cada situación:
+Leé `link_sources` en el resultado. `files-field` y `content-mention` significan
+que alguien conectó esa memoria con ese código a propósito. `inference`
+significa solo que coincidieron las palabras, y merece menos peso.
 
-| El agente necesita... | Herramienta | Por qué esta |
-|----------------|------|-------------|
-| Encontrar código relacionado a un concepto | `search` | Búsqueda vectorial semántica. Encuentra código por significado, no solo palabras clave. Devuelve chunks rankeados con rutas de archivo y puntajes. |
-| Contexto comprehensivo para un tema | `build_context` | Ensambla resultados de búsqueda + info de símbolos + memoria en un único bloque con presupuesto de tokens. Usalo cuando el agente necesita el panorama completo, no solo un puntero. |
-| Definición completa de un símbolo específico | `read_symbol` | Devuelve el código fuente completo de una función, clase, struct o tipo. Más rápido y preciso que leer un archivo entero. |
-| Todos los lugares donde se usa un símbolo | `get_references` | Devuelve cada sitio de llamada, import y uso. Esencial para entender el impacto de los cambios. |
-| Leer un archivo específico | `read_file` | Cuando sabés la ruta exacta. Soporta rangos de líneas opcionales para evitar cargar archivos enteros. |
-| Guardar una decisión o descubrimiento | `remember` | Persiste en SQLite con dedup y upsert por topic-key. Sobrevive entre sesiones y resets de contexto. |
-| Verificar si algo se discutió antes | `recall` | Busca en la memoria por query. Devuelve contenido completo, no resúmenes truncados. |
-| Revisar acciones pasadas en esta sesión | `get_session_history` | Devuelve el log de llamadas a herramientas de la sesión actual. Útil para agentes revisando su propio trabajo. |
-| Indexar o reindexar archivos | `index` | Dispara indexación incremental. Solo reprocesa archivos modificados via git diff. |
+### Cuando terminás
 
-### Anti-Patrones
+Registrá lo que la próxima sesión va a necesitar. La vara es: **¿alguien
+volvería a deducir esto, a un costo, si no estuviera escrito?**
 
-- **No uses `search` cuando sabés el nombre exacto del símbolo.** Usá `read_symbol` en su lugar. Search es para descubrimiento; `read_symbol` es para recuperación.
-- **No uses `read_file` para explorar un codebase.** Usá `search` o `build_context` primero para encontrar lo que importa, después `read_file` para la sección específica.
-- **No te saltees `recall` al inicio de la sesión.** Cinco segundos de búsqueda en memoria ahorran cinco minutos de re-exploración.
-- **No te olvides de hacer `remember`.** Si el agente tomó una decisión no obvia, corrigió un bug sutil o descubrió un gotcha — persistilo. Las sesiones futuras dependen de eso.
+Fixes de bugs con causa raíz, decisiones con razonamiento, detalles
+traicioneros, convenciones. No: lo que el diff ya dice.
 
----
+Pasá siempre `files`. Una memoria sin eso solo se encuentra por texto, lo que
+exige saber ya qué preguntar. Con eso, la memoria llega a cualquiera que caiga
+sobre ese código. Detalles en
+[MEMORY-PROTOCOL.md](../../MEMORY-PROTOCOL.md).
 
-## Ejemplo de Punta a Punta: Debuggeando un Bug en un Codebase Grande
+## Trabajar entre repositorios
 
-**Escenario:** El usuario reporta "La API devuelve 500 en /api/users cuando la base de datos está bajo carga." El codebase tiene más de 200 archivos en 15 paquetes.
+`list_projects` muestra qué rastrea esta máquina. `search_project` busca en otro
+por nombre sin salir de tu sesión — la pregunta de backend que te salta editando
+el frontend.
 
-### Paso 1: Verificar memoria para contexto previo
+Si una lección resulta aplicar más allá de un repositorio, `memory_move` la
+promueve a `group` o `global` en vez de obligarte a reescribirla.
 
-```json
-{
-  "tool": "recall",
-  "params": {
-    "query": "API 500 error users database load",
-    "project": "myapp"
-  }
-}
-```
+## Cuando no hay nada vinculado
 
-**Resultado:** No se encontró memoria previa. Es un problema nuevo.
-
-### Paso 2: Búsqueda semántica de la superficie del error
-
-```json
-{
-  "tool": "search",
-  "params": {
-    "query": "API users endpoint handler error handling",
-    "top_k": 5
-  }
-}
-```
-
-**Resultado:**
+Un servidor MCP registrado globalmente arranca en el directorio desde el que se
+lanzó el cliente, que con frecuencia no es ningún repositorio. Las herramientas
+entonces reportan que no hay proyecto vinculado.
 
 ```
-1. internal/handler/users.go:45     score: 0.87  "func (h *UserHandler) List(...)"
-2. internal/handler/users.go:82     score: 0.81  "func (h *UserHandler) Create(...)"
-3. internal/service/user_service.go  score: 0.76  "func (s *UserService) GetAll(...)"
-4. internal/middleware/recovery.go   score: 0.71  "panic recovery middleware"
-5. internal/db/pool.go              score: 0.68  "connection pool configuration"
+list_projects        → qué existe
+use_project <nombre> → vincular esta sesión
 ```
 
-### Paso 3: Leer el símbolo del handler
+Este es un estado normal, no una instalación rota.
 
-```json
-{
-  "tool": "read_symbol",
-  "params": {
-    "name": "UserHandler.List"
-  }
-}
-```
+## Cuando el índice está viejo
 
-**Resultado:**
+`index_status` reporta el último commit indexado y si el índice está al día. Si
+está atrasado, `index_repo` lo pone al día de forma incremental — solo lo que
+cambió.
 
-```go
-func (h *UserHandler) List(w http.ResponseWriter, r *http.Request) {
-    users, err := h.service.GetAll(r.Context())
-    if err != nil {
-        http.Error(w, "internal error", 500)  // sin wrapping de error, sin logging
-        return
-    }
-    json.NewEncoder(w).Encode(users)
-}
-```
+El índice refleja el **árbol de trabajo**, no el último commit, así que el
+código sin commitear es buscable. Lo que git ignora no lo es, que es la razón
+habitual de que un archivo que ves no aparezca.
 
-### Paso 4: Rastrear la cadena de llamadas
+## Antipatrones
 
-```json
-{
-  "tool": "get_references",
-  "params": {
-    "symbol": "UserService.GetAll"
-  }
-}
-```
+**Leer archivos para encontrar cosas.** Para eso está `search`. Leer es para
+después de saber qué archivo.
 
-**Resultado:**
+**Saltear `impact_analysis` porque el cambio parece chico.** El tamaño del diff
+no tiene relación con el tamaño del radio de impacto.
 
-```
-internal/handler/users.go:46        — UserHandler.List
-internal/handler/admin.go:112       — AdminHandler.ExportUsers
-internal/job/daily_report.go:34     — DailyReportJob.Run
-```
+**Confiar en una búsqueda que no devolvió nada.** Verificá `index_status`
+primero — un resultado vacío de un índice viejo o sin construir se ve idéntico a
+un resultado vacío de código que no existe.
 
-### Paso 5: Leer la implementación del servicio
+**Guardar una memoria sin `files`.** Cuesta un campo y determina si la memoria
+se vuelve a encontrar alguna vez desde el código.
 
-```json
-{
-  "tool": "read_symbol",
-  "params": {
-    "name": "UserService.GetAll"
-  }
-}
-```
-
-**Resultado:**
-
-```go
-func (s *UserService) GetAll(ctx context.Context) ([]User, error) {
-    return s.repo.FindAll(ctx)  // sin timeout, sin retry, sin chequeo de conexión
-}
-```
-
-### Paso 6: Construir contexto completo para la capa de base de datos
-
-```json
-{
-  "tool": "build_context",
-  "params": {
-    "query": "database connection pool timeout retry",
-    "max_tokens": 6000
-  }
-}
-```
-
-**Resultado:** Contexto ensamblado incluyendo la configuración del connection pool (máximo 10 conexiones, sin timeout), la implementación del repositorio (SQL crudo sin deadline de contexto), y entradas de memoria relacionadas.
-
-### Paso 7: El agente diagnostica y corrige
-
-El agente ahora tiene el panorama completo:
-
-```
-Causa raíz: UserService.GetAll pasa el contexto sin deadline al
-repositorio. Bajo carga de la base de datos, las queries se quedan
-colgadas indefinidamente. El connection pool agota sus 10 conexiones,
-y los requests subsiguientes reciben un error "connection pool
-exhausted" que sale como un 500.
-
-Corrección: Agregar context.WithTimeout en la capa de servicio, agregar
-retry con backoff en el repositorio, incrementar el tamaño del pool,
-agregar wrapping de error estructurado en el handler.
-```
-
-### Paso 8: Persistir el hallazgo
-
-```json
-{
-  "tool": "remember",
-  "params": {
-    "title": "Fixed 500 errors under DB load in /api/users",
-    "content": "Root cause: no context deadline on DB queries. Under load, connection pool (max 10) exhausted. Fix: added 5s timeout in UserService, retry with backoff in repo, increased pool to 25, added structured error logging in handler.",
-    "type": "bugfix",
-    "project": "myapp",
-    "topic_key": "bugfix/users-500-db-load"
-  }
-}
-```
-
-### Resumen del Flujo de Datos
-
-```
-recall ──▶ (sin contexto previo)
-              │
-search ──▶ handler/users.go, service/user_service.go, db/pool.go
-              │
-read_symbol ──▶ código fuente de UserHandler.List
-              │
-get_references ──▶ 3 sitios de llamada para UserService.GetAll
-              │
-read_symbol ──▶ código fuente de UserService.GetAll (sin timeout visible)
-              │
-build_context ──▶ contexto completo de la capa DB (config del pool, impl del repo)
-              │
-    ┌─────────┘
-    ▼
-Razonamiento del agente: sin deadline + pool chico = agotamiento bajo carga
-    │
-    ▼
-El agente escribe la corrección ──▶ 4 archivos modificados
-    │
-    ▼
-remember ──▶ persistido para sesiones futuras
-```
-
----
-
-## Historial de Sesión
-
-DevAI rastrea cada llamada a herramientas dentro de una sesión. Los agentes pueden revisar sus propias acciones usando `get_session_history`.
-
-**Por qué importa:** Cuando el contexto de un agente se compacta (la conversación del LLM se resume para ahorrar tokens), pierde el registro detallado de lo que hizo. El historial de sesión provee un log de verdad absoluta que sobrevive a la compactación.
-
-**Qué se registra:**
-
-- Nombre de la herramienta y parámetros de cada llamada
-- Timestamp
-- Resumen del resultado
-- ID de sesión (estable durante la sesión, cambia entre sesiones)
-
-**Uso típico:**
-
-```json
-{
-  "tool": "get_session_history",
-  "params": {
-    "session_id": "current",
-    "limit": 20
-  }
-}
-```
-
-Esto devuelve las últimas 20 llamadas a herramientas en la sesión actual. El agente puede usar esto para:
-
-- Verificar que no haya buscado algo ya (evitar trabajo duplicado)
-- Revisar qué encontró antes de que el contexto se compactara
-- Construir un resumen de acciones tomadas para el usuario
-
----
-
-## Configurando el Acceso del Agente
-
-### Setup Automático
-
-```bash
-devai server configure claude    # Claude Code
-devai server configure cursor    # Cursor
-devai server configure --all     # Todos los clientes detectados
-```
-
-Esto escribe la entrada del servidor MCP en el archivo de configuración del cliente. El agente puede llamar a las herramientas de DevAI inmediatamente — sin necesidad de editar JSON manualmente.
-
-### Qué Se Configura
-
-- Comando del servidor MCP: `devai server mcp`
-- Directorio de trabajo: la raíz del repositorio actual
-- Entorno: `DEVAI_STATE_DIR` apuntando a `.devai/state/`
-- Modo de almacenamiento: auto-detectado desde `.devai/config.yaml`
-
-### Verificando la Conexión
-
-Después de la configuración, pedile al agente que ejecute una llamada de herramienta simple:
-
-```
-"Buscá la función main en este codebase"
-```
-
-Si DevAI está conectado, el agente va a llamar a `search(query: "main function entry point")` y devolver resultados. Si no, va a caer a lecturas de archivo — una señal clara de que la conexión MCP no está activa.
-
----
-
-> **DevAI está en alpha.** Los parámetros de herramientas y los schemas de respuesta pueden cambiar entre versiones. Consultá la [Referencia de Herramientas MCP](03-conceptos-fundamentales/integracion-mcp.md) para los schemas actuales.
+**Suponer que el reranking ayudaría.** Está apagado por defecto porque se midió:
+dos órdenes de magnitud más lento, y el único modelo evaluado contra la suite
+empeoró los resultados. Ver [ADR-15](08-decisiones-de-diseno.md).
