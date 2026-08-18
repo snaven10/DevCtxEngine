@@ -62,8 +62,37 @@ pub fn write_serve_file(cfg: &ProjectConfig, addr: SocketAddr, token: Option<&st
 }
 
 /// Remove the discovery file (best effort).
+///
+/// Unconditional, so only for callers that have established the advertised
+/// server is gone — [`reclaim_db`] and [`stop_server`], which kill it first and
+/// wait for it to exit. A server tidying up after *itself* must use
+/// [`remove_own_serve_file`].
 pub fn remove_serve_file(cfg: &ProjectConfig) {
     let _ = std::fs::remove_file(serve_file(cfg));
+}
+
+/// Remove the discovery file only while it still advertises this process.
+///
+/// A server that fails to start — the port taken, the database held by the
+/// server already running — used to delete the file on its way out, and the
+/// file it deleted belonged to that healthy server. The healthy one kept
+/// running, advertised nowhere, so every later command failed to discover it,
+/// fell back to opening the database directly, and hit the lock it was holding.
+/// The CLI was then unusable until someone found the process and killed it by
+/// pid, with nothing on screen connecting the two.
+///
+/// Checking the pid makes the tidy-up idempotent under a race: whoever owns the
+/// file removes it, and a loser removes nothing.
+pub fn remove_own_serve_file(cfg: &ProjectConfig) {
+    let path = serve_file(cfg);
+    let ours = std::fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ServeInfo>(&raw).ok())
+        .and_then(|info| info.pid)
+        .is_some_and(|pid| pid == std::process::id());
+    if ours {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// A reachable server we can route requests to.
@@ -444,4 +473,56 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_at(dir: &Path) -> ProjectConfig {
+        let mut c = ProjectConfig::default();
+        c.project.path = dir.to_string_lossy().to_string();
+        c.storage.db_path = dir.join("index.duckdb").to_string_lossy().to_string();
+        c
+    }
+
+    fn advertise(cfg: &ProjectConfig, pid: u32) {
+        let info = ServeInfo {
+            addr: "127.0.0.1:1".into(),
+            token: None,
+            pid: Some(pid),
+        };
+        let path = serve_file(cfg);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&info).unwrap()).unwrap();
+    }
+
+    /// The failure this exists to prevent: a server that could not start used to
+    /// delete the discovery file of the healthy one that beat it to the port.
+    /// The healthy server kept running, advertised nowhere, and every later
+    /// command fell back to opening the database it was holding.
+    #[test]
+    fn a_losing_server_does_not_delete_the_winners_advertisement() {
+        let dir = std::env::temp_dir().join(format!("devctx_serve_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+
+        // Someone else owns the file: a pid that is not ours.
+        advertise(&cfg, std::process::id() + 1);
+        remove_own_serve_file(&cfg);
+        assert!(
+            serve_file(&cfg).exists(),
+            "another process's advertisement must survive"
+        );
+
+        // Our own, on the other hand, is ours to clean up.
+        advertise(&cfg, std::process::id());
+        remove_own_serve_file(&cfg);
+        assert!(!serve_file(&cfg).exists(), "our own must go");
+
+        // And with no file at all it is a no-op rather than an error.
+        remove_own_serve_file(&cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

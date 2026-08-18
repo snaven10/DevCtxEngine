@@ -1207,7 +1207,7 @@ fn cmd_api(addr: String, token: Option<String>) -> Result<()> {
     remote::reclaim_db(&cfg); // take over the DB from any auto-spawned daemon
     remote::write_serve_file(&cfg, socket, token.as_deref())?;
     let result = devctx_api::run_blocking(cfg.clone(), socket, token, None);
-    remote::remove_serve_file(&cfg);
+    remote::remove_own_serve_file(&cfg);
     result
 }
 
@@ -1230,7 +1230,9 @@ fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Resu
 
     let idle = (idle > 0).then(|| std::time::Duration::from_secs(idle));
     let result = devctx_api::run_blocking(cfg.clone(), socket, token, idle);
-    remote::remove_serve_file(&cfg);
+    // Only if it is still ours: a server that failed to bind must not delete
+    // the file belonging to the healthy one that beat it to the port.
+    remote::remove_own_serve_file(&cfg);
     result
 }
 
@@ -1273,7 +1275,7 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
 
     let idle = (idle > 0).then(|| std::time::Duration::from_secs(idle));
     let result = devctx_api::central::run_blocking(central, socket, token, idle);
-    devctx_central::client::remove_serve_file(&paths);
+    devctx_central::client::remove_own_serve_file(&paths);
     result
 }
 
@@ -1303,7 +1305,7 @@ fn cmd_web(addr: String, no_open: bool) -> Result<()> {
     remote::write_serve_file(&cfg, socket, None)?;
     // No token: the dashboard runs locally and needs unauthenticated access.
     let result = devctx_api::run_blocking(cfg.clone(), socket, None, None);
-    remote::remove_serve_file(&cfg);
+    remote::remove_own_serve_file(&cfg);
     result
 }
 

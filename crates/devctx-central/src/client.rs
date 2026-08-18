@@ -72,8 +72,30 @@ pub fn write_serve_file(paths: &CentralPaths, addr: SocketAddr, token: Option<&s
 }
 
 /// Remove the discovery file (best effort).
+///
+/// Unconditional: only for callers that have already established the advertised
+/// daemon is gone. A daemon tidying up after itself must use
+/// [`remove_own_serve_file`].
 pub fn remove_serve_file(paths: &CentralPaths) {
     let _ = std::fs::remove_file(serve_file(paths));
+}
+
+/// Remove the discovery file only while it still advertises this process.
+///
+/// The central store is a singleton, so a second daemon starting always loses —
+/// and on its way out it used to delete the file belonging to the winner. The
+/// winner then ran on, advertised nowhere, while every client fell back to
+/// opening the database it was holding.
+pub fn remove_own_serve_file(paths: &CentralPaths) {
+    let path = serve_file(paths);
+    let ours = std::fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ServeInfo>(&raw).ok())
+        .and_then(|info| info.pid)
+        .is_some_and(|pid| pid == std::process::id());
+    if ours {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Discover a running central daemon and confirm it answers.
@@ -347,6 +369,14 @@ impl CentralClient {
             .and_then(|m| m.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Permanently delete a shared memory. `false` means it was not there.
+    pub fn forget_memory(&self, id: &str) -> Result<bool> {
+        let v = self.delete(&format!("/memory/{}", urlencode(id)))?;
+        Ok(v.get("forgotten")
+            .and_then(|f| f.as_bool())
+            .unwrap_or(false))
     }
 
     /// Every live shared memory, for a backfill sweep.
