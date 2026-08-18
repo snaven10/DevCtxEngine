@@ -19,10 +19,10 @@ Two consequences worth internalising:
 - Anything git ignores never reaches the index, so `.gitignore` is the first
   place to control what gets indexed.
 
-## 1. The post-commit hook
+## 1. The git hooks
 
-The cheapest automation that works. It fires exactly when the commit diff has
-something new to look at, needs no process running, and costs nothing when idle.
+The cheapest automation that works. They fire exactly when the diff has
+something new to look at, need no process running, and cost nothing when idle.
 
 ```bash
 devctx hooks install
@@ -30,8 +30,24 @@ devctx hooks status
 devctx hooks uninstall
 ```
 
-The body is written between markers, so an existing `post-commit` hook is
-extended rather than replaced, and removing ours leaves yours untouched:
+**Two hooks are installed, and the second one is the one people miss:**
+
+| Hook | Fires on |
+|---|---|
+| `post-commit` | your own commits |
+| `post-merge` | merges **and fast-forward pulls** |
+
+`post-commit` does not run on a merge or on a `git pull` — git uses `post-merge`
+for both. Installing only `post-commit` leaves the index stale exactly after you
+merge a PR or pull someone else's work, which is when it is most likely to be
+asked a question it can no longer answer correctly.
+
+Still uncovered: rebase, checkout and reset. Those are rare enough that
+re-indexing by hand is the honest answer, rather than a third and fourth hook.
+`devctx hooks status` says so.
+
+The body is written between markers, so an existing hook is extended rather
+than replaced, and removing ours leaves yours untouched:
 
 ```sh
 #!/bin/sh
@@ -42,8 +58,12 @@ make lint                       # yours, kept
 # <<< devctx (managed) <<<
 ```
 
-It is detached and `|| true`: a commit must never wait on indexing, and must
-never fail because of it. Re-running `install` refreshes the block in place.
+It is detached and `|| true`: git must never wait on indexing, and must never
+fail because of it. Re-running `install` refreshes the block in place — which is
+also how an older install that predates `post-merge` picks it up.
+
+Uninstall handles each hook independently: a `post-commit` that also runs your
+linter keeps the linter, while a `post-merge` that was ours alone is deleted.
 
 ## 2. `devctx watch`
 

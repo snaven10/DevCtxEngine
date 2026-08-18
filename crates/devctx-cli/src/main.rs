@@ -327,11 +327,11 @@ enum Command {
 /// Actions under `devctx hooks`.
 #[derive(Debug, Subcommand)]
 enum HooksAction {
-    /// Install the `post-commit` hook (safe to re-run).
+    /// Install the `post-commit` and `post-merge` hooks (safe to re-run).
     Install,
-    /// Remove the hook, leaving any of your own hook code in place.
+    /// Remove them, leaving any of your own hook code in place.
     Uninstall,
-    /// Report whether the hook is installed.
+    /// Report which hooks are installed and what they do not cover.
     Status,
 }
 
@@ -603,28 +603,37 @@ fn cmd_watch(debounce: u64) -> Result<()> {
     watch::run(&cfg, &root, std::time::Duration::from_secs(debounce.max(1)))
 }
 
-/// `devctx hooks` — manage the post-commit indexing hook.
+/// `devctx hooks` — manage the git hooks that keep the index fresh.
 fn cmd_hooks(action: HooksAction) -> Result<()> {
     let cfg = load_project()?;
     let root = project_root(&cfg)?;
     match action {
         HooksAction::Install => {
-            let path = hooks::install(&root)?;
-            println!("Installed the post-commit hook at {}", path.display());
-            println!("This repository now re-indexes itself after each commit.");
+            for path in hooks::install(&root)? {
+                println!("Installed {}", path.display());
+            }
+            println!(
+                "This repository now re-indexes itself after a commit, and after \
+                 a merge or fast-forward pull."
+            );
         }
         HooksAction::Uninstall => {
             if hooks::uninstall(&root)? {
-                println!("Removed the post-commit hook.");
+                println!("Removed the DevCtxEngine hooks.");
             } else {
                 println!("No DevCtxEngine hook was installed.");
             }
         }
         HooksAction::Status => {
-            if hooks::installed(&root)? {
-                println!("Installed: this repository re-indexes after each commit.");
+            let status = hooks::status(&root)?;
+            for (hook, present) in &status {
+                println!("  {hook:<12} {}", if *present { "installed" } else { "missing" });
+            }
+            if status.iter().all(|(_, p)| *p) {
+                println!("Covered: commits, merges and fast-forward pulls.");
+                println!("Not covered: rebase, checkout, reset — re-index by hand there.");
             } else {
-                println!("Not installed (run `devctx hooks install`).");
+                println!("Run `devctx hooks install` to add what is missing (safe to re-run).");
             }
         }
     }

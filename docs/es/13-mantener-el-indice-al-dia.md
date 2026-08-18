@@ -20,11 +20,11 @@ Dos consecuencias que conviene interiorizar:
 - Lo que git ignora nunca llega al índice, así que `.gitignore` es el primer
   sitio donde controlar qué se indexa.
 
-## 1. El hook post-commit
+## 1. Los hooks de git
 
-La automatización más barata que funciona de verdad. Dispara exactamente cuando
-el diff de commits tiene algo nuevo que mirar, no necesita ningún proceso vivo, y
-no cuesta nada mientras no pasa nada.
+La automatización más barata que funciona de verdad. Disparan exactamente cuando
+el diff tiene algo nuevo que mirar, no necesitan ningún proceso vivo, y no
+cuestan nada mientras no pasa nada.
 
 ```bash
 devctx hooks install
@@ -32,8 +32,24 @@ devctx hooks status
 devctx hooks uninstall
 ```
 
-El cuerpo se escribe entre marcadores, así que un `post-commit` que ya tuvieras se
-amplía en vez de reemplazarse, y quitar el nuestro deja el tuyo intacto:
+**Se instalan dos hooks, y el segundo es el que se le pasa a todo el mundo:**
+
+| Hook | Dispara en |
+|---|---|
+| `post-commit` | tus propios commits |
+| `post-merge` | merges **y pulls fast-forward** |
+
+`post-commit` NO corre en un merge ni en un `git pull` — git usa `post-merge`
+para los dos. Instalar solo `post-commit` deja el índice viejo justo después de
+mergear un PR o de traerte el trabajo de otro, que es cuando más probable es que
+le hagas una pregunta que ya no puede responder bien.
+
+Sigue sin cubrirse: rebase, checkout y reset. Son lo bastante raros como para que
+re-indexar a mano sea la respuesta honesta, en vez de un tercer y cuarto hook.
+`devctx hooks status` te lo dice.
+
+El cuerpo se escribe entre marcadores, así que un hook que ya tuvieras se amplía
+en vez de reemplazarse, y quitar el nuestro deja el tuyo intacto:
 
 ```sh
 #!/bin/sh
@@ -44,8 +60,13 @@ make lint                       # el tuyo, conservado
 # <<< devctx (managed) <<<
 ```
 
-Va desacoplado y con `|| true`: un commit no debe esperar al indexado, ni fallar
-por su culpa. Volver a ejecutar `install` refresca el bloque en su sitio.
+Va desacoplado y con `|| true`: git no debe esperar al indexado, ni fallar por su
+culpa. Volver a ejecutar `install` refresca el bloque en su sitio — y así es como
+una instalación vieja, anterior a `post-merge`, se lo agrega.
+
+El uninstall trata cada hook por separado: un `post-commit` que además corre tu
+linter conserva el linter, mientras que un `post-merge` que era solo nuestro se
+elimina.
 
 ## 2. `devctx watch`
 
