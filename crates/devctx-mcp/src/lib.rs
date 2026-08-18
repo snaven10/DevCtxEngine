@@ -226,6 +226,25 @@ struct MemoriesByFileReq {
     limit: Option<usize>,
 }
 
+/// Parameters for the `memory_forget` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct MemoryForgetReq {
+    /// The memory id, as reported by `remember` or `recall`.
+    id: String,
+}
+
+/// Parameters for the `memory_move` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct MemoryMoveReq {
+    /// The memory id to move.
+    id: String,
+    /// Where to: `local`, `group`, `global`, or the name of another registered
+    /// project (see `list_projects`).
+    to: String,
+}
+
 /// Parameters for the `memory_refs` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -630,6 +649,32 @@ impl DevctxServer {
     ) -> Result<String, ErrorData> {
         let backend = self.bound()?;
         run_blocking(move || backend.memories_by_file(&req.file, req.limit.unwrap_or(10))).await
+    }
+
+    /// Delete one memory for good.
+    #[tool(description = "Permanently delete a memory — a wrong root cause, a \
+        decision since reversed. Looks in this project and in the shared store, \
+        so the id is enough. Not reversible.")]
+    async fn memory_forget(
+        &self,
+        Parameters(req): Parameters<MemoryForgetReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.bound()?;
+        run_blocking(move || backend.memory_forget(&req.id)).await
+    }
+
+    /// Move a memory to another tier or repository.
+    #[tool(description = "Move a memory to another tier (`local`, `group`, \
+        `global`) or to another registered project by name. Use it when a \
+        memory is invisible where it is needed or noise where it is not. The id \
+        changes, because it is derived from the project and the content — the \
+        new one is in the result.")]
+    async fn memory_move(
+        &self,
+        Parameters(req): Parameters<MemoryMoveReq>,
+    ) -> Result<String, ErrorData> {
+        let backend = self.bound()?;
+        run_blocking(move || backend.memory_move(&req.id, &req.to)).await
     }
 
     /// What code a memory concerns.

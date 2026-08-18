@@ -9,10 +9,10 @@ use serde_json::{json, Value};
 
 use crate::state::{
     do_backfill_links, do_build_context, do_impact, do_index, do_index_status, do_list_projects,
-    do_memories_by_file, do_memories_by_symbol, do_memory_context, do_memory_refs, do_memory_stats,
-    do_read_file, do_read_symbol, do_recall_scoped, do_references, do_remember, do_remember_shared,
-    do_routes_for_handler, do_search, do_search_project, do_search_routes, do_summarize,
-    parse_mode, AppState,
+    do_memories_by_file, do_memories_by_symbol, do_memory_context, do_memory_forget,
+    do_memory_move, do_memory_refs, do_memory_stats, do_read_file, do_read_symbol,
+    do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
+    do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -267,6 +267,22 @@ impl Backend {
         match self {
             Backend::Local(s) => do_impact(s, symbol, depth),
             Backend::Remote(r, _) => r.get(&format!("/impact/{}?depth={depth}", urlencode(symbol))),
+        }
+    }
+
+    /// Delete one memory for good, wherever it lives.
+    pub fn memory_forget(&self, id: &str) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_memory_forget(s, id),
+            Backend::Remote(r, _) => r.post("/memory/forget", json!({ "id": id })),
+        }
+    }
+
+    /// Move a memory to another tier, or another repository.
+    pub fn memory_move(&self, id: &str, to: &str) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_memory_move(s, id, to),
+            Backend::Remote(r, _) => r.post("/memory/move", json!({ "id": id, "to": to })),
         }
     }
 

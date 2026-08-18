@@ -1409,6 +1409,181 @@ pub fn do_backfill_links(
     .to_string())
 }
 
+/// `memory_forget` tool: delete one memory for good, wherever it lives.
+///
+/// An agent that can write a memory and not unwrite one accumulates its own
+/// mistakes: a wrong root cause, a decision that was reversed an hour later. It
+/// looks up both tiers because the id alone does not say which store holds it,
+/// and the caller — reading an id out of a recall result — has no reason to know.
+pub fn do_memory_forget(state: &AppState, id: &str) -> Result<String, String> {
+    if let Ok(store) = state.open_store() {
+        if store.forget_memory(id).unwrap_or(false) {
+            return Ok(json!({ "id": id, "forgotten": true, "from": "project" }).to_string());
+        }
+    }
+    // Not local, or this project's store could not be opened: the shared store
+    // is as likely to hold it, and only the daemon may touch that one.
+    match central() {
+        Ok(c) => {
+            let gone = c.forget_memory(id).map_err(|e| e.to_string())?;
+            Ok(json!({ "id": id, "forgotten": gone, "from": "shared" }).to_string())
+        }
+        Err(e) => Err(format!(
+            "`{id}` is not in this project, and the shared store is unreachable: {e}"
+        )),
+    }
+}
+
+/// `memory_move` tool: move a memory to another tier, or another repository.
+///
+/// A memory saved local that a sibling repository needs, or global when it only
+/// ever concerned one product, is in the wrong place — invisible where it is
+/// wanted, or noise where it is not. Rewriting it by hand loses its history and
+/// usually its `files`.
+///
+/// Written to the destination **before** the original is removed. The other
+/// order trades a recoverable duplicate for an unrecoverable loss, and there is
+/// no version of this worth losing a memory over.
+pub fn do_memory_move(state: &AppState, id: &str, to: &str) -> Result<String, String> {
+    let m = load_memory_anywhere(state, id)?;
+
+    // `local`, `group` and `global` are tiers of this project. Anything else is
+    // read as the name of another registered project.
+    let created = match to {
+        "local" => {
+            let store = state.open_store()?;
+            let req = RememberRequest {
+                title: m.title.clone(),
+                content: m.content.clone(),
+                memory_type: m.memory_type.clone(),
+                project: state.project(),
+                topic_key: m.topic_key.clone(),
+                tags: m.tags.clone(),
+                files: m.files.clone(),
+                repo: m.repo.clone(),
+                branch: m.branch.clone(),
+                now: now_epoch(),
+                ..Default::default()
+            };
+            let embedder = state.embedder()?;
+            let res = remember(&store, embedder.as_ref(), &req).map_err(|e| e.to_string())?;
+            devctx_memory::links::link_memory(&store, &res.memory);
+            res.memory.id
+        }
+        "group" | "global" => {
+            let group = if to == "group" {
+                let g = state.group_name();
+                if g.is_empty() {
+                    return Err(
+                        "this project declares no group; set `project.group` or move to `global`"
+                            .into(),
+                    );
+                }
+                g
+            } else {
+                String::new()
+            };
+            let out = do_remember_shared(
+                state,
+                &m.content,
+                &m.title,
+                &m.memory_type,
+                &m.topic_key,
+                &m.tags,
+                &group,
+                &m.files,
+            )?;
+            serde_json::from_str::<Value>(&out)
+                .ok()
+                .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .unwrap_or_default()
+        }
+        project => move_to_project(project, &m)?,
+    };
+
+    if created.is_empty() {
+        return Err(format!(
+            "the destination `{to}` did not report a new id; nothing was removed"
+        ));
+    }
+    // Only now is it safe to drop the original.
+    let removed = do_memory_forget(state, id).is_ok();
+    Ok(json!({
+        "moved": id,
+        "to": to,
+        "new_id": created,
+        "original_removed": removed,
+        // The id is derived from the project and the content, so moving a
+        // memory necessarily renames it. A caller holding the old one needs to
+        // be told rather than left to discover it.
+        "note": "the id changes with the tier: it is derived from project + content",
+    })
+    .to_string())
+}
+
+/// Read a memory from this project's store, else the shared one.
+fn load_memory_anywhere(state: &AppState, id: &str) -> Result<devctx_store::Memory, String> {
+    if let Ok(store) = state.open_store() {
+        if let Ok(Some(m)) = store.get_memory(id) {
+            if m.deleted_at.is_none() {
+                return Ok(m);
+            }
+        }
+    }
+    let c = central()?;
+    let v = c
+        .memories_by_id(&[id.to_string()])
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no memory `{id}` in this project or the shared store"))?;
+    serde_json::from_value(v).map_err(|e| format!("reading `{id}`: {e}"))
+}
+
+/// Hand a memory to another registered project, by running `remember` inside it.
+///
+/// The same route `search_project` takes: that project's database belongs to
+/// its own server, and reaching across to write it directly is how two writers
+/// end up on one DuckDB file.
+fn move_to_project(project: &str, m: &devctx_store::Memory) -> Result<String, String> {
+    let row = central()?
+        .show(project)
+        .map_err(|e| format!("{project}: {e}"))?;
+    let path = row
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("no path recorded for `{project}`"))?;
+
+    let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    cmd.args(["remember", &m.content, "--type", &m.memory_type]);
+    if !m.title.is_empty() {
+        cmd.args(["--title", &m.title]);
+    }
+    if !m.topic_key.is_empty() {
+        cmd.args(["--topic", &m.topic_key]);
+    }
+    if !m.tags.is_empty() {
+        cmd.args(["--tags", &m.tags]);
+    }
+    if !m.files.is_empty() {
+        cmd.args(["--files", &m.files]);
+    }
+    let out = cmd.current_dir(path).output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "`{project}` refused the memory: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // `remember` prints `<status>: <id> — <title>`.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("mem_"))
+        .unwrap_or_default()
+        .to_string())
+}
+
 /// `memory_context` tool: the most recent memories, with no query.
 ///
 /// The recovery path, not the search path. After a context reset an agent does

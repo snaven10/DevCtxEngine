@@ -51,6 +51,7 @@ fn router(api: CentralApi) -> Router {
         .route("/memories/by-id", post(memories_by_id))
         .route("/memories/mentioning", post(memories_mentioning))
         .route("/memory/stats", get(memory_stats))
+        .route("/memory/:id", delete(forget_memory))
         .layer(middleware::from_fn_with_state(api.clone(), auth))
         .with_state(api)
 }
@@ -464,6 +465,15 @@ async fn recall(State(api): State<CentralApi>, Json(b): Json<RecallBody>) -> Res
 ///
 /// Ids that no longer exist are simply absent from the answer: a junction row
 /// outliving the memory it points at is expected, not an error.
+/// Permanently delete one shared memory and its vectors.
+async fn forget_memory(State(api): State<CentralApi>, Path(id): Path<String>) -> Response {
+    run(api, move |c| {
+        let gone = c.store().forget_memory(&id).map_err(|e| e.to_string())?;
+        Ok(json!({ "id": id, "forgotten": gone }).to_string())
+    })
+    .await
+}
+
 async fn memories_by_id(State(api): State<CentralApi>, Json(body): Json<ByIdBody>) -> Response {
     run(api, move |c| {
         let mut out = Vec::new();
