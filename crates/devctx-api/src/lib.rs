@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_backfill_links, do_build_context, do_graph, do_impact, do_index, do_index_paths,
+    do_backfill_links, do_build_context, do_graph, do_impact, do_index_on, do_index_paths,
     do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
     do_memories_by_symbol, do_memory_context, do_memory_refs, do_memory_stats, do_read_file,
     do_read_symbol, do_recall_scoped, do_references, do_remember, do_remember_shared,
@@ -247,6 +247,10 @@ struct IndexBody {
     /// Index exactly these repo-relative paths instead of a commit diff.
     #[serde(default)]
     paths: Option<Vec<String>>,
+    /// The branch to index; absent means the project's declared default, then
+    /// whatever is checked out.
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -430,7 +434,10 @@ async fn index(State(api): State<Api>, Json(b): Json<IndexBody>) -> Response {
     if let Some(paths) = b.paths.filter(|p| !p.is_empty()) {
         return run(api.state, move |s| do_index_paths(s, &paths)).await;
     }
-    run(api.state, move |s| do_index(s, b.full.unwrap_or(false))).await
+    run(api.state, move |s| {
+        do_index_on(s, b.full.unwrap_or(false), b.branch.clone())
+    })
+    .await
 }
 
 /// How far the current indexing run has got.

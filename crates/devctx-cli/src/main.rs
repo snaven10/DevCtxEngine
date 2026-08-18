@@ -699,7 +699,7 @@ fn reindex_one(root: &std::path::Path, full: bool) -> Result<String> {
     let Some(r) = remote::ensure(&cfg) else {
         bail!("could not reach or start a server for this project");
     };
-    let raw = r.index(full)?;
+    let raw = r.index(full, None)?;
     let v: serde_json::Value = serde_json::from_str(&raw).context("parsing the index result")?;
     Ok(format!(
         "{} @ {} — {} files, {} symbols, {} chunks ({} skipped)",
@@ -2776,7 +2776,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         // from one that has barely started, and on a large repository both look
         // exactly like a hang.
         let ticker = ServerProgress::start(r.clone(), "indexing on the server");
-        let out = r.index(full);
+        let out = r.index(full, branch.as_deref());
         ticker.stop();
         println!("{}", out?);
         return Ok(());

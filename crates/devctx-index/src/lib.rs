@@ -261,6 +261,31 @@ mod tests {
         );
     }
 
+    /// Re-indexing a branch is the ordinary operation, not an edge case, and it
+    /// used to abort the whole run: the copy path inserted graph edges without
+    /// clearing the destination's, so the second pass collided with the
+    /// uniqueness constraint. Every test here indexed each branch exactly once,
+    /// which is why a fixture cleaner than reality kept passing.
+    #[test]
+    fn a_branch_can_be_indexed_twice() {
+        let dir = two_branch_repo("twice");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+
+        let first = index_branch(&store, &dir, "feature", true);
+        assert!(first.files_indexed > 0);
+        // The pass that used to fail.
+        let second = index_branch(&store, &dir, "feature", true);
+        assert_eq!(
+            second.files_indexed, first.files_indexed,
+            "a repeat of the same work must produce the same result"
+        );
+
+        // And it is a replacement, not an accumulation.
+        assert_eq!(files_on(&store, "feature"), vec!["a.py", "b.py"]);
+        assert_eq!(files_on(&store, "main"), vec!["a.py", "b.py"]);
+    }
+
     /// Branches share commits, so the file they share must not be embedded
     /// twice — that is what makes keeping several branches indexed affordable.
     #[test]

@@ -513,19 +513,31 @@ fn cap_whole_file(content: &str, budget_tokens: usize) -> String {
 
 /// `index_repo` tool: run the pipeline and return a summary.
 pub fn do_index(state: &AppState, full: bool) -> Result<String, String> {
-    do_index_inner(state, full, None)
+    do_index_inner(state, full, None, None)
+}
+
+/// Index a named branch. `None` falls back to the project's declared default,
+/// then to whatever is checked out.
+///
+/// Separate from [`do_index`] because the routed path used to drop the branch
+/// on the floor: `devctx index --branch X` with a server running indexed the
+/// server's branch instead, and said nothing. A caller asking for a specific
+/// branch and silently getting another is worse than an error.
+pub fn do_index_on(state: &AppState, full: bool, branch: Option<String>) -> Result<String, String> {
+    do_index_inner(state, full, None, branch)
 }
 
 /// Index exactly these repo-relative paths — what a file watcher needs, since a
 /// save moves no commit and the commit diff would therefore be empty.
 pub fn do_index_paths(state: &AppState, paths: &[String]) -> Result<String, String> {
-    do_index_inner(state, false, Some(paths))
+    do_index_inner(state, false, Some(paths), None)
 }
 
 fn do_index_inner(
     state: &AppState,
     full: bool,
     paths: Option<&[String]>,
+    branch: Option<String>,
 ) -> Result<String, String> {
     let store = state.open_store()?;
     let embedder = state.embedder()?;
@@ -534,7 +546,9 @@ fn do_index_inner(
     // be checked out, so running `index` from a linked worktree keeps the
     // repository's trunk fresh instead of quietly indexing the worktree's
     // branch into the same store — which is how two branches end up mixed.
-    let target_branch = state.default_branch();
+    // An explicit request wins over the project's default, which wins over the
+    // checked-out branch.
+    let target_branch = branch.or_else(|| state.default_branch());
     let run = index_run(IndexRequest {
         store: &store,
         embedder: embedder.as_ref(),

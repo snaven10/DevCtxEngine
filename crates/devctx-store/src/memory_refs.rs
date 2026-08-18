@@ -364,27 +364,57 @@ impl Store {
         let chunks = points.len();
         self.upsert(&points)?;
 
-        // The call graph travels with the code: a branch whose file is
-        // byte-identical has the same calls in it, and leaving them behind
-        // would make `impact` answer "nothing calls this" on that branch.
-        self.conn.execute(
-            "INSERT INTO graph_edges
-                 (source, target, kind, source_file, target_file, line, repo, branch, metadata)
-             SELECT source, target, kind, source_file, target_file, line, repo, ?, metadata
+        // Read the edges and routes out, then hand them to the writers that
+        // already own those tables. An `INSERT ... SELECT` with a bound
+        // parameter in the select list looked tidier and bound the parameter
+        // somewhere other than where it was written: rows landed under the
+        // *source* branch, collided with what was already there, and aborted
+        // the run with a uniqueness violation naming a branch this pass was not
+        // even writing to. Reading into Rust makes the values explicit, and
+        // `replace_*` already does the delete-then-insert this needs.
+        let mut stmt = self.conn.prepare(
+            "SELECT source, target, kind, source_file, line
              FROM graph_edges
              WHERE repo = ? AND branch = ? AND source_file = ?",
-            params![to_branch, repo, from_branch, file],
         )?;
-        self.conn.execute(
-            "INSERT INTO routes
-                 (framework, http_method, path, handler_class, handler_method,
-                  handler_symbol, file, line, repo, branch, indexed_at)
-             SELECT framework, http_method, path, handler_class, handler_method,
-                    handler_symbol, file, line, repo, ?, indexed_at
-             FROM routes
-             WHERE repo = ? AND branch = ? AND file = ?",
-            params![to_branch, repo, from_branch, file],
+        let edges: Vec<crate::graph::StoredEdge> = stmt
+            .query_map(params![repo, from_branch, file], |r| {
+                Ok(crate::graph::StoredEdge {
+                    source: r.get(0)?,
+                    target: r.get(1)?,
+                    kind: r.get(2)?,
+                    source_file: r.get(3)?,
+                    line: r.get::<_, Option<i32>>(4)?.unwrap_or(0),
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        self.replace_file_edges(repo, to_branch, file, &edges)?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT framework, http_method, path, handler_class, handler_method,
+                    handler_symbol, file, line, indexed_at
+             FROM routes WHERE repo = ? AND branch = ? AND file = ?",
         )?;
+        let mut stamp = String::new();
+        let routes: Vec<crate::routes::StoredRoute> = stmt
+            .query_map(params![repo, from_branch, file], |r| {
+                if stamp.is_empty() {
+                    stamp = r.get::<_, Option<String>>(8)?.unwrap_or_default();
+                }
+                Ok(crate::routes::StoredRoute {
+                    framework: r.get(0)?,
+                    http_method: r.get(1)?,
+                    path: r.get(2)?,
+                    handler_class: r.get(3)?,
+                    handler_method: r.get(4)?,
+                    handler_symbol: r.get(5)?,
+                    file: r.get(6)?,
+                    line: r.get::<_, Option<i32>>(7)?.unwrap_or(0),
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        self.replace_file_routes(repo, to_branch, file, &routes, &stamp)?;
+
         Ok((language, symbols.len(), chunks))
     }
 

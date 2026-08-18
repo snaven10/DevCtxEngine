@@ -308,8 +308,11 @@ impl Remote {
         self.get("/status")
     }
 
-    pub fn index(&self, full: bool) -> Result<String> {
-        self.post("/index", serde_json::json!({ "full": full }))
+    pub fn index(&self, full: bool, branch: Option<&str>) -> Result<String> {
+        self.post(
+            "/index",
+            serde_json::json!({ "full": full, "branch": branch }),
+        )
     }
 
     /// Index an explicit path list (what the watcher sends).
