@@ -3,8 +3,8 @@
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
-/// A chunk of source ready to be embedded. Mirrors the legacy `CodeChunk`
-/// (minus the vector, which is produced later in the index pipeline).
+/// A chunk of source ready to be embedded — everything but the vector, which
+/// the index pipeline produces later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     /// Chunk text (context header + body).
@@ -50,7 +50,7 @@ impl Chunk {
     }
 }
 
-/// Configuration for the semantic chunker (defaults mirror the legacy values).
+/// Configuration for the semantic chunker.
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkConfig {
     /// Target upper bound (tokens) before a function is split into blocks.
@@ -71,7 +71,9 @@ impl Default for ChunkConfig {
     }
 }
 
-/// Rough token estimate: ~4 characters per token (matches the legacy heuristic).
+/// Rough token estimate: ~4 characters per token. A heuristic, not a tokenizer —
+/// deliberately crude, since every use of it is a budget guard rather than an
+/// accounting figure.
 pub fn estimate_tokens(text: &str) -> usize {
     text.chars().count() / 4
 }

@@ -1,8 +1,8 @@
 //! The semantic multi-level chunker: file → class → function → block.
 //!
 //! Never splits mid-symbol. Small symbols are grouped; large functions are split
-//! into block chunks that re-include the signature line. Mirrors the legacy
-//! `semantic_chunker.py` (rewrite plan §3).
+//! into block chunks that re-include the signature line. See
+//! `docs/architecture-spec.md` §3.
 
 use std::path::Path;
 

@@ -1,7 +1,7 @@
 //! Extractive summarizer: rank sentences by similarity to a query (or the first
 //! sentence) using the embedding model, pack to a token budget, restore order.
-//! Preserves identifiers exactly (whole sentences are selected). Mirrors the
-//! legacy default summarizer (rewrite plan §7).
+//! Preserves identifiers exactly (whole sentences are selected) — which is why
+//! it is the default for code. See `docs/architecture-spec.md` §7.
 
 use std::sync::Arc;
 

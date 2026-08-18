@@ -3,7 +3,8 @@
 //! A [`Reranker`] reorders search candidates by relevance to the query. The
 //! local backend (default `local` feature) uses fastembed BGE cross-encoders;
 //! when disabled or turned off it falls back to [`NoopReranker`] (identity order),
-//! mirroring the legacy FlashRank→noop degradation. See rewrite plan §6.
+//! so a missing or failing reranker narrows nothing — it just leaves the
+//! retriever's order alone. See `docs/architecture-spec.md` §6.
 
 pub mod error;
 pub mod provider;

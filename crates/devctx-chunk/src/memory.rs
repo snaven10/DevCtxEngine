@@ -2,8 +2,8 @@
 //!
 //! A memory is embedded as an intro vector (`memory`, title + whole content) plus
 //! sliding body-window vectors (`memory_chunk`, title prepended). The first window
-//! is skipped because the intro already covers the start. Mirrors the legacy
-//! `memory_chunker.py` (rewrite plan §3); recall blends intro + best chunk.
+//! is skipped because the intro already covers the start. See
+//! `docs/architecture-spec.md` §3; recall blends intro + best chunk.
 
 /// A single memory chunk to embed.
 #[derive(Debug, Clone, PartialEq, Eq)]

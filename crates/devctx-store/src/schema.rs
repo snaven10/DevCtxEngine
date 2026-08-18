@@ -1,5 +1,5 @@
 //! DuckDB schema (DDL). Parameterized by embedding dimension for the `vectors`
-//! table. Mirrors the legacy LanceDB/SQLite schema (rewrite plan §4).
+//! table. See `docs/architecture-spec.md` §4.
 //!
 //! Note: `commit` is a DuckDB keyword, so it is always double-quoted.
 

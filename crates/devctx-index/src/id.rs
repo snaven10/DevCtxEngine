@@ -6,10 +6,10 @@ use sha2::{Digest, Sha256};
 
 /// Deterministic id for a code chunk: `sha256("{repo}:{branch}:{file}:{line}:{ordinal}")[:32]`.
 ///
-/// The legacy scheme keyed on `(repo, branch, file, start_line)` only; the
-/// `ordinal` disambiguates chunks that share a start line (e.g. the file-level
-/// chunk and a top-of-file symbol), so no chunk is lost. Since the shared-store
-/// sync that depended on cross-store id equality was dropped, ids are internal.
+/// `ordinal` is what keeps two chunks that share a start line apart — the
+/// file-level chunk and a top-of-file symbol, say — so neither is lost to the
+/// other. Keying on `(repo, branch, file, start_line)` alone silently dropped
+/// one of them. Ids are internal: nothing outside this store depends on them.
 pub fn chunk_id(repo: &str, branch: &str, file: &str, start_line: u32, ordinal: usize) -> String {
     let key = format!("{repo}:{branch}:{file}:{start_line}:{ordinal}");
     let digest = Sha256::digest(key.as_bytes());

@@ -1,6 +1,6 @@
 //! Model registry — pure data mapping model keys to dimensions and backends.
 //!
-//! Mirrors the legacy `MODEL_REGISTRY` (rewrite plan §5). Deliberately free of
+//! See `docs/architecture-spec.md` §5. Deliberately free of
 //! any `fastembed`/`ort` types so it compiles and tests without the `local`
 //! feature. `local.rs` maps [`LocalModelSpec::builtin`] onto fastembed models.
 

@@ -1,7 +1,7 @@
 //! fastembed-backed cross-encoder reranker.
 //!
-//! fastembed ships four rerankers and none is `ms-marco-MiniLM-L-12-v2`, the
-//! lightweight cross-encoder the legacy FlashRank pipeline defaulted to. The
+//! fastembed ships four rerankers and none of them is lightweight: the
+//! `ms-marco-MiniLM-L-12-v2` class of cross-encoder is absent entirely. The
 //! built-ins are all heavyweight — `bge-reranker-base` is an XLM-RoBERTa whose
 //! 250k-token vocabulary alone puts it past a gigabyte on disk — and reranking
 //! is already the most expensive stage of a search by two orders of magnitude.

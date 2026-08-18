@@ -1,8 +1,8 @@
 //! Framework-aware HTTP route extraction (regex-based).
 //!
 //! Best-effort extractors for FastAPI, Flask, Express, NestJS, Spring, Quarkus
-//! (JAX-RS) and Angular router configs. Mirrors the legacy `*_routes.py`
-//! (rewrite plan §4). The framework is auto-detected from extension + content;
+//! (JAX-RS) and Angular router configs. See `docs/architecture-spec.md` §3.
+//! The framework is auto-detected from extension + content;
 //! class-level prefixes are applied where a single one is evident.
 
 use std::path::Path;
