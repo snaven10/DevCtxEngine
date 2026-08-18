@@ -70,4 +70,10 @@ done < "$CACHE"
 # The label goes in front once rather than beside each repository: with two or
 # three indexing at the same time, repeating the verb is what pushes the line
 # past the width anyone reads.
-[ -n "$out" ] && printf '⚙ indexando %s' "$out"
+# The verb follows DEVCTX_LANG, the same switch the help text uses, so a status
+# line does not end up half in one language.
+case "${DEVCTX_LANG:-en}" in
+  es) verb="indexando" ;;
+  *)  verb="indexing" ;;
+esac
+[ -n "$out" ] && printf '⚙ %s %s' "$verb" "$out"

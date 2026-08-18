@@ -114,7 +114,7 @@ prints a bar for every project currently indexing — and nothing at all the res
 of the time, so it costs no room when there is nothing to report:
 
 ```
-⚙ indexando REVFA_FrontEnd ████████░░ 82% (1561/1895)
+⚙ indexing  web-app ████████░░ 82% (1561/1895)
 ```
 
 Paste this to your agent:
