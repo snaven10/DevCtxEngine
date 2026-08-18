@@ -1,8 +1,8 @@
 //! Project configuration: the `.devctx/config.yaml` schema and discovery.
 //!
-//! This is the Rust-native, solo-local config for the DuckDB rewrite. It mirrors
-//! the fields of the legacy Go `ProjectConfig` that still apply, and drops the
-//! Qdrant / shared-mode / Python-runtime fields (see docs/rust-rewrite-plan.md §7).
+//! Local-first by design: there is no shared vector store and no remote
+//! runtime, so the schema carries only what a single machine needs
+//! (see `docs/architecture-spec.md` §7).
 
 use std::path::{Path, PathBuf};
 

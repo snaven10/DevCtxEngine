@@ -1,6 +1,6 @@
 //! `devctx-core` — shared types, configuration and errors for the DevCtxEngine Rust rewrite.
 //!
-//! See `docs/rust-rewrite-plan.md` for the overall architecture. This crate is
+//! See `docs/architecture-spec.md` for the overall architecture. This crate is
 //! dependency-light on purpose: every other crate builds on top of it.
 
 pub mod config;

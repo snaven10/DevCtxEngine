@@ -35,4 +35,3 @@
 - [Benchmark de tokens y costo (MCP)](10-benchmark-tokens-mcp.md) — A/B real: recuperación filtrada MCP vs volcado bruto
 - [El store central](12-store-central.md) — Registro de proyectos y memoria global compartida entre repos
 - [Mantener el índice al día](13-mantener-el-indice-al-dia.md) — hooks, watch, reindex y el planificador
-- [Changelog](../../CHANGELOG.md) — Historial de cambios

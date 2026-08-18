@@ -1,9 +1,10 @@
 //! `devctx-store` — DuckDB-backed persistence for DevCtxEngine.
 //!
-//! F1: vector store (brute-force cosine) + full schema. See
-//! `docs/rust-rewrite-plan.md` §4. The HNSW/VSS index is deferred to F8;
-//! `array_cosine_distance` over `FLOAT[N]` columns is a core DuckDB function
-//! and needs no extension.
+//! Vector store + full schema. See `docs/architecture-spec.md` §4.
+//! `array_cosine_distance` over `FLOAT[N]` is a core DuckDB function and needs
+//! no extension, so brute-force search always works; the HNSW (VSS) and BM25
+//! (FTS) indexes are opt-in accelerators, dropped before a bulk load and
+//! rebuilt after.
 
 mod error;
 mod graph;

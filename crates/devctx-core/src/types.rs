@@ -1,8 +1,8 @@
 //! Shared domain types for vectors, chunks and search.
 //!
-//! These mirror the canonical vector-record schema used by the legacy
-//! LanceDB/Qdrant stores (see `docs/rust-rewrite-plan.md` §4.1) so the DuckDB
-//! store can preserve exact parity of IDs, metadata columns and semantics.
+//! These mirror the canonical chunk schema (see
+//! `docs/architecture-spec.md` §4.1), so IDs, metadata columns and semantics
+//! stay consistent between the indexer and the store.
 
 use serde::{Deserialize, Serialize};
 

@@ -3,8 +3,9 @@
 //! Orchestrates git diff → parse → chunk → embed → store with deterministic
 //! chunk ids and incremental `index_state`/`file_state`. Parseable code also
 //! yields call-graph edges + routes; raw-text files (markdown/json/yaml/…) are
-//! indexed as file-spanning chunks. See `docs/rust-rewrite-plan.md` §8 (F4).
-//! Stale full-reindex cleanup is a follow-up.
+//! indexed as file-spanning chunks. Branch-aware: rows whose `content_hash`
+//! matches an already-indexed branch are copied rather than re-embedded.
+//! See `docs/architecture-spec.md` §9.
 
 pub mod error;
 pub mod git;

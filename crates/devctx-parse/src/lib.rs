@@ -4,7 +4,7 @@
 //! Go, Java and Rust, plus call-graph edges with FQN receiver resolution
 //! (self/type/field-type maps) and framework HTTP route extraction. Extension-based
 //! language detection covers parseable + raw-text files. See
-//! `docs/rust-rewrite-plan.md` §4.
+//! `docs/architecture-spec.md` §3.
 
 pub mod error;
 pub mod lang;

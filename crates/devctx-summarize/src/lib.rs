@@ -3,7 +3,7 @@
 //! Providers: `extractive` (default; ranks sentences with the embedding model,
 //! offline, $0), `openai` (abstractive, cloud), and `noop` (truncate). A local
 //! abstractive backend (flan-t5) is a follow-up. A privacy guard (`require_local`)
-//! blocks non-local providers by default. See `docs/rust-rewrite-plan.md` §7.
+//! blocks non-local providers by default. See `docs/architecture-spec.md` §7.
 
 pub mod error;
 mod extractive;

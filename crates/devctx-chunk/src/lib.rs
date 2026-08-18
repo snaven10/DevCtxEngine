@@ -2,7 +2,7 @@
 //!
 //! Turns a parsed file (`devctx-parse`) plus its source into embeddable chunks at
 //! file / class / function / block level, never splitting mid-symbol. See
-//! `docs/rust-rewrite-plan.md` §3.
+//! `docs/architecture-spec.md` §3.
 
 mod chunk;
 mod chunker;

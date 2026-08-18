@@ -1,8 +1,9 @@
 //! `devctx-mcp` — Model Context Protocol server (stdio) exposing DevCtxEngine to agents.
 //!
-//! F6: a starter tool set over the indexing pipeline — `search`, `read_file`,
-//! `index_repo`, `index_status`. Memory/route/graph tools follow. Built on the
-//! official `rmcp` SDK. See `docs/rust-rewrite-plan.md` §8 (F6).
+//! 23 tools over the indexing pipeline: code (`search`, `read_file`,
+//! `read_symbol`, `get_references`, `impact_analysis`, `summarize`), routes,
+//! memory, and project/index management. Built on the official `rmcp` SDK.
+//! See `docs/architecture-spec.md` §8 for the process model.
 
 pub mod backend;
 pub mod state;

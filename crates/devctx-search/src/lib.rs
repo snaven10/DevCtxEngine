@@ -2,7 +2,7 @@
 //! (Reciprocal Rank Fusion of both), with optional cross-encoder reranking.
 //!
 //! Centralizes the logic shared by the CLI and the MCP server. See
-//! `docs/rust-rewrite-plan.md` §6.
+//! `docs/architecture-spec.md` §6.
 
 use std::collections::HashMap;
 

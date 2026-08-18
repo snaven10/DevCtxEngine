@@ -12,7 +12,7 @@
 //!
 //! Long operations (indexing above all) run on a worker thread and report back
 //! over a channel, so the event loop never blocks and the UI never freezes.
-//! Reranking is skipped for responsiveness. See `docs/rust-rewrite-plan.md`.
+//! Reranking is skipped for responsiveness. See `docs/architecture-spec.md`.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};

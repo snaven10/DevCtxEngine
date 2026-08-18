@@ -2,7 +2,7 @@
 //!
 //! Every route delegates to the same `do_*` handlers the MCP server uses, which
 //! return JSON strings. Optional Bearer-token auth guards all routes except
-//! `/health`. See `docs/rust-rewrite-plan.md`.
+//! `/health`. See `docs/architecture-spec.md`.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

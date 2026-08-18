@@ -2,7 +2,7 @@
 
 **Estado**: done
 **Fecha**: 2026-08-12
-**Proyecto(s)**: devai-context-engine
+**Proyecto(s)**: DevCtxEngine
 
 ## Objetivo
 

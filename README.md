@@ -2,8 +2,7 @@
 
 A local-first code context engine in Rust + DuckDB: incremental semantic
 indexing, hybrid search, an MCP server, an HTTP API and a TUI. See
-[`docs/rust-rewrite-plan.md`](docs/rust-rewrite-plan.md) for the architecture and
-phased plan.
+[`docs/architecture-spec.md`](docs/architecture-spec.md) for the architecture.
 
 > **This is the Rust rewrite of [snaven10/devai-context-engine](https://github.com/snaven10/devai-context-engine)**
 > — the original Go + Python implementation. See [Lineage](#lineage) for what
@@ -294,8 +293,10 @@ The real contract between them was a **JSON-RPC 2.0 bridge over stdio** — abou
 - **Incremental, with parity.** Built module by module, each phase verified
   against the Go/Python binary as the reference.
 
-The full reasoning, the dependency mapping, and the phase breakdown live in
-[`docs/rust-rewrite-plan.md`](docs/rust-rewrite-plan.md).
+The full reasoning, with the cost of each decision, is in
+[`docs/08-design-decisions.md`](docs/08-design-decisions.md); the system it
+describes is specified in
+[`docs/architecture-spec.md`](docs/architecture-spec.md).
 
 ## License
 

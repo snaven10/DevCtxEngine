@@ -3,7 +3,7 @@
 //! Local models run via `fastembed`/`ort` (behind the default `local` feature);
 //! OpenAI/Voyage/custom run over HTTP. All providers implement
 //! [`EmbeddingProvider`] and expose a fixed [`dimension`](EmbeddingProvider::dimension).
-//! See `docs/rust-rewrite-plan.md` §5.
+//! See `docs/architecture-spec.md` §5.
 
 use std::path::PathBuf;
 

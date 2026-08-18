@@ -17,7 +17,7 @@ devctx index --full
 `init` asks for the embedding model. **Answer it carefully** — it is the one
 decision that cannot be changed later without re-indexing everything and
 re-embedding every memory. If the code or its comments are not in English, pick
-a multilingual model. See [Models and Tuning](09-models-and-tuning.md).
+a multilingual model. See [Models and Tuning](../09-models-and-tuning.md).
 
 Then check what you got:
 
