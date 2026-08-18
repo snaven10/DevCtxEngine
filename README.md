@@ -106,6 +106,40 @@ If your setup supports a persistent instruction file — `CLAUDE.md`, `AGENTS.md
 a system prompt — put the pointer there instead, so it survives past this
 conversation.
 
+### Watch it index from your status line
+
+Indexing a large repository takes minutes, and a status line is the one place
+that can say so without being asked. [`contrib/statusline-devctx.sh`](contrib/statusline-devctx.sh)
+prints a bar for every project currently indexing — and nothing at all the rest
+of the time, so it costs no room when there is nothing to report:
+
+```
+⚙ indexando REVFA_FrontEnd ████████░░ 82% (1561/1895)
+```
+
+Paste this to your agent:
+
+> Set up the DevCtxEngine indexing progress indicator in my Claude Code status
+> line, using `contrib/statusline-devctx.sh` from
+> https://github.com/snaven10/DevCtxEngine.
+>
+> I may already have a status line configured — check `statusLine` in
+> `~/.claude/settings.json` first. If I do, **add to it, do not replace it**,
+> and back the original up before editing. Give the progress its own row rather
+> than appending to an existing one: those rows already carry a model, a
+> directory and a branch name, and a bar tacked on the end is the first thing a
+> terminal truncates — which is the only part that changes second to second.
+> The row must appear only while something is indexing.
+>
+> Then verify it by actually indexing something (`devctx index --full` in a
+> registered project) and running the status line command by hand while that
+> runs. A script that exits zero proves it ran, not that it printed anything.
+
+The script asks each project's server for its progress over HTTP, caches the
+project list so it does not wake the central daemon on every render, and gives
+each request a quarter-second timeout — an unreachable server costs a moment,
+not a hung prompt.
+
 ## Across projects
 
 Each repository keeps its own index. What is shared lives in a **central store**:
