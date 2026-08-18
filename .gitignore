@@ -6,7 +6,6 @@
 
 # DevCtxEngine local state / caches
 .devctx/
-.devai/
 .fastembed_cache/
 *.db
 *.duckdb

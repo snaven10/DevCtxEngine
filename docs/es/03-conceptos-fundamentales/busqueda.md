@@ -1,238 +1,220 @@
-> 🌐 [English version](../../03-core-concepts/search.md)
+# Búsqueda semántica de código
 
-# Busqueda Semantica de Codigo
+> 🇬🇧 [Read in English](../../03-core-concepts/search.md)
 
-## Que es
+Encontrar código describiendo lo que hace, no adivinando cómo se llama.
 
-> **Nota — esta página es anterior a la reescritura en Rust** y describe la
-> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
-> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
-> Referencias actuales: [Arquitectura](../02-arquitectura.md),
-> [Configuración](../11-configuracion.md).
+---
 
-La busqueda de DevAI es un motor de busqueda semantica de codigo. Entiende el **significado** de tu consulta, no solo las palabras clave. Cuando buscas "authentication middleware", encuentra la clase `AuthGuard`, la funcion `verifyJWT` y el decorator `requirePermissions` — aunque ninguno de ellos contenga la palabra "authentication".
+## Qué es
 
-## Por que existe
+`devctx search` responde una pregunta en prosa — *"dónde decidimos que un token
+expiró"* — con los fragmentos de código que más probablemente contengan la
+respuesta. Hay tres estrategias de recuperación, y una es la predeterminada:
 
-`grep` encuentra texto. DevAI encuentra **intencion**.
+```bash
+devctx search "manejo de token expirado"          # vectorial (default)
+devctx search "token expirado" --keyword          # BM25
+devctx search "token expirado" --hybrid           # ambas, fusionadas
+```
 
-| Enfoque | Consulta: "retry logic for failed API calls" |
+Los agentes llegan a lo mismo por la herramienta MCP `search`.
+
+## Por qué existe
+
+Grep encuentra la cadena que escribiste. Eso funciona cuando ya conocés el
+vocabulario del repositorio y falla justo cuando no — un proyecto nuevo, un
+subsistema que nunca abriste, un concepto que tres equipos escribieron de tres
+formas distintas (`isExpired`, `checkTTL`, `validateWindow`).
+
+La búsqueda vectorial encuentra *significado*, así que llega a la tercera forma
+partiendo de la primera. La búsqueda por palabra clave encuentra el token
+literal, que es lo que querés para un mensaje de error o un identificador que
+copiaste de un stack trace. Ninguna es estrictamente mejor, y por eso están las
+dos — y por eso existe la híbrida.
+
+## Cómo funciona
+
+### El pipeline
+
+Indexar convierte archivos en fragmentos embebibles:
+
+```
+git diff → parse (tree-sitter) → chunk → embed → store (DuckDB)
+```
+
+Cada etapa vive en su propio crate: `devctx-parse`, `devctx-chunk`,
+`devctx-embed`, `devctx-store`. Todo corre en proceso — no hay sidecar ni salto
+de red, salvo que configures un proveedor de embeddings por API.
+
+### Niveles de chunk
+
+El chunker nunca parte un símbolo por la mitad. Emite fragmentos en cinco
+niveles, y cuáles produce un archivo depende de lo que tenga adentro:
+
+| Nivel | Qué contiene |
 |---|---|
-| **grep/ripgrep** | Coincide con archivos que contienen "retry" o "API" literalmente. No encuentra `exponentialBackoff()`, `withRetries()`, ni un loop con `catch` y `setTimeout`. |
-| **Busqueda DevAI** | Devuelve la clase `RetryPolicy`, la funcion `fetchWithBackoff` y el middleware de manejo de errores — rankeados por relevancia semantica. |
+| `file` | Un fragmento resumen: la ruta más los símbolos declarados |
+| `class` | Un contenedor — `class`, `struct`, `enum`, `trait`, `interface` — con su firma y miembros |
+| `doc` | La prosa de un símbolo documentado, cuando el comentario dice algo que el nombre no |
+| `function` | Un invocable, entero |
+| `block` | Una porción de una función demasiado grande para embeber como un solo fragmento |
 
-La diferencia importa a escala. En un codebase de 500k lineas, grep te da ruido. La busqueda semantica te da respuestas.
+Dos comportamientos vale la pena conocerlos porque cambian lo que recibís:
 
-## Como funciona internamente
+- **Los símbolos chicos se agrupan.** Todo lo que baja de `min_chunk_tokens`
+  (64) se fusiona con sus vecinos en un fragmento en vez de embeberse solo — un
+  archivo de getters de una línea produce un puñado de fragmentos, no doscientos.
+- **Un comentario que solo repite el nombre no genera fragmento.**
+  `/// El nombre.` arriba de `fn nombre()` no aporta nada que el fragmento de la
+  función no tenga.
 
-### El pipeline de indexacion
+Valores por defecto, de `ChunkConfig`:
 
-Cuando ejecutas `devai index` (o la indexacion se dispara automaticamente), esto es lo que pasa:
+| Ajuste | Default | Significado |
+|---|---|---|
+| `max_chunk_tokens` | 512 | Cota superior antes de partir una función en bloques |
+| `min_chunk_tokens` | 64 | Por debajo de esto, los símbolos se agrupan |
+| `large_function_threshold` | 1024 | Por encima, la función se parte en fragmentos de bloque |
 
-```
-  git diff (desde el ultimo commit indexado)
-       │
-       ▼
-  Tree-sitter AST Parse (25+ lenguajes)
-       │
-       ▼
-  Chunking Semantico en 4 Niveles
-       │
-       ▼
-  Embedding (sentence-transformers, 384-dim)
-       │
-       ▼
-  Almacenamiento (LanceDB / Qdrant)
-       │
-       ▼
-  Symbol Graph (aristas en SQLite)
-```
+Los tokens se estiman a ~4 caracteres por token. Es una heurística, no un
+tokenizador.
 
-Cada paso es deterministico e incremental. Solo los archivos modificados se reprocesan. Un reindex completo ocurre unicamente cuando cambia el modelo de embedding.
+### Headers de contexto
 
-### Los 4 niveles de chunk
-
-El codigo no es texto plano. Un archivo tiene estructura: imports, clases, funciones, bloques de control de flujo. DevAI respeta esta estructura haciendo chunking en cuatro niveles semanticos:
-
-#### Nivel 1: Archivo
-
-El chunk a nivel de archivo captura la forma general — imports, declaraciones de nivel superior y una lista de simbolos. Pensalo como una tabla de contenidos.
+A un fragmento `function` o `block` se le antepone una línea de miga de pan
+antes de embeberlo:
 
 ```
-# auth/middleware.py
-import jwt
-from flask import request, abort
-from .models import User, Permission
-
-# Symbols: AuthMiddleware, require_auth, require_permission, decode_token
+# auth/middleware.rs > AuthMiddleware > authenticate
 ```
 
-#### Nivel 2: Clase
+Sin ella, el cuerpo de un método se lee como código anónimo. Con ella, el
+embedding carga dónde vive el código, así que una consulta que nombra el módulo
+o el tipo puede encontrar un cuerpo que no menciona ninguno de los dos.
 
-Cada clase obtiene su propio chunk: firma, campos, firmas de metodos. Suficiente para entender que **es** la clase sin leer el cuerpo de cada metodo.
+### Hash de contenido
 
-```
-# auth/middleware.py > AuthMiddleware
-class AuthMiddleware:
-    secret_key: str
-    token_header: str = "Authorization"
+Cada fragmento lleva `content_hash` — sha256 de su texto, truncado a 16
+caracteres hexadecimales. Eso es lo que hace barato re-indexar: un fragmento con
+hash sin cambios no se vuelve a embeber. También es lo que hace barato indexar
+varias ramas, ya que las ramas comparten la abrumadora mayoría del contenido de
+sus archivos.
 
-    def authenticate(self, request) -> User: ...
-    def authorize(self, user, permission) -> bool: ...
-    def refresh_token(self, token) -> str: ...
-```
+## Los tres modos
 
-#### Nivel 3: Funcion
+### Vectorial — el default
 
-Cada funcion o metodo se convierte en su propio chunk. Aca es donde aterrizan la mayoria de los resultados de busqueda.
+La consulta se embebe con el mismo modelo que embebió el código, y el store
+devuelve los vecinos más cercanos por distancia coseno (HNSW cuando el índice
+está construido, si no un escaneo).
 
-```
-# auth/middleware.py > AuthMiddleware > authenticate
-def authenticate(self, request) -> User:
-    token = request.headers.get(self.token_header)
-    if not token:
-        abort(401, "Missing authentication token")
-    payload = jwt.decode(token, self.secret_key, algorithms=["HS256"])
-    return User.from_payload(payload)
-```
+### Palabra clave — BM25
 
-#### Nivel 4: Bloque
+Búsqueda de texto completo sobre el texto de los fragmentos, servida por la
+extensión FTS de DuckDB. Exacta, rápida, y la elección correcta para mensajes de
+error e identificadores.
 
-Las funciones grandes (> 512 tokens) se dividen en los limites de control de flujo: `if/else`, `for`, `try/catch`, `match`. Cada bloque conserva el header de contexto de su padre para que nunca quede huerfano.
+### Híbrida — fusión por rango recíproco
+
+Corren los dos recuperadores y se fusionan sus listas ordenadas:
 
 ```
-# auth/middleware.py > AuthMiddleware > authenticate > try-block
-try:
-    payload = jwt.decode(token, self.secret_key, algorithms=["HS256"])
-    if payload.get("exp") < time.time():
-        raise ExpiredTokenError()
-    return User.from_payload(payload)
+score(item) = Σ  1 / (k + rango)     k = 60, el rango empieza en 1
 ```
 
-**Restricciones:** maximo 512 tokens, minimo 64 tokens por chunk. Los chunks por debajo de 64 tokens se fusionan hacia arriba con su padre.
+Un ítem bien rankeado por cualquiera de los dos aparece; un ítem bien rankeado
+por ambos aparece más arriba. RRF fusiona *rangos*, no puntajes, así que no
+necesita calibrar entre dos sistemas cuyos números significan cosas distintas.
 
-### Headers de contexto (Breadcrumbs)
+Si el índice FTS no fue construido, la híbrida degrada en silencio a solo
+vectorial en vez de fallar.
 
-Cada chunk lleva un header de contexto que muestra su posicion en la jerarquia del codigo:
+## Reranking
 
-```
-file > class > method > block
-auth/middleware.py > AuthMiddleware > authenticate > try-block
-```
+Un cross-encoder puede reordenar el pool de candidatos antes de truncarlo a
+`--limit`. **Está apagado por defecto, y ese default lo puso la medición, no el
+gusto.** En este repositorio:
 
-Esto significa que los resultados de busqueda siempre muestran DONDE vive un chunk en el codebase, no solo el codigo en si.
+| Configuración | Latencia | Memoria residente |
+|---|---|---|
+| Sin reranking | 30 ms | 406 MB |
+| El cross-encoder más barato | 8.6 s | 2.4 GB |
+| `bge-reranker-base` | 30 s | 3.4 GB |
 
-### IDs deterministicos
+Y el único modelo medido contra todo el banco de pruebas empeoró los
+resultados — bajó una respuesta correcta del primer puesto al vigésimo primero.
 
-Cada chunk recibe un ID estable y deterministico:
+Dos cosas que entender antes de encenderlo:
 
-```
-sha256("myrepo:main:auth/middleware.py:42")[:32]
-```
+- **El pool es el techo.** Un reranker reordena lo que le entregan y nada más.
+  Una respuesta rankeada por debajo de `reranking.pool` le es invisible, por
+  bueno que sea el modelo.
+- **El pool también es todo el costo.** El cross-encoder es la etapa más lenta
+  por dos órdenes de magnitud, y el tamaño del pool lo multiplica. Pool profundo
+  con modelo chico y rápido, o pool corto con modelo grande. Profundo *y* grande
+  es inusable.
 
-Formato: `sha256(repo:branch:file:line)[:32]`
+El pool por defecto es 20. `--no-rerank` lo desactiva para una búsqueda sin
+importar la configuración.
 
-Esto habilita upserts reales. Cuando una funcion cambia, el chunk en esa ubicacion es **reemplazado**, no duplicado. Cuando una funcion se elimina, su chunk se remueve. Sin huerfanos, sin duplicados, sin necesidad de garbage collection.
+Rerankers incluidos: `bge-base` (default), `bge-v2-m3` (multilingüe),
+`jina-turbo` (el más rápido). Poné `reranking.model_dir` para cargar tu propio
+cross-encoder ONNX — vale la pena, porque fastembed no trae ninguno liviano y
+los incluidos pasan todos del gigabyte.
 
-## Indexacion incremental
+## Modelos de embedding
 
-DevAI trackea el SHA del ultimo commit indexado por repositorio. En ejecuciones posteriores:
+`devctx models` lista lo disponible. El default actual para proyectos nuevos es
+`ml-granite` (384 dimensiones, multilingüe, la mejor recuperación en CPU).
 
-```
-  Ultimo indexado: a1b2c3d
-  HEAD actual:     e4f5g6h
-       │
-       ▼
-  git diff a1b2c3d..e4f5g6h --name-only
-       │
-       ▼
-  Solo reparsear + re-embeddear archivos modificados
-       │
-       ▼
-  Upsert de chunks (los IDs deterministicos manejan las actualizaciones)
-```
+**Elegí antes del primer índice.** Cambiar el modelo después significa
+re-indexar cada archivo y re-embeber cada memoria, porque los vectores de dos
+modelos no viven en el mismo espacio.
 
-En la practica, indexar un repo de 200 archivos toma ~30 segundos la primera vez y <2 segundos en actualizaciones incrementales.
+Si tu código o tus comentarios no están en inglés, elegí un modelo multilingüe.
+Los modelos en inglés van a embeber español con toda felicidad — solo que mal.
 
-Un reindex completo se fuerza unicamente cuando cambia el modelo de embedding (porque todos los vectores deben recalcularse para mantener consistencia).
+## Conciencia de ramas
 
-## Busqueda consciente de branches
+Los fragmentos se guardan por `(repo, rama)`. Una búsqueda devuelve resultados
+de la rama en la que estás, así que un símbolo borrado en tu rama no aparece
+desde `main`.
 
-DevAI no crea indices separados por branch. En su lugar, usa una estrategia de **overlay**:
+Las ramas que querés indexadas se declaran en la configuración bajo
+`indexing.branches`, y `devctx index --branch <nombre>` indexa una en concreto.
+Como la copia la maneja `content_hash`, indexar una segunda rama copia en vez de
+re-embeber todo lo que las dos comparten — medido en 95–96% de los archivos
+sobre tres repositorios reales.
 
-```
-  main (completamente indexado)
-    │
-    ├── feature/auth (overlay: 3 archivos modificados)
-    │
-    └── feature/payments (overlay: 7 archivos modificados)
-```
+Indexar es independiente del worktree: corrélo desde cualquiera y actualiza el
+mismo índice.
 
-Cuando buscas en `feature/auth`:
-1. Los resultados del overlay de `feature/auth` tienen prioridad
-2. Los resultados de `main` llenan el resto
-3. Los archivos eliminados en el branch se filtran (tombstones)
+## Filtros
 
-Esto significa que los cambios de branch son instantaneos — no se requiere reindexacion. Solo los archivos modificados en el branch se indexan como overlay.
+`--language <lang>` restringe a un lenguaje. `--limit` limita resultados
+(default 10). `--format json` emite un arreglo JSON en vez de la tabla.
 
-## Proveedores de embedding
+## Ejemplo trabajado
 
-| Proveedor | Modelo | Dimensiones | Velocidad | Costo |
-|---|---|---|---|---|
-| **Local** (default) | `all-MiniLM-L6-v2` | 384 | ~500 chunks/seg | Gratis |
-| OpenAI | `text-embedding-3-small` | 384* | ~2000 chunks/seg | $0.02/1M tokens |
-| Voyage | `voyage-code-2` | 1024 | ~1500 chunks/seg | $0.12/1M tokens |
-| Custom | Cualquier modelo sentence-transformers | Variable | Variable | Variable |
-
-*La dimensionalidad es configurable; DevAI trunca para coincidir con el indice.
-
-El proveedor local es el default y el recomendado para la mayoria de los casos de uso. Corre enteramente en CPU, no requiere API keys, y es lo suficientemente rapido para repos de hasta ~1M lineas.
-
-## Cuando se usa
-
-- **MCP `search` tool**: Llamado por agentes de IA (Claude Code, Cursor) para encontrar codigo relevante
-- **`devai search` CLI**: Busqueda directa por linea de comandos
-- **Context builder**: Internamente usa busqueda para ensamblar contexto para consultas
-- **Indexacion**: Automaticamente con `devai index` o disparada por herramientas MCP
-
-## Ejemplo: Buscando "authentication middleware"
-
-Esto es lo que pasa internamente cuando vos (o un agente de IA) buscas "authentication middleware":
-
-```
-1. EMBEDDEAR CONSULTA
-   "authentication middleware"
-      → sentence-transformers encode
-      → [0.12, -0.34, 0.56, ...] (vector de 384 dimensiones)
-
-2. BUSQUEDA VECTORIAL (LanceDB)
-   Encontrar los top-K chunks mas cercanos al vector de consulta
-   Filtro: repo="myapp", branch="main" (+ overlays)
-
-   Resultados (rankeados por similitud coseno):
-   ┌──────┬──────────────────────────────────────────┬───────┐
-   │ Rank │ Chunk                                    │ Score │
-   ├──────┼──────────────────────────────────────────┼───────┤
-   │  1   │ auth/middleware.py > AuthMiddleware       │ 0.92  │
-   │  2   │ auth/decorators.py > require_auth         │ 0.87  │
-   │  3   │ auth/jwt.py > verify_token                │ 0.84  │
-   │  4   │ tests/test_auth.py > TestAuthMiddleware   │ 0.79  │
-   │  5   │ config/security.py > AUTH_CONFIG           │ 0.71  │
-   └──────┴──────────────────────────────────────────┴───────┘
-
-3. RETORNO
-   Cada resultado incluye:
-   - ruta del archivo + rango de lineas
-   - header de contexto (breadcrumb)
-   - contenido del codigo
-   - score de similitud
-   - tipo de simbolo + lenguaje
+```bash
+$ devctx search "cómo decidimos que un token expiró" --limit 3
 ```
 
-La operacion completa toma 10-50ms para un codebase tipico. Sin I/O de archivos en tiempo de consulta — todo son vectores pre-indexados.
+1. La consulta se embebe (vector de 384 dimensiones, `ml-granite`).
+2. El store devuelve los 20 fragmentos más cercanos para este repo y rama.
+3. Con reranking apagado, se devuelven los 3 primeros en el orden del
+   recuperador.
+
+El primer resultado suele ser un fragmento `function` cuyo header de contexto
+nombra el tipo y el módulo — que es cómo una consulta que dice "token" encuentra
+un método llamado `sigue_valido`.
 
 ## Modelo mental
 
-Pensa en la busqueda de DevAI como **Google para tu codebase**. Google no matchea tu consulta palabra por palabra contra paginas web — entiende lo que estas buscando y encuentra paginas que son semanticamente relevantes. DevAI hace lo mismo, pero para codigo: entiende que "retry logic" y `exponentialBackoff()` tratan sobre el mismo concepto, aunque no compartan ninguna palabra clave.
+Grep es un índice de **cadenas**. Esto es un índice de **significado**, con un
+índice de cadenas al lado y una forma de fusionar los dos.
 
-El pipeline de indexacion es como el web crawler de Google: visita cada archivo, entiende su estructura (via tree-sitter AST), lo divide en chunks significativos, y almacena representaciones vectoriales. Al momento de la consulta, tu pregunta en lenguaje natural se convierte al mismo espacio vectorial y se matchea contra el indice. Rapido, preciso y mantenido incrementalmente.
+Usá búsqueda vectorial cuando sabés qué *hace* el código. Usá palabra clave
+cuando sabés cómo se *llama*. Usá híbrida cuando no estás seguro — que, en un
+repositorio desconocido, es la mayoría del tiempo.

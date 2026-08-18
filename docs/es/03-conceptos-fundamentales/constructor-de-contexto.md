@@ -1,240 +1,134 @@
-> 🌐 [English version](../../03-core-concepts/context-builder.md)
+# Constructor de contexto
 
-# Constructor de Contexto
+> 🇬🇧 [Read in English](../../03-core-concepts/context-builder.md)
 
-## Que es
-
-> **Nota — esta página es anterior a la reescritura en Rust** y describe la
-> implementación previa en Go + Python. Los conceptos siguen siendo válidos en su
-> mayoría; los comandos, la disposición de ficheros y las variables `DEVAI_*` no.
-> Referencias actuales: [Arquitectura](../02-arquitectura.md),
-> [Configuración](../11-configuracion.md).
-
-El constructor de contexto es un motor de ensamblado consciente del presupuesto de tokens. Dada una consulta en lenguaje natural y un presupuesto de tokens, reune el codigo y las memorias mas relevantes, los deduplica y rankea, y produce un unico documento markdown que cabe dentro del presupuesto. Es el puente entre los indices de DevAI y la ventana de contexto de un LLM.
-
-## Por que existe
-
-Los LLMs tienen ventanas de contexto finitas. Enviar "todo lo potencialmente relevante" desperdicia tokens en contenido de bajo valor y desplaza el codigo que realmente importa. Enviar muy poco deja al LLM adivinando.
-
-El constructor de contexto resuelve esto actuando como un **bibliotecario inteligente**: sabe que hay en la biblioteca (indice de codigo + memorias), entiende lo que estas pidiendo (busqueda semantica), y arma una lista de lectura que entra en tu presupuesto de tiempo (limite de tokens) — priorizada por relevancia.
-
-| Enfoque | Resultado |
-|---|---|
-| **Volcar archivos enteros** | Revienta la ventana de contexto. 3 archivos = 12k tokens de ruido por 200 tokens de senal. |
-| **Enviar resultados de busqueda crudos** | Sin deduplicacion. Sin enriquecimiento de memoria. Sin consciencia de presupuesto. Puede incluir 15 chunks del mismo archivo. |
-| **Constructor de contexto** | Enriquecido con memorias, deduplicado, ajustado al presupuesto, rankeado por relevancia. Cada token se gana su lugar. |
-
-## Como funciona internamente
-
-### El algoritmo
-
-```
-  Consulta: "refactorizar el modulo de pagos"
-  Presupuesto: 8000 tokens (default, configurable)
-       │
-       ▼
-  ┌─────────────────────────────────────┐
-  │  PASO 1: Enriquecimiento con       │
-  │          memorias                   │
-  │  Buscar memorias para la consulta   │
-  │  Tomar hasta 5 memorias relevantes  │
-  │  Extraer pistas de archivos         │
-  │  de las memorias                    │
-  │  Presupuesto consumido: ~800 tokens │
-  └──────────────┬──────────────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────────────────┐
-  │  PASO 2: Busqueda de codigo         │
-  │  Busqueda semantica con presupuesto │
-  │  restante (~7200 tokens)            │
-  │  Limite: 30 chunks maximo           │
-  │  Las pistas de archivos de memorias │
-  │  mejoran el ranking                 │
-  └──────────────┬──────────────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────────────────┐
-  │  PASO 3: Dedup por archivo          │
-  │  Multiples chunks del mismo archivo?│
-  │  Quedarse solo con el de mayor score│
-  └──────────────┬──────────────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────────────────┐
-  │  PASO 4: Filtrar tombstones         │
-  │  Remover chunks eliminados en       │
-  │  branches de mayor prioridad        │
-  │  (consciente de overlays)           │
-  └──────────────┬──────────────────────┘
-                 │
-                 ▼
-  ┌─────────────────────────────────────┐
-  │  PASO 5: Ensamblar markdown         │
-  │  Resumenes de memoria primero       │
-  │  Luego chunks de codigo con         │
-  │  archivo:linea                      │
-  │  Parar cuando se agote el           │
-  │  presupuesto                        │
-  └──────────────┬──────────────────────┘
-                 │
-                 ▼
-  Salida final: markdown estructurado
-  (cabe dentro de 8000 tokens)
-```
-
-### Paso a paso
-
-#### Paso 1: Enriquecimiento con memorias
-
-El constructor consulta el memory store de DevAI buscando memorias relevantes a la consulta. Se seleccionan hasta 5 memorias, rankeadas por similitud semantica.
-
-Las memorias sirven para dos propositos:
-1. **Contexto directo**: Decisiones de arquitectura, bugfixes pasados y convenciones relacionadas con la consulta se incluyen en la salida.
-2. **Pistas de archivos**: Las rutas de archivos mencionadas en las memorias mejoran la relevancia de los chunks de codigo de esos archivos en el Paso 2.
-
-Por ejemplo, si una memoria dice "Payment module uses hexagonal architecture, see `services/payment/ports.py`", entonces los chunks de ese archivo reciben un boost de ranking en la busqueda de codigo.
-
-#### Paso 2: Busqueda de codigo
-
-El presupuesto de tokens restante (total menos tokens consumidos por memorias) se asigna a la busqueda de codigo. El constructor ejecuta una busqueda semantica contra el indice de codigo con un limite duro de 30 chunks.
-
-Los resultados se rankean por un score combinado: similitud semantica con la consulta + boost de pistas de archivos desde las memorias.
-
-#### Paso 3: Dedup por archivo
-
-Es comun que multiples chunks del mismo archivo aparezcan en los resultados de busqueda — el chunk a nivel de archivo, el de nivel de clase y uno a nivel de funcion podrian ser todos relevantes. El constructor se queda solo con el **chunk de mayor score por archivo** para maximizar la diversidad.
-
-Esto asegura que el contexto ensamblado cubra mas del codebase en vez de profundizar en un solo archivo.
-
-#### Paso 4: Filtrar tombstones
-
-En escenarios conscientes de branches, los archivos eliminados en un feature branch no deberian aparecer en el contexto. El constructor verifica tombstones (marcadores de eliminacion en overlays de branches) y remueve esos chunks.
-
-#### Paso 5: Ensamblar markdown
-
-La salida final se ensambla como un documento markdown estructurado:
-
-1. Los resumenes de memoria van primero (con prefijo `[memory]`)
-2. Los chunks de codigo siguen, ordenados por score de relevancia
-3. Cada chunk de codigo incluye su ruta de archivo y rango de lineas
-4. El ensamblado se detiene cuando el siguiente chunk excederia el presupuesto
-
-### Gestion del presupuesto de tokens
-
-El presupuesto usa una heuristica simple: **4 caracteres ~ 1 token**. Esto es intencionalmente conservador (la mayoria de los tokenizers promedian 3.5-4.2 chars/token para codigo) para evitar pasarse del presupuesto.
-
-```
-Presupuesto: 8000 tokens = ~32,000 caracteres
-
-Asignacion de memoria:   hasta 20% del presupuesto (1,600 tokens)
-Asignacion de codigo:    80% restante (6,400 tokens)
-Margen de seguridad:     incorporado en la relacion 4:1
-```
-
-El presupuesto es configurable por llamada. El default es 8000 tokens — suficiente para contexto significativo sin dominar una conversacion de 100k tokens.
-
-## Formato de salida
-
-El contexto ensamblado es un documento markdown:
-
-```markdown
-[memory] Architecture: Payment module uses hexagonal architecture
-with ports and adapters. Domain logic in services/payment/domain.py,
-external integrations behind adapter interfaces.
-
-[memory] Bug fix: Fixed race condition in concurrent payment
-processing. Root cause was shared mutable state in PaymentGateway
-singleton. Solution: request-scoped gateway instances.
+Un solo brief con presupuesto para una pregunta: lo que ya se sabe, el código
+que mejor rankea, y el conocimiento registrado contra exactamente ese código.
 
 ---
 
-**services/payment/domain.py:15-67**
-```python
-class PaymentProcessor:
-    def __init__(self, gateway: PaymentGateway, validator: PaymentValidator):
-        self.gateway = gateway
-        self.validator = validator
+## Qué es
 
-    def process(self, order: Order) -> PaymentResult:
-        validation = self.validator.validate(order)
-        if not validation.is_valid:
-            return PaymentResult.failed(validation.errors)
-        return self.gateway.charge(order.total, order.payment_method)
+```bash
+devctx context "cómo decidimos que un token expiró" --max-tokens 4096
 ```
 
-**services/payment/ports.py:1-34**
-```python
-from abc import ABC, abstractmethod
+Los agentes llaman la herramienta MCP `build_context`. La salida es **prosa, no
+JSON** — está pensada para leerse directo al contexto de un modelo, y un sobre
+JSON alrededor de código y prosa gasta presupuesto en puntuación.
 
-class PaymentGateway(ABC):
-    @abstractmethod
-    def charge(self, amount: Decimal, method: PaymentMethod) -> ChargeResult: ...
+## Por qué existe
 
-    @abstractmethod
-    def refund(self, charge_id: str, amount: Decimal) -> RefundResult: ...
+Un agente frente a un área desconocida hace tres búsquedas, lee cuatro archivos
+y corre un recall — gastando una tajada grande de su ventana en recuperación
+antes de empezar a pensar. Peor: se lleva el *código* y se pierde el
+razonamiento, porque nunca se le ocurrió preguntar qué ya se había decidido.
+
+`build_context` hace ese ensamblado una sola vez, bajo un techo declarado, y
+devuelve un solo artefacto.
+
+## Las tres pasadas
+
+El orden es el diseño. Cada pasada acota lo que la siguiente necesita decir.
+
+### 1. Lo que ya se sabe
+
+Un `recall` contra la pregunta, en todos los alcances, límite 5.
+
+**Primero, porque es la parte que ninguna cantidad de lectura del código
+recupera**, y porque es chica. El código te dice qué pasa; no te dice que la
+alternativa obvia se probó y se abandonó.
+
+Los archivos que nombran estas memorias se registran, y la pasada 2 los usa.
+
+### 2. Código
+
+Una búsqueda vectorial de la pregunta, trayendo 30 resultados.
+
+**Los archivos que una memoria ya trajo se saltean** — no vale la pena pagarlos
+dos veces. La búsqueda es deliberadamente más profunda que lo que va a entrar:
+*el presupuesto decide dónde parar, no el límite*.
+
+### 3. Registrado contra este código
+
+Para los primeros 5 archivos que eligieron las pasadas 1 y 2, las memorias
+vinculadas a esos archivos por la unión memoria↔grafo.
+
+Esta es la pasada que justifica todo el diseño. Son memorias adheridas a
+*exactamente este código* — conocimiento que un recall semántico sobre la
+redacción de la pregunta nunca habría sacado a flote, porque la memoria y la
+pregunta usan palabras distintas. Es para esto que existe la unión.
+
+Cada una se etiqueta con la procedencia de su vínculo:
+
+```
+[memory · files-field · about crates/devctx-search/src/lib.rs] Rerank default
 ```
 
-**services/payment/adapters/stripe.py:8-42**
-```python
-class StripeGateway(PaymentGateway):
-    def __init__(self, api_key: str):
-        self.client = stripe.Client(api_key)
+`files-field` y `content-mention` significan que algo conectó la memoria con
+este código al escribirla. `inference` significa solo que las palabras calzan.
+La etiqueta está ahí para que quien lea pueda ponderarla.
 
-    def charge(self, amount: Decimal, method: PaymentMethod) -> ChargeResult:
-        # ...
-```
-```
+Los duplicados entre archivos se descartan por id de memoria.
 
-Este formato esta disenado para consumo por LLMs: las memorias proveen contexto de alto nivel, los chunks de codigo proveen detalle de implementacion, y las referencias archivo:linea le permiten al LLM sugerir ediciones precisas.
+## El presupuesto
 
-## Cuando se usa
+`--max-tokens` (default 4096) es un **corte duro**, no una meta. Los tokens se
+convierten a un presupuesto de caracteres con una razón fija, y cada ítem se
+verifica contra el espacio restante antes de agregarse.
 
-- **MCP `build_context` tool**: Interfaz principal para que los agentes de IA obtengan contexto enriquecido
-- **MCP `memory_context` tool**: Variante enfocada en memoria (solo memorias, sin codigo)
-- **Workflows de agentes**: Cada vez que un agente necesita entender un tema antes de escribir codigo
+Dos comportamientos vale la pena conocerlos:
 
-## Ejemplo: Construyendo contexto para "refactorizar el modulo de pagos"
+**Nada se descarta en silencio.** Lo que no entró se cuenta y se nombra al
+final:
 
 ```
-build_context(query: "refactor the payment module", max_tokens: 8000)
-
-Internamente:
-  1. Busqueda de memorias → 3 resultados:
-     - "Payment module uses hexagonal architecture" (decision)
-     - "Fixed race condition in PaymentGateway" (bugfix)
-     - "Payment adapters must implement idempotency" (pattern)
-     → ~600 tokens consumidos
-
-  2. Busqueda de codigo (presupuesto: 7400 tokens, limite: 30 chunks) → 18 resultados
-     Archivos con boost: services/payment/domain.py, services/payment/ports.py
-
-  3. Dedup → 12 archivos unicos conservados
-
-  4. Filtro de tombstones → 12 quedan (ninguno eliminado)
-
-  5. Ensamblar → 11 chunks caben dentro del presupuesto
-     Salida final: 7,850 tokens
-
-La salida incluye:
-  - 3 resumenes de memoria (arquitectura, bug pasado, convencion)
-  - 11 chunks de codigo de:
-    services/payment/domain.py
-    services/payment/ports.py
-    services/payment/adapters/stripe.py
-    services/payment/adapters/paypal.py
-    services/payment/validator.py
-    tests/test_payment.py
-    config/payment.py
-    ...
+[devctx] 7 further item(s) did not fit in 4096 tokens.
+Raise max_tokens, or narrow the query.
 ```
 
-Un LLM que recibe este contexto tiene todo lo que necesita para razonar sobre el refactoring: el patron de arquitectura en uso, un bug pasado para evitar reintroducir, una convencion a seguir, y el codigo fuente relevante — todo dentro de 8k tokens.
+Un brief que truncara calladamente se leería como "esto es todo lo que hay", que
+es lo único que jamás debe significar.
+
+**Los encabezados viajan con su primer ítem.** Un encabezado de sección se emite
+pegado a la primera entrada que entra, nunca solo. Un encabezado emitido por
+separado puede sobrevivir a un presupuesto que sus ítems no sobrevivieron,
+dejando una sección vacía — y una sección vacía se lee como "acá no hay nada",
+que es justo el mensaje equivocado cuando la verdad es "no entró".
+
+## Forma de la salida
+
+```
+## What is already known
+
+[memory] El reranking queda apagado por defecto
+Medido 30 ms → 8.6 s y 406 MB → 2.4 GB...
+
+## Code
+
+// crates/devctx-search/src/lib.rs:55
+pub fn search(...)
+
+## Recorded against this code
+
+[memory · files-field · about crates/devctx-search/src/lib.rs] El pool es el techo
+Un reranker reordena lo que le entregan y nada más...
+```
+
+Las secciones sin contenido no aparecen del todo.
+
+## Opciones
+
+| Flag | Default | Efecto |
+|---|---|---|
+| `--max-tokens` | 4096 | Techo duro para todo el brief |
+| `--no-memories` | apagado | Solo código — saltea las pasadas 1 y 3 |
+
+`--no-memories` es para cuando querés recuperación cruda sin la capa de opinión.
 
 ## Modelo mental
 
-El constructor de contexto es un **bibliotecario inteligente**. Entras y decis "necesito entender el procesamiento de pagos". El bibliotecario no te da todos los libros de la biblioteca — eso tardaria semanas en leer. No te da solo un libro — podria faltar contexto critico.
-
-En cambio, piensa: "hay un registro de decision sobre la arquitectura (memoria), un post-mortem sobre una race condition (memoria), y aca estan los archivos fuente mas relevantes (chunks de codigo) — priorizados, deduplicados, y dimensionados para que entren en tu tiempo de lectura (presupuesto de tokens)."
-
-Cada token en la salida se gano su lugar. Nada es relleno.
+`search` responde *"¿dónde está el código?"*. `recall` responde *"¿qué
+sabemos?"*. `build_context` responde la pregunta que el agente realmente tiene,
+que es **"¿qué debería haber leído antes de responder esto?"** — y la responde
+dentro de un techo que vos ponés, diciéndote con honestidad qué dejó afuera.

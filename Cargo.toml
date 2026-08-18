@@ -22,7 +22,7 @@ members = [
 version = "0.4.1"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/snaven10/devai-context-engine"
+repository = "https://github.com/snaven10/DevCtxEngine"
 rust-version = "1.82"
 
 [workspace.dependencies]

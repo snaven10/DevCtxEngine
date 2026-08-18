@@ -2,227 +2,174 @@
 
 > 🇪🇸 [Leer en español](../es/03-conceptos-fundamentales/memoria.md)
 
-## What It Is
+Knowledge that outlives the session that produced it — and that can be found
+again from the code it is about.
 
-> **Note — this page predates the Rust rewrite** and describes the earlier
-> Go + Python implementation. The concepts largely still apply; the commands,
-> file layout and `DEVAI_*` variables do not. Current references:
-> [Architecture](../02-architecture.md), [Configuration](../11-configuration.md).
+---
 
-DevAI memory is a persistent, structured knowledge store for AI agents. It captures decisions, discoveries, patterns, and bugs that survive across sessions — giving agents long-term memory that chat history was never designed to provide.
+## What it is
 
-## Why It Exists
+A memory is a short, typed, scoped note: a decision and its reasoning, a bug's
+root cause, a gotcha that cost someone an afternoon.
 
-AI agents have an amnesia problem. Every session starts from zero. The architecture decision you debated for 30 minutes? Gone. The root cause of that production bug? Forgotten. The naming convention the team agreed on? Lost.
+```bash
+devctx remember "Reranking stays off by default: measured 30ms → 8.6s" \
+  --type decision \
+  --topic search-rerank-default \
+  --files crates/devctx-core/src/config.rs
 
-Naive approaches don't solve this:
+devctx recall "why is reranking off"
+```
 
-| Approach | Problem |
+Agents use the `remember` and `recall` MCP tools, plus `memories_by_symbol`,
+`memories_by_file`, `memory_refs`, `memory_context`, `memory_stats`,
+`memory_forget` and `memory_move`.
+
+## Why it exists
+
+Chat history is a whiteboard: useful during the meeting, erased afterwards. Code
+comments are sticky notes — they annotate one spot but cannot hold a decision
+that spans a system. Neither survives into the next session, so the same
+question gets re-answered, and sometimes re-answered *differently*.
+
+Memory is the notebook: searchable by meaning, deduplicated, and — the part that
+matters most — reachable from the code.
+
+## The three tiers
+
+| Scope | Stored under | Visible from |
+|---|---|---|
+| `local` | The project's own store | This repository only |
+| `group` | Central store, `@group:<name>` | Every repository sharing `project.group` |
+| `global` | Central store, `@global` | Every project on the machine |
+
+`--scope all` (the default for `recall`) searches every tier that applies and
+fuses the results by rank.
+
+### Why group and global rows are re-keyed
+
+A memory's identity is derived from its `project` plus its content hash. If a
+global row kept the project that contributed it, the *same* lesson learned in
+two repositories would land as two rows — deduplication failing exactly where it
+matters most.
+
+So global rows all carry the reserved project `@global`, and group rows carry
+`@group:<name>`. The contributing repository stays in the `repo` field as
+provenance. Group keying keeps each product's shared knowledge in its own space:
+dedup still collapses the same lesson from two sibling repositories, without
+leaking it to unrelated projects the way `@global` would.
+
+## Deduplication
+
+Writing happens through one path, and it either inserts or revises:
+
+- **With `--topic`** — upsert by topic key. Saving again under
+  `search-rerank-default` revises that memory instead of adding a second one.
+  This is how a memory stays current rather than accumulating contradictory
+  versions.
+- **Without `--topic`** — identity falls back to a content hash over normalized
+  text (lowercased, whitespace collapsed). Saving the same thing twice is a
+  no-op.
+
+Use a topic key for anything you expect to revise. Use bare content for
+one-off observations.
+
+## The memory↔graph junction
+
+This is the part that distinguishes memory here from a searchable notes file.
+
+**Pass `--files`.** It is the single highest-leverage field:
+
+```bash
+devctx remember "..." --files crates/devctx-search/src/lib.rs
+```
+
+With it, the memory becomes findable from every symbol in those files —
+`memories_by_symbol` answers *"what was decided about `search()`?"* before you
+have the words to phrase a `recall`. Without it, the memory is findable only by
+text, which requires already knowing what to ask.
+
+### Where the junction row lives
+
+The call graph is per-repository and lives in the project store. A global or
+group memory lives in the central one. A memory about this repository's
+`charge()` must be findable from `charge()` regardless of which store holds its
+text.
+
+So the junction row always goes in the **project** store — next to the graph it
+points into — carrying only the memory's id. Resolving that id looks locally
+first and falls back to the central store. Copying memory text into every
+project that mentions it would mean an edit in one place leaves stale copies
+everywhere else.
+
+### Link provenance
+
+Every result carries `link_sources`, and the distinction is load-bearing:
+
+| Value | Meaning |
 |---|---|
-| **Chat history** | Ephemeral. Lost on session close. Grows unboundedly. Not searchable by concept. |
-| **Code comments** | Static. Can't capture decisions, tradeoffs, or context that led to the code. Pollutes the codebase. |
-| **External docs** | Disconnected from code. Stale within weeks. Agents can't query them semantically. |
-| **Vector-only stores** | No structure. Can't distinguish a bug fix from an architecture decision. No deduplication. |
+| `files-field` | The memory's `files` named this file. Structural. |
+| `content-mention` | The memory's prose named this file, and the file is indexed. Structural. |
+| `inference` | Only the words match. Weaker. |
 
-DevAI memory is structured (typed, scoped, tagged), deduplicated (no redundant entries from repeated saves), and searchable (hybrid semantic + metadata filtering). It's designed specifically for the AI agent use case: frequent writes from automated workflows, semantic recall by natural language queries, and topic-based upserts that keep knowledge current instead of accumulating duplicates.
+The first two mean something connected this memory to this code at write time.
+`inference` means the text happens to line up. A caller weighing whether to
+trust a link should read this field.
 
-## How It Works Internally
+### Backfilling old memories
 
-### Storage
+Memories written before the junction existed — migrated, imported, or saved by
+an older build — carry no links:
 
-Memories are stored in SQLite with the following fields:
-
-| Field | Type | Description |
-|---|---|---|
-| `title` | string | Short, searchable summary (e.g., "Fixed N+1 query in UserList") |
-| `content` | text | Full structured content (what, why, where, learned) |
-| `type` | enum | `insight`, `decision`, `note`, `bug`, `architecture`, `pattern`, `discovery` |
-| `scope` | enum | `shared` (team-visible) or `local` (personal) |
-| `project` | string | Project identifier |
-| `topic_key` | string | Stable key for upserts (e.g., `architecture/auth-model`) |
-| `tags` | list | Searchable tags |
-| `author` | string | Who created it |
-| `files` | list | Related file paths |
-| `revision_count` | int | How many times this memory has been updated |
-| `duplicate_count` | int | How many duplicate saves were deduplicated |
-
-### Memory Types
-
-Each type signals **intent** and enables filtered recall:
-
-| Type | When to Use | Example |
-|---|---|---|
-| `decision` | Architecture or technology choice with tradeoffs | "Chose Zustand over Redux for state management" |
-| `architecture` | Structural design of a system or component | "Payment module uses hexagonal architecture" |
-| `bug` / `bugfix` | Root cause and fix for a resolved bug | "Fixed race condition in WebSocket reconnect" |
-| `discovery` | Non-obvious finding about the codebase or tools | "LanceDB doesn't support concurrent writes from multiple processes" |
-| `pattern` | Established convention or coding pattern | "All API handlers follow the Result monad pattern" |
-| `insight` | Observation or learning that doesn't fit other types | "Tree-sitter Go grammar doesn't parse generics correctly" |
-| `note` | General-purpose memory | Session summaries, meeting notes, TODOs |
-
-### Deduplication
-
-Agents save memories aggressively — after every bug fix, every decision, every discovery. Without deduplication, the store would fill with near-identical entries.
-
-DevAI deduplicates at write time:
-
-```
-  New memory arrives
-       │
-       ▼
-  Normalize content
-  (lowercase + collapse whitespace)
-       │
-       ▼
-  SHA256 hash of normalized content
-       │
-       ▼
-  Check: same hash within 15-minute window?
-       │
-       ├── YES → Increment duplicate_count, skip insert
-       │
-       └── NO → Check: same topic_key + project + scope?
-                    │
-                    ├── YES → Upsert (update existing, increment revision_count)
-                    │
-                    └── NO → Insert new memory
+```bash
+devctx memories backfill-links --dry-run
+devctx memories backfill-links
 ```
 
-The 15-minute window handles the common case: an agent calling `remember` multiple times in the same session with effectively the same content. The topic key upsert handles the evolution case: the same concept being refined over multiple sessions.
+There is a text-derived pass for memories with no `files` at all, which is
+roughly half of a real corpus. It builds a *candidate* list from file paths
+named in the prose and over-matches by design: the same pattern that finds
+`apps/registry/src/app/components/firmar-registro.ts` also finds `Shepherd.js`,
+which is a library nobody indexed, and `CLAUDE.md`, which is not code. Every
+candidate is checked against the index before a link is written. **The index is
+what tells them apart, never the pattern.**
 
-### Topic Key Upserts
+## Recall
 
-Topic keys are the mechanism for **evolving knowledge**. Instead of creating a new memory every time you learn more about a topic, the topic key ensures the existing memory is updated:
-
-```
-Session 1:
-  remember(
-    title: "Auth architecture",
-    topic_key: "architecture/auth",
-    content: "Using JWT with refresh tokens. HS256 signing."
-  )
-  → Creates new memory (revision 1)
-
-Session 2:
-  remember(
-    title: "Auth architecture",
-    topic_key: "architecture/auth",
-    content: "Using JWT with refresh tokens. Switched to RS256 for key rotation support."
-  )
-  → Updates existing memory (revision 2), preserves history
+```bash
+devctx recall "why is reranking off" --limit 5 --scope all
 ```
 
-Rules:
-- Same `topic_key` + `project` + `scope` = update existing
-- Different `topic_key` = new memory (never overwrites unrelated topics)
-- No `topic_key` = always creates new memory
+Retrieval fetches a deeper pool than the limit (`limit × 8`, minimum 40) from
+each applicable tier, then fuses the ranked lists by rank and deduplicates by
+memory id. `--repo <name>` narrows global results to one contributing
+repository.
 
-### Hybrid Search (Recall)
+## Managing memories
 
-When you query memories, DevAI uses hybrid search combining semantic similarity and metadata filtering:
-
-```
-  recall(query: "authentication architecture", project: "myapp")
-       │
-       ├──► Semantic search
-       │    Embed query → search memory vectors in LanceDB
-       │    Returns: memories ranked by cosine similarity
-       │
-       ├──► Metadata filtering
-       │    Filter by: project, type, scope, tags
-       │
-       └──► Merge + rank
-            Combined relevance score
-            Return top-K results with FULL content
+```bash
+devctx memory-stats                       # counts for this project
+devctx memory-forget <id>                 # delete one, wherever it lives
+devctx memories export > memories.jsonl   # one JSON object per line
+devctx memories import memories.jsonl     # only ever adds, never overwrites
+devctx memory-purge <project-key>         # delete every memory under one key
 ```
 
-Memory vectors are stored in the same LanceDB instance as code vectors, but with distinct metadata fields (`memory_type`, `memory_scope`, `memory_tags`) that enable precise filtering.
+`memory_move` (MCP) promotes a memory between tiers — a lesson that turns out to
+apply beyond one repository moves to `group` or `global` without being rewritten.
 
-The key design choice: **recall returns full content, not truncated summaries**. Memories are structured to be concise at write time, so they can be returned in full at read time. No two-step "search then fetch" — one call gives you everything.
+Deleting matters as much as writing. A memory recording a root cause that turned
+out to be wrong is worse than no memory, because it will be recalled with
+confidence.
 
-## When It Is Used
+## Mental model
 
-- **MCP `remember` tool**: AI agents save structured memories
-- **MCP `recall` tool**: AI agents query memories by natural language + filters
-- **MCP `memory_context` tool**: Get memory-enriched context for a topic
-- **MCP `memory_stats` tool**: Inspect memory store health and size
-- **Context builder**: Automatically includes relevant memories when assembling context
+Three questions, three tools:
 
-## Example: Architecture Decision Lifecycle
+- *"What do we know about X?"* → `recall`. Needs you to have the words.
+- *"What was decided about **this** function?"* → `memories_by_symbol`. Works
+  when you are standing on the code and don't have the words yet.
+- *"What should I know before answering this question?"* → `build_context`,
+  which assembles code and memories into one budgeted brief.
 
-### Saving
-
-An AI agent (or human via CLI) completes an architecture discussion and saves it:
-
-```
-remember(
-  title: "Chose event sourcing for order management",
-  type: "decision",
-  scope: "shared",
-  project: "ecommerce",
-  topic_key: "architecture/order-management",
-  content: """
-    What: Adopted event sourcing pattern for the order management domain.
-    Why: Need full audit trail for compliance. CQRS read models give us
-         flexible querying without denormalization trade-offs.
-    Where: services/orders/, events/order_events.py, projections/
-    Learned: Event store requires careful schema versioning. Using
-             upcasters for backward compatibility.
-  """,
-  tags: ["event-sourcing", "cqrs", "orders"],
-  files: ["services/orders/aggregate.py", "events/order_events.py"]
-)
-```
-
-### Recalling (weeks later, different session)
-
-A new agent session needs to modify the order system:
-
-```
-recall(query: "order management architecture", project: "ecommerce")
-
-Result:
-  ┌─────────────────────────────────────────────────────────────┐
-  │ Title: Chose event sourcing for order management            │
-  │ Type: decision | Scope: shared | Revisions: 3              │
-  │                                                             │
-  │ What: Adopted event sourcing pattern for the order          │
-  │       management domain.                                    │
-  │ Why: Need full audit trail for compliance...                │
-  │ Where: services/orders/, events/order_events.py...          │
-  │ Learned: Event store requires careful schema versioning...  │
-  │                                                             │
-  │ Tags: event-sourcing, cqrs, orders                         │
-  │ Files: services/orders/aggregate.py, events/order_events.py │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-The agent now knows: this is an event-sourced system, uses CQRS, has a schema versioning concern, and the relevant files are in `services/orders/`. It can proceed with the modification without re-discovering any of this.
-
-### Updating (the topic evolves)
-
-Later, a migration from file-based to database-backed event store is completed:
-
-```
-remember(
-  title: "Migrated order event store to PostgreSQL",
-  type: "decision",
-  topic_key: "architecture/order-management",
-  project: "ecommerce",
-  content: """
-    What: Migrated event store from file-based to PostgreSQL with
-          pg_partman for time-based partitioning.
-    Why: File store hit performance wall at ~1M events.
-    Where: services/orders/event_store.py, migrations/
-    Learned: Partitioning by month keeps query performance under 50ms
-             up to ~100M events.
-  """
-)
-→ Updates existing memory (revision 4), preserves continuity
-```
-
-## Mental Model
-
-Think of DevAI memory as a **team's shared notebook** — but one that's searchable by meaning, automatically deduplicates, and is always available to every AI agent working on the project.
-
-Chat history is like a whiteboard: useful during the meeting, erased afterward. Code comments are like sticky notes: they annotate one spot but can't capture the reasoning behind a system-wide decision. DevAI memory is the notebook where you write down "we chose X because Y, and watch out for Z" — and six months later, any agent (or human) can ask "why did we choose X?" and get the full answer.
+The second one is why `--files` is not optional in practice.

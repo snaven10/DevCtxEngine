@@ -2,236 +2,211 @@
 
 > 🇪🇸 [Leer en español](../es/03-conceptos-fundamentales/busqueda.md)
 
-## What It Is
+Finding code by describing what it does, not by guessing what it is called.
 
-> **Note — this page predates the Rust rewrite** and describes the earlier
-> Go + Python implementation. The concepts largely still apply; the commands,
-> file layout and `DEVAI_*` variables do not. Current references:
-> [Architecture](../02-architecture.md), [Configuration](../11-configuration.md).
+---
 
-DevAI's search is a semantic code search engine. It understands the **meaning** of your query, not just the keywords. When you search for "authentication middleware," it finds the `AuthGuard` class, the `verifyJWT` function, and the `requirePermissions` decorator — even though none of them contain the word "authentication."
+## What it is
 
-## Why It Exists
+`devctx search` answers a question in prose — *"where do we decide a token is
+expired"* — with the chunks of code most likely to contain the answer. Three
+retrieval strategies are available, and one of them is the default:
 
-`grep` finds text. DevAI finds **intent**.
+```bash
+devctx search "expired token handling"          # vector (default)
+devctx search "expired token" --keyword         # BM25
+devctx search "expired token" --hybrid          # both, fused
+```
 
-| Approach | Query: "retry logic for failed API calls" |
+Agents reach the same thing through the `search` MCP tool.
+
+## Why it exists
+
+Grep matches the string you typed. That works when you already know the
+vocabulary of the codebase and fails exactly when you don't — a new repository, a
+subsystem you've never opened, a concept that three teams spelled three
+different ways (`isExpired`, `checkTTL`, `validateWindow`).
+
+Vector search matches *meaning*, so it finds the third spelling from the first
+one. Keyword search matches the literal token, which is what you want for an
+error string or an identifier you copied out of a stack trace. Neither is
+strictly better, which is why both are here and why hybrid exists.
+
+## How it works
+
+### The pipeline
+
+Indexing turns files into embeddable chunks:
+
+```
+git diff → parse (tree-sitter) → chunk → embed → store (DuckDB)
+```
+
+Each stage lives in its own crate: `devctx-parse`, `devctx-chunk`,
+`devctx-embed`, `devctx-store`. It all runs in-process — there is no sidecar and
+no network hop unless you configure an API embedding provider.
+
+### Chunk levels
+
+The chunker never splits a symbol in half. It emits chunks at five levels, and
+which ones a file produces depends on what is in it:
+
+| Level | What it holds |
 |---|---|
-| **grep/ripgrep** | Matches files containing "retry" or "API" literally. Misses `exponentialBackoff()`, `withRetries()`, or a loop with `catch` and `setTimeout`. |
-| **DevAI search** | Returns the `RetryPolicy` class, the `fetchWithBackoff` function, and the error-handling middleware — ranked by semantic relevance. |
+| `file` | A summary chunk: the path plus the symbols declared in it |
+| `class` | A container — `class`, `struct`, `enum`, `trait`, `interface` — with its signature and members |
+| `doc` | A documented symbol's prose, when the doc comment says something the name doesn't |
+| `function` | One callable, whole |
+| `block` | A slice of a function too large to embed as one chunk |
 
-The difference matters at scale. In a 500k-line codebase, grep gives you noise. Semantic search gives you answers.
+Two behaviours are worth knowing because they change what you get back:
 
-## How It Works Internally
+- **Small symbols are grouped.** Anything under `min_chunk_tokens` (64) is
+  merged with its neighbours into one chunk rather than embedded alone — a file
+  of one-line getters produces a handful of chunks, not two hundred.
+- **A doc comment that only restates the name gets no chunk.** `/// The name.`
+  above `fn name()` carries no information the function chunk lacks.
 
-### The Indexing Pipeline
+Defaults, from `ChunkConfig`:
 
-When you run `devai index` (or indexing triggers automatically), this happens:
+| Setting | Default | Meaning |
+|---|---|---|
+| `max_chunk_tokens` | 512 | Upper bound before a function is split into blocks |
+| `min_chunk_tokens` | 64 | Below this, symbols are grouped |
+| `large_function_threshold` | 1024 | Above this, a function is split into block chunks |
 
-```
-  git diff (since last indexed commit)
-       │
-       ▼
-  Tree-sitter AST Parse (25+ languages)
-       │
-       ▼
-  4-Level Semantic Chunking
-       │
-       ▼
-  Embedding (sentence-transformers, 384-dim)
-       │
-       ▼
-  Storage (LanceDB / Qdrant)
-       │
-       ▼
-  Symbol Graph (SQLite edges)
-```
+Token counts are estimated at ~4 characters per token. It is a heuristic, not a
+tokenizer.
 
-Each step is deterministic and incremental. Only changed files are reprocessed. A full reindex happens only when the embedding model changes.
+### Context headers
 
-### The 4 Chunk Levels
-
-Code isn't flat text. A file has structure: imports, classes, functions, control flow blocks. DevAI respects this structure by chunking at four semantic levels:
-
-#### Level 1: File
-
-The file-level chunk captures the high-level shape — imports, top-level declarations, and a symbol list. Think of it as a table of contents.
+A `function` or `block` chunk is embedded with a breadcrumb line prepended:
 
 ```
-# auth/middleware.py
-import jwt
-from flask import request, abort
-from .models import User, Permission
-
-# Symbols: AuthMiddleware, require_auth, require_permission, decode_token
+# auth/middleware.rs > AuthMiddleware > authenticate
 ```
 
-#### Level 2: Class
+Without it, a method body reads as anonymous code. With it, the embedding
+carries where the code lives, so a query naming the module or the type can find
+a body that never mentions either.
 
-Each class gets its own chunk: signature, fields, method signatures. Enough to understand what the class **is** without reading every method body.
+### Content hashing
 
-```
-# auth/middleware.py > AuthMiddleware
-class AuthMiddleware:
-    secret_key: str
-    token_header: str = "Authorization"
+Every chunk carries `content_hash` — sha256 of its text, truncated to 16 hex
+characters. This is what makes re-indexing cheap: a chunk whose hash is unchanged
+is not re-embedded. It is also what makes multi-branch indexing cheap, since
+branches share the overwhelming majority of their file contents.
 
-    def authenticate(self, request) -> User: ...
-    def authorize(self, user, permission) -> bool: ...
-    def refresh_token(self, token) -> str: ...
-```
+## The three modes
 
-#### Level 3: Function
+### Vector — the default
 
-Every function or method becomes its own chunk. This is where most search hits land.
+The query is embedded with the same model that embedded the code, and the store
+returns nearest neighbours by cosine distance (HNSW when the index is built,
+otherwise a scan).
 
-```
-# auth/middleware.py > AuthMiddleware > authenticate
-def authenticate(self, request) -> User:
-    token = request.headers.get(self.token_header)
-    if not token:
-        abort(401, "Missing authentication token")
-    payload = jwt.decode(token, self.secret_key, algorithms=["HS256"])
-    return User.from_payload(payload)
-```
+### Keyword — BM25
 
-#### Level 4: Block
+Full-text search over chunk text, served by DuckDB's FTS extension. Exact,
+fast, and the right choice for error strings and identifiers.
 
-Large functions (> 512 tokens) are split at control flow boundaries: `if/else`, `for`, `try/catch`, `match`. Each block retains its parent context header so it's never orphaned.
+### Hybrid — reciprocal rank fusion
+
+Both retrievers run, and their ranked lists are fused:
 
 ```
-# auth/middleware.py > AuthMiddleware > authenticate > try-block
-try:
-    payload = jwt.decode(token, self.secret_key, algorithms=["HS256"])
-    if payload.get("exp") < time.time():
-        raise ExpiredTokenError()
-    return User.from_payload(payload)
+score(item) = Σ  1 / (k + rank)     k = 60, rank is 1-based
 ```
 
-**Constraints:** max 512 tokens, min 64 tokens per chunk. Chunks below 64 tokens are merged upward into their parent.
+An item ranked well by either retriever surfaces; an item ranked well by both
+surfaces higher. RRF fuses *ranks*, not scores, so it needs no calibration
+between two systems whose numbers mean different things.
 
-### Context Headers (Breadcrumbs)
+If the FTS index has not been built, hybrid degrades silently to vector-only
+rather than failing.
 
-Every chunk carries a context header showing its position in the code hierarchy:
+## Reranking
 
-```
-file > class > method > block
-auth/middleware.py > AuthMiddleware > authenticate > try-block
-```
+A cross-encoder can reorder the candidate pool before it is truncated to
+`--limit`. **It is off by default, and that default was set by measurement, not
+taste.** On this repository:
 
-This means search results always show WHERE in the codebase a chunk lives, not just the code itself.
+| Configuration | Latency | Resident memory |
+|---|---|---|
+| No reranking | 30 ms | 406 MB |
+| Cheapest cross-encoder | 8.6 s | 2.4 GB |
+| `bge-reranker-base` | 30 s | 3.4 GB |
 
-### Deterministic IDs
+And the one model measured across the whole bench made results *worse* — it
+demoted a correct answer from first place to twenty-first.
 
-Each chunk gets a stable, deterministic ID:
+Two things to understand before turning it on:
 
-```
-sha256("myrepo:main:auth/middleware.py:42")[:32]
-```
+- **The pool is the ceiling.** A reranker reorders what it is handed and nothing
+  else. An answer ranked below `reranking.pool` is invisible to it, however good
+  the model is.
+- **The pool is also the whole cost.** The cross-encoder is the slowest stage by
+  two orders of magnitude, and pool size multiplies it. Deep pool with a small
+  fast model, or shallow pool with a large one. Deep *and* large is unusable.
 
-Format: `sha256(repo:branch:file:line)[:32]`
+The default pool is 20. `--no-rerank` disables it for one search regardless of
+config.
 
-This enables true upserts. When a function changes, the chunk at that location is **replaced**, not duplicated. When a function is deleted, its chunk is removed. No orphans, no duplicates, no garbage collection needed.
+Built-in rerankers: `bge-base` (default), `bge-v2-m3` (multilingual),
+`jina-turbo` (fastest). Set `reranking.model_dir` to load your own ONNX
+cross-encoder — worth doing, since fastembed ships no lightweight one and the
+built-ins are all over a gigabyte.
 
-## Incremental Indexing
+## Embedding models
 
-DevAI tracks the last indexed commit SHA per repository. On subsequent runs:
+`devctx models` lists what is available. The current default for new projects is
+`ml-granite` (384 dimensions, multilingual, best recall on CPU).
 
-```
-  Last indexed: a1b2c3d
-  Current HEAD:  e4f5g6h
-       │
-       ▼
-  git diff a1b2c3d..e4f5g6h --name-only
-       │
-       ▼
-  Only reparse + re-embed changed files
-       │
-       ▼
-  Upsert chunks (deterministic IDs handle updates)
-```
+**Choose before your first index.** Changing the model afterwards means
+re-indexing every file and re-embedding every memory, because vectors from two
+models do not live in the same space.
 
-In practice, indexing a 200-file repo takes ~30 seconds the first time and <2 seconds on incremental updates.
+If your code or comments are not in English, pick a multilingual model. The
+English models will embed Spanish perfectly happily — just badly.
 
-A full reindex is forced only when the embedding model changes (because all vectors must be recomputed for consistency).
+## Branch awareness
 
-## Branch-Aware Search
+Chunks are stored per `(repo, branch)`. A search returns results for the branch
+you are on, so a symbol deleted on your branch does not surface from `main`.
 
-DevAI doesn't create separate indexes per branch. Instead, it uses an **overlay** strategy:
+Branches you want indexed are declared in config under `indexing.branches`, and
+`devctx index --branch <name>` indexes a named one. Because the copy is driven by
+`content_hash`, indexing a second branch copies rather than re-embeds anything
+the two branches share — measured at 95–96% of files on three real
+repositories.
 
-```
-  main (fully indexed)
-    │
-    ├── feature/auth (overlay: 3 changed files)
-    │
-    └── feature/payments (overlay: 7 changed files)
-```
+Indexing is worktree-independent: run it from any worktree and it updates the
+one index.
 
-When you search on `feature/auth`:
-1. Search results from `feature/auth` overlay take priority
-2. Results from `main` fill the rest
-3. Deleted files in the branch are filtered out (tombstones)
+## Filters
 
-This means branch switches are instant — no reindexing required. Only changed files in the branch are indexed as an overlay.
+`--language <lang>` restricts to one language. `--limit` caps results (default
+10). `--format json` emits a JSON array instead of the table.
 
-## Embedding Providers
+## Worked example
 
-| Provider | Model | Dimensions | Speed | Cost |
-|---|---|---|---|---|
-| **Local** (default) | `all-MiniLM-L6-v2` | 384 | ~500 chunks/sec | Free |
-| OpenAI | `text-embedding-3-small` | 384* | ~2000 chunks/sec | $0.02/1M tokens |
-| Voyage | `voyage-code-2` | 1024 | ~1500 chunks/sec | $0.12/1M tokens |
-| Custom | Any sentence-transformers model | Varies | Varies | Varies |
-
-*Dimensionality is configurable; DevAI truncates to match the index.
-
-The local provider is the default and recommended for most use cases. It runs entirely on CPU, requires no API keys, and is fast enough for repos up to ~1M lines.
-
-## When It Is Used
-
-- **MCP `search` tool**: Called by AI agents (Claude Code, Cursor) to find relevant code
-- **`devai search` CLI**: Direct command-line search
-- **Context builder**: Internally uses search to assemble context for queries
-- **Indexing**: Automatically on `devai index` or triggered by MCP tools
-
-## Example: Searching for "authentication middleware"
-
-Here's what happens internally when you (or an AI agent) search for "authentication middleware":
-
-```
-1. EMBED QUERY
-   "authentication middleware"
-      → sentence-transformers encode
-      → [0.12, -0.34, 0.56, ...] (384-dim vector)
-
-2. VECTOR SEARCH (LanceDB)
-   Find top-K chunks nearest to query vector
-   Filter: repo="myapp", branch="main" (+ overlays)
-
-   Results (ranked by cosine similarity):
-   ┌──────┬──────────────────────────────────────────┬───────┐
-   │ Rank │ Chunk                                    │ Score │
-   ├──────┼──────────────────────────────────────────┼───────┤
-   │  1   │ auth/middleware.py > AuthMiddleware       │ 0.92  │
-   │  2   │ auth/decorators.py > require_auth         │ 0.87  │
-   │  3   │ auth/jwt.py > verify_token                │ 0.84  │
-   │  4   │ tests/test_auth.py > TestAuthMiddleware   │ 0.79  │
-   │  5   │ config/security.py > AUTH_CONFIG           │ 0.71  │
-   └──────┴──────────────────────────────────────────┴───────┘
-
-3. RETURN
-   Each result includes:
-   - file path + line range
-   - context header (breadcrumb)
-   - code content
-   - similarity score
-   - symbol type + language
+```bash
+$ devctx search "how do we decide a token is expired" --limit 3
 ```
 
-The entire operation takes 10-50ms for a typical codebase. No file I/O at query time — everything is pre-indexed vectors.
+1. The query is embedded (384-dim vector, `ml-granite`).
+2. The store returns the 20 nearest chunks for this repo and branch.
+3. With reranking off, the top 3 are returned in retriever order.
 
-## Mental Model
+The top hit is typically a `function` chunk whose context header names the type
+and module — which is how a query that says "token" finds a method called
+`still_valid`.
 
-Think of DevAI search as **Google for your codebase**. Google doesn't match your query word-for-word against web pages — it understands what you're looking for and finds pages that are semantically relevant. DevAI does the same thing, but for code: it understands that "retry logic" and `exponentialBackoff()` are about the same concept, even though they share zero keywords.
+## Mental model
 
-The indexing pipeline is like Google's web crawler: it visits every file, understands its structure (via tree-sitter AST), breaks it into meaningful chunks, and stores vector representations. At query time, your natural language question is converted to the same vector space and matched against the index. Fast, accurate, and incrementally maintained.
+Grep is an index of **strings**. This is an index of **meaning**, with a string
+index next to it and a way to fuse the two.
+
+Use vector search when you know what the code *does*. Use keyword when you know
+what it is *called*. Use hybrid when you are not sure — which, in an unfamiliar
+codebase, is most of the time.

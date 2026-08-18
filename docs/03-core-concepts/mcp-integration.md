@@ -2,238 +2,142 @@
 
 > 🇪🇸 [Leer en español](../es/03-conceptos-fundamentales/integracion-mcp.md)
 
-## What It Is
+DevCtxEngine exposes its capabilities as tools over the
+[Model Context Protocol](https://modelcontextprotocol.io/), so any MCP client —
+Claude Code, Claude Desktop, Cursor — can use them without per-client work.
 
-> **Note — this page predates the Rust rewrite** and describes the earlier
-> Go + Python implementation. The concepts largely still apply; the commands,
-> file layout and `DEVAI_*` variables do not. Current references:
-> [Architecture](../02-architecture.md), [Configuration](../11-configuration.md).
+---
 
-DevAI exposes its capabilities — search, memory, symbol graph, context building — as tools via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). MCP is an open standard that lets AI applications (Claude Code, Cursor, Windsurf, etc.) discover and call external tools through a unified interface. DevAI implements an MCP server that turns your codebase intelligence into tools any MCP-compatible client can use.
+## Setup
 
-## Why It Exists
-
-Without MCP, every AI tool integration is bespoke. You'd need a VS Code extension, a JetBrains plugin, a CLI wrapper, and a custom API — each with its own protocol, authentication, and maintenance burden.
-
-MCP standardizes this. DevAI implements one server. Any MCP client can use it. Today that's Claude Code and Cursor. Tomorrow it's whatever ships next. Zero integration work per client.
-
-## How It Works
-
-### Architecture
-
-```
-  ┌──────────────────┐     stdio      ┌──────────────────┐
-  │   MCP Client     │◄──(stdin/──────►│   DevAI MCP      │
-  │  (Claude Code,   │   stdout)      │   Server (Go)    │
-  │   Cursor, etc.)  │               │                  │
-  └──────────────────┘               └────────┬─────────┘
-                                              │
-                                     JSON-RPC │
-                                              │
-                                     ┌────────▼─────────┐
-                                     │   DevAI ML       │
-                                     │   Server (Python) │
-                                     │                  │
-                                     │  - Embeddings    │
-                                     │  - LanceDB       │
-                                     │  - SQLite        │
-                                     │  - Tree-sitter   │
-                                     └──────────────────┘
+```bash
+devctx mcp configure                          # Claude Code, project scope
+devctx mcp configure --client cursor
+devctx mcp configure --client claude-desktop --scope global
+devctx mcp configure --remove
 ```
 
-- **Transport**: stdio (stdin/stdout). The MCP client spawns the DevAI server as a child process and communicates via standard I/O.
-- **Go MCP server**: Built with the [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go) library. Handles MCP protocol negotiation, tool discovery, and request routing.
-- **Python ML server**: Performs the actual work — embedding, searching, indexing, memory operations. The Go server communicates with it via JSON-RPC.
+| Client | Written to |
+|---|---|
+| `claude-code` | `.mcp.json` (project) or `~/.claude.json` (global) |
+| `claude-desktop` | `claude_desktop_config.json` (global only) |
+| `cursor` | `.cursor/mcp.json` |
 
-### Handler Pattern
+`--name` changes the key under `mcpServers` (default `devctx`).
 
-Every MCP tool follows the same internal flow:
+## Transport
+
+**stdio.** The client spawns `devctx mcp` as a child process and speaks JSON-RPC
+2.0 over stdin/stdout. No HTTP, no ports, no authentication — the trust boundary
+is the process boundary.
+
+The server runs entirely in-process: parsing, chunking, embedding and reranking
+are Rust, in the same binary. There is no sidecar and no second runtime.
+
+## Project binding
+
+`devctx mcp --project <path>` sets the project root explicitly. Without it, the
+root is discovered from the working directory.
+
+This matters more than it looks. **A globally-registered MCP server starts in
+whatever directory the client was launched from**, which is often no repository
+at all. When that happens, tools report that no project is bound. The recovery
+is two calls:
 
 ```
-  MCP request (from client)
-       │
-       ▼
-  Parse arguments (validate types, apply defaults)
-       │
-       ▼
-  Call ML server via JSON-RPC
-       │
-       ▼
-  Format response (structured text for LLM consumption)
-       │
-       ▼
-  Return MCP result (to client)
+list_projects        → what this machine tracks
+use_project <name>   → bind this session to one
 ```
 
-## Tool Reference
+## The tools
 
-DevAI exposes 21 tools via MCP. Three additional operations (`push_index`, `pull_index`, `sync_index`) are CLI-only.
+23 tools, grouped by what they answer.
 
-### Code Intelligence
+### Code
 
-| Tool | Description | Key Parameters |
-|---|---|---|
-| `search` | Semantic code search across indexed repositories | `query` (string), `repo` (string, optional), `branch` (string, optional), `language` (string, optional), `symbol_type` (string, optional), `limit` (int, default 10) |
-| `read_file` | Read file contents with optional line range | `path` (string), `start_line` (int, optional), `end_line` (int, optional) |
-| `read_symbol` | Get the full definition of a function, class, or type | `name` (string), `repo` (string, optional) |
-| `get_references` | Find all call sites and usages of a symbol | `symbol` (string), `repo` (string, optional) |
-| `build_context` | Assemble token-budget-aware context from code + memories | `query` (string), `max_tokens` (int, default 8000), `repo` (string, optional) |
+| Tool | Answers |
+|---|---|
+| `search` | *Where is the code about X?* Modes: `vector` (default), `keyword` (BM25), `hybrid` (RRF) |
+| `read_file` | The file, optionally a 1-based inclusive line range |
+| `read_symbol` | A symbol's definition, code, file, line range and kind — when you know the name |
+| `get_references` | Every call site of a symbol |
+| `impact_analysis` | Transitive callers (blast radius) and callees |
+| `summarize` | Text down to roughly `max_tokens`, extractive by default so identifiers survive |
 
-### Indexing
+The distinction between `search` and `read_symbol` is worth internalising:
+`read_symbol` when you know the name and want the thing itself, `search` when
+you want code *about an idea*.
 
-| Tool | Description | Key Parameters |
-|---|---|---|
-| `index_repo` | Index or re-index a repository | `path` (string), `branch` (string, optional), `full` (bool, default false) |
-| `index_status` | Check indexing status for a repository | `path` (string) |
+### Routes
 
-### Branch Context
+| Tool | Answers |
+|---|---|
+| `search_routes` | HTTP routes by method and/or path substring |
+| `routes_for_handler` | The routes served by a handler symbol |
 
-| Tool | Description | Key Parameters |
-|---|---|---|
-| `get_branch_context` | Get context about the current branch and its changes | `path` (string), `branch` (string, optional) |
-| `switch_context` | Switch the active branch context for search | `path` (string), `branch` (string) |
+Frameworks recognised: FastAPI, Flask, Express, NestJS, Spring, Quarkus,
+Angular.
 
 ### Memory
 
-| Tool | Description | Key Parameters |
-|---|---|---|
-| `remember` | Save a structured memory | `title` (string), `content` (string), `type` (string), `project` (string), `scope` (string, default "shared"), `topic_key` (string, optional), `tags` (list, optional), `files` (list, optional) |
-| `recall` | Search memories by natural language query | `query` (string), `project` (string), `type` (string, optional), `scope` (string, optional), `limit` (int, default 10) |
-| `memory_context` | Get memory-enriched context for a topic | `query` (string), `project` (string) |
-| `memory_stats` | Get statistics about the memory store | `project` (string, optional) |
-
-### Session
-
-| Tool | Description | Key Parameters |
-|---|---|---|
-| `get_session_history` | Retrieve session interaction history | `session_id` (string, optional), `limit` (int, default 20) |
-
-### CLI-Only (Not Exposed via MCP)
-
-| Command | Description |
+| Tool | Answers |
 |---|---|
-| `devai push-index` | Push local index to remote storage |
-| `devai pull-index` | Pull index from remote storage |
-| `devai sync-index` | Bidirectional index sync |
+| `remember` | Save a decision/insight/note/bug, deduplicated by topic or content |
+| `recall` | Memories relevant to a query, across every tier, each tagged with where it came from |
+| `memory_context` | The most recent memories, *with no query* — for recovering after a reset, when you don't yet know what to ask |
+| `memories_by_symbol` | Why this symbol is the way it is — what the call graph cannot answer |
+| `memories_by_file` | The same, for a file |
+| `memory_refs` | The inverse: given a memory id, the symbols and files it concerns |
+| `memory_stats` | Counts, total and per type |
+| `memory_forget` | Permanently delete one. Not reversible. |
+| `memory_move` | Move between tiers, or to another project. The id changes. |
+| `build_context` | One budgeted brief: known + code + recorded-against-that-code |
 
-These are CLI-only because they involve potentially destructive operations (overwriting indexes) and long-running transfers that don't fit the request-response MCP model.
+### Projects and indexing
 
-## Configuration
+| Tool | Answers |
+|---|---|
+| `list_projects` | Every repository tracked: name, path, model, index freshness |
+| `use_project` | Bind this session to a project |
+| `search_project` | Search a *different* registered project by name |
+| `index_repo` | Index: git diff → parse → chunk → embed → store |
+| `index_status` | Last-indexed commit and counts for this repo and branch, and whether it is current |
 
-### Auto-Configure for Claude Code
+`search_project` is for when the answer lives in a repository other than the one
+you are working in — the backend question you hit while editing the frontend.
+
+## Return shapes
+
+Most tools return **JSON**. Two do not:
+
+- `build_context` returns **prose**, because the result is meant to be read
+  straight into a model's context and a JSON envelope would spend budget on
+  punctuation.
+- `summarize` returns text.
+
+Memory-by-code results (`memories_by_symbol`, `memories_by_file`, `memory_refs`)
+always carry `link_sources`, and it is there on purpose: `files-field` and
+`content-mention` mean something connected that memory to that code at write
+time, while `inference` means only that the words match. A caller weighing how
+much to trust a link needs that distinction.
+
+## Discovery
+
+On `tools/list` the server returns all 23 definitions with JSON Schema
+parameters, declared upfront. The client validates arguments before each call.
+There is no runtime discovery step.
+
+## Other interfaces
+
+The same engine is reachable four other ways, all reading the same store:
 
 ```bash
-devai server configure claude
+devctx tui        # interactive terminal UI: search, graph, memories
+devctx web        # browser dashboard: call graph + memories
+devctx api        # HTTP REST API
+devctx serve      # long-lived server that owns the DB; other commands route to it
 ```
 
-This writes the MCP server configuration to Claude Code's config file (`~/.claude.json` or project-level `.mcp.json`), registering DevAI as an available MCP server with the correct binary path and arguments.
-
-### Auto-Configure for Cursor
-
-```bash
-devai server configure cursor
-```
-
-Same as above, but writes to Cursor's MCP configuration location.
-
-### Manual Configuration
-
-For other MCP clients, add this to your MCP config:
-
-```json
-{
-  "mcpServers": {
-    "devai": {
-      "command": "devai",
-      "args": ["server", "start"],
-      "transport": "stdio"
-    }
-  }
-}
-```
-
-The server binary must be in your `PATH`. It will automatically locate and start the Python ML server.
-
-## When It Is Used
-
-MCP integration is the **primary interface** for AI-assisted development workflows. When you use DevAI with Claude Code or Cursor:
-
-1. The editor/CLI spawns the DevAI MCP server
-2. The AI agent discovers available tools via MCP protocol
-3. During conversation, the agent calls tools as needed:
-   - `search` to find relevant code
-   - `build_context` to assemble comprehensive context
-   - `remember` / `recall` to persist and retrieve knowledge
-   - `read_symbol` / `get_references` for precise code navigation
-4. Results are returned as structured text that the agent incorporates into its reasoning
-
-## Example: What Happens When Claude Code Calls `search`
-
-```
-User (in Claude Code): "Find the retry logic for API calls"
-
-1. TOOL DISCOVERY (already done at session start)
-   Claude Code knows DevAI exposes a `search` tool
-
-2. TOOL CALL
-   Claude Code sends MCP request:
-   {
-     "method": "tools/call",
-     "params": {
-       "name": "search",
-       "arguments": {
-         "query": "retry logic for API calls",
-         "limit": 10
-       }
-     }
-   }
-
-3. GO MCP SERVER
-   Receives request via stdin
-   Parses arguments: query="retry logic for API calls", limit=10
-   Sends JSON-RPC call to Python ML server
-
-4. PYTHON ML SERVER
-   Embeds query → 384-dim vector
-   Searches LanceDB for nearest chunks
-   Returns ranked results with metadata
-
-5. GO MCP SERVER
-   Formats results as structured text:
-
-   "Found 7 results:
-
-   [1] services/http/retry.py:12-45 (score: 0.93)
-   class RetryPolicy:
-       def __init__(self, max_retries=3, backoff_factor=2.0):
-           ...
-
-   [2] services/http/client.py:67-89 (score: 0.87)
-   async def fetch_with_retry(url, policy=None):
-       ..."
-
-   Returns MCP response via stdout
-
-6. CLAUDE CODE
-   Receives results
-   Incorporates into response to user
-   "I found the retry logic in services/http/retry.py..."
-```
-
-Total latency: 50-200ms depending on index size. The user sees results inline in the conversation, as if the AI agent just "knew" where the code was.
-
-## Adding New Tools
-
-To add a new MCP tool to DevAI:
-
-1. **Go side** (`internal/mcp/server.go`): Register the tool with its schema and handler function
-2. **Python side** (`ml/devai_ml/server.py`): Implement the JSON-RPC method that does the actual work
-3. **Test both sides**: The handler parses args and formats output; the ML method implements logic
-
-For detailed instructions, see the [Extending DevAI](../06-extending-the-system.md) guide.
-
-## Mental Model
-
-MCP is a **USB port for AI tools**. USB standardized how peripherals connect to computers — before USB, every device needed its own proprietary connector. MCP standardizes how AI agents connect to external capabilities.
-
-DevAI is a device you plug in via MCP. The AI agent (Claude Code, Cursor) is the computer. Once plugged in, the agent can use DevAI's capabilities — search, memory, symbol graph — without knowing anything about embeddings, LanceDB, or tree-sitter. It just calls tools and gets results. Swap in a different MCP client, and everything still works. That's the point.
+`serve` matters for concurrency: DuckDB allows one writer per file, so a
+long-lived server owns the database and the CLI routes through it rather than
+contending for the lock.
