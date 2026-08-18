@@ -2,250 +2,145 @@
 
 > 🇪🇸 [Leer en español](../es/03-conceptos-fundamentales/grafo-de-simbolos.md)
 
-## What It Is
+A call graph over the indexed code: who calls what, and what a change would
+reach.
 
-The symbol graph is a persistent map of every relationship in your codebase — who calls whom, who imports what, who inherits from where. It's a SQLite-backed adjacency list that lets you traverse your code's dependency web in milliseconds.
+---
 
-## Why It Exists
+## What it is
 
-Search answers "where is the code that does X?" The symbol graph answers a different, equally critical question: **"what is connected to X?"**
+While indexing, tree-sitter parses each supported file and extracts two things:
+the symbols it declares, and the calls it makes. The calls become edges.
 
-You found the `processPayment` function via search. Now you need to know:
-- Who calls it? (impact analysis)
-- What does it call? (understanding behavior)
-- What implements the `PaymentProcessor` interface? (finding concrete implementations)
-- What imports this module? (blast radius of a change)
-
-Without the graph, you're doing manual `grep` for function names and hoping you don't miss a call site hidden behind an alias, a decorator, or dynamic dispatch. The graph gives you structural truth extracted from the AST.
-
-## How It's Built
-
-The symbol graph is constructed during indexing, as a byproduct of the same tree-sitter AST parse that produces search chunks:
-
-```
-  Source file
-       │
-       ▼
-  Tree-sitter AST Parse
-       │
-       ├──► Search chunks (→ embeddings → LanceDB)
-       │
-       └──► Symbol extraction (→ graph edges → SQLite)
-              │
-              ├── Identify declarations (functions, classes, etc.)
-              ├── Identify references (calls, imports, etc.)
-              └── Create edges between symbols
+```bash
+devctx symbol authenticate          # the definition and its code
+devctx impact authenticate          # transitive callers and callees
 ```
 
-### Supported Languages
+Agents use `read_symbol`, `get_references` and `impact_analysis`.
 
-Tree-sitter grammars provide full AST parsing for **25+ languages**: Python, Go, TypeScript, JavaScript, Java, Rust, C, C++, C#, Ruby, PHP, Swift, Kotlin, and more.
+## Why it exists
 
-For languages without tree-sitter support (HTML, CSS, JSON, YAML, etc.), a raw parser fallback extracts what it can — typically just file-level symbols and import relationships.
+Semantic search answers *"where is the code about X?"*. It cannot answer *"what
+breaks if I change this?"*, because that question is about structure, not
+meaning — and the answer includes code that never mentions X.
 
-### Storage: SQLite Adjacency List
+The graph answers the structural question exactly, with no ranking and no
+approximation. A caller either exists or it does not.
 
-The graph is stored in a `graph_edges` table:
+## What is actually in the graph
 
-```sql
-CREATE TABLE graph_edges (
-    source_symbol  TEXT NOT NULL,  -- fully qualified name
-    target_symbol  TEXT NOT NULL,  -- fully qualified name
-    edge_kind      TEXT NOT NULL,  -- calls, imports, inherits, etc.
-    source_file    TEXT,
-    target_file    TEXT,
-    source_line    INTEGER,
-    target_line    INTEGER
-);
-```
+**One edge kind: `calls`.**
 
-SQLite was chosen deliberately over a graph database. The graph fits in a single file, requires zero infrastructure, and handles codebases up to ~2M lines without breaking a sweat. Queries run in <10ms.
+This is worth stating plainly, because it is easy to assume otherwise. The
+parser also extracts imports and type bindings, but those are used to *resolve*
+call targets — they are not stored as edges. There are no `inherits`,
+`implements` or `references` edges.
 
-## Symbol Types
+So: this is a call graph. Not a dependency graph, not a type hierarchy.
 
-Every node in the graph is a symbol with a fully qualified name:
+Symbol kinds recognised by the queries:
 
-| Type | Example FQN |
+`function` · `method` · `class` · `struct` · `enum` · `interface` · `type`
+
+## Supported languages
+
+**Full parsing — symbols and call edges (7):**
+
+| Language | Extensions |
 |---|---|
-| `function` | `auth/utils.py::verify_token` |
-| `method` | `auth/middleware.py::AuthMiddleware.authenticate` |
-| `class` | `auth/middleware.py::AuthMiddleware` |
-| `struct` | `models/user.go::User` |
-| `interface` | `services/payment.go::PaymentProcessor` |
-| `enum` | `types/status.ts::OrderStatus` |
-| `constant` | `config/defaults.py::MAX_RETRIES` |
-| `variable` | `config/settings.py::db_connection_string` |
-| `type_alias` | `types/common.ts::UserId` |
+| Python | `.py` `.pyi` |
+| JavaScript | `.js` `.mjs` `.cjs` `.jsx` |
+| TypeScript | `.ts` `.mts` `.cts` |
+| TSX | `.tsx` |
+| Go | `.go` |
+| Java | `.java` |
+| Rust | `.rs` |
 
-The fully qualified name format is `file::SymbolName` or `file::Class.method`. This ensures uniqueness — two classes named `Config` in different files are distinct nodes.
+**Indexed as raw text — searchable, but no symbols and no edges:**
 
-## Edge Types
+`.html` `.htm` `.css` `.scss` `.sass` `.less` `.json` `.yaml` `.yml` `.xml`
+`.md` `.markdown` `.sql` `.graphql` `.gql` `.proto` `.kt` `.kts`
 
-Edges represent relationships between symbols:
+These are chunked with overlap and embedded, so search finds them. They simply
+do not appear in the graph.
 
-### `calls`
+Kotlin is the notable case: it has no tree-sitter grammar wired up, so it is
+indexed as text — **but its Spring routes are still extracted**, because route
+detection has a separate path.
 
-Function A invokes function B.
+Anything else is not indexed.
 
-```
-  processOrder ──calls──► validatePayment
-  processOrder ──calls──► calculateTax
-  processOrder ──calls──► sendConfirmation
-```
+## Storage
 
-### `imports`
+Edges live in the project's DuckDB database, in `graph_edges`:
 
-Module A imports a symbol from module B.
+| Column | Holds |
+|---|---|
+| `source` / `target` | Symbol names |
+| `kind` | Always `calls` |
+| `source_file` / `target_file` | Where each side lives |
+| `line` | Where the call appears |
+| `repo` / `branch` | Scope — the graph is per-branch, like everything else |
 
-```
-  handlers/order.py ──imports──► services/payment.py::processPayment
-  handlers/order.py ──imports──► models/order.py::Order
-```
-
-### `inherits`
-
-Class A extends class B.
-
-```
-  AdminUser ──inherits──► User
-  PremiumUser ──inherits──► User
-```
-
-### `implements`
-
-A concrete type implements an interface (Go, Java, TypeScript).
-
-```
-  StripeProcessor ──implements──► PaymentProcessor
-  PayPalProcessor ──implements──► PaymentProcessor
-```
-
-### `references`
-
-A symbol is referenced (read, assigned, passed as argument) without being called or imported.
-
-```
-  createOrder ──references──► OrderStatus.PENDING
-  middleware ──references──► AUTH_CONFIG
-```
+Uniqueness is `(source, target, kind, repo, branch, source_file)`, so the same
+call from two different files is two edges, and re-indexing does not duplicate.
 
 ## Operations
 
-### `get_callers(symbol)` — Who calls this?
+### `get_references(symbol)` — who calls this?
 
-**Use case:** Impact analysis. Before changing a function, know every call site.
+Every call site of a symbol across the indexed code. The direct answer to *"is
+this safe to change?"* at one hop.
 
-```
-get_callers("auth/middleware.py::AuthMiddleware.authenticate")
+### `impact_analysis(symbol)` — blast radius
 
-Results:
-  handlers/api.py::handle_request        (line 45)
-  handlers/websocket.py::on_connect       (line 12)
-  tests/test_auth.py::test_valid_token    (line 23)
-```
+Transitive callers *and* callees. Callers are the blast radius: everything that
+could break. Callees are what this symbol depends on to work.
 
-### `get_callees(symbol)` — What does this call?
+Run it before refactoring anything public. This is the operation people forget
+exists and then regret not running.
 
-**Use case:** Understanding behavior. See every function a method depends on without reading the implementation.
+### `read_symbol(name)` — the definition
 
-```
-get_callees("services/order.py::processOrder")
+Code, file, line range and kind. Use this when you know the name and want the
+thing itself; use `search` when you want code *about an idea*.
 
-Results:
-  services/payment.py::validatePayment    (line 67)
-  services/tax.py::calculateTax           (line 89)
-  services/email.py::sendConfirmation     (line 112)
-  models/order.py::Order.save             (line 34)
-```
+## Limits worth knowing
 
-### `get_dependents(symbol)` — What depends on this?
+**Call resolution is name-based**, informed by imports and type bindings where
+the grammar supports it. Two methods named `save()` on different types can
+resolve to the same node. Treat impact results as a superset to review, not a
+proven exact set.
 
-**Use case:** Blast radius. What breaks if this symbol changes or disappears?
+**Dynamic dispatch is invisible.** A call made through a callback, a reflection
+API, or a string-keyed registry leaves no syntactic call edge. The graph will
+under-report exactly where a language is most dynamic.
 
-```
-get_dependents("models/user.py::User")
+**Only 7 languages produce edges.** In a polyglot repository, the graph covers
+part of it, and there is no warning that says which part. `devctx status` shows
+the symbol count; a suspiciously low one usually means the code is in a language
+that is being indexed as text.
 
-Results:
-  auth/middleware.py::AuthMiddleware       (inherits)
-  handlers/profile.py::get_profile        (imports)
-  handlers/admin.py::list_users           (imports)
-  services/notification.py::notify_user   (references)
-```
+## How it complements search
 
-### `get_dependencies(symbol)` — What does this depend on?
+| Question | Tool |
+|---|---|
+| *Where is the code about authentication?* | `search` |
+| *What calls `authenticate`?* | `get_references` |
+| *What breaks if I change it?* | `impact_analysis` |
+| *Why is it written this way?* | `memories_by_symbol` |
+| *What should I read before answering?* | `build_context` |
 
-**Use case:** Understanding a module's footprint. What does it pull in?
+Search is fuzzy and ranked. The graph is exact and unranked. The fourth row is
+the one people do not think to ask, and it is the one the code cannot answer at
+all.
 
-```
-get_dependencies("services/order.py::processOrder")
+## Mental model
 
-Results:
-  services/payment.py::validatePayment    (calls)
-  services/tax.py::calculateTax           (calls)
-  models/order.py::Order                  (imports)
-  config/settings.py::TAX_RATE            (references)
-```
+Search is a map of the territory: it shows you what is near what, by meaning.
+The graph is the road network: it shows you what actually connects to what, and
+therefore where traffic goes when you close a road.
 
-## How It Complements Search
-
-Search and the symbol graph solve different problems and are most powerful together:
-
-```
-  "How does payment processing work?"
-       │
-       ▼
-  SEARCH (semantic)
-       │  Finds: processPayment(), PaymentProcessor, StripeClient
-       │
-       ▼
-  SYMBOL GRAPH (structural)
-       │  get_callers(processPayment)    → who triggers payments
-       │  get_callees(processPayment)    → what it orchestrates
-       │  implements(PaymentProcessor)   → concrete implementations
-       │
-       ▼
-  FULL PICTURE
-       Order handler → processPayment → [validate, charge, notify]
-                                              │
-                                    StripeClient / PayPalClient
-```
-
-Search gives you the entry points. The graph gives you the connections. Together, they give an AI agent (or a human) enough structural understanding to reason about the codebase without reading every file.
-
-## When It Is Used
-
-- **MCP `get_references` tool**: Returns all call sites and usages of a symbol
-- **MCP `read_symbol` tool**: Uses the graph to locate symbol definitions
-- **Context builder**: Follows graph edges to include related code in assembled context
-- **Impact analysis**: Before refactoring, understand what depends on the code being changed
-
-## Example: Investigating a Bug in `processPayment`
-
-```
-1. SEARCH: "payment processing error handling"
-   → Finds services/payment.py::processPayment (score: 0.91)
-
-2. READ SYMBOL: processPayment
-   → Full function body (47 lines)
-
-3. GET CALLERS: processPayment
-   → handlers/checkout.py::checkout (line 34)
-   → handlers/retry.py::retry_failed_payment (line 12)
-   → workers/subscription.py::renew_subscription (line 78)
-
-4. GET CALLEES: processPayment
-   → stripe_client.charge()
-   → order.update_status()
-   → audit_log.record()
-
-   NOW you know:
-   - 3 entry points that trigger this code
-   - 3 downstream operations that could fail
-   - The exact call chain to trace the bug
-```
-
-## Mental Model
-
-Think of the symbol graph as a **city map**. Search is like asking "where's the nearest hospital?" — it finds locations. The graph is like the road network — it shows you how to get there, what's connected, and which roads will be affected if you close an intersection.
-
-Every function is an intersection. Every call is a road. The graph lets you answer "if I close this road, what routes break?" — which is exactly the question you need answered before every refactor.
+You want the map to find the neighbourhood, and the road network before you dig
+anything up.

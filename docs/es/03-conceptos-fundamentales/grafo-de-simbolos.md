@@ -1,251 +1,151 @@
-> 🌐 [English version](../../03-core-concepts/symbol-graph.md)
+# Grafo de símbolos
 
-# Grafo de Simbolos
+> 🇬🇧 [Read in English](../../03-core-concepts/symbol-graph.md)
 
-## Que es
+Un grafo de llamadas sobre el código indexado: quién llama a qué, y hasta dónde
+llegaría un cambio.
 
-El grafo de simbolos es un mapa persistente de cada relacion en tu codebase — quien llama a quien, quien importa que, quien hereda de donde. Es una lista de adyacencia respaldada por SQLite que te permite recorrer la red de dependencias de tu codigo en milisegundos.
+---
 
-## Por que existe
+## Qué es
 
-La busqueda responde "donde esta el codigo que hace X?" El grafo de simbolos responde una pregunta diferente, igualmente critica: **"que esta conectado a X?"**
+Durante el indexado, tree-sitter parsea cada archivo soportado y extrae dos
+cosas: los símbolos que declara y las llamadas que hace. Las llamadas se
+vuelven aristas.
 
-Encontraste la funcion `processPayment` via busqueda. Ahora necesitas saber:
-- Quien la llama? (analisis de impacto)
-- Que llama ella? (entender comportamiento)
-- Que implementa la interfaz `PaymentProcessor`? (encontrar implementaciones concretas)
-- Que importa este modulo? (radio de explosion de un cambio)
-
-Sin el grafo, estas haciendo `grep` manual por nombres de funciones y rezando para no perderte un call site escondido detras de un alias, un decorator o dispatch dinamico. El grafo te da la verdad estructural extraida del AST.
-
-## Como se construye
-
-El grafo de simbolos se construye durante la indexacion, como subproducto del mismo parseo tree-sitter AST que produce los chunks de busqueda:
-
-```
-  Archivo fuente
-       │
-       ▼
-  Tree-sitter AST Parse
-       │
-       ├──► Chunks de busqueda (→ embeddings → LanceDB)
-       │
-       └──► Extraccion de simbolos (→ aristas del grafo → SQLite)
-              │
-              ├── Identificar declaraciones (funciones, clases, etc.)
-              ├── Identificar referencias (llamadas, imports, etc.)
-              └── Crear aristas entre simbolos
+```bash
+devctx symbol authenticate          # la definición y su código
+devctx impact authenticate          # llamadores y llamados transitivos
 ```
 
-### Lenguajes soportados
+Los agentes usan `read_symbol`, `get_references` e `impact_analysis`.
 
-Las gramaticas de tree-sitter proveen parseo completo del AST para **25+ lenguajes**: Python, Go, TypeScript, JavaScript, Java, Rust, C, C++, C#, Ruby, PHP, Swift, Kotlin, y mas.
+## Por qué existe
 
-Para lenguajes sin soporte de tree-sitter (HTML, CSS, JSON, YAML, etc.), un parser de fallback raw extrae lo que puede — tipicamente solo simbolos a nivel de archivo y relaciones de import.
+La búsqueda semántica responde *"¿dónde está el código sobre X?"*. No puede
+responder *"¿qué se rompe si cambio esto?"*, porque esa pregunta es de
+estructura, no de significado — y la respuesta incluye código que nunca menciona
+X.
 
-### Almacenamiento: Lista de adyacencia en SQLite
+El grafo responde la pregunta estructural exactamente, sin ranking y sin
+aproximación. Un llamador existe o no existe.
 
-El grafo se almacena en una tabla `graph_edges`:
+## Qué hay realmente en el grafo
 
-```sql
-CREATE TABLE graph_edges (
-    source_symbol  TEXT NOT NULL,  -- nombre completamente calificado
-    target_symbol  TEXT NOT NULL,  -- nombre completamente calificado
-    edge_kind      TEXT NOT NULL,  -- calls, imports, inherits, etc.
-    source_file    TEXT,
-    target_file    TEXT,
-    source_line    INTEGER,
-    target_line    INTEGER
-);
-```
+**Un solo tipo de arista: `calls`.**
 
-SQLite se eligio deliberadamente por sobre una base de datos de grafos. El grafo cabe en un solo archivo, no requiere infraestructura, y maneja codebases de hasta ~2M lineas sin despeinarse. Las consultas corren en <10ms.
+Vale la pena decirlo sin rodeos, porque es fácil suponer otra cosa. El parser
+también extrae imports y ligaduras de tipo, pero eso se usa para *resolver* los
+destinos de las llamadas — no se guardan como aristas. No hay aristas
+`inherits`, `implements` ni `references`.
 
-## Tipos de simbolos
+Entonces: esto es un grafo de llamadas. No un grafo de dependencias, ni una
+jerarquía de tipos.
 
-Cada nodo en el grafo es un simbolo con un nombre completamente calificado (FQN):
+Tipos de símbolo que reconocen las consultas:
 
-| Tipo | Ejemplo de FQN |
+`function` · `method` · `class` · `struct` · `enum` · `interface` · `type`
+
+## Lenguajes soportados
+
+**Parseo completo — símbolos y aristas de llamada (7):**
+
+| Lenguaje | Extensiones |
 |---|---|
-| `function` | `auth/utils.py::verify_token` |
-| `method` | `auth/middleware.py::AuthMiddleware.authenticate` |
-| `class` | `auth/middleware.py::AuthMiddleware` |
-| `struct` | `models/user.go::User` |
-| `interface` | `services/payment.go::PaymentProcessor` |
-| `enum` | `types/status.ts::OrderStatus` |
-| `constant` | `config/defaults.py::MAX_RETRIES` |
-| `variable` | `config/settings.py::db_connection_string` |
-| `type_alias` | `types/common.ts::UserId` |
+| Python | `.py` `.pyi` |
+| JavaScript | `.js` `.mjs` `.cjs` `.jsx` |
+| TypeScript | `.ts` `.mts` `.cts` |
+| TSX | `.tsx` |
+| Go | `.go` |
+| Java | `.java` |
+| Rust | `.rs` |
 
-El formato del nombre completamente calificado es `file::SymbolName` o `file::Class.method`. Esto garantiza unicidad — dos clases llamadas `Config` en archivos diferentes son nodos distintos.
+**Indexados como texto crudo — buscables, pero sin símbolos ni aristas:**
 
-## Tipos de aristas
+`.html` `.htm` `.css` `.scss` `.sass` `.less` `.json` `.yaml` `.yml` `.xml`
+`.md` `.markdown` `.sql` `.graphql` `.gql` `.proto` `.kt` `.kts`
 
-Las aristas representan relaciones entre simbolos:
+Se fragmentan con solapamiento y se embeben, así que la búsqueda los encuentra.
+Simplemente no aparecen en el grafo.
 
-### `calls`
+Kotlin es el caso notable: no tiene gramática de tree-sitter conectada, así que
+se indexa como texto — **pero sus rutas de Spring sí se extraen**, porque la
+detección de rutas tiene un camino aparte.
 
-La funcion A invoca a la funcion B.
+Cualquier otra cosa no se indexa.
 
-```
-  processOrder ──calls──► validatePayment
-  processOrder ──calls──► calculateTax
-  processOrder ──calls──► sendConfirmation
-```
+## Almacenamiento
 
-### `imports`
+Las aristas viven en la base DuckDB del proyecto, en `graph_edges`:
 
-El modulo A importa un simbolo del modulo B.
+| Columna | Contiene |
+|---|---|
+| `source` / `target` | Nombres de símbolo |
+| `kind` | Siempre `calls` |
+| `source_file` / `target_file` | Dónde vive cada lado |
+| `line` | Dónde aparece la llamada |
+| `repo` / `branch` | Alcance — el grafo es por rama, como todo lo demás |
 
-```
-  handlers/order.py ──imports──► services/payment.py::processPayment
-  handlers/order.py ──imports──► models/order.py::Order
-```
-
-### `inherits`
-
-La clase A extiende a la clase B.
-
-```
-  AdminUser ──inherits──► User
-  PremiumUser ──inherits──► User
-```
-
-### `implements`
-
-Un tipo concreto implementa una interfaz (Go, Java, TypeScript).
-
-```
-  StripeProcessor ──implements──► PaymentProcessor
-  PayPalProcessor ──implements──► PaymentProcessor
-```
-
-### `references`
-
-Un simbolo es referenciado (leido, asignado, pasado como argumento) sin ser llamado o importado.
-
-```
-  createOrder ──references──► OrderStatus.PENDING
-  middleware ──references──► AUTH_CONFIG
-```
+La unicidad es `(source, target, kind, repo, branch, source_file)`, así que la
+misma llamada desde dos archivos distintos son dos aristas, y re-indexar no
+duplica.
 
 ## Operaciones
 
-### `get_callers(symbol)` — Quien llama a esto?
+### `get_references(símbolo)` — ¿quién llama a esto?
 
-**Caso de uso:** Analisis de impacto. Antes de cambiar una funcion, conoce cada call site.
+Cada sitio de llamada de un símbolo en el código indexado. La respuesta directa
+a *"¿es seguro cambiar esto?"* a un salto.
 
-```
-get_callers("auth/middleware.py::AuthMiddleware.authenticate")
+### `impact_analysis(símbolo)` — radio de impacto
 
-Resultados:
-  handlers/api.py::handle_request        (linea 45)
-  handlers/websocket.py::on_connect       (linea 12)
-  tests/test_auth.py::test_valid_token    (linea 23)
-```
+Llamadores *y* llamados transitivos. Los llamadores son el radio de impacto:
+todo lo que se podría romper. Los llamados son de qué depende este símbolo para
+funcionar.
 
-### `get_callees(symbol)` — Que llama esto?
+Corrélo antes de refactorizar cualquier cosa pública. Esta es la operación que
+la gente olvida que existe y después lamenta no haber corrido.
 
-**Caso de uso:** Entender comportamiento. Ve cada funcion de la que depende un metodo sin leer la implementacion.
+### `read_symbol(nombre)` — la definición
 
-```
-get_callees("services/order.py::processOrder")
+Código, archivo, rango de líneas y tipo. Usalo cuando sabés el nombre y querés
+la cosa misma; usá `search` cuando querés código *sobre una idea*.
 
-Resultados:
-  services/payment.py::validatePayment    (linea 67)
-  services/tax.py::calculateTax           (linea 89)
-  services/email.py::sendConfirmation     (linea 112)
-  models/order.py::Order.save             (linea 34)
-```
+## Límites que conviene conocer
 
-### `get_dependents(symbol)` — Que depende de esto?
+**La resolución de llamadas es por nombre**, informada por imports y ligaduras
+de tipo donde la gramática lo soporta. Dos métodos llamados `save()` en tipos
+distintos pueden resolver al mismo nodo. Tratá los resultados de impacto como un
+superconjunto a revisar, no como un conjunto exacto probado.
 
-**Caso de uso:** Radio de explosion. Que se rompe si este simbolo cambia o desaparece?
+**El despacho dinámico es invisible.** Una llamada hecha por un callback, una
+API de reflexión o un registro llaveado por strings no deja arista sintáctica de
+llamada. El grafo va a sub-reportar justo donde un lenguaje es más dinámico.
 
-```
-get_dependents("models/user.py::User")
+**Solo 7 lenguajes producen aristas.** En un repositorio políglota, el grafo
+cubre una parte, y no hay aviso que diga cuál. `devctx status` muestra el conteo
+de símbolos; uno sospechosamente bajo suele significar que el código está en un
+lenguaje que se está indexando como texto.
 
-Resultados:
-  auth/middleware.py::AuthMiddleware       (inherits)
-  handlers/profile.py::get_profile        (imports)
-  handlers/admin.py::list_users           (imports)
-  services/notification.py::notify_user   (references)
-```
+## Cómo complementa a la búsqueda
 
-### `get_dependencies(symbol)` — De que depende esto?
+| Pregunta | Herramienta |
+|---|---|
+| *¿Dónde está el código sobre autenticación?* | `search` |
+| *¿Qué llama a `authenticate`?* | `get_references` |
+| *¿Qué se rompe si lo cambio?* | `impact_analysis` |
+| *¿Por qué está escrito así?* | `memories_by_symbol` |
+| *¿Qué debería leer antes de responder?* | `build_context` |
 
-**Caso de uso:** Entender la huella de un modulo. Que arrastra consigo?
-
-```
-get_dependencies("services/order.py::processOrder")
-
-Resultados:
-  services/payment.py::validatePayment    (calls)
-  services/tax.py::calculateTax           (calls)
-  models/order.py::Order                  (imports)
-  config/settings.py::TAX_RATE            (references)
-```
-
-## Como complementa a la busqueda
-
-La busqueda y el grafo de simbolos resuelven problemas diferentes y son mas poderosos juntos:
-
-```
-  "Como funciona el procesamiento de pagos?"
-       │
-       ▼
-  BUSQUEDA (semantica)
-       │  Encuentra: processPayment(), PaymentProcessor, StripeClient
-       │
-       ▼
-  GRAFO DE SIMBOLOS (estructural)
-       │  get_callers(processPayment)    → quien dispara pagos
-       │  get_callees(processPayment)    → que orquesta
-       │  implements(PaymentProcessor)   → implementaciones concretas
-       │
-       ▼
-  PANORAMA COMPLETO
-       Order handler → processPayment → [validate, charge, notify]
-                                              │
-                                    StripeClient / PayPalClient
-```
-
-La busqueda te da los puntos de entrada. El grafo te da las conexiones. Juntos, le dan a un agente de IA (o a un humano) suficiente comprension estructural para razonar sobre el codebase sin leer cada archivo.
-
-## Cuando se usa
-
-- **MCP `get_references` tool**: Devuelve todos los call sites y usos de un simbolo
-- **MCP `read_symbol` tool**: Usa el grafo para localizar definiciones de simbolos
-- **Context builder**: Sigue las aristas del grafo para incluir codigo relacionado en el contexto ensamblado
-- **Analisis de impacto**: Antes de refactorizar, entender que depende del codigo que se va a cambiar
-
-## Ejemplo: Investigando un bug en `processPayment`
-
-```
-1. BUSQUEDA: "payment processing error handling"
-   → Encuentra services/payment.py::processPayment (score: 0.91)
-
-2. READ SYMBOL: processPayment
-   → Cuerpo completo de la funcion (47 lineas)
-
-3. GET CALLERS: processPayment
-   → handlers/checkout.py::checkout (linea 34)
-   → handlers/retry.py::retry_failed_payment (linea 12)
-   → workers/subscription.py::renew_subscription (linea 78)
-
-4. GET CALLEES: processPayment
-   → stripe_client.charge()
-   → order.update_status()
-   → audit_log.record()
-
-   AHORA sabes:
-   - 3 puntos de entrada que disparan este codigo
-   - 3 operaciones downstream que podrian fallar
-   - La cadena de llamadas exacta para rastrear el bug
-```
+La búsqueda es difusa y rankeada. El grafo es exacto y sin ranking. La cuarta
+fila es la que a nadie se le ocurre preguntar, y es la única que el código no
+puede responder en absoluto.
 
 ## Modelo mental
 
-Pensa en el grafo de simbolos como un **mapa de la ciudad**. La busqueda es como preguntar "donde esta el hospital mas cercano?" — encuentra ubicaciones. El grafo es como la red de calles — te muestra como llegar, que esta conectado y que rutas se ven afectadas si cerras una interseccion.
+La búsqueda es un mapa del territorio: te muestra qué está cerca de qué, por
+significado. El grafo es la red vial: te muestra qué conecta realmente con qué,
+y por lo tanto adónde se va el tráfico cuando cerrás una calle.
 
-Cada funcion es una interseccion. Cada llamada es una calle. El grafo te permite responder "si cierro esta calle, que rutas se rompen?" — que es exactamente la pregunta que necesitas responder antes de cada refactor.
+Querés el mapa para encontrar el barrio, y la red vial antes de romper el
+pavimento.
