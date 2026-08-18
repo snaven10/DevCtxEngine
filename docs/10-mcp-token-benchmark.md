@@ -1,139 +1,116 @@
+# Retrieval Payload Benchmark
+
 > 🇪🇸 [Leer en español](es/10-benchmark-tokens-mcp.md)
 
-# Token & Cost Benchmark: MCP (Filtered Retrieval) vs. Direct Mode (Brute-Force Dump)
-
-> **Note — this page predates the Rust rewrite** and describes the earlier
-> Go + Python implementation. The concepts largely still apply; the commands,
-> file layout and `DEVAI_*` variables do not. Current references:
-> [Architecture](02-architecture.md), [Configuration](11-configuration.md).
-
-A controlled A/B measuring how DevAI's MCP affects token consumption and cost on a real task. The **same
-diagnostic task** was solved twice, varying only whether the agent had access to DevAI's tools (vector
-retrieval + memory) or was restricted to `grep`/`read`.
-
-> **Methodology**: both sessions started from a clean context, used the same model, and ran the same
-> analysis/comprehension task (**0 lines of code changed** in both → no implementation variance). Figures
-> taken from Claude Code's `/cost` at the end of each session.
+How many tokens it costs to *get to* an answer, measured three ways on the same
+questions.
 
 ---
 
-## 1. Executive Summary
+## What this measures, and what it does not
 
-| Metric | With DevAI MCP (filtered) | Without MCP (direct dump) | Impact |
+This measures **retrieval payload**: the size of what lands in a model's context
+before it starts reasoning. That is the mechanism by which filtered retrieval
+saves money, and it is directly measurable and reproducible.
+
+It does **not** measure end-to-end session cost. That depends on the model, the
+task, how many turns the agent takes and how caching behaves — none of which
+this page can control, and all of which would make the numbers unreproducible.
+If you want session cost, measure your own with your client's cost reporting.
+
+Token counts below use the same ~4 characters per token heuristic the codebase
+uses internally. It is an estimate, applied identically to all three columns, so
+the *ratios* hold even where the absolute numbers drift.
+
+## Method
+
+Three questions about this repository, each answered three ways:
+
+1. **grep-and-read** — the naive approach: search for likely keywords, open
+   every file that matches. Measured as the total size of all matching Rust
+   files.
+2. **`build_context`** — one budgeted brief, `--max-tokens 4096`.
+3. **`search --limit 5`** — just the ranked chunks, as JSON.
+
+Reproduce it with the commands in the last section.
+
+## Results
+
+Measured on this repository: 128 files, 2,333 chunks, `ml-granite`.
+
+### "How does reciprocal rank fusion combine the two retrievers?"
+
+| Approach | Payload | Est. tokens | vs. grep |
 |---|---|---|---|
-| **Total cost** | **$1.19** | **$4.14** | **+247.9%** without MCP · **71.3% savings** with MCP |
-| Total token volume | ~0.67 M | ~8.27 M | **~12× more** without MCP |
-| Total cache read | 543.5 k | 7.56 M | ~14× more without MCP |
-| Output tokens | ~6.0 k | ~53.2 k | ~8.9× more without MCP |
-| API duration | 11 min 36 s | 11 min 28 s | Practically identical |
-| Wall time | 20 min 48 s | 12 min 56 s | +7 min 52 s with MCP *(local latency, see §4)* |
-| Lines of code changed | 0 | 0 | Analysis task in both runs |
+| grep-and-read (29 files) | 542,591 chars | ~135,600 | — |
+| `build_context` | 15,518 chars | ~3,900 | **35× less** |
+| `search --limit 5` | 3,236 chars | ~800 | **168× less** |
 
-**Headline:** on a diagnostic task, DevAI MCP cut cost by **71.3%** and moved **~12× less token volume**, in
-exchange for higher *wall time* that is attributable to local indexing latency — not to the API.
+### "Why is the WAL checkpointed before the server exits?"
 
----
+| Approach | Payload | Est. tokens | vs. grep |
+|---|---|---|---|
+| grep-and-read (56 files) | 939,148 chars | ~234,800 | — |
+| `build_context` | 16,228 chars | ~4,100 | **58× less** |
+| `search --limit 5` | 4,153 chars | ~1,000 | **226× less** |
 
-## 2. Per-Model Breakdown
+### "How are memories deduplicated when saving?"
 
-| Configuration | Input | Output | Cache Read | Cache Write | Partial Cost |
-|---|---|---|---|---|---|
-| **With MCP** · claude-haiku-4-5 | 594 | 19 | 0 | 0 | $0.0007 |
-| **With MCP** · claude-opus-4-8 | 14.0 k | 6.0 k | 543.5 k | 112.2 k | $1.1900 |
-| **Without MCP** · claude-haiku-4-5 | 6.1 k | 25.5 k | **7.5 M** | 688.5 k | $1.7400 |
-| **Without MCP** · claude-opus-4-8 | 14.1 k | **27.7 k** | 61.9 k | 256.1 k | $2.4000 |
+| Approach | Payload | Est. tokens | vs. grep |
+|---|---|---|---|
+| grep-and-read (22 files) | 518,519 chars | ~129,600 | — |
+| `build_context` | 15,903 chars | ~4,000 | **33× less** |
+| `search --limit 5` | 6,517 chars | ~1,600 | **80× less** |
 
----
+## Reading these numbers
 
-## 3. The Two Drivers of the Savings
+**The grep column is the honest villain.** Its cost is driven by how many files
+match a keyword, not by how much of them is relevant. The WAL question is the
+worst case precisely because "checkpoint" and "wal" appear in tests, comments and
+unrelated modules — 56 files, nearly a megabyte, to answer a question whose
+answer is one doc comment.
 
-The overhead of direct mode does **not** come from a single factor. There are two, worth documenting
-separately:
+**`build_context` is flat.** Roughly 4,000 tokens regardless of question,
+because that is what you asked for. This is the point of a budget: cost is a
+parameter you set, not an outcome you discover. It also reports what did not
+fit, so a flat cost does not hide a truncated answer.
 
-### 3.1 Driver A — Cache read: re-injecting whole repositories
-Without an intermediate filter, the agent dumps and re-reads large slices of the repository each turn.
-Prompt cache reads them again and again: **7.5 M cache-read tokens on Haiku alone**, vs **543.5 k with MCP**
-(~14× less). MCP acts as a smart indexer: it pre-filters with vector search + memory and hands the main
-model a **clean, bounded** context.
+**`search` is cheapest but answers a narrower question.** It returns ranked code
+and nothing else — no prior decisions, no memories recorded against those files.
+For "where is the code", that is exactly right. For "what should I know before
+changing this", it is not.
 
-### 3.2 Driver B — Output blow-up: longer, more redundant answers
-Less obvious but just as relevant: **without MCP, Opus generated 27.7 k output tokens vs 6.0 k with MCP
-(4.6×)**. Synthesizing from dumped raw code makes the model ramble and repeat. And **Opus output is the most
-expensive, non-cacheable component** — which is why the no-MCP Opus cost $2.40, driven by its output, not
-its cache. **Clean context → shorter, sharper answers → less expensive output.**
+**The gap widens with repository size.** `build_context` is bounded by its
+budget; grep-and-read grows with the number of keyword matches. On a repository
+ten times this size, column one grows and column two does not.
 
-> Net: direct mode overpays on **two fronts** — massive cache reads *and* inflated output.
+## The caveat that matters
 
----
+A real agent does not read all 29 files. It reads a few, guesses, reads a few
+more. So the grep column is an upper bound on one strategy, not a prediction of
+what any particular agent would spend.
 
-## 4. The Wall-Time Trade-off (it's local, not the API)
+What it does show correctly is the *shape* of the problem: with keyword search,
+the cost of finding an answer scales with how common the words are, and the
+agent has no way to know in advance which of the 29 files is the one. Filtered
+retrieval replaces that search with a bounded, ranked payload.
 
-MCP mode was ~8 min slower in *wall time* (20:48 vs 12:56), but **API time was practically identical**
-(11:36 vs 11:28). The model did **not "think more"**. The extra minutes are **DevAI local latency**: the ML
-service computing embeddings on CPU (hardware without a dedicated GPU) plus protocol round-trips.
+## Reproduce it
 
-**Practical implication:** that time overhead is *CPU-bound and tunable* — with a dedicated GPU, or with a
-lighter embedding model. It is not inherent to the MCP architecture, but to the execution environment.
+```bash
+# 1. grep-and-read upper bound
+rg -l -i 'wal|checkpoint|ART' crates/ --type rust > /tmp/hits.txt
+wc -l < /tmp/hits.txt                    # files an agent might open
+xargs wc -c < /tmp/hits.txt | tail -1    # total characters
 
----
+# 2. one budgeted brief
+devctx context "why is the WAL checkpointed before the server exits" \
+  --max-tokens 4096 | wc -c
 
-## 5. Influence of the Embedding Model (this benchmark used the heaviest)
+# 3. ranked chunks only
+devctx search "why is the WAL checkpointed before the server exits" \
+  --limit 5 --format json | wc -c
+```
 
-This A/B ran with **`ml-mpnet` (paraphrase-multilingual-mpnet-base-v2, 768 dim)** — the **heaviest,
-highest-quality** embedding model in the installation. That matters when reading the results, because each
-metric reacts differently to model weight:
-
-- **The cost/token savings (~71%) are essentially model-independent.** They come from *filtering* (retrieval
-  returns bounded fragments instead of dumping repos), not from model weight. A lighter model filters too →
-  the savings stay in the same order of magnitude.
-- **Wall time WOULD change — for the better.** The time penalty (§4) comes from embedding compute on CPU. A
-  lighter model is much faster:
-  - `ml-minilm` (384 dim, multilingual): ~5× faster than `ml-mpnet` on CPU.
-  - `minilm-l6` (384 dim, English): faster still (22 MB vs 1.1 GB).
-  → The ~8 min wall-time gap **would shrink substantially** with either.
-- **The price: retrieval precision.** `ml-mpnet` gives the best ranking, especially for non-English content.
-  A lighter model may surface slightly less relevant results → occasionally the agent runs an extra search
-  or reads a bit more, **marginally eroding** the token savings without changing the order of magnitude.
-
-| Model | Dim | Speed (CPU) | Retrieval quality | When to use |
-|---|---|---|---|---|
-| `ml-mpnet` *(used here)* | 768 | slow (~225 ms/embed) | **best** (multilingual) | Max precision; CPU-capable box or GPU |
-| `ml-minilm` | 384 | ~5× faster | good (multilingual) | **Balance** of speed/quality on modest machines |
-| `minilm-l6` | 384 | fastest | lower (English) | Speed priority / English content |
-
-> **Honest reading:** these figures are the **highest-quality, highest-wall-time** scenario. With a lighter
-> model you would get **the same cost savings (~71%) with noticeably less time penalty**, trading some
-> retrieval precision. The financial savings are robust; the time cost is tunable per model.
-
----
-
-## 6. Scope & Domain Caveat
-
-The 71% savings correspond to a **diagnostic / comprehension** task — exactly where a brute-force dump is
-mostly redundancy. The gap **narrows** on tasks that genuinely require touching every file (e.g. a large
-refactor), because there the content is read either way.
-
-> Operating rule: **MCP pays off more the more the task is "find the needle in the haystack,"** and less
-> when the task is "touch the whole haystack."
-
----
-
-## 7. Conclusions & Recommendation
-
-**Key findings:**
-- **Cost:** **71.3% savings** ($1.19 vs $4.14) on the measured diagnostic task.
-- **Volume:** **~12× fewer** total tokens moved; **~14×** less cache read; **~8.9×** less output.
-- **Double savings:** MCP trims both *context re-reads* (cache) and *answer verbosity* (expensive Opus
-  output).
-- **Time cost:** higher *wall time*, but from **local (CPU) indexing latency**, not the API — tunable with a
-  GPU or a lighter embedding model (§5).
-
-**Recommendation:** for diagnostic and code-comprehension tasks, DevAI MCP is **strongly recommended**: the
-financial savings (~71%) and token-volume reduction (~12×) outweigh the wait-time cost, which is itself
-tunable at the hardware/model level. For refactors that require reading the whole codebase, evaluate case by
-case.
-
----
-
-*A/B run on 2026-05-29 · diagnostic task over a real multi-repo workspace · embedding model `ml-mpnet`
-(768 dim, the heaviest available) · figures from Claude Code's `/cost`.*
+Divide characters by 4 for the token estimate. Run it against your own
+repository — the ratios are what transfer, not the absolute numbers.
