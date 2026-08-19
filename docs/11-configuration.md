@@ -181,7 +181,31 @@ Because the server holds the loaded code, **a rebuilt binary does not take effec
 until the running server is restarted** — `devctx serve --stop` before testing a
 change.
 
-## 6. Quick recap
+## 6. Changing the config while a server is running
+
+**A running server holds the config it started with.** `serve` takes a
+`ProjectConfig` by value at startup and keeps it for the life of the process;
+nothing re-reads the file. Since `devctx index` routes to that server, editing
+`.devctx/config.yaml` and re-indexing **does nothing, and says nothing** — the
+run succeeds with the old settings.
+
+Measured on a real repository: adding two generated SQL dumps to
+`indexing.exclude` and re-indexing produced byte-identical counts (216 files,
+3,253 chunks). After stopping the server first, the same run gave 214 files and
+2,002 chunks — 1,251 chunks of noise gone, and not one symbol lost, because the
+excluded files were `INSERT` statements that declared nothing.
+
+So after editing the config:
+
+```bash
+devctx serve --stop     # checkpoints, then exits
+devctx index --full     # spawns a fresh server that reads the new config
+```
+
+`devctx projects refresh <name>` updates the **registry's** copy of the config.
+It does not restart a running server, so it does not help here either.
+
+## 7. Quick recap
 
 | Want to… | Do |
 |---|---|

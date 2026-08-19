@@ -185,7 +185,31 @@ Como el servidor tiene el código cargado, **un binario recompilado no surte
 efecto hasta reiniciar el servidor que está corriendo** — haz `devctx serve
 --stop` antes de probar un cambio.
 
-## 6. Resumen rápido
+## 6. Cambiar la config con un servidor corriendo
+
+**Un servidor vivo se queda con la config con la que arrancó.** `serve` recibe
+un `ProjectConfig` por valor al iniciar y lo conserva mientras viva el proceso;
+nadie vuelve a leer el archivo. Y como `devctx index` rutea a ese servidor,
+editar `.devctx/config.yaml` y reindexar **no hace nada, y no avisa nada** — la
+corrida termina bien, con los valores viejos.
+
+Medido en un repositorio real: agregar dos dumps SQL generados a
+`indexing.exclude` y reindexar dio cifras idénticas al byte (216 archivos, 3,253
+chunks). Parando el servidor primero, la misma corrida dio 214 archivos y 2,002
+chunks — 1,251 chunks de ruido menos, y ni un símbolo perdido, porque los
+archivos excluidos eran `INSERT` que no declaraban nada.
+
+Entonces, después de editar la config:
+
+```bash
+devctx serve --stop     # hace checkpoint y sale
+devctx index --full     # levanta un servidor nuevo que lee la config nueva
+```
+
+`devctx projects refresh <nombre>` actualiza la copia del **registro**. No
+reinicia un servidor vivo, así que tampoco sirve acá.
+
+## 7. Resumen rápido
 
 | Quieres… | Haz |
 |---|---|
