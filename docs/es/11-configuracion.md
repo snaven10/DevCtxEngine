@@ -117,6 +117,17 @@ la copia del registro.
 
 Se respetan `$XDG_DATA_HOME` y `$XDG_CONFIG_HOME` si están definidas.
 
+### Del instalador
+
+Estas las leen `install.sh` / `install.ps1`, no el binario — sirven antes de que
+`devctx` exista.
+
+| Variable | Efecto |
+|---|---|
+| `DEVCTX_BIN_DIR` | Dónde instalar. Default `~/.local/bin` (Linux/macOS), `%LOCALAPPDATA%\devctx\bin` (Windows). |
+| `DEVCTX_VERSION` | Tag concreto a instalar. Sin ella, la última release. |
+| `DEVCTX_REPO` | Repositorio del que bajar. Default `snaven10/DevCtxEngine`; para un fork. |
+
 ### Por qué existen los límites de la base
 
 DuckDB por defecto toma el 80% de la memoria del sistema. Eso es correcto para

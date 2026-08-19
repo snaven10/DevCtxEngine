@@ -113,6 +113,17 @@ registry's copy.
 | `DEVCTX_LANG` | Language of the grouped `--help` summary (`en` / `es`). |
 | `OPENAI_API_KEY` / `VOYAGE_API_KEY` | Credentials for the API embedding providers. |
 
+### Installer-only
+
+Read by `install.sh` / `install.ps1`, not by the binary — they apply before
+`devctx` exists.
+
+| Variable | Effect |
+|---|---|
+| `DEVCTX_BIN_DIR` | Where to install. Default `~/.local/bin` (Linux/macOS), `%LOCALAPPDATA%\devctx\bin` (Windows). |
+| `DEVCTX_VERSION` | Install a specific tag. Without it, the latest release. |
+| `DEVCTX_REPO` | Repository to download from. Default `snaven10/DevCtxEngine`; for a fork. |
+
 ### Why the database limits exist
 
 DuckDB defaults to 80% of system memory. That is correct for one process on one
