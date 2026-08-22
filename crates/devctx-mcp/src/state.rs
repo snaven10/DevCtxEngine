@@ -2424,14 +2424,20 @@ mod tests {
         full.file("src/600.ts");
 
         let p = shared.lock().unwrap().clone();
-        assert_eq!(p.total, 647, "the watcher must not resize the run on screen");
+        assert_eq!(
+            p.total, 647,
+            "the watcher must not resize the run on screen"
+        );
         assert_eq!(p.done, 601, "only the owning run may advance the count");
         assert!(p.done <= p.total, "the bar must never pass its own total");
         assert_eq!(p.run, 1, "the watcher started no run anyone is watching");
 
         // And it may not end a run it never owned.
         watcher.finish();
-        assert!(shared.lock().unwrap().running, "the full run is still going");
+        assert!(
+            shared.lock().unwrap().running,
+            "the full run is still going"
+        );
         full.finish();
         assert!(!shared.lock().unwrap().running);
     }
