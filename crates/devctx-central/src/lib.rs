@@ -177,7 +177,7 @@ impl Central {
         // A memory reaching the central store is shared: either with one
         // group of repositories, or with everything. Anything else is
         // normalized to global.
-        if !(devctx_memory::is_group(&req.scope) && !req.group.is_empty()) {
+        if !devctx_memory::is_group(&req.scope) || req.group.is_empty() {
             req.scope = devctx_memory::SCOPE_GLOBAL.to_string();
         }
         Ok(devctx_memory::remember(

@@ -1,8 +1,20 @@
 name: ci
 
+# `push` was unfiltered, so a branch with a PR open ran this twice for every
+# commit — once for the push and once for the pull request — doing the same
+# work in both. The pull request is the one that gates a merge; on `main` the
+# push is all there is.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# Only the tip of a branch is worth checking. Without this, pushing three
+# times in a minute leaves three runs going, and the two that no longer
+# describe anything still hold runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
@@ -15,7 +27,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --all --check
+      # `--locked` because the release builds with it: a pull request that
+      # changes a dependency without committing the updated Cargo.lock passes
+      # every check here and then fails at the one build nobody can retry
+      # without cutting another tag.
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --all
+        run: cargo test --all --locked

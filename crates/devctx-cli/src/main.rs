@@ -627,7 +627,10 @@ fn cmd_hooks(action: HooksAction) -> Result<()> {
         HooksAction::Status => {
             let status = hooks::status(&root)?;
             for (hook, present) in &status {
-                println!("  {hook:<12} {}", if *present { "installed" } else { "missing" });
+                println!(
+                    "  {hook:<12} {}",
+                    if *present { "installed" } else { "missing" }
+                );
             }
             if status.iter().all(|(_, p)| *p) {
                 println!("Covered: commits, merges and fast-forward pulls.");
@@ -1992,7 +1995,13 @@ impl IndexBar {
     /// [`ProgressSink::file`] advances by one because the local path calls it
     /// once per file. A poller instead receives the server's running total, and
     /// incrementing on each poll would count the same file once per tick.
-    fn set(&self, done: usize, file: &str) {
+    ///
+    /// The length is re-applied on every poll, not just when the bar is built:
+    /// a total read once and kept is a total that goes stale the moment the
+    /// server starts reporting a different run, and the position then walks
+    /// straight past it.
+    fn set(&self, done: usize, total: usize, file: &str) {
+        self.bar.set_length(total as u64);
         self.bar.set_position(done as u64);
         self.bar.set_message(file.to_string());
     }
@@ -2624,6 +2633,11 @@ impl ServerProgress {
             let frames = ['|', '/', '-', '\\'];
             let (mut tick, mut failures) = (0usize, 0u32);
             let mut bar: Option<IndexBar> = None;
+            // Which run the bar on screen belongs to. A run that ends and one
+            // that begins between two polls is invisible in the counts alone —
+            // both are `running`, and the new one's `done` starts climbing
+            // against whatever was drawn for the old one.
+            let mut showing = 0u64;
 
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 if failures < Self::GIVE_UP_AFTER {
@@ -2634,12 +2648,18 @@ impl ServerProgress {
                         // previous run's finished bar until this one resets it.
                         Ok(p) if p.running && p.total > 0 => {
                             failures = 0;
-                            let b = bar.get_or_insert_with(|| {
-                                let b = IndexBar::new();
-                                b.start(p.total);
-                                b
-                            });
-                            b.set(p.done, &p.file);
+                            // A new run gets a new bar rather than a rescaled
+                            // one: the elapsed time and ETA belong to the run
+                            // being measured, and carrying them over would date
+                            // this run from the start of the previous one.
+                            if p.run != showing {
+                                if let Some(b) = bar.take() {
+                                    b.finish();
+                                }
+                                showing = p.run;
+                            }
+                            let b = bar.get_or_insert_with(IndexBar::new);
+                            b.set(p.done, p.total, &p.file);
                         }
                         // Reachable but not counting yet: still diffing.
                         Ok(_) => failures = 0,
