@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,13 @@ use serde_json::{json, Value};
 pub struct IndexProgress {
     /// Whether a run is in flight right now.
     pub running: bool,
+    /// Which run these counts belong to, counting up from one.
+    ///
+    /// `running` alone cannot tell two runs apart: a watcher save or a commit
+    /// hook can start one while another is still going, and a client polling
+    /// across the handover would otherwise read the new run's `done` against
+    /// the old run's `total` — which is how a bar reaches 788/647.
+    pub run: u64,
     /// Changes the run expects to process, known once it has diffed.
     pub total: usize,
     /// Changes it has started on. Started, not finished: the sink is called
@@ -40,34 +48,66 @@ pub struct IndexProgress {
 }
 
 /// Writes an indexing run's progress where a request handler can read it.
-struct SharedProgress(Arc<Mutex<IndexProgress>>);
+///
+/// There is one slot for the whole server and any number of runs that may want
+/// it: `index --full` from the CLI, a watcher indexing a saved file, a commit
+/// hook. The first to arrive owns the slot until it finishes; the others do
+/// their work and report nothing, because a full run's counts are what someone
+/// is actually watching and a one-file run would otherwise overwrite them.
+struct SharedProgress {
+    shared: Arc<Mutex<IndexProgress>>,
+    /// Whether this run is the one currently filling the slot. Decided at
+    /// [`ProgressSink::start`], since before diffing there is nothing to report.
+    owns: AtomicBool,
+}
 
 impl SharedProgress {
+    fn new(shared: Arc<Mutex<IndexProgress>>) -> Self {
+        Self {
+            shared,
+            owns: AtomicBool::new(false),
+        }
+    }
+
     /// A poisoned lock must never take an indexing run down with it: this is a
     /// counter for a progress bar, not part of the work. Recover and carry on,
     /// the same way [`AppState::checkpoint`] does.
     fn lock(&self) -> std::sync::MutexGuard<'_, IndexProgress> {
-        self.0
+        self.shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Mark the run finished, keeping the final counts for whoever polls last.
+    ///
+    /// Only the owner may clear `running`: a concurrent run releasing a slot it
+    /// never held would tell every poller that the run they are watching is
+    /// over while it is still embedding files.
     fn finish(&self) {
-        self.lock().running = false;
+        if self.owns.swap(false, Ordering::SeqCst) {
+            self.lock().running = false;
+        }
     }
 }
 
 impl ProgressSink for SharedProgress {
     fn start(&self, total: usize) {
         let mut p = self.lock();
+        if p.running {
+            return;
+        }
+        self.owns.store(true, Ordering::SeqCst);
         p.running = true;
+        p.run += 1;
         p.total = total;
         p.done = 0;
         p.file.clear();
     }
 
     fn file(&self, path: &str) {
+        if !self.owns.load(Ordering::SeqCst) {
+            return;
+        }
         let mut p = self.lock();
         p.done += 1;
         p.file.clear();
@@ -541,7 +581,7 @@ fn do_index_inner(
 ) -> Result<String, String> {
     let store = state.open_store()?;
     let embedder = state.embedder()?;
-    let sink = SharedProgress(state.index_progress.clone());
+    let sink = SharedProgress::new(state.index_progress.clone());
     // Which branch this run is about. Declared config wins over what happens to
     // be checked out, so running `index` from a linked worktree keeps the
     // repository's trunk fresh instead of quietly indexing the worktree's
@@ -618,6 +658,7 @@ pub fn do_index_progress(state: &AppState) -> Result<String, String> {
         .clone();
     Ok(json!({
         "running": p.running,
+        "run": p.run,
         "total": p.total,
         "done": p.done,
         "file": p.file,
@@ -2363,5 +2404,54 @@ mod tests {
         assert_eq!(v[0]["symbol"], "foo");
         assert_eq!(v[0]["start_line"], 1);
         assert!(v[0].get("vector").is_none());
+    }
+
+    /// The reported bar read 788/647: a second run took the slot mid-flight,
+    /// and its files kept counting against the first run's total.
+    #[test]
+    fn a_second_run_cannot_overwrite_the_one_being_watched() {
+        let shared = Arc::new(Mutex::new(IndexProgress::default()));
+        let full = SharedProgress::new(shared.clone());
+        let watcher = SharedProgress::new(shared.clone());
+
+        full.start(647);
+        for i in 0..600 {
+            full.file(&format!("src/{i}.ts"));
+        }
+        // A save lands while the full run is still going.
+        watcher.start(1);
+        watcher.file("package-lock.json");
+        full.file("src/600.ts");
+
+        let p = shared.lock().unwrap().clone();
+        assert_eq!(p.total, 647, "the watcher must not resize the run on screen");
+        assert_eq!(p.done, 601, "only the owning run may advance the count");
+        assert!(p.done <= p.total, "the bar must never pass its own total");
+        assert_eq!(p.run, 1, "the watcher started no run anyone is watching");
+
+        // And it may not end a run it never owned.
+        watcher.finish();
+        assert!(shared.lock().unwrap().running, "the full run is still going");
+        full.finish();
+        assert!(!shared.lock().unwrap().running);
+    }
+
+    /// A run that follows a finished one is a different run, and says so, so a
+    /// poller redraws instead of measuring new counts against an old total.
+    #[test]
+    fn each_run_gets_its_own_number() {
+        let shared = Arc::new(Mutex::new(IndexProgress::default()));
+
+        let first = SharedProgress::new(shared.clone());
+        first.start(647);
+        first.finish();
+        assert_eq!(shared.lock().unwrap().run, 1);
+
+        let second = SharedProgress::new(shared.clone());
+        second.start(788);
+        let p = shared.lock().unwrap().clone();
+        assert_eq!(p.run, 2);
+        assert_eq!(p.total, 788);
+        assert_eq!(p.done, 0);
     }
 }
