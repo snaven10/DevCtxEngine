@@ -80,10 +80,10 @@ impact_analysis("processPayment")
 Llamadores y llamados transitivos. Los llamadores te dicen qué podría romper un
 cambio; los llamados te dicen de qué depende esto para funcionar.
 
-**Leé el resultado como un superconjunto.** La resolución de llamadas es por
-nombre, así que dos métodos llamados `save()` en tipos distintos pueden colapsar
-en un nodo, y las llamadas por callbacks o reflexión no dejan arista. Un reporte
-limpio significa "nada obvio", nunca "nada".
+**Las aristas son confiables; el vacío no.** La cobertura es binaria por
+símbolo — medido: unos traen todas sus aristas y otros ninguna pese a tener
+llamadores reales, sin nada que los distinga de antemano. Un reporte limpio
+significa "no encontré", nunca "no hay".
 
 ## Paso 6 — Antes de concluir que el código está mal
 

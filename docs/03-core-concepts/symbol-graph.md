@@ -25,8 +25,10 @@ Semantic search answers *"where is the code about X?"*. It cannot answer *"what
 breaks if I change this?"*, because that question is about structure, not
 meaning — and the answer includes code that never mentions X.
 
-The graph answers the structural question exactly, with no ranking and no
-approximation. A caller either exists or it does not.
+The graph answers the structural question without ranking: an edge either
+exists or it does not. But **its absence proves nothing** — see the limits
+below, because that distinction is what stands between you and a broken
+refactor.
 
 ## What is actually in the graph
 
@@ -108,10 +110,20 @@ thing itself; use `search` when you want code *about an idea*.
 
 ## Limits worth knowing
 
+**Coverage is binary per symbol, not uniformly partial.** Measured on a
+1,300-file Java/Quarkus repository: `crearNotificacion` returns 8 edges for its
+8 call sites — complete — while `actualizar` and `cambiarEstado` return **zero**
+despite having real callers. Nothing tells you in advance which group a symbol
+falls into, which is why an average coverage figure misleads: it invites
+"I am missing some" when you may be missing *all* of the one you are about to
+rename.
+
+**A result with edges is reliable. An empty result means "nothing found", never
+"nothing there".** On an empty result, cross-check with
+`search --keyword` before renaming or deleting.
+
 **Call resolution is name-based**, informed by imports and type bindings where
-the grammar supports it. Two methods named `save()` on different types can
-resolve to the same node. Treat impact results as a superset to review, not a
-proven exact set.
+the grammar supports it.
 
 **Dynamic dispatch is invisible.** A call made through a callback, a reflection
 API, or a string-keyed registry leaves no syntactic call edge. The graph will

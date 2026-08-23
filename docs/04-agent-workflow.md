@@ -72,10 +72,14 @@ get_references("verify_token")   → every call site
 impact_analysis("verify_token")  → the blast radius, transitively
 ```
 
-`impact_analysis` results are a **superset to review, not a proof**. Call
-resolution is name-based, so two methods called `save()` can collapse into one
-node, and dynamic dispatch leaves no edge at all. Treat a clean impact report as
-"nothing obvious", not "nothing".
+**The graph is binary per symbol.** Measured on a Java/Quarkus repository,
+`crearNotificacion` returned 8 edges for 8 call sites while `actualizar` and
+`cambiarEstado` returned zero despite real callers — and nothing says in advance
+which group your symbol is in.
+
+So: **edges are reliable; empty is not.** A clean impact report means "nothing
+found", never "nothing there". Cross-check an empty one with
+`search --keyword` before you touch anything.
 
 ### Before you decide the code is wrong
 

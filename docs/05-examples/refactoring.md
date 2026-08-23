@@ -29,18 +29,21 @@ Two directions:
 - **Callees (downstream)** — what `getUser` depends on. This is what constrains
   how you can split it.
 
-### Read it as a superset, not a proof
+### Edges are reliable. Empty is not.
 
-Three limits, all of which under-report or over-report in ways that matter here:
+**Coverage is binary per symbol.** Measured on a Java/Quarkus repository,
+`crearNotificacion` returned 8 edges for its 8 call sites — complete — while
+`actualizar` and `cambiarEstado` returned **zero** despite real callers. Nothing
+says in advance which group your symbol is in.
 
 | Limit | Consequence for you |
 |---|---|
-| Resolution is name-based | Another type's `getUser()` may appear as the same node. Over-reports. |
-| Dynamic dispatch leaves no edge | Calls through callbacks, reflection or string-keyed registries are **invisible**. Under-reports. |
-| Only 7 languages produce edges | In a polyglot repository, part of it is not in the graph at all. Under-reports, silently. |
+| Coverage is binary per symbol | A symbol may have every edge, or none at all. **The empty case is silent.** |
+| Dynamic dispatch leaves no edge | Callbacks, reflection and string-keyed registries are **invisible**. |
+| Only 7 languages produce edges | In a polyglot repository, part of it is not in the graph. |
 
-The under-reporting cases are the dangerous ones. Cross-check with a keyword
-search before you trust a clean report:
+So a report **with** edges you can act on. A **clean** one proves nothing —
+cross-check with a keyword search before you trust it:
 
 ```bash
 devctx search "getUser" --keyword

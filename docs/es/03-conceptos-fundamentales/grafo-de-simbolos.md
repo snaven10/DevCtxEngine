@@ -27,8 +27,9 @@ responder *"¿qué se rompe si cambio esto?"*, porque esa pregunta es de
 estructura, no de significado — y la respuesta incluye código que nunca menciona
 X.
 
-El grafo responde la pregunta estructural exactamente, sin ranking y sin
-aproximación. Un llamador existe o no existe.
+El grafo responde la pregunta estructural sin ranking: una arista existe o no
+existe. Pero **su ausencia no prueba nada** — ver los límites más abajo, porque
+esa distinción es la que evita un refactor roto.
 
 ## Qué hay realmente en el grafo
 
@@ -113,10 +114,20 @@ la cosa misma; usá `search` cuando querés código *sobre una idea*.
 
 ## Límites que conviene conocer
 
+**La cobertura es BINARIA POR SÍMBOLO, no uniformemente parcial.** Medido en un
+repositorio Java/Quarkus de 1,300 archivos: `crearNotificacion` devuelve 8
+aristas para sus 8 sitios de llamada —completo—, mientras `actualizar` y
+`cambiarEstado` devuelven **cero** teniendo llamadores reales. Nada te dice de
+antemano en qué grupo cae un símbolo, y por eso un promedio de cobertura
+desinforma: te hace pensar "me falta algo" cuando puede faltarte *todo* el del
+símbolo que estás por renombrar.
+
+**Un resultado con aristas es confiable. Uno vacío significa "no encontré",
+nunca "no hay".** Ante un vacío, cruzá con `search --keyword` antes de renombrar
+o borrar.
+
 **La resolución de llamadas es por nombre**, informada por imports y ligaduras
-de tipo donde la gramática lo soporta. Dos métodos llamados `save()` en tipos
-distintos pueden resolver al mismo nodo. Tratá los resultados de impacto como un
-superconjunto a revisar, no como un conjunto exacto probado.
+de tipo donde la gramática lo soporta.
 
 **El despacho dinámico es invisible.** Una llamada hecha por un callback, una
 API de reflexión o un registro llaveado por strings no deja arista sintáctica de

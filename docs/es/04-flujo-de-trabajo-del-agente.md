@@ -71,10 +71,14 @@ get_references("verify_token")   → cada sitio de llamada
 impact_analysis("verify_token")  → el radio de impacto, transitivo
 ```
 
-Los resultados de `impact_analysis` son un **superconjunto a revisar, no una
-prueba**. La resolución de llamadas es por nombre, así que dos métodos llamados
-`save()` pueden colapsar en un nodo, y el despacho dinámico no deja arista del
-todo. Tratá un reporte de impacto limpio como "nada obvio", no como "nada".
+**El grafo es binario por símbolo.** Medido en un repositorio Java/Quarkus,
+`crearNotificacion` devolvió 8 aristas para 8 sitios de llamada mientras
+`actualizar` y `cambiarEstado` devolvieron cero teniendo llamadores reales — y
+nada dice de antemano en qué grupo está el tuyo.
+
+O sea: **las aristas son confiables; el vacío no.** Un reporte limpio significa
+"no encontré", nunca "no hay". Cruzá un vacío con `search --keyword` antes de
+tocar nada.
 
 ### Antes de decidir que el código está mal
 

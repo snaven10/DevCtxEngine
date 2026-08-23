@@ -30,19 +30,21 @@ Dos direcciones:
 - **Llamados (aguas abajo)** — de qué depende `getUser`. Esto es lo que
   condiciona cómo podés separarlo.
 
-### Leelo como superconjunto, no como prueba
+### Las aristas son confiables. El vacío no.
 
-Tres límites, todos los cuales sub-reportan o sobre-reportan de formas que acá
-importan:
+**La cobertura es binaria por símbolo.** Medido en un repositorio Java/Quarkus,
+`crearNotificacion` devolvió 8 aristas para sus 8 sitios de llamada —completo—
+mientras `actualizar` y `cambiarEstado` devolvieron **cero** teniendo llamadores
+reales. Nada dice de antemano en qué grupo está el tuyo.
 
 | Límite | Consecuencia para vos |
 |---|---|
-| La resolución es por nombre | El `getUser()` de otro tipo puede aparecer como el mismo nodo. Sobre-reporta. |
-| El despacho dinámico no deja arista | Las llamadas por callbacks, reflexión o registros llaveados por strings son **invisibles**. Sub-reporta. |
-| Solo 7 lenguajes producen aristas | En un repositorio políglota, parte no está en el grafo. Sub-reporta, en silencio. |
+| La cobertura es binaria por símbolo | Un símbolo puede traer todas sus aristas, o ninguna. **El caso vacío es silencioso.** |
+| El despacho dinámico no deja arista | Callbacks, reflexión y registros llaveados por strings son **invisibles**. |
+| Solo 7 lenguajes producen aristas | En un repositorio políglota, parte no está en el grafo. |
 
-Los casos de sub-reporte son los peligrosos. Cruzá con una búsqueda por palabra
-clave antes de confiar en un reporte limpio:
+O sea: un reporte **con** aristas sirve para actuar. Uno **limpio** no prueba
+nada — cruzá con una búsqueda por palabra clave antes de confiar en él:
 
 ```bash
 devctx search "getUser" --keyword

@@ -80,10 +80,10 @@ impact_analysis("processPayment")
 Transitive callers and callees. Callers tell you what a change could break;
 callees tell you what this depends on to work at all.
 
-**Read the result as a superset.** Call resolution is name-based, so two methods
-named `save()` on different types can collapse into one node, and calls made
-through callbacks or reflection leave no edge. A clean report means "nothing
-obvious", never "nothing".
+**Edges are reliable; empty is not.** Coverage is binary per symbol — measured,
+some symbols carry every edge and others carry none despite real callers, with
+nothing to tell them apart. A clean report means "nothing found", never
+"nothing there".
 
 ## Step 6 — Before concluding the code is wrong
 
