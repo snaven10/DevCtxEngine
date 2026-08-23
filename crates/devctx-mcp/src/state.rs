@@ -918,32 +918,300 @@ fn shellexpand(path: &str) -> String {
     }
 }
 
+/// A registered project, as the descent needs it: enough to bind, name and rank.
+#[derive(Clone, Debug)]
+pub struct ProjectRow {
+    pub name: String,
+    pub path: PathBuf,
+    pub group: Option<String>,
+    /// Embedding width. Compared before fusing rankings across projects:
+    /// vectors of different dimension are not comparable.
+    pub embed_dim: i64,
+    /// Unix seconds of the last index run, `0` when never indexed. Used only to
+    /// pick a group's default member — the most recently indexed repository is
+    /// the one most likely being worked on.
+    pub last_indexed_at: i64,
+}
+
+/// What the registry can say about the directory the server was started in.
+#[derive(Clone, Debug)]
+pub enum Resolution {
+    /// Exactly one registered project lives under this directory.
+    Single(ProjectRow),
+    /// Several do, and every one of them declares the same non-empty group.
+    Group { name: String, members: Vec<ProjectRow> },
+    /// Several do, but they do not agree on a group — binding one would be a
+    /// guess, so the caller stays unbound and shows these as the candidates.
+    Ambiguous(Vec<ProjectRow>),
+    /// None do.
+    Empty,
+    /// The registry could not be read, so the question was never answered.
+    ///
+    /// Distinct from `Empty` on purpose: "there is nothing here" and "I could
+    /// not look" lead to different fixes, and collapsing them sends the user
+    /// hunting for a missing project when the daemon is what is missing.
+    RegistryUnavailable(String),
+}
+
+/// Is `candidate` strictly below `base`?
+///
+/// Compared component by component rather than with `starts_with` on the
+/// rendered string, because `/a/revfa` is a string prefix of `/a/revfa-otro`
+/// while being no ancestor of it at all — and binding a sibling workspace by
+/// accident is exactly the failure this descent exists to avoid. Equality is
+/// not descent: a directory that *is* a project is already handled by the walk
+/// upwards, and letting it match here would bind it twice by two rules.
+fn is_strict_descendant(candidate: &std::path::Path, base: &std::path::Path) -> bool {
+    candidate != base && candidate.starts_with(base)
+}
+
+/// The group declared by a project, read from its own config.
+///
+/// Read from the file rather than the registry row because group membership
+/// lives in `project.group` of the repository's config and the registry does
+/// not carry it. Reading N small YAML files once at startup is cheaper than
+/// widening the registry schema for a value that is authored per repository.
+fn group_of(root: &std::path::Path) -> Option<String> {
+    let cfg = ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME)).ok()?;
+    let group = cfg.project.group.trim().to_string();
+    (!group.is_empty()).then_some(group)
+}
+
+/// Every registered project that lives strictly under `base`.
+///
+/// This is the query the server never asked. A globally-registered MCP server
+/// is launched from whatever directory the client happened to be in, and when
+/// that is the root of a multi-repository workspace the walk upwards finds
+/// nothing — while the registry has known where every one of those projects is
+/// all along.
+pub fn projects_under(base: &std::path::Path) -> Result<Vec<ProjectRow>, String> {
+    let base = base
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", base.display()))?;
+    let rows = central().and_then(|c| c.list(false).map_err(|e| e.to_string()))?;
+    let mut found: Vec<ProjectRow> = rows
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name")?.as_str()?.to_string();
+            let raw = r.get("path")?.as_str()?;
+            let path = std::path::Path::new(raw).canonicalize().ok()?;
+            if !is_strict_descendant(&path, &base) {
+                return None;
+            }
+            let last_indexed_at = r
+                .get("last_indexed_at")
+                .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_i64()))
+                .unwrap_or(0);
+            let group = group_of(&path);
+            let embed_dim = r.get("embed_dim").and_then(|v| v.as_i64()).unwrap_or(0);
+            Some(ProjectRow {
+                name,
+                path,
+                group,
+                embed_dim,
+                last_indexed_at,
+            })
+        })
+        .collect();
+
+    // Nested registrations: when one candidate contains another, the outer one
+    // is a workspace that happens to be registered too. Keep the shallowest set
+    // — binding the outer one is what the user pointed at, and its children stay
+    // reachable through the hint and `use_project`.
+    let paths: Vec<PathBuf> = found.iter().map(|r| r.path.clone()).collect();
+    found.retain(|r| !paths.iter().any(|other| is_strict_descendant(&r.path, other)));
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(found)
+}
+
+/// The registered project a path belongs to, walking upwards from it.
+///
+/// This is what makes a session usable across a workspace. The MCP process
+/// takes its working directory once, at spawn, and never learns that the agent
+/// has moved into a different repository — so a binding fixed at startup is
+/// fixed for the life of the process. A path carried by the call itself is the
+/// only signal that tracks where the work actually is.
+///
+/// Resolved against the registry rather than by looking for a `.devctx`
+/// directory: an unregistered repository is not something this server can open,
+/// and silently walking past it to a registered ancestor would answer from the
+/// wrong project.
+pub fn resolve_hint(hint: &str) -> Option<ProjectRow> {
+    // A bare name is a registry lookup, never a directory: resolving it against
+    // this process's working directory would bind whatever same-named folder
+    // happens to sit there, and that directory is an accident of how the client
+    // was launched.
+    let looks_like_path = hint.contains(std::path::MAIN_SEPARATOR) || hint.starts_with('~') || hint == ".";
+    if !looks_like_path {
+        let rows = central().and_then(|c| c.list(false).map_err(|e| e.to_string())).ok()?;
+        let row = rows.iter().find(|r| r.get("name").and_then(|v| v.as_str()) == Some(hint))?;
+        let path = std::path::Path::new(row.get("path")?.as_str()?).canonicalize().ok()?;
+        return Some(ProjectRow { name: hint.to_string(), path, group: None, embed_dim: 0, last_indexed_at: 0 });
+    }
+    let expanded = shellexpand(hint);
+    let start = std::path::Path::new(&expanded).canonicalize().ok()?;
+    let rows = central().and_then(|c| c.list(false).map_err(|e| e.to_string())).ok()?;
+    let registered: Vec<ProjectRow> = rows
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name")?.as_str()?.to_string();
+            let path = std::path::Path::new(r.get("path")?.as_str()?)
+                .canonicalize()
+                .ok()?;
+            Some(ProjectRow {
+                name,
+                path,
+                group: None,
+                embed_dim: 0,
+                last_indexed_at: 0,
+            })
+        })
+        .collect();
+
+    // Deepest match wins: with nested registrations the innermost project is
+    // the one that actually owns the file.
+    let mut here: Option<&std::path::Path> = Some(start.as_path());
+    while let Some(dir) = here {
+        if let Some(row) = registered.iter().find(|r| r.path == dir) {
+            return Some(row.clone());
+        }
+        here = dir.parent();
+    }
+    None
+}
+
+/// Classify what lives under `base` into something the caller can bind.
+pub fn resolve_under(base: &std::path::Path) -> Resolution {
+    let found = match projects_under(base) {
+        Ok(f) => f,
+        Err(e) => return Resolution::RegistryUnavailable(e),
+    };
+    match found.len() {
+        0 => Resolution::Empty,
+        1 => Resolution::Single(found.into_iter().next().expect("len checked")),
+        _ => {
+            // A group binding is only honest when every member agrees. One
+            // repository with a different group — or none at all — makes the
+            // product ambiguous, and guessing which product the user meant is
+            // worse than saying so.
+            let first = found[0].group.clone();
+            match first {
+                Some(name) if found.iter().all(|r| r.group.as_deref() == Some(name.as_str())) => {
+                    Resolution::Group {
+                        name,
+                        members: found,
+                    }
+                }
+                _ => Resolution::Ambiguous(found),
+            }
+        }
+    }
+}
+
 /// What to tell an agent whose server was started outside any project.
 ///
 /// This has to be a tool result, never a startup failure: a server that refuses
 /// to start reports itself to the client as a bare transport error, and a bare
 /// transport error is the one kind nobody can act on.
 pub fn unbound_help(cwd: &std::path::Path) -> String {
-    let listed = match central().and_then(|c| c.list(false).map_err(|e| e.to_string())) {
-        Ok(rows) if !rows.is_empty() => rows
-            .iter()
-            .filter_map(|r| {
-                let name = r.get("name")?.as_str()?;
-                let path = r.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-                Some(format!("  · {name} — {path}"))
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Ok(_) => "  (none registered yet — run `devctx init` in a repository)".to_string(),
-        Err(e) => format!("  (the registry could not be read: {e})"),
-    };
     format!(
-        "This MCP server is not bound to a project: it was started in {}, which \
-         is not inside a DevCtxEngine repository.\n\nRegistered projects:\n{listed}\n\n\
-         Call `use_project` with one of those names to bind this session, or \
+        "{}\n\nCall `use_project` with one of those names to bind this session, or \
          restart the server as `devctx mcp --project <path>`.",
-        cwd.display()
+        why_unbound(cwd, &resolve_under(cwd))
     )
+}
+
+/// How many candidates to spell out before summarising the rest.
+const MAX_LISTED: usize = 15;
+
+fn render(rows: &[ProjectRow], with_group: bool) -> String {
+    let mut lines: Vec<String> = rows
+        .iter()
+        .take(MAX_LISTED)
+        .map(|r| {
+            let suffix = if with_group {
+                match &r.group {
+                    Some(g) => format!("  [group: {g}]"),
+                    None => "  [no group]".to_string(),
+                }
+            } else {
+                String::new()
+            };
+            format!("  · {} — {}{}", r.name, r.path.display(), suffix)
+        })
+        .collect();
+    if rows.len() > MAX_LISTED {
+        lines.push(format!("  … and {} more", rows.len() - MAX_LISTED));
+    }
+    lines.join("\n")
+}
+
+/// Why this directory produced no binding, in the terms that let a caller fix it.
+///
+/// Two very different situations used to render identically: a workspace whose
+/// repositories disagree about their group, and a directory with no registered
+/// project anywhere near it. The first needs the candidates and their groups —
+/// listing the whole machine buries them. The second needs the whole registry,
+/// because nothing local is relevant.
+pub fn why_unbound(cwd: &std::path::Path, resolution: &Resolution) -> String {
+    match resolution {
+        Resolution::Ambiguous(rows) => format!(
+            "Found {} DevCtxEngine projects under {}, but they do not share a group, \
+             so binding one of them would be a guess.\n\nCandidates:\n{}\n\n\
+             Give them the same `project.group` in their config to have this \
+             directory bind to the group automatically.",
+            rows.len(),
+            cwd.display(),
+            render(rows, true)
+        ),
+        // Single and Group never reach here in practice — the caller binds them —
+        // but a tool asking after the fact deserves a straight answer.
+        Resolution::Single(row) => format!(
+            "One project ({}) lives under {} and should have been bound.",
+            row.name,
+            cwd.display()
+        ),
+        Resolution::Group { name, members } => format!(
+            "Group {} ({} projects) lives under {} and should have been bound.",
+            name,
+            members.len(),
+            cwd.display()
+        ),
+        Resolution::RegistryUnavailable(e) => format!(
+            "The project registry could not be read, so this server could not work out \
+             what lives under {}: {e}\n\nThis is not \"no project here\" — nothing was \
+             checked. Start the central store (`devctx serve --central`) and reconnect, or \
+             name a project explicitly with `devctx mcp --project <path>`.",
+            cwd.display()
+        ),
+        Resolution::Empty => {
+            let all = match central().and_then(|c| c.list(false).map_err(|e| e.to_string())) {
+                Ok(rows) if !rows.is_empty() => {
+                    let mapped: Vec<ProjectRow> = rows
+                        .iter()
+                        .filter_map(|r| {
+                            Some(ProjectRow {
+                                name: r.get("name")?.as_str()?.to_string(),
+                                path: PathBuf::from(r.get("path")?.as_str()?),
+                                group: None,
+                                embed_dim: 0,
+                                last_indexed_at: 0,
+                            })
+                        })
+                        .collect();
+                    render(&mapped, false)
+                }
+                Ok(_) => "  (none registered yet — run `devctx init` in a repository)".to_string(),
+                Err(e) => format!("  (the registry could not be read: {e})"),
+            };
+            format!(
+                "This MCP server is not bound to a project: it was started in {}, which is \
+                 neither inside a DevCtxEngine repository nor above one.\n\n\
+                 Registered projects:\n{all}",
+                cwd.display()
+            )
+        }
+    }
 }
 
 /// Search a *different* registered project.
@@ -952,6 +1220,349 @@ pub fn unbound_help(cwd: &std::path::Path) -> String {
 /// named one project, so this wakes exactly one server rather than all of them.
 /// The project's own server owns its database and keeps its model warm, so the
 /// search runs where it is cheapest.
+/// Run one member's search, returning its raw hit list.
+///
+/// Separate from `do_search_project` because the group path needs the hits
+/// themselves to fuse, not the single-project envelope that wraps them.
+fn search_one(
+    path: &std::path::Path,
+    query: &str,
+    limit: usize,
+    language: Option<&str>,
+    mode: &str,
+) -> Result<Vec<Value>, String> {
+    // Not opening the store directly: DuckDB allows one writing process per
+    // file, and a running `devctx serve` for that project owns it. Re-entering
+    // our own binary with its working directory set is what the single-project
+    // path already does, and it routes through that server when one is up.
+    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .args([
+            "search",
+            query,
+            "--limit",
+            &limit.to_string(),
+            "--format",
+            "json",
+        ])
+        .args(language.iter().flat_map(|l| ["--language", *l]))
+        .args(match mode {
+            "keyword" => vec!["--keyword"],
+            "hybrid" => vec!["--hybrid"],
+            _ => vec![],
+        })
+        .current_dir(path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err
+            .trim()
+            .lines()
+            .last()
+            .unwrap_or("search failed")
+            .to_string());
+    }
+    match serde_json::from_slice::<Value>(&out.stdout).map_err(|e| e.to_string())? {
+        Value::Array(v) => Ok(v),
+        other => Ok(vec![other]),
+    }
+}
+
+/// Search every member of a group and return one fused ranking.
+///
+/// A session bound to a group is attached to the product, so "search" means the
+/// product. Answering from a single member would answer a question nobody asked
+/// — and would do it invisibly, which is worse than answering nothing.
+///
+/// Fused by reciprocal rank rather than by raw score: two stores embed and score
+/// independently, so their scores are not on one scale even when the model is
+/// identical. Rank survives that; magnitude does not.
+/// How many members to search at once.
+///
+/// Measured, not guessed: a warm project daemon answers in ~300ms and holds
+/// ~100MB, a cold one takes 3-6s while it starts. Four keeps the cold case
+/// bounded without holding eleven processes open at their peak.
+const FANOUT_CONCURRENCY: usize = 4;
+
+/// Search every member of a group and return one fused ranking.
+///
+/// A session bound to a group is attached to the product, so "search" means the
+/// product. Answering from a single member would answer a question nobody asked
+/// — and would do it invisibly, which is worse than answering nothing.
+pub fn do_search_group(
+    members: &[ProjectRow],
+    query: &str,
+    limit: usize,
+    language: Option<String>,
+    mode: &str,
+    only: Option<&[String]>,
+) -> Result<String, String> {
+    // Vectors of different width are not comparable, and a ranking fused across
+    // them looks exactly as plausible as a correct one. The registry has carried
+    // `embed_dim` for this comparison all along.
+    let dims: Vec<i64> = members.iter().map(|m| m.embed_dim).collect();
+    let majority = dims
+        .iter()
+        .copied()
+        .max_by_key(|d| dims.iter().filter(|x| *x == d).count())
+        .unwrap_or(0);
+
+    let mut skipped = Vec::new();
+    let mut targets: Vec<&ProjectRow> = Vec::new();
+    for m in members {
+        if let Some(only) = only {
+            if !only.iter().any(|n| n == &m.name) {
+                continue;
+            }
+        }
+        if m.embed_dim != majority {
+            skipped.push(json!({
+                "project": m.name,
+                "reason": format!(
+                    "embedding dimension {} does not match the group's {majority}",
+                    m.embed_dim
+                ),
+            }));
+            continue;
+        }
+        targets.push(m);
+    }
+
+    // Run in bounded batches. Sequentially this is eleven round trips one after
+    // another; the members are independent, so that latency is pure waste.
+    let mut results: Vec<(String, Result<Vec<Value>, String>)> = Vec::new();
+    for batch in targets.chunks(FANOUT_CONCURRENCY) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|m| {
+                    let lang = language.clone();
+                    scope.spawn(move || {
+                        (
+                            m.name.clone(),
+                            search_one(&m.path, query, limit, lang.as_deref(), mode),
+                        )
+                    })
+                })
+                .collect();
+            for h in handles {
+                match h.join() {
+                    Ok(r) => results.push(r),
+                    Err(_) => results.push((
+                        "<panicked>".to_string(),
+                        Err("the search thread panicked".to_string()),
+                    )),
+                }
+            }
+        });
+    }
+
+    let mut failed = Vec::new();
+    let mut per_member: Vec<(String, Vec<Value>)> = Vec::new();
+    for (name, r) in results {
+        match r {
+            Ok(hits) => per_member.push((name, hits)),
+            // One member being down is not the search failing: the rest still
+            // have an answer, and saying which one went missing beats refusing.
+            Err(e) => failed.push(json!({ "project": name, "error": e })),
+        }
+    }
+
+    // How to merge depends on what the scores mean, and they do not all mean the
+    // same thing:
+    //
+    // * `vector` — cosine similarity against the same model, in the same number
+    //   of dimensions (the check above guarantees it). That is an absolute
+    //   quantity, so the scores from two stores are directly comparable.
+    // * `keyword` — BM25, whose IDF and length normalisation are computed from
+    //   each repository's own corpus. A small repository inflates them. Across
+    //   stores these numbers are not on one scale and comparing them is noise.
+    // * `hybrid` — already an internal fusion per member; same problem.
+    //
+    // Rank fusion is the safe answer for the latter two. It is the *wrong*
+    // answer for the first, because these result sets are disjoint by
+    // construction — no document appears in two repositories — so reciprocal
+    // rank never accumulates and degenerates into round-robin: one hit per
+    // member, ordered by nothing.
+    let by_score = mode == "vector" || mode.is_empty();
+    const K: f64 = 60.0;
+    let mut fused: Vec<(f64, Value)> = Vec::new();
+    for (project, hits) in per_member {
+        for (rank, hit) in hits.into_iter().enumerate() {
+            let key = if by_score {
+                hit.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0)
+            } else {
+                1.0 / (K + (rank + 1) as f64)
+            };
+            let mut hit = hit;
+            if let Value::Object(map) = &mut hit {
+                // Without this the result is unusable: two repositories can hold
+                // the same relative path, and the reader cannot tell them apart.
+                map.insert("project".into(), json!(project));
+            }
+            fused.push((key, hit));
+        }
+    }
+    fused.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let total = fused.len();
+    let hits: Vec<Value> = fused.into_iter().take(limit).map(|(_, h)| h).collect();
+
+    let mut out = json!({
+        "hits": hits,
+        "searched_group": true,
+        "fused_by": if by_score { "score" } else { "reciprocal_rank" },
+    });
+    if total > limit {
+        out["omitted_for_budget"] = json!({ "count": total - limit });
+    }
+    if !skipped.is_empty() {
+        out["skipped_projects"] = json!(skipped);
+    }
+    if !failed.is_empty() {
+        out["failed_projects"] = json!(failed);
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// Recall from one member's own store, local tier only.
+fn recall_one_local(
+    path: &std::path::Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Value>, String> {
+    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .args([
+            "recall",
+            query,
+            "--limit",
+            &limit.to_string(),
+            "--scope",
+            "local",
+            "--format",
+            "json",
+        ])
+        .current_dir(path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err
+            .trim()
+            .lines()
+            .last()
+            .unwrap_or("recall failed")
+            .to_string());
+    }
+    match serde_json::from_slice::<Value>(&out.stdout).map_err(|e| e.to_string())? {
+        Value::Array(v) => Ok(v),
+        Value::Object(m) => Ok(m
+            .get("memories")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Recall across a whole group: the shared tier once, every member's local tier.
+///
+/// Without this, a group-bound session answers "what do we know about X" from
+/// one repository's local memories plus the shared ones — and presents that as
+/// the whole answer. The other members' local memories are invisible, and their
+/// absence is not announced, which is worse than returning nothing.
+///
+/// The shared tier is queried once, not per member: it is one store, and asking
+/// it eleven times would return each group memory eleven times.
+pub fn do_recall_group(
+    members: &[ProjectRow],
+    query: &str,
+    limit: usize,
+    scope: &str,
+    repo: Option<&str>,
+) -> Result<String, String> {
+    let want_shared = scope == "all" || scope == "group" || scope == "global";
+    let want_local = scope == "all" || scope == "local";
+
+    let mut ranked: Vec<(f64, Value)> = Vec::new();
+    let mut failed = Vec::new();
+    // Memories carry no cross-store comparable score the way vector hits do, so
+    // rank fusion is the honest merge here.
+    const K: f64 = 60.0;
+
+    if want_shared {
+        let shared = do_recall_global(query, limit, repo)?;
+        if let Ok(v) = serde_json::from_str::<Value>(&shared) {
+            let arr = v
+                .get("memories")
+                .and_then(|m| m.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for (rank, m) in arr.into_iter().enumerate() {
+                ranked.push((1.0 / (K + (rank + 1) as f64), m));
+            }
+        }
+    }
+
+    if want_local {
+        // Same reasoning as the code fan-out: the members are independent, so
+        // querying them one after another buys latency and nothing else. A cold
+        // project takes seconds, a warm one milliseconds.
+        let mut gathered: Vec<(String, Result<Vec<Value>, String>)> = Vec::new();
+        for batch in members.chunks(FANOUT_CONCURRENCY) {
+            std::thread::scope(|scope_| {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .map(|m| {
+                        scope_.spawn(move || {
+                            (m.name.clone(), recall_one_local(&m.path, query, limit))
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    match h.join() {
+                        Ok(r) => gathered.push(r),
+                        Err(_) => gathered.push((
+                            "<panicked>".to_string(),
+                            Err("the recall thread panicked".to_string()),
+                        )),
+                    }
+                }
+            });
+        }
+        for (name, r) in gathered {
+            match r {
+                Ok(hits) => {
+                    for (rank, mut hit) in hits.into_iter().enumerate() {
+                        if let Value::Object(map) = &mut hit {
+                            // A local memory only means something with its
+                            // repository attached: the same note from two
+                            // members is two different facts.
+                            map.entry("repo").or_insert_with(|| json!(name.clone()));
+                        }
+                        ranked.push((1.0 / (K + (rank + 1) as f64), hit));
+                    }
+                }
+                Err(e) => failed.push(json!({ "project": name, "error": e })),
+            }
+        }
+    }
+
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let total = ranked.len();
+    let memories: Vec<Value> = ranked.into_iter().take(limit).map(|(_, m)| m).collect();
+
+    let mut out = json!({ "memories": memories, "searched_group": true });
+    if total > limit {
+        // What did not fit has to be visible; silence here reads as "there was
+        // nothing else".
+        out["omitted_for_budget"] = json!({ "count": total - limit });
+    }
+    if !failed.is_empty() {
+        out["failed_projects"] = json!(failed);
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
 pub fn do_search_project(
     project: &str,
     query: &str,
@@ -1054,6 +1665,15 @@ pub fn do_list_projects(
 /// central memory instead of this project's, so the other repositories — the
 /// group's, or every one of them — can recall it.
 #[allow(clippy::too_many_arguments)]
+/// Write a shared (group or global) memory to the central store.
+///
+/// `provenance` overrides the repository recorded as the memory's origin. A
+/// session bound to a *group* has no contributing repository: it is attached to
+/// the product, not to any member. Deriving provenance from whichever member the
+/// descent opened would not be attribution, it would be invention — the same
+/// memory would claim a different origin depending on which repository happened
+/// to be indexed last. Callers in that position pass the group name, and the
+/// record then says what is true: this came from the group.
 pub fn do_remember_shared(
     state: &AppState,
     content: &str,
@@ -1063,16 +1683,17 @@ pub fn do_remember_shared(
     tags: &str,
     group: &str,
     files: &str,
+    provenance: Option<&str>,
 ) -> Result<String, String> {
     let project = state.project();
     let (repo, branch) = state.repo_branch().unwrap_or_default();
     // Provenance must never be blank: a directory that is not a git repo still
     // belongs to a named project, and "which project taught me this" is the
     // whole point of recording it.
-    let repo = if repo.is_empty() {
-        project.clone()
-    } else {
-        repo
+    let repo = match provenance {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ if repo.is_empty() => project.clone(),
+        _ => repo,
     };
     let out = central()?
         .remember(
@@ -1507,6 +2128,9 @@ pub fn do_memory_move(state: &AppState, id: &str, to: &str) -> Result<String, St
                 &m.tags,
                 &group,
                 &m.files,
+                // Moving a memory must not rewrite where it came from: its
+                // provenance is a fact about its past, not about this session.
+                Some(m.repo.as_str()).filter(|r| !r.is_empty()),
             )?;
             serde_json::from_str::<Value>(&out)
                 .ok()

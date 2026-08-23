@@ -196,6 +196,7 @@ impl Backend {
         tags: String,
         scope: String,
         files: String,
+        provenance: Option<String>,
     ) -> Result<String, String> {
         // `group` routes to the central store like `global` does, but into the
         // space of the product this repository belongs to.
@@ -216,6 +217,7 @@ impl Backend {
                     &tags,
                     &group,
                     &files,
+                    provenance.as_deref(),
                 )
             }
             Backend::Local(s) => do_remember(s, content, title, memory_type, topic, tags, files),

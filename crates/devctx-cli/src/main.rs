@@ -1346,25 +1346,79 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
     // usually the user's home, which is inside no repository at all. Refusing to
     // start there would reach the user as a bare transport error, so instead the
     // server comes up unbound and says which projects exist.
-    let cfg = match &project {
+    // Precedence, most explicit first:
+    //   1. `--project` — the user named a root, nothing may override it.
+    //   2. the walk upwards — the working directory is inside a repository.
+    //   3. the descent — the working directory *contains* registered projects,
+    //      which is what a multi-repository workspace root looks like.
+    //   4. unbound, explaining what was found and why it was not enough.
+    let explicit = match &project {
         Some(root) => Some(
             ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
                 .with_context(|| format!("loading project at {}", root.display()))?,
         ),
+        None => None,
+    };
+    let cfg = match explicit {
+        Some(cfg) => Some(cfg),
         None => load_project().ok(),
     };
-    let backend = match cfg {
-        Some(cfg) => Some(mcp_backend(cfg)?),
+
+    let binding = match cfg {
+        Some(cfg) => devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg)?)),
         None => {
-            eprintln!(
-                "Starting DevCtxEngine MCP server (stdio, no project here); \
-                 use the use_project tool to bind one."
-            );
-            None
+            let cwd = std::env::current_dir().unwrap_or_default();
+            match devctx_mcp::state::resolve_under(&cwd) {
+                devctx_mcp::state::Resolution::Single(row) => {
+                    let cfg = ProjectConfig::load(&row.path.join(devctx_core::CONFIG_FILE_NAME))
+                        .with_context(|| format!("loading project at {}", row.path.display()))?;
+                    eprintln!(
+                        "Bound to project {} — the only DevCtxEngine project under {}",
+                        row.name,
+                        cwd.display()
+                    );
+                    devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg)?))
+                }
+                devctx_mcp::state::Resolution::Group { name, members } => {
+                    // Open only the default member here. The others are opened
+                    // lazily, when a call actually points at one.
+                    let default = members
+                        .iter()
+                        .max_by_key(|m| m.last_indexed_at)
+                        .expect("a group has members");
+                    let cfg =
+                        ProjectConfig::load(&default.path.join(devctx_core::CONFIG_FILE_NAME))
+                            .with_context(|| {
+                                format!("loading project at {}", default.path.display())
+                            })?;
+                    eprintln!(
+                        "Bound to group {} ({} projects, default {}) — resolved from {}",
+                        name,
+                        members.len(),
+                        default.name,
+                        cwd.display()
+                    );
+                    let default_name = default.name.clone();
+                    devctx_mcp::Binding::Group {
+                        name,
+                        default: std::sync::Arc::new(mcp_backend(cfg)?),
+                        default_name,
+                        members,
+                    }
+                }
+                other => {
+                    eprintln!(
+                        "Starting DevCtxEngine MCP server (stdio, no project bound): {}",
+                        devctx_mcp::state::why_unbound(&cwd, &other)
+                    );
+                    devctx_mcp::Binding::None
+                }
+            }
         }
     };
-    devctx_mcp::run_stdio(
-        backend,
+
+    devctx_mcp::run_stdio_bound(
+        binding,
         std::sync::Arc::new(|root: &std::path::Path| {
             let cfg = ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
                 .map_err(|e| format!("loading project at {}: {e}", root.display()))?;

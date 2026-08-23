@@ -230,3 +230,36 @@ envelope around code and prose spends budget on punctuation and buys structure
 nobody parses.
 
 **Cost.** Inconsistent with the other 22 tools, which return JSON.
+
+## ADR-18: A workspace root binds to its group, not to nothing
+
+**Decision.** When the MCP server's working directory holds no project but
+*contains* registered ones, it descends into the registry: one project under it
+binds that project, several sharing a `project.group` bind the group. Bound to a
+group, `remember` defaults to `scope: group`. Code tools take an optional
+`project` — a name or any path inside one — that resolves a single call without
+moving the session.
+
+**Why.** A globally-registered server inherits the client's working directory,
+and for anyone whose repositories live side by side under one folder that
+directory is the workspace root. Looking only *upwards* from there finds
+nothing, so the server came up unbound — and unbound is not a degraded mode:
+`remember` fails outright and the memory is lost. The registry knew where every
+one of those projects was the whole time.
+
+The `project` hint exists because the process's working directory is fixed at
+spawn. A binding resolved at startup cannot follow an agent that moves between
+repositories, so cross-repository work needs a signal carried by the call.
+
+**Cost.** Two changes in observable behaviour. From a workspace root the server
+now starts bound where it used to start unbound; and in group mode a `remember`
+without an explicit `scope` lands in `group` rather than `local`. The second is
+softer than it looks — the calls it changes used to fail rather than write.
+
+A memory's `repo` field still comes from the binding, so in group mode it names
+the default member. Attribution is a separate model from scope and changing it
+was left out.
+
+**Rejected.** Binding one member and calling it the workspace: it would attribute
+every memory to a repository nobody chose. Fanning code search across a group's
+stores: useful, but a different feature with its own ranking problem.

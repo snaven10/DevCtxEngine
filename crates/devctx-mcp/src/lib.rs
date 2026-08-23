@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod state;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use devctx_core::config::ProjectConfig;
@@ -23,6 +24,17 @@ use state::AppState;
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct SearchReq {
+    /// Narrow a group-wide search to these registered project names. Without it
+    /// a group-bound session searches every member; naming them is how you pay
+    /// for only the repositories you care about.
+    #[serde(default)]
+    projects: Option<Vec<String>>,
+    /// Which project to answer from: a registered project name, or any path
+    /// inside it. Resolves THIS call only and never changes what the session is
+    /// bound to — use it when the work is in a different repository than the
+    /// one bound.
+    #[serde(default)]
+    project: Option<String>,
     /// The search query (natural language or code).
     query: String,
     /// Maximum number of results (default 10).
@@ -45,6 +57,12 @@ struct SearchReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ReadFileReq {
+    /// Which project to answer from: a registered project name, or any path
+    /// inside it. Resolves THIS call only and never changes what the session is
+    /// bound to — use it when the work is in a different repository than the
+    /// one bound.
+    #[serde(default)]
+    project: Option<String>,
     /// Repo-relative (or absolute) path to read.
     path: String,
     /// 1-based first line to include (optional).
@@ -68,6 +86,11 @@ struct IndexReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct RememberReq {
+    /// Which project this memory is about: a registered project name, or any
+    /// path inside it. In a group-bound session this is what makes `scope:
+    /// local` possible, and it becomes the memory's provenance.
+    #[serde(default)]
+    project: Option<String>,
     /// The memory content to save.
     content: String,
     /// Short title (optional).
@@ -153,6 +176,12 @@ struct UseProjectReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ImpactReq {
+    /// Which project to answer from: a registered project name, or any path
+    /// inside it. Resolves THIS call only and never changes what the session is
+    /// bound to — use it when the work is in a different repository than the
+    /// one bound.
+    #[serde(default)]
+    project: Option<String>,
     /// The symbol to analyze.
     symbol: String,
     /// Traversal depth (default 3).
@@ -176,6 +205,12 @@ struct MemoryContextReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ReadSymbolReq {
+    /// Which project to answer from: a registered project name, or any path
+    /// inside it. Resolves THIS call only and never changes what the session is
+    /// bound to — use it when the work is in a different repository than the
+    /// one bound.
+    #[serde(default)]
+    project: Option<String>,
     /// The symbol name. A bare name (`charge`) or a qualified one
     /// (`Card.charge`, `src/pay.rs::charge`) both work.
     name: String,
@@ -258,6 +293,12 @@ struct MemoryRefsReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ReferencesReq {
+    /// Which project to answer from: a registered project name, or any path
+    /// inside it. Resolves THIS call only and never changes what the session is
+    /// bound to — use it when the work is in a different repository than the
+    /// one bound.
+    #[serde(default)]
+    project: Option<String>,
     /// The symbol whose call sites to list.
     symbol: String,
 }
@@ -266,6 +307,12 @@ struct ReferencesReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct SearchRoutesReq {
+    /// Which project to answer from: a registered project name, or any path
+    /// inside it. Resolves THIS call only and never changes what the session is
+    /// bound to — use it when the work is in a different repository than the
+    /// one bound.
+    #[serde(default)]
+    project: Option<String>,
     /// Restrict to an HTTP method (GET/POST/…), optional.
     #[serde(default)]
     method: Option<String>,
@@ -278,6 +325,12 @@ struct SearchRoutesReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct RoutesForHandlerReq {
+    /// Which project to answer from: a registered project name, or any path
+    /// inside it. Resolves THIS call only and never changes what the session is
+    /// bound to — use it when the work is in a different repository than the
+    /// one bound.
+    #[serde(default)]
+    project: Option<String>,
     /// The handler symbol (`Class.method` or `method`).
     handler: String,
 }
@@ -309,28 +362,97 @@ pub type Connect = Arc<dyn Fn(&std::path::Path) -> Result<Backend, String> + Sen
 /// whatever directory the client happens to be in. Starting unbound and saying
 /// so through a tool beats dying during the handshake, which reaches the user
 /// as an unattributable transport error.
+/// What this session is attached to.
+///
+/// A plain `Option<Backend>` could say "one project" or "nothing", and those
+/// were the only two answers while the server only ever looked *upwards* from
+/// its working directory. Once it also looks down into a workspace, a third
+/// answer exists and has to be representable: *this directory is a product made
+/// of several repositories*. Collapsing that into one of its members would make
+/// every memory land in a repository the user never chose.
+#[derive(Clone)]
+pub enum Binding {
+    /// Nothing resolved — tools that need a project explain how to get one.
+    None,
+    /// One project, whether found by the walk upwards, the descent, or
+    /// `use_project`.
+    Project(Arc<Backend>),
+    /// Every registered project under the working directory shares a group.
+    /// `default` is the member the code tools fall back to when a call carries
+    /// no path hint: the most recently indexed one, on the reasoning that it is
+    /// the repository actually being worked on.
+    Group {
+        name: String,
+        members: Vec<state::ProjectRow>,
+        default: Arc<Backend>,
+        /// Which member `default` is. Needed to tell a caller which repository
+        /// answered when the choice was inferred rather than asked for.
+        default_name: String,
+    },
+}
+
+impl Binding {
+    /// The backend to use when nothing more specific was asked for.
+    fn backend(&self) -> Option<Arc<Backend>> {
+        match self {
+            Binding::None => None,
+            Binding::Project(b) => Some(b.clone()),
+            Binding::Group { default, .. } => Some(default.clone()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DevctxServer {
-    backend: Arc<Mutex<Option<Arc<Backend>>>>,
+    binding: Arc<Mutex<Binding>>,
     connect: Connect,
     cwd: std::path::PathBuf,
+    /// Backends opened for per-call path hints, so hopping between repositories
+    /// does not reopen a store on every call. Capped: a long session that walks
+    /// a large workspace would otherwise hold a handle per repository forever.
+    hinted: Arc<Mutex<HashMap<std::path::PathBuf, Arc<Backend>>>>,
     tool_router: ToolRouter<Self>,
 }
+
+/// How many hint-resolved backends to keep open at once.
+const HINT_CACHE_CAP: usize = 8;
 
 impl DevctxServer {
     /// Create a server, bound to `backend` when one could be resolved at start.
     pub fn new(backend: Option<Arc<Backend>>, connect: Connect) -> Self {
+        Self::with_binding(
+            match backend {
+                Some(b) => Binding::Project(b),
+                None => Binding::None,
+            },
+            connect,
+        )
+    }
+
+    /// Create a server with a binding the caller already resolved — the descent
+    /// in the CLI produces group bindings that `new` cannot express.
+    pub fn with_binding(binding: Binding, connect: Connect) -> Self {
         Self {
-            backend: Arc::new(Mutex::new(backend)),
+            binding: Arc::new(Mutex::new(binding)),
             connect,
             cwd: std::env::current_dir().unwrap_or_default(),
+            hinted: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
 
+    /// A snapshot of the current binding.
+    fn binding(&self) -> Binding {
+        self.binding
+            .lock()
+            .ok()
+            .map(|b| b.clone())
+            .unwrap_or(Binding::None)
+    }
+
     /// The bound backend, or an explanation of how to bind one.
     fn bound(&self) -> Result<Arc<Backend>, ErrorData> {
-        match self.backend.lock().ok().and_then(|b| b.clone()) {
+        match self.binding().backend() {
             Some(b) => Ok(b),
             None => Err(ErrorData::invalid_request(
                 state::unbound_help(&self.cwd),
@@ -342,7 +464,99 @@ impl DevctxServer {
     /// The bound backend, if any — for the tools that read the registry rather
     /// than a project, and so work perfectly well without one.
     fn maybe_bound(&self) -> Option<Arc<Backend>> {
-        self.backend.lock().ok().and_then(|b| b.clone())
+        self.binding().backend()
+    }
+
+    /// The backend for one call, and the project it landed on when that was
+    /// inferred rather than stated.
+    ///
+    /// Precedence is deliberate and one-directional: a hint decides the call and
+    /// never touches the session binding, and the binding never overrides a hint
+    /// that resolved. They answer different questions — "where is this work" and
+    /// "where is this session" — and a call may legitimately disagree with its
+    /// session.
+    ///
+    /// A hint that resolves to nothing is not an error: paths reach us as text an
+    /// agent assembled, and refusing the call would turn a slightly wrong guess
+    /// into a dead end. It falls back to the binding and says so.
+    fn backend_for(
+        &self,
+        hint: Option<&str>,
+    ) -> Result<(Arc<Backend>, Option<String>), ErrorData> {
+        if let Some(row) = hint.and_then(state::resolve_hint) {
+            if let Ok(cache) = self.hinted.lock() {
+                if let Some(b) = cache.get(&row.path) {
+                    return Ok((b.clone(), Some(row.name)));
+                }
+            }
+            let backend = (self.connect)(&row.path)
+                .map_err(|e| ErrorData::invalid_request(e, None))?;
+            let backend = Arc::new(backend);
+            if let Ok(mut cache) = self.hinted.lock() {
+                // A session that walks a large workspace would otherwise hold a
+                // database handle per repository for its whole life.
+                if cache.len() >= HINT_CACHE_CAP {
+                    cache.clear();
+                }
+                cache.insert(row.path.clone(), backend.clone());
+            }
+            return Ok((backend, Some(row.name)));
+        }
+        match self.binding() {
+            Binding::Project(b) => Ok((b, None)),
+            // In a group nobody chose this member, so name it: an answer from
+            // the wrong repository is otherwise indistinguishable from a right one.
+            Binding::Group {
+                default,
+                default_name,
+                ..
+            } => Ok((default, Some(default_name))),
+            Binding::None => Err(ErrorData::invalid_request(
+                state::unbound_help(&self.cwd),
+                None,
+            )),
+        }
+    }
+
+    /// Add one field to a JSON object result, leaving other shapes untouched.
+    fn note(out: String, key: &str, value: serde_json::Value) -> String {
+        match serde_json::from_str::<serde_json::Value>(&out) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.insert(key.into(), value);
+                serde_json::to_string(&map).unwrap_or(out)
+            }
+            _ => out,
+        }
+    }
+
+    /// Record which project answered, when it was not the one the caller stated.
+    fn annotate(out: String, project: Option<String>) -> String {
+        let Some(project) = project else { return out };
+        match serde_json::from_str::<serde_json::Value>(&out) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.insert("resolved_project".into(), serde_json::json!(project));
+                serde_json::to_string(&map).unwrap_or(out)
+            }
+            // Arrays and bare strings are returned as they are: wrapping them
+            // would change a shape callers already parse.
+            _ => out,
+        }
+    }
+
+    /// How the binding describes itself to `list_projects`.
+    ///
+    /// `null` used to mean both "unbound" and, after the descent, would have
+    /// meant "in a group" — two states an agent must be able to tell apart.
+    fn binding_json(&self) -> serde_json::Value {
+        match self.binding() {
+            Binding::None => serde_json::Value::Null,
+            Binding::Project(_) => serde_json::json!({ "kind": "project" }),
+            Binding::Group { name, members, .. } => serde_json::json!({
+                "kind": "group",
+                "group": name,
+                "members": members.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+            }),
+        }
     }
 }
 
@@ -355,7 +569,28 @@ impl DevctxServer {
         chunks (file, lines, symbol, text) as JSON."
     )]
     async fn search(&self, Parameters(req): Parameters<SearchReq>) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
+        // Bound to a group and asked nothing more specific, "search" means the
+        // product — every member — not whichever member happens to be open.
+        // A `project` names one and takes precedence: the caller was specific.
+        if req.project.is_none() {
+            if let Binding::Group { members, .. } = self.binding() {
+                let (query, limit) = (req.query.clone(), req.limit.unwrap_or(10));
+                let (language, mode) = (req.language.clone(), req.mode.clone());
+                let only = req.projects.clone();
+                return run_blocking(move || {
+                    state::do_search_group(
+                        &members,
+                        &query,
+                        limit,
+                        language,
+                        mode.as_deref().unwrap_or("vector"),
+                        only.as_deref(),
+                    )
+                })
+                .await;
+            }
+        }
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
         run_blocking(move || {
             backend.search(
                 &req.query,
@@ -366,6 +601,7 @@ impl DevctxServer {
             )
         })
         .await
+        .map(|out| Self::annotate(out, resolved))
     }
 
     /// Read a file (optionally a line range) from the repository.
@@ -375,8 +611,10 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ReadFileReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
+        let hint = req.project.clone().or_else(|| Some(req.path.as_str().to_string()));
+        let (backend, resolved) = self.backend_for(hint.as_deref())?;
         run_blocking(move || backend.read_file(&req.path, req.start_line, req.end_line)).await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// Index (or reindex) the repository.
@@ -417,7 +655,55 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<RememberReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
+        // Where a memory is written, and who it is attributed to, are two
+        // different questions. A group binding answers the first with "the
+        // product" and the second with "the group" — never with a member.
+        let group_binding = match self.binding() {
+            Binding::Group { name, .. } => Some(name),
+            _ => None,
+        };
+        let implied_group = group_binding.is_some() && req.scope.is_none();
+        let scope = req
+            .scope
+            .clone()
+            .unwrap_or_else(|| if implied_group { "group" } else { "local" }.to_string());
+
+        // `local` means "this repository's own store", and in a group binding
+        // there is no such repository. Picking one would file the memory
+        // somewhere nobody chose and nobody will look. Ask instead.
+        if !devctx_memory::is_group(&scope) && !devctx_memory::is_global(&scope) {
+            if let Some(group) = &group_binding {
+                if req.project.is_none() {
+                    return Err(ErrorData::invalid_request(
+                        format!(
+                            "This session is bound to group `{group}`, not to one repository, so \
+                             `scope: local` has no store to write to. Either name the project with \
+                             `project` (a registered name, or a path inside it), or use \
+                             `scope: group` to record this for the whole product."
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+
+        // A `project` hint names the repository, and that repository is then the
+        // real provenance — so the group override only applies without one.
+        //
+        // The condition is what the CALLER asked for, not what `backend_for`
+        // resolved. In a group binding `backend_for(None)` still names the
+        // default member — deliberately, because a code tool must say which
+        // repository answered — so keying off its return value meant the group
+        // override never fired and every product-wide memory was attributed to
+        // whichever member happened to be the default.
+        let named_a_project = req.project.is_some();
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        let provenance = match (&group_binding, named_a_project) {
+            (Some(group), false) => Some(group.clone()),
+            _ => None,
+        };
+        let attributed = provenance.clone().or_else(|| resolved.clone());
+
         run_blocking(move || {
             backend.remember(
                 req.content,
@@ -425,11 +711,21 @@ impl DevctxServer {
                 req.memory_type.unwrap_or_else(|| "note".to_string()),
                 req.topic.unwrap_or_default(),
                 req.tags.unwrap_or_default(),
-                req.scope.unwrap_or_else(|| "local".to_string()),
+                scope,
                 req.files.unwrap_or_default(),
+                provenance,
             )
         })
         .await
+        .map(|out| {
+            // A default the caller did not state is one the caller cannot audit.
+            let out = if implied_group {
+                Self::note(out, "scope_from_binding", serde_json::json!("group"))
+            } else {
+                out
+            };
+            Self::annotate(out, attributed)
+        })
     }
 
     /// Recall memories relevant to a query.
@@ -453,6 +749,18 @@ impl DevctxServer {
             })
             .await;
         };
+        // Bound to a group, "what do we know" spans the product: the shared
+        // tier plus every member's own memories. Answering from one member's
+        // store would be a partial answer wearing the shape of a complete one.
+        if let Binding::Group { members, .. } = self.binding() {
+            let (query, limit) = (req.query.clone(), req.limit.unwrap_or(5));
+            let scope = req.scope.clone().unwrap_or_else(|| "all".to_string());
+            let repo = req.repo.clone();
+            return run_blocking(move || {
+                state::do_recall_group(&members, &query, limit, &scope, repo.as_deref())
+            })
+            .await;
+        }
         run_blocking(move || {
             backend.recall(
                 &req.query,
@@ -513,29 +821,37 @@ impl DevctxServer {
         let all = req.include_inactive.unwrap_or(false);
         // The registry is what an unbound server is *for*: this is the tool that
         // tells an agent which projects exist and what to bind to.
-        match self.maybe_bound() {
+        let binding = self.binding_json();
+        let out = match self.maybe_bound() {
             Some(backend) => run_blocking(move || backend.list_projects(all)).await,
             None => run_blocking(move || state::do_list_projects(None, "", all)).await,
-        }
+        }?;
+        // `bound: null` used to mean "no project". With group bindings it would
+        // also mean "a whole product", and an agent must be able to tell those
+        // apart before deciding whether it needs to call `use_project` at all.
+        Ok(Self::note(out, "binding", binding))
     }
 
     /// Bind this session to a registered project.
-    #[tool(description = "Bind this session to a project, by name (see \
-        list_projects) or by path. Needed when the server was started outside \
-        any repository — a globally-registered MCP server inherits whatever \
-        directory the client was launched from. Also switches an already-bound \
-        session to a different project.")]
+    #[tool(description = "Move this session to a different project, by name (see \
+        list_projects) or by path. Rarely needed: the server resolves a project \
+        from its working directory at startup, descending into the registry when \
+        that directory is a workspace root holding several. To answer ONE call \
+        from another repository, pass `project` to that tool instead — it does \
+        not move the session. Use this when a long stretch of work moves.")]
     async fn use_project(
         &self,
         Parameters(req): Parameters<UseProjectReq>,
     ) -> Result<String, ErrorData> {
         let connect = self.connect.clone();
-        let slot = self.backend.clone();
+        let slot = self.binding.clone();
         let target = req.project.clone();
         run_blocking(move || {
             let root = state::resolve_project_root(&target)?;
             let backend = connect(&root)?;
-            *slot.lock().map_err(|e| e.to_string())? = Some(Arc::new(backend));
+            // An explicit `use_project` overrides a group binding: the user
+            // naming one repository is a stronger signal than any inference.
+            *slot.lock().map_err(|e| e.to_string())? = Binding::Project(Arc::new(backend));
             Ok(serde_json::json!({
                 "bound": target,
                 "path": root.to_string_lossy(),
@@ -564,8 +880,9 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ImpactReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
         run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3))).await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// The most recent memories, with no query.
@@ -598,8 +915,9 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ReadSymbolReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
         run_blocking(move || backend.read_symbol(&req.name, req.limit.unwrap_or(5))).await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// One budgeted brief assembled for a question.
@@ -701,8 +1019,9 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ReferencesReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
         run_blocking(move || backend.references(&req.symbol)).await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// Find HTTP routes (framework-aware) by method and/or path.
@@ -714,8 +1033,9 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<SearchRoutesReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
         run_blocking(move || backend.search_routes(req.method, req.path)).await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// Reverse lookup: which routes a handler serves.
@@ -724,8 +1044,9 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<RoutesForHandlerReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
         run_blocking(move || backend.routes_for_handler(&req.handler)).await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// Summarize text (extractive by default; query-focusable).
@@ -798,7 +1119,16 @@ pub fn backend_for(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Re
 /// `backend` is `None` when no project could be resolved at start — the server
 /// still comes up, and `list_projects`/`use_project` are how a session gets one.
 pub async fn serve_stdio(backend: Option<Backend>, connect: Connect) -> anyhow::Result<()> {
-    let service = DevctxServer::new(backend.map(Arc::new), connect)
+    let binding = match backend {
+        Some(b) => Binding::Project(Arc::new(b)),
+        None => Binding::None,
+    };
+    serve_stdio_bound(binding, connect).await
+}
+
+/// Serve with a binding the caller resolved, which may be a whole group.
+pub async fn serve_stdio_bound(binding: Binding, connect: Connect) -> anyhow::Result<()> {
+    let service = DevctxServer::with_binding(binding, connect)
         .serve(rmcp::transport::stdio())
         .await?;
     service.waiting().await?;
@@ -807,8 +1137,17 @@ pub async fn serve_stdio(backend: Option<Backend>, connect: Connect) -> anyhow::
 
 /// Blocking entry point: build a Tokio runtime and serve over stdio.
 pub fn run_stdio(backend: Option<Backend>, connect: Connect) -> anyhow::Result<()> {
+    let binding = match backend {
+        Some(b) => Binding::Project(Arc::new(b)),
+        None => Binding::None,
+    };
+    run_stdio_bound(binding, connect)
+}
+
+/// Blocking entry point taking a resolved binding.
+pub fn run_stdio_bound(binding: Binding, connect: Connect) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve_stdio(backend, connect))
+    rt.block_on(serve_stdio_bound(binding, connect))
 }
