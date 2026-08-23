@@ -114,17 +114,27 @@ la cosa misma; usá `search` cuando querés código *sobre una idea*.
 
 ## Límites que conviene conocer
 
-**La cobertura es BINARIA POR SÍMBOLO, no uniformemente parcial.** Medido en un
-repositorio Java/Quarkus de 1,300 archivos: `crearNotificacion` devuelve 8
-aristas para sus 8 sitios de llamada —completo—, mientras `actualizar` y
-`cambiarEstado` devuelven **cero** teniendo llamadores reales. Nada te dice de
-antemano en qué grupo cae un símbolo, y por eso un promedio de cobertura
-desinforma: te hace pensar "me falta algo" cuando puede faltarte *todo* el del
-símbolo que estás por renombrar.
+**Los nombres del grafo son calificados.** El `source` de una arista se escribe
+`Clase.metodo` siempre que la función que llama esté dentro de un contenedor; su
+`target` se escribe así cuando el sitio de llamada tenía un receptor con tipo
+resoluble, y pelado cuando no. Una pregunta hecha con un nombre pelado se expande
+a cada forma calificada que lo lleva, y la respuesta reporta qué declaraciones
+fundió. Veintiún métodos llamados `actualizar` es un número corriente para un
+repositorio Quarkus — un radio de impacto que los junta sin decirlo sería peor
+que uno vacío, así que leé esa línea.
 
-**Un resultado con aristas es confiable. Uno vacío significa "no encontré",
-nunca "no hay".** Ante un vacío, cruzá con `search --keyword` antes de renombrar
-o borrar.
+Preguntá con el nombre calificado cuando querés decir un método y nada más. Es
+la única forma de acotarlo, y por eso un nombre calificado nunca se expande.
+
+> Esto corrige una afirmación anterior de estas páginas: que la cobertura era
+> "binaria por símbolo, sin nada que distinguiera los casos". No lo era. Un
+> `actualizar` pelado devolvía cero mientras `OficinaService.actualizar` devolvía
+> un llamador y veintitrés llamados: las aristas estuvieron ahí todo el tiempo,
+> bajo una llave con la que nadie preguntaba.
+
+**Un resultado vacío sigue significando "no encontré", nunca "no hay".** Las
+razones de abajo son reales y ninguna se anuncia sola. Ante un vacío, cruzá con
+`search --keyword` antes de renombrar o borrar.
 
 **La resolución de llamadas es por nombre**, informada por imports y ligaduras
 de tipo donde la gramática lo soporta.

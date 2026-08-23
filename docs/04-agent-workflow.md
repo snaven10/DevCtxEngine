@@ -72,14 +72,15 @@ get_references("verify_token")   → every call site
 impact_analysis("verify_token")  → the blast radius, transitively
 ```
 
-**The graph is binary per symbol.** Measured on a Java/Quarkus repository,
-`crearNotificacion` returned 8 edges for 8 call sites while `actualizar` and
-`cambiarEstado` returned zero despite real callers — and nothing says in advance
-which group your symbol is in.
+**The graph is keyed by qualified name.** A bare name expands to every
+`Class.method` carrying it, and the report says which declarations it merged —
+in one Quarkus repository `actualizar` is twenty-one distinct methods. Ask with
+the qualified name when you mean exactly one.
 
-So: **edges are reliable; empty is not.** A clean impact report means "nothing
-found", never "nothing there". Cross-check an empty one with
-`search --keyword` before you touch anything.
+**Empty is still not proof.** A clean report means "nothing found", never
+"nothing there": dynamic dispatch leaves no edge, only 7 languages produce edges
+at all, and a stale index looks identical to absent code. Cross-check an empty
+one with `search --keyword` before you touch anything.
 
 ### Before you decide the code is wrong
 

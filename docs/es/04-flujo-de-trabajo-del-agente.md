@@ -71,14 +71,15 @@ get_references("verify_token")   → cada sitio de llamada
 impact_analysis("verify_token")  → el radio de impacto, transitivo
 ```
 
-**El grafo es binario por símbolo.** Medido en un repositorio Java/Quarkus,
-`crearNotificacion` devolvió 8 aristas para 8 sitios de llamada mientras
-`actualizar` y `cambiarEstado` devolvieron cero teniendo llamadores reales — y
-nada dice de antemano en qué grupo está el tuyo.
+**El grafo se indexa por nombre calificado.** Un nombre pelado se expande a cada
+`Clase.metodo` que lo lleva, y el reporte dice qué declaraciones fundió — en un
+repositorio Quarkus, `actualizar` son veintiún métodos distintos. Preguntá con el
+nombre calificado cuando querés decir uno solo.
 
-O sea: **las aristas son confiables; el vacío no.** Un reporte limpio significa
-"no encontré", nunca "no hay". Cruzá un vacío con `search --keyword` antes de
-tocar nada.
+**El vacío sigue sin ser prueba.** Un reporte limpio significa "no encontré",
+nunca "no hay": el despacho dinámico no deja arista, solo 7 lenguajes las
+producen, y un índice desactualizado se ve idéntico a código ausente. Cruzá un
+vacío con `search --keyword` antes de tocar nada.
 
 ### Antes de decidir que el código está mal
 
