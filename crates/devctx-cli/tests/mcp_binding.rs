@@ -10,7 +10,25 @@
 //! exits. That stderr line is the assertion target.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::process::{Command, Stdio};
+
+/// Serialises the tests that write a memory.
+///
+/// Writing one embeds it, which loads the model — around 1.5 GB resident per
+/// server. Rust runs tests in parallel, so three of these at once put several
+/// gigabytes and every core against a machine that is usually doing something
+/// else, and the server loses the race: the call comes back as
+/// "timed out reading response" from a client whose own timeout is an hour.
+///
+/// The failure is resource contention, not behaviour, so the fix belongs in the
+/// test rather than in the product's timeouts.
+fn embedding_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct Tmp(PathBuf);
 
@@ -312,6 +330,7 @@ fn call_tool(
 /// is exactly the caller who does not know which one they are in.
 #[test]
 fn scope_defaults_follow_the_binding() {
+    let _serial = embedding_lock();
     let tmp = Tmp::new("scopedefault");
     let home = tmp.home();
     let ws = tmp.dir("workspace");
@@ -332,11 +351,18 @@ fn scope_defaults_follow_the_binding() {
     );
 
     // Bound to one project: the same call stays local.
-    let solo = tmp.dir("solo-workspace");
-    make_project(&home, &solo, "lonely", None);
+    //
+    // Its own `Tmp`, so its own central store and its own daemon. Sharing one
+    // with the group phase above made this flaky under load: the second phase
+    // could reach a daemon the first was still starting or stopping, and the
+    // failure looked like a wrong default rather than a race.
+    let solo_tmp = Tmp::new("scopedefault-solo");
+    let solo_home = solo_tmp.home();
+    let solo = solo_tmp.dir("workspace");
+    make_project(&solo_home, &solo, "lonely", None);
     let inside = solo.join("lonely");
     let local = call_tool(
-        &home,
+        &solo_home,
         &inside,
         "remember",
         serde_json::json!({"content": "el reintento genera un id nuevo por intento"}),
@@ -486,6 +512,7 @@ fn call_tool_raw(
 /// repository, so that repository *is* the real provenance.
 #[test]
 fn a_group_binding_attributes_the_memory_to_the_group() {
+    let _serial = embedding_lock();
     let tmp = Tmp::new("provenance");
     let home = tmp.home();
     let ws = tmp.dir("workspace");
@@ -529,6 +556,7 @@ fn a_group_binding_attributes_the_memory_to_the_group() {
 /// diagnosis.
 #[test]
 fn local_scope_refuses_to_guess_a_repository() {
+    let _serial = embedding_lock();
     let tmp = Tmp::new("localguard");
     let home = tmp.home();
     let ws = tmp.dir("workspace");
@@ -556,11 +584,15 @@ fn local_scope_refuses_to_guess_a_repository() {
         "the error must offer group scope, got: {err}"
     );
 
-    // And inside a single repository the same call is ordinary.
-    let solo = tmp.dir("solo");
-    make_project(&home, &solo, "lonely", None);
+    // And inside a single repository the same call is ordinary. Its own `Tmp`
+    // for the same reason as above: two phases sharing one central daemon race
+    // under load, and the race reads as a behaviour failure.
+    let solo_tmp = Tmp::new("localguard-solo");
+    let solo_home = solo_tmp.home();
+    let solo = solo_tmp.dir("workspace");
+    make_project(&solo_home, &solo, "lonely", None);
     let ok = call_tool(
-        &home,
+        &solo_home,
         &solo.join("lonely"),
         "remember",
         serde_json::json!({"content": "algo", "scope": "local"}),
