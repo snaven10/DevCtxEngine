@@ -99,7 +99,7 @@ estaba; la implementación no.
 | TASK-006 | Memoria en modo grupo: `scope` default `group` | 002 | `done` |
 | TASK-007 | Tests de integración de los escenarios | 003, 005, 006 | `done` |
 | TASK-008 | Docs (`mcp-integration.md` EN+ES) y ADR | 003, 005, 006 | `done` |
-| TASK-009 | **Procedencia real**: `repo` = grupo en modo grupo; `local` exige proyecto | 002 | `pending` |
+| TASK-009 | **Procedencia real**: `repo` = grupo en modo grupo; `local` exige proyecto | 002 | `done` (2026-08-19: tarea escrita, bug de procedencia encontrado y corregido) |
 | TASK-010 | **Fan-out de código**: buscar en todos los miembros y fusionar por RRF | 002 | `done` (verificado en código 2026-08-19: `do_search_group` cableado en `search`) |
 | TASK-011 | **Fan-out de memoria**: `recall` abarca las locales de todos los miembros | 002 | `done` (verificado en código 2026-08-19: `do_recall_group` cableado en `recall`) |
 
