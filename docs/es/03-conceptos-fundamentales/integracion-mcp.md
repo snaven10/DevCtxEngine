@@ -37,18 +37,58 @@ reranking son Rust, en el mismo binario. No hay sidecar ni un segundo runtime.
 
 ## Vinculación al proyecto
 
-`devctx mcp --project <ruta>` fija la raíz del proyecto explícitamente. Sin eso,
-la raíz se descubre desde el directorio de trabajo.
+**Un servidor MCP registrado globalmente arranca en el directorio desde el que
+se lanzó el cliente.** Rara vez es el repositorio que querías, y muchas veces no
+es ningún repositorio — así que el servidor resuelve uno, en este orden:
 
-Esto importa más de lo que parece. **Un servidor MCP registrado globalmente
-arranca en el directorio desde el que se lanzó el cliente**, que a menudo no es
-ningún repositorio. Cuando pasa eso, las herramientas reportan que no hay
-proyecto vinculado. La recuperación son dos llamadas:
+| | Regla | Cómo se ve |
+|---|---|---|
+| 1 | `--project <ruta>` | Nombraste una raíz. Nada la sobreescribe. |
+| 2 | Buscar hacia arriba | El directorio de trabajo está dentro de un repositorio. |
+| 3 | **Descender por el registry** | El directorio de trabajo *contiene* proyectos registrados: una raíz de workspace. |
+| 4 | Sin vincular | Nada coincidió; el error dice qué encontró y por qué no alcanzó. |
+
+La regla 3 es la que hace funcionar un workspace multi-repositorio. Arrancando
+desde un directorio que contiene varios proyectos registrados, el servidor
+vincula:
+
+- **un proyecto**, si solo uno vive adentro;
+- **el grupo entero**, si todos declaran el mismo `project.group`.
 
 ```
-list_projects        → qué rastrea esta máquina
-use_project <nombre> → vincular esta sesión a uno
+$ cd ~/trabajo/acme && devctx mcp
+Bound to group ACME (11 projects, default acme-api) — resolved from /home/vos/trabajo/acme
 ```
+
+Vinculado a un grupo, `remember` usa `scope: group` por defecto en vez de
+`local`: la sesión está atada a un producto, y `local` enterraría la memoria en
+el miembro que el descenso eligió. Un `scope` explícito siempre gana.
+
+Los proyectos que comparten directorio pero no grupo dejan al servidor sin
+vincular **a propósito** — elegir uno sería adivinar. Dales el mismo
+`project.group` y el descenso se encarga.
+
+### Trabajar entre repositorios
+
+El directorio de trabajo del servidor queda fijo cuando arranca el proceso y no
+cambia nunca, así que una vinculación resuelta al inicio no puede seguirte
+mientras te movés entre repositorios. Para eso, las herramientas de código toman
+un `project` opcional: el nombre de un proyecto registrado, o cualquier ruta
+adentro de uno.
+
+```
+search(query: "política de reintentos", project: "acme-worker")
+search(query: "política de reintentos", project: "~/trabajo/acme/acme-worker/src/main.rs")
+read_file(path: "~/trabajo/acme/acme-web/src/app.ts")   # se resuelve de la ruta misma
+```
+
+Resuelve **solo esa llamada** y nunca cambia la vinculación de la sesión. Cuando
+la respuesta vino de un proyecto inferido y no de uno que nombraste, el
+resultado trae `resolved_project` para que sepas qué repositorio contestó.
+
+`use_project` sigue existiendo, y ahora es lo que su nombre dice: un override
+explícito que mueve la sesión, útil cuando un tramo largo de trabajo vive en un
+solo lugar.
 
 ## Las herramientas
 

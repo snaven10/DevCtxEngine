@@ -36,18 +36,55 @@ are Rust, in the same binary. There is no sidecar and no second runtime.
 
 ## Project binding
 
-`devctx mcp --project <path>` sets the project root explicitly. Without it, the
-root is discovered from the working directory.
+**A globally-registered MCP server starts in whatever directory the client was
+launched from.** That is rarely the repository you mean, and often no repository
+at all — so the server resolves one, in this order:
 
-This matters more than it looks. **A globally-registered MCP server starts in
-whatever directory the client was launched from**, which is often no repository
-at all. When that happens, tools report that no project is bound. The recovery
-is two calls:
+| | Rule | What it looks like |
+|---|---|---|
+| 1 | `--project <path>` | You named a root. Nothing overrides it. |
+| 2 | Walk upwards | The working directory is inside a repository. |
+| 3 | **Descend into the registry** | The working directory *contains* registered projects — a workspace root. |
+| 4 | Unbound | Nothing matched; the error says what was found and why it was not enough. |
+
+Rule 3 is what makes a multi-repository workspace work. Started from a directory
+holding several registered projects, the server binds:
+
+- **one project**, if only one lives under it;
+- **the whole group**, if every one of them declares the same `project.group`.
 
 ```
-list_projects        → what this machine tracks
-use_project <name>   → bind this session to one
+$ cd ~/work/acme && devctx mcp
+Bound to group ACME (11 projects, default acme-api) — resolved from /home/you/work/acme
 ```
+
+Bound to a group, `remember` defaults to `scope: group` rather than `local`: the
+session is attached to a product, and `local` would bury the memory in whichever
+member the descent picked. An explicit `scope` always wins.
+
+Projects that share a directory but not a group leave the server unbound on
+purpose — binding one of them would be a guess. Give them the same
+`project.group` and the descent takes over.
+
+### Working across repositories
+
+The server's working directory is fixed when the process starts and never
+changes, so a binding resolved at startup cannot follow you as you move between
+repositories. Instead, the code tools take an optional `project`: a registered
+project name, or any path inside one.
+
+```
+search(query: "retry policy", project: "acme-worker")
+search(query: "retry policy", project: "~/work/acme/acme-worker/src/main.rs")
+read_file(path: "~/work/acme/acme-web/src/app.ts")     # resolved from the path itself
+```
+
+It resolves **that call only** and never changes the session binding. When the
+answer came from an inferred project rather than one you named, the result
+carries `resolved_project` so you can tell which repository replied.
+
+`use_project` still exists, and is now what its name says: an explicit override
+that moves the session, useful when a long stretch of work lives in one place.
 
 ## The tools
 

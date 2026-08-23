@@ -483,6 +483,10 @@ async fn remember(State(api): State<Api>, Json(b): Json<RememberBody>) -> Respon
                 &tags,
                 &group,
                 &files,
+                // The HTTP API is always serving one project's store, so the
+                // bound repository IS the provenance. Only a group-bound MCP
+                // session needs the override.
+                None,
             );
         }
         do_remember(s, b.content, title, memory_type, topic, tags, files)
