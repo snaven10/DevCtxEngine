@@ -65,6 +65,7 @@ Dos defectos secundarios salieron en la misma corrida:
 | TASK-004 | `constructor_declaration` y kinds Java completos | — | TASK-003 | `pending` |
 | TASK-005 | Retractar la afirmación falsa en docs, protocolos y CLAUDE.md | — | TASK-001 | `pending` |
 | TASK-006 | Verificación con datos reales sobre REVFA_BackEnd | — | TASK-001..004 | `pending` |
+| TASK-007 | El recall entre repositorios devolvía cero, en dos capas | — | — | `done` |
 
 **Paralelizables:** TASK-001 y TASK-002 no se tocan (store vs parse). TASK-005
 puede correr en paralelo con 002/003 una vez cerrada la 001. TASK-003 va después

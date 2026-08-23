@@ -167,6 +167,10 @@ enum Command {
         /// Only global memories contributed by this repository.
         #[arg(long)]
         repo: Option<String>,
+        /// Output format. `json` prints `{"memories": [...]}`, which is what
+        /// the group fan-out parses when it asks each member for its own.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
     /// Show memory counts for the project.
     MemoryStats,
@@ -533,7 +537,8 @@ fn main() -> Result<()> {
             limit,
             scope,
             repo,
-        } => cmd_recall(query, limit, scope, repo),
+            format,
+        } => cmd_recall(query, limit, scope, repo, format),
         Command::MemoryStats => cmd_memory_stats(),
         Command::Memories { action } => match action {
             MemoriesAction::Export { scope, repo } => cmd_memories_export(&scope, repo.as_deref()),
@@ -1641,7 +1646,13 @@ fn cmd_remember(
 /// With both scopes the two result lists are fused **by rank**: the project and
 /// the central store may embed with different models, so their similarity scores
 /// are not on comparable scales.
-fn cmd_recall(query: String, limit: usize, scope: MemoryScope, repo: Option<String>) -> Result<()> {
+fn cmd_recall(
+    query: String,
+    limit: usize,
+    scope: MemoryScope,
+    repo: Option<String>,
+    format: OutputFormat,
+) -> Result<()> {
     let cfg = load_project()?;
 
     let wants = |t: MemoryScope| scope == t || scope == MemoryScope::All;
@@ -1669,6 +1680,14 @@ fn cmd_recall(query: String, limit: usize, scope: MemoryScope, repo: Option<Stri
     };
 
     let hits = fuse_memory_lists(vec![local, group, global], limit);
+    if format == OutputFormat::Json {
+        // Always an object, even with nothing in it. The group fan-out parses
+        // this; a bare "No memories." would come back as a parse failure and be
+        // reported as the member being broken.
+        let memories: Vec<&serde_json::Value> = hits.iter().map(|(h, _)| h).collect();
+        println!("{}", serde_json::json!({ "memories": memories }));
+        return Ok(());
+    }
     if hits.is_empty() {
         println!("No memories.");
         return Ok(());
@@ -1684,13 +1703,31 @@ fn cmd_recall(query: String, limit: usize, scope: MemoryScope, repo: Option<Stri
     Ok(())
 }
 
+/// The memories out of a recall payload, accepting either the object the
+/// server returns or a bare array. Neither shape should be assumed: this exact
+/// mismatch silently emptied local recall.
+fn memories_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    match v {
+        serde_json::Value::Array(a) => a.clone(),
+        _ => v
+            .get("memories")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
 /// Recall a project's own memories, routing through its server when one is
 /// running so no second process takes the DuckDB lock.
 fn local_recall(cfg: &ProjectConfig, query: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
     if let Some(r) = remote::ensure(cfg) {
         let raw = r.recall(query, limit)?;
         let parsed: serde_json::Value = serde_json::from_str(&raw).context("parsing recall")?;
-        return Ok(parsed.as_array().cloned().unwrap_or_default());
+        // The endpoint answers `{"memories": [...]}`. This used to read it as a
+        // bare array, so `as_array()` was always None and every recall made
+        // while a server was running reported no local memories at all — for a
+        // project that had sixteen of them.
+        return Ok(memories_of(&parsed));
     }
     let embedder = build_embedder(cfg)?;
     let store = open_store(cfg, embedder.dimension())?;
