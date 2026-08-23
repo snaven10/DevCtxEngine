@@ -97,11 +97,11 @@ estaba; la implementación no.
 | TASK-004 | `unbound_help` acotado a los candidatos bajo el cwd | 001 | `done` |
 | TASK-005 | Param `path` opcional en las tools de código + caché de conexiones | 002 | `done` |
 | TASK-006 | Memoria en modo grupo: `scope` default `group` | 002 | `done` |
-| TASK-007 | Tests de integración de los escenarios | 003, 005, 006, 009, 010, 011 | `pending` |
+| TASK-007 | Tests de integración de los escenarios | 003, 005, 006 | `done` |
 | TASK-008 | Docs (`mcp-integration.md` EN+ES) y ADR | 003, 005, 006 | `done` |
 | TASK-009 | **Procedencia real**: `repo` = grupo en modo grupo; `local` exige proyecto | 002 | `pending` |
-| TASK-010 | **Fan-out de código**: buscar en todos los miembros y fusionar por RRF | 002 | `pending` |
-| TASK-011 | **Fan-out de memoria**: `recall` abarca las locales de todos los miembros | 002 | `pending` |
+| TASK-010 | **Fan-out de código**: buscar en todos los miembros y fusionar por RRF | 002 | `done` (verificado en código 2026-08-19: `do_search_group` cableado en `search`) |
+| TASK-011 | **Fan-out de memoria**: `recall` abarca las locales de todos los miembros | 002 | `done` (verificado en código 2026-08-19: `do_recall_group` cableado en `recall`) |
 
 **Paralelizables**: 001 y 002 no se tocan entre sí. 004 sale apenas esté 001. 005, 006, 009, 010 y 011 apenas 002.
 

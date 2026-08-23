@@ -230,3 +230,191 @@ fn an_empty_directory_starts_unbound() {
         "expected the unbound message, got:\n{err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The two scenarios above assert on the startup banner. The two below have to
+// call a tool, because what they check is behaviour the banner cannot show:
+// which member a call is answered from, and where a memory is filed.
+// ---------------------------------------------------------------------------
+
+/// Speak MCP over stdio: initialise, call `tool`, return its parsed JSON.
+///
+/// stdin stays open until the answer arrives — closing it signals shutdown to
+/// the stdio transport and would race a slow call. Mirrors the helper in
+/// `mcp_tools.rs`; kept local so neither test file constrains the other.
+fn call_tool(
+    home: &Path,
+    cwd: &Path,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", home)
+        .current_dir(cwd)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let init = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"#,
+        r#""2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+    );
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{tool}","arguments":{arguments}}}}}"#
+    );
+    stdin.write_all(init.as_bytes()).unwrap();
+    stdin.write_all(call.as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+
+    let stdout = child.stdout.take().expect("stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let out = loop {
+        let Some(Ok(line)) = lines.next() else {
+            let _ = child.kill();
+            panic!("the MCP server closed before answering `{tool}`");
+        };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if msg.get("id").and_then(|v| v.as_u64()) != Some(2) {
+            continue;
+        }
+        if let Some(err) = msg.get("error") {
+            let _ = child.kill();
+            panic!("tool `{tool}` returned an error: {err}");
+        }
+        let text = msg["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no text content in: {msg}"))
+            .to_string();
+        break serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+    };
+    drop(stdin);
+    let _ = child.wait();
+    out
+}
+
+/// Scenario H — where a memory lands when nobody said.
+///
+/// A group binding means "the product", so an unqualified `remember` belongs to
+/// the group. A project binding means one repository, so it stays `local`. The
+/// default has to follow the binding, because the caller who omitted `scope`
+/// is exactly the caller who does not know which one they are in.
+#[test]
+fn scope_defaults_follow_the_binding() {
+    let tmp = Tmp::new("scopedefault");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    make_project(&home, &ws, "api", Some("ACME"));
+    make_project(&home, &ws, "web", Some("ACME"));
+
+    // Bound to the group: no `scope` given, so the memory is the product's.
+    let grouped = call_tool(
+        &home,
+        &ws,
+        "remember",
+        serde_json::json!({"content": "el gateway deduplica por request id"}),
+    );
+    let as_text = grouped.to_string();
+    assert!(
+        as_text.contains("group"),
+        "a group binding must file an unqualified memory as `group`, got: {as_text}"
+    );
+
+    // Bound to one project: the same call stays local.
+    let solo = tmp.dir("solo-workspace");
+    make_project(&home, &solo, "lonely", None);
+    let inside = solo.join("lonely");
+    let local = call_tool(
+        &home,
+        &inside,
+        "remember",
+        serde_json::json!({"content": "el reintento genera un id nuevo por intento"}),
+    );
+    // A project binding does not echo `scope` back, so the invariant to assert
+    // is the one that matters: it must NOT have been filed against the group.
+    let as_text = local.to_string();
+    assert!(
+        !as_text.contains("group"),
+        "a project binding must not file an unqualified memory as `group`, got: {as_text}"
+    );
+}
+
+/// Scenario F — a `project` hint names the member a call is answered from.
+///
+/// In a group binding the code tools need a default, and a default is a guess.
+/// `project` is how a caller says which member it means. The answer carries
+/// `resolved_project`, because otherwise the caller cannot tell whether the
+/// hint was honoured or silently ignored — and a silently ignored hint returns
+/// another repository's code with no sign that it did.
+#[test]
+fn a_project_hint_selects_the_member() {
+    let tmp = Tmp::new("hint");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let alpha = make_project(&home, &ws, "alpha", Some("ACME"));
+    let beta = make_project(&home, &ws, "beta", Some("ACME"));
+
+    // Distinct contents: the file each member answers with is what proves which
+    // one answered.
+    std::fs::write(alpha.join("who.txt"), "i am alpha").unwrap();
+    std::fs::write(beta.join("who.txt"), "i am beta").unwrap();
+
+    // Some code tools ask git where the repository root is, so the members have
+    // to be real repositories rather than registered directories.
+    for member in [&alpha, &beta] {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["add", "-A"],
+            vec!["commit", "-qm", "init"],
+        ] {
+            Command::new("git")
+                .args(args)
+                .current_dir(member)
+                .output()
+                .expect("git");
+        }
+    }
+
+    for (name, expected) in [("alpha", "i am alpha"), ("beta", "i am beta")] {
+        let out = call_tool(
+            &home,
+            &ws,
+            "read_file",
+            serde_json::json!({"path": "who.txt", "project": name}),
+        );
+        let text = out.to_string();
+        assert!(
+            text.contains(expected),
+            "`project: {name}` must be answered from {name}, got: {text}"
+        );
+    }
+
+    // `read_file` returns a bare string, and `annotate` deliberately leaves
+    // those alone rather than changing a shape callers already parse. A tool
+    // that answers with an object carries `resolved_project`, which is how a
+    // caller tells an honoured hint from a silently ignored one.
+    let obj = call_tool(
+        &home,
+        &ws,
+        "impact_analysis",
+        serde_json::json!({"symbol": "nothing_here", "project": "beta"}),
+    );
+    assert_eq!(
+        obj.get("resolved_project").and_then(|v| v.as_str()),
+        Some("beta"),
+        "an object answer must name the project it resolved to, got: {obj}"
+    );
+}
