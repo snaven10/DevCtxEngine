@@ -2265,6 +2265,9 @@ pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<
 pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String, String> {
     let store = state.open_store()?;
     let (repo, branch) = state.repo_branch()?;
+    let resolved = store
+        .resolve_symbol(&repo, &branch, symbol)
+        .map_err(|e| e.to_string())?;
     let impact = store
         .impact_analysis(&repo, &branch, symbol, depth)
         .map_err(|e| e.to_string())?;
@@ -2273,12 +2276,29 @@ pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String,
             .map(|(s, d)| json!({ "symbol": s, "depth": d }))
             .collect()
     };
-    Ok(json!({
+    let mut out = json!({
         "symbol": symbol,
         "upstream": to_json(&impact.upstream),
         "downstream": to_json(&impact.downstream),
-    })
-    .to_string())
+    });
+    // A bare name can stand for several methods, and the radius below merges
+    // them. Say so: an unannounced merge reads as one method with a wide blast
+    // radius, which is a different and much more alarming fact.
+    if let Some(names) = merged_declarations(symbol, &resolved) {
+        out["resolved_symbols"] = json!(names);
+    }
+    Ok(out.to_string())
+}
+
+/// The declarations a bare name was expanded into, when that is worth telling
+/// the caller: more than one, or one that is not the name they asked with.
+/// `None` when the question already named exactly one thing.
+pub fn merged_declarations(symbol: &str, resolved: &[String]) -> Option<Vec<String>> {
+    match resolved {
+        [only] if only.as_str() == symbol => None,
+        [] => None,
+        names => Some(names.to_vec()),
+    }
 }
 
 /// `build_context` tool: one budgeted brief assembled for a question.
@@ -2654,6 +2674,9 @@ fn value_json(v: Value, sources: &str) -> Value {
 pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
     let store = state.open_store()?;
     let (repo, branch) = state.repo_branch()?;
+    let resolved = store
+        .resolve_symbol(&repo, &branch, symbol)
+        .map_err(|e| e.to_string())?;
     let refs = store
         .find_references(&repo, &branch, symbol)
         .map_err(|e| e.to_string())?;
@@ -2661,7 +2684,11 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
         .iter()
         .map(|r| json!({ "file": r.file, "line": r.line, "source": r.source }))
         .collect();
-    serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
+    let mut out = json!({ "symbol": symbol, "references": arr });
+    if let Some(names) = merged_declarations(symbol, &resolved) {
+        out["resolved_symbols"] = json!(names);
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// `search_routes` tool: find HTTP routes by optional method + path substring.

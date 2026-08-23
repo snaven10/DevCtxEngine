@@ -3,7 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use duckdb::params;
+use duckdb::{params, params_from_iter};
 
 use crate::error::Result;
 use crate::store::Store;
@@ -159,26 +159,97 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Every name in the graph that `symbol` could mean.
+    ///
+    /// An edge's `source` is written qualified (`Class.method`) whenever the
+    /// calling function sits inside a container, but its `target` is qualified
+    /// only when the call site had a receiver whose type could be resolved. In
+    /// a language where every method lives in a class — Java — that leaves a
+    /// bare name unable to match any `source` at all, and able to match a
+    /// `target` only by luck of how the call happened to be written. Measured
+    /// on a Java/Quarkus repository: `actualizar` returned nothing while
+    /// `OficinaService.actualizar` returned one caller and twenty-three
+    /// callees. The edges were never missing — the key was.
+    ///
+    /// So a bare name expands to every qualified form carrying it. A name that
+    /// is already qualified is returned untouched: `OficinaService.actualizar`
+    /// has to keep meaning exactly one thing. A name nothing matches returns as
+    /// itself, so an absent symbol still yields an empty result rather than an
+    /// error.
+    ///
+    /// Callers are expected to report an expansion wider than one. Folding
+    /// seven distinct `actualizar` methods into a single blast radius without
+    /// saying so is worse than returning nothing.
+    pub fn resolve_symbol(&self, repo: &str, branch: &str, symbol: &str) -> Result<Vec<String>> {
+        if symbol.contains('.') {
+            return Ok(vec![symbol.to_string()]);
+        }
+        // `ends_with` rather than `LIKE '%.' || ?`: in LIKE an underscore is a
+        // single-character wildcard, and identifiers are full of underscores —
+        // `find_by_id` would also match `findXbyXid`.
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT source AS name FROM graph_edges
+              WHERE repo = ? AND branch = ?
+                AND (source = ? OR ends_with(source, '.' || ?))
+             UNION
+             SELECT DISTINCT target AS name FROM graph_edges
+              WHERE repo = ? AND branch = ?
+                AND (target = ? OR ends_with(target, '.' || ?))
+             ORDER BY name",
+        )?;
+        let rows = stmt.query_map(
+            params![repo, branch, symbol, symbol, repo, branch, symbol, symbol],
+            |r| r.get::<_, String>(0),
+        )?;
+        let found: Vec<String> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(if found.is_empty() {
+            vec![symbol.to_string()]
+        } else {
+            found
+        })
+    }
+
     /// Direct callers of `symbol` (sources of edges targeting it).
     pub fn get_callers(&self, repo: &str, branch: &str, symbol: &str) -> Result<Vec<String>> {
-        self.distinct(
-            "SELECT DISTINCT source FROM graph_edges
-             WHERE repo = ? AND branch = ? AND target = ?",
-            repo,
-            branch,
-            symbol,
-        )
+        let names = self.resolve_symbol(repo, branch, symbol)?;
+        self.neighbours_of(repo, branch, &names, true)
     }
 
     /// Direct callees of `symbol` (targets of edges from it).
     pub fn get_callees(&self, repo: &str, branch: &str, symbol: &str) -> Result<Vec<String>> {
-        self.distinct(
-            "SELECT DISTINCT target FROM graph_edges
-             WHERE repo = ? AND branch = ? AND source = ?",
-            repo,
-            branch,
-            symbol,
-        )
+        let names = self.resolve_symbol(repo, branch, symbol)?;
+        self.neighbours_of(repo, branch, &names, false)
+    }
+
+    /// Neighbours of an exact set of names — no expansion. Traversal uses this:
+    /// the names it walks came out of the graph already, so re-expanding them
+    /// would pull in unrelated homonyms at every hop.
+    fn neighbours_of(
+        &self,
+        repo: &str,
+        branch: &str,
+        names: &[String],
+        callers: bool,
+    ) -> Result<Vec<String>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (select, matched) = if callers {
+            ("source", "target")
+        } else {
+            ("target", "source")
+        };
+        let holes = vec!["?"; names.len()].join(", ");
+        let sql = format!(
+            "SELECT DISTINCT {select} FROM graph_edges
+              WHERE repo = ? AND branch = ? AND {matched} IN ({holes})"
+        );
+        let mut args: Vec<String> = vec![repo.to_string(), branch.to_string()];
+        args.extend(names.iter().cloned());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// All references (call sites) of `symbol`.
@@ -188,12 +259,20 @@ impl Store {
         branch: &str,
         symbol: &str,
     ) -> Result<Vec<Reference>> {
-        let mut stmt = self.conn.prepare(
+        let names = self.resolve_symbol(repo, branch, symbol)?;
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let holes = vec!["?"; names.len()].join(", ");
+        let sql = format!(
             "SELECT source_file, line, source FROM graph_edges
-             WHERE repo = ? AND branch = ? AND target = ?
-             ORDER BY source_file, line",
-        )?;
-        let rows = stmt.query_map(params![repo, branch, symbol], |r| {
+              WHERE repo = ? AND branch = ? AND target IN ({holes})
+             ORDER BY source_file, line"
+        );
+        let mut args: Vec<String> = vec![repo.to_string(), branch.to_string()];
+        args.extend(names);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
             Ok(Reference {
                 file: r.get(0)?,
                 line: r.get(1)?,
@@ -226,33 +305,38 @@ impl Store {
         max_depth: usize,
         callers: bool,
     ) -> Result<Vec<(String, usize)>> {
-        let mut visited: HashSet<String> = HashSet::from([start.to_string()]);
-        let mut queue: VecDeque<(String, usize)> = VecDeque::from([(start.to_string(), 0)]);
+        // Only the starting point expands. Every name reached from here came
+        // out of the graph as written, so it is walked exactly as it is.
+        let seeds = self.resolve_symbol(repo, branch, start)?;
+
+        // Two sets, because a seed is both a starting point and a reachable
+        // node. In `OficinaResource.actualizar -> OficinaService.actualizar`
+        // — the dominant shape in a Quarkus codebase — both ends answer to the
+        // bare name `actualizar`, so both are seeds *and* one is genuinely the
+        // caller of the other. Suppressing a seed from the output would drop
+        // exactly the edge the question was about.
+        let mut walked: HashSet<String> = seeds.iter().cloned().collect();
+        let mut reported: HashSet<String> = HashSet::from([start.to_string()]);
+        let mut queue: VecDeque<(String, usize)> = seeds.into_iter().map(|s| (s, 0)).collect();
         let mut out = Vec::new();
         while let Some((node, depth)) = queue.pop_front() {
             if depth >= max_depth {
                 continue;
             }
-            let neighbors = if callers {
-                self.get_callers(repo, branch, &node)?
-            } else {
-                self.get_callees(repo, branch, &node)?
-            };
-            for n in neighbors {
-                if visited.insert(n.clone()) {
+            let neighbours =
+                self.neighbours_of(repo, branch, std::slice::from_ref(&node), callers)?;
+            for n in neighbours {
+                if reported.insert(n.clone()) {
                     out.push((n.clone(), depth + 1));
-                    queue.push_back((n, depth + 1));
+                    // A seed reached as a neighbour is reported, but not walked
+                    // a second time.
+                    if walked.insert(n.clone()) {
+                        queue.push_back((n, depth + 1));
+                    }
                 }
             }
         }
         Ok(out)
-    }
-
-    fn distinct(&self, sql: &str, repo: &str, branch: &str, symbol: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![repo, branch, symbol], |r| r.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
     }
 }
 
@@ -312,6 +396,186 @@ mod tests {
             .downstream;
         assert!(down.contains(&("b".to_string(), 1)));
         assert!(down.contains(&("c".to_string(), 2)));
+    }
+
+    /// The shape a Java repository actually produces: every `source` qualified
+    /// because every method lives in a class, and a `target` qualified only
+    /// when the call site had a receiver whose type resolved.
+    fn java_like() -> Store {
+        let store = Store::open_in_memory(3).unwrap();
+        store
+            .replace_file_edges(
+                "repo",
+                "main",
+                "OficinaResource.java",
+                &[edge(
+                    "OficinaResource.actualizar",
+                    "OficinaService.actualizar",
+                    "OficinaResource.java",
+                    129,
+                )],
+            )
+            .unwrap();
+        store
+            .replace_file_edges(
+                "repo",
+                "main",
+                "TicketResource.java",
+                &[edge(
+                    "TicketResource.actualizar",
+                    "TicketService.actualizar",
+                    "TicketResource.java",
+                    148,
+                )],
+            )
+            .unwrap();
+        store
+            .replace_file_edges(
+                "repo",
+                "main",
+                "OficinaService.java",
+                &[edge(
+                    "OficinaService.actualizar",
+                    "Oficina.persist",
+                    "OficinaService.java",
+                    121,
+                )],
+            )
+            .unwrap();
+        store
+    }
+
+    /// The defect this whole change exists for. `actualizar` is written into
+    /// the graph only as `Clase.actualizar`, so an exact-match lookup on the
+    /// bare name returned nothing at all — which reads as "this symbol is not
+    /// called" and is the most expensive wrong answer the graph can give.
+    #[test]
+    fn a_bare_name_finds_the_edges_written_under_its_qualified_forms() {
+        let store = java_like();
+
+        let callers = store.get_callers("repo", "main", "actualizar").unwrap();
+        assert!(callers.contains(&"OficinaResource.actualizar".to_string()));
+        assert!(callers.contains(&"TicketResource.actualizar".to_string()));
+
+        let callees = store.get_callees("repo", "main", "actualizar").unwrap();
+        assert!(callees.contains(&"Oficina.persist".to_string()));
+
+        let refs = store.find_references("repo", "main", "actualizar").unwrap();
+        assert_eq!(refs.len(), 2, "both call sites, not zero");
+    }
+
+    /// Expansion is what the caller has to be told about: four declarations
+    /// answer to `actualizar` here, and a blast radius that silently merges
+    /// them is worse than an empty one.
+    #[test]
+    fn resolving_a_bare_name_lists_every_declaration_it_could_mean() {
+        let store = java_like();
+        let names = store.resolve_symbol("repo", "main", "actualizar").unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "OficinaResource.actualizar",
+                "OficinaService.actualizar",
+                "TicketResource.actualizar",
+                "TicketService.actualizar",
+            ]
+        );
+    }
+
+    /// The other half of the contract: asking for one specific method has to
+    /// keep meaning one specific method. If qualifying a name stopped
+    /// narrowing the answer, there would be no way left to disambiguate.
+    #[test]
+    fn a_qualified_name_does_not_collect_its_homonyms() {
+        let store = java_like();
+        assert_eq!(
+            store
+                .resolve_symbol("repo", "main", "OficinaService.actualizar")
+                .unwrap(),
+            vec!["OficinaService.actualizar"]
+        );
+        assert_eq!(
+            store
+                .get_callers("repo", "main", "OficinaService.actualizar")
+                .unwrap(),
+            vec!["OficinaResource.actualizar"]
+        );
+    }
+
+    /// A name unknown to the graph answers empty, not with an error and not by
+    /// matching everything.
+    #[test]
+    fn an_unknown_name_resolves_to_itself_and_finds_nothing() {
+        let store = java_like();
+        assert_eq!(
+            store.resolve_symbol("repo", "main", "noExiste").unwrap(),
+            vec!["noExiste"]
+        );
+        assert!(store
+            .get_callers("repo", "main", "noExiste")
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Expansion applies to the question, never to the walk. The names a
+    /// traversal reaches came out of the graph already; expanding them again
+    /// at every hop would drag in an unrelated homonym and report it as part
+    /// of the blast radius.
+    #[test]
+    fn traversal_does_not_re_expand_the_names_it_walks() {
+        let store = java_like();
+        // `Oficina.persist` calls a bare `flush`; an unrelated `Repo.flush`
+        // exists and calls something that must never surface here.
+        store
+            .replace_file_edges(
+                "repo",
+                "main",
+                "Oficina.java",
+                &[edge("Oficina.persist", "flush", "Oficina.java", 40)],
+            )
+            .unwrap();
+        store
+            .replace_file_edges(
+                "repo",
+                "main",
+                "Repo.java",
+                &[edge("Repo.flush", "noDebeAparecer", "Repo.java", 12)],
+            )
+            .unwrap();
+
+        let down = store
+            .impact_analysis("repo", "main", "OficinaService.actualizar", 5)
+            .unwrap()
+            .downstream;
+        let reached: Vec<&str> = down.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(reached.contains(&"Oficina.persist"));
+        assert!(reached.contains(&"flush"));
+        assert!(
+            !reached.contains(&"noDebeAparecer"),
+            "the walk expanded `flush` into `Repo.flush` and followed it: {reached:?}"
+        );
+    }
+
+    /// Seeding, on the other hand, does expand: the question was asked with a
+    /// bare name, so every declaration behind it is a legitimate entry point.
+    ///
+    /// And a seed still gets reported when it is reached as a neighbour. In
+    /// `OficinaResource.actualizar -> OficinaService.actualizar` both ends
+    /// answer to `actualizar`; treating a seed as already-seen would delete the
+    /// one edge the question was actually about.
+    #[test]
+    fn impact_seeds_from_every_form_of_a_bare_name() {
+        let store = java_like();
+        let impact = store.impact_analysis("repo", "main", "actualizar", 5).unwrap();
+        assert!(impact
+            .upstream
+            .contains(&("OficinaResource.actualizar".to_string(), 1)));
+        assert!(impact
+            .upstream
+            .contains(&("TicketResource.actualizar".to_string(), 1)));
+        assert!(impact
+            .downstream
+            .contains(&("Oficina.persist".to_string(), 1)));
     }
 
     /// The repair path for a database whose ART indexes lost their entries to a

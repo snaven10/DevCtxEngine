@@ -1895,6 +1895,15 @@ fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     if let Some(r) = remote::ensure(&cfg) {
         let json: serde_json::Value = serde_json::from_str(&r.impact(&symbol, depth)?)?;
         println!("Impact of `{symbol}` (depth {depth}):");
+        let merged: Vec<String> = json["resolved_symbols"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        print_expansion(&symbol, &merged);
         print_impact("callers (upstream)", &json_depth_pairs(&json["upstream"]));
         print_impact(
             "callees (downstream)",
@@ -1905,12 +1914,39 @@ fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     let store = open_store(&cfg, configured_dimension(&cfg))?;
     let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
     let branch = git.state().branch;
-    let impact = store.impact_analysis(&git.short_name(), &branch, &symbol, depth)?;
+    let repo = git.short_name();
+    let resolved = store.resolve_symbol(&repo, &branch, &symbol)?;
+    let impact = store.impact_analysis(&repo, &branch, &symbol, depth)?;
 
     println!("Impact of `{symbol}` (depth {depth}):");
+    print_expansion(
+        &symbol,
+        &devctx_mcp::state::merged_declarations(&symbol, &resolved).unwrap_or_default(),
+    );
     print_impact("callers (upstream)", &impact.upstream);
     print_impact("callees (downstream)", &impact.downstream);
     Ok(())
+}
+
+/// Say out loud when a bare name stood for more than one declaration.
+///
+/// The radius printed underneath is the union of all of them. Left unsaid, it
+/// reads as one method reaching unusually far — which is a different claim, and
+/// the kind of wrong that gets acted on.
+fn print_expansion(symbol: &str, merged: &[String]) {
+    match merged {
+        [] => {}
+        [only] => println!("  `{symbol}` is `{only}`."),
+        names => {
+            println!(
+                "  `{symbol}` names {} declarations, merged below:",
+                names.len()
+            );
+            for n in names {
+                println!("    {n}");
+            }
+        }
+    }
 }
 
 /// Extract `[{symbol, depth}]` from a server JSON array into `(symbol, depth)`.
