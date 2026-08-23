@@ -418,3 +418,155 @@ fn a_project_hint_selects_the_member() {
         "an object answer must name the project it resolved to, got: {obj}"
     );
 }
+
+/// Call a tool and return the raw JSON-RPC message, so a test can assert on an
+/// *error* rather than a result. `call_tool` panics on errors by design; here
+/// the error is the thing under test.
+fn call_tool_raw(
+    home: &Path,
+    cwd: &Path,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", home)
+        .current_dir(cwd)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let init = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"#,
+        r#""2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+    );
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{tool}","arguments":{arguments}}}}}"#
+    );
+    stdin.write_all(init.as_bytes()).unwrap();
+    stdin.write_all(call.as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+
+    let stdout = child.stdout.take().expect("stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let msg = loop {
+        let Some(Ok(line)) = lines.next() else {
+            let _ = child.kill();
+            panic!("the MCP server closed before answering `{tool}`");
+        };
+        let Ok(m) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if m.get("id").and_then(|v| v.as_u64()) == Some(2) {
+            break m;
+        }
+    };
+    drop(stdin);
+    let _ = child.wait();
+    msg
+}
+
+/// TASK-009, first half — who a memory is attributed to.
+///
+/// Where a memory is written and who it came from are different questions. A
+/// group binding answers the second with the group, never with a member:
+/// picking one would invent a provenance nobody declared, and six months later
+/// someone reads that a product-wide decision came out of one repository.
+///
+/// A `project` hint is the exception, and it has to be: the caller named the
+/// repository, so that repository *is* the real provenance.
+#[test]
+fn a_group_binding_attributes_the_memory_to_the_group() {
+    let tmp = Tmp::new("provenance");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    make_project(&home, &ws, "api", Some("ACME"));
+    make_project(&home, &ws, "web", Some("ACME"));
+
+    // No `project`: the product wrote this, so the product is the provenance.
+    let grouped = call_tool(
+        &home,
+        &ws,
+        "remember",
+        serde_json::json!({"content": "el producto decidió X", "scope": "group"}),
+    );
+    let text = grouped.to_string();
+    assert!(
+        text.contains("ACME"),
+        "a group binding must attribute to the group, got: {text}"
+    );
+
+    // Named a member: that member is the provenance, not the group. Otherwise
+    // the override would be lying in the other direction.
+    let hinted = call_tool(
+        &home,
+        &ws,
+        "remember",
+        serde_json::json!({"content": "esto salió de api", "scope": "group", "project": "api"}),
+    );
+    let text = hinted.to_string();
+    assert!(
+        text.contains("api"),
+        "an explicit project must be the provenance, got: {text}"
+    );
+}
+
+/// TASK-009, second half — `local` has nowhere to go in a group binding.
+///
+/// `local` means "this repository's own store", and a group binding has no such
+/// repository. Choosing one would file the memory where nobody chose and nobody
+/// will look — the silent-wrong-answer failure this whole plan exists to close.
+/// So it fails, and the message carries both ways out rather than just the
+/// diagnosis.
+#[test]
+fn local_scope_refuses_to_guess_a_repository() {
+    let tmp = Tmp::new("localguard");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    make_project(&home, &ws, "api", Some("ACME"));
+    make_project(&home, &ws, "web", Some("ACME"));
+
+    let msg = call_tool_raw(
+        &home,
+        &ws,
+        "remember",
+        serde_json::json!({"content": "algo", "scope": "local"}),
+    );
+    let err = msg
+        .get("error")
+        .unwrap_or_else(|| panic!("`scope: local` in a group binding must fail, got: {msg}"))
+        .to_string();
+
+    // A refusal that does not say how to proceed just moves the problem.
+    assert!(
+        err.contains("project"),
+        "the error must offer naming the project, got: {err}"
+    );
+    assert!(
+        err.contains("group"),
+        "the error must offer group scope, got: {err}"
+    );
+
+    // And inside a single repository the same call is ordinary.
+    let solo = tmp.dir("solo");
+    make_project(&home, &solo, "lonely", None);
+    let ok = call_tool(
+        &home,
+        &solo.join("lonely"),
+        "remember",
+        serde_json::json!({"content": "algo", "scope": "local"}),
+    );
+    assert!(
+        ok.get("id").is_some(),
+        "a project binding must accept `scope: local`, got: {ok}"
+    );
+}

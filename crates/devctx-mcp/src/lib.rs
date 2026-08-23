@@ -689,9 +689,17 @@ impl DevctxServer {
 
         // A `project` hint names the repository, and that repository is then the
         // real provenance — so the group override only applies without one.
+        //
+        // The condition is what the CALLER asked for, not what `backend_for`
+        // resolved. In a group binding `backend_for(None)` still names the
+        // default member — deliberately, because a code tool must say which
+        // repository answered — so keying off its return value meant the group
+        // override never fired and every product-wide memory was attributed to
+        // whichever member happened to be the default.
+        let named_a_project = req.project.is_some();
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        let provenance = match (&group_binding, &resolved) {
-            (Some(group), None) => Some(group.clone()),
+        let provenance = match (&group_binding, named_a_project) {
+            (Some(group), false) => Some(group.clone()),
             _ => None,
         };
         let attributed = provenance.clone().or_else(|| resolved.clone());
