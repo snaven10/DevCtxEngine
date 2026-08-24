@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -131,17 +132,67 @@ pub fn ensure(paths: &CentralPaths) -> Option<CentralClient> {
     if std::env::var_os("DEVCTX_NO_AUTOSERVE").is_some() {
         return None;
     }
-    if spawn(paths).is_err() {
+    let Ok(exited) = spawn(paths) else {
         return None;
-    }
-    // No model to load here, so a healthy daemon appears in well under a second.
-    for _ in 0..40 {
-        std::thread::sleep(Duration::from_millis(100));
+    };
+    // The budget used to be four seconds, on the reasoning that this daemon
+    // loads no model and so "appears in well under a second". True on an idle
+    // machine, false on a busy one: a full test run has several processes
+    // loading embedding models at once, and under that the daemon lost the race
+    // and the caller reported it as "could not be started". That was the whole
+    // flaky-test story.
+    //
+    // Waiting longer is only half of it — a daemon that DIED is not going to
+    // arrive no matter how long anyone waits, so the loop watches for that too
+    // and gives up immediately instead of burning the budget.
+    for _ in 0..WAIT_TICKS {
+        std::thread::sleep(TICK);
         if let Some(r) = discover(paths) {
             return Some(r);
         }
+        if exited.lock().is_ok_and(|e| e.is_some()) {
+            return None;
+        }
     }
     None
+}
+
+/// How long to wait for a freshly spawned central daemon, and in what steps.
+///
+/// Twenty seconds is not a guess at how long startup takes — startup is fast.
+/// It is the margin for a machine so loaded that a process takes seconds just
+/// to be scheduled. The loop leaves as soon as the daemon answers, so on an
+/// idle machine this costs the same few hundred milliseconds it always did.
+const TICK: Duration = Duration::from_millis(100);
+const WAIT_TICKS: usize = 200;
+
+/// Why the last spawned daemon did not come up, as far as its log knows.
+///
+/// `ensure` returning `None` says only "no daemon". The daemon writes the
+/// actual reason — a lock it could not take, a port already held, a store whose
+/// config no longer matches — to `serve.log` and then exits, and without this
+/// that line is never read by anyone. An error that names no cause is an error
+/// somebody has to reproduce before they can start working on it.
+pub fn spawn_failure_hint(paths: &CentralPaths) -> Option<String> {
+    let log = std::fs::read_to_string(paths.dir.join("serve.log")).ok()?;
+    let tail: Vec<&str> = log
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(3)
+        .collect();
+    if tail.is_empty() {
+        return None;
+    }
+    Some(
+        tail.into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" / ")
+            .chars()
+            .take(400)
+            .collect(),
+    )
 }
 
 /// Where a spawned daemon's stderr goes: `serve.log` beside the database,
@@ -157,7 +208,10 @@ fn log_sink(paths: &CentralPaths) -> std::process::Stdio {
 }
 
 /// Launch `devctx serve --central` detached, with an idle timeout.
-fn spawn(paths: &CentralPaths) -> Result<()> {
+///
+/// Returns a handle the caller can poll to tell "not up yet" apart from "it is
+/// never coming up".
+fn spawn(paths: &CentralPaths) -> Result<Arc<Mutex<Option<std::process::ExitStatus>>>> {
     let exe_path =
         std::env::current_exe().map_err(|e| CentralError::Io(e, PathBuf::from("<current exe>")))?;
     let mut cmd = std::process::Command::new(&exe_path);
@@ -192,11 +246,17 @@ fn spawn(paths: &CentralPaths) -> Result<()> {
     // immediately when another daemon already owns the database. In a long-lived
     // parent (an MCP server that outlives many of them) those corpses
     // accumulate, one per attempt. Reap it wherever it ends.
+    let exited: Arc<Mutex<Option<std::process::ExitStatus>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&exited);
     std::thread::spawn(move || {
         let mut child = child;
-        let _ = child.wait();
+        if let Ok(status) = child.wait() {
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(status);
+            }
+        }
     });
-    Ok(())
+    Ok(exited)
 }
 
 /// Stop the advertised central daemon.
@@ -226,11 +286,24 @@ pub fn default_addr(paths: &CentralPaths) -> String {
     auto_addr(paths)
 }
 
+/// How long to wait on the central daemon for one call.
+///
+/// The expensive endpoints — `/remember` above all — load an embedding model
+/// and then embed, and neither step reports progress, so the client has nothing
+/// to go on but the clock. Sixty seconds was enough on an idle machine and not
+/// enough during a full workspace test run, where several processes load models
+/// at once; the call surfaced as `timed out reading response`, which reads like
+/// a broken daemon rather than a busy one.
+///
+/// This is a ceiling for a local process, not a latency target. A daemon that
+/// died is already caught by the exit watch in `ensure`, so the only thing this
+/// bound still protects against is one that hangs — and for that, waiting five
+/// minutes before saying so costs nothing anybody notices.
+const CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
 impl CentralClient {
     fn agent(&self) -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(60))
-            .build()
+        ureq::AgentBuilder::new().timeout(CALL_TIMEOUT).build()
     }
 
     fn auth(&self, req: ureq::Request) -> ureq::Request {
