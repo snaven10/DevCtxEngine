@@ -34,7 +34,7 @@ import os
 def alpha():
     return 1
 ";
-        let chunks = chunks_for(Lang::Python, "pkg/mod.py", src);
+        let chunks = chunks_for(Lang::python(), "pkg/mod.py", src);
         let file = &chunks[0];
         assert_eq!(file.level, "file");
         assert_eq!(file.symbol_name, "mod.py");
@@ -53,7 +53,7 @@ class Greeter:
     def bye(self):
         return 2
 ";
-        let chunks = chunks_for(Lang::Python, "g.py", src);
+        let chunks = chunks_for(Lang::python(), "g.py", src);
         let class = chunks.iter().find(|c| c.level == "class").unwrap();
         assert_eq!(class.symbol_name, "Greeter");
         assert!(class.text.contains("# methods:"));
@@ -68,7 +68,7 @@ class Greeter:
             .map(|i| format!("    let v{i} = {i} + 1;\n"))
             .collect();
         let src = format!("fn medium() {{\n{body}}}\n");
-        let chunks = chunks_for(Lang::Rust, "src/lib.rs", &src);
+        let chunks = chunks_for(Lang::rust(), "src/lib.rs", &src);
         let f = chunks.iter().find(|c| c.level == "function").unwrap();
         assert_eq!(f.symbol_name, "medium");
         assert!(f.context_header.contains("lib.rs"));
@@ -83,7 +83,7 @@ fn a() {}
 fn b() {}
 fn c() {}
 ";
-        let chunks = chunks_for(Lang::Rust, "t.rs", src);
+        let chunks = chunks_for(Lang::rust(), "t.rs", src);
         let grouped: Vec<_> = chunks
             .iter()
             .filter(|c| c.symbol_type == "grouped")
@@ -135,7 +135,7 @@ fn c() {}
             .map(|i| format!("    let v{i} = {i} + 1;\n"))
             .collect();
         let src = format!("fn big() {{\n{body}}}\n");
-        let chunks = chunks_for(Lang::Rust, "big.rs", &src);
+        let chunks = chunks_for(Lang::rust(), "big.rs", &src);
         let blocks: Vec<_> = chunks.iter().filter(|c| c.level == "block").collect();
         assert!(
             blocks.len() >= 2,

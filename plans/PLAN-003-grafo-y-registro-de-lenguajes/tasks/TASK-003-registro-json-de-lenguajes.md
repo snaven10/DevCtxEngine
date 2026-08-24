@@ -4,7 +4,7 @@
 - **Especialista:** —
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
 - **Depende de:** TASK-002
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -43,41 +43,41 @@ globales compartidas entre los 7 lenguajes.
 
 ## Pasos
 
-- [ ] **Paso 1 — Definir `LangDef`** en `registry.rs`, con `Deserialize`:
+- [x] **Paso 1 — Definir `LangDef`** en `registry.rs`, con `Deserialize`:
       `name`, `grammar`, `extensions`, `symbols`, `calls`, `types` (opcional),
       `imports`, `function_kinds`, `container_kinds`.
-- [ ] **Paso 2 — Escribir los 7 JSON** trasladando **literalmente** las queries y
+- [x] **Paso 2 — Escribir los 7 JSON** trasladando **literalmente** las queries y
       extensiones que hoy están en `lang.rs`. Los `function_kinds`/`container_kinds`
       de cada uno arrancan siendo el subconjunto de las listas globales que
       aplica a ese lenguaje. **Traslado 1:1: este paso no cambia comportamiento.**
-- [ ] **Paso 3 — Embeber y parsear.** `include_str!` por archivo, deserializados
+- [x] **Paso 3 — Embeber y parsear.** `include_str!` por archivo, deserializados
       una vez en un `LazyLock<Vec<LangDef>>`. Un JSON inválido revienta ahí, y el
       test del Paso 6 lo atrapa en CI.
-- [ ] **Paso 4 — Tabla de gramáticas.** `fn grammar_for(name: &str) -> Option<Language>`
+- [x] **Paso 4 — Tabla de gramáticas.** `fn grammar_for(name: &str) -> Option<Language>`
       con las 7 entradas. **Es lo único compilado que queda**, porque las
       gramáticas son símbolos C linkeados (ver DD-4).
-- [ ] **Paso 5 — Kinds por lenguaje.** `LanguageParser` guarda los kinds de su
+- [x] **Paso 5 — Kinds por lenguaje.** `LanguageParser` guarda los kinds de su
       `LangDef`; `enclosing_function_node`, `enclosing_container` y
       `extract_symbols` los reciben en vez de leer las `const` globales.
       **Borrar `FUNCTION_KINDS` y `CONTAINER_KINDS`.**
-- [ ] **Paso 6 — Test de validación.** Recorre los 7 `LangDef`, resuelve su
+- [x] **Paso 6 — Test de validación.** Recorre los 7 `LangDef`, resuelve su
       gramática y compila sus 4 queries con `Query::new`. Falla nombrando el
       lenguaje y la query. Un JSON sin gramática registrada también falla.
-- [ ] **Paso 7 — Documentar cómo se agrega un lenguaje** en
+- [x] **Paso 7 — Documentar cómo se agrega un lenguaje** en
       `docs/03-core-concepts/symbol-graph.md` y su par en `docs/es/`: 1 JSON +
       1 dep + 1 línea en la tabla, y por qué la gramática no puede venir del JSON.
-- [ ] **Paso 8 — Commit.** `refactor(parse): define languages in embedded JSON`
+- [x] **Paso 8 — Commit.** `refactor(parse): define languages in embedded JSON`
 
 ## Criterios de aceptación
 
-- [ ] Toda la suite de `devctx-parse` pasa **sin tocar un solo test**: el traslado
+- [x] Toda la suite de `devctx-parse` pasa **sin tocar un solo test**: el traslado
       es 1:1 y los tests existentes son la prueba de que no cambió nada.
-- [ ] `FUNCTION_KINDS` y `CONTAINER_KINDS` ya no existen en el árbol.
-- [ ] El test del Paso 6 falla —y nombra el lenguaje— si se corrompe a propósito
+- [x] `FUNCTION_KINDS` y `CONTAINER_KINDS` ya no existen en el árbol.
+- [x] El test del Paso 6 falla —y nombra el lenguaje— si se corrompe a propósito
       un nodo en `java.json`. **Comprobarlo de verdad, no asumirlo.**
-- [ ] Reindexar un repo pequeño produce el **mismo** conteo de símbolos y aristas
+- [x] Reindexar un repo pequeño produce el **mismo** conteo de símbolos y aristas
       que antes del cambio. Anotar ambos números en `## Resultado`.
-- [ ] `Lang::` sigue sin usarse fuera de `devctx-parse`.
+- [x] `Lang::` sigue sin usarse fuera de `devctx-parse`.
 
 ## Riesgos
 
@@ -94,4 +94,6 @@ copiar una query. Los tests existentes de `lib.rs` cubren los 7 lenguajes y son
 la red — no los modifiques para que pasen.
 
 ## Resultado
-<!-- SE LLENA AL CERRAR -->
+
+- **Estado final:** `done` (2026-08-24)
+- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre REVFA_BackEnd, con lo que NO se verificó declarado.

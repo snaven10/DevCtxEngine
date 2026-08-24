@@ -9,12 +9,14 @@
 pub mod error;
 pub mod lang;
 pub mod parser;
+pub mod registry;
 pub mod routes;
 pub mod types;
 
 pub use error::{ParseError, Result};
 pub use lang::{lang_for_extension, raw_text_language, Lang};
 pub use parser::LanguageParser;
+pub use registry::LangDef;
 pub use routes::{extract_routes, Route};
 pub use types::{GraphEdge, Import, ParsedFile, Symbol};
 
@@ -48,7 +50,7 @@ mod tests {
 
     #[test]
     fn all_queries_compile() {
-        for &l in lang::ALL {
+        for l in lang::all() {
             assert!(LanguageParser::new(l).is_ok(), "parser build failed: {l:?}");
         }
     }
@@ -66,7 +68,7 @@ class Greeter:
     def greet(self, name):
         return name
 ";
-        let pf = parse_ok(Lang::Python, src);
+        let pf = parse_ok(Lang::python(), src);
         assert_eq!(pf.language, "python");
         assert_eq!(find(&pf, "top_level").kind, "function");
         assert_eq!(find(&pf, "Greeter").kind, "class");
@@ -93,7 +95,7 @@ impl Point {
 trait Shape {}
 enum Color { Red }
 ";
-        let pf = parse_ok(Lang::Rust, src);
+        let pf = parse_ok(Lang::rust(), src);
         assert_eq!(find(&pf, "Point").kind, "struct");
         assert_eq!(find(&pf, "free").kind, "function");
         let mag = find(&pf, "mag");
@@ -117,7 +119,7 @@ func (s *Server) Handle() {}
 
 func main() {}
 ";
-        let pf = parse_ok(Lang::Go, src);
+        let pf = parse_ok(Lang::go(), src);
         assert_eq!(find(&pf, "Server").kind, "type");
         assert_eq!(find(&pf, "Handle").kind, "method");
         assert_eq!(find(&pf, "main").kind, "function");
@@ -136,7 +138,7 @@ public class Service {
 
 interface Runnable2 {}
 ";
-        let pf = parse_ok(Lang::Java, src);
+        let pf = parse_ok(Lang::java(), src);
         assert_eq!(find(&pf, "Service").kind, "class");
         let run = find(&pf, "run");
         assert_eq!(run.kind, "method");
@@ -158,7 +160,7 @@ export class Widget {
 
 interface Props {}
 ";
-        let pf = parse_ok(Lang::TypeScript, src);
+        let pf = parse_ok(Lang::typescript(), src);
         assert_eq!(find(&pf, "build").kind, "function");
         assert_eq!(find(&pf, "Widget").kind, "class");
         assert_eq!(find(&pf, "render").kind, "method");
@@ -173,7 +175,7 @@ import x from 'x';
 function go() {}
 class Box { open() {} }
 ";
-        let pf = parse_ok(Lang::JavaScript, src);
+        let pf = parse_ok(Lang::javascript(), src);
         assert_eq!(find(&pf, "go").kind, "function");
         assert_eq!(find(&pf, "Box").kind, "class");
         assert_eq!(find(&pf, "open").kind, "method");
@@ -185,7 +187,7 @@ class Box { open() {} }
 fn helper() -> i32 { 1 }
 fn caller() -> i32 { helper() + helper() }
 ";
-        let pf = parse_ok(Lang::Rust, src);
+        let pf = parse_ok(Lang::rust(), src);
         let calls: Vec<_> = pf
             .edges
             .iter()
@@ -205,7 +207,7 @@ class A:
     def helper(self):
         pass
 ";
-        let pf = parse_ok(Lang::Python, src);
+        let pf = parse_ok(Lang::python(), src);
         assert!(
             pf.edges
                 .iter()
@@ -221,7 +223,7 @@ class A:
 def configure():
     Logger.getLogger()
 ";
-        let pf = parse_ok(Lang::Python, src);
+        let pf = parse_ok(Lang::python(), src);
         assert!(
             pf.edges
                 .iter()
@@ -240,7 +242,7 @@ impl Point {
     fn compute(&self) {}
 }
 ";
-        let pf = parse_ok(Lang::Rust, src);
+        let pf = parse_ok(Lang::rust(), src);
         assert!(
             pf.edges
                 .iter()
@@ -266,7 +268,7 @@ public class Svc {
     }
 }
 ";
-        let pf = parse_ok(Lang::Java, src);
+        let pf = parse_ok(Lang::java(), src);
         assert!(
             has_edge(&pf, "Svc.run", "UserRepository.findById"),
             "edges: {:?}",
@@ -274,10 +276,112 @@ public class Svc {
         );
     }
 
+    /// A fluent chain is the norm in reactive Java, and its receiver node is the
+    /// whole expression before the dot — newlines, arguments and lambdas
+    /// included. Measured on a Quarkus repository, that put call-graph nodes
+    /// named `Oficina.findByCodigo(codigo).flatMap` and a three-line expression
+    /// with a lambda inside it into the graph. A receiver nobody can name is
+    /// not a qualifier: the honest answer is the bare callee.
+    #[test]
+    fn a_fluent_chain_receiver_does_not_qualify_the_target() {
+        let src = "\
+public class Svc {
+    public void run() {
+        Oficina.findByCodigo(codigo).flatMap(o -> o.persist());
+    }
+}
+";
+        let pf = parse_ok(Lang::java(), src);
+        assert!(
+            has_edge(&pf, "Svc.run", "flatMap"),
+            "the chained call should fall back to the bare name; edges: {:?}",
+            pf.edges
+        );
+        assert!(
+            pf.edges
+                .iter()
+                .all(|e| !e.target.contains('(') && !e.target.contains('\n')),
+            "a target carries an expression rather than a name: {:?}",
+            pf.edges
+        );
+    }
+
+    /// The multi-line case, which is what the graph actually filled up with.
+    #[test]
+    fn a_multiline_receiver_never_reaches_a_target_name() {
+        let src = "\
+public class Svc {
+    public void run() {
+        Oficina
+            .persist(oficina).replaceWith(
+                () -> OficinaDTO.from(oficina)).invoke(x);
+    }
+}
+";
+        let pf = parse_ok(Lang::java(), src);
+        for e in &pf.edges {
+            assert!(
+                !e.target.contains('\n') && !e.target.contains(' '),
+                "target is an expression, not a name: {:?}",
+                e
+            );
+        }
+    }
+
+    /// The receivers that DO name something have to keep qualifying, or this
+    /// change would trade one wrong answer for a less useful one.
+    #[test]
+    fn a_nameable_receiver_still_qualifies() {
+        let src = "\
+public class Svc {
+    private UserRepository repo;
+    public void run() {
+        this.repo.findById();
+        Helper.parse();
+    }
+}
+";
+        let pf = parse_ok(Lang::java(), src);
+        assert!(
+            has_edge(&pf, "Svc.run", "UserRepository.findById"),
+            "a dotted field receiver still resolves; edges: {:?}",
+            pf.edges
+        );
+        assert!(
+            has_edge(&pf, "Svc.run", "Helper.parse"),
+            "a type-looking receiver still qualifies; edges: {:?}",
+            pf.edges
+        );
+    }
+
+    /// A call inside a Java constructor used to produce no edge at all: the
+    /// walk up from the call looked for a `function_kind`, a constructor is
+    /// none of them, and an edge with no source is dropped. Constructor
+    /// injection is the norm in Quarkus, so this was not an edge case.
+    #[test]
+    fn a_call_inside_a_java_constructor_produces_an_edge() {
+        let src = "\
+public class Svc {
+    private final Repo repo;
+    public Svc(Repo repo) {
+        this.repo = repo;
+        register();
+    }
+    void register() {}
+}
+";
+        let pf = parse_ok(Lang::java(), src);
+        assert!(
+            has_edge(&pf, "Svc.Svc", "register"),
+            "the constructor's call should be an edge; edges: {:?}",
+            pf.edges
+        );
+    }
+
     #[test]
     fn resolves_rust_param_receiver_type() {
         let src = "fn handle(repo: Repo) { repo.load(); }\n";
-        let pf = parse_ok(Lang::Rust, src);
+        let pf = parse_ok(Lang::rust(), src);
         assert!(
             has_edge(&pf, "handle", "Repo.load"),
             "edges: {:?}",
@@ -288,7 +392,7 @@ public class Svc {
     #[test]
     fn resolves_go_param_receiver_type() {
         let src = "package m\nfunc handle(repo Repo) {\n\trepo.Save()\n}\n";
-        let pf = parse_ok(Lang::Go, src);
+        let pf = parse_ok(Lang::go(), src);
         assert!(
             has_edge(&pf, "handle", "Repo.Save"),
             "edges: {:?}",
@@ -299,7 +403,7 @@ public class Svc {
     #[test]
     fn resolves_python_typed_param_receiver() {
         let src = "def handle(repo: Repo):\n    repo.load()\n";
-        let pf = parse_ok(Lang::Python, src);
+        let pf = parse_ok(Lang::python(), src);
         assert!(
             has_edge(&pf, "handle", "Repo.load"),
             "edges: {:?}",
@@ -310,7 +414,7 @@ public class Svc {
     #[test]
     fn resolves_typescript_local_var_receiver() {
         let src = "function handle() {\n  const repo: Repo = make();\n  repo.load();\n}\n";
-        let pf = parse_ok(Lang::TypeScript, src);
+        let pf = parse_ok(Lang::typescript(), src);
         assert!(
             has_edge(&pf, "handle", "Repo.load"),
             "edges: {:?}",
@@ -329,7 +433,7 @@ public class Svc {
 #[inline]
 fn wait_for_exit() {}
 ";
-        let sym = &parse_ok(Lang::Rust, src).symbols[0];
+        let sym = &parse_ok(Lang::rust(), src).symbols[0];
         assert_eq!(sym.doc_start_line, 1, "starts at the first `///` line");
         assert_eq!(sym.start_line, 4, "the definition itself is unmoved");
         assert!(src[sym.doc_start_byte..sym.end_byte].contains("lock holder"));
@@ -341,13 +445,16 @@ fn wait_for_exit() {}
     #[test]
     fn only_the_comment_directly_above_is_taken() {
         let blank = "/// Belongs to nothing.\n\nfn f() {}\n";
-        assert_eq!(parse_ok(Lang::Rust, blank).symbols[0].doc_start_line, 3);
+        assert_eq!(parse_ok(Lang::rust(), blank).symbols[0].doc_start_line, 3);
 
         let trailing = "fn a() {} // unrelated\nfn f() {}\n";
-        assert_eq!(parse_ok(Lang::Rust, trailing).symbols[1].doc_start_line, 2);
+        assert_eq!(
+            parse_ok(Lang::rust(), trailing).symbols[1].doc_start_line,
+            2
+        );
 
         let module = "//! The parser.\nfn f() {}\n";
-        assert_eq!(parse_ok(Lang::Rust, module).symbols[0].doc_start_line, 2);
+        assert_eq!(parse_ok(Lang::rust(), module).symbols[0].doc_start_line, 2);
     }
 
     /// Every language we parse writes docs above the definition, whatever the
@@ -355,18 +462,22 @@ fn wait_for_exit() {}
     #[test]
     fn doc_comments_are_found_in_every_language() {
         let cases = [
-            (Lang::Python, "# Greets.\ndef greet():\n    pass\n", "greet"),
             (
-                Lang::Go,
+                Lang::python(),
+                "# Greets.\ndef greet():\n    pass\n",
+                "greet",
+            ),
+            (
+                Lang::go(),
                 "package m\n\n// Greets.\nfunc Greet() {}\n",
                 "Greet",
             ),
             (
-                Lang::TypeScript,
+                Lang::typescript(),
                 "/** Greets. */\nfunction greet() {}\n",
                 "greet",
             ),
-            (Lang::Java, "// Greets.\nclass Greeter {}\n", "Greeter"),
+            (Lang::java(), "// Greets.\nclass Greeter {}\n", "Greeter"),
         ];
         for (lang, src, name) in cases {
             let pf = parse_ok(lang, src);
@@ -380,10 +491,10 @@ fn wait_for_exit() {}
 
     #[test]
     fn detects_language_from_path() {
-        assert_eq!(detect_lang(Path::new("a/b/foo.py")), Some(Lang::Python));
-        assert_eq!(detect_lang(Path::new("Main.java")), Some(Lang::Java));
-        assert_eq!(detect_lang(Path::new("mod.rs")), Some(Lang::Rust));
-        assert_eq!(detect_lang(Path::new("app.tsx")), Some(Lang::Tsx));
+        assert_eq!(detect_lang(Path::new("a/b/foo.py")), Some(Lang::python()));
+        assert_eq!(detect_lang(Path::new("Main.java")), Some(Lang::java()));
+        assert_eq!(detect_lang(Path::new("mod.rs")), Some(Lang::rust()));
+        assert_eq!(detect_lang(Path::new("app.tsx")), Some(Lang::tsx()));
         assert_eq!(detect_lang(Path::new("README.md")), None);
     }
 
@@ -397,8 +508,8 @@ fn wait_for_exit() {}
 
     #[test]
     fn tsx_reports_typescript() {
-        assert_eq!(Lang::Tsx.name(), "typescript");
-        let pf = parse_ok(Lang::Tsx, "export function C() { return null; }");
+        assert_eq!(Lang::tsx().name(), "typescript");
+        let pf = parse_ok(Lang::tsx(), "export function C() { return null; }");
         assert_eq!(pf.language, "typescript");
         assert_eq!(find(&pf, "C").kind, "function");
     }

@@ -1,0 +1,21 @@
+{
+  "name": "java",
+  "grammar": "java",
+  "extensions": [
+    "java"
+  ],
+  "symbols": "(class_declaration name: (identifier) @class)\n(interface_declaration name: (identifier) @interface)\n(enum_declaration name: (identifier) @enum)\n(method_declaration name: (identifier) @method)",
+  "calls": "(method_invocation name: (identifier) @callee)",
+  "types": "(field_declaration type: (type_identifier) @type\n    declarator: (variable_declarator name: (identifier) @name))\n(local_variable_declaration type: (type_identifier) @type\n    declarator: (variable_declarator name: (identifier) @name))\n(formal_parameter type: (type_identifier) @type name: (identifier) @name)",
+  "imports": "(import_declaration) @import",
+  "function_kinds": [
+    "method_declaration",
+    "constructor_declaration"
+  ],
+  "container_kinds": [
+    "class_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "record_declaration"
+  ]
+}

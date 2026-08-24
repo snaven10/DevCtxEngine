@@ -1186,6 +1186,8 @@ version = "0.5.0"
 dependencies = [
  "devctx-core",
  "regex",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tree-sitter",
  "tree-sitter-go",

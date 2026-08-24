@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::error::{ParseError, Result};
-use crate::lang::{Lang, CONTAINER_KINDS, FUNCTION_KINDS};
+use crate::lang::Lang;
 use crate::types::{GraphEdge, Import, ParsedFile, Symbol};
 
 /// Variable/field name → declared type, for receiver resolution.
@@ -122,10 +122,10 @@ impl LanguageParser {
                     continue;
                 };
                 // Source: the enclosing function, qualified with its class if any.
-                let Some(source) = qualified_source(callee, bytes) else {
+                let Some(source) = qualified_source(callee, bytes, self.lang) else {
                     continue; // module-level call: no source symbol.
                 };
-                let target = qualified_target(callee, name, bytes, type_map);
+                let target = qualified_target(callee, name, bytes, type_map, self.lang);
                 out.push(GraphEdge {
                     source,
                     target,
@@ -153,7 +153,7 @@ impl LanguageParser {
                 };
                 let def = name_node.parent().unwrap_or(name_node);
 
-                let container = enclosing_container(def);
+                let container = enclosing_container(def, self.lang.container_kinds());
                 let parent = container.and_then(|c| container_name(c, bytes));
                 if kind == "function" && container.is_some() {
                     kind = "method".to_string();
@@ -280,10 +280,10 @@ fn is_inner_doc(node: Node<'_>, bytes: &[u8]) -> bool {
 }
 
 /// The nearest enclosing function/method definition node, if any.
-fn enclosing_function_node(node: Node<'_>) -> Option<Node<'_>> {
+fn enclosing_function_node<'t>(node: Node<'t>, kinds: &[String]) -> Option<Node<'t>> {
     let mut cur = node.parent();
     while let Some(n) = cur {
-        if FUNCTION_KINDS.contains(&n.kind()) {
+        if kinds.iter().any(|k| k == n.kind()) {
             return Some(n);
         }
         cur = n.parent();
@@ -293,13 +293,13 @@ fn enclosing_function_node(node: Node<'_>) -> Option<Node<'_>> {
 
 /// The edge source: the enclosing function, qualified as `Class.method` when the
 /// function is defined inside a container (class/impl/…).
-fn qualified_source(node: Node<'_>, bytes: &[u8]) -> Option<String> {
-    let func = enclosing_function_node(node)?;
+fn qualified_source(node: Node<'_>, bytes: &[u8], lang: Lang) -> Option<String> {
+    let func = enclosing_function_node(node, lang.function_kinds())?;
     let name = func
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(bytes).ok())?
         .to_string();
-    match enclosing_container(func).and_then(|c| container_name(c, bytes)) {
+    match enclosing_container(func, lang.container_kinds()).and_then(|c| container_name(c, bytes)) {
         Some(class) => Some(format!("{class}.{name}")),
         None => Some(name),
     }
@@ -309,12 +309,18 @@ fn qualified_source(node: Node<'_>, bytes: &[u8]) -> Option<String> {
 /// `self`/`this` → `EnclosingClass.callee`; a `Type`-looking receiver →
 /// `Type.callee`; a local/field whose type is known → `Type.callee`; otherwise
 /// the bare callee name.
-fn qualified_target(callee: Node<'_>, name: &str, bytes: &[u8], type_map: &TypeMap) -> String {
+fn qualified_target(
+    callee: Node<'_>,
+    name: &str,
+    bytes: &[u8],
+    type_map: &TypeMap,
+    lang: Lang,
+) -> String {
     let Some(receiver) = receiver_of(callee, bytes) else {
         return name.to_string();
     };
     match receiver.as_str() {
-        "self" | "this" | "cls" | "super" => enclosing_container(callee)
+        "self" | "this" | "cls" | "super" => enclosing_container(callee, lang.container_kinds())
             .and_then(|c| container_name(c, bytes))
             .map(|class| format!("{class}.{name}"))
             .unwrap_or_else(|| name.to_string()),
@@ -347,14 +353,37 @@ fn receiver_of(callee: Node<'_>, bytes: &[u8]) -> Option<String> {
     parent
         .child_by_field_name(field)
         .and_then(|n| n.utf8_text(bytes).ok())
+        .filter(|t| nameable(t))
         .map(str::to_string)
 }
 
+/// Can this receiver text stand for something a person could look up?
+///
+/// The receiver node of a chained call is the entire expression before the dot.
+/// In reactive Java that is routine, and it put graph nodes like
+/// `Oficina.findByCodigo(codigo).flatMap` — and three-line ones with a lambda
+/// inside — into the call graph, where they match nothing and are searchable by
+/// nobody.
+///
+/// Only an identifier or a dotted run of identifiers qualifies a target.
+/// Anything else falls back to the bare callee name: less specific, but true,
+/// and a bare name now finds its own edges anyway.
+fn nameable(text: &str) -> bool {
+    !text.is_empty()
+        && text.split('.').all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+                && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        })
+}
+
 /// Walk up from `node` to the nearest container (class/impl/…) definition.
-fn enclosing_container(node: Node<'_>) -> Option<Node<'_>> {
+fn enclosing_container<'t>(node: Node<'t>, kinds: &[String]) -> Option<Node<'t>> {
     let mut cur = node.parent();
     while let Some(n) = cur {
-        if CONTAINER_KINDS.contains(&n.kind()) {
+        if kinds.iter().any(|k| k == n.kind()) {
             return Some(n);
         }
         cur = n.parent();

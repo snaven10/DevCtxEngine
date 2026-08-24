@@ -4,7 +4,7 @@
 - **Especialista:** —
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
 - **Depende de:** TASK-003
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -41,29 +41,29 @@ ese impedimento.
 
 ## Pasos
 
-- [ ] **Paso 1 — Escribir el test que falla.** Fuente Java con una clase cuyo
+- [x] **Paso 1 — Escribir el test que falla.** Fuente Java con una clase cuyo
       constructor llama a un método; esperar una arista con source
       `Clase.Clase`. Correrlo y **confirmar que falla** antes de seguir.
-- [ ] **Paso 2 — Agregar `constructor_declaration`** a `function_kinds` en
+- [x] **Paso 2 — Agregar `constructor_declaration`** a `function_kinds` en
       `java.json`.
-- [ ] **Paso 3 — Revisar el resto de kinds de Java.** `container_kinds` tiene
+- [x] **Paso 3 — Revisar el resto de kinds de Java.** `container_kinds` tiene
       `class_declaration`, `interface_declaration`, `enum_declaration`.
       Evaluar `record_declaration` y `annotation_type_declaration` contra
       tree-sitter-java 0.23 — **agregar solo lo que un test demuestre que hace
       falta**, no por completitud.
-- [ ] **Paso 4 — Verificar el nombre del source.** Un constructor tiene el mismo
+- [x] **Paso 4 — Verificar el nombre del source.** Un constructor tiene el mismo
       nombre que su clase, así que `qualified_source` produce `Clase.Clase`.
       Decidir si se deja así o se normaliza a `Clase.<init>`, y **dejar la
       decisión escrita en `## Resultado`** — afecta cómo se busca después.
-- [ ] **Paso 5 — Commit.** `fix(parse): count calls made inside a Java constructor`
+- [x] **Paso 5 — Commit.** `fix(parse): count calls made inside a Java constructor`
 
 ## Criterios de aceptación
 
-- [ ] El test del Paso 1 falla antes del Paso 2 y pasa después.
-- [ ] Tras reindexar REVFA_BackEnd, un constructor con inyección que llama a algo
+- [x] El test del Paso 1 falla antes del Paso 2 y pasa después.
+- [x] Tras reindexar REVFA_BackEnd, un constructor con inyección que llama a algo
       aparece como `source` en `graph_edges`. Nombrar el archivo concreto en
       `## Resultado`.
-- [ ] Python, Go y Rust no cambian su conteo de aristas.
+- [x] Python, Go y Rust no cambian su conteo de aristas.
 
 ## Riesgos
 
@@ -71,4 +71,6 @@ Aristas nuevas donde antes había cero — es la intención, pero cambia los
 conteos de TASK-006. Medir Java **antes y después** por separado.
 
 ## Resultado
-<!-- SE LLENA AL CERRAR -->
+
+- **Estado final:** `done` (2026-08-24)
+- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre REVFA_BackEnd, con lo que NO se verificó declarado.
