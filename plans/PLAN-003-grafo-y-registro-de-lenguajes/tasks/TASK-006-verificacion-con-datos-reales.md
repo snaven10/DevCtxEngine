@@ -4,7 +4,7 @@
 - **Especialista:** —
 - **Proyecto:** DevCtxEngine (medición sobre `~/revfa/REVFA_BackEnd`, rama `development`)
 - **Depende de:** TASK-001, TASK-002, TASK-003, TASK-004
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -39,37 +39,37 @@ en forma pelada y calificada.
 
 ## Pasos
 
-- [ ] **Paso 0 — Pedir autorización** para compilar, instalar y reindexar.
-- [ ] **Paso 1 — Solo TASK-001, sin reindexar.** Compilar, instalar, y correr
+- [x] **Paso 0 — Pedir autorización** para compilar, instalar y reindexar.
+- [x] **Paso 1 — Solo TASK-001, sin reindexar.** Compilar, instalar, y correr
       `devctx impact actualizar`. Es la prueba de que la corrección de consulta
       funciona **sobre el índice viejo**. Anotar callers/callees y a cuántas
       declaraciones expandió.
-- [ ] **Paso 2 — Tiempo de `impact`** antes y después del `LIKE`, sobre el mismo
+- [x] **Paso 2 — Tiempo de `impact`** antes y después del `LIKE`, sobre el mismo
       símbolo. Es el riesgo declarado en TASK-001.
-- [ ] **Paso 3 — Reindexar** REVFA_BackEnd/`development` con TASK-002+003+004
+- [x] **Paso 3 — Reindexar** REVFA_BackEnd/`development` con TASK-002+003+004
       dentro. Anotar conteo total de aristas antes y después.
-- [ ] **Paso 4 — Basura y duplicados.** Confirmar que ningún callee de
+- [x] **Paso 4 — Basura y duplicados.** Confirmar que ningún callee de
       `OficinaService.actualizar` tiene `(`, `)`, `<`, espacio o salto de línea,
       y ver si `getNombre` sigue duplicado.
-- [ ] **Paso 5 — Constructores.** Nombrar un constructor Java concreto de
+- [x] **Paso 5 — Constructores.** Nombrar un constructor Java concreto de
       REVFA_BackEnd que ahora aparezca como `source`.
-- [ ] **Paso 6 — Muestra ciega.** Elegir **10 métodos Java al azar** —no los tres
+- [x] **Paso 6 — Muestra ciega.** Elegir **10 métodos Java al azar** —no los tres
       de la línea base— y para cada uno comparar el conteo de `get_references`
       contra un `grep -c` de sus sitios de llamada. Reportar la tabla **completa,
       incluidos los que no coincidan**.
-- [ ] **Paso 7 — No-regresión políglota.** Reindexar DevCtxEngine (Rust) y un
+- [x] **Paso 7 — No-regresión políglota.** Reindexar DevCtxEngine (Rust) y un
       repo Python; conteo de símbolos y aristas antes/después. No deben moverse.
-- [ ] **Paso 8 — Escribir `VERIFICACION.md`** y el `## 5. Cierre` del master,
+- [x] **Paso 8 — Escribir `VERIFICACION.md`** y el `## 5. Cierre` del master,
       diciendo también **qué no se verificó**.
 
 ## Criterios de aceptación
 
-- [ ] `devctx impact actualizar` devuelve callers y callees no vacíos, y la
+- [x] `devctx impact actualizar` devuelve callers y callees no vacíos, y la
       diferencia con la línea base está escrita.
-- [ ] La tabla del Paso 6 está completa. **Un resultado con discrepancias y
+- [x] La tabla del Paso 6 está completa. **Un resultado con discrepancias y
       reportado vale; uno "100%" sin la tabla, no.**
-- [ ] Rust y Python no cambiaron sus conteos (o el cambio está explicado).
-- [ ] `VERIFICACION.md` existe y dice qué quedó sin probar.
+- [x] Rust y Python no cambiaron sus conteos (o el cambio está explicado).
+- [x] `VERIFICACION.md` existe y dice qué quedó sin probar.
 
 ## Riesgos
 
@@ -83,4 +83,6 @@ que cuadre.
 seguro, pero avisar antes.
 
 ## Resultado
-<!-- SE LLENA AL CERRAR -->
+
+- **Estado final:** `done` (2026-08-24)
+- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre REVFA_BackEnd, con lo que NO se verificó declarado.

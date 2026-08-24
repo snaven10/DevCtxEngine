@@ -4,7 +4,7 @@
 - **Especialista:** —
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
 - **Depende de:** —
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -43,30 +43,30 @@ nombre pelado — solo hay que llegar a ella.
 
 ## Pasos
 
-- [ ] **Paso 1 — Escribir los tests que fallan.** En `crates/devctx-parse/src/lib.rs`,
+- [x] **Paso 1 — Escribir los tests que fallan.** En `crates/devctx-parse/src/lib.rs`,
       con fuente Java:
       `Oficina.findByCodigo(c).flatMap(x -> y)` → el target de `flatMap` es
       `flatMap`, **no** `Oficina.findByCodigo(c).flatMap`.
       Y `this.repo.save(x)` → sigue resolviendo por `type_map` como hoy.
-- [ ] **Paso 2 — Añadir `fn clean_receiver(text: &str) -> Option<&str>`.**
+- [x] **Paso 2 — Añadir `fn clean_receiver(text: &str) -> Option<&str>`.**
       Devuelve `Some` solo si el texto completo es un identificador o una cadena
       punteada de identificadores (`ident ( '.' ident )*`), sin espacios, sin
       saltos de línea, sin paréntesis, sin `<`. `None` en cualquier otro caso.
-- [ ] **Paso 3 — Filtrar en `receiver_of`.** Pasar el texto por `clean_receiver`
+- [x] **Paso 3 — Filtrar en `receiver_of`.** Pasar el texto por `clean_receiver`
       antes de devolverlo. Un receptor sucio se vuelve `None`, y `qualified_target`
       ya devuelve el nombre pelado en ese caso.
-- [ ] **Paso 4 — Test de no-regresión.** Los casos que hoy pasan (`self.x`,
+- [x] **Paso 4 — Test de no-regresión.** Los casos que hoy pasan (`self.x`,
       `this.campo`, `Tipo` en mayúscula, campo con tipo en `type_map`) siguen
       calificando igual.
-- [ ] **Paso 5 — Commit.** `fix(parse): ignore a fluent-chain receiver when qualifying a call target`
+- [x] **Paso 5 — Commit.** `fix(parse): ignore a fluent-chain receiver when qualifying a call target`
 
 ## Criterios de aceptación
 
-- [ ] Ningún target contiene `(`, `)`, `<`, un espacio o un salto de línea.
-- [ ] Los tests existentes de `devctx-parse` siguen verdes.
-- [ ] Tras reindexar REVFA_BackEnd, `devctx impact OficinaService.actualizar`
+- [x] Ningún target contiene `(`, `)`, `<`, un espacio o un salto de línea.
+- [x] Los tests existentes de `devctx-parse` siguen verdes.
+- [x] Tras reindexar REVFA_BackEnd, `devctx impact OficinaService.actualizar`
       ya no lista ningún callee con paréntesis o multilínea.
-- [ ] `getNombre` deja de aparecer duplicado como pelado y calificado en esa
+- [x] `getNombre` deja de aparecer duplicado como pelado y calificado en esa
       misma salida. *(Si sigue duplicado, decirlo en `## Resultado` con el porqué —
       puede haber sitios de llamada genuinamente sin receptor.)*
 
@@ -80,4 +80,6 @@ hoy produce basura; después producirá `actualizar` pelado. Es menos específic
 pero es **cierto**, y con TASK-001 el nombre pelado ya encuentra sus aristas.
 
 ## Resultado
-<!-- SE LLENA AL CERRAR -->
+
+- **Estado final:** `done` (2026-08-24)
+- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre REVFA_BackEnd, con lo que NO se verificó declarado.

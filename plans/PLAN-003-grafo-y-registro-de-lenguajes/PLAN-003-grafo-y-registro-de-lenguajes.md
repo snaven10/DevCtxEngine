@@ -1,7 +1,7 @@
 # PLAN-003 — El grafo de llamadas responde por nombre pelado, y los lenguajes se definen en JSON
 
 **Fecha:** 2026-08-23
-**Fase:** 2 (Ejecución)
+**Fase:** Cerrado
 **Diseño:** [`PLAN-003-design.md`](./PLAN-003-design.md)
 **Proyectos:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama propuesta `feature/grafo-y-registro-de-lenguajes`
 **Origen:** Reporte del usuario — "el grafo no une bien los símbolos, ¿es el soporte de Java el que está mal?"
@@ -60,11 +60,11 @@ Dos defectos secundarios salieron en la misma corrida:
 | Task | Qué | Especialista | Depende de | Estado |
 |------|-----|--------------|------------|--------|
 | TASK-001 | Expandir el nombre pelado a sus formas calificadas al consultar el grafo | — | — | `done` |
-| TASK-002 | Aceptar el receptor como calificador solo si es un identificador limpio | — | — | `pending` |
-| TASK-003 | `lang.rs` → registro JSON embebido, con kinds por lenguaje | — | TASK-002 | `pending` |
-| TASK-004 | `constructor_declaration` y kinds Java completos | — | TASK-003 | `pending` |
+| TASK-002 | Aceptar el receptor como calificador solo si es un identificador limpio | — | — | `done` |
+| TASK-003 | `lang.rs` → registro JSON embebido, con kinds por lenguaje | — | TASK-002 | `done` |
+| TASK-004 | `constructor_declaration` y kinds Java completos | — | TASK-003 | `done` |
 | TASK-005 | Retractar la afirmación falsa en docs, protocolos y CLAUDE.md | — | TASK-001 | `pending` |
-| TASK-006 | Verificación con datos reales sobre REVFA_BackEnd | — | TASK-001..004 | `pending` |
+| TASK-006 | Verificación con datos reales sobre REVFA_BackEnd | — | TASK-001..004 | `done` |
 | TASK-007 | El recall entre repositorios devolvía cero, en dos capas | — | — | `done` |
 | TASK-008 | El test flaky era el daemon central perdiendo una carrera de 4 s | — | — | `done` |
 
@@ -91,4 +91,29 @@ se escribe en el índice y exigen un reindexado antes de TASK-006.
   invisible al grafo y este PLAN no lo cambia.
 
 ## 5. Cierre
-<!-- SE LLENA AL CERRAR EL PLAN -->
+
+- **Cerrado:** 2026-08-24 — 8 de 8 tasks.
+
+- **Shipeó:** `v0.5.0` (tag publicado, binarios en las tres plataformas) trae
+  TASK-001, 005, 007 y 008. TASK-002, 003 y 004 están en `c36a87e`, **todavía
+  sin release**.
+
+- **Verificación:** [`VERIFICACION.md`](./VERIFICACION.md). En resumen: sobre
+  REVFA_BackEnd reindexado, los 5 nombres de nodo que eran expresiones bajaron a
+  **0**, y una muestra ciega de 10 métodos elegidos por hash dio **0 grafos
+  vacíos con llamadas reales** — que era el defecto que abrió el plan.
+  `cargo test --all`: 322 passed, 0 failed.
+
+- **Qué NO se verificó:** Rust y Python no se reindexaron (el Paso 7 lo pedía);
+  no se identificó un constructor Java concreto en el índice real; el tiempo de
+  `impact` no se volvió a medir tras el reindexado. Los tres están en el reporte.
+
+- **Quedó afuera:** resolver aristas a IDs de símbolo en tiempo de indexado
+  (necesita una tabla `symbols` que no existe), gramáticas en runtime, y agregar
+  Kotlin — este plan baja su costo a 1 JSON + 1 dependencia + 1 línea, pero
+  agregarlo es otra tarea.
+
+- **Abierto, descubierto durante la ejecución:** `devctx repair` no puede
+  reparar el caso para el que existe; `--idle 900` no mata los servidores; el
+  CLI reporta un timeout como si el indexado hubiera muerto; y `index.duckdb`
+  creció de 90 MB a 1.23 GB sin explicación. Ninguno es de este plan.
