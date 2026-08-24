@@ -479,18 +479,15 @@ impl DevctxServer {
     /// A hint that resolves to nothing is not an error: paths reach us as text an
     /// agent assembled, and refusing the call would turn a slightly wrong guess
     /// into a dead end. It falls back to the binding and says so.
-    fn backend_for(
-        &self,
-        hint: Option<&str>,
-    ) -> Result<(Arc<Backend>, Option<String>), ErrorData> {
+    fn backend_for(&self, hint: Option<&str>) -> Result<(Arc<Backend>, Option<String>), ErrorData> {
         if let Some(row) = hint.and_then(state::resolve_hint) {
             if let Ok(cache) = self.hinted.lock() {
                 if let Some(b) = cache.get(&row.path) {
                     return Ok((b.clone(), Some(row.name)));
                 }
             }
-            let backend = (self.connect)(&row.path)
-                .map_err(|e| ErrorData::invalid_request(e, None))?;
+            let backend =
+                (self.connect)(&row.path).map_err(|e| ErrorData::invalid_request(e, None))?;
             let backend = Arc::new(backend);
             if let Ok(mut cache) = self.hinted.lock() {
                 // A session that walks a large workspace would otherwise hold a
@@ -611,9 +608,13 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<ReadFileReq>,
     ) -> Result<String, ErrorData> {
-        let hint = req.project.clone().or_else(|| Some(req.path.as_str().to_string()));
+        let hint = req
+            .project
+            .clone()
+            .or_else(|| Some(req.path.as_str().to_string()));
         let (backend, resolved) = self.backend_for(hint.as_deref())?;
-        run_blocking(move || backend.read_file(&req.path, req.start_line, req.end_line)).await
+        run_blocking(move || backend.read_file(&req.path, req.start_line, req.end_line))
+            .await
             .map(|out| Self::annotate(out, resolved))
     }
 
@@ -833,12 +834,14 @@ impl DevctxServer {
     }
 
     /// Bind this session to a registered project.
-    #[tool(description = "Move this session to a different project, by name (see \
+    #[tool(
+        description = "Move this session to a different project, by name (see \
         list_projects) or by path. Rarely needed: the server resolves a project \
         from its working directory at startup, descending into the registry when \
         that directory is a workspace root holding several. To answer ONE call \
         from another repository, pass `project` to that tool instead — it does \
-        not move the session. Use this when a long stretch of work moves.")]
+        not move the session. Use this when a long stretch of work moves."
+    )]
     async fn use_project(
         &self,
         Parameters(req): Parameters<UseProjectReq>,
@@ -881,7 +884,8 @@ impl DevctxServer {
         Parameters(req): Parameters<ImpactReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3))).await
+        run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3)))
+            .await
             .map(|out| Self::annotate(out, resolved))
     }
 
@@ -916,7 +920,8 @@ impl DevctxServer {
         Parameters(req): Parameters<ReadSymbolReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.read_symbol(&req.name, req.limit.unwrap_or(5))).await
+        run_blocking(move || backend.read_symbol(&req.name, req.limit.unwrap_or(5)))
+            .await
             .map(|out| Self::annotate(out, resolved))
     }
 
@@ -1020,7 +1025,8 @@ impl DevctxServer {
         Parameters(req): Parameters<ReferencesReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.references(&req.symbol)).await
+        run_blocking(move || backend.references(&req.symbol))
+            .await
             .map(|out| Self::annotate(out, resolved))
     }
 
@@ -1034,7 +1040,8 @@ impl DevctxServer {
         Parameters(req): Parameters<SearchRoutesReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.search_routes(req.method, req.path)).await
+        run_blocking(move || backend.search_routes(req.method, req.path))
+            .await
             .map(|out| Self::annotate(out, resolved))
     }
 
@@ -1045,7 +1052,8 @@ impl DevctxServer {
         Parameters(req): Parameters<RoutesForHandlerReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.routes_for_handler(&req.handler)).await
+        run_blocking(move || backend.routes_for_handler(&req.handler))
+            .await
             .map(|out| Self::annotate(out, resolved))
     }
 

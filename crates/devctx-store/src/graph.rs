@@ -566,7 +566,9 @@ mod tests {
     #[test]
     fn impact_seeds_from_every_form_of_a_bare_name() {
         let store = java_like();
-        let impact = store.impact_analysis("repo", "main", "actualizar", 5).unwrap();
+        let impact = store
+            .impact_analysis("repo", "main", "actualizar", 5)
+            .unwrap();
         assert!(impact
             .upstream
             .contains(&("OficinaResource.actualizar".to_string(), 1)));

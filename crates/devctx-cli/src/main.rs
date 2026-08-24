@@ -632,7 +632,10 @@ fn cmd_hooks(action: HooksAction) -> Result<()> {
         HooksAction::Status => {
             let status = hooks::status(&root)?;
             for (hook, present) in &status {
-                println!("  {hook:<12} {}", if *present { "installed" } else { "missing" });
+                println!(
+                    "  {hook:<12} {}",
+                    if *present { "installed" } else { "missing" }
+                );
             }
             if status.iter().all(|(_, p)| *p) {
                 println!("Covered: commits, merges and fast-forward pulls.");
