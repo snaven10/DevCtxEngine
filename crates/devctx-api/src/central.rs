@@ -56,6 +56,42 @@ fn router(api: CentralApi) -> Router {
         .with_state(api)
 }
 
+/// Bind `addr`, or the next free port after it.
+///
+/// The requested port is a hash of the central home, which keeps it stable and
+/// makes two different homes unlikely to land on the same one. Unlikely is not
+/// never — there are five thousand of them — and a port can equally be held by
+/// a daemon that has not finished dying, or left in `TIME_WAIT` by one that
+/// just did. Any of those made `bind` fail with `AddrInUse` and the daemon
+/// exit, and the caller then reported "no central store daemon and one could
+/// not be started": a message that reads like something is broken rather than
+/// like a port being busy. It was the cause behind an intermittent test
+/// failure that looked for a whole day like slow startup.
+///
+/// Walking to the next port is safe because nothing finds this daemon by
+/// guessing: clients read the address out of the discovery file, and that file
+/// is written from the address actually bound.
+async fn bind_near(addr: SocketAddr) -> anyhow::Result<(tokio::net::TcpListener, SocketAddr)> {
+    const TRIES: u16 = 32;
+    let first = addr.port();
+    let mut addr = addr;
+    for _ in 0..TRIES {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if addr.port() != first {
+                    eprintln!("port {first} was taken; bound {} instead", addr.port());
+                }
+                return Ok((listener, addr));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                addr.set_port(addr.port().wrapping_add(1));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("no free port in the {TRIES} starting at {first}")
+}
+
 /// Serve the central API until stopped, exiting after `idle` with no non-health
 /// request when set.
 pub async fn serve(
@@ -75,7 +111,7 @@ pub async fn serve(
     let registry = api.central.clone();
     let activity = Arc::new(Mutex::new(Instant::now()));
     let app = router(api).layer(middleware::from_fn_with_state(activity.clone(), track));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let (listener, addr) = bind_near(addr).await?;
     eprintln!("DevCtxEngine central store listening on http://{addr}");
 
     if let Some(timeout) = idle {

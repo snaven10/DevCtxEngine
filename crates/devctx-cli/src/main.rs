@@ -18,7 +18,7 @@ mod watch;
 mod wizard_text;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -3027,6 +3027,54 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
 /// or `UNIQUE`. Everything still reads correctly; the first delete does not, and
 /// since indexing begins by deleting, the repository can no longer be reindexed.
 /// Rebuilding each table from its own rows puts the two back in agreement.
+/// Open an index whose write-ahead log will not replay, by setting the log
+/// aside first.
+///
+/// `repair` could not repair the case it exists for. To rebuild anything it has
+/// to open the database; opening replays the WAL; and a WAL left by a process
+/// killed mid-write is exactly what fails to replay:
+///
+/// ```text
+/// Cannot drop entry "fts_main_vectors" because there are entries that depend
+/// on it. Use DROP...CASCADE to drop all dependents.
+/// ```
+///
+/// So the command that was supposed to be the safety net reported the same
+/// error as everything else, and the only way through was to move the file by
+/// hand. That is what this does — with the moving named out loud, because it
+/// throws work away: whatever the WAL held that had not been checkpointed is
+/// gone, and the honest thing is to say so rather than present a silent rescue.
+/// In practice that is index writes, which `devctx index` regenerates; memories
+/// live through it, having been checkpointed when they were written.
+///
+/// The log is renamed, never deleted. If setting it aside does not help either,
+/// it goes back where it was: this must not be the step that makes a recoverable
+/// database unrecoverable.
+fn open_past_a_broken_wal(cfg: &ProjectConfig, path: &Path, first: anyhow::Error) -> Result<Store> {
+    let wal = path.with_extension("duckdb.wal");
+    if !wal.exists() {
+        return Err(first);
+    }
+    let aside = path.with_extension(format!("duckdb.wal.unreplayable-{}", std::process::id()));
+    println!("The index will not open, and it has a write-ahead log:");
+    println!("  {first}");
+    std::fs::rename(&wal, &aside).with_context(|| format!("setting aside {}", wal.display()))?;
+    match open_store(cfg, DEFAULT_DIM) {
+        Ok(store) => {
+            println!("Opened with the log set aside, at {}.", aside.display());
+            println!("  Uncheckpointed writes in it are lost — re-run `devctx index`.");
+            println!("  Memories are checkpointed when written and are not affected.");
+            Ok(store)
+        }
+        Err(second) => {
+            // Put it back: a database that would not open either way is still
+            // the user's to recover, and it is not ours to leave dismantled.
+            let _ = std::fs::rename(&aside, &wal);
+            Err(second.context("the index does not open with its log set aside either"))
+        }
+    }
+}
+
 fn cmd_repair() -> Result<()> {
     let cfg = load_project()?;
     let path = cfg.db_path();
@@ -3040,7 +3088,10 @@ fn cmd_repair() -> Result<()> {
     }
     // Any dimension opens an existing database — the schema is only created when
     // absent — and the rebuild reads the real width off the stored column.
-    let store = open_store(&cfg, DEFAULT_DIM)?;
+    let store = match open_store(&cfg, DEFAULT_DIM) {
+        Ok(s) => s,
+        Err(e) => open_past_a_broken_wal(&cfg, &path, e)?,
+    };
     let dim = store.stored_dimension()?;
     println!("Repairing {}…", path.display());
     let repaired = store.rebuild_indexes()?;
