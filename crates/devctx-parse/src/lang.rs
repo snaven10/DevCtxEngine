@@ -1,209 +1,133 @@
-//! Supported languages: grammar, tree-sitter queries, and extension mapping.
+//! Language lookup: the handle a caller holds, and extension detection.
+//!
+//! Everything that describes a language — its queries, its extensions, which
+//! node kinds are callables or containers — lives in `languages/*.json` and is
+//! reached through [`crate::registry`]. This module is only the handle and the
+//! two lookups built on it.
 
 use tree_sitter::Language;
 
+use crate::registry::{self, LangDef};
+
 /// A language with a wired-in tree-sitter parser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lang {
-    /// Python.
-    Python,
-    /// JavaScript (incl. JSX).
-    JavaScript,
-    /// TypeScript.
-    TypeScript,
-    /// TypeScript with JSX (`.tsx`).
-    Tsx,
-    /// Go.
-    Go,
-    /// Java.
-    Java,
-    /// Rust.
-    Rust,
-}
+///
+/// A handle onto its embedded definition, not a copy of it: `Copy`, and free to
+/// pass around. It used to be an enum whose seven variants each fanned out into
+/// six `match` arms, which is what made adding a language a nine-edit job.
+#[derive(Debug, Clone, Copy)]
+pub struct Lang(&'static LangDef);
 
 impl Lang {
-    /// The store `language` string for this language (`Tsx` reports `typescript`).
+    /// The language registered under `name`, if any.
+    pub fn named(name: &str) -> Option<Self> {
+        registry::by_name(name).map(Self)
+    }
+
+    /// Python.
+    pub fn python() -> Self {
+        Self::named("python").expect("python is registered")
+    }
+    /// JavaScript (incl. JSX).
+    pub fn javascript() -> Self {
+        Self::named("javascript").expect("javascript is registered")
+    }
+    /// TypeScript.
+    pub fn typescript() -> Self {
+        Self::named("typescript").expect("typescript is registered")
+    }
+    /// TypeScript with JSX (`.tsx`).
+    pub fn tsx() -> Self {
+        Self::named("tsx").expect("tsx is registered")
+    }
+    /// Go.
+    pub fn go() -> Self {
+        Self::named("go").expect("go is registered")
+    }
+    /// Java.
+    pub fn java() -> Self {
+        Self::named("java").expect("java is registered")
+    }
+    /// Rust.
+    pub fn rust() -> Self {
+        Self::named("rust").expect("rust is registered")
+    }
+
+    /// The underlying definition.
+    pub fn def(self) -> &'static LangDef {
+        self.0
+    }
+
+    /// The store `language` string (`tsx` reports `typescript`).
     pub fn name(self) -> &'static str {
-        match self {
-            Lang::Python => "python",
-            Lang::JavaScript => "javascript",
-            Lang::TypeScript | Lang::Tsx => "typescript",
-            Lang::Go => "go",
-            Lang::Java => "java",
-            Lang::Rust => "rust",
-        }
+        self.0.language()
+    }
+
+    /// The registry key, which unlike [`name`](Self::name) distinguishes `tsx`.
+    pub fn key(self) -> &'static str {
+        &self.0.name
     }
 
     /// The tree-sitter grammar.
     pub fn grammar(self) -> Language {
-        match self {
-            Lang::Python => tree_sitter_python::LANGUAGE.into(),
-            Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            Lang::Go => tree_sitter_go::LANGUAGE.into(),
-            Lang::Java => tree_sitter_java::LANGUAGE.into(),
-            Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
-        }
+        registry::grammar_for(&self.0.grammar).expect("a registered grammar")
     }
 
     /// tree-sitter query capturing symbol definitions. The capture name is the
     /// symbol kind (`function`/`class`/…); `function` is reclassified to
-    /// `method` at parse time when nested in a class/impl.
+    /// `method` at parse time when nested in a container.
     pub fn symbol_query(self) -> &'static str {
-        match self {
-            Lang::Python => {
-                "(function_definition name: (identifier) @function)
-                 (class_definition name: (identifier) @class)"
-            }
-            Lang::JavaScript => {
-                "(function_declaration name: (identifier) @function)
-                 (class_declaration name: (identifier) @class)
-                 (method_definition name: (property_identifier) @method)"
-            }
-            Lang::TypeScript | Lang::Tsx => {
-                "(function_declaration name: (identifier) @function)
-                 (class_declaration name: (type_identifier) @class)
-                 (interface_declaration name: (type_identifier) @interface)
-                 (method_definition name: (property_identifier) @method)"
-            }
-            Lang::Go => {
-                "(function_declaration name: (identifier) @function)
-                 (method_declaration name: (field_identifier) @method)
-                 (type_declaration (type_spec name: (type_identifier) @type))"
-            }
-            Lang::Java => {
-                "(class_declaration name: (identifier) @class)
-                 (interface_declaration name: (identifier) @interface)
-                 (enum_declaration name: (identifier) @enum)
-                 (method_declaration name: (identifier) @method)"
-            }
-            Lang::Rust => {
-                "(function_item name: (identifier) @function)
-                 (struct_item name: (type_identifier) @struct)
-                 (enum_item name: (type_identifier) @enum)
-                 (trait_item name: (type_identifier) @trait)
-                 (mod_item name: (identifier) @module)"
-            }
-        }
+        &self.0.symbols
     }
 
     /// tree-sitter query capturing call callees as `@callee`.
     pub fn calls_query(self) -> &'static str {
-        match self {
-            Lang::Python => {
-                "(call function: (identifier) @callee)
-                 (call function: (attribute attribute: (identifier) @callee))"
-            }
-            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
-                "(call_expression function: (identifier) @callee)
-                 (call_expression function: (member_expression property: (property_identifier) @callee))"
-            }
-            Lang::Go => {
-                "(call_expression function: (identifier) @callee)
-                 (call_expression function: (selector_expression field: (field_identifier) @callee))"
-            }
-            Lang::Java => "(method_invocation name: (identifier) @callee)",
-            Lang::Rust => {
-                "(call_expression function: (identifier) @callee)
-                 (call_expression function: (field_expression field: (field_identifier) @callee))
-                 (call_expression function: (scoped_identifier name: (identifier) @callee))"
-            }
-        }
+        &self.0.calls
     }
 
-    /// tree-sitter query capturing `@name`/`@type` binding pairs (fields, typed
-    /// locals, typed params) to resolve a receiver's type. `None` for untyped
-    /// languages (JavaScript).
+    /// tree-sitter query capturing `@name`/`@type` binding pairs to resolve a
+    /// receiver's type. `None` for untyped languages (JavaScript).
     pub fn type_bindings_query(self) -> Option<&'static str> {
-        Some(match self {
-            Lang::JavaScript => return None,
-            Lang::Python => {
-                "(assignment left: (identifier) @name type: (type (identifier) @type))
-                 (typed_parameter (identifier) @name type: (type (identifier) @type))"
-            }
-            Lang::TypeScript | Lang::Tsx => {
-                "(public_field_definition name: (property_identifier) @name
-                    type: (type_annotation (type_identifier) @type))
-                 (variable_declarator name: (identifier) @name
-                    type: (type_annotation (type_identifier) @type))
-                 (required_parameter pattern: (identifier) @name
-                    type: (type_annotation (type_identifier) @type))"
-            }
-            Lang::Go => {
-                "(var_spec name: (identifier) @name type: (type_identifier) @type)
-                 (parameter_declaration name: (identifier) @name type: (type_identifier) @type)
-                 (field_declaration name: (field_identifier) @name type: (type_identifier) @type)"
-            }
-            Lang::Java => {
-                "(field_declaration type: (type_identifier) @type
-                    declarator: (variable_declarator name: (identifier) @name))
-                 (local_variable_declaration type: (type_identifier) @type
-                    declarator: (variable_declarator name: (identifier) @name))
-                 (formal_parameter type: (type_identifier) @type name: (identifier) @name)"
-            }
-            Lang::Rust => {
-                "(let_declaration pattern: (identifier) @name type: (type_identifier) @type)
-                 (parameter pattern: (identifier) @name type: (type_identifier) @type)
-                 (field_declaration name: (field_identifier) @name type: (type_identifier) @type)"
-            }
-        })
+        self.0.types.as_deref()
     }
 
     /// tree-sitter query capturing whole import statements as `@import`.
     pub fn import_query(self) -> &'static str {
-        match self {
-            Lang::Python => "(import_statement) @import (import_from_statement) @import",
-            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => "(import_statement) @import",
-            Lang::Go => "(import_declaration) @import",
-            Lang::Java => "(import_declaration) @import",
-            Lang::Rust => "(use_declaration) @import",
-        }
+        &self.0.imports
+    }
+
+    /// Node kinds that define a callable, for resolving an edge's source.
+    ///
+    /// Per language, not shared. While these were one global list, adding
+    /// Java's `constructor_declaration` would have added it to Python and Rust
+    /// too — so it was never added, and every call inside a Java constructor
+    /// was dropped for want of a source symbol.
+    pub fn function_kinds(self) -> &'static [String] {
+        &self.0.function_kinds
+    }
+
+    /// Node kinds that act as symbol containers, for a symbol's parent and for
+    /// telling a method from a function.
+    pub fn container_kinds(self) -> &'static [String] {
+        &self.0.container_kinds
     }
 }
 
-/// All languages with wired parsers.
-pub const ALL: &[Lang] = &[
-    Lang::Python,
-    Lang::JavaScript,
-    Lang::TypeScript,
-    Lang::Tsx,
-    Lang::Go,
-    Lang::Java,
-    Lang::Rust,
-];
+impl PartialEq for Lang {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
 
-/// Node kinds that define a callable (for resolving an edge's source symbol).
-pub const FUNCTION_KINDS: &[&str] = &[
-    "function_definition",
-    "function_declaration",
-    "method_declaration",
-    "method_definition",
-    "function_item",
-];
+impl Eq for Lang {}
 
-/// Node kinds that act as symbol containers (for parent + method detection).
-pub const CONTAINER_KINDS: &[&str] = &[
-    "class_definition",
-    "class_declaration",
-    "interface_declaration",
-    "enum_declaration",
-    "impl_item",
-    "trait_item",
-];
+/// Every language with a wired parser.
+pub fn all() -> Vec<Lang> {
+    registry::ALL.iter().map(Lang).collect()
+}
 
 /// Detect a parseable language from a file extension (lowercased, no dot).
 pub fn lang_for_extension(ext: &str) -> Option<Lang> {
-    Some(match ext {
-        "py" | "pyi" => Lang::Python,
-        "js" | "mjs" | "cjs" | "jsx" => Lang::JavaScript,
-        "ts" | "mts" | "cts" => Lang::TypeScript,
-        "tsx" => Lang::Tsx,
-        "go" => Lang::Go,
-        "java" => Lang::Java,
-        "rs" => Lang::Rust,
-        _ => return None,
-    })
+    registry::for_extension(ext).map(Lang)
 }
 
 /// Non-parseable languages that are still indexed as raw text (one file-spanning

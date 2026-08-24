@@ -1,0 +1,20 @@
+{
+  "name": "javascript",
+  "grammar": "javascript",
+  "extensions": [
+    "js",
+    "mjs",
+    "cjs",
+    "jsx"
+  ],
+  "symbols": "(function_declaration name: (identifier) @function)\n(class_declaration name: (identifier) @class)\n(method_definition name: (property_identifier) @method)",
+  "calls": "(call_expression function: (identifier) @callee)\n(call_expression function: (member_expression property: (property_identifier) @callee))",
+  "imports": "(import_statement) @import",
+  "function_kinds": [
+    "function_declaration",
+    "method_definition"
+  ],
+  "container_kinds": [
+    "class_declaration"
+  ]
+}

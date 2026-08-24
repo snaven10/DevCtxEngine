@@ -1,0 +1,18 @@
+{
+  "name": "rust",
+  "grammar": "rust",
+  "extensions": [
+    "rs"
+  ],
+  "symbols": "(function_item name: (identifier) @function)\n(struct_item name: (type_identifier) @struct)\n(enum_item name: (type_identifier) @enum)\n(trait_item name: (type_identifier) @trait)\n(mod_item name: (identifier) @module)",
+  "calls": "(call_expression function: (identifier) @callee)\n(call_expression function: (field_expression field: (field_identifier) @callee))\n(call_expression function: (scoped_identifier name: (identifier) @callee))",
+  "types": "(let_declaration pattern: (identifier) @name type: (type_identifier) @type)\n(parameter pattern: (identifier) @name type: (type_identifier) @type)\n(field_declaration name: (field_identifier) @name type: (type_identifier) @type)",
+  "imports": "(use_declaration) @import",
+  "function_kinds": [
+    "function_item"
+  ],
+  "container_kinds": [
+    "impl_item",
+    "trait_item"
+  ]
+}

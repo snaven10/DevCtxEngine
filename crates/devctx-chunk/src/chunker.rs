@@ -409,7 +409,7 @@ mod tests {
 /// not open a database another process still owns.
 fn wait_for_exit(pid: u32) -> bool { true }
 ";
-        let parsed = devctx_parse::parse(devctx_parse::Lang::Rust, src).unwrap();
+        let parsed = devctx_parse::parse(devctx_parse::Lang::rust(), src).unwrap();
         let chunks = chunk_file("remote.rs", src, &parsed, &ChunkConfig::default());
         let doc = chunks
             .iter()
@@ -428,7 +428,7 @@ fn wait_for_exit(pid: u32) -> bool { true }
     #[test]
     fn a_doc_that_restates_the_name_is_not_worth_a_chunk() {
         let src = "/// The name.\nfn name() {}\n";
-        let parsed = devctx_parse::parse(devctx_parse::Lang::Rust, src).unwrap();
+        let parsed = devctx_parse::parse(devctx_parse::Lang::rust(), src).unwrap();
         let chunks = chunk_file("a.rs", src, &parsed, &ChunkConfig::default());
         assert!(!chunks.iter().any(|c| c.level == "doc"));
     }

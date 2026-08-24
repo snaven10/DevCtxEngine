@@ -1,0 +1,18 @@
+{
+  "name": "python",
+  "grammar": "python",
+  "extensions": [
+    "py",
+    "pyi"
+  ],
+  "symbols": "(function_definition name: (identifier) @function)\n(class_definition name: (identifier) @class)",
+  "calls": "(call function: (identifier) @callee)\n(call function: (attribute attribute: (identifier) @callee))",
+  "types": "(assignment left: (identifier) @name type: (type (identifier) @type))\n(typed_parameter (identifier) @name type: (type (identifier) @type))",
+  "imports": "(import_statement) @import (import_from_statement) @import",
+  "function_kinds": [
+    "function_definition"
+  ],
+  "container_kinds": [
+    "class_definition"
+  ]
+}

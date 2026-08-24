@@ -1,0 +1,16 @@
+{
+  "name": "go",
+  "grammar": "go",
+  "extensions": [
+    "go"
+  ],
+  "symbols": "(function_declaration name: (identifier) @function)\n(method_declaration name: (field_identifier) @method)\n(type_declaration (type_spec name: (type_identifier) @type))",
+  "calls": "(call_expression function: (identifier) @callee)\n(call_expression function: (selector_expression field: (field_identifier) @callee))",
+  "types": "(var_spec name: (identifier) @name type: (type_identifier) @type)\n(parameter_declaration name: (identifier) @name type: (type_identifier) @type)\n(field_declaration name: (field_identifier) @name type: (type_identifier) @type)",
+  "imports": "(import_declaration) @import",
+  "function_kinds": [
+    "function_declaration",
+    "method_declaration"
+  ],
+  "container_kinds": []
+}
