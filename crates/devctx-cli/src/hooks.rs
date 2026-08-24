@@ -182,7 +182,6 @@ pub fn status(repo_root: &Path) -> Result<Vec<(&'static str, bool)>> {
         .collect())
 }
 
-
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;

@@ -110,17 +110,27 @@ thing itself; use `search` when you want code *about an idea*.
 
 ## Limits worth knowing
 
-**Coverage is binary per symbol, not uniformly partial.** Measured on a
-1,300-file Java/Quarkus repository: `crearNotificacion` returns 8 edges for its
-8 call sites — complete — while `actualizar` and `cambiarEstado` return **zero**
-despite having real callers. Nothing tells you in advance which group a symbol
-falls into, which is why an average coverage figure misleads: it invites
-"I am missing some" when you may be missing *all* of the one you are about to
-rename.
+**Names in the graph are qualified.** An edge's `source` is written
+`Class.method` whenever the calling function sits inside a container; its
+`target` is written that way when the call site had a receiver whose type could
+be resolved, and as a bare name when it did not. A question asked with a bare
+name expands to every qualified form carrying it, and the answer reports which
+declarations it merged. Twenty-one methods named `actualizar` is an ordinary
+number for one Quarkus repository — a blast radius that folds them together
+without saying so would be worse than an empty one, so read that line.
 
-**A result with edges is reliable. An empty result means "nothing found", never
-"nothing there".** On an empty result, cross-check with
-`search --keyword` before renaming or deleting.
+Ask with the qualified name when you mean exactly one method. That is the only
+way to narrow it, and it is why qualified names are never expanded.
+
+> This is the correction to an earlier claim in these pages that coverage was
+> "binary per symbol, with nothing to tell the cases apart". It was not. A bare
+> `actualizar` returned nothing while `OficinaService.actualizar` returned one
+> caller and twenty-three callees: the edges were there the whole time, under a
+> key nobody was asking with.
+
+**An empty result still means "nothing found", never "nothing there".** The
+reasons below are real and none of them announce themselves. Cross-check an
+empty result with `search --keyword` before renaming or deleting.
 
 **Call resolution is name-based**, informed by imports and type bindings where
 the grammar supports it.

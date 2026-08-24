@@ -9,11 +9,65 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// A scratch central home that cleans up after itself.
+/// Serialises every test that writes a memory — across test binaries, not just
+/// within this one.
+///
+/// Writing a memory embeds it, which loads the model: around 1.5 GB resident
+/// per server. Cargo runs each test file as its own process AND runs the tests
+/// inside it in parallel, so a plain `Mutex` only holds back the neighbours in
+/// this file while `mcp_tools.rs` embeds alongside it. Several gigabytes and
+/// every core land on a machine already busy, the server never answers, and the
+/// call surfaces as "timed out reading response" — which reads like a broken
+/// daemon rather than a busy one.
+///
+/// So the lock has to live where every process can see it: a file. Acquired by
+/// atomic create, released on drop.
+struct EmbedLock(PathBuf);
+
+impl EmbedLock {
+    fn acquire() -> Self {
+        let path = std::env::temp_dir().join("devctx_it_embedding.lock");
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self(path),
+                Err(_) => {
+                    // A test that panicked while holding it would block the rest
+                    // of the run forever, so a lock older than this is assumed
+                    // abandoned rather than held.
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| t.elapsed().unwrap_or_default().as_secs() > 300)
+                        .unwrap_or(false);
+                    if stale || start.elapsed().as_secs() > 600 {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for EmbedLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 struct Tmp(PathBuf);
 
 impl Tmp {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("devctx_mcp_it_{tag}"));
+        // Unique per run: `auto_addr` hashes the project path into a port, so a
+        // fixed path collides with a server left over from an earlier run —
+        // one whose database directory no longer exists.
+        let dir = std::env::temp_dir().join(format!("devctx_mcp_it_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
@@ -32,15 +86,26 @@ impl Tmp {
 
 impl Drop for Tmp {
     fn drop(&mut self) {
-        for args in [
-            vec!["serve", "--central", "--stop"],
-            vec!["serve", "--stop"],
-        ] {
-            let _ = Command::new(env!("CARGO_BIN_EXE_devctx"))
-                .env("DEVCTX_HOME", self.home())
-                .args(args)
-                .output();
+        // `serve --stop` acts on the project of the *current directory*, so
+        // running it from the test process's cwd stopped a server belonging to
+        // this repository rather than the temp ones. Each project has to be
+        // asked from inside itself, or its server outlives the test by its
+        // fifteen-minute idle window and the next run competes with it.
+        if let Ok(entries) = std::fs::read_dir(&self.0) {
+            for entry in entries.flatten() {
+                if entry.path().join(".devctx").is_dir() {
+                    let _ = Command::new(env!("CARGO_BIN_EXE_devctx"))
+                        .env("DEVCTX_HOME", self.home())
+                        .current_dir(entry.path())
+                        .args(["serve", "--stop"])
+                        .output();
+                }
+            }
         }
+        let _ = Command::new(env!("CARGO_BIN_EXE_devctx"))
+            .env("DEVCTX_HOME", self.home())
+            .args(["serve", "--central", "--stop"])
+            .output();
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -196,6 +261,7 @@ fn list_projects_hides_deactivated_projects() {
 #[test]
 #[ignore = "loads an embedding model (downloads it on a cold cache)"]
 fn recall_reaches_global_memories_from_another_project() {
+    let _serial = EmbedLock::acquire();
     let tmp = Tmp::new("globalrecall");
     let home = tmp.home();
     let shop = tmp.repo("shop");

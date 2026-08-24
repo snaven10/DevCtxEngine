@@ -860,8 +860,12 @@ pub fn report_index(store: &Store, root: &std::path::Path, res: &devctx_index::I
 fn central() -> Result<devctx_central::CentralClient, String> {
     let paths = devctx_central::CentralPaths::resolve().map_err(|e| e.to_string())?;
     devctx_central::client::ensure(&paths).ok_or_else(|| {
-        "no central store daemon and one could not be started; run `devctx serve --central`"
-            .to_string()
+        let base =
+            "no central store daemon and one could not be started; run `devctx serve --central`";
+        match devctx_central::client::spawn_failure_hint(&paths) {
+            Some(why) => format!("{base}\n\nThe daemon's log ends with: {why}"),
+            None => base.to_string(),
+        }
     })
 }
 
@@ -939,7 +943,10 @@ pub enum Resolution {
     /// Exactly one registered project lives under this directory.
     Single(ProjectRow),
     /// Several do, and every one of them declares the same non-empty group.
-    Group { name: String, members: Vec<ProjectRow> },
+    Group {
+        name: String,
+        members: Vec<ProjectRow>,
+    },
     /// Several do, but they do not agree on a group — binding one would be a
     /// guess, so the caller stays unbound and shows these as the candidates.
     Ambiguous(Vec<ProjectRow>),
@@ -1000,7 +1007,11 @@ pub fn projects_under(base: &std::path::Path) -> Result<Vec<ProjectRow>, String>
             }
             let last_indexed_at = r
                 .get("last_indexed_at")
-                .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_i64()))
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| v.as_i64())
+                })
                 .unwrap_or(0);
             let group = group_of(&path);
             let embed_dim = r.get("embed_dim").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1019,7 +1030,11 @@ pub fn projects_under(base: &std::path::Path) -> Result<Vec<ProjectRow>, String>
     // — binding the outer one is what the user pointed at, and its children stay
     // reachable through the hint and `use_project`.
     let paths: Vec<PathBuf> = found.iter().map(|r| r.path.clone()).collect();
-    found.retain(|r| !paths.iter().any(|other| is_strict_descendant(&r.path, other)));
+    found.retain(|r| {
+        !paths
+            .iter()
+            .any(|other| is_strict_descendant(&r.path, other))
+    });
     found.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(found)
 }
@@ -1041,16 +1056,31 @@ pub fn resolve_hint(hint: &str) -> Option<ProjectRow> {
     // this process's working directory would bind whatever same-named folder
     // happens to sit there, and that directory is an accident of how the client
     // was launched.
-    let looks_like_path = hint.contains(std::path::MAIN_SEPARATOR) || hint.starts_with('~') || hint == ".";
+    let looks_like_path =
+        hint.contains(std::path::MAIN_SEPARATOR) || hint.starts_with('~') || hint == ".";
     if !looks_like_path {
-        let rows = central().and_then(|c| c.list(false).map_err(|e| e.to_string())).ok()?;
-        let row = rows.iter().find(|r| r.get("name").and_then(|v| v.as_str()) == Some(hint))?;
-        let path = std::path::Path::new(row.get("path")?.as_str()?).canonicalize().ok()?;
-        return Some(ProjectRow { name: hint.to_string(), path, group: None, embed_dim: 0, last_indexed_at: 0 });
+        let rows = central()
+            .and_then(|c| c.list(false).map_err(|e| e.to_string()))
+            .ok()?;
+        let row = rows
+            .iter()
+            .find(|r| r.get("name").and_then(|v| v.as_str()) == Some(hint))?;
+        let path = std::path::Path::new(row.get("path")?.as_str()?)
+            .canonicalize()
+            .ok()?;
+        return Some(ProjectRow {
+            name: hint.to_string(),
+            path,
+            group: None,
+            embed_dim: 0,
+            last_indexed_at: 0,
+        });
     }
     let expanded = shellexpand(hint);
     let start = std::path::Path::new(&expanded).canonicalize().ok()?;
-    let rows = central().and_then(|c| c.list(false).map_err(|e| e.to_string())).ok()?;
+    let rows = central()
+        .and_then(|c| c.list(false).map_err(|e| e.to_string()))
+        .ok()?;
     let registered: Vec<ProjectRow> = rows
         .iter()
         .filter_map(|r| {
@@ -1096,7 +1126,11 @@ pub fn resolve_under(base: &std::path::Path) -> Resolution {
             // worse than saying so.
             let first = found[0].group.clone();
             match first {
-                Some(name) if found.iter().all(|r| r.group.as_deref() == Some(name.as_str())) => {
+                Some(name)
+                    if found
+                        .iter()
+                        .all(|r| r.group.as_deref() == Some(name.as_str())) =>
+                {
                     Resolution::Group {
                         name,
                         members: found,
@@ -2265,6 +2299,9 @@ pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<
 pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String, String> {
     let store = state.open_store()?;
     let (repo, branch) = state.repo_branch()?;
+    let resolved = store
+        .resolve_symbol(&repo, &branch, symbol)
+        .map_err(|e| e.to_string())?;
     let impact = store
         .impact_analysis(&repo, &branch, symbol, depth)
         .map_err(|e| e.to_string())?;
@@ -2273,12 +2310,29 @@ pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String,
             .map(|(s, d)| json!({ "symbol": s, "depth": d }))
             .collect()
     };
-    Ok(json!({
+    let mut out = json!({
         "symbol": symbol,
         "upstream": to_json(&impact.upstream),
         "downstream": to_json(&impact.downstream),
-    })
-    .to_string())
+    });
+    // A bare name can stand for several methods, and the radius below merges
+    // them. Say so: an unannounced merge reads as one method with a wide blast
+    // radius, which is a different and much more alarming fact.
+    if let Some(names) = merged_declarations(symbol, &resolved) {
+        out["resolved_symbols"] = json!(names);
+    }
+    Ok(out.to_string())
+}
+
+/// The declarations a bare name was expanded into, when that is worth telling
+/// the caller: more than one, or one that is not the name they asked with.
+/// `None` when the question already named exactly one thing.
+pub fn merged_declarations(symbol: &str, resolved: &[String]) -> Option<Vec<String>> {
+    match resolved {
+        [only] if only.as_str() == symbol => None,
+        [] => None,
+        names => Some(names.to_vec()),
+    }
 }
 
 /// `build_context` tool: one budgeted brief assembled for a question.
@@ -2654,6 +2708,9 @@ fn value_json(v: Value, sources: &str) -> Value {
 pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
     let store = state.open_store()?;
     let (repo, branch) = state.repo_branch()?;
+    let resolved = store
+        .resolve_symbol(&repo, &branch, symbol)
+        .map_err(|e| e.to_string())?;
     let refs = store
         .find_references(&repo, &branch, symbol)
         .map_err(|e| e.to_string())?;
@@ -2661,7 +2718,11 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
         .iter()
         .map(|r| json!({ "file": r.file, "line": r.line, "source": r.source }))
         .collect();
-    serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
+    let mut out = json!({ "symbol": symbol, "references": arr });
+    if let Some(names) = merged_declarations(symbol, &resolved) {
+        out["resolved_symbols"] = json!(names);
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// `search_routes` tool: find HTTP routes by optional method + path substring.

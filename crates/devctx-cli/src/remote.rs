@@ -373,10 +373,16 @@ impl Remote {
         )
     }
 
+    /// Recall this project's OWN memories.
+    ///
+    /// The scope is sent explicitly: the endpoint defaults to `all`, and the
+    /// caller already queries the group and global tiers itself. Leaving it out
+    /// asked the server for everything and then fused it with those tiers a
+    /// second time.
     pub fn recall(&self, query: &str, limit: usize) -> Result<String> {
         self.post(
             "/recall",
-            serde_json::json!({ "query": query, "limit": limit }),
+            serde_json::json!({ "query": query, "limit": limit, "scope": "local" }),
         )
     }
 

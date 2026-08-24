@@ -29,18 +29,23 @@ Two directions:
 - **Callees (downstream)** — what `getUser` depends on. This is what constrains
   how you can split it.
 
-### Edges are reliable. Empty is not.
+### Read the first line of the report
 
-**Coverage is binary per symbol.** Measured on a Java/Quarkus repository,
-`crearNotificacion` returned 8 edges for its 8 call sites — complete — while
-`actualizar` and `cambiarEstado` returned **zero** despite real callers. Nothing
-says in advance which group your symbol is in.
+The graph is keyed by qualified name. A bare `getUser` expands to every
+`Class.getUser` that exists, and the report opens by listing what it merged.
+
+| What you see | What it means |
+|---|---|
+| One declaration | The radius below is that method's. |
+| Several declarations | The radius is their **union**. Narrow it by asking with the qualified name. |
+| Nothing at all | "Not found" — see below. It is never "not there". |
 
 | Limit | Consequence for you |
 |---|---|
-| Coverage is binary per symbol | A symbol may have every edge, or none at all. **The empty case is silent.** |
 | Dynamic dispatch leaves no edge | Callbacks, reflection and string-keyed registries are **invisible**. |
 | Only 7 languages produce edges | In a polyglot repository, part of it is not in the graph. |
+| A call made outside any function | Module-level code has no source symbol, so the edge is dropped. |
+| A stale index | Looks exactly like code that does not exist. Check `index_status`. |
 
 So a report **with** edges you can act on. A **clean** one proves nothing —
 cross-check with a keyword search before you trust it:

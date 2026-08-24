@@ -30,18 +30,23 @@ Dos direcciones:
 - **Llamados (aguas abajo)** — de qué depende `getUser`. Esto es lo que
   condiciona cómo podés separarlo.
 
-### Las aristas son confiables. El vacío no.
+### Leé la primera línea del reporte
 
-**La cobertura es binaria por símbolo.** Medido en un repositorio Java/Quarkus,
-`crearNotificacion` devolvió 8 aristas para sus 8 sitios de llamada —completo—
-mientras `actualizar` y `cambiarEstado` devolvieron **cero** teniendo llamadores
-reales. Nada dice de antemano en qué grupo está el tuyo.
+El grafo se indexa por nombre calificado. Un `getUser` pelado se expande a cada
+`Clase.getUser` que exista, y el reporte arranca listando lo que fundió.
+
+| Lo que ves | Qué significa |
+|---|---|
+| Una declaración | El radio de abajo es el de ese método. |
+| Varias declaraciones | El radio es la **unión** de todas. Acotalo preguntando con el nombre calificado. |
+| Nada | "No encontré" — mirá abajo. Nunca es "no hay". |
 
 | Límite | Consecuencia para vos |
 |---|---|
-| La cobertura es binaria por símbolo | Un símbolo puede traer todas sus aristas, o ninguna. **El caso vacío es silencioso.** |
 | El despacho dinámico no deja arista | Callbacks, reflexión y registros llaveados por strings son **invisibles**. |
 | Solo 7 lenguajes producen aristas | En un repositorio políglota, parte no está en el grafo. |
+| Una llamada fuera de toda función | El código a nivel de módulo no tiene símbolo origen, así que la arista se descarta. |
+| Un índice desactualizado | Se ve exactamente igual que código que no existe. Revisá `index_status`. |
 
 O sea: un reporte **con** aristas sirve para actuar. Uno **limpio** no prueba
 nada — cruzá con una búsqueda por palabra clave antes de confiar en él:

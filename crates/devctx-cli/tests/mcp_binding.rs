@@ -10,31 +10,70 @@
 //! exits. That stderr line is the assertion target.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::process::{Command, Stdio};
 
-/// Serialises the tests that write a memory.
+/// Serialises every test that writes a memory — across test binaries, not just
+/// within this one.
 ///
-/// Writing one embeds it, which loads the model — around 1.5 GB resident per
-/// server. Rust runs tests in parallel, so three of these at once put several
-/// gigabytes and every core against a machine that is usually doing something
-/// else, and the server loses the race: the call comes back as
-/// "timed out reading response" from a client whose own timeout is an hour.
+/// Writing a memory embeds it, which loads the model: around 1.5 GB resident
+/// per server. Cargo runs each test file as its own process AND runs the tests
+/// inside it in parallel, so a plain `Mutex` only holds back the neighbours in
+/// this file while `mcp_tools.rs` embeds alongside it. Several gigabytes and
+/// every core land on a machine already busy, the server never answers, and the
+/// call surfaces as "timed out reading response" — which reads like a broken
+/// daemon rather than a busy one.
 ///
-/// The failure is resource contention, not behaviour, so the fix belongs in the
-/// test rather than in the product's timeouts.
-fn embedding_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// So the lock has to live where every process can see it: a file. Acquired by
+/// atomic create, released on drop.
+struct EmbedLock(PathBuf);
+
+impl EmbedLock {
+    fn acquire() -> Self {
+        let path = std::env::temp_dir().join("devctx_it_embedding.lock");
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self(path),
+                Err(_) => {
+                    // A test that panicked while holding it would block the rest
+                    // of the run forever, so a lock older than this is assumed
+                    // abandoned rather than held.
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| t.elapsed().unwrap_or_default().as_secs() > 300)
+                        .unwrap_or(false);
+                    if stale || start.elapsed().as_secs() > 600 {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for EmbedLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 struct Tmp(PathBuf);
 
 impl Tmp {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("devctx_bind_it_{tag}"));
+        // The path must be unique per run, not just per test. `auto_addr`
+        // derives a server's port from an FNV hash of the project path, so a
+        // fixed path means a fixed port — and a server left over from an
+        // earlier run answers on it while its database directory has already
+        // been deleted. The call then hangs until the client gives up, which
+        // reads as flakiness rather than as the collision it is.
+        let dir = std::env::temp_dir().join(format!("devctx_bind_it_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
@@ -53,6 +92,38 @@ impl Tmp {
 
 impl Drop for Tmp {
     fn drop(&mut self) {
+        // Stop every server this test started, not just the central one.
+        //
+        // `devctx mcp` auto-spawns a server per project it touches, each with
+        // `--idle 900`. Stopping only the central daemon left those running for
+        // fifteen minutes apiece: a suite run leaked one per project, they
+        // accumulated across runs, and at fifteen of them holding ~3 GB the
+        // next run's servers lost the race to answer and the tests failed as
+        // "timed out reading response". The leak looked like flakiness.
+        if let Ok(entries) = std::fs::read_dir(&self.0) {
+            for entry in entries.flatten() {
+                let candidate = entry.path();
+                if candidate.join(".devctx").is_dir() {
+                    let _ = Command::new(env!("CARGO_BIN_EXE_devctx"))
+                        .env("DEVCTX_HOME", self.home())
+                        .current_dir(&candidate)
+                        .args(["serve", "--stop"])
+                        .output();
+                }
+                // Workspaces hold the projects one level further down.
+                if let Ok(inner) = std::fs::read_dir(&candidate) {
+                    for sub in inner.flatten() {
+                        if sub.path().join(".devctx").is_dir() {
+                            let _ = Command::new(env!("CARGO_BIN_EXE_devctx"))
+                                .env("DEVCTX_HOME", self.home())
+                                .current_dir(sub.path())
+                                .args(["serve", "--stop"])
+                                .output();
+                        }
+                    }
+                }
+            }
+        }
         let _ = Command::new(env!("CARGO_BIN_EXE_devctx"))
             .env("DEVCTX_HOME", self.home())
             .args(["serve", "--central", "--stop"])
@@ -74,10 +145,7 @@ fn devctx(home: &Path, args: &[&str]) -> std::process::Output {
 fn make_project(home: &Path, parent: &Path, name: &str, group: Option<&str>) -> PathBuf {
     let root = parent.join(name);
     std::fs::create_dir_all(&root).unwrap();
-    let out = devctx(
-        home,
-        &["projects", "add", root.to_str().unwrap(), "--init"],
-    );
+    let out = devctx(home, &["projects", "add", root.to_str().unwrap(), "--init"]);
     assert!(
         out.status.success(),
         "registering {name}:\n{}",
@@ -330,7 +398,7 @@ fn call_tool(
 /// is exactly the caller who does not know which one they are in.
 #[test]
 fn scope_defaults_follow_the_binding() {
-    let _serial = embedding_lock();
+    let _serial = EmbedLock::acquire();
     let tmp = Tmp::new("scopedefault");
     let home = tmp.home();
     let ws = tmp.dir("workspace");
@@ -512,7 +580,7 @@ fn call_tool_raw(
 /// repository, so that repository *is* the real provenance.
 #[test]
 fn a_group_binding_attributes_the_memory_to_the_group() {
-    let _serial = embedding_lock();
+    let _serial = EmbedLock::acquire();
     let tmp = Tmp::new("provenance");
     let home = tmp.home();
     let ws = tmp.dir("workspace");
@@ -556,7 +624,7 @@ fn a_group_binding_attributes_the_memory_to_the_group() {
 /// diagnosis.
 #[test]
 fn local_scope_refuses_to_guess_a_repository() {
-    let _serial = embedding_lock();
+    let _serial = EmbedLock::acquire();
     let tmp = Tmp::new("localguard");
     let home = tmp.home();
     let ws = tmp.dir("workspace");
