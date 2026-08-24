@@ -99,6 +99,7 @@ pub async fn serve(
     addr: SocketAddr,
     token: Option<String>,
     idle: Option<Duration>,
+    announce: impl FnOnce(SocketAddr),
 ) -> anyhow::Result<()> {
     let api = CentralApi {
         central: Arc::new(Mutex::new(central)),
@@ -112,6 +113,11 @@ pub async fn serve(
     let activity = Arc::new(Mutex::new(Instant::now()));
     let app = router(api).layer(middleware::from_fn_with_state(activity.clone(), track));
     let (listener, addr) = bind_near(addr).await?;
+    // Announce only now, and with the port actually bound. Advertising the
+    // requested one before binding was fine while a taken port meant the daemon
+    // died; now that it walks to the next free one, a file written beforehand
+    // sends every client to a port nothing is listening on.
+    announce(addr);
     eprintln!("DevCtxEngine central store listening on http://{addr}");
 
     if let Some(timeout) = idle {
@@ -211,11 +217,12 @@ pub fn run_blocking(
     addr: SocketAddr,
     token: Option<String>,
     idle: Option<Duration>,
+    announce: impl FnOnce(SocketAddr),
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(central, addr, token, idle))
+    rt.block_on(serve(central, addr, token, idle, announce))
 }
 
 // --- request bodies / query params ---

@@ -1284,14 +1284,23 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
 
     let central = Central::open().context("opening the central store")?;
-    devctx_central::client::write_serve_file(&paths, socket, token.as_deref())?;
     println!("DevCtxEngine central store → http://{addr}");
     println!("  Database: {}", paths.db.display());
     println!("  Config:   {}", paths.config.display());
     println!("Registry commands will route through it while it runs. Ctrl-C to stop.");
 
     let idle = (idle > 0).then(|| std::time::Duration::from_secs(idle));
-    let result = devctx_api::central::run_blocking(central, socket, token, idle);
+    // Written from inside, once the port is bound: `bind_near` may have moved
+    // past a taken one, and the file has to name where the daemon actually is.
+    let announce_paths = paths.clone();
+    let announce_token = token.clone();
+    let result = devctx_api::central::run_blocking(central, socket, token, idle, move |bound| {
+        let _ = devctx_central::client::write_serve_file(
+            &announce_paths,
+            bound,
+            announce_token.as_deref(),
+        );
+    });
     devctx_central::client::remove_own_serve_file(&paths);
     result
 }
