@@ -1,6 +1,6 @@
 # PLAN-001 — Progreso de indexado a través del servidor
 
-**Estado**: done
+**Estado**: done — con un riesgo aceptado que después explotó, ver [Seguimiento](#seguimiento--2026-08-22)
 **Fecha**: 2026-08-12
 **Proyecto(s)**: DevCtxEngine
 
@@ -67,9 +67,12 @@ Estrictamente secuencial — cada tarea consume lo que expone la anterior.
 - **Servidor viejo, CLI nuevo.** Mientras convivan binarios, el endpoint puede devolver 404.
   → El CLI cae a `Heartbeat` en cualquier error del poller. Nunca aborta el indexado por
   fallar el progreso.
-- **Dos indexados a la vez.** El estado es uno solo por servidor; dos clientes indexando el
-  mismo proyecto se pisarían las cuentas.
-  → Aceptable: el servidor ya es dueño único del DuckDB y serializa el trabajo. Se documenta.
+- **Dos indexados a la vez.** ⚠️ **SE MATERIALIZÓ** — ver "Seguimiento" al final.
+  El estado es uno solo por servidor; dos clientes indexando el mismo proyecto se pisarían
+  las cuentas.
+  → ~~Aceptable: el servidor ya es dueño único del DuckDB y serializa el trabajo. Se
+  documenta.~~ La mitigación era falsa: ser dueño único del DuckDB serializa el **acceso a
+  la base**, no las llamadas al `ProgressSink`.
 - **Ruido en la terminal.** El `IndexBar` escribe a stderr con `\r`; mezclado con los
   `eprintln!` del servidor podría ensuciar.
   → El servidor escribe a su propio log, no a la terminal del CLI. Verificar en la prueba.
@@ -103,3 +106,54 @@ Estrictamente secuencial — cada tarea consume lo que expone la anterior.
 - **Hallazgo lateral**: el indexado va a ~3.7 s por archivo (15 archivos en 55 s), lo que
   da ~1 hora para este repo. Es un problema de rendimiento aparte, no de este plan, pero
   explica por qué la barra hacía tanta falta.
+
+## Seguimiento — 2026-08-22
+
+El Riesgo 3 ("dos indexados a la vez") **se materializó a los diez días**. Un
+`devctx index --full` sobre un proyecto JavaScript dibujó esto durante minutos:
+
+```
+⠖ [00:06:32] [================================] 788/647 (eta 0s) package-lock.json
+```
+
+Más archivos procesados que archivos a procesar. Arreglado en
+[PR #1](https://github.com/snaven10/DevCtxEngine/pull/1) (commit `a0bd167`).
+
+**Por qué la mitigación no sostenía.** El plan aceptó el riesgo razonando que el servidor
+"ya es dueño único del DuckDB y serializa el trabajo". Serializa el acceso a la base, sí —
+pero nada serializaba las llamadas al `ProgressSink`. El watcher (`watch.rs`) y los hooks
+post-commit/post-merge entran por `POST /index` con paths, llaman `start()`, y reinician
+`total` y `done` debajo del run que alguien está mirando. La conclusión no se seguía de la
+premisa. Un guardado de archivo a mitad del reindex bastaba.
+
+**Y el riesgo tenía un socio que el plan no vio**, en el CLI: `ServerProgress` construía el
+`IndexBar` dentro de `get_or_insert_with` y llamaba `set_length` ahí y en ningún otro lado.
+El largo de la barra se leía una vez y se congelaba. Cualquiera de los dos defectos bastaba
+por su cuenta para el número absurdo.
+
+**La nota de ejecución sobre `running` llegó cerca y no lo agarró.** Detectó que los totales
+de una corrida sobreviven a su final, y por eso `running && total > 0`. Eso cubre runs
+**consecutivos**. Los **solapados** se le escaparon: `running` no distingue dos runs porque
+nunca baja entre ellos.
+
+**Lo que lo cierra** (los tres en el mismo PR):
+
+- `IndexProgress` lleva `run`, una generación que sube cuando un run toma el slot, publicada
+  por `/index/progress`. El cliente la lee con `#[serde(default)]`.
+- El slot tiene dueño: el primero que llama `start()` lo retiene hasta terminar; el que llega
+  con `running == true` trabaja y no reporta — sus `file()` no cuentan y su `finish()` no
+  baja `running`.
+- El CLI re-aplica `set_length` en cada poll, y si cambia `run` retira la barra y dibuja otra.
+
+Tests que fijan el comportamiento, en `devctx-mcp/src/state.rs`:
+`a_second_run_cannot_overwrite_the_one_being_watched` (reproduce el caso reportado) y
+`each_run_gets_its_own_number`.
+
+**Sigue sin verificar**, y ahora con una razón más: el criterio del fallback contra un
+servidor sin el endpoint. El campo `run` nuevo depende del mismo camino — un servidor viejo
+lo omite y el cliente lo toma como 0 — y tampoco se probó contra un binario anterior.
+
+**Lección para el próximo plan**: un riesgo aceptado necesita que la mitigación se verifique,
+no que suene razonable. Esta decía "el servidor serializa el trabajo" sin nombrar *qué*
+trabajo, y la ambigüedad se comió la diferencia entre serializar la base y serializar los
+contadores.

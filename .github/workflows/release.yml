@@ -16,7 +16,31 @@ permissions:
   contents: write
 
 jobs:
+  # Nothing stood between a tag and published binaries. `ci` runs on `main`,
+  # but a tag does not ask whether it was green: `main` carried a failing
+  # check for four days in August and the next tag would have shipped over it
+  # without a word. Twenty minutes of building for three platforms, and an
+  # install script pointing at the result, is too much to spend on a commit
+  # whose tests nobody ran.
+  #
+  # One runner, the same checks `ci` makes, and the build waits for it.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --all --locked
+
   build:
+    needs: gate
     strategy:
       fail-fast: false
       matrix:

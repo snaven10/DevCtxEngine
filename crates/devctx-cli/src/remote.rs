@@ -30,6 +30,11 @@ pub struct ServeInfo {
 pub struct IndexProgress {
     /// Whether a run is in flight right now.
     pub running: bool,
+    /// Which run these counts belong to. Defaults to zero against a server
+    /// built before the field existed, which reads as "always the same run" —
+    /// the same behaviour those servers already had.
+    #[serde(default)]
+    pub run: u64,
     /// Changes the run expects to process.
     pub total: usize,
     /// Changes it has started on.
