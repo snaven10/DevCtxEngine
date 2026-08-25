@@ -270,6 +270,13 @@ struct RememberBody {
     /// Comma-separated files the memory is about, used to link it to the graph.
     #[serde(default)]
     files: Option<String>,
+    /// Who the memory should be attributed to, overriding what git reports.
+    ///
+    /// Only a group-bound MCP session sends this: it is writing on behalf of a
+    /// product rather than a repository, and letting git answer would credit
+    /// whichever member happens to be the default.
+    #[serde(default)]
+    provenance: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -483,10 +490,10 @@ async fn remember(State(api): State<Api>, Json(b): Json<RememberBody>) -> Respon
                 &tags,
                 &group,
                 &files,
-                // The HTTP API is always serving one project's store, so the
-                // bound repository IS the provenance. Only a group-bound MCP
-                // session needs the override.
-                None,
+                // Absent, the bound repository IS the provenance — the API
+                // serves one project's store. A group-bound MCP session sends
+                // the override because it is writing for the product.
+                b.provenance.as_deref(),
             );
         }
         do_remember(s, b.content, title, memory_type, topic, tags, files)

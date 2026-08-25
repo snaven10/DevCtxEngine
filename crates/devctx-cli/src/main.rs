@@ -2946,6 +2946,46 @@ fn cmd_status() -> Result<()> {
     Ok(())
 }
 
+/// Turn a lost connection into the truth about it, by asking the server.
+///
+/// The client losing its answer is not the server losing its work, and this
+/// reported them as the same thing:
+///
+/// ```text
+/// Error: http://127.0.0.1:55409/index: timed out reading response
+/// ```
+///
+/// That arrived four seconds into a run that then indexed for two and a half
+/// hours. Read as a failure it invites the two worst next moves — start the run
+/// again on top of the one already going, or kill the process. I nearly did the
+/// second one to a live index of fifteen hundred files.
+///
+/// So before reporting a failure, ask: `/index/progress` says whether a run is
+/// still in flight and how far it has got. If one is, that is the message.
+///
+/// The four seconds are still unexplained — the agent's own timeout is an hour —
+/// and this does not pretend to fix them. It fixes the part that does damage:
+/// saying "it failed" about work that is going fine.
+fn still_running_or(r: &remote::Remote, e: anyhow::Error) -> anyhow::Error {
+    let Ok(p) = r.index_progress() else {
+        return e;
+    };
+    if !p.running {
+        return e;
+    }
+    let position = if p.total > 0 {
+        format!("{} of {} files", p.done, p.total)
+    } else {
+        format!("{} files", p.done)
+    };
+    anyhow!(
+        "lost the connection to the server, but the indexing run is STILL GOING \
+         ({position}). Nothing was lost and nothing needs restarting — watch it \
+         with `devctx status`, and start again only once it reports up to date.\n\
+         \nThe connection error was: {e}"
+    )
+}
+
 /// `devctx index` — run the indexing pipeline.
 fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
     let cfg = load_project()?;
@@ -2961,7 +3001,10 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         let ticker = ServerProgress::start(r.clone(), "indexing on the server");
         let out = r.index(full, branch.as_deref());
         ticker.stop();
-        println!("{}", out?);
+        match out {
+            Ok(report) => println!("{report}"),
+            Err(e) => return Err(still_running_or(&r, e)),
+        }
         return Ok(());
     }
     let root = project_root(&cfg)?;

@@ -221,12 +221,59 @@ impl Backend {
                 )
             }
             Backend::Local(s) => do_remember(s, content, title, memory_type, topic, tags, files),
-            Backend::Remote(r, _) => r.post(
-                "/remember",
-                json!({ "content": content, "title": title, "type": memory_type,
-                        "topic": topic, "tags": tags, "scope": scope, "files": files }),
-            ),
+            Backend::Remote(r, _) => {
+                let answer = r.post(
+                    "/remember",
+                    json!({ "content": content, "title": title, "type": memory_type,
+                            "topic": topic, "tags": tags, "scope": scope,
+                            "files": files, "provenance": provenance }),
+                )?;
+                Ok(Self::warn_if_provenance_was_ignored(
+                    answer,
+                    provenance.as_deref(),
+                ))
+            }
         }
+    }
+
+    /// Say so when the server did not honour `provenance`.
+    ///
+    /// Serde ignores unknown fields by default, so a server built before this
+    /// field existed accepts the request, drops it, and attributes the memory
+    /// to whatever git reports — the exact bug this closes, silently, against a
+    /// version that looks like it worked. Sending the field is not enough; the
+    /// answer has to be checked.
+    ///
+    /// The reply carries the stored `repo`, so this is a comparison rather than
+    /// a guess. A mismatch is a warning and not an error: the memory was saved,
+    /// and losing it over a wrong attribution would be the worse trade.
+    fn warn_if_provenance_was_ignored(answer: String, wanted: Option<&str>) -> String {
+        let Some(wanted) = wanted.filter(|w| !w.is_empty()) else {
+            return answer;
+        };
+        let Ok(mut v) = serde_json::from_str::<Value>(&answer) else {
+            return answer;
+        };
+        // Owned, not borrowed: the warning is written back into the same value.
+        let stored = v
+            .get("repo")
+            .and_then(|r| r.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if stored == wanted {
+            return answer;
+        }
+        if let Value::Object(map) = &mut v {
+            map.insert(
+                "warning".into(),
+                json!(format!(
+                    "the server attributed this memory to `{stored}` rather than `{wanted}`, \
+                     so it is probably older than the `provenance` field and ignored it. \
+                     The memory was saved; its attribution is wrong."
+                )),
+            );
+        }
+        serde_json::to_string_pretty(&v).unwrap_or(answer)
     }
 
     pub fn recall(
@@ -429,4 +476,63 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reason sending the field is not enough.
+    ///
+    /// Serde ignores unknown fields, so a server older than `provenance`
+    /// accepts the request, drops it, and answers 200 with the memory
+    /// attributed to whatever git said. Without this check the bug closes
+    /// against a version that only looks like it works.
+    #[test]
+    fn an_ignored_provenance_is_reported_not_assumed() {
+        let answer = json!({ "id": "mem_1", "repo": "api" }).to_string();
+        let out = Backend::warn_if_provenance_was_ignored(answer, Some("REVFA"));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let warning = v["warning"]
+            .as_str()
+            .expect("a mismatch has to be reported");
+        assert!(warning.contains("api"), "name what it stored: {warning}");
+        assert!(warning.contains("REVFA"), "and what was asked: {warning}");
+        assert_eq!(v["id"], "mem_1", "the answer itself survives");
+    }
+
+    /// A server that honoured it says nothing extra — the common case must not
+    /// grow a warning nobody needs.
+    #[test]
+    fn an_honoured_provenance_is_left_alone() {
+        let answer = json!({ "id": "mem_1", "repo": "REVFA" }).to_string();
+        let out = Backend::warn_if_provenance_was_ignored(answer.clone(), Some("REVFA"));
+        assert_eq!(out, answer);
+    }
+
+    /// No provenance asked for, nothing to check. A project-bound session sends
+    /// none, and its `repo` is whatever git reports — which is correct there.
+    #[test]
+    fn no_provenance_asked_means_no_comparison() {
+        let answer = json!({ "id": "mem_1", "repo": "api" }).to_string();
+        assert_eq!(
+            Backend::warn_if_provenance_was_ignored(answer.clone(), None),
+            answer
+        );
+        assert_eq!(
+            Backend::warn_if_provenance_was_ignored(answer.clone(), Some("")),
+            answer
+        );
+    }
+
+    /// An answer that is not JSON comes back untouched rather than being
+    /// swallowed: whatever the server said, the caller should see it.
+    #[test]
+    fn a_non_json_answer_passes_through() {
+        let answer = "saved".to_string();
+        assert_eq!(
+            Backend::warn_if_provenance_was_ignored(answer.clone(), Some("REVFA")),
+            answer
+        );
+    }
 }
