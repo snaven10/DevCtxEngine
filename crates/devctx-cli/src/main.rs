@@ -2708,6 +2708,11 @@ fn cmd_init(
         }
     }
 
+    // Taken before `base` swallows the `None` case: a project that was NOT
+    // copied from must fall through to the machine defaults, and
+    // `unwrap_or_default()` would hand back a built-in that looks like a choice.
+    let copied_language = copied.as_ref().map(|c| c.language);
+    let copied_storage = copied.as_ref().map(|c| c.storage.clone());
     let base = copied.unwrap_or_default();
     let cfg = ProjectConfig {
         project: Project {
@@ -2716,9 +2721,22 @@ fn cmd_init(
             group: answers.group.clone().unwrap_or_default(),
         },
         state_dir: answers.state_dir.clone().unwrap_or(base.state_dir),
-        language: answers.language.unwrap_or(base.language),
+        // What the user just said, then what a copied project carries, then the
+        // machine's default, then the built-in. `language` and `storage` used to
+        // skip the third step entirely: setting them under `defaults:` in the
+        // central config changed nothing, and there was no sign that it had not.
+        language: answers
+            .language
+            .or(copied_language)
+            .or(defaults.language)
+            .unwrap_or_default(),
         embeddings: defaults.embeddings,
-        storage: answers.storage.clone().unwrap_or(base.storage),
+        storage: answers
+            .storage
+            .clone()
+            .or(copied_storage)
+            .or(defaults.storage)
+            .unwrap_or_default(),
         indexing: answers.indexing.clone().unwrap_or(base.indexing),
         reranking: defaults.reranking,
         summarization: answers.summarization.clone().unwrap_or(base.summarization),

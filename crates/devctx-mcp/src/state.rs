@@ -1496,7 +1496,49 @@ pub fn do_search_group(
     if !failed.is_empty() {
         out["failed_projects"] = json!(failed);
     }
+    if let Some(warning) = fan_out_warning(&failed, members.len())? {
+        out["warning"] = json!(warning);
+    }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// How a fan-out reports members it could not reach.
+///
+/// `failed_projects` alone is not enough. It is a field inside a JSON blob that
+/// gets skimmed, and "nothing recorded about that" is a perfectly plausible
+/// answer — so a recall that reached nobody looked exactly like a recall that
+/// found nothing. That is how the group fan-out stayed broken for months: every
+/// member failed on a flag the subcommand did not have, and the only trace was
+/// a key nobody read.
+///
+/// So: if EVERY member failed, this is not a thin result, it is a query that did
+/// not run, and it fails loudly. If some failed, the answer stands but says so
+/// in prose that cannot be skimmed past.
+fn fan_out_warning(failed: &[Value], members: usize) -> Result<Option<String>, String> {
+    if failed.is_empty() {
+        return Ok(None);
+    }
+    let first_error = failed
+        .first()
+        .and_then(|f| f.get("error").and_then(|e| e.as_str()))
+        .unwrap_or("no reason given");
+    if members > 0 && failed.len() >= members {
+        return Err(format!(
+            "None of the {members} repositories in this group could be reached, so this \
+             answer would come from the shared tier alone — which is not an answer to \
+             the question asked. First failure: {first_error}"
+        ));
+    }
+    let names: Vec<&str> = failed
+        .iter()
+        .filter_map(|f| f.get("project").and_then(|p| p.as_str()))
+        .collect();
+    Ok(Some(format!(
+        "INCOMPLETE: {} of {members} repositories could not be reached ({}), so anything \
+         recorded only in them is missing here. First failure: {first_error}",
+        failed.len(),
+        names.join(", ")
+    )))
 }
 
 /// Recall from one member's own store, local tier only.
@@ -1634,6 +1676,9 @@ pub fn do_recall_group(
     }
     if !failed.is_empty() {
         out["failed_projects"] = json!(failed);
+    }
+    if let Some(warning) = fan_out_warning(&failed, members.len())? {
+        out["warning"] = json!(warning);
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
@@ -1845,9 +1890,19 @@ pub fn do_recall_scoped(
         .map_err(|e| e.to_string())?
         .iter()
         .map(|h| {
+            // Fall back to the bound project when the stored `repo` is empty.
+            // These came out of *this* repository's store, so leaving the field
+            // blank loses a fact we hold: a group recall then shows three
+            // memories with no origin beside eight that have one, and the reader
+            // cannot tell whether that means "unknown" or "everywhere".
+            let origin = if h.memory.repo.is_empty() {
+                project.clone()
+            } else {
+                h.memory.repo.clone()
+            };
             json!({
                 "id": h.memory.id, "title": h.memory.title, "content": h.memory.content,
-                "type": h.memory.memory_type, "tags": h.memory.tags, "repo": h.memory.repo,
+                "type": h.memory.memory_type, "tags": h.memory.tags, "repo": origin,
             })
         })
         .collect()
@@ -2896,6 +2951,51 @@ fn slice_lines(content: &str, start: Option<usize>, end: Option<usize>) -> Strin
 
 #[cfg(test)]
 mod tests {
+    use super::fan_out_warning;
+
+    /// The failure this exists for. A fan-out where every member fell over used
+    /// to answer from the shared tier alone and put the eleven failures in a
+    /// key nobody reads — indistinguishable from "nothing recorded about that",
+    /// which is why it went unnoticed for months.
+    #[test]
+    fn every_member_failing_is_an_error_not_a_thin_answer() {
+        let failed: Vec<serde_json::Value> = (0..11)
+            .map(|i| serde_json::json!({ "project": format!("repo{i}"), "error": "boom" }))
+            .collect();
+        let err = fan_out_warning(&failed, 11).expect_err("should refuse to answer");
+        assert!(err.contains("None of the 11"), "{err}");
+        assert!(
+            err.contains("boom"),
+            "the cause has to travel with it: {err}"
+        );
+    }
+
+    /// Some failing is still an answer — but one that says what is missing, in
+    /// prose, where a reader cannot skim past it.
+    #[test]
+    fn some_members_failing_warns_without_refusing() {
+        let failed = vec![serde_json::json!({ "project": "api", "error": "timed out" })];
+        let warning = fan_out_warning(&failed, 11)
+            .expect("a partial answer is still an answer")
+            .expect("and it has to carry a warning");
+        assert!(warning.contains("1 of 11"), "{warning}");
+        assert!(warning.contains("api"), "name who is missing: {warning}");
+        assert!(warning.contains("timed out"), "{warning}");
+    }
+
+    #[test]
+    fn nothing_failing_says_nothing() {
+        assert!(fan_out_warning(&[], 11).unwrap().is_none());
+    }
+
+    /// A group with no members cannot have "all of them" fail: guarding on
+    /// `members > 0` keeps an empty group from turning every call into an error.
+    #[test]
+    fn an_empty_group_does_not_refuse() {
+        let failed = vec![serde_json::json!({ "project": "x", "error": "boom" })];
+        assert!(fan_out_warning(&failed, 0).is_ok());
+    }
+
     use super::*;
     use devctx_core::{VectorMetadata, VectorPoint};
 

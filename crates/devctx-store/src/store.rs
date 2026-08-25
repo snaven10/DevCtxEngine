@@ -333,6 +333,28 @@ impl Store {
         let _ = self.conn.execute_batch("CHECKPOINT;");
     }
 
+    /// How many times bigger the database file is than the rows it holds, or
+    /// `None` when it cannot be worked out (an in-memory store, or a query that
+    /// fails — neither is worth failing an indexing run over).
+    ///
+    /// `PRAGMA database_size` reports the blocks in use and the blocks free;
+    /// a full reindex deletes every row and writes them again, and the freed
+    /// blocks stay in the file. This is the number that makes that visible.
+    pub fn bloat_ratio(&self) -> Option<f64> {
+        let (used, free): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT total_blocks - free_blocks, free_blocks FROM pragma_database_size()",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()?;
+        if used <= 0 {
+            return None;
+        }
+        Some((used + free) as f64 / used as f64)
+    }
+
     /// Rebuild every table, restoring index structures from the rows themselves.
     ///
     /// The repair for the damage [`checkpoint`](Self::checkpoint) prevents: copy

@@ -285,8 +285,35 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // connection is still open to do it.
     req.store.checkpoint();
 
+    // A full run deletes every row and writes them again, and DuckDB does not
+    // hand the space of the deleted ones back to the file — a checkpoint folds
+    // the log in, it does not compact. Measured on a 1,500-file repository: 90 MB
+    // before, 1,175 MB after, holding FEWER chunks than it started with, and
+    // three checkpoints moved it by nothing. Rebuilding the tables took it to
+    // 166 MB.
+    //
+    // Rebuilding here is not an option — it needs exclusive access to a database
+    // this process is serving — so say it instead. Silence is what let a
+    // thirteen-fold file go unremarked.
+    if !req.incremental {
+        if let Some(ratio) = req.store.bloat_ratio() {
+            if ratio >= BLOAT_WARN_RATIO {
+                eprintln!(
+                    "· the index file is about {ratio:.0}× the size of what it holds; \
+                     `devctx repair` rebuilds it and gives the space back"
+                );
+            }
+        }
+    }
+
     Ok(result)
 }
+
+/// How much bigger than its contents the file has to be before saying so.
+///
+/// Some overhead is normal — indexes, page alignment, a little slack. Three is
+/// past all of that and into "a full run left its old rows behind".
+const BLOAT_WARN_RATIO: f64 = 3.0;
 
 /// DevCtxEngine's own working directories, which must never be indexed.
 ///
