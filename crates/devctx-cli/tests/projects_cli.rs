@@ -438,3 +438,61 @@ fn global_memories_cross_projects_while_local_ones_stay_put() {
     );
     assert!(again.contains("duplicate"), "got: {again}");
 }
+
+/// Routed and direct reads have to agree in SHAPE, not only in content.
+///
+/// This is the class of defect that went unnoticed longest. `local_recall` read
+/// the server's answer with `as_array()`; the endpoint returns
+/// `{"memories": [...]}`, so it was always `None` and every recall made while a
+/// server was running reported nothing — one project held sixteen memories and
+/// answered "No memories." Nothing failed, nothing logged, and "nothing recorded
+/// about that" is a perfectly ordinary answer.
+///
+/// Both paths are exercised here without an embedding model, so this stays cheap
+/// enough to run every time. What it cannot cover is the `recall` path itself,
+/// which needs a model loaded; that gap is why the bug survived, and it is still
+/// open.
+#[test]
+fn routed_and_direct_agree_on_shape_not_just_content() {
+    let tmp = Tmp::new("shape");
+    let home = tmp.home();
+    ok(
+        &home,
+        &[
+            "projects",
+            "add",
+            tmp.repo("shapes").to_str().unwrap(),
+            "--init",
+        ],
+    );
+
+    // Each of these crosses the CLI/HTTP boundary, and each parses what comes
+    // back. A reader that assumes the wrong container returns empty rather than
+    // failing, which is what makes the mistake invisible.
+    for args in [
+        vec!["projects", "list", "--format", "json"],
+        vec!["projects", "show", "shapes"],
+    ] {
+        let direct = ok(&home, &args);
+        let routed = devctx_routed(&home, &args);
+        assert!(
+            routed.status.success(),
+            "`devctx {}` failed when routed:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&routed.stderr)
+        );
+        let routed = String::from_utf8_lossy(&routed.stdout).into_owned();
+        assert_eq!(
+            direct,
+            routed,
+            "`devctx {}` answers differently through the daemon",
+            args.join(" ")
+        );
+        assert!(
+            !routed.trim().is_empty(),
+            "`devctx {}` came back empty through the daemon — the shape of the \
+             answer probably changed and the reader silently got nothing",
+            args.join(" ")
+        );
+    }
+}
