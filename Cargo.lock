@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-api"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-central"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "devctx-core",
  "devctx-embed",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-chunk"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "devctx-core",
  "devctx-parse",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-embed"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "devctx-core",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-index"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "devctx-chunk",
  "devctx-core",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-mcp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "devctx-central",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-memory"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "devctx-chunk",
  "devctx-core",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-parse"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "devctx-core",
  "regex",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-rerank"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "devctx-core",
  "fastembed",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-search"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "devctx-core",
  "devctx-embed",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-store"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "devctx-core",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-summarize"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "devctx-tui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "devctx-central",
