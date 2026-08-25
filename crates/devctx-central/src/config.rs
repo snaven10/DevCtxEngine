@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use devctx_core::config::{Embeddings, Reranking};
+use devctx_core::config::{Embeddings, Language, Reranking, Storage};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CentralError, Result};
@@ -62,6 +62,18 @@ pub struct Defaults {
     /// Default `reranking:` for new projects.
     #[serde(default)]
     pub reranking: Reranking,
+    /// Default `language:` for new projects.
+    ///
+    /// `Option` rather than a bare value, because the two are not the same
+    /// question: an absent key means "this machine has no preference, use the
+    /// built-in", while a present one means "every project here starts in
+    /// Spanish". Storing the type's own default would make those
+    /// indistinguishable and silently override a copied config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
+    /// Default `storage:` for new projects. `Option` for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<Storage>,
 }
 
 /// `reindex:` section — the daemon's optional background refresh.
@@ -128,6 +140,28 @@ impl CentralConfig {
 
 #[cfg(test)]
 mod tests {
+    /// `language` and `storage` under `defaults:` used to be dropped on the
+    /// floor: a project created afterwards took the built-in and gave no sign
+    /// that the setting had been ignored. `Option` is what lets "unset" and
+    /// "set to the default value" stay different questions.
+    #[test]
+    fn defaults_carry_language_and_storage_only_when_set() {
+        let bare: CentralConfig = serde_yaml::from_str("defaults: {}\n").unwrap();
+        assert!(bare.defaults.language.is_none());
+        assert!(bare.defaults.storage.is_none());
+
+        let set: CentralConfig = serde_yaml::from_str("defaults:\n  language: es\n").unwrap();
+        assert!(
+            set.defaults.language.is_some(),
+            "an explicit language survives"
+        );
+
+        // And an unset one is not written back out, so a round trip does not
+        // turn "no preference" into a stated one.
+        let round = serde_yaml::to_string(&bare).unwrap();
+        assert!(!round.contains("language:"), "{round}");
+    }
+
     use super::*;
 
     #[test]
