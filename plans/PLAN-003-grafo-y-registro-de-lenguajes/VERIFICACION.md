@@ -165,6 +165,21 @@ vez no coinciden. El repositorio tiene cinco ramas indexadas y el `--full`
 reportó `files_copied: 161`, así que la sospecha es que el incremental deja filas
 de versiones anteriores, o que el conteo cruza ramas.
 
-**Sin diagnosticar, a propósito.** Hay un dato duro —incremental 1,732 contra
-full 1,580 sobre el mismo commit— y ninguna explicación verificada. Escribir un
-arreglo sobre la sospecha es exactamente lo que costó un día con el test flaky.
+**Sin diagnosticar, pero acotado.** Se probaron tres explicaciones y las tres
+cayeron, cada una con su medición:
+
+| Hipótesis | Cómo murió |
+|---|---|
+| El parser nuevo extrae menos símbolos de Rust | Los mismos dos `.rs` con el binario 0.4.1 y con el 0.6.0: **49 y 49** |
+| El `--full` limpia archivos que el incremental dejó | El `--full` reportó **`files_pruned: 0`** |
+| El incremental acumula filas de versiones anteriores | Repositorio de prueba, tres commits de una función cada uno: 49 → 52 símbolos, y un `--full` de control da **52** también. Exacto |
+
+Queda en pie lo único que este repositorio tiene y el de prueba no: **cinco ramas
+indexadas**, y un `--full` que reportó `files_copied: 161` — el copiado de chunks
+entre ramas por hash de contenido. Ese camino no se ejerció.
+
+Y una salvedad que importa: **nunca se comprobó que 1,732 estuviera mal.** Se
+comprobó que es distinto de un `--full` limpio sobre un árbol que cambió durante
+todo un día de commits. Puede ser un conteo que cruza ramas; puede ser que fuera
+correcto en su momento. Sin esa distinción, no hay bug confirmado — hay un número
+que no cuadra.
