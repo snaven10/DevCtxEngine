@@ -3421,6 +3421,44 @@ fn render_table(hits: &[SearchResult]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The defect that hid the longest, in the cheapest possible form.
+    ///
+    /// `local_recall` read the server's answer with `as_array()`. `/recall`
+    /// returns `{"memories": [...]}`, so it was always `None` and every recall
+    /// made while a server was running reported nothing — one project held
+    /// sixteen memories and answered "No memories." Nothing failed and nothing
+    /// logged, because an empty result is a perfectly ordinary answer.
+    ///
+    /// The integration test that covers this path needs an embedding model and
+    /// is `#[ignore]`d, which is to say it protects nobody by default. This one
+    /// costs nothing and runs every time, because the bug was never about
+    /// embeddings: it was about believing a payload had a shape nobody checked.
+    #[test]
+    fn memories_are_read_from_either_shape() {
+        let object = serde_json::json!({
+            "memories": [{"id": "m1"}, {"id": "m2"}],
+            "omitted_for_budget": { "count": 3 }
+        });
+        assert_eq!(
+            memories_of(&object).len(),
+            2,
+            "the object form is what the server actually returns"
+        );
+
+        let array = serde_json::json!([{"id": "m1"}]);
+        assert_eq!(
+            memories_of(&array).len(),
+            1,
+            "the bare array still works, so neither shape is assumed"
+        );
+
+        // An empty answer and a misread one look identical from the outside,
+        // which is exactly why this went unnoticed. Both are exercised.
+        assert!(memories_of(&serde_json::json!({"memories": []})).is_empty());
+        assert!(memories_of(&serde_json::json!({"hits": [{"id": "m1"}]})).is_empty());
+        assert!(memories_of(&serde_json::json!("No memories.")).is_empty());
+    }
+
     use super::*;
     use devctx_core::{VectorMetadata, VectorPoint};
 
