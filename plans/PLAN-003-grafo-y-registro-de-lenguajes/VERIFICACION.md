@@ -75,9 +75,7 @@ final corrió: la base abre limpia.
 
 ## 4. Qué NO se verificó
 
-- **Rust y Python sin reindexar.** El Paso 7 pedía comprobar que sus conteos no
-  se movieran. La suite (`cargo test --all`, 322 passed) cubre el parser, pero
-  **no se midió sobre repositorios reales**. Queda pendiente.
+- ~~**Rust y Python sin reindexar.**~~ **HECHO el 2026-08-26** — ver §7.
 - **Ningún constructor Java concreto identificado en el índice.** El test
   unitario prueba que ahora produce arista —fallaba con `edges: []` antes del
   cambio— pero no se nombró un constructor real de REVFA_BackEnd en el grafo.
@@ -118,3 +116,55 @@ extraídos.
 - **El CLI reporta un timeout como si el indexado hubiera muerto**, cuando el
   servidor sigue trabajando. Miente en la dirección cara: invita a reintentar o
   a matar el proceso.
+
+
+---
+
+## 7. Paso 7 — Rust y Python, medido (2026-08-26)
+
+El punto que quedó abierto arriba. El refactor movió los siete lenguajes a JSON,
+y los tests unitarios sólo prueban que las queries compilan y matchean en casos
+pequeños; que el comportamiento sobre código real no cambiara era otra cosa.
+
+### Python — la comparación que vale
+
+`REVFAConversorPlantilla` tenía su índice de hacía días, construido con el parser
+**anterior**. Un `--full` lo rehizo entero con el nuevo:
+
+| | Archivos | Chunks | Símbolos |
+|---|---|---|---|
+| Antes (parser viejo) | 21 | 177 | 117 |
+| Después (parser nuevo) | 21 | 177 | **117** |
+
+Idéntico. El traslado de las queries de Python al JSON no perdió ni agregó una
+sola captura.
+
+### Rust — medido contra el binario anterior
+
+El índice de DevCtxEngine ya se había rehecho con el parser nuevo vía el hook, así
+que no servía de "antes". Se comparó directamente el binario **0.4.1**
+(`~/.local/bin/devctx.bak-pre-plan003`, previo al refactor) contra el **0.6.0**,
+sobre los mismos dos archivos `.rs`:
+
+| Binario | Chunks | Símbolos |
+|---|---|---|
+| 0.4.1, pre-refactor | 80 | 49 |
+| 0.6.0, post-refactor | 80 | **49** |
+
+Idéntico también. **No hay regresión de parser en Rust.**
+
+### Lo que sí apareció, y no es del parser
+
+Reindexar DevCtxEngine con `--full` dio **1,580** símbolos donde el índice
+incremental decía **1,732** — mismo commit (`d81f196`), mismo código, 152 de
+diferencia. Los chunks no se movieron (2,529 en ambos).
+
+Como el parser produce lo mismo en ambas versiones (arriba), esto **no es del
+refactor**: es que un índice construido incrementalmente y uno construido de una
+vez no coinciden. El repositorio tiene cinco ramas indexadas y el `--full`
+reportó `files_copied: 161`, así que la sospecha es que el incremental deja filas
+de versiones anteriores, o que el conteo cruza ramas.
+
+**Sin diagnosticar, a propósito.** Hay un dato duro —incremental 1,732 contra
+full 1,580 sobre el mismo commit— y ninguna explicación verificada. Escribir un
+arreglo sobre la sospecha es exactamente lo que costó un día con el test flaky.
