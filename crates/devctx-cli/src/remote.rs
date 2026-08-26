@@ -304,7 +304,12 @@ impl Remote {
 
     fn post(&self, path: &str, body: Value) -> Result<String> {
         let req = self.auth(self.agent().post(&format!("{}{path}", self.base)));
-        read(req.send_json(body))
+        let started = std::time::Instant::now();
+        read(req.send_json(body)).map_err(|e| {
+            // How long it took is what proves or disproves a timeout claim: an
+            // agent that allows an hour cannot time out in four seconds.
+            anyhow::anyhow!("{e}\n  after {:.1}s", started.elapsed().as_secs_f64())
+        })
     }
 
     // --- typed endpoints (return the server's JSON string) ---
@@ -471,8 +476,36 @@ fn read(r: std::result::Result<ureq::Response, ureq::Error>) -> Result<String> {
             }
             anyhow::bail!("{}", msg.trim())
         }
-        Err(e) => Err(anyhow::anyhow!(e.to_string())),
+        Err(e) => Err(describe_transport_failure(e)),
     }
+}
+
+/// Say what a transport failure actually was, rather than repeating ureq's
+/// wording for it.
+///
+/// ureq normalises *any* `WouldBlock` from the socket into the string
+/// "timed out reading response" (`stream.rs`, with the comment that the socket
+/// "most definitely" is not non-blocking). So that message does not mean a
+/// timeout happened — it means a read did not complete, for a reason it threw
+/// away.
+///
+/// That mattered once: `index` reported it four seconds into a run whose agent
+/// allows an hour, against a server that then indexed for two and a half hours.
+/// Four seconds is not an hour, so no deadline expired; the message was wrong
+/// about its own cause and there was nothing else to go on.
+///
+/// This does not fix that — the cause is still unknown. It records what the next
+/// occurrence needs: the error kind underneath, and how long it took to get
+/// there, which is the number that showed the timeout story could not be true.
+fn describe_transport_failure(e: ureq::Error) -> anyhow::Error {
+    let ureq::Error::Transport(t) = &e else {
+        return anyhow::anyhow!(e.to_string());
+    };
+    let detail = match t.message() {
+        Some(m) => format!("{} ({m})", t.kind()),
+        None => t.kind().to_string(),
+    };
+    anyhow::anyhow!("{e}\n  transport failure: {detail}")
 }
 
 /// Minimal percent-encoding for a path/query segment.
