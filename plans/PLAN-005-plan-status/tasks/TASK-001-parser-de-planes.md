@@ -4,7 +4,7 @@
 - **Especialista:** — (modelo sugerido: sonnet)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plan-status`
 - **Depende de:** — (primera del plan)
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -90,4 +90,8 @@ adivinanza** — un estado inventado es exactamente lo que este plan quiere evit
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR -->
+- **Estado final:** `done`
+- **Resumen:** `devctx_core::plans` con `Plan`, `Task`, `Status`, `FileRef`, `Analysis`. Parsers puros `parse_task_doc`/`parse_plan_doc` + `load_plans(root)` que lee disco. `analyze()` calcula ready/in_progress/blocked/missing/cycles por DFS.
+- **Archivos tocados:** `crates/devctx-core/src/plans.rs` (nuevo), `crates/devctx-core/src/lib.rs` (`pub mod plans;`).
+- **Verificado por:** 18 tests unitarios sobre fixtures (`cargo test -p devctx-core plans`), todos verdes. Además `load_plans(".")` corrido contra `plans/` real: PLAN-001..005 detectados, 8 tasks en PLAN-005, `tasks=0` para PLAN-004 (sin `tasks/`), y exactamente los 3 warnings de tabla/archivo esperados (PLAN-002 TASK-010/011, PLAN-003 TASK-005).
+- **Desviaciones:** Ninguna respecto al contrato. `Status` serializa como `{"kind":"...","text":"..."}` (necesario porque `Unknown` carga texto); las tasks consumidoras (002+) deben tenerlo en cuenta al armar JSON de salida.

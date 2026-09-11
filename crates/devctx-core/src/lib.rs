@@ -6,6 +6,7 @@
 pub mod config;
 pub mod dirs;
 pub mod error;
+pub mod plans;
 pub mod rank;
 pub mod types;
 
