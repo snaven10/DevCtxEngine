@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use devctx_core::config::ProjectConfig;
+use devctx_core::plans::{self, Analysis, Plan};
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::{run as index_run, GitRepo, IndexRequest, ProgressSink};
@@ -692,6 +693,173 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
         }),
     };
     Ok(value.to_string())
+}
+
+/// `plan_status` tool: read `plans/PLAN-*/` (see `plans/PLAN-005-plan-status/`) and answer
+/// "where am I": the list of plans with no argument, or one plan's ready/in-progress/blocked
+/// tasks with `plan`. Reads markdown from disk on every call — plans are the source of truth,
+/// never copied into the store (PLAN-005 §3).
+pub fn do_plan_status(state: &AppState, plan: Option<&str>) -> Result<String, String> {
+    let value = plan_status_value(&state.root, plan)?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    Ok(fit_plan_status_budget(value, budget))
+}
+
+/// The unbudgeted `plan_status` JSON, built straight from disk. Shared by `do_plan_status`
+/// (which trims it to `DEVCTX_MAX_OUTPUT_TOKENS`) and the CLI's `devctx plan-status`, which
+/// wants the same shape without going through `AppState` — no store, no daemon, just markdown.
+pub fn plan_status_value(root: &std::path::Path, plan: Option<&str>) -> Result<Value, String> {
+    let loaded = plans::load_plans(root);
+    match plan {
+        None => Ok(plan_status_list(&loaded)),
+        Some(query) => plan_status_detail(&loaded, query),
+    }
+}
+
+/// The plan with the most recently modified `.md` file among plans that still have at least one
+/// non-done task. A tie (e.g. a fresh clone or checkout, which equalizes mtimes) is broken by the
+/// highest plan number. If every plan is fully done (or there are no plans), there is no active one.
+fn active_plan_id(plans: &[Plan]) -> Option<String> {
+    plans
+        .iter()
+        .filter(|p| !p.tasks.is_empty() && p.tasks.iter().any(|t| !t.status.is_done()))
+        .max_by(|a, b| {
+            let by_mtime = a.mtime.cmp(&b.mtime);
+            if by_mtime != std::cmp::Ordering::Equal {
+                return by_mtime;
+            }
+            plan_number(&a.id).cmp(&plan_number(&b.id))
+        })
+        .map(|p| p.id.clone())
+}
+
+fn plan_number(id: &str) -> u32 {
+    id.trim_start_matches("PLAN-").parse().unwrap_or(0)
+}
+
+fn plan_status_list(plans: &[Plan]) -> Value {
+    let active = active_plan_id(plans);
+    let items: Vec<Value> = plans
+        .iter()
+        .map(|p| {
+            let done = p.tasks.iter().filter(|t| t.status.is_done()).count();
+            json!({
+                "id": p.id,
+                "title": p.title,
+                "done": done,
+                "total": p.tasks.len(),
+                "active": active.as_deref() == Some(p.id.as_str()),
+                "task_files": !p.tasks.is_empty(),
+                "warnings_count": p.warnings.len(),
+            })
+        })
+        .collect();
+    json!({ "plans": items, "active": active })
+}
+
+/// Resolves a user-supplied plan identifier (`PLAN-005`, `005`, `5`, or the directory name)
+/// against the loaded plans.
+fn find_plan<'a>(plans: &'a [Plan], query: &str) -> Option<&'a Plan> {
+    let q = query.trim();
+    let normalized = if q.to_uppercase().starts_with("PLAN-") {
+        let n: u32 = q[5..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()?;
+        Some(format!("PLAN-{n:03}"))
+    } else if q.chars().all(|c| c.is_ascii_digit()) && !q.is_empty() {
+        let n: u32 = q.parse().ok()?;
+        Some(format!("PLAN-{n:03}"))
+    } else {
+        None
+    };
+    if let Some(id) = &normalized {
+        if let Some(p) = plans.iter().find(|p| &p.id == id) {
+            return Some(p);
+        }
+    }
+    plans
+        .iter()
+        .find(|p| p.dir.file_name().and_then(|n| n.to_str()) == Some(q))
+}
+
+fn plan_status_detail(plans: &[Plan], query: &str) -> Result<Value, String> {
+    let Some(plan) = find_plan(plans, query) else {
+        let ids: Vec<&str> = plans.iter().map(|p| p.id.as_str()).collect();
+        return Err(format!(
+            "plan '{query}' no encontrado. Planes disponibles: {}",
+            ids.join(", ")
+        ));
+    };
+    let Analysis { ready, in_progress, blocked, missing, cycles } = plans::analyze(plan);
+    let by_id: HashMap<&str, &devctx_core::plans::Task> =
+        plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+
+    let title_of = |id: &str| by_id.get(id).map(|t| t.title.clone()).unwrap_or_default();
+
+    let ready: Vec<Value> = ready.iter().map(|id| json!({ "id": id, "title": title_of(id) })).collect();
+    let in_progress: Vec<Value> =
+        in_progress.iter().map(|id| json!({ "id": id, "title": title_of(id) })).collect();
+    let blocked: Vec<Value> = blocked
+        .iter()
+        .map(|(id, waiting_on)| {
+            json!({ "id": id, "title": title_of(id), "waiting_on": waiting_on })
+        })
+        .collect();
+
+    let mut warnings: Vec<String> = plan.warnings.clone();
+    for (task, dep) in &missing {
+        warnings.push(format!("{task}: depende de {dep}, que no existe en el plan"));
+    }
+    for cycle in &cycles {
+        warnings.push(format!("ciclo de dependencias: {}", cycle.join(" -> ")));
+    }
+
+    let done = plan.tasks.iter().filter(|t| t.status.is_done()).count();
+    Ok(json!({
+        "plan": plan.id,
+        "title": plan.title,
+        "done": done,
+        "total": plan.tasks.len(),
+        "ready": ready,
+        "in_progress": in_progress,
+        "blocked": blocked,
+        "warnings": warnings,
+    }))
+}
+
+/// Fits the `plan_status` detail (or list) JSON into the output budget by dropping, in order,
+/// `warnings` then `blocked` — never `ready` — and recording what was omitted.
+fn fit_plan_status_budget(mut value: Value, budget_tokens: usize) -> String {
+    let mut out = value.to_string();
+    if budget_tokens == 0 {
+        return out;
+    }
+    let budget_chars = budget_tokens * CHARS_PER_TOKEN;
+    if out.len() <= budget_chars {
+        return out;
+    }
+    let mut omitted_warnings = 0usize;
+    let mut omitted_blocked = 0usize;
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(Value::Array(warnings)) = obj.get_mut("warnings") {
+            omitted_warnings = warnings.len();
+            warnings.clear();
+        }
+    }
+    out = value.to_string();
+    if out.len() > budget_chars {
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(Value::Array(blocked)) = obj.get_mut("blocked") {
+                omitted_blocked = blocked.len();
+                blocked.clear();
+            }
+        }
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "omitted".to_string(),
+            json!({ "blocked": omitted_blocked, "warnings": omitted_warnings }),
+        );
+    }
+    value.to_string()
 }
 
 /// `remember` tool: save a memory (deduplicated).
@@ -3276,5 +3444,140 @@ mod tests {
         assert_eq!(p.run, 2);
         assert_eq!(p.total, 788);
         assert_eq!(p.done, 0);
+    }
+
+    // --- plan_status (TASK-002) ---
+
+    fn write_plan_fixture(root: &std::path::Path) {
+        let older = root.join("plans/PLAN-001-old");
+        let newer = root.join("plans/PLAN-002-new");
+        std::fs::create_dir_all(older.join("tasks")).unwrap();
+        std::fs::create_dir_all(newer.join("tasks")).unwrap();
+
+        std::fs::write(
+            older.join("PLAN-001-old.md"),
+            "# PLAN-001 — todo terminado\n\n| Task | Estado |\n|---|---|\n| TASK-001 | `done` |\n",
+        )
+        .unwrap();
+        std::fs::write(
+            older.join("tasks/TASK-001-x.md"),
+            "# TASK-001 — x\n\n- **Estado:** `done`\n\n## Objetivo\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            newer.join("PLAN-002-new.md"),
+            "# PLAN-002 — con pendientes\n\n| Task | Estado |\n|---|---|\n\
+             | TASK-001 | `pending` |\n| TASK-002 | `pending` |\n",
+        )
+        .unwrap();
+        std::fs::write(
+            newer.join("tasks/TASK-001-a.md"),
+            "# TASK-001 — a\n\n- **Depende de:** —\n- **Estado:** `pending`\n\n## Objetivo\n",
+        )
+        .unwrap();
+        std::fs::write(
+            newer.join("tasks/TASK-002-b.md"),
+            "# TASK-002 — b\n\n- **Depende de:** TASK-001\n- **Estado:** `pending`\n\n## Objetivo\n",
+        )
+        .unwrap();
+
+        // Make the older plan's files strictly older than the newer plan's, even though
+        // "older" is only true by mtime here (both were just written) — set the older
+        // plan's mtimes back to be sure the test exercises the mtime rule and not luck.
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for f in [
+            older.join("PLAN-001-old.md"),
+            older.join("tasks/TASK-001-x.md"),
+        ] {
+            let file = std::fs::File::open(&f).unwrap();
+            file.set_modified(past).unwrap();
+        }
+    }
+
+    #[test]
+    fn active_plan_is_the_newest_with_pending_tasks_even_if_another_plan_is_newer_and_done() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_status_active_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_plan_fixture(&root);
+
+        let value = plan_status_value(&root, None).expect("list should succeed");
+        assert_eq!(value["active"].as_str(), Some("PLAN-002"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn blocked_waiting_on_names_exactly_the_pending_deps() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_status_blocked_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_plan_fixture(&root);
+
+        let value = plan_status_value(&root, Some("PLAN-002")).expect("detail should succeed");
+        assert_eq!(value["plan"].as_str(), Some("PLAN-002"));
+        let ready: Vec<&str> = value["ready"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ready, vec!["TASK-001"]);
+        let blocked = value["blocked"].as_array().unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0]["id"].as_str(), Some("TASK-002"));
+        assert_eq!(
+            blocked[0]["waiting_on"].as_array().unwrap(),
+            &vec![serde_json::json!("TASK-001")]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn budget_of_fifty_tokens_on_a_forty_task_plan_keeps_ready_and_reports_omitted() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_status_budget_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("plans/PLAN-009-grande/tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            root.join("plans/PLAN-009-grande/PLAN-009-grande.md"),
+            "# PLAN-009 — grande\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("TASK-001-ready.md"),
+            "# TASK-001 — ready\n\n- **Depende de:** —\n- **Estado:** `pending`\n\n## Objetivo\n",
+        )
+        .unwrap();
+        for n in 2..=40 {
+            let body = format!(
+                "# TASK-{n:03} — bloqueada\n\n- **Depende de:** TASK-001\n- **Estado:** `pending`\n\n## Objetivo\n"
+            );
+            std::fs::write(dir.join(format!("TASK-{n:03}-x.md")), body).unwrap();
+        }
+
+        let value = plan_status_value(&root, Some("PLAN-009")).unwrap();
+        let budgeted = fit_plan_status_budget(value, 50);
+        let parsed: Value = serde_json::from_str(&budgeted).unwrap();
+        assert!(parsed.get("omitted").is_some(), "{budgeted}");
+        assert!(
+            !parsed["ready"].as_array().unwrap().is_empty(),
+            "ready must survive the cut: {budgeted}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repo_without_plans_dir_gives_an_empty_list_not_an_error() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_status_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let value = plan_status_value(&root, None).expect("no plans/ dir is not an error");
+        assert!(value["plans"].as_array().unwrap().is_empty());
+        assert!(value["active"].is_null());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

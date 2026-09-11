@@ -4,7 +4,7 @@
 - **Especialista:** — (modelo sugerido: sonnet)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plan-status`
 - **Depende de:** TASK-001
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -64,4 +64,8 @@ Leer el disco en cada llamada: ~25 archivos. Despreciable hoy; si molesta, cache
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR -->
+- **Estado final:** `done`
+- **Resumen:** `do_plan_status`/`plan_status_value` en `state.rs`: listado (`plan_status_list`) y detalle (`plan_status_detail`) sobre `devctx_core::plans`. Plan activo = mtime mayor entre planes con tasks pendientes, empate por número de plan más alto. `Backend::plan_status` (Local/Remote) y ruta `GET /plans/status?plan=`.
+- **Archivos tocados:** `crates/devctx-mcp/src/state.rs`, `crates/devctx-mcp/src/backend.rs`, `crates/devctx-api/src/lib.rs`.
+- **Verificado por:** `cargo test -p devctx-mcp` — 27/27 verdes, incluye los 4 tests nuevos de `plan_status` (activo por mtime con desempate, `waiting_on` exacto, presupuesto con `DEVCTX_MAX_OUTPUT_TOKENS=50` sobre 40 tasks conservando `ready`, repo sin `plans/` da lista vacía sin error).
+- **Desviaciones:** La función pública quedó como `plan_status_value(root: &Path, plan)` en vez de tomar `&AppState` — la pensé así desde el principio para que TASK-004 (CLI) no necesite construir un `AppState` completo (store, embedder) solo para leer markdown.

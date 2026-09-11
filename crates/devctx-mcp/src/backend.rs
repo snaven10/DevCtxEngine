@@ -10,9 +10,10 @@ use serde_json::{json, Value};
 use crate::state::{
     do_backfill_links, do_build_context, do_impact, do_index, do_index_status, do_list_projects,
     do_memories_by_file, do_memories_by_symbol, do_memory_context, do_memory_forget,
-    do_memory_move, do_memory_refs, do_memory_stats, do_read_file, do_read_symbol,
-    do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
-    do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
+    do_memory_move, do_memory_refs, do_memory_stats, do_plan_status, do_read_file,
+    do_read_symbol, do_recall_scoped, do_references, do_remember, do_remember_shared,
+    do_routes_for_handler, do_search, do_search_project, do_search_routes, do_summarize,
+    parse_mode, AppState,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -219,6 +220,18 @@ impl Backend {
         match self {
             Backend::Local(s) => do_index_status(s),
             Backend::Remote(r, _) => r.get("/status"),
+        }
+    }
+
+    /// Progress on the plans in `plans/` (see `plans/PLAN-005-plan-status/`): no `plan` lists
+    /// them, `plan` gives one plan's ready/in-progress/blocked tasks.
+    pub fn plan_status(&self, plan: Option<&str>) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_plan_status(s, plan),
+            Backend::Remote(r, _) => match plan {
+                Some(p) => r.get(&format!("/plans/status?plan={}", urlencode(p))),
+                None => r.get("/plans/status"),
+            },
         }
     }
 
