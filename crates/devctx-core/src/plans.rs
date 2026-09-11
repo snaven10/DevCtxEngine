@@ -65,6 +65,7 @@ impl FileRef {
     /// Whether `self` matches a lookup `query`, per TASK-007's rule:
     /// - exact match, or
     /// - both have >= 2 path components and one is a component-wise suffix of the other.
+    ///
     /// A bare single-component ref (e.g. `lib.rs`) only matches an identical bare query.
     pub fn matches(&self, query: &str) -> bool {
         if self.path == query {
