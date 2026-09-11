@@ -1718,14 +1718,27 @@ fn cmd_recall(
 /// The memories out of a recall payload, accepting either the object the
 /// server returns or a bare array. Neither shape should be assumed: this exact
 /// mismatch silently emptied local recall.
-fn memories_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
+///
+/// A shape that is neither of those is an error, not an empty result. It used
+/// to fall through to `unwrap_or_default()`, so a payload nobody had seen
+/// before — a stale server answering `{"hits": [...]}`, an error body that
+/// slipped past the transport layer, a bare string — read exactly like a
+/// project with no memories. An empty `memories: []` is still a legitimate
+/// answer and stays `Ok(vec![])`; anything else the caller has to see.
+fn memories_of(v: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
     match v {
-        serde_json::Value::Array(a) => a.clone(),
-        _ => v
-            .get("memories")
-            .and_then(|m| m.as_array())
-            .cloned()
-            .unwrap_or_default(),
+        serde_json::Value::Array(a) => Ok(a.clone()),
+        serde_json::Value::Object(_) => match v.get("memories") {
+            Some(serde_json::Value::Array(a)) => Ok(a.clone()),
+            Some(other) => bail!(
+                "recall answered with a `memories` field that is not an array: {other}"
+            ),
+            None => bail!("recall answered with no `memories` field at all: {v}"),
+        },
+        other => bail!(
+            "recall answered with a shape that is neither an array nor an object with \
+             `memories`: {other}"
+        ),
     }
 }
 
@@ -1739,7 +1752,7 @@ fn local_recall(cfg: &ProjectConfig, query: &str, limit: usize) -> Result<Vec<se
         // bare array, so `as_array()` was always None and every recall made
         // while a server was running reported no local memories at all — for a
         // project that had sixteen of them.
-        return Ok(memories_of(&parsed));
+        return memories_of(&parsed).context("reading the local server's recall answer");
     }
     let embedder = build_embedder(cfg)?;
     let store = open_store(cfg, embedder.dimension())?;
@@ -3440,23 +3453,42 @@ mod tests {
             "omitted_for_budget": { "count": 3 }
         });
         assert_eq!(
-            memories_of(&object).len(),
+            memories_of(&object).unwrap().len(),
             2,
             "the object form is what the server actually returns"
         );
 
         let array = serde_json::json!([{"id": "m1"}]);
         assert_eq!(
-            memories_of(&array).len(),
+            memories_of(&array).unwrap().len(),
             1,
             "the bare array still works, so neither shape is assumed"
         );
 
-        // An empty answer and a misread one look identical from the outside,
-        // which is exactly why this went unnoticed. Both are exercised.
-        assert!(memories_of(&serde_json::json!({"memories": []})).is_empty());
-        assert!(memories_of(&serde_json::json!({"hits": [{"id": "m1"}]})).is_empty());
-        assert!(memories_of(&serde_json::json!("No memories.")).is_empty());
+        // A legitimately empty answer still reads as empty.
+        assert!(memories_of(&serde_json::json!({"memories": []}))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The regression this closes: a shape nobody expected used to fall
+    /// through to `unwrap_or_default()` and read exactly like "no memories" —
+    /// indistinguishable from the legitimately empty case above. It must now
+    /// be an error a caller can see, not a silent zero.
+    #[test]
+    fn an_unrecognized_shape_is_an_error_not_an_empty_result() {
+        assert!(
+            memories_of(&serde_json::json!({"hits": [{"id": "m1"}]})).is_err(),
+            "an object with no `memories` field must not read as empty"
+        );
+        assert!(
+            memories_of(&serde_json::json!({"memories": "not an array"})).is_err(),
+            "a `memories` field that is not an array must not read as empty"
+        );
+        assert!(
+            memories_of(&serde_json::json!("No memories.")).is_err(),
+            "a bare string must not read as empty"
+        );
     }
 
     use super::*;

@@ -1856,6 +1856,38 @@ pub fn do_remember_shared(
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
+/// `remember` when no project is bound at all — not even a group — and the
+/// caller did not ask for `scope: local`. The only project-less place left to
+/// put the content is the central store as global, via the same write path
+/// `do_remember_shared` uses and the same store `do_recall_global` reads back
+/// from. `group` is left empty so `Central::remember` normalizes the scope to
+/// global rather than rejecting it for having nowhere to go.
+///
+/// There is no `AppState` here, so there is no repository graph to link this
+/// against — an unbound session has no project whose symbols it could mean.
+pub fn do_remember_unbound(
+    content: &str,
+    title: &str,
+    memory_type: &str,
+    topic: &str,
+    tags: &str,
+    files: &str,
+) -> Result<String, String> {
+    let mut out = central()?
+        .remember(content, title, memory_type, topic, tags, "", "unbound", "", "", files)
+        .map_err(|e| e.to_string())?;
+    if let Some(o) = out.as_object_mut() {
+        o.insert(
+            "forced_scope".into(),
+            json!(
+                "global — no project was bound, so \"local\" had nowhere to write to. \
+                 Move it later with memory_move if it belongs somewhere narrower."
+            ),
+        );
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
 /// `recall` across scopes. Local and global results are fused by **rank**, not
 /// score: the two stores may embed with different models, so their similarities
 /// are not on comparable scales.

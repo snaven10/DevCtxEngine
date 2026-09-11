@@ -29,12 +29,36 @@ pub struct RemoteClient {
     token: Option<String>,
 }
 
+/// Default per-call timeout for a routed request, in seconds. This used to be a
+/// flat 3600s applied to every call — search, read_file, recall, all of it —
+/// so a genuinely hung daemon or a stalled connection left a caller waiting an
+/// hour to find out. Overridable because a slow network is a real thing an
+/// operator may need to widen this for, without a rebuild.
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+/// Timeout for the one route that can legitimately run for minutes: indexing a
+/// large repository. Not read from the environment — an operator who wants
+/// `index_repo` to time out sooner than 30 minutes can call it with `full:
+/// false` and let incremental indexing do less work per call.
+const LONG_TIMEOUT_SECS: u64 = 1800;
+
+/// How long a routed call waits before giving up, from `DEVCTX_DAEMON_TIMEOUT_SECS`.
+fn default_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("DEVCTX_DAEMON_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS),
+    )
+}
+
+fn long_timeout() -> Duration {
+    Duration::from_secs(LONG_TIMEOUT_SECS)
+}
+
 impl RemoteClient {
-    fn agent(&self) -> ureq::Agent {
-        // Generous: a routed `index` can run for many minutes on the server.
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(3600))
-            .build()
+    fn agent(&self, timeout: Duration) -> ureq::Agent {
+        ureq::AgentBuilder::new().timeout(timeout).build()
     }
 
     fn auth(&self, req: ureq::Request) -> ureq::Request {
@@ -45,15 +69,23 @@ impl RemoteClient {
     }
 
     fn get(&self, path: &str) -> Result<String, String> {
+        self.get_timed(path, default_timeout())
+    }
+
+    fn get_timed(&self, path: &str, timeout: Duration) -> Result<String, String> {
         read(
-            self.auth(self.agent().get(&format!("{}{path}", self.base)))
+            self.auth(self.agent(timeout).get(&format!("{}{path}", self.base)))
                 .call(),
         )
     }
 
     fn post(&self, path: &str, body: Value) -> Result<String, String> {
+        self.post_timed(path, body, default_timeout())
+    }
+
+    fn post_timed(&self, path: &str, body: Value, timeout: Duration) -> Result<String, String> {
         read(
-            self.auth(self.agent().post(&format!("{}{path}", self.base)))
+            self.auth(self.agent(timeout).post(&format!("{}{path}", self.base)))
                 .send_json(body),
         )
     }
@@ -175,7 +207,11 @@ impl Backend {
     pub fn index(&self, full: bool) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_index(s, full),
-            Backend::Remote(r, _) => r.post("/index", json!({ "full": full })),
+            // The one call worth a long timeout: indexing a large repository
+            // from scratch can run for many minutes on the server.
+            Backend::Remote(r, _) => {
+                r.post_timed("/index", json!({ "full": full }), long_timeout())
+            }
         }
     }
 

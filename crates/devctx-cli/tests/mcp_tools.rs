@@ -332,3 +332,67 @@ fn recall_reaches_global_memories_from_another_project() {
         "a project-local memory leaked across projects: {all}"
     );
 }
+
+/// The memory protocol document must be discoverable over MCP itself, not
+/// only by pasting it into a project's own instructions file. Needs no model
+/// (`list_prompts` is a static list), so it runs on every suite.
+#[test]
+fn lists_the_memory_protocol_prompt() {
+    let tmp = Tmp::new("prompts");
+    let home = tmp.home();
+    let repo = tmp.repo("solo");
+    devctx(&home, &repo, &["projects", "add", ".", "--init"]);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&repo)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let init = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"#,
+        r#""2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+    );
+    let call = r#"{"jsonrpc":"2.0","id":2,"method":"prompts/list","params":{}}"#;
+    stdin.write_all(init.as_bytes()).unwrap();
+    stdin.write_all(call.as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+
+    let stdout = child.stdout.take().expect("stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let result = loop {
+        let Some(Ok(line)) = lines.next() else {
+            let _ = child.kill();
+            panic!("the MCP server closed before answering prompts/list");
+        };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if msg.get("id").and_then(|v| v.as_u64()) != Some(2) {
+            continue;
+        }
+        if let Some(err) = msg.get("error") {
+            let _ = child.kill();
+            panic!("prompts/list returned an error: {err}");
+        }
+        break msg["result"].clone();
+    };
+    drop(stdin);
+    let _ = child.wait();
+
+    let prompts = result["prompts"].as_array().expect("a prompts array");
+    let names: Vec<&str> = prompts.iter().filter_map(|p| p["name"].as_str()).collect();
+    assert!(
+        names.contains(&"memory-protocol"),
+        "expected the memory-protocol prompt, got: {names:?}"
+    );
+}

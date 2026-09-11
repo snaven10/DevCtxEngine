@@ -109,6 +109,7 @@ registry's copy.
 | `DEVCTX_DB_THREADS` | DuckDB worker threads. Default `4`. |
 | `DEVCTX_MODEL_IDLE_SECS` | How long an unused model is kept loaded. Default `300`; `0` keeps it for the life of the process. |
 | `DEVCTX_MAX_OUTPUT_TOKENS` | Cap on a whole-file `read_file` with no line range. Default `8000`; `0` disables. |
+| `DEVCTX_DAEMON_TIMEOUT_SECS` | How long an MCP session waits for a routed call to the shared daemon before giving up. Default `120`. `index_repo` stays on a fixed 1800s regardless of this, since indexing a large repository can legitimately run for many minutes. |
 | `DEVCTX_NO_UPDATE_CHECK` | Opt out of the background release check. |
 | `DEVCTX_LANG` | Language of the grouped `--help` summary (`en` / `es`). |
 | `OPENAI_API_KEY` / `VOYAGE_API_KEY` | Credentials for the API embedding providers. |
