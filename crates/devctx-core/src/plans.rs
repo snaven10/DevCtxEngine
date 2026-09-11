@@ -627,7 +627,9 @@ fn h1_title_strip_plan_prefix(title: &str, plan_id: &str) -> String {
     t.to_string()
 }
 
-fn status_label(s: &Status) -> String {
+/// The word a caller sees for a `Status` (`"pending"`, `"in_progress"`, `"done"`, `"blocked"`,
+/// or `"unknown(...)"`).
+pub fn status_label(s: &Status) -> String {
     match s {
         Status::Pending => "pending".to_string(),
         Status::InProgress => "in_progress".to_string(),

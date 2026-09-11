@@ -4,7 +4,7 @@
 - **Especialista:** — (modelo sugerido: sonnet)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plan-status`
 - **Depende de:** TASK-001
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -60,4 +60,8 @@ task de qué plan lo va a tocar o lo tocó?" cuesta una lectura de `plans/` y **
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR -->
+- **Estado final:** `done`
+- **Resumen:** `plan_tasks_for_file(root, query, resolved)` en `state.rs` usa `FileRef::matches` (TASK-001) para emparejar; `do_memories_by_file` la llama con la ruta resuelta por `file_index().resolve` cuando la consulta es pelada, y agrega el campo `plan_tasks` (siempre presente, orden no-done primero luego plan descendente, tope 10) vía `with_plan_tasks_field` sin tocar `linked_response`.
+- **Archivos tocados:** `crates/devctx-mcp/src/state.rs`, `crates/devctx-core/src/plans.rs` (`status_label` pasó a `pub`).
+- **Verificado por:** `cargo test -p devctx-mcp` (33/33) — incluye: ref completa con línea matchea la misma ruta completa y trae `line`; `lib.rs` pelado NO matchea `crates/a/src/lib.rs` pero sí matchea la consulta pelada `lib.rs`; `with_plan_tasks_field` agrega el campo sin alterar el resto del JSON. `cargo test -p devctx-core` (29/29).
+- **Desviaciones:** El `resolve()` de nombre pelado ahora se intenta siempre que la consulta no tenga `/` (antes solo cuando `linked` venía vacío) porque `plan_tasks_for_file` lo necesita independientemente de si hubo memorias — el camino de memorias no cambia de comportamiento (sigue re-consultando `memory_ids_for_file` solo cuando `linked` está vacío).

@@ -2938,7 +2938,9 @@ pub fn do_memories_by_symbol(
     )
 }
 
-/// `memories_by_file` tool: the decisions recorded about a file.
+/// `memories_by_file` tool: the decisions recorded about a file, plus the plan tasks that
+/// mention it (`plan_tasks`, PLAN-005 TASK-007) — computed at call time from `plans/`, never
+/// stored, so a parser failure never breaks the memory half of the answer.
 pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result<String, String> {
     let store = state.open_store()?;
     let mut linked = store
@@ -2948,17 +2950,76 @@ pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result
     // The junction stores the path the index uses, and a caller who has a bare
     // file name — which is how anyone refers to a file in conversation — would
     // otherwise get nothing while the links sit right there. Resolve the name
-    // the same way the writer did, so both spellings reach the same rows.
-    if linked.is_empty() && !file.contains('/') {
-        if let Ok(index) = store.file_index() {
-            if let Some(resolved) = index.resolve(&[file.to_string()]).into_iter().next() {
-                linked = store
-                    .memory_ids_for_file(&resolved, limit)
-                    .map_err(|e| e.to_string())?;
+    // the same way the writer did, so both spellings reach the same rows — and
+    // the same resolved path is what plan-task matching below also tries.
+    let resolved: Option<String> = if file.contains('/') {
+        None
+    } else {
+        store
+            .file_index()
+            .ok()
+            .and_then(|index| index.resolve(&[file.to_string()]).into_iter().next())
+    };
+    if linked.is_empty() {
+        if let Some(r) = &resolved {
+            linked = store.memory_ids_for_file(r, limit).map_err(|e| e.to_string())?;
+        }
+    }
+
+    let out = linked_response(&store, file, linked, file, limit)?;
+    let plan_tasks = plan_tasks_for_file(&state.root, file, resolved.as_deref());
+    Ok(with_plan_tasks_field(out, plan_tasks))
+}
+
+/// Plan tasks (across all plans in `plans/`) whose `Archivos`/inline-code file references match
+/// `query` (or `resolved`, the index's resolution of a bare filename), per the matching rule in
+/// [`devctx_core::plans::FileRef::matches`]. Non-done first, then by plan number descending,
+/// capped at 10. Never errors: an unreadable `plans/` yields an empty list.
+fn plan_tasks_for_file(root: &std::path::Path, query: &str, resolved: Option<&str>) -> Vec<Value> {
+    let loaded = plans::load_plans(root);
+    let mut hits: Vec<(&Plan, &devctx_core::plans::Task, Option<u32>)> = Vec::new();
+    for p in &loaded {
+        for t in &p.tasks {
+            let m = t.files.iter().find(|f| {
+                f.matches(query) || resolved.map(|r| f.matches(r)).unwrap_or(false)
+            });
+            if let Some(fref) = m {
+                hits.push((p, t, fref.line));
             }
         }
     }
-    linked_response(&store, file, linked, file, limit)
+    hits.sort_by(|a, b| {
+        let by_done = a.1.status.is_done().cmp(&b.1.status.is_done());
+        if by_done != std::cmp::Ordering::Equal {
+            return by_done;
+        }
+        plan_number(&b.0.id).cmp(&plan_number(&a.0.id))
+    });
+    hits.truncate(10);
+    hits.into_iter()
+        .map(|(p, t, line)| {
+            json!({
+                "plan": p.id,
+                "task": t.id,
+                "title": t.title,
+                "status": plans::status_label(&t.status),
+                "line": line,
+            })
+        })
+        .collect()
+}
+
+/// Adds `plan_tasks` to a `memories_by_file`-shaped JSON object. Always present (an empty array
+/// means "none", never "not computed") — the same rule as `omitted_for_budget` elsewhere in this
+/// module, so an older client cannot mistake a missing field for a question never asked.
+fn with_plan_tasks_field(out: String, plan_tasks: Vec<Value>) -> String {
+    match serde_json::from_str::<Value>(&out) {
+        Ok(Value::Object(mut map)) => {
+            map.insert("plan_tasks".to_string(), Value::Array(plan_tasks));
+            serde_json::to_string(&Value::Object(map)).unwrap_or(out)
+        }
+        _ => out,
+    }
 }
 
 /// `memory_refs` tool: the inverse — what code one memory concerns.
@@ -3736,5 +3797,59 @@ mod tests {
         assert_eq!(value["message"].as_str(), Some("sin tasks"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- plan_tasks_for_file (TASK-007) ---
+
+    fn write_file_ref_fixture(root: &std::path::Path) {
+        let dir = root.join("plans/PLAN-002-x/tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(root.join("plans/PLAN-002-x/PLAN-002-x.md"), "# PLAN-002 — x\n").unwrap();
+        std::fs::write(
+            dir.join("TASK-001-a.md"),
+            "# TASK-001 — a\n\n- **Depende de:** —\n- **Estado:** `pending`\n\n## Archivos\n\n\
+             - **Modificar:** `crates/a/src/x.rs:10`\n\n\
+             Referencia pelada: `lib.rs`.\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_full_path_reference_with_a_line_matches_the_same_full_path() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_tasks_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_file_ref_fixture(&root);
+
+        let hits = plan_tasks_for_file(&root, "crates/a/src/x.rs", None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["task"].as_str(), Some("TASK-001"));
+        assert_eq!(hits[0]["line"].as_u64(), Some(10));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bare_lib_rs_reference_does_not_match_a_full_path_query() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_tasks_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_file_ref_fixture(&root);
+
+        let hits = plan_tasks_for_file(&root, "crates/a/src/lib.rs", None);
+        assert!(hits.is_empty(), "a bare `lib.rs` must not match a full path: {hits:?}");
+
+        // But it matches an equally bare query.
+        let hits = plan_tasks_for_file(&root, "lib.rs", None);
+        assert_eq!(hits.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn with_plan_tasks_field_adds_the_field_without_disturbing_the_rest() {
+        let original = r#"{"subject":"x.rs","memories":[],"matched_by":"junction"}"#.to_string();
+        let out = with_plan_tasks_field(original, vec![json!({"plan": "PLAN-002", "task": "TASK-001"})]);
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["subject"].as_str(), Some("x.rs"));
+        assert_eq!(value["plan_tasks"].as_array().unwrap().len(), 1);
     }
 }
