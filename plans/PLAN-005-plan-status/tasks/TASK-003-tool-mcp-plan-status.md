@@ -4,7 +4,7 @@
 - **Especialista:** — (modelo sugerido: sonnet)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plan-status`
 - **Depende de:** TASK-002
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -55,4 +55,8 @@ Ninguno propio: es cableado. El riesgo está en TASK-002.
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR -->
+- **Estado final:** `done`
+- **Resumen:** `PlanStatusReq { project, plan }` + método `plan_status` en `DevctxServer`, mismo patrón que `impact_analysis` (`backend_for` → `run_blocking` → `annotate`). Descripción de 139 caracteres. Línea agregada a `with_instructions` sobre llamar `plan_status` tras compactar.
+- **Archivos tocados:** `crates/devctx-mcp/src/lib.rs`.
+- **Verificado por:** `cargo check --workspace --all-targets` limpio. Longitud de la descripción medida por script (139 < 200). El escenario completo por protocolo MCP real (con y sin `plan`, con `project`, plan inexistente) se cubre en TASK-008 (`mcp_tools.rs`) para no duplicar la fixture de planes.
+- **Desviaciones:** Ninguna.

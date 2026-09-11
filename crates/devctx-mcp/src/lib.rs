@@ -186,6 +186,18 @@ struct ImpactReq {
     depth: Option<usize>,
 }
 
+/// Parameters for the `plan_status` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct PlanStatusReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
+    /// Plan id (PLAN-005 or 5). Omit to list plans.
+    #[serde(default)]
+    plan: Option<String>,
+}
+
 /// Parameters for the `memory_context` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -919,6 +931,21 @@ impl DevctxServer {
             .map(|out| Self::annotate(out, resolved))
     }
 
+    /// Progress on the plans under `plans/` (markdown, source of truth).
+    #[tool(
+        description = "Plans in plans/ (markdown, source of truth): no arg lists progress and \
+        the active plan; with `plan`, ready/in-progress/blocked tasks. JSON."
+    )]
+    async fn plan_status(
+        &self,
+        Parameters(req): Parameters<PlanStatusReq>,
+    ) -> Result<String, ErrorData> {
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        run_blocking(move || backend.plan_status(req.plan.as_deref()))
+            .await
+            .map(|out| Self::annotate(out, resolved))
+    }
+
     /// The most recent memories, with no query.
     #[tool(
         description = "The most recently written memories, with no query — for \
@@ -1126,7 +1153,9 @@ impl ServerHandler for DevctxServer {
              The memory-recording protocol (when to remember, how to scope it, how recall \
              works) is available as the `memory-protocol` prompt and as the \
              `devctx://memory-protocol` resource, rather than needing to be pasted into a \
-             project's own instructions.",
+             project's own instructions.\n\n\
+             After a compaction, call `plan_status` before resuming work: it reads the \
+             plans under plans/ and answers what is ready, in progress, or blocked.",
         )
     }
 
