@@ -117,7 +117,7 @@ consulta; no los copia a ninguna tabla.**
 | TASK-002 | `do_plan_status` en `state.rs`: listado, listas/bloqueadas, ciclos, presupuesto; `Backend` + ruta HTTP | TASK-001 | `done` |
 | TASK-003 | Tool MCP `plan_status(plan?, project?)` | TASK-002 | `done` |
 | TASK-004 | Subcomando `devctx plan-status [PLAN] [--format json]` | TASK-001 | `done` |
-| TASK-005 | Hook `SessionStart` inyecta las próximas tasks del plan activo (fuera del repo) | TASK-004 | `pending` (fuera de alcance de este agente: la hace el orquestador en `~/.claude`) |
+| TASK-005 | Hook `SessionStart` inyecta las próximas tasks del plan activo (fuera del repo) | TASK-004 | `done` (hook en `~/.claude/hooks/devctx-session-start.sh`, fuera del repo) |
 | TASK-006 | `/plans/graph` + pestaña "Plans" en el dashboard | TASK-002 | `done` |
 | TASK-007 | `memories_by_file` devuelve también `plan_tasks` | TASK-001 | `done` |
 | TASK-008 | Tests de integración y docs (EN + ES) | TASK-003, TASK-004, TASK-006, TASK-007 | `done` |

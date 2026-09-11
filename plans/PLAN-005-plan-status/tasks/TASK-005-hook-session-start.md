@@ -4,7 +4,7 @@
 - **Especialista:** — (lo hace el **orquestador**, en `~/.claude`; no es un cambio del repo)
 - **Proyecto:** configuración global (`~/.claude/hooks/devctx-session-start.sh`)
 - **Depende de:** TASK-004
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
