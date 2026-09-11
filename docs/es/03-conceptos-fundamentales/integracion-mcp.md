@@ -92,7 +92,7 @@ solo lugar.
 
 ## Las herramientas
 
-23 herramientas, agrupadas por lo que responden.
+24 herramientas, agrupadas por lo que responden.
 
 ### Código
 
@@ -127,12 +127,25 @@ Angular.
 | `recall` | Memorias relevantes a una consulta, en todos los niveles, etiquetadas con su origen |
 | `memory_context` | Las memorias más recientes, *sin consulta* — para recuperarse tras un reset, cuando todavía no sabés qué preguntar |
 | `memories_by_symbol` | Por qué este símbolo es como es — lo que el grafo de llamadas no puede responder |
-| `memories_by_file` | Lo mismo, para un archivo |
+| `memories_by_file` | Lo mismo, para un archivo — más `plan_tasks`, las tasks de plan (de `plans/`) que lo mencionan |
 | `memory_refs` | La inversa: dado un id de memoria, los símbolos y archivos que le conciernen |
 | `memory_stats` | Conteos, total y por tipo |
 | `memory_forget` | Borrar una permanentemente. No reversible. |
 | `memory_move` | Mover entre niveles, o a otro proyecto. El id cambia. |
 | `build_context` | Un brief con presupuesto: lo conocido + código + lo registrado contra ese código |
+
+### Planes
+
+| Herramienta | Responde |
+|---|---|
+| `plan_status` | Progreso de los planes en `plans/` (markdown, fuente de verdad): sin argumento lista todos los planes y nombra el activo; con `plan`, las tasks listas/en curso/bloqueadas de ese plan |
+
+Los planes viven como markdown escrito a mano en git, nunca se copian a la
+base: `plan_status` lee `plans/PLAN-*/` en cada llamada. La tabla de progreso
+de un plan y los archivos de sus tasks pueden discrepar (ambos se escriben a
+mano) — cuando pasa, el archivo de la task manda y la discrepancia se reporta
+como warning, nunca se elige en silencio. Llamala justo después de compactar
+para recuperar qué task está lista para arrancar.
 
 ### Proyectos e indexado
 

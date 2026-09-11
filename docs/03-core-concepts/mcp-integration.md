@@ -88,7 +88,7 @@ that moves the session, useful when a long stretch of work lives in one place.
 
 ## The tools
 
-23 tools, grouped by what they answer.
+24 tools, grouped by what they answer.
 
 ### Code
 
@@ -123,12 +123,25 @@ Angular.
 | `recall` | Memories relevant to a query, across every tier, each tagged with where it came from |
 | `memory_context` | The most recent memories, *with no query* — for recovering after a reset, when you don't yet know what to ask |
 | `memories_by_symbol` | Why this symbol is the way it is — what the call graph cannot answer |
-| `memories_by_file` | The same, for a file |
+| `memories_by_file` | The same, for a file — plus `plan_tasks`, the plan tasks (from `plans/`) that mention it |
 | `memory_refs` | The inverse: given a memory id, the symbols and files it concerns |
 | `memory_stats` | Counts, total and per type |
 | `memory_forget` | Permanently delete one. Not reversible. |
 | `memory_move` | Move between tiers, or to another project. The id changes. |
 | `build_context` | One budgeted brief: known + code + recorded-against-that-code |
+
+### Plans
+
+| Tool | Answers |
+|---|---|
+| `plan_status` | Progress on the plans under `plans/` (markdown, source of truth): no argument lists every plan and names the active one; with `plan`, that plan's ready/in-progress/blocked tasks |
+
+Plans live as hand-written markdown in git, never copied into the store:
+`plan_status` reads `plans/PLAN-*/` on every call. A plan's own progress table
+and its task files can disagree (both are written by hand) — when they do, the
+task file wins and the disagreement is reported as a warning, never silently
+picked one way. Call it right after a compaction to recover which task is
+ready to start.
 
 ### Projects and indexing
 

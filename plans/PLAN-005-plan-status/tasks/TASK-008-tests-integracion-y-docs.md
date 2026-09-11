@@ -4,7 +4,7 @@
 - **Especialista:** — (modelo sugerido: sonnet para tests; haiku para docs)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plan-status`
 - **Depende de:** TASK-003, TASK-004, TASK-006, TASK-007
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -57,4 +57,8 @@ no corre. Ver PLAN §5.
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR -->
+- **Estado final:** `done`
+- **Resumen:** Fixture `write_plan_status_fixture` en `mcp_tools.rs` (PLAN-001 4/4 done, PLAN-002-x con lista/en curso/bloqueada/dep faltante). 5 tests MCP nuevos: listado con activo correcto, detalle con `waiting_on` y warning de dep faltante, plan inexistente falla con los ids disponibles (`call_tool_error`, nuevo helper), `memories_by_file` trae `plan_tasks` por MCP, y el JSON del CLI (`--format json`) coincide byte a byte con el de la tool (salvo `resolved_project`, que el CLI no tiene). Docs actualizadas EN+ES: tabla de tools (24, antes 23) con sección "Plans"/"Planes", `memories_by_file` menciona `plan_tasks`, y una sección nueva "Plans, and the markdown format `plan_status` expects" / "Planes, y el formato markdown que espera `plan_status`" con el formato mínimo de task y la regla "el archivo manda".
+- **Archivos tocados:** `crates/devctx-cli/tests/mcp_tools.rs`, `docs/03-core-concepts/mcp-integration.md`, `docs/es/03-conceptos-fundamentales/integracion-mcp.md`, `docs/04-agent-workflow.md`, `docs/es/04-flujo-de-trabajo-del-agente.md`.
+- **Verificado por:** `cargo test -p devctx-cli --test mcp_tools` (8/8 no ignorados, incluye los 5 nuevos + el que compara CLI vs tool) y `cargo test -p devctx-cli --test plan_status_cli` (5/5, TASK-004). `cargo check --workspace --all-targets` limpio.
+- **Desviaciones:** Paso 6 ("sanear los 3 desacuerdos reales preguntando al usuario") **no se ejecutó**: la decisión ya vino aprobada en las instrucciones de esta tarea — "el archivo de la task manda, emitir warning, NO editar esos archivos" (PLAN-002 TASK-010/011, PLAN-003 TASK-005) — así que preguntar de nuevo habría sido redundante. `devctx plan-status` sobre el `plans/` real de este repo **sigue reportando esos 3 warnings**, a propósito: es el comportamiento correcto según la decisión aprobada, no un pendiente. El criterio de aceptación "ya no reporta desacuerdos" del plan original queda así superado por la decisión del usuario.
