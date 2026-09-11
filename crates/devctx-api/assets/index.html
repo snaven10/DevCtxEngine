@@ -29,7 +29,7 @@
   #left { border-right: 1px solid var(--border); }
   #right { border-left: 1px solid var(--border); }
   #center { position: relative; padding: 0; }
-  #cy { position: absolute; inset: 0; }
+  #cy, #cyPlan { position: absolute; inset: 0; }
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
        color: var(--muted); margin: 16px 0 6px; }
   h2:first-child { margin-top: 0; }
@@ -95,13 +95,14 @@
   </div>
 
   <!-- graph -->
-  <div class="col" id="center"><div id="cy"></div></div>
+  <div class="col" id="center"><div id="cy"></div><div id="cyPlan" style="display:none"></div></div>
 
   <!-- explore / memories -->
   <div class="col" id="right">
     <div class="tabs">
       <button data-tab="explore" class="active">Explore</button>
       <button data-tab="memories">Memories</button>
+      <button data-tab="plans">Plans</button>
     </div>
 
     <div class="pane active" id="pane-explore">
@@ -123,6 +124,22 @@
       </div>
       <h2 id="memHeader">recent</h2>
       <div id="memList" class="empty">Loading…</div>
+    </div>
+
+    <div class="pane" id="pane-plans">
+      <div class="field">
+        <label>plan</label>
+        <select id="planSelect"></select>
+      </div>
+      <div class="stat" id="planStat"></div>
+      <h2>ready</h2>
+      <div id="planReady" class="empty">—</div>
+      <h2>in progress</h2>
+      <div id="planInProgress" class="empty">—</div>
+      <h2>blocked</h2>
+      <div id="planBlocked" class="empty">—</div>
+      <h2>selected task</h2>
+      <div id="planTaskInfo" class="empty">No task selected.</div>
     </div>
   </div>
 </main>
@@ -298,6 +315,111 @@ async function doRecall() {
   catch (e) { $('memList').textContent = 'recall error: ' + e.message; }
 }
 
+// --- Plans tab: a separate cytoscape instance (#cyPlan) so switching back to
+// Explore never re-fetches or re-lays-out the (possibly large) call graph in #cy. ---
+
+let planCy = null;
+
+function graphStylePlan() {
+  return [
+    { selector: 'node', style: {
+        'label': 'data(label)', 'color': '#c9d1d9', 'font-size': 7,
+        'width': 14, 'height': 14, 'text-valign': 'center', 'text-halign': 'right',
+        'text-margin-x': 2, 'min-zoomed-font-size': 6, 'background-color': '#8b949e' }},
+    { selector: 'node[status = "done"]', style: { 'background-color': '#3fb950' }},
+    { selector: 'node[status = "in_progress"]', style: { 'background-color': '#58a6ff' }},
+    { selector: 'node[status = "ready"]', style: { 'background-color': '#8b949e' }},
+    { selector: 'node[status = "blocked"]', style: {
+        'background-color': '#f85149', 'border-width': 2, 'border-style': 'dashed',
+        'border-color': '#f85149' }},
+    { selector: 'node[status = "missing"]', style: {
+        'background-color': '#161b22', 'shape': 'diamond', 'border-width': 2,
+        'border-color': '#f85149' }},
+    { selector: 'node:selected', style: { 'border-color': '#fff', 'border-width': 2, 'width': 22, 'height': 22 }},
+    { selector: 'edge', style: {
+        'width': 1, 'line-color': '#8b949e', 'target-arrow-color': '#8b949e',
+        'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.7, 'opacity': 0.7 }},
+  ];
+}
+
+function selectPlanNode(node) {
+  const d = node.data();
+  const deps = (d.depends_on || []).join(', ') || '—';
+  const files = (d.files || []).join(', ') || '—';
+  $('planTaskInfo').className = '';
+  $('planTaskInfo').innerHTML = `<div class="item">
+    <div class="title">${esc(d.label)}</div>
+    <div class="sub">status: ${esc(d.status)}</div>
+    <div class="sub">depends on: ${esc(deps)}</div>
+    <div class="sub">files: ${esc(files)}</div>
+  </div>`;
+}
+
+function renderTaskList(elId, items, withWaiting) {
+  const el = $(elId);
+  if (!items || !items.length) { el.className = 'empty'; el.textContent = '—'; return; }
+  el.className = '';
+  el.innerHTML = items.map(it => {
+    const waiting = withWaiting && it.waiting_on && it.waiting_on.length
+      ? `<div class="sub">waiting on ${esc(it.waiting_on.join(', '))}</div>` : '';
+    return `<div class="item"><div class="title">${esc(it.id)}</div><div class="sub">${esc(it.title || '')}</div>${waiting}</div>`;
+  }).join('');
+}
+
+async function loadPlanStatusLists(planId) {
+  try {
+    const params = planId ? ('?plan=' + encodeURIComponent(planId)) : '';
+    const s = await getJSON('/plans/status' + params);
+    renderTaskList('planReady', s.ready);
+    renderTaskList('planInProgress', s.in_progress);
+    renderTaskList('planBlocked', s.blocked, true);
+  } catch (e) {
+    ['planReady', 'planInProgress', 'planBlocked'].forEach(id => {
+      $(id).className = 'empty'; $(id).textContent = 'error: ' + e.message;
+    });
+  }
+}
+
+function fillPlanSelect(ids, selected) {
+  const sel = $('planSelect');
+  const key = ids.join(',');
+  if (sel.dataset.loaded !== key) {
+    sel.innerHTML = ids.map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join('');
+    sel.dataset.loaded = key;
+  }
+  if (selected) sel.value = selected;
+}
+
+async function loadPlanGraph(planId) {
+  $('planStat').textContent = 'loading…';
+  let data;
+  try {
+    const params = planId ? ('?plan=' + encodeURIComponent(planId)) : '';
+    data = await getJSON('/plans/graph' + params);
+  } catch (e) { $('planStat').textContent = 'plan graph error: ' + e.message; return; }
+
+  fillPlanSelect(data.plans || [], data.plan);
+
+  if (planCy) { planCy.destroy(); planCy = null; }
+  if (data.message) {
+    $('planStat').textContent = `${data.plan} · ${data.message}`;
+    $('cyPlan').innerHTML = '';
+  } else {
+    const elements = [
+      ...data.nodes.map(n => ({ data: n.data })),
+      ...data.edges.map(e => ({ data: e.data })),
+    ];
+    planCy = cytoscape({
+      container: $('cyPlan'), elements, style: graphStylePlan(),
+      layout: { name: 'breadthfirst', directed: true, animate: false, spacingFactor: 1.3 },
+      wheelSensitivity: 0.25,
+    });
+    planCy.on('tap', 'node', (ev) => selectPlanNode(ev.target));
+    $('planStat').textContent = `${data.plan} · ${data.nodes.length} tasks`;
+  }
+  await loadPlanStatusLists(data.plan);
+}
+
 function initTabs() {
   document.querySelectorAll('.tabs button').forEach(btn =>
     btn.addEventListener('click', () => {
@@ -305,7 +427,12 @@ function initTabs() {
       const tab = btn.dataset.tab;
       $('pane-explore').classList.toggle('active', tab === 'explore');
       $('pane-memories').classList.toggle('active', tab === 'memories');
+      $('pane-plans').classList.toggle('active', tab === 'plans');
+      $('cy').style.display = tab === 'plans' ? 'none' : '';
+      $('cyPlan').style.display = tab === 'plans' ? '' : 'none';
+      if (tab === 'plans' && !planCy) loadPlanGraph($('planSelect').value || undefined);
     }));
+  $('planSelect').addEventListener('change', () => loadPlanGraph($('planSelect').value));
 }
 
 async function loadMeta() {

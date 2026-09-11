@@ -5,7 +5,7 @@
 //! connect handshake times out while the model downloads). The DuckDB store is
 //! opened once and cloned per call (a `Connection` is not `Sync`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -860,6 +860,104 @@ fn fit_plan_status_budget(mut value: Value, budget_tokens: usize) -> String {
         );
     }
     value.to_string()
+}
+
+/// The dashboard's "Plans" tab: one plan's dependency graph as cytoscape `{nodes, edges}`, plus
+/// `plans` (every plan id, for the tab's selector). No `plan` means the active plan (same rule
+/// as `do_plan_status`), falling back to the first plan by id when nothing is active (e.g. every
+/// plan is done) so the tab is never empty just because there is nothing left to do.
+pub fn do_plan_graph(state: &AppState, plan: Option<&str>) -> Result<String, String> {
+    plan_graph_value(&state.root, plan)
+}
+
+/// The unbudgeted `plan_status`-graph JSON, built straight from disk (see [`plan_status_value`]
+/// for the same split and why: it keeps this testable without an `AppState`).
+pub fn plan_graph_value(root: &std::path::Path, plan: Option<&str>) -> Result<String, String> {
+    let loaded = plans::load_plans(root);
+    let plan_ids: Vec<String> = loaded.iter().map(|p| p.id.clone()).collect();
+
+    let target_id = match plan {
+        Some(query) => find_plan(&loaded, query)
+            .map(|p| p.id.clone())
+            .ok_or_else(|| {
+                format!(
+                    "plan '{query}' no encontrado. Planes disponibles: {}",
+                    plan_ids.join(", ")
+                )
+            })?,
+        None => active_plan_id(&loaded)
+            .or_else(|| loaded.first().map(|p| p.id.clone()))
+            .ok_or_else(|| "no hay planes en plans/".to_string())?,
+    };
+    let p = loaded
+        .iter()
+        .find(|p| p.id == target_id)
+        .ok_or_else(|| format!("plan '{target_id}' no encontrado"))?;
+
+    if p.tasks.is_empty() {
+        return Ok(json!({
+            "plan": p.id,
+            "title": p.title,
+            "nodes": [],
+            "edges": [],
+            "plans": plan_ids,
+            "message": "sin tasks",
+        })
+        .to_string());
+    }
+
+    let Analysis { ready, in_progress, missing, .. } = plans::analyze(p);
+    let ready_set: HashSet<&str> = ready.iter().map(|s| s.as_str()).collect();
+    let in_progress_set: HashSet<&str> = in_progress.iter().map(|s| s.as_str()).collect();
+    let missing_ids: HashSet<&str> = missing.iter().map(|(_, dep)| dep.as_str()).collect();
+
+    let mut nodes: Vec<Value> = Vec::new();
+    for t in &p.tasks {
+        let status = if t.status.is_done() {
+            "done"
+        } else if in_progress_set.contains(t.id.as_str()) {
+            "in_progress"
+        } else if matches!(t.status, plans::Status::Blocked) {
+            "blocked"
+        } else if ready_set.contains(t.id.as_str()) {
+            "ready"
+        } else {
+            "blocked"
+        };
+        nodes.push(json!({
+            "data": {
+                "id": t.id,
+                "label": format!("{} {}", t.id, t.title),
+                "status": status,
+                "ready": ready_set.contains(t.id.as_str()),
+                "depends_on": t.depends_on,
+                "files": t.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+            }
+        }));
+    }
+    for missing_id in &missing_ids {
+        nodes.push(json!({
+            "data": { "id": missing_id, "label": missing_id, "status": "missing", "ready": false }
+        }));
+    }
+
+    let mut edges: Vec<Value> = Vec::new();
+    for t in &p.tasks {
+        for dep in &t.depends_on {
+            edges.push(json!({
+                "data": { "id": format!("{dep}->{}", t.id), "source": dep, "target": t.id }
+            }));
+        }
+    }
+
+    Ok(json!({
+        "plan": p.id,
+        "title": p.title,
+        "nodes": nodes,
+        "edges": edges,
+        "plans": plan_ids,
+    })
+    .to_string())
 }
 
 /// `remember` tool: save a memory (deduplicated).
@@ -3577,6 +3675,65 @@ mod tests {
         let value = plan_status_value(&root, None).expect("no plans/ dir is not an error");
         assert!(value["plans"].as_array().unwrap().is_empty());
         assert!(value["active"].is_null());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- plan_graph (TASK-006) ---
+
+    #[test]
+    fn plan_graph_has_a_node_per_task_and_an_edge_per_dependency() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_graph_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_plan_fixture(&root); // PLAN-001 (done, 1 task), PLAN-002 (2 tasks, 1 dep edge)
+
+        let raw = plan_graph_value(&root, Some("PLAN-002")).expect("graph should succeed");
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["plan"].as_str(), Some("PLAN-002"));
+        assert_eq!(value["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(value["edges"].as_array().unwrap().len(), 1);
+        let edge = &value["edges"][0]["data"];
+        assert_eq!(edge["source"].as_str(), Some("TASK-001"));
+        assert_eq!(edge["target"].as_str(), Some("TASK-002"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_graph_marks_a_missing_dependency_as_a_node_instead_of_dropping_it() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_graph_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("plans/PLAN-003-x/tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(root.join("plans/PLAN-003-x/PLAN-003-x.md"), "# PLAN-003 — x\n").unwrap();
+        std::fs::write(
+            dir.join("TASK-001-a.md"),
+            "# TASK-001 — a\n\n- **Depende de:** TASK-099\n- **Estado:** `pending`\n\n## Objetivo\n",
+        )
+        .unwrap();
+
+        let raw = plan_graph_value(&root, Some("PLAN-003")).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        let nodes = value["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2, "TASK-001 plus the missing TASK-099 node");
+        let missing = nodes.iter().find(|n| n["data"]["id"] == "TASK-099").unwrap();
+        assert_eq!(missing["data"]["status"].as_str(), Some("missing"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_graph_on_a_plan_with_no_task_files_says_so_without_an_empty_canvas() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_graph_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("plans/PLAN-004-sin-tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PLAN-004-sin-tasks.md"), "# PLAN-004 — sin tasks\n").unwrap();
+
+        let raw = plan_graph_value(&root, Some("PLAN-004")).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(value["message"].as_str(), Some("sin tasks"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

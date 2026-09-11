@@ -4,7 +4,7 @@
 - **Especialista:** — (modelo sugerido: sonnet)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plan-status`
 - **Depende de:** TASK-002
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -62,4 +62,8 @@ estilo existente (funciones sueltas, `getJSON`, `esc`) en vez de meter un framew
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR -->
+- **Estado final:** `done`
+- **Resumen:** `plan_graph_value(root, plan)` (usada por `do_plan_graph`) arma nodos `{id, label, status, ready, depends_on, files}` y aristas `dep->task`, con nodos `missing` para dependencias inexistentes y `message: "sin tasks"` cuando el plan no tiene `tasks/`. Ruta `GET /plans/graph?plan=`. Pestaña "Plans" en `index.html` con `<select>` de planes, listas ready/in_progress/blocked (de `/plans/status`) y una instancia cytoscape separada `#cyPlan` (layout `breadthfirst`), estilo por estado (verde done, azul in_progress, gris ready, rojo punteado blocked, diamante hueco missing). `initTabs()` generalizado a 3 pestañas; cambiar de pestaña solo alterna `display`, nunca recrea `#cy`.
+- **Archivos tocados:** `crates/devctx-mcp/src/state.rs` (`do_plan_graph`/`plan_graph_value`), `crates/devctx-api/src/lib.rs` (ruta), `crates/devctx-api/assets/index.html`.
+- **Verificado por:** `cargo test -p devctx-mcp plan_graph` — 3/3 verdes (nodos/aristas de un plan con 2 tasks y 1 dependencia, dependencia faltante como nodo `missing` sin descartarla, plan sin `tasks/` da `message: "sin tasks"` con 0 nodos). `cargo check --workspace --all-targets` limpio.
+- **Desviaciones:** No se probó en navegador real (`devctx web` + click) ni con `curl` contra un servidor levantado: arrancar y curlear un proceso HTTP real requeriría backgroundearlo, y la instrucción vigente de esta sesión es no backgroundear ni usar Monitor. La lógica del endpoint está cubierta por los 3 tests unitarios sobre `plan_graph_value`, que es exactamente lo que la ruta expone envuelto en `run()`.

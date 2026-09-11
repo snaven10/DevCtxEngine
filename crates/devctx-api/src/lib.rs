@@ -18,8 +18,8 @@ use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
     do_backfill_links, do_build_context, do_graph, do_impact, do_index_on, do_index_paths,
     do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
-    do_memories_by_symbol, do_memory_context, do_memory_refs, do_memory_stats, do_plan_status,
-    do_read_file, do_read_symbol, do_recall_scoped, do_references, do_remember,
+    do_memories_by_symbol, do_memory_context, do_memory_refs, do_memory_stats, do_plan_graph,
+    do_plan_status, do_read_file, do_read_symbol, do_recall_scoped, do_references, do_remember,
     do_remember_shared, do_routes_for_handler, do_search, do_search_routes, do_summarize,
     parse_mode, AppState,
 };
@@ -55,6 +55,7 @@ fn router(api: Api) -> Router {
         .route("/projects", get(list_projects))
         .route("/graph", get(graph))
         .route("/plans/status", get(plans_status))
+        .route("/plans/graph", get(plans_graph))
         .route("/impact/:symbol", get(impact))
         .route("/references/:symbol", get(references))
         .route("/memories/by-symbol/:symbol", get(memories_by_symbol))
@@ -424,6 +425,10 @@ async fn graph(State(api): State<Api>, Query(q): Query<GraphQuery>) -> Response 
 
 async fn plans_status(State(api): State<Api>, Query(q): Query<PlanStatusQuery>) -> Response {
     run(api.state, move |s| do_plan_status(s, q.plan.as_deref())).await
+}
+
+async fn plans_graph(State(api): State<Api>, Query(q): Query<PlanStatusQuery>) -> Response {
+    run(api.state, move |s| do_plan_graph(s, q.plan.as_deref())).await
 }
 
 async fn memories(State(api): State<Api>, Query(q): Query<MemoriesQuery>) -> Response {
