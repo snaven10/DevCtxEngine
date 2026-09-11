@@ -4,7 +4,7 @@
 - **Especialista:** — (modelo sugerido: sonnet)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plan-status`
 - **Depende de:** TASK-001
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -67,4 +67,8 @@ Paso 3 existe para que haya **una** función.
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR -->
+- **Estado final:** `done`
+- **Resumen:** `Command::PlanStatus { plan, format }` → `cmd_plan_status`. Root = `project_root()` del `.devctx` bajo el cwd si existe, si no el cwd (nunca `remote::ensure`). Reusa `plan_status_value` de TASK-002 (mismo JSON que la tool, sin recorte de presupuesto en `--format json`). Formato `table` con títulos truncados a 40/28 caracteres (`truncate_chars`, por caracteres UTF-8 no bytes) para caber en el presupuesto del hook.
+- **Archivos tocados:** `crates/devctx-cli/src/main.rs`, `crates/devctx-cli/tests/plan_status_cli.rs` (nuevo).
+- **Verificado por:** `cargo test -p devctx-cli --test plan_status_cli` — 5/5 verdes: JSON sin `.devctx/`, detalle por id corto (`2`→`PLAN-002`), plan inexistente sale con status≠0 y lista los ids disponibles, sin `plans/` sale 0 con "sin planes", y la tabla sobre el `plans/` real del repo (5 planes, títulos largos) mide ≤600 bytes tras truncar.
+- **Desviaciones:** El criterio "≤600 bytes sobre el plans/ real" no se cumplía con los títulos completos (730 bytes con los títulos reales, que son largos). Se truncan títulos en el formato `table` en vez de acortar los títulos de los planes/tasks — no tocar los `.md` para eso. `--format json` no trunca nada (el presupuesto de tokens lo aplica `do_plan_status`/la tool, no el CLI).

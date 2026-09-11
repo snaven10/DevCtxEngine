@@ -235,6 +235,14 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         depth: usize,
     },
+    /// Progress on the plans under `plans/` (markdown, source of truth). No daemon, no store:
+    /// reads markdown from disk. Fast enough for a shell-startup hook.
+    PlanStatus {
+        /// Plan id (PLAN-005, 005, 5, or the directory name). Omit to list every plan.
+        plan: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
     /// List framework-aware HTTP routes.
     Routes {
         /// Filter by HTTP method.
@@ -565,6 +573,7 @@ fn main() -> Result<()> {
             no_memories,
         } => cmd_context(query, max_tokens, !no_memories),
         Command::Impact { symbol, depth } => cmd_impact(symbol, depth),
+        Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),
         Command::Routes { method, path } => cmd_routes(method, path),
         Command::Summarize {
             path,
@@ -1988,6 +1997,127 @@ fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     print_impact("callers (upstream)", &impact.upstream);
     print_impact("callees (downstream)", &impact.downstream);
     Ok(())
+}
+
+/// Root to read `plans/` from: the project's configured root when this cwd is inside a
+/// DevCtxEngine project, else the cwd itself — plans exist in git whether or not the repo is
+/// indexed, and the hook that calls this needs an answer even in a fresh clone.
+fn plan_status_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    if let Some(cfg_path) = find_config_file(&cwd) {
+        let cfg = ProjectConfig::load(&cfg_path)?;
+        return project_root(&cfg);
+    }
+    Ok(cwd)
+}
+
+/// `devctx plan-status [PLAN] [--format json]`: reads `plans/` straight off disk — no store, no
+/// daemon (`remote::ensure` is deliberately never called here) — so the SessionStart hook can
+/// call it on every turn without cost.
+fn cmd_plan_status(plan: Option<String>, format: OutputFormat) -> Result<()> {
+    let root = plan_status_root()?;
+    let value = devctx_mcp::state::plan_status_value(&root, plan.as_deref()).map_err(|e| anyhow!(e))?;
+
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string(&value)?);
+        return Ok(());
+    }
+
+    if let Some(plan_id) = value.get("plan").and_then(|v| v.as_str()) {
+        let title = truncate_chars(value["title"].as_str().unwrap_or(""), 60);
+        let done = value["done"].as_u64().unwrap_or(0);
+        let total = value["total"].as_u64().unwrap_or(0);
+        let list = devctx_mcp::state::plan_status_value(&root, None).map_err(|e| anyhow!(e))?;
+        let active = list["active"].as_str() == Some(plan_id);
+        let marker = if active { " (activo)" } else { "" };
+        println!("{plan_id} {title} — {done}/{total} done{marker}");
+        print_plan_status_block(&value, "  ");
+        return Ok(());
+    }
+
+    let plans = value["plans"].as_array().cloned().unwrap_or_default();
+    if plans.is_empty() {
+        println!("sin planes");
+        return Ok(());
+    }
+    let active = value["active"].as_str().map(str::to_string);
+    for p in &plans {
+        let id = p["id"].as_str().unwrap_or("");
+        let done = p["done"].as_u64().unwrap_or(0);
+        let total = p["total"].as_u64().unwrap_or(0);
+        let title = truncate_chars(p["title"].as_str().unwrap_or(""), 40);
+        let marker = if active.as_deref() == Some(id) { " *" } else { "" };
+        println!("{id}  {done}/{total}  {title}{marker}");
+    }
+    if let Some(active_id) = active {
+        let detail = devctx_mcp::state::plan_status_value(&root, Some(&active_id)).map_err(|e| anyhow!(e))?;
+        println!();
+        print_plan_status_block(&detail, "  ");
+    }
+    Ok(())
+}
+
+/// Renders the `listas` / `en curso` / `bloqueadas` / warning lines of a plan-status detail JSON.
+fn print_plan_status_block(value: &serde_json::Value, indent: &str) {
+    let empty = Vec::new();
+    let ready = value["ready"].as_array().unwrap_or(&empty);
+    let in_progress = value["in_progress"].as_array().unwrap_or(&empty);
+    let blocked = value["blocked"].as_array().unwrap_or(&empty);
+    println!("{indent}listas:     {}", format_task_list(ready));
+    println!("{indent}en curso:   {}", format_task_list(in_progress));
+    println!("{indent}bloqueadas: {}", format_blocked_list(blocked));
+    let warn_count = value["warnings"].as_array().map(Vec::len).unwrap_or(0);
+    if warn_count > 0 {
+        let plural = if warn_count == 1 { "" } else { "s" };
+        println!("{indent}⚠ {warn_count} warning{plural}");
+    }
+}
+
+fn format_task_list(items: &[serde_json::Value]) -> String {
+    if items.is_empty() {
+        return "—".to_string();
+    }
+    items
+        .iter()
+        .map(|it| {
+            format!(
+                "{} {}",
+                it["id"].as_str().unwrap_or(""),
+                truncate_chars(it["title"].as_str().unwrap_or(""), 28)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Truncates `s` to at most `max_chars` characters (not bytes — titles carry accents and em
+/// dashes), appending `…` when it cuts. Keeps the compact `table` format inside the hook's
+/// output budget without an arbitrary byte cut landing mid-character.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn format_blocked_list(items: &[serde_json::Value]) -> String {
+    if items.is_empty() {
+        return "0".to_string();
+    }
+    let parts: Vec<String> = items
+        .iter()
+        .map(|it| {
+            let id = it["id"].as_str().unwrap_or("");
+            let waiting: Vec<&str> = it["waiting_on"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            format!("{id} espera {}", waiting.join(", "))
+        })
+        .collect();
+    format!("{} ({})", items.len(), parts.join("; "))
 }
 
 /// Say out loud when a bare name stood for more than one declaration.
