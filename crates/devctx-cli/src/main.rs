@@ -1361,12 +1361,20 @@ fn open_browser(url: &str) {
 
 /// `devctx mcp` — run the MCP server over stdio.
 fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
-    // Checked once here, at startup, and handed to the tools through the
-    // environment: a per-call check would put a network round-trip on the path
-    // of every `list_projects`, and the answer changes at most daily.
-    if let Some(v) = update_check::available(RELEASE_REPO, env!("CARGO_PKG_VERSION")) {
-        std::env::set_var("DEVCTX_UPDATE_AVAILABLE", v);
-    }
+    // Checked once, off the startup path: this used to run inline, right here,
+    // before the server ever started serving — a network round-trip (up to the
+    // 4s timeout in `update_check::fetch_latest`) sitting directly on top of
+    // every MCP client's `initialize` handshake. A client that gives up on a
+    // slow handshake never gets a second try. The answer changes at most
+    // daily and nothing here branches on it, so it can arrive whenever the
+    // network answers: a background thread that sets the same environment
+    // variable once it knows, read lazily by `list_projects` (`state.rs:2066`)
+    // exactly as before — the only change is *when* the network call happens.
+    std::thread::spawn(|| {
+        if let Some(v) = update_check::available(RELEASE_REPO, env!("CARGO_PKG_VERSION")) {
+            std::env::set_var("DEVCTX_UPDATE_AVAILABLE", v);
+        }
+    });
     // Registering this server globally is the normal thing to do, and it means
     // the client launches it from whatever directory it happens to be in —
     // usually the user's home, which is inside no repository at all. Refusing to
