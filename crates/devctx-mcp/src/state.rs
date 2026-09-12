@@ -405,7 +405,24 @@ pub fn do_search(
         reranker.as_deref(),
     )
     .map_err(|e| e.to_string())?;
-    serde_json::to_string_pretty(&hits_to_json(&hits)).map_err(|e| e.to_string())
+    let items = match hits_to_json(&hits) {
+        Value::Array(a) => a,
+        other => return serde_json::to_string_pretty(&other).map_err(|e| e.to_string()),
+    };
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
+        let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
+        format!("{file}:{line}")
+    });
+    if dropped.is_empty() {
+        return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
+    }
+    serde_json::to_string_pretty(&json!({
+        "results": kept,
+        "omitted_for_budget": { "count": dropped.len(), "items": dropped },
+    }))
+    .map_err(|e| e.to_string())
 }
 
 /// Drop rows for branches the config no longer lists. Returns rows removed.
@@ -1993,8 +2010,18 @@ pub fn do_search_project(
             .to_string());
     }
     let hits: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
-    serde_json::to_string_pretty(&json!({ "project": project, "path": path, "hits": hits }))
-        .map_err(|e| e.to_string())
+    let items = hits.as_array().cloned().unwrap_or_default();
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
+        let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
+        format!("{file}:{line}")
+    });
+    let mut out = json!({ "project": project, "path": path, "hits": kept });
+    if !dropped.is_empty() {
+        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// `list_projects` tool: every repository DevCtxEngine knows about.
@@ -2375,6 +2402,66 @@ fn shorten_memory(
     m
 }
 
+/// Fit a JSON array of tool results into the output budget.
+///
+/// Same shape and the same soft-budget philosophy as [`fit_memories`] — an
+/// equal share of the budget per item, with a floor below which a share is
+/// not worth enforcing on a long tail of small items — for tools with no
+/// summarizer to fall back on: when `text_field` names a string field worth
+/// shrinking, an oversized item is truncated in place; otherwise (or when the
+/// item has no such field) it is dropped whole. Either way the caller is
+/// told: dropped items are named by `label` under `omitted_for_budget`,
+/// never silently missing.
+fn fit_json_array(
+    items: Vec<Value>,
+    budget_tokens: usize,
+    text_field: Option<&str>,
+    label: impl Fn(&Value) -> String,
+) -> (Vec<Value>, Vec<String>) {
+    if budget_tokens == 0 || items.is_empty() {
+        return (items, Vec::new());
+    }
+    // Below this a "share" is too small to hold anything useful, so a long
+    // tail of small items is not minced down to nothing — same floor as
+    // `fit_memories`.
+    const MIN_SHARE_TOKENS: usize = 64;
+    let share = (budget_tokens / items.len()).max(MIN_SHARE_TOKENS) * CHARS_PER_TOKEN;
+
+    let mut kept: Vec<Value> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for mut item in items {
+        let full_len = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
+        if full_len <= share {
+            kept.push(item);
+            continue;
+        }
+        let Some(field) = text_field else {
+            dropped.push(label(&item));
+            continue;
+        };
+        let Some(obj) = item.as_object_mut() else {
+            dropped.push(label(&item));
+            continue;
+        };
+        let Some(text) = obj.get(field).and_then(|v| v.as_str()).map(str::to_string) else {
+            dropped.push(label(&item));
+            continue;
+        };
+        let mut out = String::with_capacity(share + 96);
+        for line in text.lines() {
+            if out.len() + line.len() + 1 > share {
+                break;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("\n[devctx] truncated: exceeded its share of the output budget.\n");
+        obj.insert(field.to_string(), json!(out));
+        kept.push(item);
+    }
+    (kept, dropped)
+}
+
 /// Fuse labelled result lists by rank, tagging each survivor with the scope it
 /// came from so an agent can tell a project memory from a shared one.
 fn fuse_by_rank(lists: Vec<(Vec<Value>, &str)>, limit: usize) -> Vec<Value> {
@@ -2686,7 +2773,15 @@ pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<
         key(b).cmp(&key(a))
     });
     out.truncate(limit);
-    Ok(json!({ "scope": scope, "memories": out }).to_string())
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (out, dropped) = fit_memories(out, budget, |content, target| {
+        do_summarize(state, content, None, target).ok()
+    });
+    let mut resp = json!({ "scope": scope, "memories": out });
+    if !dropped.is_empty() {
+        resp["omitted_for_budget"] = json!({ "count": dropped.len(), "titles": dropped });
+    }
+    Ok(resp.to_string())
 }
 
 /// `impact_analysis` tool: blast radius (transitive callers/callees) of a symbol.
@@ -2704,16 +2799,32 @@ pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String,
             .map(|(s, d)| json!({ "symbol": s, "depth": d }))
             .collect()
     };
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    // Each direction gets half the budget: a symbol with a huge upstream and a
+    // tiny downstream (or the reverse) is common, and a single shared pool
+    // would let one side starve the other silently.
+    let half = budget / 2;
+    let label = |v: &Value| v.get("symbol").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let (upstream, up_dropped) = fit_json_array(to_json(&impact.upstream), half, None, label);
+    let (downstream, down_dropped) = fit_json_array(to_json(&impact.downstream), half, None, label);
     let mut out = json!({
         "symbol": symbol,
-        "upstream": to_json(&impact.upstream),
-        "downstream": to_json(&impact.downstream),
+        "upstream": upstream,
+        "downstream": downstream,
     });
     // A bare name can stand for several methods, and the radius below merges
     // them. Say so: an unannounced merge reads as one method with a wide blast
     // radius, which is a different and much more alarming fact.
     if let Some(names) = merged_declarations(symbol, &resolved) {
         out["resolved_symbols"] = json!(names);
+    }
+    let dropped_total = up_dropped.len() + down_dropped.len();
+    if dropped_total > 0 {
+        out["omitted_for_budget"] = json!({
+            "count": dropped_total,
+            "upstream": up_dropped,
+            "downstream": down_dropped,
+        });
     }
     Ok(out.to_string())
 }
@@ -2799,7 +2910,7 @@ pub fn do_build_context(
 
     // Fetch more than will fit: the budget, not the limit, decides where to stop.
     let raw = do_search(state, query, 30, None, SearchMode::Vector, false)?;
-    let hits: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let hits: Vec<Value> = parse_memories(&raw);
     let mut code_files: Vec<String> = Vec::new();
     let mut head = "## Code\n\n";
     for h in &hits {
@@ -2871,6 +2982,8 @@ pub fn do_build_context(
 ///
 /// The recall and by-file answers differ in shape — one is a bare array, the
 /// other wraps it — so both are accepted rather than making the caller care.
+/// Also accepts `results` (`do_search`'s wrapped shape once budget-trimmed),
+/// so `do_build_context` keeps working whether or not `do_search` had to trim.
 fn parse_memories(raw: &str) -> Vec<Value> {
     let parsed: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -2881,6 +2994,7 @@ fn parse_memories(raw: &str) -> Vec<Value> {
     }
     parsed
         .get("memories")
+        .or_else(|| parsed.get("results"))
         .and_then(|m| m.as_array())
         .cloned()
         .unwrap_or_default()
@@ -3116,13 +3230,18 @@ fn linked_response(
     });
     out.truncate(limit);
 
-    Ok(json!({
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (out, dropped) = fit_memories(out, budget, |_, _| None);
+    let mut resp = json!({
         "subject": subject,
         "memories": out,
         // Named so a reader knows the results are word matches, not recorded links.
         "matched_by": if fallback_used { "text-inference" } else { "junction" },
-    })
-    .to_string())
+    });
+    if !dropped.is_empty() {
+        resp["omitted_for_budget"] = json!({ "count": dropped.len(), "titles": dropped });
+    }
+    Ok(resp.to_string())
 }
 
 fn memory_json(m: &devctx_store::Memory, sources: &str) -> Value {
@@ -3173,9 +3292,18 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
         .iter()
         .map(|r| json!({ "file": r.file, "line": r.line, "source": r.source }))
         .collect();
-    let mut out = json!({ "symbol": symbol, "references": arr });
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (kept, dropped) = fit_json_array(arr, budget, Some("source"), |v| {
+        let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        let line = v.get("line").and_then(|l| l.as_i64()).unwrap_or(0);
+        format!("{file}:{line}")
+    });
+    let mut out = json!({ "symbol": symbol, "references": kept });
     if let Some(names) = merged_declarations(symbol, &resolved) {
         out["resolved_symbols"] = json!(names);
+    }
+    if !dropped.is_empty() {
+        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
@@ -3218,7 +3346,20 @@ fn routes_to_json(routes: &[devctx_store::StoredRoute]) -> Result<String, String
             })
         })
         .collect();
-    serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (kept, dropped) = fit_json_array(arr, budget, None, |v| {
+        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        format!("{method} {path}")
+    });
+    if dropped.is_empty() {
+        return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
+    }
+    serde_json::to_string_pretty(&json!({
+        "routes": kept,
+        "omitted_for_budget": { "count": dropped.len(), "items": dropped },
+    }))
+    .map_err(|e| e.to_string())
 }
 
 /// `summarize` tool: condense `content`, optionally focused on `query`.
@@ -3851,5 +3992,140 @@ mod tests {
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["subject"].as_str(), Some("x.rs"));
         assert_eq!(value["plan_tasks"].as_array().unwrap().len(), 1);
+    }
+
+    // --- TASK-001 (PLAN-006): output budget on the tools that lacked it ---
+
+    fn hit(file: &str, line: i64, text_len: usize) -> Value {
+        json!({ "file": file, "start_line": line, "text": "x".repeat(text_len) })
+    }
+
+    /// Under budget, `fit_json_array` is a no-op: nothing is touched, nothing
+    /// is reported missing — same contract as `fit_memories`.
+    #[test]
+    fn fit_json_array_under_budget_returns_everything_untouched() {
+        let items = vec![hit("a.rs", 1, 50), hit("b.rs", 2, 50)];
+        let (kept, dropped) = fit_json_array(items, 8000, Some("text"), |_| String::new());
+        assert_eq!(kept.len(), 2);
+        assert!(dropped.is_empty());
+    }
+
+    /// An oversized item with a shrinkable field is truncated in place, not
+    /// dropped whole — the same "shrink before you drop" rule as memories.
+    #[test]
+    fn fit_json_array_truncates_an_oversized_item_in_place() {
+        let items = vec![hit("huge.rs", 1, 200_000)];
+        let (kept, dropped) = fit_json_array(items, 100, Some("text"), |v| {
+            v["file"].as_str().unwrap().to_string()
+        });
+        assert!(dropped.is_empty());
+        let text = kept[0]["text"].as_str().unwrap();
+        assert!(text.contains("[devctx] truncated"), "{text:?}");
+    }
+
+    /// With no shrinkable field, an item bigger than its share is dropped and
+    /// named under `omitted_for_budget` — silence about what was cut is never
+    /// acceptable. A tiny item alongside it survives untouched.
+    #[test]
+    fn fit_json_array_drops_and_names_items_it_cannot_shrink() {
+        let items = vec![
+            json!({ "framework": "x", "method": "GET", "path": "/ping" }),
+            json!({ "framework": "x", "method": "GET", "path": "/".to_string() + &"x".repeat(2000) }),
+        ];
+        let label =
+            |v: &Value| format!("{} {}", v["method"].as_str().unwrap(), v["path"].as_str().unwrap());
+        let (kept, dropped) = fit_json_array(items, 20, None, label);
+        assert_eq!(kept.len(), 1, "the small route survives: {kept:?}");
+        assert_eq!(kept[0]["path"], "/ping");
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].starts_with("GET /xxx"), "{dropped:?}");
+    }
+
+    /// `routes_to_json` (feeds `search_routes`/`routes_for_handler`) wraps its
+    /// answer with `omitted_for_budget` when a huge result set does not fit,
+    /// and stays a bare array otherwise — never silent truncation.
+    #[test]
+    fn routes_to_json_reports_omissions_under_a_tiny_budget() {
+        // Many small routes plus one with a wildly long path: the small ones
+        // fit their (floor-protected) share, the long one does not and has
+        // no field this tool knows how to shrink, so it alone is dropped.
+        std::env::set_var("DEVCTX_MAX_OUTPUT_TOKENS", "20");
+        let mut routes: Vec<devctx_store::StoredRoute> = (0..5)
+            .map(|i| devctx_store::StoredRoute {
+                framework: "fastapi".into(),
+                http_method: "GET".into(),
+                path: format!("/r{i}"),
+                file: "app.py".into(),
+                line: i,
+                ..Default::default()
+            })
+            .collect();
+        routes.push(devctx_store::StoredRoute {
+            framework: "fastapi".into(),
+            http_method: "GET".into(),
+            path: "/".to_string() + &"segment/".repeat(200),
+            file: "app.py".into(),
+            line: 999,
+            ..Default::default()
+        });
+        let out = routes_to_json(&routes).unwrap();
+        std::env::remove_var("DEVCTX_MAX_OUTPUT_TOKENS");
+        let value: Value = serde_json::from_str(&out).unwrap();
+        let omitted = value["omitted_for_budget"]["count"].as_u64().unwrap();
+        assert_eq!(omitted, 1, "only the oversized route should be dropped: {out}");
+        assert_eq!(value["routes"].as_array().unwrap().len(), 5);
+    }
+
+    /// The same call under a generous budget stays the plain array shape the
+    /// tool has always returned — the wrapper only appears when it is needed.
+    #[test]
+    fn routes_to_json_stays_a_bare_array_when_everything_fits() {
+        let routes = vec![devctx_store::StoredRoute {
+            framework: "flask".into(),
+            http_method: "GET".into(),
+            path: "/ping".into(),
+            file: "app.py".into(),
+            line: 1,
+            ..Default::default()
+        }];
+        let out = routes_to_json(&routes).unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert!(value.is_array(), "{out}");
+    }
+
+    /// `do_impact`'s upstream/downstream split each get half the budget, so a
+    /// symbol with a huge blast radius on one side does not starve the other:
+    /// a mix of small and very deep (long-symbol) callers on one side is
+    /// trimmed by dropping the ones that do not fit their share, while a
+    /// handful of small callees on the other side is untouched.
+    #[test]
+    fn fit_json_array_splits_a_shared_budget_fairly_between_two_lists() {
+        let mut upstream: Vec<Value> = (0..5)
+            .map(|i| json!({ "symbol": format!("Caller{i}"), "depth": 1 }))
+            .collect();
+        upstream.push(json!({ "symbol": "x".repeat(2000), "depth": 1 }));
+        let downstream: Vec<Value> = (0..3)
+            .map(|i| json!({ "symbol": format!("Callee{i}"), "depth": 1 }))
+            .collect();
+        let label = |v: &Value| v["symbol"].as_str().unwrap().to_string();
+        let half = 20usize;
+        let (up_kept, up_dropped) = fit_json_array(upstream, half, None, label);
+        let (down_kept, down_dropped) = fit_json_array(downstream, half, None, label);
+        assert_eq!(up_dropped.len(), 1, "only the oversized caller is dropped");
+        assert_eq!(up_kept.len(), 5);
+        assert!(down_dropped.is_empty(), "3 small callees fit easily");
+        assert_eq!(down_kept.len(), 3);
+    }
+
+    /// `memories_by_symbol`/`memories_by_file` (via `linked_response`) reuse
+    /// `fit_memories`: an oversized linked memory is truncated, not dropped
+    /// whole, and the JSON keeps its `subject`/`matched_by` shape either way.
+    #[test]
+    fn linked_response_style_output_budgets_an_oversized_memory() {
+        let out = vec![mem("m1", 200_000)];
+        let (kept, dropped) = fit_memories(out, 200, |_, _| None);
+        assert!(dropped.is_empty());
+        let content = kept[0]["content"].as_str().unwrap();
+        assert!(content.contains("[devctx] truncated"), "{content:?}");
     }
 }
