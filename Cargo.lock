@@ -1048,6 +1048,7 @@ dependencies = [
  "axum",
  "devctx-central",
  "devctx-core",
+ "devctx-embed",
  "devctx-mcp",
  "devctx-memory",
  "devctx-store",

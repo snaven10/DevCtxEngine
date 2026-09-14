@@ -744,10 +744,15 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_cfg(dir: &std::path::Path) -> ProjectConfig {
-        let mut cfg = ProjectConfig::default();
-        cfg.state_dir = dir.to_string_lossy().to_string();
-        cfg.project.path = dir.to_string_lossy().to_string();
-        cfg
+        let path = dir.to_string_lossy().to_string();
+        ProjectConfig {
+            state_dir: path.clone(),
+            project: devctx_core::config::Project {
+                path,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     /// PLAN-006 TASK-003: `Backend::Remote::memory_forget`

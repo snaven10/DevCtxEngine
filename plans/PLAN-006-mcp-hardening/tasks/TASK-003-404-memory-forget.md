@@ -92,7 +92,9 @@ embeddings, así que no hacía falta reproducir con uno.
   `devctx-api`, así que toda sesión MCP enrutada por un daemon (el modo normal) caía en el 404
   genérico de axum antes de llegar al código de la aplicación.
 - **Archivos tocados:** `crates/devctx-api/src/lib.rs`, `crates/devctx-api/Cargo.toml`
-  (`tower` como dev-dependency, para el test de integración con `oneshot`).
+  (`tower` y `devctx-embed` como dev-dependencies, para el test de integración con `oneshot` — el
+  test necesita `devctx_embed::dimension_for` para abrir el store de prueba con la dimensión
+  correcta, y `devctx-api` no lo tenía como dependencia).
 - **Verificado por:** `memory_forget_route_exists_and_forgets_a_real_memory` (nuevo,
   `cargo test -p devctx-api --lib`), confirmado que reproduce la falla al comentar la ruta.
 - **Desviaciones:** el plan original suponía un problema de scope en el store; el rastreo lo

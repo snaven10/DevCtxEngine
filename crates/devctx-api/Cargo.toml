@@ -25,3 +25,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
+devctx-embed = { path = "../devctx-embed" }
