@@ -134,4 +134,39 @@ sesión para evitar pisarse en `state.rs`.
 
 ## 6. Cierre
 
-<!-- SE LLENA AL CERRAR EL PLAN -->
+Las cuatro tasks quedaron `done`. Resumen ejecutivo por task en sus propios archivos
+(`tasks/TASK-00N-*.md`); acá solo los números que las atan entre sí.
+
+- **TASK-001**: `fit_json_array` (nuevo, junto a `fit_memories` en `state.rs`) cablea presupuesto
+  en `search`, `search_project`, `get_references`, `impact_analysis`, `search_routes`,
+  `routes_for_handler`, `memory_context`, `memories_by_symbol` y `memories_by_file`.
+  `build_context` se deja igual (ya se autolimita con `max_tokens`). 9 tests nuevos.
+- **TASK-002**: el chequeo de actualización de `devctx mcp` pasa a un hilo aparte. Medido con el
+  binario compilado: `initialize` responde en `0.551s` en estado estable (daemon por-proyecto ya
+  arriba). No se repitió la medición "antes" — hubiera costado otro ciclo de ~49 min de
+  recompilación de `libduckdb-sys` (ver nota abajo); el argumento de por qué ya no puede bloquear
+  es por código (`update_check::fetch_latest` corría en línea recta con timeout de 4s; ahora corre
+  en `std::thread::spawn` y no puede demorar la primera respuesta).
+- **TASK-003**: el 404 no era scope — eran `/memory/forget` y `/memory/move`, ausentes del router
+  por-proyecto de `devctx-api` (nunca se registraron: ni la ruta, ni el `use`, ni el handler).
+  `Store::forget_memory` sigue borrando por `id` sin filtro de proyecto, como siempre. Test de
+  regresión con HTTP real (`tower::oneshot`), sin embeddings.
+- **TASK-004**: `/plans/status` y `/plans/graph` verificados con `devctx web` real contra un
+  proyecto de scratch (la base del propio repo quedó con el WAL corrupto — ver nota de
+  `TASK-004-verificacion-dashboard-plans.md`, probablemente por el `pkill -f 'devctx serve'` de
+  mitad de sesión). Las dos formas coinciden con lo que `assets/index.html` espera.
+
+**Nota de infraestructura, no de código**: en esta máquina, `libduckdb-sys` (el bundle C++ de
+DuckDB) se recompila entero — no incremental — la primera vez que se usa cada "forma" distinta de
+invocación de `cargo` (`build` plano, `clippy`, `test`), cada una ~49 minutos. Una vez que las tres
+formas están cacheadas, todo lo demás es rápido (`cargo clippy --workspace --all-targets` terminó
+en menos de 4s en la corrida final). Quien retome este repo en una máquina nueva debe esperar ese
+costo la primera vez.
+
+**Verificación final:** `cargo test --workspace` → 385 passed, 0 failed, 5 ignored (los 5 ya
+ignorados de antes: modelo de embeddings/reranker y un benchmark). `cargo clippy --workspace
+--all-targets` → limpio, cero warnings.
+
+**Pendiente**: nada de las cuatro tasks. Fuera de alcance y sin tocar: el WAL corrupto de la base
+local del repo (nota TASK-004) y la medición empírica "antes" de TASK-002 (razonada por código, no
+remedida por el costo de recompilación).

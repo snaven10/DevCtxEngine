@@ -46,8 +46,22 @@ perder el comportamiento para comandos interactivos de la CLI.
 
 ## Verificación
 
-Tiempo de respuesta a un `initialize` de JSON-RPC sobre stdin, antes y después del cambio —
-números en el cierre del plan (PLAN-006 §6) y en el reporte final.
+Medido con un script que spawnea `target/debug/devctx mcp`, escribe un `initialize` sobre stdin y
+cronometra hasta la primera línea de respuesta:
+
+- **Después del fix, con el daemon por-proyecto ya arriba (estado estable — el caso normal, un
+  daemon corre con `--idle 900` entre sesiones):** `0.551s`.
+- **Después del fix, la primera vez sobre un `DEVCTX_HOME` vacío (arranca también el daemon por-
+  proyecto):** `7.322s` — este número no mide el chequeo de versión, mide levantar el daemon desde
+  cero (creación de la base, `spawn`/`WAIT_TICKS` de `devctx_central::client::ensure`); ya estaba
+  ahí antes de este cambio y queda fuera de alcance de esta task.
+- **Antes del fix:** no se volvió a medir empíricamente en esta sesión — revertirlo y recompilar
+  hubiera costado otro ciclo de compilación de ~49 minutos (`libduckdb-sys` se recompila entero por
+  cada "forma" de invocación de cargo distinta: build plano, clippy, test — ver la nota en el cierre
+  del plan). El argumento es por código, no por medición repetida: `update_check::fetch_latest`
+  (`update_check.rs:57-69`) corría en línea recta antes de servir, con un timeout de red de hasta 4s;
+  ahora corre en un hilo aparte y no puede demorar el primer byte de la respuesta a `initialize` en
+  absoluto, cualquiera sea el estado de la red.
 
 ## Resultado
 
@@ -55,7 +69,8 @@ números en el cierre del plan (PLAN-006 §6) y en el reporte final.
 - **Resumen:** El chequeo de actualización de `devctx mcp` corre en un hilo aparte; el servidor
   empieza a servir sin esperarlo. El comando interactivo de CLI sigue chequeando en línea recta.
 - **Archivos tocados:** `crates/devctx-cli/src/main.rs` (`cmd_mcp`).
-- **Verificado por:** medición de `initialize` sobre stdin antes/después (ver cierre del plan).
+- **Verificado por:** `initialize` real sobre stdin contra el binario compilado con el fix:
+  `0.551s` en estado estable. Ver la nota arriba sobre por qué no se repitió la medición "antes".
 - **Desviaciones:** ninguna respecto al enfoque planteado por el usuario ("saltarlo del todo en
   modo mcp, o correrlo después de servir") — se optó por la segunda opción porque conserva el
   chequeo diario sin agregar una rama de comportamiento nueva.
