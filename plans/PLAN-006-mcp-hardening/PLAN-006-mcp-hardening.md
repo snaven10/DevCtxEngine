@@ -101,10 +101,12 @@ con su propio commit convencional:
 | TASK-002 | El chequeo de actualización no bloquea el handshake de `devctx mcp` | — | `done` |
 | TASK-003 | Rutas `/memory/forget` y `/memory/move` faltantes en `devctx-api` (causa real del 404) | — | `done` |
 | TASK-004 | Verificación en caliente de `/plans/status` y `/plans/graph` | — | `done` |
+| TASK-005 | Checkpoint tras crear/borrar el índice FTS (y HNSW), y checkpoint real tras `remember` | — | `done` |
 
-No hay orden real de dependencia: las cuatro tocan archivos distintos (TASK-001 y TASK-003 rozan
+No hay orden real de dependencia: las cinco tocan archivos distintos (TASK-001 y TASK-003 rozan
 `devctx-mcp`/`devctx-api` pero en funciones separadas) y se hicieron en secuencia en la misma
-sesión para evitar pisarse en `state.rs`.
+sesión para evitar pisarse en `state.rs`. TASK-005 nace de la nota de infraestructura que dejó
+TASK-004 (el WAL corrupto de la base local del repo).
 
 ## 4. Riesgos
 
