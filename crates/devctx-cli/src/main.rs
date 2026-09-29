@@ -3266,7 +3266,9 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
 /// throws work away: whatever the WAL held that had not been checkpointed is
 /// gone, and the honest thing is to say so rather than present a silent rescue.
 /// In practice that is index writes, which `devctx index` regenerates; memories
-/// live through it, having been checkpointed when they were written.
+/// live through it, having been checkpointed when they were written —
+/// `devctx_memory::remember` checkpoints after every successful write, for
+/// exactly this reason: unlike an index, a memory is not regenerable.
 ///
 /// The log is renamed, never deleted. If setting it aside does not help either,
 /// it goes back where it was: this must not be the step that makes a recoverable

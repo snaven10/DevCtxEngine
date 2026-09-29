@@ -166,6 +166,10 @@ pub fn remember(
             m.duplicate_count += 1;
             m.updated_at = req.now.clone();
             store.upsert_memory(&m)?;
+            // Memories are not regenerable the way an index is — a crash
+            // before this reaches disk loses the write for good. See the
+            // checkpoint below for the full rationale.
+            store.checkpoint();
             return Ok(RememberResult {
                 memory: m,
                 status: RememberStatus::Duplicate,
@@ -213,6 +217,13 @@ pub fn remember(
 
     store.upsert_memory(&memory)?;
     index_memory_vectors(store, embedder, &memory)?;
+    // A memory is not regenerable the way a search index is — reindexing
+    // recovers a lost index, nothing recovers a lost memory. Fold the WAL in
+    // now, while a connection is still open to do it: a process killed right
+    // after this call must not lose the write, unlike the FTS/HNSW indexing
+    // DDL this same `checkpoint` also protects (see `Store::checkpoint`'s doc
+    // comment).
+    store.checkpoint();
 
     Ok(RememberResult { memory, status })
 }
@@ -754,5 +765,75 @@ mod tests {
 
         assert!(fuse(vec![], 5).is_empty());
         assert_eq!(fuse(vec![vec![mk("a", 1.0), mk("b", 0.5)]], 1).len(), 1);
+    }
+
+    /// Regression: a crash right after `remember` must not lose the memory.
+    /// Unlike a search index, a memory is not regenerable — nothing rebuilds
+    /// it — so `remember` checkpoints after every successful write (see the
+    /// comments inside `remember` itself). A real crash is simulated with a
+    /// child process that writes the memory and then aborts
+    /// (`std::process::abort`, which — unlike `std::process::exit` — runs no
+    /// destructors and no C `atexit`/static-destructor cleanup DuckDB might
+    /// otherwise do on ordinary exit), the same pattern used for the FTS/HNSW
+    /// regression in `devctx-store`.
+    #[test]
+    fn remember_survives_a_crash_right_after_writing() {
+        let path = std::env::temp_dir()
+            .join(format!("devctx_memory_crash_{}.duckdb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let status = std::process::Command::new(exe)
+            .arg("tests::crash_producer_remember")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("DEVCTX_CRASH_TEST_DB", &path)
+            .status()
+            .expect("spawning the crash-producer child");
+        assert!(
+            !status.success(),
+            "the crash producer is expected to abort, not return normally"
+        );
+
+        let store = Store::open(&path, DIM)
+            .expect("reopening right after a crash must not fail to replay the WAL");
+        let hits = recall(
+            &store,
+            &KwEmbedder,
+            &RecallQuery {
+                query: "auth tokens for login",
+                project: Some("proj"),
+                repo: None,
+                limit: 5,
+            },
+        )
+        .expect("recall after the crash");
+        assert!(
+            !hits.is_empty(),
+            "the memory written right before the crash must survive it"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
+    }
+
+    /// Child entry point for [`remember_survives_a_crash_right_after_writing`].
+    /// A no-op under an ordinary `cargo test` run — the env var is only ever
+    /// set by that test, which spawns this same binary with it set to the
+    /// scratch database path.
+    #[test]
+    fn crash_producer_remember() {
+        let Ok(path) = std::env::var("DEVCTX_CRASH_TEST_DB") else {
+            return;
+        };
+        let store = Store::open(std::path::Path::new(&path), DIM).expect("opening scratch store");
+        remember(
+            &store,
+            &KwEmbedder,
+            &req("Auth decision", "we use auth tokens for login", "decision"),
+        )
+        .expect("remember");
+        std::process::abort();
     }
 }
