@@ -1128,6 +1128,7 @@ dependencies = [
  "anyhow",
  "devctx-core",
  "fastembed",
+ "ort",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1206,6 +1207,7 @@ version = "0.6.0"
 dependencies = [
  "devctx-core",
  "fastembed",
+ "ort",
  "thiserror 2.0.20",
 ]
 

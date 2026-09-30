@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use devctx_core::config::Device;
+
 pub mod api;
 pub mod error;
 pub mod provider;
@@ -35,6 +37,8 @@ pub struct EmbedSettings {
     pub custom_dimension: Option<usize>,
     /// Directory holding a user-defined ONNX model + tokenizer (e.g. Granite).
     pub model_dir: Option<PathBuf>,
+    /// Where the local model runs (`cpu` | `cuda`).
+    pub device: Device,
 }
 
 impl EmbedSettings {
@@ -58,6 +62,8 @@ impl EmbedSettings {
             } else {
                 Some(PathBuf::from(&cfg.model_dir))
             },
+            // `DEVCTX_DEVICE` overrides the config.
+            device: cfg.device.with_env_override(),
         }
     }
 }

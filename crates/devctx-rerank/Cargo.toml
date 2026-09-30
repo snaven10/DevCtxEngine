@@ -11,8 +11,12 @@ description = "Cross-encoder reranking for DevCtxEngine (fastembed) with a no-op
 default = ["local"]
 # Gates the fastembed/ort-backed cross-encoder. Disabled => no-op reranker.
 local = ["dep:fastembed"]
+# CUDA execution provider for the local cross-encoder (`device: cuda`).
+gpu = ["local", "dep:ort", "ort/cuda"]
 
 [dependencies]
 devctx-core.workspace = true
 thiserror.workspace = true
 fastembed = { version = "4", optional = true }
+# Only to name `CUDAExecutionProvider`; pinned to the version fastembed uses.
+ort = { version = "=2.0.0-rc.9", default-features = false, optional = true }

@@ -191,6 +191,7 @@ impl AppState {
             model: cfg.reranking.model.clone(),
             model_dir: (!cfg.reranking.model_dir.is_empty())
                 .then(|| PathBuf::from(&cfg.reranking.model_dir)),
+            device: cfg.reranking.device.with_env_override(),
         };
         let root = if cfg.project.path.is_empty() {
             std::env::current_dir()?
@@ -779,7 +780,12 @@ fn plan_status_list(plans: &[Plan]) -> Value {
 fn find_plan<'a>(plans: &'a [Plan], query: &str) -> Option<&'a Plan> {
     let q = query.trim();
     let normalized = if q.to_uppercase().starts_with("PLAN-") {
-        let n: u32 = q[5..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()?;
+        let n: u32 = q[5..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()?;
         Some(format!("PLAN-{n:03}"))
     } else if q.chars().all(|c| c.is_ascii_digit()) && !q.is_empty() {
         let n: u32 = q.parse().ok()?;
@@ -805,25 +811,38 @@ fn plan_status_detail(plans: &[Plan], query: &str) -> Result<Value, String> {
             ids.join(", ")
         ));
     };
-    let Analysis { ready, in_progress, blocked, missing, cycles } = plans::analyze(plan);
+    let Analysis {
+        ready,
+        in_progress,
+        blocked,
+        missing,
+        cycles,
+    } = plans::analyze(plan);
     let by_id: HashMap<&str, &devctx_core::plans::Task> =
         plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
 
     let title_of = |id: &str| by_id.get(id).map(|t| t.title.clone()).unwrap_or_default();
 
-    let ready: Vec<Value> = ready.iter().map(|id| json!({ "id": id, "title": title_of(id) })).collect();
-    let in_progress: Vec<Value> =
-        in_progress.iter().map(|id| json!({ "id": id, "title": title_of(id) })).collect();
+    let ready: Vec<Value> = ready
+        .iter()
+        .map(|id| json!({ "id": id, "title": title_of(id) }))
+        .collect();
+    let in_progress: Vec<Value> = in_progress
+        .iter()
+        .map(|id| json!({ "id": id, "title": title_of(id) }))
+        .collect();
     let blocked: Vec<Value> = blocked
         .iter()
-        .map(|(id, waiting_on)| {
-            json!({ "id": id, "title": title_of(id), "waiting_on": waiting_on })
-        })
+        .map(
+            |(id, waiting_on)| json!({ "id": id, "title": title_of(id), "waiting_on": waiting_on }),
+        )
         .collect();
 
     let mut warnings: Vec<String> = plan.warnings.clone();
     for (task, dep) in &missing {
-        warnings.push(format!("{task}: depende de {dep}, que no existe en el plan"));
+        warnings.push(format!(
+            "{task}: depende de {dep}, que no existe en el plan"
+        ));
     }
     for cycle in &cycles {
         warnings.push(format!("ciclo de dependencias: {}", cycle.join(" -> ")));
@@ -923,7 +942,12 @@ pub fn plan_graph_value(root: &std::path::Path, plan: Option<&str>) -> Result<St
         .to_string());
     }
 
-    let Analysis { ready, in_progress, missing, .. } = plans::analyze(p);
+    let Analysis {
+        ready,
+        in_progress,
+        missing,
+        ..
+    } = plans::analyze(p);
     let ready_set: HashSet<&str> = ready.iter().map(|s| s.as_str()).collect();
     let in_progress_set: HashSet<&str> = in_progress.iter().map(|s| s.as_str()).collect();
     let missing_ids: HashSet<&str> = missing.iter().map(|(_, dep)| dep.as_str()).collect();
@@ -2167,7 +2191,18 @@ pub fn do_remember_unbound(
     files: &str,
 ) -> Result<String, String> {
     let mut out = central()?
-        .remember(content, title, memory_type, topic, tags, "", "unbound", "", "", files)
+        .remember(
+            content,
+            title,
+            memory_type,
+            topic,
+            tags,
+            "",
+            "unbound",
+            "",
+            "",
+            files,
+        )
         .map_err(|e| e.to_string())?;
     if let Some(o) = out.as_object_mut() {
         o.insert(
@@ -2804,7 +2839,12 @@ pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String,
     // tiny downstream (or the reverse) is common, and a single shared pool
     // would let one side starve the other silently.
     let half = budget / 2;
-    let label = |v: &Value| v.get("symbol").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let label = |v: &Value| {
+        v.get("symbol")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let (upstream, up_dropped) = fit_json_array(to_json(&impact.upstream), half, None, label);
     let (downstream, down_dropped) = fit_json_array(to_json(&impact.downstream), half, None, label);
     let mut out = json!({
@@ -3076,7 +3116,9 @@ pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result
     };
     if linked.is_empty() {
         if let Some(r) = &resolved {
-            linked = store.memory_ids_for_file(r, limit).map_err(|e| e.to_string())?;
+            linked = store
+                .memory_ids_for_file(r, limit)
+                .map_err(|e| e.to_string())?;
         }
     }
 
@@ -3094,9 +3136,10 @@ fn plan_tasks_for_file(root: &std::path::Path, query: &str, resolved: Option<&st
     let mut hits: Vec<(&Plan, &devctx_core::plans::Task, Option<u32>)> = Vec::new();
     for p in &loaded {
         for t in &p.tasks {
-            let m = t.files.iter().find(|f| {
-                f.matches(query) || resolved.map(|r| f.matches(r)).unwrap_or(false)
-            });
+            let m = t
+                .files
+                .iter()
+                .find(|f| f.matches(query) || resolved.map(|r| f.matches(r)).unwrap_or(false));
             if let Some(fref) = m {
                 hits.push((p, t, fref.line));
             }
@@ -3797,7 +3840,8 @@ mod tests {
 
     #[test]
     fn active_plan_is_the_newest_with_pending_tasks_even_if_another_plan_is_newer_and_done() {
-        let root = std::env::temp_dir().join(format!("devctx_plan_status_active_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_status_active_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write_plan_fixture(&root);
 
@@ -3809,7 +3853,8 @@ mod tests {
 
     #[test]
     fn blocked_waiting_on_names_exactly_the_pending_deps() {
-        let root = std::env::temp_dir().join(format!("devctx_plan_status_blocked_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_status_blocked_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write_plan_fixture(&root);
 
@@ -3835,7 +3880,8 @@ mod tests {
 
     #[test]
     fn budget_of_fifty_tokens_on_a_forty_task_plan_keeps_ready_and_reports_omitted() {
-        let root = std::env::temp_dir().join(format!("devctx_plan_status_budget_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_status_budget_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("plans/PLAN-009-grande/tasks");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3870,7 +3916,8 @@ mod tests {
 
     #[test]
     fn a_repo_without_plans_dir_gives_an_empty_list_not_an_error() {
-        let root = std::env::temp_dir().join(format!("devctx_plan_status_none_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_status_none_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
@@ -3903,11 +3950,16 @@ mod tests {
 
     #[test]
     fn plan_graph_marks_a_missing_dependency_as_a_node_instead_of_dropping_it() {
-        let root = std::env::temp_dir().join(format!("devctx_plan_graph_missing_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_graph_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("plans/PLAN-003-x/tasks");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(root.join("plans/PLAN-003-x/PLAN-003-x.md"), "# PLAN-003 — x\n").unwrap();
+        std::fs::write(
+            root.join("plans/PLAN-003-x/PLAN-003-x.md"),
+            "# PLAN-003 — x\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.join("TASK-001-a.md"),
             "# TASK-001 — a\n\n- **Depende de:** TASK-099\n- **Estado:** `pending`\n\n## Objetivo\n",
@@ -3918,7 +3970,10 @@ mod tests {
         let value: Value = serde_json::from_str(&raw).unwrap();
         let nodes = value["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 2, "TASK-001 plus the missing TASK-099 node");
-        let missing = nodes.iter().find(|n| n["data"]["id"] == "TASK-099").unwrap();
+        let missing = nodes
+            .iter()
+            .find(|n| n["data"]["id"] == "TASK-099")
+            .unwrap();
         assert_eq!(missing["data"]["status"].as_str(), Some("missing"));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3926,11 +3981,16 @@ mod tests {
 
     #[test]
     fn plan_graph_on_a_plan_with_no_task_files_says_so_without_an_empty_canvas() {
-        let root = std::env::temp_dir().join(format!("devctx_plan_graph_empty_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_graph_empty_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("plans/PLAN-004-sin-tasks");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("PLAN-004-sin-tasks.md"), "# PLAN-004 — sin tasks\n").unwrap();
+        std::fs::write(
+            dir.join("PLAN-004-sin-tasks.md"),
+            "# PLAN-004 — sin tasks\n",
+        )
+        .unwrap();
 
         let raw = plan_graph_value(&root, Some("PLAN-004")).unwrap();
         let value: Value = serde_json::from_str(&raw).unwrap();
@@ -3945,7 +4005,11 @@ mod tests {
     fn write_file_ref_fixture(root: &std::path::Path) {
         let dir = root.join("plans/PLAN-002-x/tasks");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(root.join("plans/PLAN-002-x/PLAN-002-x.md"), "# PLAN-002 — x\n").unwrap();
+        std::fs::write(
+            root.join("plans/PLAN-002-x/PLAN-002-x.md"),
+            "# PLAN-002 — x\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.join("TASK-001-a.md"),
             "# TASK-001 — a\n\n- **Depende de:** —\n- **Estado:** `pending`\n\n## Archivos\n\n\
@@ -3957,7 +4021,8 @@ mod tests {
 
     #[test]
     fn a_full_path_reference_with_a_line_matches_the_same_full_path() {
-        let root = std::env::temp_dir().join(format!("devctx_plan_tasks_file_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_tasks_file_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write_file_ref_fixture(&root);
 
@@ -3971,12 +4036,16 @@ mod tests {
 
     #[test]
     fn a_bare_lib_rs_reference_does_not_match_a_full_path_query() {
-        let root = std::env::temp_dir().join(format!("devctx_plan_tasks_bare_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_tasks_bare_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write_file_ref_fixture(&root);
 
         let hits = plan_tasks_for_file(&root, "crates/a/src/lib.rs", None);
-        assert!(hits.is_empty(), "a bare `lib.rs` must not match a full path: {hits:?}");
+        assert!(
+            hits.is_empty(),
+            "a bare `lib.rs` must not match a full path: {hits:?}"
+        );
 
         // But it matches an equally bare query.
         let hits = plan_tasks_for_file(&root, "lib.rs", None);
@@ -3988,7 +4057,10 @@ mod tests {
     #[test]
     fn with_plan_tasks_field_adds_the_field_without_disturbing_the_rest() {
         let original = r#"{"subject":"x.rs","memories":[],"matched_by":"junction"}"#.to_string();
-        let out = with_plan_tasks_field(original, vec![json!({"plan": "PLAN-002", "task": "TASK-001"})]);
+        let out = with_plan_tasks_field(
+            original,
+            vec![json!({"plan": "PLAN-002", "task": "TASK-001"})],
+        );
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["subject"].as_str(), Some("x.rs"));
         assert_eq!(value["plan_tasks"].as_array().unwrap().len(), 1);
@@ -4032,8 +4104,13 @@ mod tests {
             json!({ "framework": "x", "method": "GET", "path": "/ping" }),
             json!({ "framework": "x", "method": "GET", "path": "/".to_string() + &"x".repeat(2000) }),
         ];
-        let label =
-            |v: &Value| format!("{} {}", v["method"].as_str().unwrap(), v["path"].as_str().unwrap());
+        let label = |v: &Value| {
+            format!(
+                "{} {}",
+                v["method"].as_str().unwrap(),
+                v["path"].as_str().unwrap()
+            )
+        };
         let (kept, dropped) = fit_json_array(items, 20, None, label);
         assert_eq!(kept.len(), 1, "the small route survives: {kept:?}");
         assert_eq!(kept[0]["path"], "/ping");
@@ -4072,7 +4149,10 @@ mod tests {
         std::env::remove_var("DEVCTX_MAX_OUTPUT_TOKENS");
         let value: Value = serde_json::from_str(&out).unwrap();
         let omitted = value["omitted_for_budget"]["count"].as_u64().unwrap();
-        assert_eq!(omitted, 1, "only the oversized route should be dropped: {out}");
+        assert_eq!(
+            omitted, 1,
+            "only the oversized route should be dropped: {out}"
+        );
         assert_eq!(value["routes"].as_array().unwrap().len(), 5);
     }
 

@@ -146,6 +146,7 @@ impl Central {
             provider: self.config.memory.provider.clone(),
             model: self.config.memory.model.clone(),
             model_dir,
+            device: self.config.defaults.embeddings.device,
             ..Default::default()
         })
     }

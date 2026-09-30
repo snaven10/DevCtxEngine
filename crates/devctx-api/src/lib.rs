@@ -19,9 +19,9 @@ use devctx_mcp::state::{
     do_backfill_links, do_build_context, do_graph, do_impact, do_index_on, do_index_paths,
     do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
     do_memories_by_symbol, do_memory_context, do_memory_forget, do_memory_move, do_memory_refs,
-    do_memory_stats, do_plan_graph, do_plan_status, do_read_file, do_read_symbol,
-    do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
-    do_search, do_search_routes, do_summarize, parse_mode, AppState,
+    do_memory_stats, do_plan_graph, do_plan_status, do_read_file, do_read_symbol, do_recall_scoped,
+    do_references, do_remember, do_remember_shared, do_routes_for_handler, do_search,
+    do_search_routes, do_summarize, parse_mode, AppState,
 };
 use serde::Deserialize;
 
@@ -772,10 +772,8 @@ mod tests {
     /// failing with 404 again rather than as a 500 from a store error.
     #[tokio::test]
     async fn memory_forget_route_exists_and_forgets_a_real_memory() {
-        let dir = std::env::temp_dir().join(format!(
-            "devctx_api_forget_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_forget_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = test_cfg(&dir);

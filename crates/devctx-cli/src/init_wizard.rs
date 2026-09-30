@@ -259,6 +259,7 @@ pub fn ask(
             model: rerank_model,
             model_dir: r.model_dir,
             pool: rerank_pool,
+            device: r.device,
         }),
         summarization: Some(Summarization {
             provider: sum_provider,

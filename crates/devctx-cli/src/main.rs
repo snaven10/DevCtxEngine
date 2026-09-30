@@ -1747,9 +1747,9 @@ fn memories_of(v: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
         serde_json::Value::Array(a) => Ok(a.clone()),
         serde_json::Value::Object(_) => match v.get("memories") {
             Some(serde_json::Value::Array(a)) => Ok(a.clone()),
-            Some(other) => bail!(
-                "recall answered with a `memories` field that is not an array: {other}"
-            ),
+            Some(other) => {
+                bail!("recall answered with a `memories` field that is not an array: {other}")
+            }
             None => bail!("recall answered with no `memories` field at all: {v}"),
         },
         other => bail!(
@@ -2024,7 +2024,8 @@ fn plan_status_root() -> Result<PathBuf> {
 /// call it on every turn without cost.
 fn cmd_plan_status(plan: Option<String>, format: OutputFormat) -> Result<()> {
     let root = plan_status_root()?;
-    let value = devctx_mcp::state::plan_status_value(&root, plan.as_deref()).map_err(|e| anyhow!(e))?;
+    let value =
+        devctx_mcp::state::plan_status_value(&root, plan.as_deref()).map_err(|e| anyhow!(e))?;
 
     if matches!(format, OutputFormat::Json) {
         println!("{}", serde_json::to_string(&value)?);
@@ -2054,11 +2055,16 @@ fn cmd_plan_status(plan: Option<String>, format: OutputFormat) -> Result<()> {
         let done = p["done"].as_u64().unwrap_or(0);
         let total = p["total"].as_u64().unwrap_or(0);
         let title = truncate_chars(p["title"].as_str().unwrap_or(""), 40);
-        let marker = if active.as_deref() == Some(id) { " *" } else { "" };
+        let marker = if active.as_deref() == Some(id) {
+            " *"
+        } else {
+            ""
+        };
         println!("{id}  {done}/{total}  {title}{marker}");
     }
     if let Some(active_id) = active {
-        let detail = devctx_mcp::state::plan_status_value(&root, Some(&active_id)).map_err(|e| anyhow!(e))?;
+        let detail = devctx_mcp::state::plan_status_value(&root, Some(&active_id))
+            .map_err(|e| anyhow!(e))?;
         println!();
         print_plan_status_block(&detail, "  ");
     }
@@ -3394,6 +3400,7 @@ fn cmd_search(
             model: cfg.reranking.model.clone(),
             model_dir: (!cfg.reranking.model_dir.is_empty())
                 .then(|| PathBuf::from(&cfg.reranking.model_dir)),
+            device: cfg.reranking.device.with_env_override(),
         })?)
     } else {
         None

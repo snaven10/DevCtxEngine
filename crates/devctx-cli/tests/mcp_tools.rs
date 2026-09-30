@@ -196,7 +196,12 @@ fn call_tool(
 
 /// Like [`call_tool`], but for a call expected to fail: returns the JSON-RPC error's message
 /// instead of panicking on it, and panics if the call succeeds instead.
-fn call_tool_error(home: &PathBuf, cwd: &PathBuf, tool: &str, arguments: serde_json::Value) -> String {
+fn call_tool_error(
+    home: &PathBuf,
+    cwd: &PathBuf,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
         .env("DEVCTX_HOME", home)
         .current_dir(cwd)
@@ -334,9 +339,19 @@ fn plan_status_detail_reports_ready_in_progress_blocked_and_a_missing_dep_warnin
         serde_json::json!({ "plan": "2" }),
     );
     assert_eq!(out["plan"].as_str(), Some("PLAN-002"));
-    let ready: Vec<&str> = out["ready"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+    let ready: Vec<&str> = out["ready"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
     assert_eq!(ready, vec!["TASK-001"]);
-    let in_progress: Vec<&str> = out["in_progress"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+    let in_progress: Vec<&str> = out["in_progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
     assert_eq!(in_progress, vec!["TASK-002"]);
     let blocked = out["blocked"].as_array().unwrap();
     let task3 = blocked.iter().find(|b| b["id"] == "TASK-003").unwrap();
@@ -344,9 +359,16 @@ fn plan_status_detail_reports_ready_in_progress_blocked_and_a_missing_dep_warnin
         task3["waiting_on"].as_array().unwrap(),
         &vec![serde_json::json!("TASK-001")]
     );
-    let warnings: Vec<&str> = out["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect();
+    let warnings: Vec<&str> = out["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
     assert!(
-        warnings.iter().any(|w| w.contains("TASK-004") && w.contains("TASK-099")),
+        warnings
+            .iter()
+            .any(|w| w.contains("TASK-004") && w.contains("TASK-099")),
         "{warnings:?}"
     );
 }
@@ -366,7 +388,10 @@ fn plan_status_unknown_plan_errors_with_available_ids() {
         "plan_status",
         serde_json::json!({ "plan": "PLAN-009" }),
     );
-    assert!(message.contains("PLAN-001") && message.contains("PLAN-002"), "{message}");
+    assert!(
+        message.contains("PLAN-001") && message.contains("PLAN-002"),
+        "{message}"
+    );
 }
 
 /// `memories_by_file` over MCP carries `plan_tasks` for a file a task mentions.
@@ -387,7 +412,9 @@ fn memories_by_file_carries_plan_tasks_over_mcp() {
     assert!(out.get("plan_tasks").is_some(), "{out}");
     let plan_tasks = out["plan_tasks"].as_array().unwrap();
     assert!(
-        plan_tasks.iter().any(|t| t["task"] == "TASK-004" && t["plan"] == "PLAN-002"),
+        plan_tasks
+            .iter()
+            .any(|t| t["task"] == "TASK-004" && t["plan"] == "PLAN-002"),
         "{plan_tasks:?}"
     );
 }
@@ -403,10 +430,20 @@ fn cli_plan_status_json_matches_the_mcp_tool() {
     write_plan_status_fixture(&repo);
     devctx(&home, &repo, &["projects", "add", ".", "--init"]);
 
-    let tool_out = call_tool(&home, &repo, "plan_status", serde_json::json!({ "plan": "PLAN-002" }));
+    let tool_out = call_tool(
+        &home,
+        &repo,
+        "plan_status",
+        serde_json::json!({ "plan": "PLAN-002" }),
+    );
 
-    let cli_stdout = devctx(&home, &repo, &["plan-status", "PLAN-002", "--format", "json"]);
-    let mut cli_out: serde_json::Value = serde_json::from_str(cli_stdout.trim()).expect("valid JSON");
+    let cli_stdout = devctx(
+        &home,
+        &repo,
+        &["plan-status", "PLAN-002", "--format", "json"],
+    );
+    let mut cli_out: serde_json::Value =
+        serde_json::from_str(cli_stdout.trim()).expect("valid JSON");
 
     // The tool annotates `resolved_project` when a `project` hint resolved a different
     // repository than the session's binding; the CLI has no such concept. Strip it before

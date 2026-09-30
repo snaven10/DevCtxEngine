@@ -778,8 +778,8 @@ mod tests {
     /// regression in `devctx-store`.
     #[test]
     fn remember_survives_a_crash_right_after_writing() {
-        let path = std::env::temp_dir()
-            .join(format!("devctx_memory_crash_{}.duckdb", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("devctx_memory_crash_{}.duckdb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
 

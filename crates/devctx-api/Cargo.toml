@@ -10,6 +10,8 @@ description = "HTTP REST API for DevCtxEngine (axum), reusing the MCP engine."
 [features]
 # Passthrough for the local flan-t5 summarizer (used by the `summarize` route).
 flan-t5 = ["devctx-mcp/flan-t5"]
+# Passthrough for CUDA support in the local embedder/reranker.
+gpu = ["devctx-mcp/gpu"]
 
 [dependencies]
 devctx-core.workspace = true

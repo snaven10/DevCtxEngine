@@ -76,7 +76,11 @@ impl FileRef {
         if a.len() < 2 || b.len() < 2 {
             return false;
         }
-        let (shorter, longer) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+        let (shorter, longer) = if a.len() <= b.len() {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
         longer.ends_with(shorter.as_slice())
     }
 }
@@ -147,7 +151,10 @@ fn strip_accents_lower(s: &str) -> String {
 /// Returns `(field_name_lowercase_no_accents, value)` if the line is a field line.
 fn parse_field_line(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();
-    let trimmed = trimmed.strip_prefix('-').map(|s| s.trim()).unwrap_or(trimmed);
+    let trimmed = trimmed
+        .strip_prefix('-')
+        .map(|s| s.trim())
+        .unwrap_or(trimmed);
     if !trimmed.starts_with("**") {
         return None;
     }
@@ -244,7 +251,7 @@ fn parse_depends_on(raw: &str) -> (Vec<String>, Option<String>) {
         }
         // Unrecognized token that isn't just punctuation/connector words.
         let lw = strip_accents_lower(tok);
-        if matches!(lw.as_str(), "y" | "," | "" ) {
+        if matches!(lw.as_str(), "y" | "," | "") {
             continue;
         }
         warning = Some(format!("Depende de: token no reconocido '{tok}'"));
@@ -275,7 +282,10 @@ fn digits_of(s: &str) -> Option<String> {
 /// Normalizes a token like `TASK-001`, `TASK-1`, or bare `001`/`1` into `TASK-NNN` (3 digits).
 fn normalize_task_id(tok: &str) -> Option<String> {
     let upper = tok.to_uppercase();
-    if let Some(rest) = upper.strip_prefix("TASK-").or_else(|| upper.strip_prefix("TASK")) {
+    if let Some(rest) = upper
+        .strip_prefix("TASK-")
+        .or_else(|| upper.strip_prefix("TASK"))
+    {
         let digits = digits_of(rest)?;
         let n: u32 = digits.parse().ok()?;
         return Some(format!("TASK-{n:03}"));
@@ -289,7 +299,9 @@ fn normalize_task_id(tok: &str) -> Option<String> {
 }
 
 /// Known file extensions recognized when scanning inline code spans for file references.
-const KNOWN_EXTS: &[&str] = &["rs", "md", "toml", "yaml", "yml", "json", "html", "js", "ts", "sh"];
+const KNOWN_EXTS: &[&str] = &[
+    "rs", "md", "toml", "yaml", "yml", "json", "html", "js", "ts", "sh",
+];
 
 /// Extracts file references (`FileRef`) from inline single-backtick code spans, skipping any
 /// text inside triple-backtick fenced blocks.
@@ -340,7 +352,10 @@ fn extract_files(text: &str) -> Vec<FileRef> {
                 continue;
             }
             if seen.insert(path_part.clone()) {
-                refs.push(FileRef { path: path_part, line: line_part });
+                refs.push(FileRef {
+                    path: path_part,
+                    line: line_part,
+                });
             }
         }
     }
@@ -429,7 +444,9 @@ fn parse_table_status(text: &str) -> BTreeMap<String, Status> {
             continue;
         }
         let id_cell = cells[0];
-        let Some(id) = normalize_task_id(id_cell) else { continue };
+        let Some(id) = normalize_task_id(id_cell) else {
+            continue;
+        };
         let last = cells.last().unwrap();
         let cleaned = last.trim_matches('`');
         if cleaned.is_empty() {
@@ -457,7 +474,11 @@ pub fn plan_id_from_dir(dir_name: &str) -> Option<String> {
 /// Picks the plan doc among the `.md` files directly in `dir` (not `tasks/`), per TASK-001
 /// Paso 8: prefer `<dir-name>.md`; else the only `PLAN-N-*.md` not ending in `-design.md`; if
 /// several, warn and take the first in sorted order.
-fn pick_plan_doc(dir: &Path, dir_name: &str, candidates: &[PathBuf]) -> (Option<PathBuf>, Option<String>) {
+fn pick_plan_doc(
+    dir: &Path,
+    dir_name: &str,
+    candidates: &[PathBuf],
+) -> (Option<PathBuf>, Option<String>) {
     let preferred = dir.join(format!("{dir_name}.md"));
     if candidates.contains(&preferred) {
         return (Some(preferred), None);
@@ -507,8 +528,14 @@ pub fn load_plans(root: &Path) -> Vec<Plan> {
         .collect();
     dirs.sort();
     for dir in dirs {
-        let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let Some(plan_id) = plan_id_from_dir(&dir_name) else { continue };
+        let dir_name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(plan_id) = plan_id_from_dir(&dir_name) else {
+            continue;
+        };
         plans.push(load_plan(&dir, &dir_name, &plan_id));
     }
     plans
@@ -567,7 +594,10 @@ fn load_plan(dir: &Path, dir_name: &str, plan_id: &str) -> Plan {
             for f in files {
                 let name = f.file_stem().and_then(|n| n.to_str()).unwrap_or("");
                 let Some(id) = extract_task_id_from_filename(name) else {
-                    warnings.push(format!("nombre de archivo de task no reconocido: {}", f.display()));
+                    warnings.push(format!(
+                        "nombre de archivo de task no reconocido: {}",
+                        f.display()
+                    ));
                     continue;
                 };
                 if let Ok(meta) = f.metadata() {
@@ -645,7 +675,10 @@ fn extract_task_id_from_filename(stem: &str) -> Option<String> {
     if !upper.starts_with("TASK-") {
         return None;
     }
-    let digits: String = upper[5..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = upper[5..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if digits.is_empty() {
         return None;
     }
@@ -702,7 +735,11 @@ fn detect_cycles(plan: &Plan) -> Vec<Vec<String>> {
         Black,
     }
     let by_id: BTreeMap<&str, &Task> = plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-    let mut color: BTreeMap<&str, Color> = plan.tasks.iter().map(|t| (t.id.as_str(), Color::White)).collect();
+    let mut color: BTreeMap<&str, Color> = plan
+        .tasks
+        .iter()
+        .map(|t| (t.id.as_str(), Color::White))
+        .collect();
     let mut cycles = Vec::new();
     let mut stack: Vec<&str> = Vec::new();
 
@@ -718,13 +755,16 @@ fn detect_cycles(plan: &Plan) -> Vec<Vec<String>> {
         if let Some(task) = by_id.get(id) {
             for dep in &task.depends_on {
                 let dep_id = dep.as_str();
-                let Some(&dep_key) = by_id.keys().find(|k| **k == dep_id) else { continue };
+                let Some(&dep_key) = by_id.keys().find(|k| **k == dep_id) else {
+                    continue;
+                };
                 match color.get(dep_key) {
                     Some(Color::White) | None => visit(dep_key, by_id, color, stack, cycles),
                     Some(Color::Gray) => {
                         // found a cycle: slice the stack from dep_key's position
                         if let Some(pos) = stack.iter().position(|s| *s == dep_key) {
-                            let mut cycle: Vec<String> = stack[pos..].iter().map(|s| s.to_string()).collect();
+                            let mut cycle: Vec<String> =
+                                stack[pos..].iter().map(|s| s.to_string()).collect();
                             cycle.push(dep_key.to_string());
                             cycles.push(cycle);
                         }
@@ -775,7 +815,10 @@ Texto.
     fn plan002_style_header_parses_status_and_no_dependency() {
         let (t, warnings) = task(PLAN002_STYLE_TASK, "TASK-002", "PLAN-002");
         assert_eq!(t.status, Status::Done);
-        assert!(t.depends_on.is_empty(), "— (paralela a TASK-001) debe leerse como sin dependencia");
+        assert!(
+            t.depends_on.is_empty(),
+            "— (paralela a TASK-001) debe leerse como sin dependencia"
+        );
         assert!(warnings.is_empty());
     }
 
@@ -889,9 +932,7 @@ Texto.
     #[test]
     fn ninguna_and_na_mean_no_dependency() {
         for value in ["Ninguna", "N/A", "n/a"] {
-            let text = format!(
-                "# TASK-001 — algo\n\n- **Depende de:** {value}\n\n## Objetivo\n"
-            );
+            let text = format!("# TASK-001 — algo\n\n- **Depende de:** {value}\n\n## Objetivo\n");
             let (t, _w) = task(&text, "TASK-001", "PLAN-002");
             assert!(t.depends_on.is_empty(), "{value} debe dar sin dependencias");
         }
@@ -922,7 +963,11 @@ Referencia pelada: `lib.rs` y relativa `../VERIFICACION.md` (excluida) y `state.
         assert!(paths.contains(&"lib.rs"));
         assert!(paths.contains(&"state.rs"));
         assert!(!paths.iter().any(|p| p.starts_with("..")));
-        let state_rs = t.files.iter().find(|f| f.path == "crates/devctx-mcp/src/state.rs").unwrap();
+        let state_rs = t
+            .files
+            .iter()
+            .find(|f| f.path == "crates/devctx-mcp/src/state.rs")
+            .unwrap();
         assert_eq!(state_rs.line, Some(161));
     }
 
@@ -935,12 +980,18 @@ Referencia pelada: `lib.rs` y relativa `../VERIFICACION.md` (excluida) y `state.
 
     #[test]
     fn file_ref_matches_component_suffix_but_not_bare_lib_rs() {
-        let a = FileRef { path: "crates/devctx-mcp/src/state.rs".to_string(), line: None };
+        let a = FileRef {
+            path: "crates/devctx-mcp/src/state.rs".to_string(),
+            line: None,
+        };
         assert!(a.matches("crates/devctx-mcp/src/state.rs"));
         assert!(a.matches("devctx-mcp/src/state.rs"));
         assert!(!a.matches("state.rs"));
 
-        let bare = FileRef { path: "lib.rs".to_string(), line: None };
+        let bare = FileRef {
+            path: "lib.rs".to_string(),
+            line: None,
+        };
         assert!(bare.matches("lib.rs"));
         assert!(!bare.matches("crates/devctx-mcp/src/lib.rs"));
     }
@@ -964,7 +1015,10 @@ Referencia pelada: `lib.rs` y relativa `../VERIFICACION.md` (excluida) y `state.
         ];
         let (picked, warning) =
             pick_plan_doc(&dir, "PLAN-003-grafo-y-registro-de-lenguajes", &candidates);
-        assert_eq!(picked, Some(dir.join("PLAN-003-grafo-y-registro-de-lenguajes.md")));
+        assert_eq!(
+            picked,
+            Some(dir.join("PLAN-003-grafo-y-registro-de-lenguajes.md"))
+        );
         assert!(warning.is_none());
     }
 
@@ -1017,8 +1071,13 @@ Referencia pelada: `lib.rs` y relativa `../VERIFICACION.md` (excluida) y `state.
         };
         let analysis = analyze(&plan);
         assert_eq!(analysis.ready, vec!["TASK-002".to_string()]);
-        assert!(analysis.blocked.iter().any(|(id, deps)| id == "TASK-003" && deps == &vec!["TASK-002".to_string()]));
-        assert!(analysis.missing.contains(&("TASK-004".to_string(), "TASK-099".to_string())));
+        assert!(analysis
+            .blocked
+            .iter()
+            .any(|(id, deps)| id == "TASK-003" && deps == &vec!["TASK-002".to_string()]));
+        assert!(analysis
+            .missing
+            .contains(&("TASK-004".to_string(), "TASK-099".to_string())));
     }
 
     #[test]
@@ -1043,6 +1102,9 @@ Referencia pelada: `lib.rs` y relativa `../VERIFICACION.md` (excluida) y `state.
             warnings: vec![],
         };
         let analysis = analyze(&plan);
-        assert!(!analysis.cycles.is_empty(), "A->B->A debe detectarse como ciclo");
+        assert!(
+            !analysis.cycles.is_empty(),
+            "A->B->A debe detectarse como ciclo"
+        );
     }
 }

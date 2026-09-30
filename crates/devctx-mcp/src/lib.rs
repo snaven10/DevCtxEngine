@@ -15,10 +15,10 @@ use devctx_core::config::ProjectConfig;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation,
-    ListPromptsResult, ListResourcesResult, PaginatedRequestParams, Prompt, PromptMessage,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, Role, ServerCapabilities, ServerInfo,
+    GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult,
+    ListResourcesResult, PaginatedRequestParams, Prompt, PromptMessage, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities,
+    ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
@@ -1003,11 +1003,9 @@ impl DevctxServer {
     }
 
     /// Memories recorded about a symbol.
-    #[tool(
-        description = "Decisions, bugs and insights recorded about a symbol. \
+    #[tool(description = "Decisions, bugs and insights recorded about a symbol. \
         Searches project and shared memories. `link_sources` says how: files-\
-        field/content-mention (recorded) or inference (text match only)."
-    )]
+        field/content-mention (recorded) or inference (text match only).")]
     async fn memories_by_symbol(
         &self,
         Parameters(req): Parameters<MemoriesBySymbolReq>,
@@ -1185,10 +1183,7 @@ impl ServerHandler for DevctxServer {
                 None,
             ));
         }
-        Ok(
-            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, MEMORY_PROTOCOL)])
-                .into(),
-        )
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(Role::User, MEMORY_PROTOCOL)]).into())
     }
 
     /// Same document, exposed as a resource for a client that reads those

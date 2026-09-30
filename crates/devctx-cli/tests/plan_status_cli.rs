@@ -10,7 +10,10 @@ struct Tmp(PathBuf);
 
 impl Tmp {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("devctx_plan_status_cli_it_{tag}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "devctx_plan_status_cli_it_{tag}_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
@@ -79,7 +82,11 @@ fn detail_by_short_plan_id() {
     write_fixture(&tmp.0);
 
     let out = devctx(&tmp.0, &["plan-status", "2", "--format", "json"]);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["plan"].as_str(), Some("PLAN-002"));
@@ -103,7 +110,11 @@ fn unknown_plan_id_exits_nonzero_with_available_ids() {
 fn no_plans_directory_exits_zero() {
     let tmp = Tmp::new("noplans");
     let out = devctx(&tmp.0, &["plan-status"]);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("sin planes"), "{stdout}");
 }
@@ -113,7 +124,11 @@ fn no_plans_directory_exits_zero() {
 fn table_output_on_the_real_repo_plans_fits_the_hook_budget() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let out = devctx(&repo_root, &["plan-status"]);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         out.stdout.len() <= 600,
         "table output was {} bytes: {}",

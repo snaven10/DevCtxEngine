@@ -10,6 +10,8 @@ description = "Model Context Protocol server for DevCtxEngine (stdio)."
 [features]
 # Enable the local flan-t5 summarizer (heavy: pulls in candle + model download).
 flan-t5 = ["devctx-summarize/flan-t5"]
+# CUDA support for the local embedder and reranker (`device: cuda`).
+gpu = ["devctx-embed/gpu", "devctx-rerank/gpu"]
 
 [dependencies]
 devctx-core.workspace = true

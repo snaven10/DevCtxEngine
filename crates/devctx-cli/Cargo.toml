@@ -14,6 +14,8 @@ path = "src/main.rs"
 [features]
 # Build with the local flan-t5 summarizer (heavy: candle + model download).
 flan-t5 = ["devctx-summarize/flan-t5", "devctx-mcp/flan-t5"]
+# Build with CUDA support for local embeddings/reranking (`device: cuda`).
+gpu = ["devctx-embed/gpu", "devctx-rerank/gpu", "devctx-mcp/gpu"]
 
 [dependencies]
 crossterm = "0.28"

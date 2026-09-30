@@ -9,6 +9,8 @@
 pub mod error;
 pub mod provider;
 
+use devctx_core::config::Device;
+
 #[cfg(feature = "local")]
 pub mod local;
 
@@ -27,6 +29,8 @@ pub struct RerankSettings {
     pub pool: usize,
     /// Directory of a user-supplied cross-encoder (ONNX + tokenizer files).
     pub model_dir: Option<std::path::PathBuf>,
+    /// Where the cross-encoder runs (`cpu` | `cuda`).
+    pub device: Device,
 }
 
 impl Default for RerankSettings {
@@ -36,6 +40,7 @@ impl Default for RerankSettings {
             pool: 100,
             model: default_model().to_string(),
             model_dir: None,
+            device: Device::Cpu,
         }
     }
 }
@@ -60,6 +65,7 @@ pub fn create_reranker(settings: &RerankSettings) -> Result<Box<dyn Reranker>> {
         &settings.model,
         settings.model_dir.as_deref(),
         settings.pool,
+        settings.device,
     )
 }
 
@@ -68,9 +74,10 @@ fn create_local(
     model: &str,
     model_dir: Option<&std::path::Path>,
     pool: usize,
+    device: Device,
 ) -> Result<Box<dyn Reranker>> {
     Ok(Box::new(
-        local::LocalReranker::load(model, model_dir)?.with_pool(pool),
+        local::LocalReranker::load(model, model_dir, device)?.with_pool(pool),
     ))
 }
 
@@ -79,6 +86,7 @@ fn create_local(
     _model: &str,
     _model_dir: Option<&std::path::Path>,
     _pool: usize,
+    _device: Device,
 ) -> Result<Box<dyn Reranker>> {
     Ok(Box::new(NoopReranker))
 }
@@ -94,6 +102,7 @@ mod tests {
             model_dir: None,
             enabled: false,
             model: "bge-base".into(),
+            device: Device::Cpu,
         })
         .unwrap();
         assert_eq!(r.name(), "noop");

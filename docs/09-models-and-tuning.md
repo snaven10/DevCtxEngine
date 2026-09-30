@@ -103,6 +103,35 @@ either alone. On a constrained machine, lowering `DEVCTX_EMBED_MAX_CHARS` to
 2048 is usually the more effective of the two, because it attacks the padding
 rather than the count.
 
+## GPU (CUDA)
+
+Local ONNX models (the embedder and the reranker) run on CPU unless told
+otherwise. A binary built with the `gpu` feature can use an NVIDIA GPU:
+
+```bash
+cargo install --path crates/devctx-cli --features gpu
+```
+
+```yaml
+embeddings:
+  device: cuda          # cpu (default) | cuda
+reranking:
+  device: cuda
+```
+
+`DEVCTX_DEVICE=cpu|cuda` overrides both. Requirements: an NVIDIA driver, the
+CUDA 12.x toolkit and cuDNN 9 on the host (or in WSL); Blackwell GPUs need
+CUDA 12.8 or newer.
+
+Nothing fails silently. If `device: cuda` is set on a binary built without
+`--features gpu`, or CUDA cannot be initialised (missing driver, toolkit or
+cuDNN), devctx prints a warning to stderr and runs on CPU.
+
+One caveat: the default Granite ONNX is int8-quantized, and CUDA has no kernels
+for some quantized operators, so those run on CPU and most of the benefit is
+lost. For GPU use an fp16 ONNX of the same model — same 384 dimensions, so the
+index is unchanged and nothing needs re-embedding.
+
 ## Storage tuning
 
 ```yaml

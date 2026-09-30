@@ -7,9 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
+use devctx_core::config::Device;
 use fastembed::{
-    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles,
-    UserDefinedEmbeddingModel,
+    EmbeddingModel, ExecutionProviderDispatch, InitOptions, InitOptionsUserDefined, Pooling,
+    TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
 
 use crate::error::{EmbedError, Result};
@@ -50,8 +51,8 @@ impl LocalProvider {
             .ok_or_else(|| EmbedError::UnknownModel(key.to_string(), "local".into()))?;
 
         let model = match spec.builtin {
-            Some(builtin) => load_builtin(builtin, spec)?,
-            None => load_user_defined(spec, settings.model_dir.as_deref())?,
+            Some(builtin) => load_builtin(builtin, spec, settings.device)?,
+            None => load_user_defined(spec, settings.model_dir.as_deref(), settings.device)?,
         };
 
         Ok(Self {
@@ -92,7 +93,51 @@ impl EmbeddingProvider for LocalProvider {
     }
 }
 
-fn load_builtin(builtin: &str, spec: &LocalModelSpec) -> Result<TextEmbedding> {
+/// The CUDA execution provider, or `None` when built without `--features gpu`.
+///
+/// `error_on_failure` makes a missing driver/toolkit fail the session instead of
+/// ort silently continuing on CPU, so [`init_on`] can say so.
+#[cfg(feature = "gpu")]
+fn cuda_providers() -> Option<Vec<ExecutionProviderDispatch>> {
+    use ort::execution_providers::CUDAExecutionProvider;
+    Some(vec![CUDAExecutionProvider::default()
+        .build()
+        .error_on_failure()])
+}
+
+#[cfg(not(feature = "gpu"))]
+fn cuda_providers() -> Option<Vec<ExecutionProviderDispatch>> {
+    None
+}
+
+/// Run `init` with the execution providers for `device`, falling back to CPU
+/// (with a warning) when CUDA was asked for but is unavailable.
+fn init_on<T>(
+    device: Device,
+    mut init: impl FnMut(Vec<ExecutionProviderDispatch>) -> Result<T>,
+) -> Result<T> {
+    if device == Device::Cuda {
+        match cuda_providers() {
+            Some(providers) => {
+                eprintln!("devctx: embeddings requested CUDA (device: cuda)");
+                match init(providers) {
+                    Ok(model) => return Ok(model),
+                    Err(e) => eprintln!(
+                        "devctx: warning: CUDA failed for embeddings ({e}); falling back to CPU. \
+                         Check the NVIDIA driver, CUDA 12 toolkit and cuDNN 9."
+                    ),
+                }
+            }
+            None => eprintln!(
+                "devctx: warning: device is cuda but this binary was built without GPU \
+                 support (--features gpu); embeddings run on CPU"
+            ),
+        }
+    }
+    init(Vec::new())
+}
+
+fn load_builtin(builtin: &str, spec: &LocalModelSpec, device: Device) -> Result<TextEmbedding> {
     let model = builtin_model(builtin)?;
     let mut opts = InitOptions::new(model).with_show_download_progress(false);
     // Without this fastembed caches relative to the working directory, so the
@@ -104,7 +149,10 @@ fn load_builtin(builtin: &str, spec: &LocalModelSpec) -> Result<TextEmbedding> {
     if let Some(max) = spec.max_input_tokens {
         opts = opts.with_max_length(max);
     }
-    TextEmbedding::try_new(opts).map_err(|e| EmbedError::Backend(e.to_string()))
+    init_on(device, |eps| {
+        TextEmbedding::try_new(opts.clone().with_execution_providers(eps))
+            .map_err(|e| EmbedError::Backend(e.to_string()))
+    })
 }
 
 fn builtin_model(builtin: &str) -> Result<EmbeddingModel> {
@@ -119,7 +167,11 @@ fn builtin_model(builtin: &str) -> Result<EmbeddingModel> {
     })
 }
 
-fn load_user_defined(spec: &LocalModelSpec, model_dir: Option<&Path>) -> Result<TextEmbedding> {
+fn load_user_defined(
+    spec: &LocalModelSpec,
+    model_dir: Option<&Path>,
+    device: Device,
+) -> Result<TextEmbedding> {
     let dir = model_dir.ok_or_else(|| {
         EmbedError::MissingConfig(format!(
             "model_dir (DEVCTX_MODEL_DIR) for user-defined model '{}' ({})",
@@ -144,8 +196,11 @@ fn load_user_defined(spec: &LocalModelSpec, model_dir: Option<&Path>) -> Result<
     let tokenizer_files = read_tokenizer_files(dir)?;
 
     let udm = UserDefinedEmbeddingModel::new(onnx, tokenizer_files).with_pooling(Pooling::Mean);
-    TextEmbedding::try_new_from_user_defined(udm, InitOptionsUserDefined::new())
-        .map_err(|e| EmbedError::Backend(e.to_string()))
+    init_on(device, |eps| {
+        let opts = InitOptionsUserDefined::new().with_execution_providers(eps);
+        TextEmbedding::try_new_from_user_defined(udm.clone(), opts)
+            .map_err(|e| EmbedError::Backend(e.to_string()))
+    })
 }
 
 fn read_tokenizer_files(dir: &Path) -> Result<TokenizerFiles> {
@@ -192,7 +247,7 @@ mod tests {
     fn user_defined_requires_model_dir() {
         let spec = registry::find_local("ml-granite").unwrap();
         assert!(matches!(
-            load_user_defined(spec, None),
+            load_user_defined(spec, None, Device::Cpu),
             Err(EmbedError::MissingConfig(_))
         ));
     }
