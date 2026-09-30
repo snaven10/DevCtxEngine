@@ -112,8 +112,20 @@ indique otra cosa. Un binario compilado con la feature `gpu` puede usar una GPU
 NVIDIA:
 
 ```bash
-cargo install --path crates/devctx-cli --features gpu
+cargo rustc --release -p devctx-cli --bin devctx --features gpu \
+  -- -C 'link-arg=-Wl,-rpath,$ORIGIN/../lib/devctx'
+mkdir -p ~/.local/lib/devctx
+cp ~/.cache/ort.pyke.io/dfbin/x86_64-unknown-linux-gnu/*/onnxruntime/lib/libonnxruntime{,_providers_shared,_providers_cuda}.so \
+  ~/.local/lib/devctx/
+install -m 755 target/release/devctx ~/.local/bin/devctx
 ```
+
+Un `cargo install --features gpu` a secas produce un binario que no arranca.
+Con la feature de CUDA el ONNX Runtime deja de enlazarse estático: el binario
+necesita `libonnxruntime.so` (y el provider de CUDA al lado) en tiempo de
+ejecución, y no tiene ruta para encontrarlos. El `rpath` de arriba lo apunta a
+`../lib/devctx` relativo a sí mismo, que es donde se copian las librerías. Los
+binarios del release de GitHub se compilan sin `gpu` y no se ven afectados.
 
 ```yaml
 embeddings:

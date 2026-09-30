@@ -109,8 +109,20 @@ Local ONNX models (the embedder and the reranker) run on CPU unless told
 otherwise. A binary built with the `gpu` feature can use an NVIDIA GPU:
 
 ```bash
-cargo install --path crates/devctx-cli --features gpu
+cargo rustc --release -p devctx-cli --bin devctx --features gpu \
+  -- -C 'link-arg=-Wl,-rpath,$ORIGIN/../lib/devctx'
+mkdir -p ~/.local/lib/devctx
+cp ~/.cache/ort.pyke.io/dfbin/x86_64-unknown-linux-gnu/*/onnxruntime/lib/libonnxruntime{,_providers_shared,_providers_cuda}.so \
+  ~/.local/lib/devctx/
+install -m 755 target/release/devctx ~/.local/bin/devctx
 ```
+
+A plain `cargo install --features gpu` builds a binary that does not start.
+With the CUDA feature the ONNX Runtime is no longer linked statically: the
+binary needs `libonnxruntime.so` (and the CUDA provider next to it) at run
+time, and has no path to find them. The `rpath` above points it at
+`../lib/devctx` relative to itself, which is where the libraries are copied.
+The release binaries on GitHub are built without `gpu` and are unaffected.
 
 ```yaml
 embeddings:
