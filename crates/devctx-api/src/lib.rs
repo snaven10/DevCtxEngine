@@ -18,9 +18,10 @@ use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
     do_backfill_links, do_build_context, do_graph, do_impact, do_index_on, do_index_paths,
     do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
-    do_memories_by_symbol, do_memory_context, do_memory_refs, do_memory_stats, do_read_file,
-    do_read_symbol, do_recall_scoped, do_references, do_remember, do_remember_shared,
-    do_routes_for_handler, do_search, do_search_routes, do_summarize, parse_mode, AppState,
+    do_memories_by_symbol, do_memory_context, do_memory_forget, do_memory_move, do_memory_refs,
+    do_memory_stats, do_plan_graph, do_plan_status, do_read_file, do_read_symbol, do_recall_scoped,
+    do_references, do_remember, do_remember_shared, do_routes_for_handler, do_search,
+    do_search_routes, do_summarize, parse_mode, AppState,
 };
 use serde::Deserialize;
 
@@ -50,9 +51,13 @@ fn router(api: Api) -> Router {
         .route("/remember", post(remember))
         .route("/recall", post(recall))
         .route("/memories", get(memories))
+        .route("/memory/forget", post(memory_forget))
+        .route("/memory/move", post(memory_move))
         .route("/memory/stats", get(memory_stats))
         .route("/projects", get(list_projects))
         .route("/graph", get(graph))
+        .route("/plans/status", get(plans_status))
+        .route("/plans/graph", get(plans_graph))
         .route("/impact/:symbol", get(impact))
         .route("/references/:symbol", get(references))
         .route("/memories/by-symbol/:symbol", get(memories_by_symbol))
@@ -299,6 +304,17 @@ struct ListProjectsQuery {
 }
 
 #[derive(Deserialize)]
+struct MemoryForgetBody {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct MemoryMoveBody {
+    id: String,
+    to: String,
+}
+
+#[derive(Deserialize)]
 struct ReadFileBody {
     path: String,
     #[serde(default)]
@@ -376,6 +392,12 @@ struct MemoriesQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct PlanStatusQuery {
+    #[serde(default)]
+    plan: Option<String>,
+}
+
 // --- handlers ---
 
 async fn health() -> Response {
@@ -412,6 +434,14 @@ async fn graph(State(api): State<Api>, Query(q): Query<GraphQuery>) -> Response 
         )
     })
     .await
+}
+
+async fn plans_status(State(api): State<Api>, Query(q): Query<PlanStatusQuery>) -> Response {
+    run(api.state, move |s| do_plan_status(s, q.plan.as_deref())).await
+}
+
+async fn plans_graph(State(api): State<Api>, Query(q): Query<PlanStatusQuery>) -> Response {
+    run(api.state, move |s| do_plan_graph(s, q.plan.as_deref())).await
 }
 
 async fn memories(State(api): State<Api>, Query(q): Query<MemoriesQuery>) -> Response {
@@ -616,6 +646,22 @@ async fn memory_refs(State(api): State<Api>, Path(id): Path<String>) -> Response
     run(api.state, move |s| do_memory_refs(s, &id)).await
 }
 
+/// Permanently delete one memory, wherever it lives (this project or the
+/// shared store). Was missing entirely: `Backend::Remote::memory_forget`
+/// (`backend.rs`) POSTs here, and until this route existed every call routed
+/// through a per-project daemon fell through to axum's 404 fallback — the
+/// tool call reads as "the memory does not exist" when it is really "this
+/// route does not exist".
+async fn memory_forget(State(api): State<Api>, Json(b): Json<MemoryForgetBody>) -> Response {
+    run(api.state, move |s| do_memory_forget(s, &b.id)).await
+}
+
+/// Move a memory to another tier (local/group/global) or another repository.
+/// Missing for the same reason as `memory_forget` above.
+async fn memory_move(State(api): State<Api>, Json(b): Json<MemoryMoveBody>) -> Response {
+    run(api.state, move |s| do_memory_move(s, &b.id, &b.to)).await
+}
+
 async fn references(State(api): State<Api>, Path(symbol): Path<String>) -> Response {
     run(api.state, move |s| do_references(s, &symbol)).await
 }
@@ -688,4 +734,93 @@ pub(crate) fn json_ok(body: String) -> Response {
 pub(crate) fn json_err(code: StatusCode, msg: String) -> Response {
     let body = serde_json::json!({ "error": msg }).to_string();
     (code, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as HttpStatus};
+    use tower::ServiceExt;
+
+    fn test_cfg(dir: &std::path::Path) -> ProjectConfig {
+        let path = dir.to_string_lossy().to_string();
+        ProjectConfig {
+            state_dir: path.clone(),
+            project: devctx_core::config::Project {
+                path,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// PLAN-006 TASK-003: `Backend::Remote::memory_forget`
+    /// (`devctx-mcp/src/backend.rs`) POSTs to `/memory/forget` on the
+    /// per-project daemon. That route did not exist on this router at all —
+    /// no `.route("/memory/forget", …)`, no handler — so every call fell
+    /// through to axum's built-in 404, which is what a user saw and reported
+    /// as "memory_forget returns 404 on group-scope memories". The bug was
+    /// never about store scoping (`Store::forget_memory` deletes by bare
+    /// `id`, no project filter — see `devctx-store/src/memory.rs`); it
+    /// reproduces for ANY memory forgotten through a routed (`Remote`)
+    /// session, which is the default mode `devctx mcp` runs in.
+    ///
+    /// This seeds a memory directly into the store (no embedder needed —
+    /// `upsert_memory` only touches the `memories` table) and forgets it
+    /// through the real HTTP router, so a regression shows up as this test
+    /// failing with 404 again rather than as a 500 from a store error.
+    #[tokio::test]
+    async fn memory_forget_route_exists_and_forgets_a_real_memory() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_forget_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = test_cfg(&dir);
+
+        let dim = devctx_embed::dimension_for(&cfg.embeddings.provider, &cfg.embeddings.model);
+        {
+            // Own connection, closed before `AppState::build` opens its own —
+            // DuckDB allows only one writer at a time.
+            let store = devctx_store::Store::open(&cfg.db_path(), dim).unwrap();
+            let m = devctx_store::Memory {
+                id: "mem_test_forget_me".into(),
+                title: "t".into(),
+                content: "c".into(),
+                memory_type: "note".into(),
+                project: "default".into(),
+                ..Default::default()
+            };
+            store.upsert_memory(&m).unwrap();
+        }
+
+        // No central daemon in this test: the local store already has the
+        // memory, so `do_memory_forget`'s local path answers before it would
+        // ever need one.
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(cfg).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/memory/forget")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "id": "mem_test_forget_me" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            HttpStatus::OK,
+            "the route must exist and succeed, not fall through to axum's 404"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["forgotten"], serde_json::json!(true), "{v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

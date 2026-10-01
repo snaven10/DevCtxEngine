@@ -235,6 +235,14 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         depth: usize,
     },
+    /// Progress on the plans under `plans/` (markdown, source of truth). No daemon, no store:
+    /// reads markdown from disk. Fast enough for a shell-startup hook.
+    PlanStatus {
+        /// Plan id (PLAN-005, 005, 5, or the directory name). Omit to list every plan.
+        plan: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
     /// List framework-aware HTTP routes.
     Routes {
         /// Filter by HTTP method.
@@ -565,6 +573,7 @@ fn main() -> Result<()> {
             no_memories,
         } => cmd_context(query, max_tokens, !no_memories),
         Command::Impact { symbol, depth } => cmd_impact(symbol, depth),
+        Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),
         Command::Routes { method, path } => cmd_routes(method, path),
         Command::Summarize {
             path,
@@ -1352,12 +1361,20 @@ fn open_browser(url: &str) {
 
 /// `devctx mcp` — run the MCP server over stdio.
 fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
-    // Checked once here, at startup, and handed to the tools through the
-    // environment: a per-call check would put a network round-trip on the path
-    // of every `list_projects`, and the answer changes at most daily.
-    if let Some(v) = update_check::available(RELEASE_REPO, env!("CARGO_PKG_VERSION")) {
-        std::env::set_var("DEVCTX_UPDATE_AVAILABLE", v);
-    }
+    // Checked once, off the startup path: this used to run inline, right here,
+    // before the server ever started serving — a network round-trip (up to the
+    // 4s timeout in `update_check::fetch_latest`) sitting directly on top of
+    // every MCP client's `initialize` handshake. A client that gives up on a
+    // slow handshake never gets a second try. The answer changes at most
+    // daily and nothing here branches on it, so it can arrive whenever the
+    // network answers: a background thread that sets the same environment
+    // variable once it knows, read lazily by `list_projects` (`state.rs:2066`)
+    // exactly as before — the only change is *when* the network call happens.
+    std::thread::spawn(|| {
+        if let Some(v) = update_check::available(RELEASE_REPO, env!("CARGO_PKG_VERSION")) {
+            std::env::set_var("DEVCTX_UPDATE_AVAILABLE", v);
+        }
+    });
     // Registering this server globally is the normal thing to do, and it means
     // the client launches it from whatever directory it happens to be in —
     // usually the user's home, which is inside no repository at all. Refusing to
@@ -1718,14 +1735,27 @@ fn cmd_recall(
 /// The memories out of a recall payload, accepting either the object the
 /// server returns or a bare array. Neither shape should be assumed: this exact
 /// mismatch silently emptied local recall.
-fn memories_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
+///
+/// A shape that is neither of those is an error, not an empty result. It used
+/// to fall through to `unwrap_or_default()`, so a payload nobody had seen
+/// before — a stale server answering `{"hits": [...]}`, an error body that
+/// slipped past the transport layer, a bare string — read exactly like a
+/// project with no memories. An empty `memories: []` is still a legitimate
+/// answer and stays `Ok(vec![])`; anything else the caller has to see.
+fn memories_of(v: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
     match v {
-        serde_json::Value::Array(a) => a.clone(),
-        _ => v
-            .get("memories")
-            .and_then(|m| m.as_array())
-            .cloned()
-            .unwrap_or_default(),
+        serde_json::Value::Array(a) => Ok(a.clone()),
+        serde_json::Value::Object(_) => match v.get("memories") {
+            Some(serde_json::Value::Array(a)) => Ok(a.clone()),
+            Some(other) => {
+                bail!("recall answered with a `memories` field that is not an array: {other}")
+            }
+            None => bail!("recall answered with no `memories` field at all: {v}"),
+        },
+        other => bail!(
+            "recall answered with a shape that is neither an array nor an object with \
+             `memories`: {other}"
+        ),
     }
 }
 
@@ -1739,7 +1769,7 @@ fn local_recall(cfg: &ProjectConfig, query: &str, limit: usize) -> Result<Vec<se
         // bare array, so `as_array()` was always None and every recall made
         // while a server was running reported no local memories at all — for a
         // project that had sixteen of them.
-        return Ok(memories_of(&parsed));
+        return memories_of(&parsed).context("reading the local server's recall answer");
     }
     let embedder = build_embedder(cfg)?;
     let store = open_store(cfg, embedder.dimension())?;
@@ -1975,6 +2005,133 @@ fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     print_impact("callers (upstream)", &impact.upstream);
     print_impact("callees (downstream)", &impact.downstream);
     Ok(())
+}
+
+/// Root to read `plans/` from: the project's configured root when this cwd is inside a
+/// DevCtxEngine project, else the cwd itself — plans exist in git whether or not the repo is
+/// indexed, and the hook that calls this needs an answer even in a fresh clone.
+fn plan_status_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    if let Some(cfg_path) = find_config_file(&cwd) {
+        let cfg = ProjectConfig::load(&cfg_path)?;
+        return project_root(&cfg);
+    }
+    Ok(cwd)
+}
+
+/// `devctx plan-status [PLAN] [--format json]`: reads `plans/` straight off disk — no store, no
+/// daemon (`remote::ensure` is deliberately never called here) — so the SessionStart hook can
+/// call it on every turn without cost.
+fn cmd_plan_status(plan: Option<String>, format: OutputFormat) -> Result<()> {
+    let root = plan_status_root()?;
+    let value =
+        devctx_mcp::state::plan_status_value(&root, plan.as_deref()).map_err(|e| anyhow!(e))?;
+
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string(&value)?);
+        return Ok(());
+    }
+
+    if let Some(plan_id) = value.get("plan").and_then(|v| v.as_str()) {
+        let title = truncate_chars(value["title"].as_str().unwrap_or(""), 60);
+        let done = value["done"].as_u64().unwrap_or(0);
+        let total = value["total"].as_u64().unwrap_or(0);
+        let list = devctx_mcp::state::plan_status_value(&root, None).map_err(|e| anyhow!(e))?;
+        let active = list["active"].as_str() == Some(plan_id);
+        let marker = if active { " (activo)" } else { "" };
+        println!("{plan_id} {title} — {done}/{total} done{marker}");
+        print_plan_status_block(&value, "  ");
+        return Ok(());
+    }
+
+    let plans = value["plans"].as_array().cloned().unwrap_or_default();
+    if plans.is_empty() {
+        println!("sin planes");
+        return Ok(());
+    }
+    let active = value["active"].as_str().map(str::to_string);
+    for p in &plans {
+        let id = p["id"].as_str().unwrap_or("");
+        let done = p["done"].as_u64().unwrap_or(0);
+        let total = p["total"].as_u64().unwrap_or(0);
+        let title = truncate_chars(p["title"].as_str().unwrap_or(""), 40);
+        let marker = if active.as_deref() == Some(id) {
+            " *"
+        } else {
+            ""
+        };
+        println!("{id}  {done}/{total}  {title}{marker}");
+    }
+    if let Some(active_id) = active {
+        let detail = devctx_mcp::state::plan_status_value(&root, Some(&active_id))
+            .map_err(|e| anyhow!(e))?;
+        println!();
+        print_plan_status_block(&detail, "  ");
+    }
+    Ok(())
+}
+
+/// Renders the `listas` / `en curso` / `bloqueadas` / warning lines of a plan-status detail JSON.
+fn print_plan_status_block(value: &serde_json::Value, indent: &str) {
+    let empty = Vec::new();
+    let ready = value["ready"].as_array().unwrap_or(&empty);
+    let in_progress = value["in_progress"].as_array().unwrap_or(&empty);
+    let blocked = value["blocked"].as_array().unwrap_or(&empty);
+    println!("{indent}listas:     {}", format_task_list(ready));
+    println!("{indent}en curso:   {}", format_task_list(in_progress));
+    println!("{indent}bloqueadas: {}", format_blocked_list(blocked));
+    let warn_count = value["warnings"].as_array().map(Vec::len).unwrap_or(0);
+    if warn_count > 0 {
+        let plural = if warn_count == 1 { "" } else { "s" };
+        println!("{indent}⚠ {warn_count} warning{plural}");
+    }
+}
+
+fn format_task_list(items: &[serde_json::Value]) -> String {
+    if items.is_empty() {
+        return "—".to_string();
+    }
+    items
+        .iter()
+        .map(|it| {
+            format!(
+                "{} {}",
+                it["id"].as_str().unwrap_or(""),
+                truncate_chars(it["title"].as_str().unwrap_or(""), 28)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Truncates `s` to at most `max_chars` characters (not bytes — titles carry accents and em
+/// dashes), appending `…` when it cuts. Keeps the compact `table` format inside the hook's
+/// output budget without an arbitrary byte cut landing mid-character.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn format_blocked_list(items: &[serde_json::Value]) -> String {
+    if items.is_empty() {
+        return "0".to_string();
+    }
+    let parts: Vec<String> = items
+        .iter()
+        .map(|it| {
+            let id = it["id"].as_str().unwrap_or("");
+            let waiting: Vec<&str> = it["waiting_on"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            format!("{id} espera {}", waiting.join(", "))
+        })
+        .collect();
+    format!("{} ({})", items.len(), parts.join("; "))
 }
 
 /// Say out loud when a bare name stood for more than one declaration.
@@ -3115,7 +3272,9 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
 /// throws work away: whatever the WAL held that had not been checkpointed is
 /// gone, and the honest thing is to say so rather than present a silent rescue.
 /// In practice that is index writes, which `devctx index` regenerates; memories
-/// live through it, having been checkpointed when they were written.
+/// live through it, having been checkpointed when they were written —
+/// `devctx_memory::remember` checkpoints after every successful write, for
+/// exactly this reason: unlike an index, a memory is not regenerable.
 ///
 /// The log is renamed, never deleted. If setting it aside does not help either,
 /// it goes back where it was: this must not be the step that makes a recoverable
@@ -3241,6 +3400,7 @@ fn cmd_search(
             model: cfg.reranking.model.clone(),
             model_dir: (!cfg.reranking.model_dir.is_empty())
                 .then(|| PathBuf::from(&cfg.reranking.model_dir)),
+            device: cfg.reranking.device.with_env_override(),
         })?)
     } else {
         None
@@ -3440,23 +3600,42 @@ mod tests {
             "omitted_for_budget": { "count": 3 }
         });
         assert_eq!(
-            memories_of(&object).len(),
+            memories_of(&object).unwrap().len(),
             2,
             "the object form is what the server actually returns"
         );
 
         let array = serde_json::json!([{"id": "m1"}]);
         assert_eq!(
-            memories_of(&array).len(),
+            memories_of(&array).unwrap().len(),
             1,
             "the bare array still works, so neither shape is assumed"
         );
 
-        // An empty answer and a misread one look identical from the outside,
-        // which is exactly why this went unnoticed. Both are exercised.
-        assert!(memories_of(&serde_json::json!({"memories": []})).is_empty());
-        assert!(memories_of(&serde_json::json!({"hits": [{"id": "m1"}]})).is_empty());
-        assert!(memories_of(&serde_json::json!("No memories.")).is_empty());
+        // A legitimately empty answer still reads as empty.
+        assert!(memories_of(&serde_json::json!({"memories": []}))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The regression this closes: a shape nobody expected used to fall
+    /// through to `unwrap_or_default()` and read exactly like "no memories" —
+    /// indistinguishable from the legitimately empty case above. It must now
+    /// be an error a caller can see, not a silent zero.
+    #[test]
+    fn an_unrecognized_shape_is_an_error_not_an_empty_result() {
+        assert!(
+            memories_of(&serde_json::json!({"hits": [{"id": "m1"}]})).is_err(),
+            "an object with no `memories` field must not read as empty"
+        );
+        assert!(
+            memories_of(&serde_json::json!({"memories": "not an array"})).is_err(),
+            "a `memories` field that is not an array must not read as empty"
+        );
+        assert!(
+            memories_of(&serde_json::json!("No memories.")).is_err(),
+            "a bare string must not read as empty"
+        );
     }
 
     use super::*;

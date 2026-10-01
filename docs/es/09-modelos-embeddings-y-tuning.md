@@ -105,6 +105,48 @@ el pico de memoria — no cualquiera de los dos por separado. En una máquina
 limitada, bajar `DEVCTX_EMBED_MAX_CHARS` a 2048 suele ser lo más efectivo,
 porque ataca el relleno en vez del conteo.
 
+## GPU (CUDA)
+
+Los modelos ONNX locales (el embedder y el reranker) corren en CPU salvo que se
+indique otra cosa. Un binario compilado con la feature `gpu` puede usar una GPU
+NVIDIA:
+
+```bash
+cargo rustc --release -p devctx-cli --bin devctx --features gpu \
+  -- -C 'link-arg=-Wl,-rpath,$ORIGIN/../lib/devctx'
+mkdir -p ~/.local/lib/devctx
+cp ~/.cache/ort.pyke.io/dfbin/x86_64-unknown-linux-gnu/*/onnxruntime/lib/libonnxruntime{,_providers_shared,_providers_cuda}.so \
+  ~/.local/lib/devctx/
+install -m 755 target/release/devctx ~/.local/bin/devctx
+```
+
+Un `cargo install --features gpu` a secas produce un binario que no arranca.
+Con la feature de CUDA el ONNX Runtime deja de enlazarse estático: el binario
+necesita `libonnxruntime.so` (y el provider de CUDA al lado) en tiempo de
+ejecución, y no tiene ruta para encontrarlos. El `rpath` de arriba lo apunta a
+`../lib/devctx` relativo a sí mismo, que es donde se copian las librerías. Los
+binarios del release de GitHub se compilan sin `gpu` y no se ven afectados.
+
+```yaml
+embeddings:
+  device: cuda          # cpu (default) | cuda
+reranking:
+  device: cuda
+```
+
+`DEVCTX_DEVICE=cpu|cuda` anula ambos. Requisitos: driver NVIDIA, toolkit CUDA
+12.x y cuDNN 9 en el host (o en WSL); las GPU Blackwell necesitan CUDA 12.8 o
+superior.
+
+Nada falla en silencio. Si ponés `device: cuda` en un binario compilado sin
+`--features gpu`, o CUDA no se puede inicializar (falta el driver, el toolkit o
+cuDNN), devctx imprime una advertencia por stderr y corre en CPU.
+
+Una salvedad: el ONNX de Granite por defecto está cuantizado a int8, y CUDA no
+tiene kernels para algunos operadores cuantizados, así que esos corren en CPU y
+se pierde buena parte del beneficio. Para GPU usá un ONNX fp16 del mismo modelo:
+mismas 384 dimensiones, así que el índice no cambia y no hay que re-embeber.
+
 ## Ajuste de almacenamiento
 
 ```yaml

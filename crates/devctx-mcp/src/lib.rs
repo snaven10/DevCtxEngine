@@ -14,8 +14,14 @@ use std::sync::{Arc, Mutex};
 use devctx_core::config::ProjectConfig;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
+use rmcp::model::{
+    GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult,
+    ListResourcesResult, PaginatedRequestParams, Prompt, PromptMessage, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
 
 pub use backend::{Backend, ServerConn};
 use state::AppState;
@@ -29,10 +35,7 @@ struct SearchReq {
     /// for only the repositories you care about.
     #[serde(default)]
     projects: Option<Vec<String>>,
-    /// Which project to answer from: a registered project name, or any path
-    /// inside it. Resolves THIS call only and never changes what the session is
-    /// bound to — use it when the work is in a different repository than the
-    /// one bound.
+    /// Answer this call from a different project than the one bound (this call only).
     #[serde(default)]
     project: Option<String>,
     /// The search query (natural language or code).
@@ -57,10 +60,7 @@ struct SearchReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ReadFileReq {
-    /// Which project to answer from: a registered project name, or any path
-    /// inside it. Resolves THIS call only and never changes what the session is
-    /// bound to — use it when the work is in a different repository than the
-    /// one bound.
+    /// Answer this call from a different project than the one bound (this call only).
     #[serde(default)]
     project: Option<String>,
     /// Repo-relative (or absolute) path to read.
@@ -176,10 +176,7 @@ struct UseProjectReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ImpactReq {
-    /// Which project to answer from: a registered project name, or any path
-    /// inside it. Resolves THIS call only and never changes what the session is
-    /// bound to — use it when the work is in a different repository than the
-    /// one bound.
+    /// Answer this call from a different project than the one bound (this call only).
     #[serde(default)]
     project: Option<String>,
     /// The symbol to analyze.
@@ -187,6 +184,18 @@ struct ImpactReq {
     /// Traversal depth (default 3).
     #[serde(default)]
     depth: Option<usize>,
+}
+
+/// Parameters for the `plan_status` tool.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct PlanStatusReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
+    /// Plan id (PLAN-005 or 5). Omit to list plans.
+    #[serde(default)]
+    plan: Option<String>,
 }
 
 /// Parameters for the `memory_context` tool.
@@ -205,10 +214,7 @@ struct MemoryContextReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ReadSymbolReq {
-    /// Which project to answer from: a registered project name, or any path
-    /// inside it. Resolves THIS call only and never changes what the session is
-    /// bound to — use it when the work is in a different repository than the
-    /// one bound.
+    /// Answer this call from a different project than the one bound (this call only).
     #[serde(default)]
     project: Option<String>,
     /// The symbol name. A bare name (`charge`) or a qualified one
@@ -293,10 +299,7 @@ struct MemoryRefsReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ReferencesReq {
-    /// Which project to answer from: a registered project name, or any path
-    /// inside it. Resolves THIS call only and never changes what the session is
-    /// bound to — use it when the work is in a different repository than the
-    /// one bound.
+    /// Answer this call from a different project than the one bound (this call only).
     #[serde(default)]
     project: Option<String>,
     /// The symbol whose call sites to list.
@@ -307,10 +310,7 @@ struct ReferencesReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct SearchRoutesReq {
-    /// Which project to answer from: a registered project name, or any path
-    /// inside it. Resolves THIS call only and never changes what the session is
-    /// bound to — use it when the work is in a different repository than the
-    /// one bound.
+    /// Answer this call from a different project than the one bound (this call only).
     #[serde(default)]
     project: Option<String>,
     /// Restrict to an HTTP method (GET/POST/…), optional.
@@ -325,10 +325,7 @@ struct SearchRoutesReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct RoutesForHandlerReq {
-    /// Which project to answer from: a registered project name, or any path
-    /// inside it. Resolves THIS call only and never changes what the session is
-    /// bound to — use it when the work is in a different repository than the
-    /// one bound.
+    /// Answer this call from a different project than the one bound (this call only).
     #[serde(default)]
     project: Option<String>,
     /// The handler symbol (`Class.method` or `method`).
@@ -416,6 +413,19 @@ pub struct DevctxServer {
 
 /// How many hint-resolved backends to keep open at once.
 const HINT_CACHE_CAP: usize = 8;
+
+/// The memory protocol (`MEMORY-PROTOCOL.md` at the repo root), embedded so it
+/// travels with the binary. Exposed over MCP as both a prompt and a resource,
+/// so an agent — or whatever assembled its system prompt — can pull it once
+/// instead of every project pasting a copy into its own CLAUDE.md, which is
+/// how it drifts out of date.
+const MEMORY_PROTOCOL: &str = include_str!("../../../MEMORY-PROTOCOL.md");
+
+/// Name the protocol is served under as a prompt.
+const MEMORY_PROTOCOL_NAME: &str = "memory-protocol";
+
+/// URI the protocol is served under as a resource.
+const MEMORY_PROTOCOL_URI: &str = "devctx://memory-protocol";
 
 impl DevctxServer {
     /// Create a server, bound to `backend` when one could be resolved at start.
@@ -636,26 +646,66 @@ impl DevctxServer {
 
     /// Save a memory (decision, insight, note) for later recall.
     #[tool(
-        description = "Save a memory (decision/insight/note/bug/…) so it can be \
-        recalled across sessions. Deduplicated by topic key or content.\n\n\
-        Pick the scope by asking who needs this later:\n\
-        · \"local\" (default) — true of this repository only: a file, a \
-        symbol, a fix in this codebase.\n\
-        · \"group\" — true of this product, whose repositories are listed by \
-        list_projects and share a `project.group`. A backend contract the \
-        frontend must honour, a decision spanning services, a bug whose cause \
-        is in one repo and whose symptom is in another. If the project belongs \
-        to a group, this is usually the right answer for anything a sibling \
-        repository would want.\n\
-        · \"global\" — true regardless of project: a lesson about a language, \
-        a tool, a way of working. Rare. Everything saved here is recalled by \
-        every unrelated project forever, so prefer \"group\" when the knowledge \
-        is about one product."
+        description = "Save a memory (decision/insight/note/bug/…) for later recall, \
+        deduplicated by topic or content. Scope: \"local\" (default, this repo \
+        only), \"group\" (this product's repos, see list_projects), or \"global\" \
+        (every project — rare; prefer \"group\" when the lesson is product-specific)."
     )]
     async fn remember(
         &self,
         Parameters(req): Parameters<RememberReq>,
     ) -> Result<String, ErrorData> {
+        // Unbound, and nothing named a repository to hint at one: there is no
+        // "local" store to write into. The old code let this fall straight
+        // through to `backend_for`, which is exactly where an unbound session
+        // always errors out — so `remember` discarded the content on every
+        // scope, global included, before this function ever looked at what was
+        // asked for. Handled here, first, so a caller who said `scope: global`
+        // (or said nothing) is never punished for a session nobody bound.
+        if matches!(self.binding(), Binding::None) && req.project.is_none() {
+            let title = req.title.clone().unwrap_or_default();
+            let content = req.content.clone();
+            if req.scope.as_deref() == Some("local") {
+                // `local` truly has nowhere to go here — there is no project at
+                // all, not even a group to redirect to `group` scope. Refuse,
+                // but hand the content back so the caller can retry rather than
+                // having to remember what it just tried to save.
+                return Err(ErrorData::invalid_request(
+                    format!(
+                        "{}\n\nNothing was saved: `scope: local` has no repository to write \
+                         into while unbound. Retry with `scope: global` (or omit `scope`), or \
+                         bind a project first. So the content is not lost:\n\nTitle: {title}\n\
+                         Content: {content}",
+                        state::unbound_help(&self.cwd),
+                    ),
+                    None,
+                ));
+            }
+            let memory_type = req.memory_type.unwrap_or_else(|| "note".to_string());
+            let topic = req.topic.unwrap_or_default();
+            let tags = req.tags.unwrap_or_default();
+            let files = req.files.unwrap_or_default();
+            let title_for_err = title.clone();
+            let content_for_err = content.clone();
+            return run_blocking(move || {
+                state::do_remember_unbound(&content, &title, &memory_type, &topic, &tags, &files)
+            })
+            .await
+            .map_err(|e| {
+                // The central store failed too — the only way left to not lose
+                // the memory is to hand it back whole, so the caller can retry.
+                ErrorData::internal_error(
+                    format!(
+                        "{}\n\nThe memory was NOT saved anywhere. Retry once a store is \
+                         reachable, with this exact content:\n\nTitle: {title_for_err}\n\
+                         Content: {content_for_err}",
+                        e.message,
+                    ),
+                    None,
+                )
+            });
+        }
+
         // Where a memory is written, and who it is attributed to, are two
         // different questions. A group binding answers the first with "the
         // product" and the second with "the group" — never with a member.
@@ -730,13 +780,9 @@ impl DevctxServer {
     }
 
     /// Recall memories relevant to a query.
-    #[tool(description = "Recall previously saved memories relevant to a query \
-        (semantic + intro/chunk blend). Searches every tier by default — this \
-        repository, this product's group, and the global store — and tags each \
-        hit with the one it came from. When the budget cannot fit them all, the \
-        least relevant are dropped and their titles are returned under \
-        omitted_for_budget, so ask again with a narrower query if one of those \
-        titles is what you needed. Returns JSON.")]
+    #[tool(description = "Recall saved memories for a query, across local/group/\
+        global tiers by default (tagged per hit). Results dropped for budget are \
+        listed under omitted_for_budget — retry narrower. Returns JSON.")]
     async fn recall(&self, Parameters(req): Parameters<RecallReq>) -> Result<String, ErrorData> {
         // Global memories are written down because they outlive the project that
         // learned them, so an unbound session can still reach them. Only the
@@ -811,9 +857,8 @@ impl DevctxServer {
     /// Every project DevCtxEngine knows about.
     #[tool(
         description = "List every repository DevCtxEngine tracks: name, path, \
-        description, embedding model and how fresh its index is. Use this to \
-        discover which other projects exist before recalling from them or \
-        reading their code. Returns JSON."
+        description, embedding model, and index freshness. Use to discover other \
+        projects before recalling from or reading their code. Returns JSON."
     )]
     async fn list_projects(
         &self,
@@ -835,12 +880,9 @@ impl DevctxServer {
 
     /// Bind this session to a registered project.
     #[tool(
-        description = "Move this session to a different project, by name (see \
-        list_projects) or by path. Rarely needed: the server resolves a project \
-        from its working directory at startup, descending into the registry when \
-        that directory is a workspace root holding several. To answer ONE call \
-        from another repository, pass `project` to that tool instead — it does \
-        not move the session. Use this when a long stretch of work moves."
+        description = "Bind this session to a different project (name or path, see \
+        list_projects). Rarely needed. To answer ONE call from another repo \
+        without moving the session, use `project` on that tool instead."
     )]
     async fn use_project(
         &self,
@@ -885,6 +927,21 @@ impl DevctxServer {
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
         run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3)))
+            .await
+            .map(|out| Self::annotate(out, resolved))
+    }
+
+    /// Progress on the plans under `plans/` (markdown, source of truth).
+    #[tool(
+        description = "Plans in plans/ (markdown, source of truth): no arg lists progress and \
+        the active plan; with `plan`, ready/in-progress/blocked tasks. JSON."
+    )]
+    async fn plan_status(
+        &self,
+        Parameters(req): Parameters<PlanStatusReq>,
+    ) -> Result<String, ErrorData> {
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        run_blocking(move || backend.plan_status(req.plan.as_deref()))
             .await
             .map(|out| Self::annotate(out, resolved))
     }
@@ -946,14 +1003,9 @@ impl DevctxServer {
     }
 
     /// Memories recorded about a symbol.
-    #[tool(
-        description = "The decisions, bugs and insights recorded about a symbol \
-        — why the code is the way it is, which the call graph cannot answer. \
-        Searches both this project's memories and the shared ones. Each result \
-        carries `link_sources`: `files-field`/`content-mention` mean a link was \
-        recorded when the memory was written, `inference` means only that the \
-        text mentions the name. Returns JSON."
-    )]
+    #[tool(description = "Decisions, bugs and insights recorded about a symbol. \
+        Searches project and shared memories. `link_sources` says how: files-\
+        field/content-mention (recorded) or inference (text match only).")]
     async fn memories_by_symbol(
         &self,
         Parameters(req): Parameters<MemoriesBySymbolReq>,
@@ -988,11 +1040,9 @@ impl DevctxServer {
     }
 
     /// Move a memory to another tier or repository.
-    #[tool(description = "Move a memory to another tier (`local`, `group`, \
-        `global`) or to another registered project by name. Use it when a \
-        memory is invisible where it is needed or noise where it is not. The id \
-        changes, because it is derived from the project and the content — the \
-        new one is in the result.")]
+    #[tool(description = "Move a memory to another tier (local/group/global) or \
+        project by name. Use when it's invisible where needed or noise where \
+        not. The id changes (project+content derived); returned in the result.")]
     async fn memory_move(
         &self,
         Parameters(req): Parameters<MemoryMoveReq>,
@@ -1077,17 +1127,97 @@ impl DevctxServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for DevctxServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(
-                Implementation::new("devctx", env!("CARGO_PKG_VERSION")).with_title("DevCtxEngine"),
-            )
-            .with_instructions(
-                "DevCtxEngine: semantic code search, file reading, and incremental indexing \
-                 over your git repository. If a tool reports that no project is bound, call \
-                 list_projects to see what is registered and use_project to bind one — a \
-                 globally-registered server starts in whatever directory the client was \
-                 launched from, which is often none of them.",
-            )
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(
+            Implementation::new("devctx", env!("CARGO_PKG_VERSION")).with_title("DevCtxEngine"),
+        )
+        .with_instructions(
+            "DevCtxEngine: semantic code search, file reading, and incremental indexing \
+             over your git repository. If a tool reports that no project is bound, call \
+             list_projects to see what is registered and use_project to bind one — a \
+             globally-registered server starts in whatever directory the client was \
+             launched from, which is often none of them.\n\n\
+             Several tools take an optional `project`: a registered project name, or any \
+             path inside it. It resolves THAT ONE CALL only and never changes what the \
+             session is bound to — use it when the work you are doing right now is in a \
+             different repository than the one this session is bound to, without giving up \
+             the binding for every call after it.\n\n\
+             The memory-recording protocol (when to remember, how to scope it, how recall \
+             works) is available as the `memory-protocol` prompt and as the \
+             `devctx://memory-protocol` resource, rather than needing to be pasted into a \
+             project's own instructions.\n\n\
+             After a compaction, call `plan_status` before resuming work: it reads the \
+             plans under plans/ and answers what is ready, in progress, or blocked.",
+        )
+    }
+
+    /// The one prompt this server offers: the memory protocol, so a client can
+    /// fetch it once instead of every project pasting a copy into its own
+    /// instructions file.
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+            MEMORY_PROTOCOL_NAME,
+            Some("How and when to use DevCtxEngine's remember/recall memory tools"),
+            None,
+        )]))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        if request.name != MEMORY_PROTOCOL_NAME {
+            return Err(ErrorData::invalid_params(
+                format!("no such prompt: {}", request.name),
+                None,
+            ));
+        }
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(Role::User, MEMORY_PROTOCOL)]).into())
+    }
+
+    /// Same document, exposed as a resource for a client that reads those
+    /// rather than fetching prompts.
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(vec![Resource::new(
+            MEMORY_PROTOCOL_URI,
+            MEMORY_PROTOCOL_NAME,
+        )
+        .with_description("How and when to use DevCtxEngine's remember/recall memory tools")
+        .with_mime_type("text/markdown")]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if request.uri != MEMORY_PROTOCOL_URI {
+            return Err(ErrorData::resource_not_found(
+                format!("no such resource: {}", request.uri),
+                None,
+            ));
+        }
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            MEMORY_PROTOCOL,
+            MEMORY_PROTOCOL_URI,
+        )
+        .with_mime_type("text/markdown")])
+        .into())
     }
 }
 

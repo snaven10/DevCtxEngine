@@ -5,13 +5,14 @@
 //! connect handshake times out while the model downloads). The DuckDB store is
 //! opened once and cloned per call (a `Connection` is not `Sync`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use devctx_core::config::ProjectConfig;
+use devctx_core::plans::{self, Analysis, Plan};
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::{run as index_run, GitRepo, IndexRequest, ProgressSink};
@@ -190,6 +191,7 @@ impl AppState {
             model: cfg.reranking.model.clone(),
             model_dir: (!cfg.reranking.model_dir.is_empty())
                 .then(|| PathBuf::from(&cfg.reranking.model_dir)),
+            device: cfg.reranking.device.with_env_override(),
         };
         let root = if cfg.project.path.is_empty() {
             std::env::current_dir()?
@@ -404,7 +406,24 @@ pub fn do_search(
         reranker.as_deref(),
     )
     .map_err(|e| e.to_string())?;
-    serde_json::to_string_pretty(&hits_to_json(&hits)).map_err(|e| e.to_string())
+    let items = match hits_to_json(&hits) {
+        Value::Array(a) => a,
+        other => return serde_json::to_string_pretty(&other).map_err(|e| e.to_string()),
+    };
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
+        let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
+        format!("{file}:{line}")
+    });
+    if dropped.is_empty() {
+        return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
+    }
+    serde_json::to_string_pretty(&json!({
+        "results": kept,
+        "omitted_for_budget": { "count": dropped.len(), "items": dropped },
+    }))
+    .map_err(|e| e.to_string())
 }
 
 /// Drop rows for branches the config no longer lists. Returns rows removed.
@@ -692,6 +711,294 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
         }),
     };
     Ok(value.to_string())
+}
+
+/// `plan_status` tool: read `plans/PLAN-*/` (see `plans/PLAN-005-plan-status/`) and answer
+/// "where am I": the list of plans with no argument, or one plan's ready/in-progress/blocked
+/// tasks with `plan`. Reads markdown from disk on every call — plans are the source of truth,
+/// never copied into the store (PLAN-005 §3).
+pub fn do_plan_status(state: &AppState, plan: Option<&str>) -> Result<String, String> {
+    let value = plan_status_value(&state.root, plan)?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    Ok(fit_plan_status_budget(value, budget))
+}
+
+/// The unbudgeted `plan_status` JSON, built straight from disk. Shared by `do_plan_status`
+/// (which trims it to `DEVCTX_MAX_OUTPUT_TOKENS`) and the CLI's `devctx plan-status`, which
+/// wants the same shape without going through `AppState` — no store, no daemon, just markdown.
+pub fn plan_status_value(root: &std::path::Path, plan: Option<&str>) -> Result<Value, String> {
+    let loaded = plans::load_plans(root);
+    match plan {
+        None => Ok(plan_status_list(&loaded)),
+        Some(query) => plan_status_detail(&loaded, query),
+    }
+}
+
+/// The plan with the most recently modified `.md` file among plans that still have at least one
+/// non-done task. A tie (e.g. a fresh clone or checkout, which equalizes mtimes) is broken by the
+/// highest plan number. If every plan is fully done (or there are no plans), there is no active one.
+fn active_plan_id(plans: &[Plan]) -> Option<String> {
+    plans
+        .iter()
+        .filter(|p| !p.tasks.is_empty() && p.tasks.iter().any(|t| !t.status.is_done()))
+        .max_by(|a, b| {
+            let by_mtime = a.mtime.cmp(&b.mtime);
+            if by_mtime != std::cmp::Ordering::Equal {
+                return by_mtime;
+            }
+            plan_number(&a.id).cmp(&plan_number(&b.id))
+        })
+        .map(|p| p.id.clone())
+}
+
+fn plan_number(id: &str) -> u32 {
+    id.trim_start_matches("PLAN-").parse().unwrap_or(0)
+}
+
+fn plan_status_list(plans: &[Plan]) -> Value {
+    let active = active_plan_id(plans);
+    let items: Vec<Value> = plans
+        .iter()
+        .map(|p| {
+            let done = p.tasks.iter().filter(|t| t.status.is_done()).count();
+            json!({
+                "id": p.id,
+                "title": p.title,
+                "done": done,
+                "total": p.tasks.len(),
+                "active": active.as_deref() == Some(p.id.as_str()),
+                "task_files": !p.tasks.is_empty(),
+                "warnings_count": p.warnings.len(),
+            })
+        })
+        .collect();
+    json!({ "plans": items, "active": active })
+}
+
+/// Resolves a user-supplied plan identifier (`PLAN-005`, `005`, `5`, or the directory name)
+/// against the loaded plans.
+fn find_plan<'a>(plans: &'a [Plan], query: &str) -> Option<&'a Plan> {
+    let q = query.trim();
+    let normalized = if q.to_uppercase().starts_with("PLAN-") {
+        let n: u32 = q[5..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()?;
+        Some(format!("PLAN-{n:03}"))
+    } else if q.chars().all(|c| c.is_ascii_digit()) && !q.is_empty() {
+        let n: u32 = q.parse().ok()?;
+        Some(format!("PLAN-{n:03}"))
+    } else {
+        None
+    };
+    if let Some(id) = &normalized {
+        if let Some(p) = plans.iter().find(|p| &p.id == id) {
+            return Some(p);
+        }
+    }
+    plans
+        .iter()
+        .find(|p| p.dir.file_name().and_then(|n| n.to_str()) == Some(q))
+}
+
+fn plan_status_detail(plans: &[Plan], query: &str) -> Result<Value, String> {
+    let Some(plan) = find_plan(plans, query) else {
+        let ids: Vec<&str> = plans.iter().map(|p| p.id.as_str()).collect();
+        return Err(format!(
+            "plan '{query}' no encontrado. Planes disponibles: {}",
+            ids.join(", ")
+        ));
+    };
+    let Analysis {
+        ready,
+        in_progress,
+        blocked,
+        missing,
+        cycles,
+    } = plans::analyze(plan);
+    let by_id: HashMap<&str, &devctx_core::plans::Task> =
+        plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+
+    let title_of = |id: &str| by_id.get(id).map(|t| t.title.clone()).unwrap_or_default();
+
+    let ready: Vec<Value> = ready
+        .iter()
+        .map(|id| json!({ "id": id, "title": title_of(id) }))
+        .collect();
+    let in_progress: Vec<Value> = in_progress
+        .iter()
+        .map(|id| json!({ "id": id, "title": title_of(id) }))
+        .collect();
+    let blocked: Vec<Value> = blocked
+        .iter()
+        .map(
+            |(id, waiting_on)| json!({ "id": id, "title": title_of(id), "waiting_on": waiting_on }),
+        )
+        .collect();
+
+    let mut warnings: Vec<String> = plan.warnings.clone();
+    for (task, dep) in &missing {
+        warnings.push(format!(
+            "{task}: depende de {dep}, que no existe en el plan"
+        ));
+    }
+    for cycle in &cycles {
+        warnings.push(format!("ciclo de dependencias: {}", cycle.join(" -> ")));
+    }
+
+    let done = plan.tasks.iter().filter(|t| t.status.is_done()).count();
+    Ok(json!({
+        "plan": plan.id,
+        "title": plan.title,
+        "done": done,
+        "total": plan.tasks.len(),
+        "ready": ready,
+        "in_progress": in_progress,
+        "blocked": blocked,
+        "warnings": warnings,
+    }))
+}
+
+/// Fits the `plan_status` detail (or list) JSON into the output budget by dropping, in order,
+/// `warnings` then `blocked` — never `ready` — and recording what was omitted.
+fn fit_plan_status_budget(mut value: Value, budget_tokens: usize) -> String {
+    let mut out = value.to_string();
+    if budget_tokens == 0 {
+        return out;
+    }
+    let budget_chars = budget_tokens * CHARS_PER_TOKEN;
+    if out.len() <= budget_chars {
+        return out;
+    }
+    let mut omitted_warnings = 0usize;
+    let mut omitted_blocked = 0usize;
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(Value::Array(warnings)) = obj.get_mut("warnings") {
+            omitted_warnings = warnings.len();
+            warnings.clear();
+        }
+    }
+    out = value.to_string();
+    if out.len() > budget_chars {
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(Value::Array(blocked)) = obj.get_mut("blocked") {
+                omitted_blocked = blocked.len();
+                blocked.clear();
+            }
+        }
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "omitted".to_string(),
+            json!({ "blocked": omitted_blocked, "warnings": omitted_warnings }),
+        );
+    }
+    value.to_string()
+}
+
+/// The dashboard's "Plans" tab: one plan's dependency graph as cytoscape `{nodes, edges}`, plus
+/// `plans` (every plan id, for the tab's selector). No `plan` means the active plan (same rule
+/// as `do_plan_status`), falling back to the first plan by id when nothing is active (e.g. every
+/// plan is done) so the tab is never empty just because there is nothing left to do.
+pub fn do_plan_graph(state: &AppState, plan: Option<&str>) -> Result<String, String> {
+    plan_graph_value(&state.root, plan)
+}
+
+/// The unbudgeted `plan_status`-graph JSON, built straight from disk (see [`plan_status_value`]
+/// for the same split and why: it keeps this testable without an `AppState`).
+pub fn plan_graph_value(root: &std::path::Path, plan: Option<&str>) -> Result<String, String> {
+    let loaded = plans::load_plans(root);
+    let plan_ids: Vec<String> = loaded.iter().map(|p| p.id.clone()).collect();
+
+    let target_id = match plan {
+        Some(query) => find_plan(&loaded, query)
+            .map(|p| p.id.clone())
+            .ok_or_else(|| {
+                format!(
+                    "plan '{query}' no encontrado. Planes disponibles: {}",
+                    plan_ids.join(", ")
+                )
+            })?,
+        None => active_plan_id(&loaded)
+            .or_else(|| loaded.first().map(|p| p.id.clone()))
+            .ok_or_else(|| "no hay planes en plans/".to_string())?,
+    };
+    let p = loaded
+        .iter()
+        .find(|p| p.id == target_id)
+        .ok_or_else(|| format!("plan '{target_id}' no encontrado"))?;
+
+    if p.tasks.is_empty() {
+        return Ok(json!({
+            "plan": p.id,
+            "title": p.title,
+            "nodes": [],
+            "edges": [],
+            "plans": plan_ids,
+            "message": "sin tasks",
+        })
+        .to_string());
+    }
+
+    let Analysis {
+        ready,
+        in_progress,
+        missing,
+        ..
+    } = plans::analyze(p);
+    let ready_set: HashSet<&str> = ready.iter().map(|s| s.as_str()).collect();
+    let in_progress_set: HashSet<&str> = in_progress.iter().map(|s| s.as_str()).collect();
+    let missing_ids: HashSet<&str> = missing.iter().map(|(_, dep)| dep.as_str()).collect();
+
+    let mut nodes: Vec<Value> = Vec::new();
+    for t in &p.tasks {
+        let status = if t.status.is_done() {
+            "done"
+        } else if in_progress_set.contains(t.id.as_str()) {
+            "in_progress"
+        } else if matches!(t.status, plans::Status::Blocked) {
+            "blocked"
+        } else if ready_set.contains(t.id.as_str()) {
+            "ready"
+        } else {
+            "blocked"
+        };
+        nodes.push(json!({
+            "data": {
+                "id": t.id,
+                "label": format!("{} {}", t.id, t.title),
+                "status": status,
+                "ready": ready_set.contains(t.id.as_str()),
+                "depends_on": t.depends_on,
+                "files": t.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+            }
+        }));
+    }
+    for missing_id in &missing_ids {
+        nodes.push(json!({
+            "data": { "id": missing_id, "label": missing_id, "status": "missing", "ready": false }
+        }));
+    }
+
+    let mut edges: Vec<Value> = Vec::new();
+    for t in &p.tasks {
+        for dep in &t.depends_on {
+            edges.push(json!({
+                "data": { "id": format!("{dep}->{}", t.id), "source": dep, "target": t.id }
+            }));
+        }
+    }
+
+    Ok(json!({
+        "plan": p.id,
+        "title": p.title,
+        "nodes": nodes,
+        "edges": edges,
+        "plans": plan_ids,
+    })
+    .to_string())
 }
 
 /// `remember` tool: save a memory (deduplicated).
@@ -1727,8 +2034,18 @@ pub fn do_search_project(
             .to_string());
     }
     let hits: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
-    serde_json::to_string_pretty(&json!({ "project": project, "path": path, "hits": hits }))
-        .map_err(|e| e.to_string())
+    let items = hits.as_array().cloned().unwrap_or_default();
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
+        let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
+        format!("{file}:{line}")
+    });
+    let mut out = json!({ "project": project, "path": path, "hits": kept });
+    if !dropped.is_empty() {
+        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// `list_projects` tool: every repository DevCtxEngine knows about.
@@ -1852,6 +2169,49 @@ pub fn do_remember_shared(
                 o.insert("linked_symbols".into(), json!(linked));
             }
         }
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// `remember` when no project is bound at all — not even a group — and the
+/// caller did not ask for `scope: local`. The only project-less place left to
+/// put the content is the central store as global, via the same write path
+/// `do_remember_shared` uses and the same store `do_recall_global` reads back
+/// from. `group` is left empty so `Central::remember` normalizes the scope to
+/// global rather than rejecting it for having nowhere to go.
+///
+/// There is no `AppState` here, so there is no repository graph to link this
+/// against — an unbound session has no project whose symbols it could mean.
+pub fn do_remember_unbound(
+    content: &str,
+    title: &str,
+    memory_type: &str,
+    topic: &str,
+    tags: &str,
+    files: &str,
+) -> Result<String, String> {
+    let mut out = central()?
+        .remember(
+            content,
+            title,
+            memory_type,
+            topic,
+            tags,
+            "",
+            "unbound",
+            "",
+            "",
+            files,
+        )
+        .map_err(|e| e.to_string())?;
+    if let Some(o) = out.as_object_mut() {
+        o.insert(
+            "forced_scope".into(),
+            json!(
+                "global — no project was bound, so \"local\" had nowhere to write to. \
+                 Move it later with memory_move if it belongs somewhere narrower."
+            ),
+        );
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
@@ -2075,6 +2435,66 @@ fn shorten_memory(
     out.push_str("\n[devctx] truncated: this memory exceeded its share of the output budget.\n");
     obj.insert("content".to_string(), json!(out));
     m
+}
+
+/// Fit a JSON array of tool results into the output budget.
+///
+/// Same shape and the same soft-budget philosophy as [`fit_memories`] — an
+/// equal share of the budget per item, with a floor below which a share is
+/// not worth enforcing on a long tail of small items — for tools with no
+/// summarizer to fall back on: when `text_field` names a string field worth
+/// shrinking, an oversized item is truncated in place; otherwise (or when the
+/// item has no such field) it is dropped whole. Either way the caller is
+/// told: dropped items are named by `label` under `omitted_for_budget`,
+/// never silently missing.
+fn fit_json_array(
+    items: Vec<Value>,
+    budget_tokens: usize,
+    text_field: Option<&str>,
+    label: impl Fn(&Value) -> String,
+) -> (Vec<Value>, Vec<String>) {
+    if budget_tokens == 0 || items.is_empty() {
+        return (items, Vec::new());
+    }
+    // Below this a "share" is too small to hold anything useful, so a long
+    // tail of small items is not minced down to nothing — same floor as
+    // `fit_memories`.
+    const MIN_SHARE_TOKENS: usize = 64;
+    let share = (budget_tokens / items.len()).max(MIN_SHARE_TOKENS) * CHARS_PER_TOKEN;
+
+    let mut kept: Vec<Value> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for mut item in items {
+        let full_len = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
+        if full_len <= share {
+            kept.push(item);
+            continue;
+        }
+        let Some(field) = text_field else {
+            dropped.push(label(&item));
+            continue;
+        };
+        let Some(obj) = item.as_object_mut() else {
+            dropped.push(label(&item));
+            continue;
+        };
+        let Some(text) = obj.get(field).and_then(|v| v.as_str()).map(str::to_string) else {
+            dropped.push(label(&item));
+            continue;
+        };
+        let mut out = String::with_capacity(share + 96);
+        for line in text.lines() {
+            if out.len() + line.len() + 1 > share {
+                break;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("\n[devctx] truncated: exceeded its share of the output budget.\n");
+        obj.insert(field.to_string(), json!(out));
+        kept.push(item);
+    }
+    (kept, dropped)
 }
 
 /// Fuse labelled result lists by rank, tagging each survivor with the scope it
@@ -2388,7 +2808,15 @@ pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<
         key(b).cmp(&key(a))
     });
     out.truncate(limit);
-    Ok(json!({ "scope": scope, "memories": out }).to_string())
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (out, dropped) = fit_memories(out, budget, |content, target| {
+        do_summarize(state, content, None, target).ok()
+    });
+    let mut resp = json!({ "scope": scope, "memories": out });
+    if !dropped.is_empty() {
+        resp["omitted_for_budget"] = json!({ "count": dropped.len(), "titles": dropped });
+    }
+    Ok(resp.to_string())
 }
 
 /// `impact_analysis` tool: blast radius (transitive callers/callees) of a symbol.
@@ -2406,16 +2834,37 @@ pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String,
             .map(|(s, d)| json!({ "symbol": s, "depth": d }))
             .collect()
     };
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    // Each direction gets half the budget: a symbol with a huge upstream and a
+    // tiny downstream (or the reverse) is common, and a single shared pool
+    // would let one side starve the other silently.
+    let half = budget / 2;
+    let label = |v: &Value| {
+        v.get("symbol")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let (upstream, up_dropped) = fit_json_array(to_json(&impact.upstream), half, None, label);
+    let (downstream, down_dropped) = fit_json_array(to_json(&impact.downstream), half, None, label);
     let mut out = json!({
         "symbol": symbol,
-        "upstream": to_json(&impact.upstream),
-        "downstream": to_json(&impact.downstream),
+        "upstream": upstream,
+        "downstream": downstream,
     });
     // A bare name can stand for several methods, and the radius below merges
     // them. Say so: an unannounced merge reads as one method with a wide blast
     // radius, which is a different and much more alarming fact.
     if let Some(names) = merged_declarations(symbol, &resolved) {
         out["resolved_symbols"] = json!(names);
+    }
+    let dropped_total = up_dropped.len() + down_dropped.len();
+    if dropped_total > 0 {
+        out["omitted_for_budget"] = json!({
+            "count": dropped_total,
+            "upstream": up_dropped,
+            "downstream": down_dropped,
+        });
     }
     Ok(out.to_string())
 }
@@ -2501,7 +2950,7 @@ pub fn do_build_context(
 
     // Fetch more than will fit: the budget, not the limit, decides where to stop.
     let raw = do_search(state, query, 30, None, SearchMode::Vector, false)?;
-    let hits: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let hits: Vec<Value> = parse_memories(&raw);
     let mut code_files: Vec<String> = Vec::new();
     let mut head = "## Code\n\n";
     for h in &hits {
@@ -2573,6 +3022,8 @@ pub fn do_build_context(
 ///
 /// The recall and by-file answers differ in shape — one is a bare array, the
 /// other wraps it — so both are accepted rather than making the caller care.
+/// Also accepts `results` (`do_search`'s wrapped shape once budget-trimmed),
+/// so `do_build_context` keeps working whether or not `do_search` had to trim.
 fn parse_memories(raw: &str) -> Vec<Value> {
     let parsed: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -2583,6 +3034,7 @@ fn parse_memories(raw: &str) -> Vec<Value> {
     }
     parsed
         .get("memories")
+        .or_else(|| parsed.get("results"))
         .and_then(|m| m.as_array())
         .cloned()
         .unwrap_or_default()
@@ -2640,7 +3092,9 @@ pub fn do_memories_by_symbol(
     )
 }
 
-/// `memories_by_file` tool: the decisions recorded about a file.
+/// `memories_by_file` tool: the decisions recorded about a file, plus the plan tasks that
+/// mention it (`plan_tasks`, PLAN-005 TASK-007) — computed at call time from `plans/`, never
+/// stored, so a parser failure never breaks the memory half of the answer.
 pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result<String, String> {
     let store = state.open_store()?;
     let mut linked = store
@@ -2650,17 +3104,79 @@ pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result
     // The junction stores the path the index uses, and a caller who has a bare
     // file name — which is how anyone refers to a file in conversation — would
     // otherwise get nothing while the links sit right there. Resolve the name
-    // the same way the writer did, so both spellings reach the same rows.
-    if linked.is_empty() && !file.contains('/') {
-        if let Ok(index) = store.file_index() {
-            if let Some(resolved) = index.resolve(&[file.to_string()]).into_iter().next() {
-                linked = store
-                    .memory_ids_for_file(&resolved, limit)
-                    .map_err(|e| e.to_string())?;
+    // the same way the writer did, so both spellings reach the same rows — and
+    // the same resolved path is what plan-task matching below also tries.
+    let resolved: Option<String> = if file.contains('/') {
+        None
+    } else {
+        store
+            .file_index()
+            .ok()
+            .and_then(|index| index.resolve(&[file.to_string()]).into_iter().next())
+    };
+    if linked.is_empty() {
+        if let Some(r) = &resolved {
+            linked = store
+                .memory_ids_for_file(r, limit)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let out = linked_response(&store, file, linked, file, limit)?;
+    let plan_tasks = plan_tasks_for_file(&state.root, file, resolved.as_deref());
+    Ok(with_plan_tasks_field(out, plan_tasks))
+}
+
+/// Plan tasks (across all plans in `plans/`) whose `Archivos`/inline-code file references match
+/// `query` (or `resolved`, the index's resolution of a bare filename), per the matching rule in
+/// [`devctx_core::plans::FileRef::matches`]. Non-done first, then by plan number descending,
+/// capped at 10. Never errors: an unreadable `plans/` yields an empty list.
+fn plan_tasks_for_file(root: &std::path::Path, query: &str, resolved: Option<&str>) -> Vec<Value> {
+    let loaded = plans::load_plans(root);
+    let mut hits: Vec<(&Plan, &devctx_core::plans::Task, Option<u32>)> = Vec::new();
+    for p in &loaded {
+        for t in &p.tasks {
+            let m = t
+                .files
+                .iter()
+                .find(|f| f.matches(query) || resolved.map(|r| f.matches(r)).unwrap_or(false));
+            if let Some(fref) = m {
+                hits.push((p, t, fref.line));
             }
         }
     }
-    linked_response(&store, file, linked, file, limit)
+    hits.sort_by(|a, b| {
+        let by_done = a.1.status.is_done().cmp(&b.1.status.is_done());
+        if by_done != std::cmp::Ordering::Equal {
+            return by_done;
+        }
+        plan_number(&b.0.id).cmp(&plan_number(&a.0.id))
+    });
+    hits.truncate(10);
+    hits.into_iter()
+        .map(|(p, t, line)| {
+            json!({
+                "plan": p.id,
+                "task": t.id,
+                "title": t.title,
+                "status": plans::status_label(&t.status),
+                "line": line,
+            })
+        })
+        .collect()
+}
+
+/// Adds `plan_tasks` to a `memories_by_file`-shaped JSON object. Always present (an empty array
+/// means "none", never "not computed") — the same rule as `omitted_for_budget` elsewhere in this
+/// module, so an older client cannot mistake a missing field for a question never asked.
+fn with_plan_tasks_field(out: String, plan_tasks: Vec<Value>) -> String {
+    match serde_json::from_str::<Value>(&out) {
+        Ok(Value::Object(mut map)) => {
+            map.insert("plan_tasks".to_string(), Value::Array(plan_tasks));
+            serde_json::to_string(&Value::Object(map)).unwrap_or(out)
+        }
+        _ => out,
+    }
 }
 
 /// `memory_refs` tool: the inverse — what code one memory concerns.
@@ -2757,13 +3273,18 @@ fn linked_response(
     });
     out.truncate(limit);
 
-    Ok(json!({
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (out, dropped) = fit_memories(out, budget, |_, _| None);
+    let mut resp = json!({
         "subject": subject,
         "memories": out,
         // Named so a reader knows the results are word matches, not recorded links.
         "matched_by": if fallback_used { "text-inference" } else { "junction" },
-    })
-    .to_string())
+    });
+    if !dropped.is_empty() {
+        resp["omitted_for_budget"] = json!({ "count": dropped.len(), "titles": dropped });
+    }
+    Ok(resp.to_string())
 }
 
 fn memory_json(m: &devctx_store::Memory, sources: &str) -> Value {
@@ -2814,9 +3335,18 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
         .iter()
         .map(|r| json!({ "file": r.file, "line": r.line, "source": r.source }))
         .collect();
-    let mut out = json!({ "symbol": symbol, "references": arr });
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (kept, dropped) = fit_json_array(arr, budget, Some("source"), |v| {
+        let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        let line = v.get("line").and_then(|l| l.as_i64()).unwrap_or(0);
+        format!("{file}:{line}")
+    });
+    let mut out = json!({ "symbol": symbol, "references": kept });
     if let Some(names) = merged_declarations(symbol, &resolved) {
         out["resolved_symbols"] = json!(names);
+    }
+    if !dropped.is_empty() {
+        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
@@ -2859,7 +3389,20 @@ fn routes_to_json(routes: &[devctx_store::StoredRoute]) -> Result<String, String
             })
         })
         .collect();
-    serde_json::to_string_pretty(&Value::Array(arr)).map_err(|e| e.to_string())
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (kept, dropped) = fit_json_array(arr, budget, None, |v| {
+        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        format!("{method} {path}")
+    });
+    if dropped.is_empty() {
+        return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
+    }
+    serde_json::to_string_pretty(&json!({
+        "routes": kept,
+        "omitted_for_budget": { "count": dropped.len(), "items": dropped },
+    }))
+    .map_err(|e| e.to_string())
 }
 
 /// `summarize` tool: condense `content`, optionally focused on `query`.
@@ -3244,5 +3787,425 @@ mod tests {
         assert_eq!(p.run, 2);
         assert_eq!(p.total, 788);
         assert_eq!(p.done, 0);
+    }
+
+    // --- plan_status (TASK-002) ---
+
+    fn write_plan_fixture(root: &std::path::Path) {
+        let older = root.join("plans/PLAN-001-old");
+        let newer = root.join("plans/PLAN-002-new");
+        std::fs::create_dir_all(older.join("tasks")).unwrap();
+        std::fs::create_dir_all(newer.join("tasks")).unwrap();
+
+        std::fs::write(
+            older.join("PLAN-001-old.md"),
+            "# PLAN-001 — todo terminado\n\n| Task | Estado |\n|---|---|\n| TASK-001 | `done` |\n",
+        )
+        .unwrap();
+        std::fs::write(
+            older.join("tasks/TASK-001-x.md"),
+            "# TASK-001 — x\n\n- **Estado:** `done`\n\n## Objetivo\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            newer.join("PLAN-002-new.md"),
+            "# PLAN-002 — con pendientes\n\n| Task | Estado |\n|---|---|\n\
+             | TASK-001 | `pending` |\n| TASK-002 | `pending` |\n",
+        )
+        .unwrap();
+        std::fs::write(
+            newer.join("tasks/TASK-001-a.md"),
+            "# TASK-001 — a\n\n- **Depende de:** —\n- **Estado:** `pending`\n\n## Objetivo\n",
+        )
+        .unwrap();
+        std::fs::write(
+            newer.join("tasks/TASK-002-b.md"),
+            "# TASK-002 — b\n\n- **Depende de:** TASK-001\n- **Estado:** `pending`\n\n## Objetivo\n",
+        )
+        .unwrap();
+
+        // Make the older plan's files strictly older than the newer plan's, even though
+        // "older" is only true by mtime here (both were just written) — set the older
+        // plan's mtimes back to be sure the test exercises the mtime rule and not luck.
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for f in [
+            older.join("PLAN-001-old.md"),
+            older.join("tasks/TASK-001-x.md"),
+        ] {
+            let file = std::fs::File::open(&f).unwrap();
+            file.set_modified(past).unwrap();
+        }
+    }
+
+    #[test]
+    fn active_plan_is_the_newest_with_pending_tasks_even_if_another_plan_is_newer_and_done() {
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_status_active_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_plan_fixture(&root);
+
+        let value = plan_status_value(&root, None).expect("list should succeed");
+        assert_eq!(value["active"].as_str(), Some("PLAN-002"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn blocked_waiting_on_names_exactly_the_pending_deps() {
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_status_blocked_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_plan_fixture(&root);
+
+        let value = plan_status_value(&root, Some("PLAN-002")).expect("detail should succeed");
+        assert_eq!(value["plan"].as_str(), Some("PLAN-002"));
+        let ready: Vec<&str> = value["ready"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ready, vec!["TASK-001"]);
+        let blocked = value["blocked"].as_array().unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0]["id"].as_str(), Some("TASK-002"));
+        assert_eq!(
+            blocked[0]["waiting_on"].as_array().unwrap(),
+            &vec![serde_json::json!("TASK-001")]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn budget_of_fifty_tokens_on_a_forty_task_plan_keeps_ready_and_reports_omitted() {
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_status_budget_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("plans/PLAN-009-grande/tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            root.join("plans/PLAN-009-grande/PLAN-009-grande.md"),
+            "# PLAN-009 — grande\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("TASK-001-ready.md"),
+            "# TASK-001 — ready\n\n- **Depende de:** —\n- **Estado:** `pending`\n\n## Objetivo\n",
+        )
+        .unwrap();
+        for n in 2..=40 {
+            let body = format!(
+                "# TASK-{n:03} — bloqueada\n\n- **Depende de:** TASK-001\n- **Estado:** `pending`\n\n## Objetivo\n"
+            );
+            std::fs::write(dir.join(format!("TASK-{n:03}-x.md")), body).unwrap();
+        }
+
+        let value = plan_status_value(&root, Some("PLAN-009")).unwrap();
+        let budgeted = fit_plan_status_budget(value, 50);
+        let parsed: Value = serde_json::from_str(&budgeted).unwrap();
+        assert!(parsed.get("omitted").is_some(), "{budgeted}");
+        assert!(
+            !parsed["ready"].as_array().unwrap().is_empty(),
+            "ready must survive the cut: {budgeted}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repo_without_plans_dir_gives_an_empty_list_not_an_error() {
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_status_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let value = plan_status_value(&root, None).expect("no plans/ dir is not an error");
+        assert!(value["plans"].as_array().unwrap().is_empty());
+        assert!(value["active"].is_null());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- plan_graph (TASK-006) ---
+
+    #[test]
+    fn plan_graph_has_a_node_per_task_and_an_edge_per_dependency() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_graph_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_plan_fixture(&root); // PLAN-001 (done, 1 task), PLAN-002 (2 tasks, 1 dep edge)
+
+        let raw = plan_graph_value(&root, Some("PLAN-002")).expect("graph should succeed");
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["plan"].as_str(), Some("PLAN-002"));
+        assert_eq!(value["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(value["edges"].as_array().unwrap().len(), 1);
+        let edge = &value["edges"][0]["data"];
+        assert_eq!(edge["source"].as_str(), Some("TASK-001"));
+        assert_eq!(edge["target"].as_str(), Some("TASK-002"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_graph_marks_a_missing_dependency_as_a_node_instead_of_dropping_it() {
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_graph_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("plans/PLAN-003-x/tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            root.join("plans/PLAN-003-x/PLAN-003-x.md"),
+            "# PLAN-003 — x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("TASK-001-a.md"),
+            "# TASK-001 — a\n\n- **Depende de:** TASK-099\n- **Estado:** `pending`\n\n## Objetivo\n",
+        )
+        .unwrap();
+
+        let raw = plan_graph_value(&root, Some("PLAN-003")).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        let nodes = value["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2, "TASK-001 plus the missing TASK-099 node");
+        let missing = nodes
+            .iter()
+            .find(|n| n["data"]["id"] == "TASK-099")
+            .unwrap();
+        assert_eq!(missing["data"]["status"].as_str(), Some("missing"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_graph_on_a_plan_with_no_task_files_says_so_without_an_empty_canvas() {
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_graph_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("plans/PLAN-004-sin-tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("PLAN-004-sin-tasks.md"),
+            "# PLAN-004 — sin tasks\n",
+        )
+        .unwrap();
+
+        let raw = plan_graph_value(&root, Some("PLAN-004")).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(value["message"].as_str(), Some("sin tasks"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- plan_tasks_for_file (TASK-007) ---
+
+    fn write_file_ref_fixture(root: &std::path::Path) {
+        let dir = root.join("plans/PLAN-002-x/tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            root.join("plans/PLAN-002-x/PLAN-002-x.md"),
+            "# PLAN-002 — x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("TASK-001-a.md"),
+            "# TASK-001 — a\n\n- **Depende de:** —\n- **Estado:** `pending`\n\n## Archivos\n\n\
+             - **Modificar:** `crates/a/src/x.rs:10`\n\n\
+             Referencia pelada: `lib.rs`.\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_full_path_reference_with_a_line_matches_the_same_full_path() {
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_tasks_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_file_ref_fixture(&root);
+
+        let hits = plan_tasks_for_file(&root, "crates/a/src/x.rs", None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["task"].as_str(), Some("TASK-001"));
+        assert_eq!(hits[0]["line"].as_u64(), Some(10));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bare_lib_rs_reference_does_not_match_a_full_path_query() {
+        let root =
+            std::env::temp_dir().join(format!("devctx_plan_tasks_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_file_ref_fixture(&root);
+
+        let hits = plan_tasks_for_file(&root, "crates/a/src/lib.rs", None);
+        assert!(
+            hits.is_empty(),
+            "a bare `lib.rs` must not match a full path: {hits:?}"
+        );
+
+        // But it matches an equally bare query.
+        let hits = plan_tasks_for_file(&root, "lib.rs", None);
+        assert_eq!(hits.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn with_plan_tasks_field_adds_the_field_without_disturbing_the_rest() {
+        let original = r#"{"subject":"x.rs","memories":[],"matched_by":"junction"}"#.to_string();
+        let out = with_plan_tasks_field(
+            original,
+            vec![json!({"plan": "PLAN-002", "task": "TASK-001"})],
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["subject"].as_str(), Some("x.rs"));
+        assert_eq!(value["plan_tasks"].as_array().unwrap().len(), 1);
+    }
+
+    // --- TASK-001 (PLAN-006): output budget on the tools that lacked it ---
+
+    fn hit(file: &str, line: i64, text_len: usize) -> Value {
+        json!({ "file": file, "start_line": line, "text": "x".repeat(text_len) })
+    }
+
+    /// Under budget, `fit_json_array` is a no-op: nothing is touched, nothing
+    /// is reported missing — same contract as `fit_memories`.
+    #[test]
+    fn fit_json_array_under_budget_returns_everything_untouched() {
+        let items = vec![hit("a.rs", 1, 50), hit("b.rs", 2, 50)];
+        let (kept, dropped) = fit_json_array(items, 8000, Some("text"), |_| String::new());
+        assert_eq!(kept.len(), 2);
+        assert!(dropped.is_empty());
+    }
+
+    /// An oversized item with a shrinkable field is truncated in place, not
+    /// dropped whole — the same "shrink before you drop" rule as memories.
+    #[test]
+    fn fit_json_array_truncates_an_oversized_item_in_place() {
+        let items = vec![hit("huge.rs", 1, 200_000)];
+        let (kept, dropped) = fit_json_array(items, 100, Some("text"), |v| {
+            v["file"].as_str().unwrap().to_string()
+        });
+        assert!(dropped.is_empty());
+        let text = kept[0]["text"].as_str().unwrap();
+        assert!(text.contains("[devctx] truncated"), "{text:?}");
+    }
+
+    /// With no shrinkable field, an item bigger than its share is dropped and
+    /// named under `omitted_for_budget` — silence about what was cut is never
+    /// acceptable. A tiny item alongside it survives untouched.
+    #[test]
+    fn fit_json_array_drops_and_names_items_it_cannot_shrink() {
+        let items = vec![
+            json!({ "framework": "x", "method": "GET", "path": "/ping" }),
+            json!({ "framework": "x", "method": "GET", "path": "/".to_string() + &"x".repeat(2000) }),
+        ];
+        let label = |v: &Value| {
+            format!(
+                "{} {}",
+                v["method"].as_str().unwrap(),
+                v["path"].as_str().unwrap()
+            )
+        };
+        let (kept, dropped) = fit_json_array(items, 20, None, label);
+        assert_eq!(kept.len(), 1, "the small route survives: {kept:?}");
+        assert_eq!(kept[0]["path"], "/ping");
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].starts_with("GET /xxx"), "{dropped:?}");
+    }
+
+    /// `routes_to_json` (feeds `search_routes`/`routes_for_handler`) wraps its
+    /// answer with `omitted_for_budget` when a huge result set does not fit,
+    /// and stays a bare array otherwise — never silent truncation.
+    #[test]
+    fn routes_to_json_reports_omissions_under_a_tiny_budget() {
+        // Many small routes plus one with a wildly long path: the small ones
+        // fit their (floor-protected) share, the long one does not and has
+        // no field this tool knows how to shrink, so it alone is dropped.
+        std::env::set_var("DEVCTX_MAX_OUTPUT_TOKENS", "20");
+        let mut routes: Vec<devctx_store::StoredRoute> = (0..5)
+            .map(|i| devctx_store::StoredRoute {
+                framework: "fastapi".into(),
+                http_method: "GET".into(),
+                path: format!("/r{i}"),
+                file: "app.py".into(),
+                line: i,
+                ..Default::default()
+            })
+            .collect();
+        routes.push(devctx_store::StoredRoute {
+            framework: "fastapi".into(),
+            http_method: "GET".into(),
+            path: "/".to_string() + &"segment/".repeat(200),
+            file: "app.py".into(),
+            line: 999,
+            ..Default::default()
+        });
+        let out = routes_to_json(&routes).unwrap();
+        std::env::remove_var("DEVCTX_MAX_OUTPUT_TOKENS");
+        let value: Value = serde_json::from_str(&out).unwrap();
+        let omitted = value["omitted_for_budget"]["count"].as_u64().unwrap();
+        assert_eq!(
+            omitted, 1,
+            "only the oversized route should be dropped: {out}"
+        );
+        assert_eq!(value["routes"].as_array().unwrap().len(), 5);
+    }
+
+    /// The same call under a generous budget stays the plain array shape the
+    /// tool has always returned — the wrapper only appears when it is needed.
+    #[test]
+    fn routes_to_json_stays_a_bare_array_when_everything_fits() {
+        let routes = vec![devctx_store::StoredRoute {
+            framework: "flask".into(),
+            http_method: "GET".into(),
+            path: "/ping".into(),
+            file: "app.py".into(),
+            line: 1,
+            ..Default::default()
+        }];
+        let out = routes_to_json(&routes).unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert!(value.is_array(), "{out}");
+    }
+
+    /// `do_impact`'s upstream/downstream split each get half the budget, so a
+    /// symbol with a huge blast radius on one side does not starve the other:
+    /// a mix of small and very deep (long-symbol) callers on one side is
+    /// trimmed by dropping the ones that do not fit their share, while a
+    /// handful of small callees on the other side is untouched.
+    #[test]
+    fn fit_json_array_splits_a_shared_budget_fairly_between_two_lists() {
+        let mut upstream: Vec<Value> = (0..5)
+            .map(|i| json!({ "symbol": format!("Caller{i}"), "depth": 1 }))
+            .collect();
+        upstream.push(json!({ "symbol": "x".repeat(2000), "depth": 1 }));
+        let downstream: Vec<Value> = (0..3)
+            .map(|i| json!({ "symbol": format!("Callee{i}"), "depth": 1 }))
+            .collect();
+        let label = |v: &Value| v["symbol"].as_str().unwrap().to_string();
+        let half = 20usize;
+        let (up_kept, up_dropped) = fit_json_array(upstream, half, None, label);
+        let (down_kept, down_dropped) = fit_json_array(downstream, half, None, label);
+        assert_eq!(up_dropped.len(), 1, "only the oversized caller is dropped");
+        assert_eq!(up_kept.len(), 5);
+        assert!(down_dropped.is_empty(), "3 small callees fit easily");
+        assert_eq!(down_kept.len(), 3);
+    }
+
+    /// `memories_by_symbol`/`memories_by_file` (via `linked_response`) reuse
+    /// `fit_memories`: an oversized linked memory is truncated, not dropped
+    /// whole, and the JSON keeps its `subject`/`matched_by` shape either way.
+    #[test]
+    fn linked_response_style_output_budgets_an_oversized_memory() {
+        let out = vec![mem("m1", 200_000)];
+        let (kept, dropped) = fit_memories(out, 200, |_, _| None);
+        assert!(dropped.is_empty());
+        let content = kept[0]["content"].as_str().unwrap();
+        assert!(content.contains("[devctx] truncated"), "{content:?}");
     }
 }

@@ -361,6 +361,12 @@ fn a_second_daemon_is_refused() {
 ///
 /// Ignored by default because it loads a real embedding model — the engine
 /// semantics themselves are covered by unit tests in `devctx-memory`.
+///
+/// Re-checked while hardening `memories_of` against unexpected payload
+/// shapes: this test drives `remember`/`recall` end to end through a real
+/// server, and both embed unconditionally (see `RememberRequest` /
+/// `RecallQuery` in `devctx-memory`) — there is no path through them that
+/// skips the model, so it cannot be un-ignored without changing what it tests.
 #[test]
 #[ignore = "loads an embedding model (downloads it on a cold cache)"]
 fn global_memories_cross_projects_while_local_ones_stay_put() {

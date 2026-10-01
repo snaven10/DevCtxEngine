@@ -184,7 +184,11 @@ La memoria residente la domina el modelo cargado. La cifra de ~406 MB de arriba
 es un modelo de embeddings de 384 dimensiones más el store; habilitar un
 cross-encoder agrega gigabytes, que es la razón real de que venga apagado.
 
-**Solo-CPU es el caso asumido.** Nada de acá requiere GPU.
+**Solo-CPU es el caso asumido.** Nada de acá requiere GPU, y todas las cifras de
+esta página son de CPU. Un build con `--features gpu` puede correr el embedder y
+el reranker locales en una GPU NVIDIA (`device: cuda`); es opcional, no está
+medido acá, y se describe en
+[Modelos y ajuste](09-modelos-embeddings-y-tuning.md#gpu-cuda).
 
 **Red:** solo descargas de modelos en el primer uso, y solo para modelos cuyos
 archivos no estén ya presentes. `devctx models` muestra cuáles aplican. Con un

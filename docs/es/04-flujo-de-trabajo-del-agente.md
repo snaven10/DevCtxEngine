@@ -37,6 +37,7 @@ rara existe por un incidente en producción.
 | ¿Qué ruta HTTP sirve esto? | `search_routes` / `routes_for_handler` |
 | La respuesta está en otro repositorio | `search_project` |
 | Acabo de perder mi contexto | `memory_context` |
+| ¿En qué estaba en este plan? ¿Qué sigue? | `plan_status` |
 
 Las dos filas que la gente saltea son las caras de saltear: `impact_analysis`
 antes de cambiar algo público, y `memories_by_symbol` antes de suponer que el
@@ -125,6 +126,40 @@ use_project <nombre> → vincular esta sesión
 ```
 
 Este es un estado normal, no una instalación rota.
+
+## Planes, y el formato markdown que espera `plan_status`
+
+Un repositorio que usa `plans/PLAN-NNN[-slug]/` para sus planes de trabajo
+tiene `plan_status` gratis: sin argumento lista todos los planes y nombra el
+activo (el que tiene trabajo pendiente y cuyo `.md` cambió más reciente;
+empate va al número de plan más alto); `plan: "PLAN-005"` (o `5`, o el nombre
+del directorio) da las tasks listas/en curso/bloqueadas de ese plan. Llamala
+justo después de compactar — es lo que le falta al contexto recuperado.
+
+`plan_status` lee archivos `plans/PLAN-NNN[-slug]/tasks/TASK-NNN-*.md`. El
+bloque de encabezado (entre el H1 y la primera sección `## `) necesita como
+mínimo:
+
+```markdown
+# TASK-003 — un título corto
+
+- **Plan:** PLAN-005 — título del plan
+- **Depende de:** TASK-001, TASK-002
+- **Estado:** `pending`
+```
+
+`Estado` toma uno de cuatro valores: `pending`, `in_progress`, `done`,
+`blocked`. `Depende de` lista ids `TASK-NNN` (un `—`, `Ninguna` o `N/A` a
+secas significa ninguna — aunque el texto después mencione otra task, p. ej.
+`— (paralela a TASK-001)`). Lo que el parser no pueda ubicar se vuelve un
+warning, nunca una adivinanza.
+
+La tabla de progreso propia de un plan (en el `.md` del plan, no en el archivo
+de la task) solo se lee para chequear que coincide con los archivos de las
+tasks. **El archivo de la task siempre gana** — si la tabla de un plan dice
+`done` y el archivo de la task dice `pending`, la task se reporta `pending`,
+más un warning nombrando la discrepancia. Nunca edites un archivo de task para
+que un warning desaparezca sin antes verificar cuál de los dos es correcto.
 
 ## Cuando el índice está viejo
 

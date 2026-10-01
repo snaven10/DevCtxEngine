@@ -222,6 +222,9 @@ impl Store {
              ON vectors USING HNSW (vector) WITH (metric = '{metric}');",
         ))?;
         self.invalidate_metric_cache();
+        // The index DDL above must not outlive this process uncheckpointed —
+        // see `checkpoint`'s own doc comment. Best-effort, same as there.
+        self.checkpoint();
         Ok(true)
     }
 
@@ -270,6 +273,9 @@ impl Store {
              DROP INDEX IF EXISTS idx_vectors_hnsw_ip;",
         );
         self.invalidate_metric_cache();
+        // Same shape as the FTS drop below: a DROP is DDL, and a crash before
+        // the next checkpoint leaves it stranded in the WAL, unreplayable.
+        self.checkpoint();
         Ok(())
     }
 
@@ -282,6 +288,11 @@ impl Store {
         }
         self.conn
             .execute_batch("PRAGMA create_fts_index('vectors', 'id', 'text', overwrite = 1);")?;
+        // This is DDL, and a process that dies before the next checkpoint
+        // leaves it stranded in the WAL — DuckDB cannot replay it on the next
+        // open, and the database is unopenable for good. See `checkpoint`'s
+        // doc comment; best-effort there for the same reason it is here.
+        self.checkpoint();
         Ok(true)
     }
 
@@ -306,9 +317,16 @@ impl Store {
     /// from index". So it is dropped before any run that deletes and rebuilt
     /// after — the same shape as [`drop_hnsw`](Self::drop_hnsw), for the same
     /// reason. Best-effort: absent index or extension is a no-op.
+    ///
+    /// The drop is DDL too, and the exact failure that motivates the
+    /// checkpoint below — a process dying between this drop and the next
+    /// checkpoint — is what actually bricked this repo's own index: DuckDB
+    /// replaying the WAL hit "Cannot drop entry \"fts_main_vectors\" because
+    /// there are entries that depend on it" and refused to open ever again.
     pub fn drop_fts(&self) -> Result<()> {
         if self.load_fts() {
             let _ = self.conn.execute_batch("PRAGMA drop_fts_index('vectors');");
+            self.checkpoint();
         }
         Ok(())
     }
@@ -878,6 +896,106 @@ mod tests {
         // suite with `DEVCTX_DB_THREADS` set does not see a spurious failure.
         let expected = env_usize("DEVCTX_DB_THREADS", DEFAULT_THREADS).max(1) as i64;
         assert_eq!(threads, expected);
+    }
+
+    /// Regression for a WAL that a crash leaves unreplayable.
+    ///
+    /// A bare first-time `create_fts_index` replays fine even uncheckpointed —
+    /// WAL replay of a plain `CREATE` is the ordinary case. The failure this
+    /// repo actually hit ("Cannot drop entry \"fts_main_vectors\" because
+    /// there are entries that depend on it... Use DROP...CASCADE") comes from
+    /// the *drop* half: `drop_fts` issues `PRAGMA drop_fts_index`, DDL that
+    /// tears down the `fts_main_vectors` schema and its dependent
+    /// `terms`/`docs`/`dict` tables, and if the process dies before the next
+    /// checkpoint folds that into the database file, DuckDB cannot replay the
+    /// drop on the next open — the database is unopenable for good, forever
+    /// (a reindex cannot fix it either, because reindexing itself begins by
+    /// deleting).
+    ///
+    /// So the crash producer below builds the index, *checkpoints* (steady
+    /// state — an index that has always been there), then drops it and exits
+    /// via [`std::process::abort`] with no checkpoint after the drop. `abort`
+    /// (unlike [`std::process::exit`], which still runs C `atexit`/static
+    /// destructors — DuckDB is a C++ library and could be using one to flush
+    /// on ordinary process exit) raises `SIGABRT` and runs nothing, the
+    /// closest a same-process simulation gets to `kill -9`.
+    #[test]
+    fn fts_drop_survives_a_crash_before_the_next_checkpoint() {
+        let path =
+            std::env::temp_dir().join(format!("devctx_fts_crash_{}.duckdb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let status = std::process::Command::new(exe)
+            .arg("store::tests::crash_producer_drop_fts")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("DEVCTX_CRASH_TEST_DB", &path)
+            .status()
+            .expect("spawning the crash-producer child");
+
+        if !path.exists() {
+            // The child bailed out early: the FTS extension is unavailable in
+            // this environment (e.g. offline), and it exited normally on
+            // purpose. Checked before the status, or that exit reads as a
+            // failure. Nothing to verify.
+            return;
+        }
+        assert!(
+            !status.success(),
+            "the crash producer is expected to abort, not return normally"
+        );
+
+        let store = Store::open(&path, 8).expect(
+            "reopening a database crashed right after drop_fts must not fail to \
+             replay its WAL",
+        );
+        // The point isn't whether FTS is still built (it was mid-drop) — it's
+        // that the database opens at all instead of being bricked.
+        let _ = store.has_fts();
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
+    }
+
+    /// Child entry point for
+    /// [`fts_drop_survives_a_crash_before_the_next_checkpoint`]. A no-op
+    /// under an ordinary `cargo test` run — the env var is only ever set by
+    /// that test, which spawns this same binary with it set to the scratch
+    /// database path.
+    #[test]
+    fn crash_producer_drop_fts() {
+        let Ok(path) = std::env::var("DEVCTX_CRASH_TEST_DB") else {
+            return;
+        };
+        let store = Store::open(Path::new(&path), 8).expect("opening the scratch store");
+        store
+            .upsert(&[VectorPoint {
+                id: "a".into(),
+                vector: vec![0.0; 8],
+                text: "connect to the postgres database".into(),
+                metadata: VectorMetadata {
+                    repo: "demo".into(),
+                    branch: "main".into(),
+                    language: "rust".into(),
+                    ..Default::default()
+                },
+            }])
+            .expect("seeding a row");
+        if !store.rebuild_fts().expect("rebuild_fts") {
+            // FTS extension unavailable here either; leave no file behind so
+            // the parent knows to skip its assertion, then exit *normally* —
+            // no drop happened, so there is nothing to abort mid-way.
+            let _ = std::fs::remove_file(&path);
+            std::process::exit(0);
+        }
+        // Steady state: the index has been built and checkpointed, same as an
+        // index that has existed since a previous run.
+        store.checkpoint();
+        // The risky part: drop it, then crash before the next checkpoint.
+        store.drop_fts().expect("drop_fts");
+        std::process::abort();
     }
 }
 

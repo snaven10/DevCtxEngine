@@ -179,7 +179,10 @@ Resident memory is dominated by the loaded model. The ~406 MB figure above is a
 384-dimension embedding model plus the store; enabling a cross-encoder adds
 gigabytes, which is the real reason it defaults off.
 
-**CPU-only is the assumed case.** Nothing here requires a GPU.
+**CPU-only is the assumed case.** Nothing here requires a GPU, and every
+figure on this page is CPU. A build with `--features gpu` can run the local
+embedder and reranker on an NVIDIA GPU (`device: cuda`); it is opt-in, unmeasured
+here, and described in [Models and Tuning](09-models-and-tuning.md#gpu-cuda).
 
 **Network:** only model downloads on first use, and only for models whose files
 are not already present. `devctx models` shows which of those apply. With a

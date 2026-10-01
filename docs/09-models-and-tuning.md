@@ -103,6 +103,47 @@ either alone. On a constrained machine, lowering `DEVCTX_EMBED_MAX_CHARS` to
 2048 is usually the more effective of the two, because it attacks the padding
 rather than the count.
 
+## GPU (CUDA)
+
+Local ONNX models (the embedder and the reranker) run on CPU unless told
+otherwise. A binary built with the `gpu` feature can use an NVIDIA GPU:
+
+```bash
+cargo rustc --release -p devctx-cli --bin devctx --features gpu \
+  -- -C 'link-arg=-Wl,-rpath,$ORIGIN/../lib/devctx'
+mkdir -p ~/.local/lib/devctx
+cp ~/.cache/ort.pyke.io/dfbin/x86_64-unknown-linux-gnu/*/onnxruntime/lib/libonnxruntime{,_providers_shared,_providers_cuda}.so \
+  ~/.local/lib/devctx/
+install -m 755 target/release/devctx ~/.local/bin/devctx
+```
+
+A plain `cargo install --features gpu` builds a binary that does not start.
+With the CUDA feature the ONNX Runtime is no longer linked statically: the
+binary needs `libonnxruntime.so` (and the CUDA provider next to it) at run
+time, and has no path to find them. The `rpath` above points it at
+`../lib/devctx` relative to itself, which is where the libraries are copied.
+The release binaries on GitHub are built without `gpu` and are unaffected.
+
+```yaml
+embeddings:
+  device: cuda          # cpu (default) | cuda
+reranking:
+  device: cuda
+```
+
+`DEVCTX_DEVICE=cpu|cuda` overrides both. Requirements: an NVIDIA driver, the
+CUDA 12.x toolkit and cuDNN 9 on the host (or in WSL); Blackwell GPUs need
+CUDA 12.8 or newer.
+
+Nothing fails silently. If `device: cuda` is set on a binary built without
+`--features gpu`, or CUDA cannot be initialised (missing driver, toolkit or
+cuDNN), devctx prints a warning to stderr and runs on CPU.
+
+One caveat: the default Granite ONNX is int8-quantized, and CUDA has no kernels
+for some quantized operators, so those run on CPU and most of the benefit is
+lost. For GPU use an fp16 ONNX of the same model — same 384 dimensions, so the
+index is unchanged and nothing needs re-embedding.
+
 ## Storage tuning
 
 ```yaml

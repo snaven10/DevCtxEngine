@@ -37,6 +37,29 @@ pub enum Offline {
     False,
 }
 
+/// Where local ONNX models run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Device {
+    /// CPU (default).
+    #[default]
+    Cpu,
+    /// NVIDIA GPU via the CUDA execution provider. Needs a binary built with
+    /// `--features gpu`; otherwise it warns and runs on CPU.
+    Cuda,
+}
+
+impl Device {
+    /// Apply the `DEVCTX_DEVICE` (`cpu` | `cuda`) override, if set and valid.
+    pub fn with_env_override(self) -> Self {
+        match std::env::var("DEVCTX_DEVICE") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("cuda") => Self::Cuda,
+            Ok(v) if v.trim().eq_ignore_ascii_case("cpu") => Self::Cpu,
+            _ => self,
+        }
+    }
+}
+
 /// `project:` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Project {
@@ -75,6 +98,10 @@ pub struct Embeddings {
     /// Offline policy.
     #[serde(default)]
     pub offline: Offline,
+    /// Where the local model runs: `cpu` (default) or `cuda`. `DEVCTX_DEVICE`
+    /// overrides it. `cuda` needs a binary built with `--features gpu`.
+    #[serde(default)]
+    pub device: Device,
 }
 
 impl Default for Embeddings {
@@ -84,6 +111,7 @@ impl Default for Embeddings {
             model: default_model(),
             model_dir: String::new(),
             offline: Offline::default(),
+            device: Device::default(),
         }
     }
 }
@@ -241,6 +269,10 @@ pub struct Reranking {
     /// with a large one; deep and large is unusably slow.
     #[serde(default = "default_rerank_pool")]
     pub pool: usize,
+    /// Where the cross-encoder runs: `cpu` (default) or `cuda`. `DEVCTX_DEVICE`
+    /// overrides it. `cuda` needs a binary built with `--features gpu`.
+    #[serde(default)]
+    pub device: Device,
 }
 
 impl Default for Reranking {
@@ -250,6 +282,7 @@ impl Default for Reranking {
             model: default_reranker(),
             model_dir: String::new(),
             pool: default_rerank_pool(),
+            device: Device::default(),
         }
     }
 }
@@ -521,6 +554,19 @@ mod tests {
         assert_eq!(cfg.embeddings.offline, Offline::Auto);
         assert_eq!(cfg.language, Language::En);
         assert!(cfg.indexing.exclude.is_empty());
+    }
+
+    #[test]
+    fn device_defaults_to_cpu_and_parses_cuda() {
+        let cfg = ProjectConfig::from_yaml("{}").unwrap();
+        assert_eq!(cfg.embeddings.device, Device::Cpu);
+        assert_eq!(cfg.reranking.device, Device::Cpu);
+
+        let cfg =
+            ProjectConfig::from_yaml("embeddings:\n  device: cuda\nreranking:\n  device: cuda\n")
+                .unwrap();
+        assert_eq!(cfg.embeddings.device, Device::Cuda);
+        assert_eq!(cfg.reranking.device, Device::Cuda);
     }
 
     #[test]

@@ -37,6 +37,7 @@ weird branch exists because of a production incident.
 | Which HTTP route serves this? | `search_routes` / `routes_for_handler` |
 | The answer is in another repository | `search_project` |
 | I just lost my context | `memory_context` |
+| What was I doing on this plan? What's next? | `plan_status` |
 
 The two rows people skip are the expensive ones to skip: `impact_analysis`
 before changing anything public, and `memories_by_symbol` before assuming code
@@ -126,6 +127,38 @@ use_project <name>   → bind this session
 ```
 
 This is a normal state, not a broken install.
+
+## Plans, and the markdown format `plan_status` expects
+
+A repository using `plans/PLAN-NNN[-slug]/` for its work plans gets
+`plan_status` for free: no argument lists every plan and names the active one
+(the one with pending work whose `.md` changed most recently; ties go to the
+higher plan number); `plan: "PLAN-005"` (or `5`, or the directory name) gives
+that plan's ready/in-progress/blocked tasks. Call it right after a compaction —
+it is what the recovered context is missing.
+
+`plan_status` reads `plans/PLAN-NNN[-slug]/tasks/TASK-NNN-*.md` files. The
+header block (between the H1 and the first `## ` section) needs at minimum:
+
+```markdown
+# TASK-003 — a short title
+
+- **Plan:** PLAN-005 — plan title
+- **Depende de:** TASK-001, TASK-002
+- **Estado:** `pending`
+```
+
+`Estado` takes one of four values: `pending`, `in_progress`, `done`,
+`blocked`. `Depende de` lists `TASK-NNN` ids (a bare `—`, `Ninguna`, or `N/A`
+means none — even if the text after it happens to mention another task, e.g.
+`— (parallel to TASK-001)`). Anything the parser cannot place becomes a
+warning, never a guess.
+
+A plan's own progress table (in the plan's `.md`, not the task file) is read
+only to check it agrees with the task files. **The task file always wins** —
+if a plan's table says `done` and the task file says `pending`, the task is
+reported `pending`, plus a warning naming the disagreement. Never edit a task
+file to make a warning go away without checking which one is actually true.
 
 ## When the index is stale
 

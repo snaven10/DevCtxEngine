@@ -12,9 +12,10 @@
 
 use std::path::Path;
 
+use devctx_core::config::Device;
 use fastembed::{
-    RerankInitOptions, RerankInitOptionsUserDefined, RerankerModel, TextRerank, TokenizerFiles,
-    UserDefinedRerankingModel,
+    ExecutionProviderDispatch, RerankInitOptions, RerankInitOptionsUserDefined, RerankerModel,
+    TextRerank, TokenizerFiles, UserDefinedRerankingModel,
 };
 
 use crate::error::{RerankError, Result};
@@ -78,6 +79,50 @@ fn read_tokenizer_files(dir: &Path) -> Result<TokenizerFiles> {
     })
 }
 
+/// The CUDA execution provider, or `None` when built without `--features gpu`.
+///
+/// `error_on_failure` makes a missing driver/toolkit fail the session instead of
+/// ort silently continuing on CPU, so [`init_on`] can say so.
+#[cfg(feature = "gpu")]
+fn cuda_providers() -> Option<Vec<ExecutionProviderDispatch>> {
+    use ort::execution_providers::CUDAExecutionProvider;
+    Some(vec![CUDAExecutionProvider::default()
+        .build()
+        .error_on_failure()])
+}
+
+#[cfg(not(feature = "gpu"))]
+fn cuda_providers() -> Option<Vec<ExecutionProviderDispatch>> {
+    None
+}
+
+/// Run `init` with the execution providers for `device`, falling back to CPU
+/// (with a warning) when CUDA was asked for but is unavailable.
+fn init_on<T>(
+    device: Device,
+    mut init: impl FnMut(Vec<ExecutionProviderDispatch>) -> Result<T>,
+) -> Result<T> {
+    if device == Device::Cuda {
+        match cuda_providers() {
+            Some(providers) => {
+                eprintln!("devctx: reranking requested CUDA (device: cuda)");
+                match init(providers) {
+                    Ok(model) => return Ok(model),
+                    Err(e) => eprintln!(
+                        "devctx: warning: CUDA failed for reranking ({e}); falling back to CPU. \
+                         Check the NVIDIA driver, CUDA 12 toolkit and cuDNN 9."
+                    ),
+                }
+            }
+            None => eprintln!(
+                "devctx: warning: device is cuda but this binary was built without GPU \
+                 support (--features gpu); reranking runs on CPU"
+            ),
+        }
+    }
+    init(Vec::new())
+}
+
 /// A fastembed cross-encoder reranker.
 /// Candidates shown to the cross-encoder unless configured otherwise.
 const DEFAULT_POOL: usize = 100;
@@ -110,11 +155,11 @@ impl LocalReranker {
     }
 
     /// Load the reranker named by `key` (downloads/caches on first use).
-    pub fn load(key: &str, model_dir: Option<&Path>) -> Result<Self> {
+    pub fn load(key: &str, model_dir: Option<&Path>, device: Device) -> Result<Self> {
         // A directory wins over the key: it is the only way to run a
         // cross-encoder fastembed does not ship, which is the whole point of it.
         if let Some(dir) = model_dir {
-            return Self::load_user_defined(key, dir);
+            return Self::load_user_defined(key, dir, device);
         }
         if key == CUSTOM_MODEL {
             return Err(RerankError::MissingConfig(
@@ -128,8 +173,10 @@ impl LocalReranker {
         if let Some(cache) = devctx_core::dirs::model_cache_dir() {
             opts = opts.with_cache_dir(cache);
         }
-        let text_rerank =
-            TextRerank::try_new(opts).map_err(|e| RerankError::Backend(e.to_string()))?;
+        let text_rerank = init_on(device, |eps| {
+            TextRerank::try_new(opts.clone().with_execution_providers(eps))
+                .map_err(|e| RerankError::Backend(e.to_string()))
+        })?;
         Ok(Self {
             model: text_rerank,
             name: key.to_string(),
@@ -138,7 +185,7 @@ impl LocalReranker {
     }
 
     /// Load a cross-encoder from a directory of ONNX + tokenizer files.
-    fn load_user_defined(key: &str, dir: &Path) -> Result<Self> {
+    fn load_user_defined(key: &str, dir: &Path, device: Device) -> Result<Self> {
         let onnx_path = find_onnx(dir).ok_or_else(|| {
             RerankError::MissingConfig(format!("no .onnx file in {}", dir.display()))
         })?;
@@ -146,9 +193,14 @@ impl LocalReranker {
             .map_err(|e| RerankError::Backend(format!("reading {}: {e}", onnx_path.display())))?;
 
         let udm = UserDefinedRerankingModel::new(onnx, read_tokenizer_files(dir)?);
-        let text_rerank =
-            TextRerank::try_new_from_user_defined(udm, RerankInitOptionsUserDefined::default())
-                .map_err(|e| RerankError::Backend(e.to_string()))?;
+        let text_rerank = init_on(device, |eps| {
+            // No builder for execution providers on this options type, and it is
+            // `#[non_exhaustive]` — so set the public field after `default()`.
+            let mut opts = RerankInitOptionsUserDefined::default();
+            opts.execution_providers = eps;
+            TextRerank::try_new_from_user_defined(udm.clone(), opts)
+                .map_err(|e| RerankError::Backend(e.to_string()))
+        })?;
         Ok(Self {
             model: text_rerank,
             name: key.to_string(),
@@ -221,7 +273,7 @@ mod tests {
     #[test]
     #[ignore = "downloads a model from HuggingFace"]
     fn reranks_by_relevance() {
-        let r = LocalReranker::load("bge-base", None).unwrap();
+        let r = LocalReranker::load("bge-base", None, Device::Cpu).unwrap();
         let cands: Vec<String> = vec![
             "the cat sat on the mat".into(),
             "how to connect to a postgres database".into(),

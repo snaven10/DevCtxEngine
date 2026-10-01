@@ -670,3 +670,66 @@ fn local_scope_refuses_to_guess_a_repository() {
         "a project binding must accept `scope: local`, got: {ok}"
     );
 }
+
+/// The bug this task closes: `remember` on a fully unbound session (no
+/// project, no group — an empty directory) used to fail outright and lose the
+/// content, on every scope, because `backend_for` errored before `remember`
+/// ever looked at what was asked for. It must now be saved centrally as
+/// global instead of dropped.
+#[test]
+fn unbound_remember_saves_as_global_instead_of_losing_content() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("unboundremember");
+    let home = tmp.home();
+    let empty = tmp.dir("nothing-here");
+
+    let out = call_tool(
+        &home,
+        &empty,
+        "remember",
+        serde_json::json!({"content": "nada estaba vinculado, pero igual hay que guardarlo"}),
+    );
+    assert!(
+        out.get("id").is_some(),
+        "the memory must be saved, not dropped, got: {out}"
+    );
+    let text = out.to_string();
+    assert!(
+        text.contains("global"),
+        "an unbound save must say it landed as global, got: {text}"
+    );
+}
+
+/// `scope: local` while fully unbound truly has nowhere to go — there is not
+/// even a group to redirect to. It must still fail, but the error has to carry
+/// the original content back, or the model has no way to retry it without the
+/// caller re-typing what it already sent.
+#[test]
+fn unbound_remember_with_explicit_local_preserves_content_in_the_error() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("unboundlocal");
+    let home = tmp.home();
+    let empty = tmp.dir("nothing-here");
+
+    let msg = call_tool_raw(
+        &home,
+        &empty,
+        "remember",
+        serde_json::json!({
+            "content": "un contenido bien especifico que no se puede perder",
+            "scope": "local",
+        }),
+    );
+    let err = msg
+        .get("error")
+        .unwrap_or_else(|| panic!("`scope: local` while fully unbound must fail, got: {msg}"))
+        .to_string();
+    assert!(
+        err.contains("un contenido bien especifico que no se puede perder"),
+        "the original content must be echoed back so it is not lost, got: {err}"
+    );
+    assert!(
+        err.contains("global"),
+        "the error must point at `scope: global` as the way out, got: {err}"
+    );
+}
