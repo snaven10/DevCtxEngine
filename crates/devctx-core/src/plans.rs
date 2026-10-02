@@ -153,7 +153,8 @@ fn keyword_status(word: &str) -> Option<Status> {
         | "implementado" | "ejecutada" | "ejecutado" | "merged" => Some(Status::Done),
         "blocked" | "bloqueada" | "bloqueado" => Some(Status::Blocked),
         "skipped" | "omitida" | "omitido" | "descartada" | "descartado" | "cancelled"
-        | "canceled" | "cancelada" | "cancelado" | "superseded" => Some(Status::Skipped),
+        | "canceled" | "cancelada" | "cancelado" | "superseded" | "postponed" | "pospuesta"
+        | "pospuesto" => Some(Status::Skipped),
         _ => None,
     }
 }
@@ -1622,6 +1623,8 @@ Referencia pelada: `lib.rs` y relativa `../VERIFICACION.md` (excluida) y `state.
             ("**Estado**: PENDING", Status::Pending),
             ("- **Estado:** sigue `pending`.", Status::Pending),
             ("- **Estado:** `skipped`", Status::Skipped),
+            ("**Status:** POSTPONED", Status::Skipped),
+            ("**Estado:** pospuesta hasta la fase 2", Status::Skipped),
             (
                 "- **Estado:** ✅ **`done`** — ejecutada en la rama",
                 Status::Done,

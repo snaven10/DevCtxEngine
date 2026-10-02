@@ -157,7 +157,7 @@ also accepts these synonyms (any case, accents ignored, English or Spanish):
 | `in_progress` | `in_progress`, `in-progress`, `en progreso`, `en curso`, `in progress`, `wip` |
 | `done` | `done`, `completed`, `hecho`/`hecha`, `terminada`, `cerrada`, `implemented`, `ejecutada`, `merged`, or a bare `✅` |
 | `blocked` | `blocked`, `bloqueada`/`bloqueado` |
-| `skipped` | `skipped`, `omitida`, `descartada`, `cancelled`/`cancelada`, `superseded` |
+| `skipped` | `skipped`, `omitida`, `descartada`, `cancelled`/`cancelada`, `superseded`, `postponed`/`pospuesta` |
 
 `skipped` is for a task dropped on purpose: it resolves the tasks that depend
 on it (like `done`) but is counted apart — the CLI shows `done/total (+N
