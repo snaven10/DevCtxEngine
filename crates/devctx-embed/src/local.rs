@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use devctx_core::config::Device;
+use devctx_core::CudaFallback;
 use fastembed::{
     EmbeddingModel, ExecutionProviderDispatch, InitOptions, InitOptionsUserDefined, Pooling,
     TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
@@ -32,7 +33,8 @@ const ONNX_CANDIDATES: &[&str] = &[
 
 /// A fastembed-backed embedding provider.
 pub struct LocalProvider {
-    model: TextEmbedding,
+    /// Falls back to a CPU rebuild if inference fails while on CUDA.
+    model: CudaFallback<TextEmbedding, EmbedError>,
     dimension: usize,
     name: String,
     max_chars: usize,
@@ -50,10 +52,11 @@ impl LocalProvider {
         let spec = registry::find_local(key)
             .ok_or_else(|| EmbedError::UnknownModel(key.to_string(), "local".into()))?;
 
-        let model = match spec.builtin {
-            Some(builtin) => load_builtin(builtin, spec, settings.device)?,
-            None => load_user_defined(spec, settings.model_dir.as_deref(), settings.device)?,
-        };
+        let (model, on_cuda) = load_model(spec, settings.model_dir.as_deref(), settings.device)?;
+        let model_dir = settings.model_dir.clone();
+        let model = CudaFallback::new("embeddings", model, on_cuda, move || {
+            load_model(spec, model_dir.as_deref(), Device::Cpu).map(|(m, _)| m)
+        });
 
         Ok(Self {
             model,
@@ -74,10 +77,10 @@ impl EmbeddingProvider for LocalProvider {
             .iter()
             .map(|t| t.chars().take(self.max_chars).collect())
             .collect();
-        let mut out = self
-            .model
-            .embed(capped, Some(self.batch_size))
-            .map_err(|e| EmbedError::Backend(e.to_string()))?;
+        let mut out = self.model.run(|m| {
+            m.embed(capped.clone(), Some(self.batch_size))
+                .map_err(|e| EmbedError::Backend(e.to_string()))
+        })?;
         for v in &mut out {
             l2_normalize(v);
         }
@@ -111,17 +114,18 @@ fn cuda_providers() -> Option<Vec<ExecutionProviderDispatch>> {
 }
 
 /// Run `init` with the execution providers for `device`, falling back to CPU
-/// (with a warning) when CUDA was asked for but is unavailable.
+/// (with a warning) when CUDA was asked for but is unavailable. The flag says
+/// whether the result is actually on CUDA.
 fn init_on<T>(
     device: Device,
     mut init: impl FnMut(Vec<ExecutionProviderDispatch>) -> Result<T>,
-) -> Result<T> {
+) -> Result<(T, bool)> {
     if device == Device::Cuda {
         match cuda_providers() {
             Some(providers) => {
                 eprintln!("devctx: embeddings requested CUDA (device: cuda)");
                 match init(providers) {
-                    Ok(model) => return Ok(model),
+                    Ok(model) => return Ok((model, true)),
                     Err(e) => eprintln!(
                         "devctx: warning: CUDA failed for embeddings ({e}); falling back to CPU. \
                          Check the NVIDIA driver, CUDA 12 toolkit and cuDNN 9."
@@ -134,10 +138,26 @@ fn init_on<T>(
             ),
         }
     }
-    init(Vec::new())
+    init(Vec::new()).map(|model| (model, false))
 }
 
-fn load_builtin(builtin: &str, spec: &LocalModelSpec, device: Device) -> Result<TextEmbedding> {
+/// Load `spec` from fastembed's catalog or from `model_dir`, on `device`.
+fn load_model(
+    spec: &LocalModelSpec,
+    model_dir: Option<&Path>,
+    device: Device,
+) -> Result<(TextEmbedding, bool)> {
+    match spec.builtin {
+        Some(builtin) => load_builtin(builtin, spec, device),
+        None => load_user_defined(spec, model_dir, device),
+    }
+}
+
+fn load_builtin(
+    builtin: &str,
+    spec: &LocalModelSpec,
+    device: Device,
+) -> Result<(TextEmbedding, bool)> {
     let model = builtin_model(builtin)?;
     let mut opts = InitOptions::new(model).with_show_download_progress(false);
     // Without this fastembed caches relative to the working directory, so the
@@ -171,7 +191,7 @@ fn load_user_defined(
     spec: &LocalModelSpec,
     model_dir: Option<&Path>,
     device: Device,
-) -> Result<TextEmbedding> {
+) -> Result<(TextEmbedding, bool)> {
     let dir = model_dir.ok_or_else(|| {
         EmbedError::MissingConfig(format!(
             "model_dir (DEVCTX_MODEL_DIR) for user-defined model '{}' ({})",
