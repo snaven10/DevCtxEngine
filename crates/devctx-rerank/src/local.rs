@@ -13,6 +13,7 @@
 use std::path::Path;
 
 use devctx_core::config::Device;
+use devctx_core::CudaFallback;
 use fastembed::{
     ExecutionProviderDispatch, RerankInitOptions, RerankInitOptionsUserDefined, RerankerModel,
     TextRerank, TokenizerFiles, UserDefinedRerankingModel,
@@ -97,17 +98,18 @@ fn cuda_providers() -> Option<Vec<ExecutionProviderDispatch>> {
 }
 
 /// Run `init` with the execution providers for `device`, falling back to CPU
-/// (with a warning) when CUDA was asked for but is unavailable.
+/// (with a warning) when CUDA was asked for but is unavailable. The flag says
+/// whether the result is actually on CUDA.
 fn init_on<T>(
     device: Device,
     mut init: impl FnMut(Vec<ExecutionProviderDispatch>) -> Result<T>,
-) -> Result<T> {
+) -> Result<(T, bool)> {
     if device == Device::Cuda {
         match cuda_providers() {
             Some(providers) => {
                 eprintln!("devctx: reranking requested CUDA (device: cuda)");
                 match init(providers) {
-                    Ok(model) => return Ok(model),
+                    Ok(model) => return Ok((model, true)),
                     Err(e) => eprintln!(
                         "devctx: warning: CUDA failed for reranking ({e}); falling back to CPU. \
                          Check the NVIDIA driver, CUDA 12 toolkit and cuDNN 9."
@@ -120,7 +122,7 @@ fn init_on<T>(
             ),
         }
     }
-    init(Vec::new())
+    init(Vec::new()).map(|model| (model, false))
 }
 
 /// A fastembed cross-encoder reranker.
@@ -142,7 +144,8 @@ const DEFAULT_POOL: usize = 100;
 const BATCH: usize = 16;
 
 pub struct LocalReranker {
-    model: TextRerank,
+    /// Falls back to a CPU rebuild if inference fails while on CUDA.
+    model: CudaFallback<TextRerank, RerankError>,
     name: String,
     pool: usize,
 }
@@ -156,57 +159,60 @@ impl LocalReranker {
 
     /// Load the reranker named by `key` (downloads/caches on first use).
     pub fn load(key: &str, model_dir: Option<&Path>, device: Device) -> Result<Self> {
-        // A directory wins over the key: it is the only way to run a
-        // cross-encoder fastembed does not ship, which is the whole point of it.
-        if let Some(dir) = model_dir {
-            return Self::load_user_defined(key, dir, device);
-        }
-        if key == CUSTOM_MODEL {
-            return Err(RerankError::MissingConfig(
-                "reranking.model is `custom` but reranking.model_dir is empty".to_string(),
-            ));
-        }
-
-        let model = model_for(key)?;
-        let mut opts = RerankInitOptions::new(model).with_show_download_progress(false);
-        // Shared with the embedding models: see `devctx_core::dirs`.
-        if let Some(cache) = devctx_core::dirs::model_cache_dir() {
-            opts = opts.with_cache_dir(cache);
-        }
-        let text_rerank = init_on(device, |eps| {
-            TextRerank::try_new(opts.clone().with_execution_providers(eps))
-                .map_err(|e| RerankError::Backend(e.to_string()))
-        })?;
+        let (text_rerank, on_cuda) = build(key, model_dir, device)?;
+        let (rebuild_key, rebuild_dir) = (key.to_string(), model_dir.map(Path::to_path_buf));
+        let model = CudaFallback::new("reranking", text_rerank, on_cuda, move || {
+            build(&rebuild_key, rebuild_dir.as_deref(), Device::Cpu).map(|(m, _)| m)
+        });
         Ok(Self {
-            model: text_rerank,
+            model,
             name: key.to_string(),
             pool: DEFAULT_POOL,
         })
     }
+}
 
-    /// Load a cross-encoder from a directory of ONNX + tokenizer files.
-    fn load_user_defined(key: &str, dir: &Path, device: Device) -> Result<Self> {
-        let onnx_path = find_onnx(dir).ok_or_else(|| {
-            RerankError::MissingConfig(format!("no .onnx file in {}", dir.display()))
-        })?;
-        let onnx = std::fs::read(&onnx_path)
-            .map_err(|e| RerankError::Backend(format!("reading {}: {e}", onnx_path.display())))?;
-
-        let udm = UserDefinedRerankingModel::new(onnx, read_tokenizer_files(dir)?);
-        let text_rerank = init_on(device, |eps| {
-            // No builder for execution providers on this options type, and it is
-            // `#[non_exhaustive]` — so set the public field after `default()`.
-            let mut opts = RerankInitOptionsUserDefined::default();
-            opts.execution_providers = eps;
-            TextRerank::try_new_from_user_defined(udm.clone(), opts)
-                .map_err(|e| RerankError::Backend(e.to_string()))
-        })?;
-        Ok(Self {
-            model: text_rerank,
-            name: key.to_string(),
-            pool: DEFAULT_POOL,
-        })
+/// Build the model for `key`, or from `model_dir` when given, on `device`.
+fn build(key: &str, model_dir: Option<&Path>, device: Device) -> Result<(TextRerank, bool)> {
+    // A directory wins over the key: it is the only way to run a
+    // cross-encoder fastembed does not ship, which is the whole point of it.
+    if let Some(dir) = model_dir {
+        return build_user_defined(dir, device);
     }
+    if key == CUSTOM_MODEL {
+        return Err(RerankError::MissingConfig(
+            "reranking.model is `custom` but reranking.model_dir is empty".to_string(),
+        ));
+    }
+
+    let model = model_for(key)?;
+    let mut opts = RerankInitOptions::new(model).with_show_download_progress(false);
+    // Shared with the embedding models: see `devctx_core::dirs`.
+    if let Some(cache) = devctx_core::dirs::model_cache_dir() {
+        opts = opts.with_cache_dir(cache);
+    }
+    init_on(device, |eps| {
+        TextRerank::try_new(opts.clone().with_execution_providers(eps))
+            .map_err(|e| RerankError::Backend(e.to_string()))
+    })
+}
+
+/// Build a cross-encoder from a directory of ONNX + tokenizer files.
+fn build_user_defined(dir: &Path, device: Device) -> Result<(TextRerank, bool)> {
+    let onnx_path = find_onnx(dir)
+        .ok_or_else(|| RerankError::MissingConfig(format!("no .onnx file in {}", dir.display())))?;
+    let onnx = std::fs::read(&onnx_path)
+        .map_err(|e| RerankError::Backend(format!("reading {}: {e}", onnx_path.display())))?;
+
+    let udm = UserDefinedRerankingModel::new(onnx, read_tokenizer_files(dir)?);
+    init_on(device, |eps| {
+        // No builder for execution providers on this options type, and it is
+        // `#[non_exhaustive]` — so set the public field after `default()`.
+        let mut opts = RerankInitOptionsUserDefined::default();
+        opts.execution_providers = eps;
+        TextRerank::try_new_from_user_defined(udm.clone(), opts)
+            .map_err(|e| RerankError::Backend(e.to_string()))
+    })
 }
 
 impl Reranker for LocalReranker {
@@ -215,10 +221,10 @@ impl Reranker for LocalReranker {
             return Ok(Vec::new());
         }
         let docs: Vec<&str> = candidates.iter().map(String::as_str).collect();
-        let mut results = self
-            .model
-            .rerank(query, docs, false, Some(BATCH))
-            .map_err(|e| RerankError::Backend(e.to_string()))?;
+        let mut results = self.model.run(|m| {
+            m.rerank(query, docs.clone(), false, Some(BATCH))
+                .map_err(|e| RerankError::Backend(e.to_string()))
+        })?;
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)

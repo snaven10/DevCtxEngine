@@ -137,7 +137,13 @@ CUDA 12.8 or newer.
 
 Nothing fails silently. If `device: cuda` is set on a binary built without
 `--features gpu`, or CUDA cannot be initialised (missing driver, toolkit or
-cuDNN), devctx prints a warning to stderr and runs on CPU.
+cuDNN), devctx prints a warning to stderr and runs on CPU. The same goes for
+a failure at first inference rather than at load: the model is rebuilt on CPU,
+the call is retried, and the rest of the process stays on CPU.
+
+The ONNX Runtime bundled by `ort` 2.0.0-rc.9 (ORT 1.20) has no kernels for
+Blackwell GPUs (sm_120: RTX 50xx, RTX PRO Blackwell). There CUDA registers fine
+but the first inference fails, so devctx falls back to CPU.
 
 One caveat: the default Granite ONNX is int8-quantized, and CUDA has no kernels
 for some quantized operators, so those run on CPU and most of the benefit is

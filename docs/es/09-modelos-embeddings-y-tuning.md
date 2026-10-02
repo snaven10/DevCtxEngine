@@ -140,7 +140,13 @@ superior.
 
 Nada falla en silencio. Si ponés `device: cuda` en un binario compilado sin
 `--features gpu`, o CUDA no se puede inicializar (falta el driver, el toolkit o
-cuDNN), devctx imprime una advertencia por stderr y corre en CPU.
+cuDNN), devctx imprime una advertencia por stderr y corre en CPU. Lo mismo si
+la falla ocurre en la primera inferencia y no al cargar: el modelo se reconstruye
+en CPU, se reintenta la llamada y el resto del proceso sigue en CPU.
+
+El ONNX Runtime que trae `ort` 2.0.0-rc.9 (ORT 1.20) no tiene kernels para las
+GPU Blackwell (sm_120: RTX 50xx, RTX PRO Blackwell). Ahí CUDA se registra bien
+pero la primera inferencia falla, así que devctx cae a CPU.
 
 Una salvedad: el ONNX de Granite por defecto está cuantizado a int8, y CUDA no
 tiene kernels para algunos operadores cuantizados, así que esos corren en CPU y
