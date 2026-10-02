@@ -148,18 +148,89 @@ mínimo:
 - **Estado:** `pending`
 ```
 
-`Estado` toma uno de cuatro valores: `pending`, `in_progress`, `done`,
-`blocked`. `Depende de` lista ids `TASK-NNN` (un `—`, `Ninguna` o `N/A` a
-secas significa ninguna — aunque el texto después mencione otra task, p. ej.
-`— (paralela a TASK-001)`). Lo que el parser no pueda ubicar se vuelve un
-warning, nunca una adivinanza.
+`Estado` toma uno de cinco valores, escritos como prefieras; el parser
+acepta además estos sinónimos (mayúsculas o minúsculas, sin importar
+acentos, en inglés o español):
+
+| Estado | Palabras reconocidas |
+|---|---|
+| `pending` | `pending`, `pendiente`, `todo` |
+| `in_progress` | `in_progress`, `in-progress`, `en progreso`, `en curso`, `in progress`, `wip` |
+| `done` | `done`, `completed`, `hecho`/`hecha`, `terminada`, `cerrada`, `implemented`, `ejecutada`, `merged`, o un `✅` a secas |
+| `blocked` | `blocked`, `bloqueada`/`bloqueado` |
+| `skipped` | `skipped`, `omitida`, `descartada`, `cancelled`/`cancelada`, `superseded` |
+
+`skipped` es para una task descartada a propósito: resuelve a las tasks que
+dependen de ella (como `done`) pero se cuenta aparte — el CLI muestra
+`done/total (+N skipped)` — porque no se hizo. El valor puede traer emoji,
+negritas y prosa al final (`✅ **`done`** — ejecutada en la rama`): gana un
+span entre backticks que sea exactamente una palabra clave; si no, la primera
+palabra clave del texto. Un valor sin palabra clave queda desconocido y
+genera un warning; el parser nunca adivina. `` `pending` `` entre backticks
+sigue siendo la forma recomendada.
+
+Dónde se busca el estado, en orden:
+
+1. un campo del encabezado — `Estado`, `Status` o `State`, en cualquiera de
+   `- **Estado:** x`, `**Estado**: x`, `**Estado: x**` o `Estado: x` plano;
+   varios campos pueden compartir línea separados por ` · ` (`**Plan:**
+   PLAN-005 · **Estado:** pending · **Depende de:** —`);
+2. front matter YAML (`---` … `---` al tope del archivo) con `estado:`,
+   `status:` o `state:`;
+3. una sección `## Estado` (o `## Status`): su primera línea no vacía.
+
+El nombre tiene que coincidir exacto, así que `Estado final` o `Estado
+objetivo` no son el estado.
+
+`Depende de` (también `Depends on`, `Dependencias`, `Dependencies`,
+`Bloqueada por`, `Blocked by`; en el encabezado o el front matter) solo cuenta
+tokens `TASK-<id>`: la prosa alrededor se ignora, y se expanden rangos
+(`TASK-001..004`) y listas (`TASK-033/034`). Un `—`, `Ninguna`, `None`, `N/A`
+o `[]` al inicio significa ninguna, aunque el texto después mencione una task
+(`— (paralela a TASK-001)`). Una referencia a una task de otro plan
+(`PLAN-120/TASK-031`) se guarda como dependencia externa: se reporta pero
+nunca bloquea. Como los ids se sacan del texto, un id de task mencionado en
+una frase de este campo sí se vuelve arista — dejá en el campo solo las
+dependencias.
+
+Los ids conservan un sufijo o prefijo de letra tal cual: `TASK-001b` no es
+`TASK-001`, y `TASK-R01` es su propia task. Dos archivos con el mismo id (un
+compañero `TASK-001-DESIGN.md` junto a `TASK-001-verify.md`) generan un
+warning y solo el primero, en orden alfabético, es la task. Lo demás que el
+parser no pueda ubicar se vuelve un warning, nunca una adivinanza.
 
 La tabla de progreso propia de un plan (en el `.md` del plan, no en el archivo
 de la task) solo se lee para chequear que coincide con los archivos de las
-tasks. **El archivo de la task siempre gana** — si la tabla de un plan dice
+tasks, y solo cuenta una tabla con columna `Estado`/`Status` (una tabla de
+rollback con ids en la primera columna se ignora). El documento del plan es el
+archivo con prefijo `PLAN-`, prefiriendo `<nombre-del-dir>.md`. **El archivo de
+la task siempre gana** — si la tabla de un plan dice
 `done` y el archivo de la task dice `pending`, la task se reporta `pending`,
 más un warning nombrando la discrepancia. Nunca edites un archivo de task para
 que un warning desaparezca sin antes verificar cuál de los dos es correcto.
+
+### De dónde se lee `plans/`
+
+La salida de `plan_status` trae `plans_root: {path, source}`. La raíz se
+resuelve en este orden:
+
+1. **workspace** — la raíz del workspace (donde arrancó un descenso de grupo
+   del MCP, o el directorio desde el que lanzaste si no es ningún proyecto),
+   si tiene `plans/`;
+2. **project** — la raíz propia del proyecto, si tiene `plans/`;
+3. **ancestor** — solo cuando el proyecto declara `group:`: el ancestro más
+   cercano con `plans/PLAN-*`, deteniéndose por debajo de `$HOME`;
+4. si no, `source` es `none` y la lista de planes queda vacía.
+
+El caso de uso: un producto cuyos repositorios son proyectos devctx separados
+bajo un directorio que no es proyecto, con los planes en
+`<workspace>/plans/` — pertenecen al producto, no a un repo. Con ese layout el
+MCP en modo grupo (o sin vincular) lee `<workspace>/plans`; `devctx web`
+lanzado desde la raíz del workspace funciona sin `.devctx/` ahí (el mismo
+descenso de grupo que `devctx mcp`); y el CLI desde dentro de un repo miembro
+que declara `group:` encuentra el `plans/` del workspace como ancestro. Un
+daemon en marcha sigue sirviendo la raíz que resolvió al arrancar: tras el
+cambio, corré `devctx serve --stop`.
 
 ## Cuando el índice está viejo
 

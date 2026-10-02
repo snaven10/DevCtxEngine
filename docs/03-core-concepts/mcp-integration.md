@@ -137,7 +137,12 @@ Angular.
 | `plan_status` | Progress on the plans under `plans/` (markdown, source of truth): no argument lists every plan and names the active one; with `plan`, that plan's ready/in-progress/blocked tasks |
 
 Plans live as hand-written markdown in git, never copied into the store:
-`plan_status` reads `plans/PLAN-*/` on every call. A plan's own progress table
+`plan_status` reads `plans/PLAN-*/` on every call — from the project, or from
+the workspace root when the repositories of a product live under a directory
+that holds the shared `plans/` (the result's `plans_root` says which, and why;
+the order is in [the agent workflow](../04-agent-workflow.md#where-plans-is-read-from)).
+The task format is tolerant — `Status:`/`Estado:`, synonyms, a `skipped`
+state — and is documented there too. A plan's own progress table
 and its task files can disagree (both are written by hand) — when they do, the
 task file wins and the disagreement is reported as a warning, never silently
 picked one way. Call it right after a compaction to recover which task is

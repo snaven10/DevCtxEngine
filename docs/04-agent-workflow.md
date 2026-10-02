@@ -148,17 +148,84 @@ header block (between the H1 and the first `## ` section) needs at minimum:
 - **Estado:** `pending`
 ```
 
-`Estado` takes one of four values: `pending`, `in_progress`, `done`,
-`blocked`. `Depende de` lists `TASK-NNN` ids (a bare `—`, `Ninguna`, or `N/A`
-means none — even if the text after it happens to mention another task, e.g.
-`— (parallel to TASK-001)`). Anything the parser cannot place becomes a
-warning, never a guess.
+`Estado` takes one of five values, written the way you like; the parser
+also accepts these synonyms (any case, accents ignored, English or Spanish):
+
+| Status | Recognized words |
+|---|---|
+| `pending` | `pending`, `pendiente`, `todo` |
+| `in_progress` | `in_progress`, `in-progress`, `en progreso`, `en curso`, `in progress`, `wip` |
+| `done` | `done`, `completed`, `hecho`/`hecha`, `terminada`, `cerrada`, `implemented`, `ejecutada`, `merged`, or a bare `✅` |
+| `blocked` | `blocked`, `bloqueada`/`bloqueado` |
+| `skipped` | `skipped`, `omitida`, `descartada`, `cancelled`/`cancelada`, `superseded` |
+
+`skipped` is for a task dropped on purpose: it resolves the tasks that depend
+on it (like `done`) but is counted apart — the CLI shows `done/total (+N
+skipped)` — because it was not done. The value may carry emoji, bold and
+trailing prose (`✅ **`done`** — ran on the branch`): a backtick span that is
+exactly a keyword wins, otherwise the first keyword in the text. A value with
+no keyword stays unknown and produces a warning; the parser never guesses.
+`` `pending` `` in backticks stays the recommended form.
+
+Where the status is looked for, in order:
+
+1. a header field — `Estado`, `Status` or `State`, in any of `- **Estado:** x`,
+   `**Estado**: x`, `**Estado: x**` or plain `Estado: x`; several fields may
+   share a line separated by ` · ` (`**Plan:** PLAN-005 · **Estado:** pending
+   · **Depende de:** —`);
+2. YAML front matter (`---` … `---` at the top of the file) with `estado:`,
+   `status:` or `state:`;
+3. a `## Estado` (or `## Status`) section: its first non-empty line.
+
+The name must match exactly, so `Estado final` or `Estado objetivo` are not
+the status.
+
+`Depende de` (also `Depends on`, `Dependencias`, `Dependencies`, `Bloqueada
+por`, `Blocked by`; header or front matter) only counts `TASK-<id>` tokens:
+the prose around them is ignored, and ranges (`TASK-001..004`) and lists
+(`TASK-033/034`) are expanded. A leading `—`, `Ninguna`, `None`, `N/A` or `[]`
+means none, even if the text after it mentions a task (`— (parallel to
+TASK-001)`). A reference to another plan's task (`PLAN-120/TASK-031`) is kept
+as an external dependency, reported but never blocking. Because ids are
+picked out of the text, a task id mentioned in a sentence in this field does
+become an edge — keep the field to the dependencies themselves.
+
+Ids keep a letter suffix or prefix as written: `TASK-001b` is not `TASK-001`,
+and `TASK-R01` is its own task. Two files with the same id (a companion
+`TASK-001-DESIGN.md` next to `TASK-001-verify.md`) produce a warning and only
+the first, in sorted order, is the task. Anything else the parser cannot place
+becomes a warning, never a guess.
 
 A plan's own progress table (in the plan's `.md`, not the task file) is read
-only to check it agrees with the task files. **The task file always wins** —
+only to check it agrees with the task files, and only a table with an
+`Estado`/`Status` column counts (a rollback table with ids in the first column
+is ignored). The plan doc itself is the `PLAN-`-prefixed file, preferring
+`<dir-name>.md`. **The task file always wins** —
 if a plan's table says `done` and the task file says `pending`, the task is
 reported `pending`, plus a warning naming the disagreement. Never edit a task
 file to make a warning go away without checking which one is actually true.
+
+### Where `plans/` is read from
+
+The output of `plan_status` carries `plans_root: {path, source}`. The root is
+resolved in this order:
+
+1. **workspace** — the workspace root (where an MCP group descent started, or
+   the directory you launched from when it is no project), if it has `plans/`;
+2. **project** — the project's own root, if it has `plans/`;
+3. **ancestor** — only when the project declares `group:`: the nearest
+   ancestor directory with `plans/PLAN-*`, stopping below `$HOME`;
+4. otherwise `source` is `none` and the plan list is empty.
+
+The use case: a product whose repositories are separate devctx projects under
+a directory that is not itself a project, with the plans kept in
+`<workspace>/plans/` — they belong to the product, not to any one repo. In
+that layout the MCP in group mode (or unbound) reads `<workspace>/plans`;
+`devctx web` run from the workspace root works without a `.devctx/` there
+(same group descent as `devctx mcp`); and the CLI from inside a member repo
+that declares `group:` finds the workspace `plans/` as the ancestor. A running
+daemon keeps serving the root it resolved at start: after changing this, run
+`devctx serve --stop`.
 
 ## When the index is stale
 
