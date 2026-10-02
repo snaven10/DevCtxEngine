@@ -525,6 +525,23 @@ impl DevctxServer {
         }
     }
 
+    /// The plans root to answer `plan_status` from in this process, when the binding is a
+    /// group or nothing and the working directory holds the plans. `None` means "ask the
+    /// bound project": a single project, or a cwd without `plans/` (a group member's own
+    /// resolution, or the unbound error, then apply).
+    fn workspace_plans_root(&self) -> Option<devctx_core::plans::PlansRoot> {
+        if matches!(self.binding(), Binding::Project(_)) {
+            return None;
+        }
+        let root = devctx_core::plans::resolve_plans_root(
+            None,
+            Some(&self.cwd),
+            false,
+            state::home_dir().as_deref(),
+        );
+        (root.source == devctx_core::plans::PlansRootSource::Workspace).then_some(root)
+    }
+
     /// Add one field to a JSON object result, leaving other shapes untouched.
     fn note(out: String, key: &str, value: serde_json::Value) -> String {
         match serde_json::from_str::<serde_json::Value>(&out) {
@@ -940,6 +957,17 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<PlanStatusReq>,
     ) -> Result<String, ErrorData> {
+        // Plans are markdown, not store data, so in a group (or with nothing bound) the answer
+        // is computed here from the workspace root, not by a member's daemon: that daemon may be
+        // an older build still reading its own root (PLAN-007 DD-4). A `project` hint is
+        // specific and goes to that project as before.
+        if req.project.is_none() {
+            if let Some(root) = self.workspace_plans_root() {
+                let plan = req.plan.clone();
+                return run_blocking(move || state::plan_status_budgeted(&root, plan.as_deref()))
+                    .await;
+            }
+        }
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
         run_blocking(move || backend.plan_status(req.plan.as_deref()))
             .await

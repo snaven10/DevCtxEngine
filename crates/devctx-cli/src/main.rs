@@ -1316,11 +1316,33 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
 
 /// `devctx web` — serve the web dashboard (call-graph + memories) locally.
 fn cmd_web(addr: String, no_open: bool) -> Result<()> {
-    let cfg = load_project()?;
+    let (cfg, workspace) = match load_project() {
+        Ok(cfg) => (cfg, None),
+        // Not inside a project: a workspace root is still servable through one of its members.
+        Err(e) => {
+            let (cfg, note) = resolve_workspace_project(&e)?;
+            (cfg, Some(note))
+        }
+    };
+    if let Some(note) = &workspace {
+        let plans = devctx_core::plans::resolve_plans_root(
+            project_root(&cfg).ok().as_deref(),
+            None,
+            !cfg.project.group.trim().is_empty(),
+            devctx_mcp::state::home_dir().as_deref(),
+        );
+        println!("{}", note.banner(&plans.root));
+    }
     // A running server (incl. an auto-spawned one) already serves the dashboard
     // and owns the DB — reuse it instead of trying to bind a second owner.
     if let Some(url) = remote::running_server_url(&cfg) {
         println!("Reusing the running server → {url}");
+        if workspace.is_some() {
+            println!(
+                "The plans root is decided by that process; if it predates this version it still \
+                 shows the member's own plans/ — `devctx serve --stop` and run `devctx web` again."
+            );
+        }
         if !no_open {
             open_browser(&url);
         }
@@ -1342,6 +1364,86 @@ fn cmd_web(addr: String, no_open: bool) -> Result<()> {
     let result = devctx_api::run_blocking(cfg.clone(), socket, None, None);
     remote::remove_own_serve_file(&cfg);
     result
+}
+
+/// How a project was found from a directory that is not inside one.
+struct WorkspaceNote {
+    cwd: PathBuf,
+    /// The group the descent bound, `None` when a single project sits under `cwd`.
+    group: Option<String>,
+    /// The member that is served.
+    project: String,
+}
+
+impl WorkspaceNote {
+    fn banner(&self, plans_root: &std::path::Path) -> String {
+        match &self.group {
+            Some(group) => format!(
+                "Workspace {} (group {group}): plans from {}, code and memories from {}",
+                self.cwd.display(),
+                plans_root.display(),
+                self.project
+            ),
+            None => format!(
+                "Workspace {}: serving {}, the only DevCtxEngine project under it (plans from {})",
+                self.cwd.display(),
+                self.project,
+                plans_root.display()
+            ),
+        }
+    }
+}
+
+/// The member of a group that stands for it: the most recently indexed one, on the reasoning
+/// that it is the repository actually being worked on. Shared by `devctx mcp` and `devctx web`.
+fn default_member(members: &[devctx_mcp::state::ProjectRow]) -> &devctx_mcp::state::ProjectRow {
+    members
+        .iter()
+        .max_by_key(|m| m.last_indexed_at)
+        .expect("a group has members")
+}
+
+/// The config of a registered project, with the path in the error.
+fn load_member_config(row: &devctx_mcp::state::ProjectRow) -> Result<ProjectConfig> {
+    ProjectConfig::load(&row.path.join(devctx_core::CONFIG_FILE_NAME))
+        .with_context(|| format!("loading project at {}", row.path.display()))
+}
+
+/// `devctx web` outside any project: the same descent `devctx mcp` does over the registry.
+/// One project under the cwd, or a group of them (served through its default member), works;
+/// anything else fails with the reason, appended to why the walk upwards found nothing.
+fn resolve_workspace_project(not_found: &anyhow::Error) -> Result<(ProjectConfig, WorkspaceNote)> {
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    match devctx_mcp::state::resolve_under(&cwd) {
+        devctx_mcp::state::Resolution::Single(row) => {
+            let cfg = load_member_config(&row)?;
+            Ok((
+                cfg,
+                WorkspaceNote {
+                    cwd,
+                    group: None,
+                    project: row.name,
+                },
+            ))
+        }
+        devctx_mcp::state::Resolution::Group { name, members } => {
+            let default = default_member(&members);
+            let cfg = load_member_config(default)?;
+            let project = default.name.clone();
+            Ok((
+                cfg,
+                WorkspaceNote {
+                    cwd,
+                    group: Some(name),
+                    project,
+                },
+            ))
+        }
+        other => bail!(
+            "{not_found}\n{}",
+            devctx_mcp::state::why_unbound(&cwd, &other)
+        ),
+    }
 }
 
 /// Best-effort open of a URL in the platform browser.
@@ -1404,8 +1506,7 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
             let cwd = std::env::current_dir().unwrap_or_default();
             match devctx_mcp::state::resolve_under(&cwd) {
                 devctx_mcp::state::Resolution::Single(row) => {
-                    let cfg = ProjectConfig::load(&row.path.join(devctx_core::CONFIG_FILE_NAME))
-                        .with_context(|| format!("loading project at {}", row.path.display()))?;
+                    let cfg = load_member_config(&row)?;
                     eprintln!(
                         "Bound to project {} — the only DevCtxEngine project under {}",
                         row.name,
@@ -1416,15 +1517,8 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
                 devctx_mcp::state::Resolution::Group { name, members } => {
                     // Open only the default member here. The others are opened
                     // lazily, when a call actually points at one.
-                    let default = members
-                        .iter()
-                        .max_by_key(|m| m.last_indexed_at)
-                        .expect("a group has members");
-                    let cfg =
-                        ProjectConfig::load(&default.path.join(devctx_core::CONFIG_FILE_NAME))
-                            .with_context(|| {
-                                format!("loading project at {}", default.path.display())
-                            })?;
+                    let default = default_member(&members);
+                    let cfg = load_member_config(default)?;
                     eprintln!(
                         "Bound to group {} ({} projects, default {}) — resolved from {}",
                         name,
@@ -2007,16 +2101,30 @@ fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     Ok(())
 }
 
-/// Root to read `plans/` from: the project's configured root when this cwd is inside a
-/// DevCtxEngine project, else the cwd itself — plans exist in git whether or not the repo is
-/// indexed, and the hook that calls this needs an answer even in a fresh clone.
-fn plan_status_root() -> Result<PathBuf> {
+/// Root to read `plans/` from (PLAN-007 DD-2): inside a DevCtxEngine project, its own root — or,
+/// when it declares `group:` and has no `plans/` of its own, the workspace above it that does —
+/// else the cwd itself. Plans exist in git whether or not the repo is indexed, and the hook that
+/// calls this needs an answer even in a fresh clone.
+fn plan_status_root() -> Result<devctx_core::plans::PlansRoot> {
     let cwd = std::env::current_dir().context("resolving current directory")?;
+    let home = devctx_mcp::state::home_dir();
     if let Some(cfg_path) = find_config_file(&cwd) {
         let cfg = ProjectConfig::load(&cfg_path)?;
-        return project_root(&cfg);
+        let root = project_root(&cfg)?;
+        let group_declared = !cfg.project.group.trim().is_empty();
+        return Ok(devctx_core::plans::resolve_plans_root(
+            Some(&root),
+            None,
+            group_declared,
+            home.as_deref(),
+        ));
     }
-    Ok(cwd)
+    Ok(devctx_core::plans::resolve_plans_root(
+        None,
+        Some(&cwd),
+        false,
+        home.as_deref(),
+    ))
 }
 
 /// `devctx plan-status [PLAN] [--format json]`: reads `plans/` straight off disk — no store, no
@@ -2025,7 +2133,7 @@ fn plan_status_root() -> Result<PathBuf> {
 fn cmd_plan_status(plan: Option<String>, format: OutputFormat) -> Result<()> {
     let root = plan_status_root()?;
     let value =
-        devctx_mcp::state::plan_status_value(&root, plan.as_deref()).map_err(|e| anyhow!(e))?;
+        devctx_mcp::state::plan_status_value_in(&root, plan.as_deref()).map_err(|e| anyhow!(e))?;
 
     if matches!(format, OutputFormat::Json) {
         println!("{}", serde_json::to_string(&value)?);
@@ -2036,10 +2144,11 @@ fn cmd_plan_status(plan: Option<String>, format: OutputFormat) -> Result<()> {
         let title = truncate_chars(value["title"].as_str().unwrap_or(""), 60);
         let done = value["done"].as_u64().unwrap_or(0);
         let total = value["total"].as_u64().unwrap_or(0);
-        let list = devctx_mcp::state::plan_status_value(&root, None).map_err(|e| anyhow!(e))?;
+        let skipped = format_skipped(value["skipped"].as_u64().unwrap_or(0));
+        let list = devctx_mcp::state::plan_status_value_in(&root, None).map_err(|e| anyhow!(e))?;
         let active = list["active"].as_str() == Some(plan_id);
         let marker = if active { " (activo)" } else { "" };
-        println!("{plan_id} {title} — {done}/{total} done{marker}");
+        println!("{plan_id} {title} — {done}/{total} done{skipped}{marker}");
         print_plan_status_block(&value, "  ");
         return Ok(());
     }
@@ -2054,21 +2163,33 @@ fn cmd_plan_status(plan: Option<String>, format: OutputFormat) -> Result<()> {
         let id = p["id"].as_str().unwrap_or("");
         let done = p["done"].as_u64().unwrap_or(0);
         let total = p["total"].as_u64().unwrap_or(0);
+        let skipped = format_skipped(p["skipped"].as_u64().unwrap_or(0));
         let title = truncate_chars(p["title"].as_str().unwrap_or(""), 40);
         let marker = if active.as_deref() == Some(id) {
             " *"
         } else {
             ""
         };
-        println!("{id}  {done}/{total}  {title}{marker}");
+        println!("{id}  {done}/{total}{skipped}  {title}{marker}");
     }
     if let Some(active_id) = active {
-        let detail = devctx_mcp::state::plan_status_value(&root, Some(&active_id))
+        let detail = devctx_mcp::state::plan_status_value_in(&root, Some(&active_id))
             .map_err(|e| anyhow!(e))?;
         println!();
         print_plan_status_block(&detail, "  ");
     }
     Ok(())
+}
+
+/// ` (+N skipped)` for the progress columns, empty when nothing was skipped: a plan whose
+/// remaining tasks were dropped on purpose must not read as unfinished. `done` stays the
+/// JSON's `done`, so the numbers still match `--format json`.
+fn format_skipped(skipped: u64) -> String {
+    if skipped == 0 {
+        String::new()
+    } else {
+        format!(" (+{skipped} skipped)")
+    }
 }
 
 /// Renders the `listas` / `en curso` / `bloqueadas` / warning lines of a plan-status detail JSON.
