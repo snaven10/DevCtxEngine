@@ -158,7 +158,7 @@ acentos, en inglés o español):
 | `in_progress` | `in_progress`, `in-progress`, `en progreso`, `en curso`, `in progress`, `wip` |
 | `done` | `done`, `completed`, `hecho`/`hecha`, `terminada`, `cerrada`, `implemented`, `ejecutada`, `merged`, o un `✅` a secas |
 | `blocked` | `blocked`, `bloqueada`/`bloqueado` |
-| `skipped` | `skipped`, `omitida`, `descartada`, `cancelled`/`cancelada`, `superseded` |
+| `skipped` | `skipped`, `omitida`, `descartada`, `cancelled`/`cancelada`, `superseded`, `postponed`/`pospuesta` |
 
 `skipped` es para una task descartada a propósito: resuelve a las tasks que
 dependen de ella (como `done`) pero se cuenta aparte — el CLI muestra
