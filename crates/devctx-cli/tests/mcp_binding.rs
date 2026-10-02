@@ -337,6 +337,29 @@ fn call_tool(
     call_tool_with_user_home(home, cwd, None, tool, arguments)
 }
 
+/// Give a pinned `HOME` the real one's DuckDB extension cache.
+///
+/// Every store opens with `INSTALL vss; INSTALL fts;`, and DuckDB keeps those
+/// extensions under `$HOME/.duckdb`. A test that pins `HOME` to a temp directory
+/// therefore made each of its processes — the central daemon and every project
+/// server — download ~40 MB before the store could open. Several such tests in
+/// parallel on an ordinary connection took longer than `ensure`'s budget, and
+/// the central daemon was reported as "could not be started" while it was still
+/// downloading. CI's network hid it. A link to the shared cache keeps the walk
+/// stopping at the pinned `HOME` without paying for the download.
+fn share_duckdb_extensions(user_home: &Path) {
+    let Some(real) = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".duckdb")) else {
+        return;
+    };
+    let link = user_home.join(".duckdb");
+    if link.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&real);
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(&real, &link);
+}
+
 /// [`call_tool`] with the process's `HOME` pinned (when given).
 ///
 /// The server decides where a group member finds the workspace's `plans/` by walking upwards and
@@ -360,6 +383,7 @@ fn call_tool_with_user_home(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if let Some(h) = user_home {
+        share_duckdb_extensions(h);
         cmd.env("HOME", h);
     }
     let mut child = cmd.spawn().expect("spawning the MCP server");
@@ -1009,6 +1033,7 @@ fn web_in_a_workspace_without_devctx_serves_the_workspace_plans() {
         "the workspace root must not be a project"
     );
 
+    share_duckdb_extensions(&tmp.0);
     let port = free_port();
     let log_path = tmp.0.join("web.log");
     let log = std::fs::File::create(&log_path).unwrap();
@@ -1077,6 +1102,7 @@ fn web_without_any_project_fails_with_the_unbound_explanation() {
     let bare = tmp.dir("bare");
     write_plans(&bare, &[("PLAN-001-alfa", "alfa")]);
 
+    share_duckdb_extensions(&tmp.0);
     let port = free_port();
     let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
         .env("DEVCTX_HOME", &home)
