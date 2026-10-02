@@ -141,7 +141,12 @@ Angular.
 | `plan_status` | Progreso de los planes en `plans/` (markdown, fuente de verdad): sin argumento lista todos los planes y nombra el activo; con `plan`, las tasks listas/en curso/bloqueadas de ese plan |
 
 Los planes viven como markdown escrito a mano en git, nunca se copian a la
-base: `plan_status` lee `plans/PLAN-*/` en cada llamada. La tabla de progreso
+base: `plan_status` lee `plans/PLAN-*/` en cada llamada — del proyecto, o de la raíz
+del workspace cuando los repositorios de un producto viven bajo un directorio
+que guarda el `plans/` compartido (el `plans_root` del resultado dice cuál y
+por qué; el orden está en [el flujo de trabajo del agente](../04-flujo-de-trabajo-del-agente.md#de-dónde-se-lee-plans)).
+El formato de las tasks es tolerante — `Status:`/`Estado:`, sinónimos, un
+estado `skipped` — y también está documentado ahí. La tabla de progreso
 de un plan y los archivos de sus tasks pueden discrepar (ambos se escriben a
 mano) — cuando pasa, el archivo de la task manda y la discrepancia se reporta
 como warning, nunca se elige en silencio. Llamala justo después de compactar

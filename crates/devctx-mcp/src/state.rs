@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use devctx_core::config::ProjectConfig;
-use devctx_core::plans::{self, Analysis, Plan};
+use devctx_core::plans::{self, Analysis, Plan, PlansRoot};
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::{run as index_run, GitRepo, IndexRequest, ProgressSink};
@@ -161,6 +161,9 @@ impl<T: Clone> Cached<T> {
 pub struct AppState {
     cfg: ProjectConfig,
     root: PathBuf,
+    /// Where `plans/` is read from (PLAN-007 DD-3): the project's own root, or the workspace
+    /// that holds the plans of a group member. Decided once, at construction.
+    plans_root: PlansRoot,
     /// The primary connection: opened once and kept for the server's lifetime so
     /// this process owns the DuckDB file (single writer). Request handlers get a
     /// cloned connection to the same in-process database via [`Store::try_clone`],
@@ -200,9 +203,16 @@ impl AppState {
         };
         let dim = configured_dimension(&cfg);
         let primary = Store::open(&cfg.db_path(), dim)?;
+        let plans_root = plans::resolve_plans_root(
+            Some(&root),
+            None,
+            !cfg.project.group.trim().is_empty(),
+            home_dir().as_deref(),
+        );
         Ok(Self {
             cfg,
             root,
+            plans_root,
             primary: Arc::new(Mutex::new(primary)),
             embed_settings,
             rerank_settings,
@@ -211,6 +221,11 @@ impl AppState {
             reranker: Mutex::new(None),
             index_progress: Arc::new(Mutex::new(IndexProgress::default())),
         })
+    }
+
+    /// The directory `plan_status`, the plans graph and `memories_by_file` read `plans/` from.
+    pub fn plans_root(&self) -> &PlansRoot {
+        &self.plans_root
     }
 
     /// The embedding provider, built (and cached) on first use.
@@ -718,20 +733,50 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
 /// tasks with `plan`. Reads markdown from disk on every call — plans are the source of truth,
 /// never copied into the store (PLAN-005 §3).
 pub fn do_plan_status(state: &AppState, plan: Option<&str>) -> Result<String, String> {
-    let value = plan_status_value(&state.root, plan)?;
+    plan_status_budgeted(&state.plans_root, plan)
+}
+
+/// `plan_status_value_in` trimmed to `DEVCTX_MAX_OUTPUT_TOKENS`. The single path behind the
+/// daemon's `do_plan_status` and the MCP's in-process answer in group mode (PLAN-007 DD-4).
+pub fn plan_status_budgeted(root: &PlansRoot, plan: Option<&str>) -> Result<String, String> {
+    let value = plan_status_value_in(root, plan)?;
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     Ok(fit_plan_status_budget(value, budget))
+}
+
+/// The user's home directory, the upper bound of the plans-root ancestor walk.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The unbudgeted `plan_status` JSON, built straight from disk. Shared by `do_plan_status`
 /// (which trims it to `DEVCTX_MAX_OUTPUT_TOKENS`) and the CLI's `devctx plan-status`, which
 /// wants the same shape without going through `AppState` — no store, no daemon, just markdown.
 pub fn plan_status_value(root: &std::path::Path, plan: Option<&str>) -> Result<Value, String> {
-    let loaded = plans::load_plans(root);
-    match plan {
-        None => Ok(plan_status_list(&loaded)),
-        Some(query) => plan_status_detail(&loaded, query),
-    }
+    plan_status_value_in(
+        &PlansRoot {
+            root: root.to_path_buf(),
+            source: plans::PlansRootSource::Project,
+        },
+        plan,
+    )
+}
+
+/// Like [`plan_status_value`], for a root that was resolved: the JSON also says where the plans
+/// came from (`plans_root: {path, source}`), so nobody has to wonder which `plans/` was read.
+pub fn plan_status_value_in(root: &PlansRoot, plan: Option<&str>) -> Result<Value, String> {
+    let loaded = plans::load_plans(&root.root);
+    let mut value = match plan {
+        None => plan_status_list(&loaded),
+        Some(query) => plan_status_detail(&loaded, query)?,
+    };
+    value["plans_root"] = json!({
+        "path": root.root.to_string_lossy(),
+        "source": root.source.as_str(),
+    });
+    Ok(value)
 }
 
 /// The plan with the most recently modified `.md` file among plans that still have at least one
@@ -740,7 +785,7 @@ pub fn plan_status_value(root: &std::path::Path, plan: Option<&str>) -> Result<V
 fn active_plan_id(plans: &[Plan]) -> Option<String> {
     plans
         .iter()
-        .filter(|p| !p.tasks.is_empty() && p.tasks.iter().any(|t| !t.status.is_done()))
+        .filter(|p| !p.tasks.is_empty() && p.tasks.iter().any(|t| !t.status.is_resolved()))
         .max_by(|a, b| {
             let by_mtime = a.mtime.cmp(&b.mtime);
             if by_mtime != std::cmp::Ordering::Equal {
@@ -761,10 +806,16 @@ fn plan_status_list(plans: &[Plan]) -> Value {
         .iter()
         .map(|p| {
             let done = p.tasks.iter().filter(|t| t.status.is_done()).count();
+            let skipped = p
+                .tasks
+                .iter()
+                .filter(|t| matches!(t.status, plans::Status::Skipped))
+                .count();
             json!({
                 "id": p.id,
                 "title": p.title,
                 "done": done,
+                "skipped": skipped,
                 "total": p.tasks.len(),
                 "active": active.as_deref() == Some(p.id.as_str()),
                 "task_files": !p.tasks.is_empty(),
@@ -849,16 +900,33 @@ fn plan_status_detail(plans: &[Plan], query: &str) -> Result<Value, String> {
     }
 
     let done = plan.tasks.iter().filter(|t| t.status.is_done()).count();
-    Ok(json!({
+    let skipped = plan
+        .tasks
+        .iter()
+        .filter(|t| matches!(t.status, plans::Status::Skipped))
+        .count();
+    // Cross-plan dependencies are only reported: they never block and are never "missing".
+    let external_deps: Vec<Value> = plan
+        .tasks
+        .iter()
+        .filter(|t| !t.external_deps.is_empty())
+        .map(|t| json!({ "id": t.id, "deps": t.external_deps }))
+        .collect();
+    let mut detail = json!({
         "plan": plan.id,
         "title": plan.title,
         "done": done,
+        "skipped": skipped,
         "total": plan.tasks.len(),
         "ready": ready,
         "in_progress": in_progress,
         "blocked": blocked,
         "warnings": warnings,
-    }))
+    });
+    if !external_deps.is_empty() {
+        detail["external_deps"] = Value::Array(external_deps);
+    }
+    Ok(detail)
 }
 
 /// Fits the `plan_status` detail (or list) JSON into the output budget by dropping, in order,
@@ -903,7 +971,7 @@ fn fit_plan_status_budget(mut value: Value, budget_tokens: usize) -> String {
 /// as `do_plan_status`), falling back to the first plan by id when nothing is active (e.g. every
 /// plan is done) so the tab is never empty just because there is nothing left to do.
 pub fn do_plan_graph(state: &AppState, plan: Option<&str>) -> Result<String, String> {
-    plan_graph_value(&state.root, plan)
+    plan_graph_value(&state.plans_root.root, plan)
 }
 
 /// The unbudgeted `plan_status`-graph JSON, built straight from disk (see [`plan_status_value`]
@@ -956,6 +1024,8 @@ pub fn plan_graph_value(root: &std::path::Path, plan: Option<&str>) -> Result<St
     for t in &p.tasks {
         let status = if t.status.is_done() {
             "done"
+        } else if matches!(t.status, plans::Status::Skipped) {
+            "skipped"
         } else if in_progress_set.contains(t.id.as_str()) {
             "in_progress"
         } else if matches!(t.status, plans::Status::Blocked) {
@@ -972,6 +1042,7 @@ pub fn plan_graph_value(root: &std::path::Path, plan: Option<&str>) -> Result<St
                 "status": status,
                 "ready": ready_set.contains(t.id.as_str()),
                 "depends_on": t.depends_on,
+                "external_deps": t.external_deps,
                 "files": t.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
             }
         }));
@@ -3123,7 +3194,7 @@ pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result
     }
 
     let out = linked_response(&store, file, linked, file, limit)?;
-    let plan_tasks = plan_tasks_for_file(&state.root, file, resolved.as_deref());
+    let plan_tasks = plan_tasks_for_file(&state.plans_root.root, file, resolved.as_deref());
     Ok(with_plan_tasks_field(out, plan_tasks))
 }
 
@@ -3146,7 +3217,7 @@ fn plan_tasks_for_file(root: &std::path::Path, query: &str, resolved: Option<&st
         }
     }
     hits.sort_by(|a, b| {
-        let by_done = a.1.status.is_done().cmp(&b.1.status.is_done());
+        let by_done = a.1.status.is_resolved().cmp(&b.1.status.is_resolved());
         if by_done != std::cmp::Ordering::Equal {
             return by_done;
         }
@@ -3926,6 +3997,32 @@ mod tests {
         assert!(value["active"].is_null());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_status_of_a_group_member_reads_the_workspace_plans_and_says_so() {
+        let home =
+            std::env::temp_dir().join(format!("devctx_plan_status_ws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let ws = home.join("ws");
+        write_plan_fixture(&ws);
+        let member = ws.join("api");
+        std::fs::create_dir_all(&member).unwrap();
+
+        let resolved = plans::resolve_plans_root(Some(&member), None, true, Some(&home));
+        let value = plan_status_value_in(&resolved, None).expect("list should succeed");
+        assert_eq!(value["plans"].as_array().unwrap().len(), 2);
+        assert_eq!(value["plans_root"]["source"], "ancestor");
+        assert_eq!(value["plans_root"]["path"], ws.to_string_lossy().as_ref());
+
+        let detail = plan_status_value_in(&resolved, Some("PLAN-002")).unwrap();
+        assert_eq!(detail["plans_root"]["source"], "ancestor");
+
+        // The path-only wrapper keeps working and reports `project`.
+        let legacy = plan_status_value(&ws, None).unwrap();
+        assert_eq!(legacy["plans_root"]["source"], "project");
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // --- plan_graph (TASK-006) ---

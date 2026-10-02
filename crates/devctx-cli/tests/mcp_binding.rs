@@ -334,17 +334,35 @@ fn call_tool(
     tool: &str,
     arguments: serde_json::Value,
 ) -> serde_json::Value {
+    call_tool_with_user_home(home, cwd, None, tool, arguments)
+}
+
+/// [`call_tool`] with the process's `HOME` pinned (when given).
+///
+/// The server decides where a group member finds the workspace's `plans/` by walking upwards and
+/// stopping at `$HOME` (PLAN-007 DD-2), and the per-project daemon it auto-spawns inherits this
+/// environment. A test about that walk has to say where `HOME` is: the real one is not an
+/// ancestor of a temp directory.
+fn call_tool_with_user_home(
+    home: &Path,
+    cwd: &Path,
+    user_home: Option<&Path>,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
     use std::io::{BufRead, BufReader, Write};
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
-        .env("DEVCTX_HOME", home)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_devctx"));
+    cmd.env("DEVCTX_HOME", home)
         .current_dir(cwd)
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawning the MCP server");
+        .stderr(Stdio::null());
+    if let Some(h) = user_home {
+        cmd.env("HOME", h);
+    }
+    let mut child = cmd.spawn().expect("spawning the MCP server");
 
     let mut stdin = child.stdin.take().expect("stdin");
     let init = concat!(
@@ -731,5 +749,369 @@ fn unbound_remember_with_explicit_local_preserves_content_in_the_error() {
     assert!(
         err.contains("global"),
         "the error must point at `scope: global` as the way out, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PLAN-007 TASK-006 — plans kept at the workspace root.
+//
+// A workspace is a directory that holds several repositories and is itself none of them, so
+// there is no `.devctx/` in it and `devctx init` there would index the whole monorepo. Its
+// `plans/` still has to be reachable: from an MCP session started at the root, from a session
+// pinned to one member, and from `devctx web`. These drive the real binary, because the claim
+// is about which directory a process reads — the thing a unit test on the resolver cannot reach.
+//
+// `HOME` is pinned to the temp root wherever a member has to find the workspace above it: the
+// walk upwards stops at `$HOME`, and the real one is not an ancestor of a temp directory.
+// ---------------------------------------------------------------------------
+
+/// `plans/PLAN-N-<slug>/` with a plan doc and one pending task, for each `(dir, title)`.
+fn write_plans(root: &Path, plans: &[(&str, &str)]) {
+    for (dir, title) in plans {
+        let plan = root.join("plans").join(dir);
+        std::fs::create_dir_all(plan.join("tasks")).unwrap();
+        let id = dir.split('-').take(2).collect::<Vec<_>>().join("-");
+        std::fs::write(
+            plan.join(format!("{dir}.md")),
+            format!("# {id} — {title}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            plan.join("tasks/TASK-001-a.md"),
+            "# TASK-001 — a\n\n- **Depende de:** —\n- **Estado:** `pending`\n",
+        )
+        .unwrap();
+    }
+}
+
+fn plan_ids(value: &serde_json::Value) -> Vec<String> {
+    value["plans"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `plans` array in: {value}"))
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Whether `reported` (a path as the server printed it) is `expected`, ignoring symlinks.
+fn same_path(reported: &serde_json::Value, expected: &Path) -> bool {
+    let Some(reported) = reported.as_str() else {
+        return false;
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(Path::new(reported)) == canon(expected)
+}
+
+/// Bound to a group from the workspace root, with `plans/` right there: the plans are the
+/// workspace's and the answer says `workspace`. Neither member has `plans/`, and neither is asked.
+#[test]
+fn plan_status_in_a_group_reads_the_workspace_plans() {
+    let tmp = Tmp::new("plans_group");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    make_project(&home, &ws, "api", Some("ACME"));
+    make_project(&home, &ws, "web", Some("ACME"));
+    write_plans(&ws, &[("PLAN-001-alfa", "alfa"), ("PLAN-002-beta", "beta")]);
+
+    let out = call_tool_with_user_home(
+        &home,
+        &ws,
+        Some(&tmp.0),
+        "plan_status",
+        serde_json::json!({}),
+    );
+    assert_eq!(plan_ids(&out), ["PLAN-001", "PLAN-002"], "{out}");
+    assert_eq!(
+        out["plans_root"]["source"].as_str(),
+        Some("workspace"),
+        "{out}"
+    );
+    assert!(same_path(&out["plans_root"]["path"], &ws), "{out}");
+
+    // The detail form resolves against the same root.
+    let detail = call_tool_with_user_home(
+        &home,
+        &ws,
+        Some(&tmp.0),
+        "plan_status",
+        serde_json::json!({"plan": "PLAN-002"}),
+    );
+    assert_eq!(detail["plan"].as_str(), Some("PLAN-002"), "{detail}");
+    assert_eq!(
+        detail["plans_root"]["source"].as_str(),
+        Some("workspace"),
+        "{detail}"
+    );
+}
+
+/// A `project` hint is specific: it goes to that member's own daemon, which finds the plans one
+/// level up because its project declares `group:` — `ancestor`, not `workspace`.
+#[test]
+fn plan_status_with_a_project_hint_reads_the_workspace_as_an_ancestor() {
+    let tmp = Tmp::new("plans_hint");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    make_project(&home, &ws, "api", Some("ACME"));
+    make_project(&home, &ws, "web", Some("ACME"));
+    write_plans(&ws, &[("PLAN-001-alfa", "alfa"), ("PLAN-002-beta", "beta")]);
+
+    let out = call_tool_with_user_home(
+        &home,
+        &ws,
+        Some(&tmp.0),
+        "plan_status",
+        serde_json::json!({"project": "api"}),
+    );
+    assert_eq!(plan_ids(&out), ["PLAN-001", "PLAN-002"], "{out}");
+    assert_eq!(
+        out["plans_root"]["source"].as_str(),
+        Some("ancestor"),
+        "{out}"
+    );
+    assert!(same_path(&out["plans_root"]["path"], &ws), "{out}");
+    assert_eq!(
+        out["resolved_project"].as_str(),
+        Some("api"),
+        "the answer must name the member that gave it: {out}"
+    );
+}
+
+/// Started in a directory that holds `plans/` and no registered project: not an error. The plans
+/// are listed from the directory itself.
+#[test]
+fn plan_status_unbound_in_a_directory_with_plans_lists_them() {
+    let tmp = Tmp::new("plans_unbound");
+    let home = tmp.home();
+    let bare = tmp.dir("bare");
+    write_plans(&bare, &[("PLAN-001-alfa", "alfa")]);
+
+    let out = call_tool_with_user_home(
+        &home,
+        &bare,
+        Some(&tmp.0),
+        "plan_status",
+        serde_json::json!({}),
+    );
+    assert_eq!(plan_ids(&out), ["PLAN-001"], "{out}");
+    assert_eq!(
+        out["plans_root"]["source"].as_str(),
+        Some("workspace"),
+        "{out}"
+    );
+    assert!(same_path(&out["plans_root"]["path"], &bare), "{out}");
+}
+
+/// The other half of "not an error": with no `plans/` either, the unbound server still fails, and
+/// the failure still names the way out. Nothing about this changed.
+#[test]
+fn plan_status_unbound_without_plans_still_explains_itself() {
+    let tmp = Tmp::new("plans_unbound_empty");
+    let home = tmp.home();
+    let empty = tmp.dir("nothing-here");
+
+    let msg = call_tool_raw(&home, &empty, "plan_status", serde_json::json!({}));
+    let err = msg
+        .get("error")
+        .unwrap_or_else(|| panic!("an unbound server with no plans/ must still fail, got: {msg}"))
+        .to_string();
+    assert!(
+        err.contains("not bound to a project"),
+        "the unbound error should say so, got: {err}"
+    );
+}
+
+/// Bound to one project that has its own `plans/`: unchanged. The project's plans are served, as
+/// `project`, even though the workspace above it has plans of its own and the project declares a
+/// group.
+#[test]
+fn plan_status_bound_to_a_project_with_its_own_plans_is_unchanged() {
+    let tmp = Tmp::new("plans_own");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let api = make_project(&home, &ws, "api", Some("ACME"));
+    make_project(&home, &ws, "web", Some("ACME"));
+    write_plans(&ws, &[("PLAN-900-del-workspace", "workspace")]);
+    write_plans(&api, &[("PLAN-001-propio", "propio")]);
+
+    let out = call_tool_with_user_home(
+        &home,
+        &api,
+        Some(&tmp.0),
+        "plan_status",
+        serde_json::json!({}),
+    );
+    assert_eq!(plan_ids(&out), ["PLAN-001"], "{out}");
+    assert_eq!(
+        out["plans_root"]["source"].as_str(),
+        Some("project"),
+        "{out}"
+    );
+    assert!(same_path(&out["plans_root"]["path"], &api), "{out}");
+}
+
+// --- `devctx web` ----------------------------------------------------------
+
+/// A port nobody holds right now: bind to 0, read it, let go. Never a fixed one — the repository
+/// has been bitten by fixed ports and by servers left over from earlier runs.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("binding an ephemeral port")
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Kills the child when dropped, so a failing assertion cannot leave a dashboard running.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `GET path` over plain HTTP/1.0. `None` while nothing is listening yet.
+fn http_get(port: u16, path: &str) -> Option<(String, String)> {
+    use std::io::{Read, Write};
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    write!(stream, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .unwrap_or_else(|e| panic!("reading the response to GET {path}: {e}"));
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no HTTP head in: {raw}"));
+    Some((
+        head.lines().next().unwrap_or("").to_string(),
+        body.to_string(),
+    ))
+}
+
+/// `devctx web` from a workspace root that has no `.devctx/`: it serves one member of the group,
+/// and `/plans/status` answers with the workspace's plans — a member of a group reads the
+/// workspace above it.
+#[test]
+fn web_in_a_workspace_without_devctx_serves_the_workspace_plans() {
+    let tmp = Tmp::new("web_ws");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    make_project(&home, &ws, "api", Some("ACME"));
+    make_project(&home, &ws, "web", Some("ACME"));
+    write_plans(&ws, &[("PLAN-001-alfa", "alfa"), ("PLAN-002-beta", "beta")]);
+    assert!(
+        !ws.join(".devctx").exists(),
+        "the workspace root must not be a project"
+    );
+
+    let port = free_port();
+    let log_path = tmp.0.join("web.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    // Declared after `tmp`, so it is killed before `Tmp::drop` stops the servers and deletes the tree.
+    let mut web = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_devctx"))
+            .env("DEVCTX_HOME", &home)
+            .env("HOME", &tmp.0)
+            .current_dir(&ws)
+            .args(["web", "--addr", &format!("127.0.0.1:{port}"), "--no-open"])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("spawning `devctx web`"),
+    );
+
+    let started = std::time::Instant::now();
+    let (status, body) = loop {
+        if let Some(answer) = http_get(port, "/plans/status") {
+            break answer;
+        }
+        if let Ok(Some(exit)) = web.0.try_wait() {
+            panic!(
+                "`devctx web` exited early ({exit}):\n{}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+        }
+        assert!(
+            started.elapsed().as_secs() < 90,
+            "the dashboard never came up:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
+
+    assert!(
+        status.contains("200"),
+        "GET /plans/status: {status}\n{body}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"));
+    assert_eq!(plan_ids(&value), ["PLAN-001", "PLAN-002"], "{value}");
+    assert_eq!(
+        value["plans_root"]["source"].as_str(),
+        Some("ancestor"),
+        "{value}"
+    );
+    assert!(same_path(&value["plans_root"]["path"], &ws), "{value}");
+
+    // The banner names where the plans come from, so nobody has to guess.
+    let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        log_text.contains("Workspace") && log_text.contains("plans from"),
+        "expected the workspace banner, got:\n{log_text}"
+    );
+}
+
+/// `devctx web` where there is no project at all — neither above nor below — fails, and the
+/// failure carries the same explanation `devctx mcp` gives, not just "run `devctx init`". Plans in
+/// that directory do not change it: the dashboard needs a project to serve.
+#[test]
+fn web_without_any_project_fails_with_the_unbound_explanation() {
+    let tmp = Tmp::new("web_none");
+    let home = tmp.home();
+    let bare = tmp.dir("bare");
+    write_plans(&bare, &[("PLAN-001-alfa", "alfa")]);
+
+    let port = free_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .env("HOME", &tmp.0)
+        .current_dir(&bare)
+        .args(["web", "--addr", &format!("127.0.0.1:{port}"), "--no-open"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning `devctx web`");
+
+    // A bound dashboard would never exit: poll with a deadline rather than block on `output()`.
+    let started = std::time::Instant::now();
+    let exit = loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            break exit;
+        }
+        if started.elapsed().as_secs() > 60 {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("`devctx web` with no project must exit, but it kept running");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!exit.success(), "expected a failure, stderr:\n{stderr}");
+    assert!(
+        stderr.contains("No DevCtxEngine project found"),
+        "the original error should survive:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("neither inside a DevCtxEngine repository nor above one"),
+        "the why-unbound explanation should be appended:\n{stderr}"
     );
 }
