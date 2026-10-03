@@ -116,71 +116,251 @@ fn auto_addr(cfg: &ProjectConfig) -> String {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    let port = 20000 + (h % 40000) as u16;
+    // Stay below the kernel's ephemeral range (32768-60999 on Linux): any
+    // outgoing connection on the machine can be holding a port in it, and a
+    // server that finds its port taken never comes up.
+    let port = 20000 + (h % 12000) as u16;
     format!("127.0.0.1:{port}")
 }
 
-/// Ensure a server is running for this project, auto-spawning one in the
-/// background if needed, and return a client to it. Falls back to `None` (run
-/// locally) when auto-spawn is disabled (`DEVCTX_NO_AUTOSERVE`) or the server
-/// does not come up in time. Every DB command routes through this so the server
-/// is the single owner of the DuckDB file — no command ever fights the lock
-/// (e.g. querying while an `index` runs), and the embedding model stays warm.
-pub fn ensure(cfg: &ProjectConfig) -> Option<Remote> {
-    if let Some(r) = discover(cfg) {
-        return Some(r);
-    }
-    if std::env::var_os("DEVCTX_NO_AUTOSERVE").is_some() {
-        return None;
-    }
-    if spawn_server(cfg).is_err() {
-        return None;
-    }
-    eprintln!("· started background server (devctx serve); it stays warm for later commands");
-    // Poll until healthy (model load can take a few seconds on a cold start).
-    for _ in 0..200 {
-        std::thread::sleep(Duration::from_millis(300));
-        if let Some(r) = discover(cfg) {
-            return Some(r);
-        }
-    }
-    None
+/// Why no server could be reached for a project.
+#[derive(Debug)]
+pub enum EnsureError {
+    /// `DEVCTX_NO_AUTOSERVE` is set and nothing is advertised.
+    Disabled,
+    /// A server is alive (its pid is a `devctx serve`) but did not answer in
+    /// time. Never spawned over and never killed: it owns the database.
+    Busy { pid: u32, addr: String },
+    /// The server could not even be launched.
+    Spawn(String),
+    /// The spawned server exited (or never answered); `cause` is what it wrote
+    /// to `serve.log`, when anything.
+    Failed { cause: Option<String> },
 }
 
+impl std::fmt::Display for EnsureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnsureError::Disabled => {
+                write!(
+                    f,
+                    "auto-spawn is disabled (DEVCTX_NO_AUTOSERVE) and no server is running"
+                )
+            }
+            EnsureError::Busy { pid, addr } => write!(
+                f,
+                "the server (pid {pid}, {addr}) is alive but not answering; it is busy or hung"
+            ),
+            EnsureError::Spawn(e) => write!(f, "could not launch `devctx serve`: {e}"),
+            EnsureError::Failed { cause: Some(c) } => {
+                write!(f, "`devctx serve` did not start: {c}")
+            }
+            EnsureError::Failed { cause: None } => {
+                write!(f, "`devctx serve` did not start (nothing in serve.log)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EnsureError {}
+
+/// How long a freshly spawned server gets to answer, in steps. Not an estimate
+/// of startup (that is fast) but the margin for a loaded machine; the loop
+/// leaves the moment the server answers or its process exits.
+const WAIT_TICK: Duration = Duration::from_millis(100);
+const WAIT_TICKS: usize = 600;
+
+/// Ensure a server is running for this project, auto-spawning one in the
+/// background if needed, and return a client to it — or say why not.
+///
+/// Waits only as long as the spawned process lives: when it exits (a lock held
+/// by someone else, a port taken, a broken config) the answer is immediate and
+/// carries the last lines it wrote to `serve.log`. Every DB command routes
+/// through this so the server is the single owner of the DuckDB file.
+pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
+    match probe(cfg) {
+        Discovery::Up(r) => return Ok(r),
+        Discovery::Busy { pid, addr } => return Err(EnsureError::Busy { pid, addr }),
+        Discovery::Down => {}
+    }
+    if std::env::var_os("DEVCTX_NO_AUTOSERVE").is_some() {
+        return Err(EnsureError::Disabled);
+    }
+    let spawned = spawn_server(cfg).map_err(|e| EnsureError::Spawn(format!("{e:#}")))?;
+    eprintln!("· started background server (devctx serve); it stays warm for later commands");
+    for _ in 0..WAIT_TICKS {
+        std::thread::sleep(WAIT_TICK);
+        match probe(cfg) {
+            Discovery::Up(r) => return Ok(r),
+            Discovery::Busy { pid, addr } => return Err(EnsureError::Busy { pid, addr }),
+            Discovery::Down => {}
+        }
+        if spawned.exited.lock().is_ok_and(|e| e.is_some()) {
+            // It may have exited because another server won the race and is up.
+            if let Discovery::Up(r) = probe(cfg) {
+                return Ok(r);
+            }
+            return Err(EnsureError::Failed {
+                cause: spawned.failure_hint(),
+            });
+        }
+    }
+    Err(EnsureError::Failed {
+        cause: Some(
+            spawned
+                .failure_hint()
+                .map(|h| format!("no answer after {}s; {h}", WAIT_TICKS / 10))
+                .unwrap_or_else(|| format!("no answer after {}s", WAIT_TICKS / 10)),
+        ),
+    })
+}
+
+/// [`ensure_checked`] for callers that only need "a server or not" and fall
+/// back to opening the store themselves (the CLI commands, until they stop
+/// doing that).
+pub fn ensure(cfg: &ProjectConfig) -> Option<Remote> {
+    ensure_checked(cfg).ok()
+}
+
+/// What a spawned `devctx serve` is doing.
+struct Spawned {
+    exited: std::sync::Arc<std::sync::Mutex<Option<std::process::ExitStatus>>>,
+    log: PathBuf,
+    /// Length of `serve.log` before this spawn, so a stale line from an earlier
+    /// failure is never reported as this one's cause.
+    log_offset: u64,
+}
+
+impl Spawned {
+    /// The last lines this server wrote to `serve.log`.
+    fn failure_hint(&self) -> Option<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&self.log).ok()?;
+        f.seek(SeekFrom::Start(self.log_offset)).ok()?;
+        let mut raw = String::new();
+        f.read_to_string(&mut raw).ok()?;
+        let lines: Vec<&str> = raw
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("DevCtxEngine API listening"))
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        let from = lines.len().saturating_sub(4);
+        Some(lines[from..].join(" / ").chars().take(600).collect())
+    }
+}
+
+/// `serve.log` next to the database. Spawned servers append their stderr to it.
+pub fn serve_log(cfg: &ProjectConfig) -> PathBuf {
+    serve_file(cfg).with_file_name("serve.log")
+}
+
+/// Above this the log is dropped at spawn time rather than grown forever.
+const SERVE_LOG_MAX: u64 = 256 * 1024;
+
 /// Launch `devctx serve` detached in the background, with an idle timeout so it
-/// eventually exits on its own.
-fn spawn_server(cfg: &ProjectConfig) -> Result<()> {
-    let exe = std::env::current_exe().context("locating the devctx binary")?;
-    let mut cmd = std::process::Command::new(exe);
+/// eventually exits on its own. Its stderr goes to `serve.log`, and the child
+/// is reaped by a thread so its exit is observable (and it never lingers as a
+/// zombie in a long-lived parent such as the MCP).
+fn spawn_server(cfg: &ProjectConfig) -> Result<Spawned> {
+    let exe = devctx_core::self_exe().context("locating the devctx binary")?;
+    let log = serve_log(cfg);
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    if std::fs::metadata(&log).is_ok_and(|m| m.len() > SERVE_LOG_MAX) {
+        let _ = std::fs::remove_file(&log);
+    }
+    let log_offset = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    let sink = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+    let mut cmd = std::process::Command::new(&exe);
     cmd.args(["serve", "--addr", &auto_addr(cfg), "--idle", "900"])
         .current_dir(&cfg.project.path)
+        // Tells `cmd_serve` it was spawned, not typed: it must not kill a
+        // server that is already up.
+        .env(AUTOSPAWN_ENV, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(sink);
     // Detach from the parent's process group so it survives the CLI exiting.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
     }
-    cmd.spawn().context("spawning devctx serve")?;
-    Ok(())
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawning {}", exe.display()))?;
+    let exited = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&exited);
+    std::thread::spawn(move || {
+        let mut child = child;
+        if let Ok(status) = child.wait() {
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(status);
+            }
+        }
+    });
+    Ok(Spawned {
+        exited,
+        log,
+        log_offset,
+    })
 }
+
+/// Set on a server launched by [`ensure_checked`]; absent when a person ran
+/// `devctx serve`.
+pub const AUTOSPAWN_ENV: &str = "DEVCTX_AUTOSPAWNED";
 
 /// The base URL of a reachable running server for this project, if any.
 pub fn running_server_url(cfg: &ProjectConfig) -> Option<String> {
     discover(cfg).map(|r| r.base)
 }
 
-/// Whether a process with `pid` is alive (`kill -0`).
+/// Whether `pid` is a live `devctx serve` (or `api`) process.
+///
+/// "The pid exists" is not enough: pids are reused, and a `serve.json` left by
+/// a server that died can name a process that is now something else entirely —
+/// which a caller would then kill, or wait on, as if it were the server. On
+/// Linux the process's own `cmdline` settles it.
 fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(raw) => cmdline_is_server(&raw),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+/// Whether a NUL-separated `/proc/<pid>/cmdline` is `…devctx… serve|api …`.
+#[cfg(any(target_os = "linux", test))]
+fn cmdline_is_server(raw: &[u8]) -> bool {
+    let mut args = raw.split(|b| *b == 0).filter(|a| !a.is_empty());
+    let Some(exe) = args.next() else {
+        return false;
+    };
+    let exe = String::from_utf8_lossy(exe);
+    let name = exe.rsplit('/').next().unwrap_or("");
+    // A replaced binary shows up as `devctx (deleted)` in some kernels' argv0.
+    name.starts_with("devctx") && args.any(|a| a == b"serve" || a == b"api")
 }
 
 /// Send SIGTERM to `pid`, quietly (no "No such process" noise on a race).
@@ -228,7 +408,7 @@ pub fn stop_server(cfg: &ProjectConfig) -> Result<()> {
         return Ok(());
     };
     let info: ServeInfo = serde_json::from_slice(&raw).context("parsing serve.json")?;
-    if let Some(pid) = info.pid {
+    if let Some(pid) = info.pid.filter(|p| pid_alive(*p)) {
         kill_pid(pid);
         // Wait for it to actually exit. Returning while it still holds the DuckDB
         // file means the next command spawns a server that cannot open the
@@ -254,26 +434,75 @@ fn wait_for_exit(pid: u32) -> bool {
     false
 }
 
-/// Discover a running server for this project and confirm it is reachable.
-/// Returns `None` when there is no server (so the caller runs locally).
-pub fn discover(cfg: &ProjectConfig) -> Option<Remote> {
-    let raw = std::fs::read(serve_file(cfg)).ok()?;
-    let info: ServeInfo = serde_json::from_slice(&raw).ok()?;
-    let base = format!("http://{}", info.addr);
-    // Health-check with a short timeout so a stale file doesn't hang the CLI.
-    let ok = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(400))
+/// What [`probe`] found.
+pub enum Discovery {
+    /// A server answered.
+    Up(Remote),
+    /// An advertised server is alive but did not answer in time.
+    Busy { pid: u32, addr: String },
+    /// Nothing advertised, or what is advertised is gone.
+    Down,
+}
+
+/// Health check for the first look at `serve.json`: short, so a stale file does
+/// not hang the CLI.
+const HEALTH_QUICK: Duration = Duration::from_millis(400);
+/// Second look, only for a server whose process is demonstrably alive: a busy
+/// server (indexing, embedding) can take seconds to answer `/health`, and
+/// reading that as "dead" is how a second process ends up fighting it for the
+/// database.
+const HEALTH_PATIENT: Duration = Duration::from_secs(3);
+
+fn healthy(base: &str, timeout: Duration) -> bool {
+    ureq::AgentBuilder::new()
+        .timeout(timeout)
         .build()
         .get(&format!("{base}/health"))
         .call()
-        .is_ok();
-    if !ok {
-        return None;
+        .is_ok()
+}
+
+/// Discover a running server for this project, telling "gone" apart from
+/// "alive but slow".
+pub fn probe(cfg: &ProjectConfig) -> Discovery {
+    let Some(info) = std::fs::read(serve_file(cfg))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ServeInfo>(&raw).ok())
+    else {
+        return Discovery::Down;
+    };
+    let base = format!("http://{}", info.addr);
+    let up = |token: Option<String>| {
+        Discovery::Up(Remote {
+            base: base.clone(),
+            token,
+        })
+    };
+    if healthy(&base, HEALTH_QUICK) {
+        return up(info.token);
     }
-    Some(Remote {
-        base,
-        token: info.token,
-    })
+    match info.pid {
+        Some(pid) if pid_alive(pid) => {
+            if healthy(&base, HEALTH_PATIENT) {
+                up(info.token)
+            } else {
+                Discovery::Busy {
+                    pid,
+                    addr: info.addr,
+                }
+            }
+        }
+        _ => Discovery::Down,
+    }
+}
+
+/// Discover a running server for this project and confirm it is reachable.
+/// Returns `None` when there is no server (so the caller runs locally).
+pub fn discover(cfg: &ProjectConfig) -> Option<Remote> {
+    match probe(cfg) {
+        Discovery::Up(r) => Some(r),
+        _ => None,
+    }
 }
 
 impl Remote {
@@ -571,5 +800,19 @@ mod tests {
         // And with no file at all it is a no-op rather than an error.
         remove_own_serve_file(&cfg);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recycled pid must not count as a live server.
+    #[test]
+    fn only_a_devctx_serve_cmdline_counts_as_a_server() {
+        assert!(cmdline_is_server(
+            b"/home/u/.local/bin/devctx\0serve\0--addr\x00127.0.0.1:20111\x00"
+        ));
+        assert!(cmdline_is_server(b"devctx\0api\0"));
+        assert!(!cmdline_is_server(b"/usr/bin/vim\0serve\0"));
+        assert!(!cmdline_is_server(b"/usr/bin/devctx\0mcp\0"));
+        assert!(!cmdline_is_server(b""));
+        // The test process itself is alive but is not a server.
+        assert!(!pid_alive(std::process::id()));
     }
 }

@@ -100,6 +100,19 @@ pub async fn serve(
     token: Option<String>,
     idle: Option<Duration>,
 ) -> anyhow::Result<()> {
+    serve_with(cfg, addr, token, idle, || Ok(())).await
+}
+
+/// [`serve`] with a hook that runs once the store is open and the port is
+/// bound — the moment this process really owns the database and can be
+/// advertised. A failing hook aborts the start.
+pub async fn serve_with(
+    cfg: ProjectConfig,
+    addr: SocketAddr,
+    token: Option<String>,
+    idle: Option<Duration>,
+    ready: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let state = Arc::new(AppState::build(cfg)?);
     let activity = Arc::new(Mutex::new(Instant::now()));
     let app = router(Api {
@@ -107,7 +120,10 @@ pub async fn serve(
         token,
     })
     .layer(middleware::from_fn_with_state(activity.clone(), track));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?;
+    ready()?;
     eprintln!("DevCtxEngine API listening on http://{addr}");
 
     if let Some(timeout) = idle {
@@ -226,6 +242,20 @@ pub fn run_blocking(
         .enable_all()
         .build()?;
     rt.block_on(serve(cfg, addr, token, idle))
+}
+
+/// [`run_blocking`] with the [`serve_with`] hook.
+pub fn run_blocking_ready(
+    cfg: ProjectConfig,
+    addr: SocketAddr,
+    token: Option<String>,
+    idle: Option<Duration>,
+    ready: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(serve_with(cfg, addr, token, idle, ready))
 }
 
 // --- request bodies / query params ---

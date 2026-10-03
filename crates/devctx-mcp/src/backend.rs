@@ -23,10 +23,19 @@ pub struct ServerConn {
     pub token: Option<String>,
 }
 
+/// Finds (spawning if needed) the project's server; the error is what the agent
+/// reads when there is none.
+pub type Connector = Arc<dyn Fn() -> Result<ServerConn, String> + Send + Sync>;
+
 /// A thin blocking HTTP client for the shared server's endpoints.
+///
+/// The connection may not exist yet: an MCP never opens the project's database
+/// itself, and it does not need the server at startup either. The first call
+/// connects, and a call that finds no server fails with the reason and tries
+/// again next time.
 pub struct RemoteClient {
-    base: String,
-    token: Option<String>,
+    conn: std::sync::Mutex<Option<(String, Option<String>)>>,
+    connect: Option<Connector>,
 }
 
 /// Default per-call timeout for a routed request, in seconds. This used to be a
@@ -57,12 +66,29 @@ fn long_timeout() -> Duration {
 }
 
 impl RemoteClient {
+    /// `(base, token)` of the server, connecting on first use. Held under the
+    /// lock so concurrent first calls spawn one server, not several.
+    fn target(&self) -> Result<(String, Option<String>), String> {
+        let mut slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = slot.as_ref() {
+            return Ok(t.clone());
+        }
+        let connect = self
+            .connect
+            .as_ref()
+            .ok_or_else(|| "no devctx server connection".to_string())?;
+        let c = connect()?;
+        let t = (c.base, c.token);
+        *slot = Some(t.clone());
+        Ok(t)
+    }
+
     fn agent(&self, timeout: Duration) -> ureq::Agent {
         ureq::AgentBuilder::new().timeout(timeout).build()
     }
 
-    fn auth(&self, req: ureq::Request) -> ureq::Request {
-        match &self.token {
+    fn auth(req: ureq::Request, token: &Option<String>) -> ureq::Request {
+        match token {
             Some(t) => req.set("Authorization", &format!("Bearer {t}")),
             None => req,
         }
@@ -73,10 +99,8 @@ impl RemoteClient {
     }
 
     fn get_timed(&self, path: &str, timeout: Duration) -> Result<String, String> {
-        read(
-            self.auth(self.agent(timeout).get(&format!("{}{path}", self.base)))
-                .call(),
-        )
+        let (base, token) = self.target()?;
+        read(Self::auth(self.agent(timeout).get(&format!("{base}{path}")), &token).call())
     }
 
     fn post(&self, path: &str, body: Value) -> Result<String, String> {
@@ -84,10 +108,8 @@ impl RemoteClient {
     }
 
     fn post_timed(&self, path: &str, body: Value, timeout: Duration) -> Result<String, String> {
-        read(
-            self.auth(self.agent(timeout).post(&format!("{}{path}", self.base)))
-                .send_json(body),
-        )
+        let (base, token) = self.target()?;
+        read(Self::auth(self.agent(timeout).post(&format!("{base}{path}")), &token).send_json(body))
     }
 }
 
@@ -128,6 +150,9 @@ pub enum Backend {
 pub struct ProjectIdentity {
     pub name: String,
     pub group: String,
+    /// Where this project's `plans/` live. `plan_status` only reads markdown, so
+    /// it is answered here, in process, without a server and without a `Store`.
+    pub plans_root: Option<devctx_core::plans::PlansRoot>,
 }
 
 impl Backend {
@@ -138,8 +163,19 @@ impl Backend {
     pub fn remote(conn: ServerConn, identity: ProjectIdentity) -> Self {
         Backend::Remote(
             RemoteClient {
-                base: conn.base,
-                token: conn.token,
+                conn: std::sync::Mutex::new(Some((conn.base, conn.token))),
+                connect: None,
+            },
+            identity,
+        )
+    }
+
+    /// A backend whose server is found on first use (see [`RemoteClient`]).
+    pub fn lazy(connect: Connector, identity: ProjectIdentity) -> Self {
+        Backend::Remote(
+            RemoteClient {
+                conn: std::sync::Mutex::new(None),
+                connect: Some(connect),
             },
             identity,
         )
@@ -227,6 +263,9 @@ impl Backend {
     pub fn plan_status(&self, plan: Option<&str>) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_plan_status(s, plan),
+            Backend::Remote(_, id) if id.plans_root.is_some() => {
+                crate::state::plan_status_budgeted(id.plans_root.as_ref().unwrap(), plan)
+            }
             Backend::Remote(r, _) => match plan {
                 Some(p) => r.get(&format!("/plans/status?plan={}", urlencode(p))),
                 None => r.get("/plans/status"),

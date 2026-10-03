@@ -1141,3 +1141,191 @@ fn web_without_any_project_fails_with_the_unbound_explanation() {
         "the why-unbound explanation should be appended:\n{stderr}"
     );
 }
+
+// --- the MCP never owns the database ---------------------------------------
+
+/// The `host:port` an auto-spawned server for `root` binds, derived the way
+/// `remote::auto_addr` does (FNV-1a over the project path as written in the
+/// project's config). Duplicated on purpose: the test pins the contract.
+fn auto_port(root: &Path) -> u16 {
+    let cfg = std::fs::read_to_string(root.join(".devctx/config.yaml")).unwrap();
+    let path = cfg
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("path:"))
+        .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .expect("project.path in config.yaml");
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in path.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    20000 + (h % 12000) as u16
+}
+
+/// Like `call_tool_raw`, but runs `exe` and times only the tool call (from the
+/// moment the handshake is done), with `before_call` run in between.
+fn call_tool_timed(
+    exe: &Path,
+    home: &Path,
+    cwd: &Path,
+    tool: &str,
+    before_call: impl FnOnce(),
+) -> (serde_json::Value, std::time::Duration) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut child = Command::new(exe)
+        .env("DEVCTX_HOME", home)
+        .current_dir(cwd)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let init = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"#,
+        r#""2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+    );
+    stdin.write_all(init.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    let mut wait_for = |id: u64| loop {
+        let Some(Ok(line)) = lines.next() else {
+            let _ = child.kill();
+            panic!("the MCP server closed before answering id {id}");
+        };
+        if let Ok(m) = serde_json::from_str::<serde_json::Value>(&line) {
+            if m.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                return m;
+            }
+        }
+    };
+    wait_for(1);
+    before_call();
+    let started = std::time::Instant::now();
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{tool}","arguments":{{}}}}}}"#
+    );
+    stdin.write_all(call.as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+    let msg = wait_for(2);
+    let elapsed = started.elapsed();
+    drop(stdin);
+    let _ = child.wait();
+    (msg, elapsed)
+}
+
+/// B1: a server that cannot come up used to push the MCP into opening the
+/// DuckDB itself — and holding it, locked, for the whole session. Here the
+/// project's port is taken by a listener that never answers: the tool must
+/// fail with an explanation, and the database must be free afterwards.
+#[test]
+fn a_port_held_by_a_mute_listener_errors_and_leaves_the_database_free() {
+    let tmp = Tmp::new("mute");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+    let _mute = std::net::TcpListener::bind(("127.0.0.1", auto_port(&root)))
+        .expect("the project's auto port is free for the test");
+
+    let (msg, _) = call_tool_timed(
+        Path::new(env!("CARGO_BIN_EXE_devctx")),
+        &home,
+        &root,
+        "index_status",
+        || {},
+    );
+    let err = msg["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an error while no server can start, got: {msg}"));
+    assert!(err.contains("no devctx server"), "unexpected error: {err}");
+
+    // Nothing is left holding the file: a direct open works.
+    let out = devctx(&home, &["status"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && !combined.contains("lock"),
+        "the database should be openable after the MCP failed:\n{combined}"
+    );
+}
+
+/// A lock someone else holds: the tool answers fast and names the owner.
+#[test]
+fn a_foreign_lock_is_reported_quickly_with_the_owner_pid() {
+    let tmp = Tmp::new("foreign");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{}", free_port())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning a hand-run server");
+    let pid = owner.id();
+    let _owner = KillOnDrop(owner);
+    let advert = root.join(".devctx/state/serve.json");
+    let t0 = std::time::Instant::now();
+    while !advert.exists() {
+        assert!(t0.elapsed().as_secs() < 60, "the server never advertised");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Invisible to discovery, still holding the lock.
+    std::fs::remove_file(&advert).unwrap();
+
+    let (msg, elapsed) = call_tool_timed(
+        Path::new(env!("CARGO_BIN_EXE_devctx")),
+        &home,
+        &root,
+        "index_status",
+        || {},
+    );
+    let err = msg["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an error, got: {msg}"));
+    assert!(
+        err.contains(&pid.to_string()),
+        "the error should name the lock owner {pid}: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "took {elapsed:?}: it must not wait out the old 60s budget"
+    );
+}
+
+/// After a reinstall the running MCP's own executable is "…/devctx (deleted)";
+/// it must still be able to start a server.
+#[test]
+fn an_mcp_whose_binary_was_replaced_can_still_start_a_server() {
+    let tmp = Tmp::new("replaced");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+    // `index_status` asks git which branch it is on.
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .expect("running git init");
+    assert!(git.success());
+    let copy = tmp.0.join("devctx-copy");
+    std::fs::copy(env!("CARGO_BIN_EXE_devctx"), &copy).expect("copying the binary");
+
+    let (msg, _) = call_tool_timed(&copy, &home, &root, "index_status", || {
+        std::fs::remove_file(&copy).expect("deleting the running binary");
+    });
+    assert!(
+        msg.get("error").is_none(),
+        "the server should have started from the replaced binary: {msg}"
+    );
+}

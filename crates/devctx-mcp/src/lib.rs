@@ -23,8 +23,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
 
-pub use backend::{Backend, ServerConn};
-use state::AppState;
+pub use backend::{Backend, Connector, ServerConn};
 
 /// Parameters for the `search` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -1261,23 +1260,38 @@ where
     }
 }
 
-/// Build a backend for a project already resolved to a config: route through
-/// its shared server when there is one, else own the database here.
-pub fn backend_for(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Result<Backend> {
-    Ok(match server {
-        Some(conn) => Backend::remote(
-            conn,
-            crate::backend::ProjectIdentity {
-                name: if cfg.project.name.is_empty() {
-                    "default".to_string()
-                } else {
-                    cfg.project.name.clone()
-                },
-                group: cfg.project.group.clone(),
+/// Build the backend for a project already resolved to a config.
+///
+/// Always remote: the MCP never opens the project's database. `connect` finds
+/// (or starts) the project's server the first time a tool needs it, so a
+/// missing server is an error on that call — with its cause — rather than a
+/// process that quietly took the DuckDB lock for as long as the session lives.
+pub fn backend_for(cfg: &ProjectConfig, connect: backend::Connector) -> Backend {
+    let root = if cfg.project.path.is_empty() {
+        std::env::current_dir().ok()
+    } else {
+        Some(std::path::PathBuf::from(&cfg.project.path))
+    };
+    let plans_root = root.map(|r| {
+        devctx_core::plans::resolve_plans_root(
+            Some(&r),
+            None,
+            !cfg.project.group.trim().is_empty(),
+            state::home_dir().as_deref(),
+        )
+    });
+    Backend::lazy(
+        connect,
+        crate::backend::ProjectIdentity {
+            name: if cfg.project.name.is_empty() {
+                "default".to_string()
+            } else {
+                cfg.project.name.clone()
             },
-        ),
-        None => Backend::local(Arc::new(AppState::build(cfg)?)),
-    })
+            group: cfg.project.group.clone(),
+            plans_root,
+        },
+    )
 }
 
 /// Serve the DevCtxEngine MCP server over stdio until the client disconnects.

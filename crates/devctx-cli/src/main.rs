@@ -1244,18 +1244,35 @@ fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Resu
     if stop {
         return remote::stop_server(&cfg);
     }
-    remote::reclaim_db(&cfg); // replace any auto-spawned daemon
+    // A person typing `devctx serve` means "this one, now": replace whatever
+    // is advertised. An auto-spawned server must never do that — it is spawned
+    // precisely because nothing answered, and if something is alive after all
+    // (busy, mid-index) killing it would turn a slow server into a dead one.
+    // Left to fail on the lock instead, it reports the owner in `serve.log`.
+    if std::env::var_os(remote::AUTOSPAWN_ENV).is_none() {
+        remote::reclaim_db(&cfg);
+    }
     let socket: SocketAddr = addr
         .parse()
         .with_context(|| format!("invalid --addr `{addr}`"))?;
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
 
-    remote::write_serve_file(&cfg, socket, token.as_deref())?;
-    println!("DevCtxEngine server (owns the DB) → http://{addr}");
-    println!("Other `devctx` commands will route through it while it runs. Ctrl-C to stop.");
-
     let idle = (idle > 0).then(|| std::time::Duration::from_secs(idle));
-    let result = devctx_api::run_blocking(cfg.clone(), socket, token, idle);
+    // Advertise only once the store is open and the port bound: a process that
+    // dies on the lock must not leave a `serve.json` pointing at nothing.
+    let advertise = {
+        let cfg = cfg.clone();
+        let token = token.clone();
+        move || {
+            remote::write_serve_file(&cfg, socket, token.as_deref())?;
+            println!("DevCtxEngine server (owns the DB) → http://{socket}");
+            println!(
+                "Other `devctx` commands will route through it while it runs. Ctrl-C to stop."
+            );
+            Ok(())
+        }
+    };
+    let result = devctx_api::run_blocking_ready(cfg.clone(), socket, token, idle, advertise);
     // Only if it is still ours: a server that failed to bind must not delete
     // the file belonging to the healthy one that beat it to the port.
     remote::remove_own_serve_file(&cfg);
@@ -1501,7 +1518,7 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
     };
 
     let binding = match cfg {
-        Some(cfg) => devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg)?)),
+        Some(cfg) => devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg))),
         None => {
             let cwd = std::env::current_dir().unwrap_or_default();
             match devctx_mcp::state::resolve_under(&cwd) {
@@ -1512,7 +1529,7 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
                         row.name,
                         cwd.display()
                     );
-                    devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg)?))
+                    devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg)))
                 }
                 devctx_mcp::state::Resolution::Group { name, members } => {
                     // Open only the default member here. The others are opened
@@ -1529,7 +1546,7 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
                     let default_name = default.name.clone();
                     devctx_mcp::Binding::Group {
                         name,
-                        default: std::sync::Arc::new(mcp_backend(cfg)?),
+                        default: std::sync::Arc::new(mcp_backend(cfg)),
                         default_name,
                         members,
                     }
@@ -1550,30 +1567,37 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
         std::sync::Arc::new(|root: &std::path::Path| {
             let cfg = ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
                 .map_err(|e| format!("loading project at {}: {e}", root.display()))?;
-            mcp_backend(cfg).map_err(|e| e.to_string())
+            Ok(mcp_backend(cfg))
         }),
     )
 }
 
 /// A tool backend for one project.
 ///
-/// Routes through a shared server (auto-spawned if needed) so many MCP sessions
-/// plus the web/CLI/TUI of the same project coexist without lock fights; owning
-/// the database here is the fallback when no server can be reached.
-fn mcp_backend(cfg: ProjectConfig) -> Result<devctx_mcp::Backend> {
-    let server = match remote::ensure(&cfg) {
-        Some(r) => {
-            let (base, token) = r.into_parts();
-            eprintln!("DevCtxEngine MCP → routing to {base}");
-            Some(devctx_mcp::ServerConn { base, token })
-        }
-        None => {
-            remote::reclaim_db(&cfg);
-            eprintln!("DevCtxEngine MCP → local database");
-            None
-        }
+/// The MCP never owns the database: it routes to the project's server and
+/// finds or starts it on the first tool call, not here. Opening the store as a
+/// fallback is what used to make one MCP hold the DuckDB lock for the whole
+/// session whenever the server could not be reached.
+fn mcp_backend(cfg: ProjectConfig) -> devctx_mcp::Backend {
+    let name = if cfg.project.name.is_empty() {
+        "default".to_string()
+    } else {
+        cfg.project.name.clone()
     };
-    devctx_mcp::backend_for(cfg, server)
+    let path = cfg.project.path.clone();
+    let for_connect = cfg.clone();
+    let connect: devctx_mcp::Connector =
+        std::sync::Arc::new(move || match remote::ensure_checked(&for_connect) {
+            Ok(r) => {
+                let (base, token) = r.into_parts();
+                eprintln!("DevCtxEngine MCP → routing to {base}");
+                Ok(devctx_mcp::ServerConn { base, token })
+            }
+            Err(e) => Err(format!(
+                "no devctx server for {name}: {e}. Try `devctx serve` in {path}"
+            )),
+        });
+    devctx_mcp::backend_for(&cfg, connect)
 }
 
 /// `devctx mcp configure` — register DevCtxEngine as an MCP server in an AI client.

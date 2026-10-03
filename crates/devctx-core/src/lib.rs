@@ -6,6 +6,7 @@
 pub mod config;
 pub mod dirs;
 pub mod error;
+pub mod exe;
 pub mod fallback;
 pub mod plans;
 pub mod rank;
@@ -13,6 +14,7 @@ pub mod types;
 
 pub use config::{ProjectConfig, CONFIG_FILE_NAME};
 pub use error::{Error, Result};
+pub use exe::self_exe;
 pub use fallback::CudaFallback;
 pub use rank::{fuse_by_rank, rank_score};
 pub use types::{SearchFilter, SearchResult, VectorMetadata, VectorPoint};

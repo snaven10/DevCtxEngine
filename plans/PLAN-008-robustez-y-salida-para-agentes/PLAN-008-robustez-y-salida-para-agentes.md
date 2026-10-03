@@ -231,7 +231,7 @@ binario instalado y sugieren reiniciar la sesión.
 
 | TASK | Título | Prioridad | Depende de | Estado |
 |------|--------|-----------|------------|--------|
-| TASK-001 | El MCP nunca abre el DuckDB: backend remoto perezoso, `ensure` que detecta muerte, `serve.log`, exe `(deleted)` | P0 | — | `pending` |
+| TASK-001 | El MCP nunca abre el DuckDB: backend remoto perezoso, `ensure` que detecta muerte, `serve.log`, exe `(deleted)` | P0 | — | `done` |
 | TASK-002 | CLI: fallo rápido ante un DB bloqueado, con PID y cómo liberarlo | P0 | TASK-001 | `pending` |
 | TASK-003 | Ciclo de vida del MCP: salida en EOF y aviso de versión desfasada | P0 | — | `pending` |
 | TASK-004 | Reconexión del cliente remoto ante un serve muerto | P0 | TASK-001 | `pending` |
