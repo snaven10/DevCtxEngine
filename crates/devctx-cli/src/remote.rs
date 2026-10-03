@@ -281,6 +281,8 @@ fn spawn_server(cfg: &ProjectConfig) -> Result<Spawned> {
         .map(std::process::Stdio::from)
         .unwrap_or_else(|_| std::process::Stdio::null());
     let mut cmd = std::process::Command::new(&exe);
+    // Never inherit the committing worktree's `GIT_*` from a git hook.
+    devctx_core::clean_git_env(&mut cmd);
     cmd.args(["serve", "--addr", &auto_addr(cfg), "--idle", "900"])
         .current_dir(&cfg.project.path)
         // Tells `cmd_serve` it was spawned, not typed: it must not kill a

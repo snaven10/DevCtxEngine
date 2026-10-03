@@ -185,7 +185,7 @@ fn stale_projects(registry: &Arc<Mutex<Central>>) -> Vec<(String, String)> {
 }
 
 fn head_commit(path: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new("git"))
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "HEAD"])
@@ -203,7 +203,7 @@ fn index_project(path: &str) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let _ = std::process::Command::new(exe)
+    let _ = devctx_core::clean_git_env(&mut std::process::Command::new(exe))
         .arg("index")
         .current_dir(path)
         .stdout(std::process::Stdio::null())

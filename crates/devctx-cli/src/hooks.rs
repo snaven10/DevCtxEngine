@@ -34,7 +34,7 @@ const HOOKS: &[&str] = &["post-commit", "post-merge"];
 
 /// Path of the repository's hooks directory, honouring `core.hooksPath`.
 fn hooks_dir(repo_root: &Path) -> Result<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new("git"))
         .arg("-C")
         .arg(repo_root)
         .args(["rev-parse", "--git-path", "hooks"])
@@ -69,9 +69,10 @@ fn block(exe: &Path, hook: &str) -> String {
         "{BEGIN}\n\
          # Re-index this repository {when}. Detached and silent: git must never\n\
          # wait on indexing, and must never fail because of it.\n\
-         (\"{exe}\" index >/dev/null 2>&1 &) || true\n\
+         (unset {vars}; \"{exe}\" index >/dev/null 2>&1 &) || true\n\
          {END}\n",
-        exe = exe.display()
+        exe = exe.display(),
+        vars = devctx_core::GIT_REPO_ENV.join(" ")
     )
 }
 
@@ -231,6 +232,21 @@ mod tests {
         assert!(b.contains("\"/usr/local/bin/devctx\" index"));
         assert!(b.contains('&'), "must not block the commit");
         assert!(b.contains("|| true"), "must not fail the commit");
+    }
+
+    /// Git exports `GIT_DIR`, `GIT_INDEX_FILE`… to hooks; the server the hook's
+    /// `devctx index` spawns must not inherit them (PLAN-008 B3). `unset` is a
+    /// POSIX builtin, so it needs no `env` binary and cannot fail the commit.
+    #[test]
+    fn the_block_unsets_git_repo_variables_before_running_index() {
+        let b = block(Path::new("/usr/local/bin/devctx"), "post-commit");
+        let line = b.lines().find(|l| l.contains(" index ")).unwrap();
+        let (unset, run) = line.split_once(';').expect("unset precedes the command");
+        for var in devctx_core::GIT_REPO_ENV {
+            assert!(unset.contains(var), "{var} not unset in: {line}");
+        }
+        assert!(unset.contains("unset"));
+        assert!(run.contains("\"/usr/local/bin/devctx\" index"));
     }
 
     /// The gap this exists to close: `post-commit` never fires on a merge or a

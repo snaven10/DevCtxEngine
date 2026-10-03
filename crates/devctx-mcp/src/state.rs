@@ -1688,24 +1688,26 @@ fn search_one(
     // file, and a running `devctx serve` for that project owns it. Re-entering
     // our own binary with its working directory set is what the single-project
     // path already does, and it routes through that server when one is up.
-    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args([
-            "search",
-            query,
-            "--limit",
-            &limit.to_string(),
-            "--format",
-            "json",
-        ])
-        .args(language.iter().flat_map(|l| ["--language", *l]))
-        .args(match mode {
-            "keyword" => vec!["--keyword"],
-            "hybrid" => vec!["--hybrid"],
-            _ => vec![],
-        })
-        .current_dir(path)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new(
+        std::env::current_exe().map_err(|e| e.to_string())?,
+    ))
+    .args([
+        "search",
+        query,
+        "--limit",
+        &limit.to_string(),
+        "--format",
+        "json",
+    ])
+    .args(language.iter().flat_map(|l| ["--language", *l]))
+    .args(match mode {
+        "keyword" => vec!["--keyword"],
+        "hybrid" => vec!["--hybrid"],
+        _ => vec![],
+    })
+    .current_dir(path)
+    .output()
+    .map_err(|e| e.to_string())?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(err
@@ -1925,20 +1927,22 @@ fn recall_one_local(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Value>, String> {
-    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args([
-            "recall",
-            query,
-            "--limit",
-            &limit.to_string(),
-            "--scope",
-            "local",
-            "--format",
-            "json",
-        ])
-        .current_dir(path)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new(
+        std::env::current_exe().map_err(|e| e.to_string())?,
+    ))
+    .args([
+        "recall",
+        query,
+        "--limit",
+        &limit.to_string(),
+        "--scope",
+        "local",
+        "--format",
+        "json",
+    ])
+    .current_dir(path)
+    .output()
+    .map_err(|e| e.to_string())?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(err
@@ -2076,24 +2080,26 @@ pub fn do_search_project(
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("no path recorded for `{project}`"))?;
 
-    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args([
-            "search",
-            query,
-            "--limit",
-            &limit.to_string(),
-            "--format",
-            "json",
-        ])
-        .args(language.iter().flat_map(|l| ["--language", l]))
-        .args(match mode {
-            "keyword" => vec!["--keyword"],
-            "hybrid" => vec!["--hybrid"],
-            _ => vec![],
-        })
-        .current_dir(path)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new(
+        std::env::current_exe().map_err(|e| e.to_string())?,
+    ))
+    .args([
+        "search",
+        query,
+        "--limit",
+        &limit.to_string(),
+        "--format",
+        "json",
+    ])
+    .args(language.iter().flat_map(|l| ["--language", l]))
+    .args(match mode {
+        "keyword" => vec!["--keyword"],
+        "hybrid" => vec!["--hybrid"],
+        _ => vec![],
+    })
+    .current_dir(path)
+    .output()
+    .map_err(|e| e.to_string())?;
 
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -2815,6 +2821,7 @@ fn move_to_project(project: &str, m: &devctx_store::Memory) -> Result<String, St
         .ok_or_else(|| format!("no path recorded for `{project}`"))?;
 
     let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    devctx_core::clean_git_env(&mut cmd);
     cmd.args(["remember", &m.content, "--type", &m.memory_type]);
     if !m.title.is_empty() {
         cmd.args(["--title", &m.title]);

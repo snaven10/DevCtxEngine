@@ -216,6 +216,8 @@ fn spawn(paths: &CentralPaths) -> Result<Arc<Mutex<Option<std::process::ExitStat
     let exe_path =
         devctx_core::self_exe().map_err(|e| CentralError::Io(e, PathBuf::from("<current exe>")))?;
     let mut cmd = std::process::Command::new(&exe_path);
+    // Never inherit the committing worktree's `GIT_*` from a git hook.
+    devctx_core::clean_git_env(&mut cmd);
     cmd.args([
         "serve",
         "--central",

@@ -220,7 +220,11 @@ fn push_path(changes: &mut Vec<Change>, parts: &[&str], idx: usize, make: fn(Str
 }
 
 fn run(cwd: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(cwd).args(args).output()?;
+    let out = devctx_core::clean_git_env(&mut Command::new("git"))
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()?;
     if !out.status.success() {
         return Err(IndexError::Git(
             args.join(" "),

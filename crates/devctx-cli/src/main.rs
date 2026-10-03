@@ -3162,7 +3162,7 @@ impl ServerProgress {
 /// registered and configured but never indexed. Saying so at the moment of
 /// registering costs nothing and saves a confusing failure later.
 fn is_git_repo(path: &std::path::Path) -> bool {
-    std::process::Command::new("git")
+    devctx_core::clean_git_env(&mut std::process::Command::new("git"))
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])

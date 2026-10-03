@@ -450,7 +450,7 @@ pub fn find_config_file(start_dir: &Path) -> Option<PathBuf> {
 /// `.git`, and in a linked one it is an absolute path to the main worktree's
 /// `.git`. Its parent is the root we want.
 fn main_worktree(dir: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = crate::clean_git_env(&mut std::process::Command::new("git"))
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--git-common-dir"])
@@ -478,7 +478,7 @@ fn main_worktree(dir: &Path) -> Option<PathBuf> {
 /// never indexed.
 pub fn detect_default_branch(repo: &Path) -> Option<String> {
     for name in ["main", "master"] {
-        let ok = std::process::Command::new("git")
+        let ok = crate::clean_git_env(&mut std::process::Command::new("git"))
             .arg("-C")
             .arg(repo)
             .args([
