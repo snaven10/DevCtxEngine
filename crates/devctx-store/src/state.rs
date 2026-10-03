@@ -211,6 +211,18 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Branches with an `index_state` record for this repository, most recently
+    /// indexed first. What "the last indexed branch" means when neither the
+    /// checked-out nor the default branch has anything.
+    pub fn branches_by_recency(&self, repo_path: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT branch FROM index_state WHERE repo_path = ? ORDER BY indexed_at DESC, branch",
+        )?;
+        let rows = stmt.query_map(duckdb::params![repo_path], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn delete_file_state(&self, repo_path: &str, branch: &str, file: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",

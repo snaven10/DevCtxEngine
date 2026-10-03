@@ -371,10 +371,11 @@ pub fn do_search(
     rerank: bool,
 ) -> Result<String, String> {
     let store = state.open_store()?;
+    let (branch_filter, fallback) = search_branch(state, &store);
     let filter = SearchFilter {
         languages: language.into_iter().collect(),
         exclude_deletions: true,
-        ..search_branch(state, &store)
+        ..branch_filter
     };
     // Keyword search needs the BM25 index, which is opt-in and therefore usually
     // absent. Building it here — the user has just asked for the feature — turns
@@ -431,14 +432,17 @@ pub fn do_search(
         let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
         format!("{file}:{line}")
     });
-    if dropped.is_empty() {
+    if dropped.is_empty() && fallback.is_none() {
         return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
     }
-    serde_json::to_string_pretty(&json!({
-        "results": kept,
-        "omitted_for_budget": { "count": dropped.len(), "items": dropped },
-    }))
-    .map_err(|e| e.to_string())
+    let mut out = json!({ "results": kept });
+    if !dropped.is_empty() {
+        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+    }
+    if let Some(f) = &fallback {
+        out["branch_fallback"] = f.to_json();
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// Drop rows for branches the config no longer lists. Returns rows removed.
@@ -482,27 +486,144 @@ fn prune_untracked_branches(state: &AppState, store: &devctx_store::Store) -> us
 /// has rows, else no filter — which is exactly the behaviour of every version
 /// before branches were tracked, and correct for the single-branch store that
 /// most repositories are.
-fn search_branch(state: &AppState, store: &devctx_store::Store) -> SearchFilter {
+fn search_branch(
+    state: &AppState,
+    store: &devctx_store::Store,
+) -> (SearchFilter, Option<BranchFallback>) {
     let unfiltered = SearchFilter::default();
     let Ok((repo, branch)) = state.repo_branch() else {
-        return unfiltered;
+        return (unfiltered, None);
     };
     let has = |b: &str| store.has_branch_rows(&repo, b).unwrap_or(false);
     if has(&branch) {
-        return SearchFilter {
+        let filter = SearchFilter {
             repo: Some(repo),
             branch: Some(branch),
             ..unfiltered
         };
+        return (filter, None);
     }
     match state.default_branch().filter(|b| has(b)) {
-        Some(b) => SearchFilter {
-            repo: Some(repo),
-            branch: Some(b),
-            ..unfiltered
-        },
-        None => unfiltered,
+        Some(b) => {
+            let fallback = BranchFallback {
+                current: branch,
+                used: b.clone(),
+            };
+            let filter = SearchFilter {
+                repo: Some(repo),
+                branch: Some(b),
+                ..unfiltered
+            };
+            (filter, Some(fallback))
+        }
+        None => (unfiltered, None),
     }
+}
+
+/// The checked-out branch had nothing indexed, so an answer came from another.
+///
+/// Reported in the tool output, never silently: the other branch may hold code
+/// that has since changed in the one the caller is standing in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchFallback {
+    current: String,
+    used: String,
+}
+
+impl BranchFallback {
+    fn to_json(&self) -> Value {
+        json!({
+            "current": self.current,
+            "used": self.used,
+            "why": format!(
+                "current branch {} is not indexed; answering from branch {}",
+                self.current, self.used
+            ),
+        })
+    }
+}
+
+/// The branch a graph query (symbols, references, routes, impact) runs against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchChoice {
+    repo: String,
+    branch: String,
+    fallback: Option<BranchFallback>,
+    /// `false` when no branch has rows at all.
+    indexed: bool,
+}
+
+impl BranchChoice {
+    /// The branch to query, or the explicit "nothing indexed" error — an empty
+    /// answer from an empty index reads as "no such symbol", which is false.
+    fn ready(self) -> Result<Self, String> {
+        if self.indexed {
+            Ok(self)
+        } else {
+            Err(format!(
+                "{} has no index for any branch; run devctx index",
+                self.repo
+            ))
+        }
+    }
+
+    /// Adds `branch_fallback` to an object answer when the branch is not the current one.
+    fn annotate(&self, out: &mut Value) {
+        if let Some(f) = &self.fallback {
+            out["branch_fallback"] = f.to_json();
+        }
+    }
+}
+
+/// Same rule as [`search_branch`] — checked-out branch if it has rows, else the
+/// configured default if it has rows — plus one more step the graph needs
+/// because it cannot run unfiltered: the most recently indexed branch that has
+/// rows. If none does, `indexed` is false.
+fn pick_graph_branch(
+    store: &devctx_store::Store,
+    repo: &str,
+    repo_path: &str,
+    current: &str,
+    default: Option<&str>,
+) -> BranchChoice {
+    let has = |b: &str| store.has_branch_rows(repo, b).unwrap_or(false);
+    let choice = |branch: &str, indexed: bool| BranchChoice {
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        fallback: (indexed && branch != current).then(|| BranchFallback {
+            current: current.to_string(),
+            used: branch.to_string(),
+        }),
+        indexed,
+    };
+    if has(current) {
+        return choice(current, true);
+    }
+    if let Some(d) = default.filter(|d| has(d)) {
+        return choice(d, true);
+    }
+    let latest = store
+        .branches_by_recency(repo_path)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|b| has(b));
+    match latest {
+        Some(b) => choice(&b, true),
+        None => choice(current, false),
+    }
+}
+
+fn graph_branch(state: &AppState, store: &devctx_store::Store) -> Result<BranchChoice, String> {
+    let (repo, current) = state.repo_branch()?;
+    let repo_path = state.root.to_string_lossy().to_string();
+    pick_graph_branch(
+        store,
+        &repo,
+        &repo_path,
+        &current,
+        state.default_branch().as_deref(),
+    )
+    .ready()
 }
 
 /// Parse an optional mode string into a [`SearchMode`] (default vector).
@@ -710,7 +831,25 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
         .get_index_record(&repo_path, &state_git.branch)
         .map_err(|e| e.to_string())?;
     let value = match record {
-        None => json!({ "indexed": false, "branch": state_git.branch }),
+        None => {
+            let indexed_branches = store.branches_by_recency(&repo_path).unwrap_or_default();
+            let hint = if indexed_branches.is_empty() {
+                "nothing is indexed for this repository; run devctx index".to_string()
+            } else {
+                format!(
+                    "branch {} is not indexed; search and the graph tools answer from another \
+                     indexed branch ({}); run devctx index to index this one",
+                    state_git.branch,
+                    indexed_branches.join(", ")
+                )
+            };
+            json!({
+                "indexed": false,
+                "branch": state_git.branch,
+                "indexed_branches": indexed_branches,
+                "hint": hint,
+            })
+        }
         Some(r) => json!({
             "indexed": true,
             "branch": r.branch,
@@ -2900,12 +3039,13 @@ pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<
 /// `impact_analysis` tool: blast radius (transitive callers/callees) of a symbol.
 pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
+    let (repo, branch) = (&chosen.repo, &chosen.branch);
     let resolved = store
-        .resolve_symbol(&repo, &branch, symbol)
+        .resolve_symbol(repo, branch, symbol)
         .map_err(|e| e.to_string())?;
     let impact = store
-        .impact_analysis(&repo, &branch, symbol, depth)
+        .impact_analysis(repo, branch, symbol, depth)
         .map_err(|e| e.to_string())?;
     let to_json = |v: &[(String, usize)]| -> Vec<Value> {
         v.iter()
@@ -2936,6 +3076,7 @@ pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String,
     if let Some(names) = merged_declarations(symbol, &resolved) {
         out["resolved_symbols"] = json!(names);
     }
+    chosen.annotate(&mut out);
     let dropped_total = up_dropped.len() + down_dropped.len();
     if dropped_total > 0 {
         out["omitted_for_budget"] = json!({
@@ -3126,11 +3267,11 @@ fn parse_memories(raw: &str) -> Vec<Value> {
 /// miss rather than padded with the nearest neighbours.
 pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
     let found = store
-        .symbol_definitions(&repo, &branch, name, limit)
+        .symbol_definitions(&chosen.repo, &chosen.branch, name, limit)
         .map_err(|e| e.to_string())?;
-    Ok(json!({
+    let mut out = json!({
         "symbol": name,
         "definitions": found.iter().map(|p| json!({
             "symbol": p.metadata.symbol,
@@ -3141,8 +3282,9 @@ pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<Stri
             "end_line": p.metadata.end_line,
             "code": p.text,
         })).collect::<Vec<_>>(),
-    })
-    .to_string())
+    });
+    chosen.annotate(&mut out);
+    Ok(out.to_string())
 }
 
 /// `memories_by_symbol` tool: the decisions recorded about a symbol.
@@ -3402,12 +3544,12 @@ fn value_json(v: Value, sources: &str) -> Value {
 /// `get_references` tool: all call sites of a symbol.
 pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
     let resolved = store
-        .resolve_symbol(&repo, &branch, symbol)
+        .resolve_symbol(&chosen.repo, &chosen.branch, symbol)
         .map_err(|e| e.to_string())?;
     let refs = store
-        .find_references(&repo, &branch, symbol)
+        .find_references(&chosen.repo, &chosen.branch, symbol)
         .map_err(|e| e.to_string())?;
     let arr: Vec<Value> = refs
         .iter()
@@ -3423,6 +3565,7 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
     if let Some(names) = merged_declarations(symbol, &resolved) {
         out["resolved_symbols"] = json!(names);
     }
+    chosen.annotate(&mut out);
     if !dropped.is_empty() {
         out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
     }
@@ -3436,24 +3579,32 @@ pub fn do_search_routes(
     path: Option<String>,
 ) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
     let routes = store
-        .search_routes(&repo, &branch, method.as_deref(), path.as_deref())
+        .search_routes(
+            &chosen.repo,
+            &chosen.branch,
+            method.as_deref(),
+            path.as_deref(),
+        )
         .map_err(|e| e.to_string())?;
-    routes_to_json(&routes)
+    routes_to_json(&routes, &chosen)
 }
 
 /// `routes_for_handler` tool: routes served by a handler symbol.
 pub fn do_routes_for_handler(state: &AppState, handler: &str) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
     let routes = store
-        .routes_for_handler(&repo, &branch, handler)
+        .routes_for_handler(&chosen.repo, &chosen.branch, handler)
         .map_err(|e| e.to_string())?;
-    routes_to_json(&routes)
+    routes_to_json(&routes, &chosen)
 }
 
-fn routes_to_json(routes: &[devctx_store::StoredRoute]) -> Result<String, String> {
+fn routes_to_json(
+    routes: &[devctx_store::StoredRoute],
+    chosen: &BranchChoice,
+) -> Result<String, String> {
     let arr: Vec<Value> = routes
         .iter()
         .map(|r| {
@@ -3473,14 +3624,15 @@ fn routes_to_json(routes: &[devctx_store::StoredRoute]) -> Result<String, String
         let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
         format!("{method} {path}")
     });
-    if dropped.is_empty() {
+    if dropped.is_empty() && chosen.fallback.is_none() {
         return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
     }
-    serde_json::to_string_pretty(&json!({
-        "routes": kept,
-        "omitted_for_budget": { "count": dropped.len(), "items": dropped },
-    }))
-    .map_err(|e| e.to_string())
+    let mut out = json!({ "routes": kept });
+    if !dropped.is_empty() {
+        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+    }
+    chosen.annotate(&mut out);
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// `summarize` tool: condense `content`, optionally focused on `query`.
@@ -4249,7 +4401,7 @@ mod tests {
             line: 999,
             ..Default::default()
         });
-        let out = routes_to_json(&routes).unwrap();
+        let out = routes_to_json(&routes, &on_current_branch()).unwrap();
         std::env::remove_var("DEVCTX_MAX_OUTPUT_TOKENS");
         let value: Value = serde_json::from_str(&out).unwrap();
         let omitted = value["omitted_for_budget"]["count"].as_u64().unwrap();
@@ -4272,7 +4424,7 @@ mod tests {
             line: 1,
             ..Default::default()
         }];
-        let out = routes_to_json(&routes).unwrap();
+        let out = routes_to_json(&routes, &on_current_branch()).unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
         assert!(value.is_array(), "{out}");
     }
@@ -4311,5 +4463,207 @@ mod tests {
         assert!(dropped.is_empty());
         let content = kept[0]["content"].as_str().unwrap();
         assert!(content.contains("[devctx] truncated"), "{content:?}");
+    }
+
+    fn on_current_branch() -> BranchChoice {
+        BranchChoice {
+            repo: "demo".into(),
+            branch: "main".into(),
+            fallback: None,
+            indexed: true,
+        }
+    }
+
+    // --- graph branch fallback (PLAN-008 TASK-006) ---
+
+    const GRAPH_DIM: usize = 3;
+    const REPO_PATH: &str = "/tmp/devctx-graph-branch-demo";
+
+    /// A store indexed only on `main`: one definition, one call edge, one route.
+    fn store_indexed_on(branch: &str) -> Store {
+        let store = Store::open_in_memory(GRAPH_DIM).unwrap();
+        store
+            .upsert(&[VectorPoint {
+                id: "p1".into(),
+                vector: vec![0.0; GRAPH_DIM],
+                text: "fn greet() {}".into(),
+                metadata: VectorMetadata {
+                    repo: "demo".into(),
+                    branch: branch.into(),
+                    file: "a.rs".into(),
+                    symbol: "greet".into(),
+                    symbol_type: "function".into(),
+                    language: "rust".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    ..Default::default()
+                },
+            }])
+            .unwrap();
+        store
+            .replace_file_edges(
+                "demo",
+                branch,
+                "b.rs",
+                &[devctx_store::StoredEdge {
+                    source: "main_fn".into(),
+                    target: "greet".into(),
+                    kind: "calls".into(),
+                    source_file: "b.rs".into(),
+                    line: 3,
+                }],
+            )
+            .unwrap();
+        store
+            .replace_file_routes(
+                "demo",
+                branch,
+                "r.rs",
+                &[devctx_store::StoredRoute {
+                    framework: "axum".into(),
+                    http_method: "GET".into(),
+                    path: "/hello".into(),
+                    handler_class: String::new(),
+                    handler_method: "greet".into(),
+                    handler_symbol: "greet".into(),
+                    file: "r.rs".into(),
+                    line: 1,
+                }],
+                "2026-10-03T00:00:00Z",
+            )
+            .unwrap();
+        store
+            .save_index_record(&devctx_store::IndexRecord {
+                repo_path: REPO_PATH.into(),
+                branch: branch.into(),
+                last_commit: "abc".into(),
+                model_name: "m".into(),
+                model_dimension: GRAPH_DIM as i64,
+                file_count: 1,
+                symbol_count: 1,
+                chunk_count: 1,
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn a_branch_nobody_indexed_answers_the_graph_from_the_indexed_one() {
+        let store = store_indexed_on("main");
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "feat/x", None);
+        assert!(c.indexed);
+        assert_eq!(c.branch, "main");
+        let f = c.fallback.as_ref().expect("a fallback must be reported");
+        assert_eq!((f.current.as_str(), f.used.as_str()), ("feat/x", "main"));
+
+        // Every graph query, run on the chosen branch, finds what `main` has.
+        let defs = store
+            .symbol_definitions(&c.repo, &c.branch, "greet", 5)
+            .unwrap();
+        assert_eq!(defs.len(), 1);
+        let refs = store.find_references(&c.repo, &c.branch, "greet").unwrap();
+        assert_eq!(refs.len(), 1);
+        let routes = store
+            .search_routes(&c.repo, &c.branch, None, Some("hello"))
+            .unwrap();
+        assert_eq!(routes.len(), 1);
+        let impact = store
+            .impact_analysis(&c.repo, &c.branch, "greet", 2)
+            .unwrap();
+        assert!(!impact.upstream.is_empty());
+
+        // And the output says so.
+        let mut out = json!({ "symbol": "greet" });
+        c.annotate(&mut out);
+        assert_eq!(out["branch_fallback"]["current"], "feat/x");
+        assert_eq!(out["branch_fallback"]["used"], "main");
+        assert!(out["branch_fallback"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("feat/x is not indexed"));
+        let routes_out = routes_to_json(&routes, &c).unwrap();
+        assert!(routes_out.contains("branch_fallback"), "{routes_out}");
+    }
+
+    #[test]
+    fn the_configured_default_wins_over_the_most_recent() {
+        let store = store_indexed_on("main");
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "feat/x", Some("main"));
+        assert_eq!(c.branch, "main");
+        assert!(c.fallback.is_some());
+        // A default with no rows is skipped, not trusted.
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "feat/x", Some("develop"));
+        assert_eq!(c.branch, "main");
+    }
+
+    #[test]
+    fn the_indexed_current_branch_adds_no_field() {
+        let store = store_indexed_on("main");
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "main", Some("other"));
+        assert_eq!(c.branch, "main");
+        assert!(c.fallback.is_none());
+        let mut out = json!({ "symbol": "greet" });
+        c.annotate(&mut out);
+        assert!(out.get("branch_fallback").is_none());
+        let routes = store.search_routes("demo", "main", None, None).unwrap();
+        assert!(
+            routes_to_json(&routes, &c)
+                .unwrap()
+                .trim_start()
+                .starts_with('['),
+            "shape unchanged when the current branch is indexed"
+        );
+    }
+
+    #[test]
+    fn an_empty_store_is_an_explicit_error_not_an_empty_answer() {
+        let store = Store::open_in_memory(GRAPH_DIM).unwrap();
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "main", None);
+        assert!(!c.indexed);
+        let err = c
+            .ready()
+            .expect_err("nothing indexed must not look like []");
+        assert!(err.contains("demo has no index for any branch"), "{err}");
+        assert!(err.contains("devctx index"), "{err}");
+    }
+
+    #[test]
+    fn the_most_recently_indexed_branch_is_the_last_resort() {
+        let store = store_indexed_on("main");
+        // A second branch, indexed later.
+        store
+            .upsert(&[VectorPoint {
+                id: "p2".into(),
+                vector: vec![0.0; GRAPH_DIM],
+                text: "fn other() {}".into(),
+                metadata: VectorMetadata {
+                    repo: "demo".into(),
+                    branch: "develop".into(),
+                    file: "c.rs".into(),
+                    symbol: "other".into(),
+                    ..Default::default()
+                },
+            }])
+            .unwrap();
+        store
+            .save_index_record(&devctx_store::IndexRecord {
+                repo_path: REPO_PATH.into(),
+                branch: "develop".into(),
+                last_commit: "def".into(),
+                model_name: "m".into(),
+                model_dimension: GRAPH_DIM as i64,
+                file_count: 1,
+                symbol_count: 1,
+                chunk_count: 1,
+                indexed_at: "2026-10-04T00:00:00Z".into(),
+            })
+            .unwrap();
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "feat/x", None);
+        assert_eq!(c.branch, "develop");
+        assert_eq!(
+            store.branches_by_recency(REPO_PATH).unwrap(),
+            vec!["develop".to_string(), "main".to_string()]
+        );
     }
 }

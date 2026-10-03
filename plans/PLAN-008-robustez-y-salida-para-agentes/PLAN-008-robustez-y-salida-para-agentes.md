@@ -236,7 +236,7 @@ binario instalado y sugieren reiniciar la sesión.
 | TASK-003 | Ciclo de vida del MCP: salida en EOF y aviso de versión desfasada | P0 | — | `done` |
 | TASK-004 | Reconexión del cliente remoto ante un serve muerto | P0 | TASK-001 | `pending` |
 | TASK-005 | Entorno de git limpio en hooks, serve y subprocesos `git` | P0 | — | `done` |
-| TASK-006 | Grafo honesto: fallback de rama como `search` y avisos explícitos | P0 | — | `pending` |
+| TASK-006 | Grafo honesto: fallback de rama como `search` y avisos explícitos | P0 | — | `done` |
 | TASK-007 | Versión del extractor en `index_meta` y aviso de índice viejo | P0 | — | `pending` |
 | TASK-008 | `recall` federado: exe propio robusto y errores con ruta | P0 | TASK-001 | `pending` |
 | TASK-009 | Higiene de tests: ningún serve sobrevive a la suite | P0 | TASK-001 | `pending` |

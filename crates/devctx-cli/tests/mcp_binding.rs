@@ -495,6 +495,7 @@ fn scope_defaults_follow_the_binding() {
 /// another repository's code with no sign that it did.
 #[test]
 fn a_project_hint_selects_the_member() {
+    let _serial = EmbedLock::acquire();
     let tmp = Tmp::new("hint");
     let home = tmp.home();
     let ws = tmp.dir("workspace");
@@ -505,6 +506,7 @@ fn a_project_hint_selects_the_member() {
     // one answered.
     std::fs::write(alpha.join("who.txt"), "i am alpha").unwrap();
     std::fs::write(beta.join("who.txt"), "i am beta").unwrap();
+    std::fs::write(beta.join("lib.rs"), "pub fn beta_marker() {}\n").unwrap();
 
     // Some code tools ask git where the repository root is, so the members have
     // to be real repositories rather than registered directories.
@@ -541,7 +543,10 @@ fn a_project_hint_selects_the_member() {
     // `read_file` returns a bare string, and `annotate` deliberately leaves
     // those alone rather than changing a shape callers already parse. A tool
     // that answers with an object carries `resolved_project`, which is how a
-    // caller tells an honoured hint from a silently ignored one.
+    // caller tells an honoured hint from a silently ignored one. The member has
+    // to be indexed first: a graph tool answers "nothing indexed" with an
+    // explicit error, not an object (PLAN-008 TASK-006).
+    index_directly(&home, &beta);
     let obj = call_tool(
         &home,
         &ws,
@@ -553,6 +558,95 @@ fn a_project_hint_selects_the_member() {
         Some("beta"),
         "an object answer must name the project it resolved to, got: {obj}"
     );
+}
+
+/// Index a repository in-process (no server), the way `devctx index` does with
+/// autoserve off. The repository must already be a git repo with a commit.
+fn index_directly(home: &Path, repo: &Path) {
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", home)
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(repo)
+        .arg("index")
+        .output()
+        .expect("running devctx index");
+    assert!(
+        out.status.success(),
+        "index: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn git_in(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// PLAN-008 TASK-006 (B4) — the graph answers from an indexed branch, and says so.
+///
+/// Indexed on one branch, checked out on another nobody indexed: `search` has
+/// always fallen back, but the graph tools filtered by the current branch and
+/// answered `[]` with no explanation. Now they use the same rule and carry
+/// `branch_fallback`; and a repository with no index at all is an error, not `[]`.
+#[test]
+fn graph_tools_fall_back_to_the_indexed_branch_and_say_so() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("graphbranch");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let repo = make_project(&home, &ws, "solo", None);
+    std::fs::write(repo.join("lib.rs"), "pub fn alpha_marker() {}\n").unwrap();
+    git_in(&repo, &["init", "-q", "-b", "trunk"]);
+    git_in(&repo, &["config", "user.email", "t@t"]);
+    git_in(&repo, &["config", "user.name", "t"]);
+    git_in(&repo, &["add", "-A"]);
+    git_in(&repo, &["commit", "-qm", "init"]);
+
+    // Nothing indexed yet: an explicit error, not an empty answer.
+    let msg = call_tool_raw(
+        &home,
+        &repo,
+        "read_symbol",
+        serde_json::json!({"name": "alpha_marker"}),
+    );
+    let err = msg["error"]["message"].as_str().unwrap_or_default();
+    assert!(err.contains("has no index for any branch"), "got: {msg}");
+
+    index_directly(&home, &repo);
+
+    // The indexed branch itself: no new field.
+    let on_trunk = call_tool(
+        &home,
+        &repo,
+        "read_symbol",
+        serde_json::json!({"name": "alpha_marker"}),
+    );
+    assert!(on_trunk.get("branch_fallback").is_none(), "{on_trunk}");
+    assert!(!on_trunk["definitions"].as_array().unwrap().is_empty());
+
+    // A branch nobody indexed.
+    git_in(&repo, &["checkout", "-q", "-b", "feat/not-indexed"]);
+    let on_feature = call_tool(
+        &home,
+        &repo,
+        "read_symbol",
+        serde_json::json!({"name": "alpha_marker"}),
+    );
+    assert!(
+        !on_feature["definitions"].as_array().unwrap().is_empty(),
+        "the graph must answer from the indexed branch, got: {on_feature}"
+    );
+    assert_eq!(on_feature["branch_fallback"]["current"], "feat/not-indexed");
+    assert_eq!(on_feature["branch_fallback"]["used"], "trunk");
 }
 
 /// Call a tool and return the raw JSON-RPC message, so a test can assert on an
