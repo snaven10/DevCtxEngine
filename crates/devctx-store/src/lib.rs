@@ -23,7 +23,7 @@ pub use memory_refs::{short_label, FileIndex, LinkedMemory, SymbolRef};
 pub use projects::{ProjectIndexStats, ProjectRecord};
 pub use routes::StoredRoute;
 pub use schema::init_schema;
-pub use state::{FileState, IndexRecord};
+pub use state::{FileState, IndexRecord, EXTRACTOR_META_KEY};
 pub use store::Store;
 
 #[cfg(test)]

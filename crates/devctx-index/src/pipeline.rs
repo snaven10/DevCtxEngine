@@ -8,7 +8,7 @@ use devctx_chunk::{chunk_file, chunk_raw_text, content_hash, Chunk, ChunkConfig}
 use devctx_core::types::{VectorMetadata, VectorPoint};
 use devctx_embed::EmbeddingProvider;
 use devctx_parse::{detect_lang, extract_routes, parse, raw_text_language};
-use devctx_store::{FileState, IndexRecord, Store, StoredEdge, StoredRoute};
+use devctx_store::{FileState, IndexRecord, Store, StoredEdge, StoredRoute, EXTRACTOR_META_KEY};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::error::{IndexError, Result};
@@ -89,6 +89,10 @@ pub struct IndexResult {
     pub symbols: usize,
     /// Total chunks stored.
     pub chunks: usize,
+    /// An incremental run left this branch's index on an older (or unknown)
+    /// extractor: only the changed files were re-parsed, so the rest still
+    /// carries what the old extractor produced. `--full` clears it.
+    pub extractor_stale: bool,
 }
 
 /// Run the indexing pipeline against the repository containing `repo_root`.
@@ -156,6 +160,9 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let model_changed = prev.as_ref().is_some_and(|p| {
         p.model_name != req.model_name || p.model_dimension as usize != req.embedder.dimension()
     });
+    let prev_extractor_stale =
+        req.store
+            .extractor_stale(&repo_path, &branch, &devctx_parse::extractor_fingerprint())?;
     let last_commit = prev.as_ref().map(|p| p.last_commit.clone());
     let can_incremental = req.incremental
         && !model_changed
@@ -262,8 +269,8 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     };
     let counts = totals;
     req.store.save_index_record(&IndexRecord {
-        repo_path,
-        branch,
+        repo_path: repo_path.clone(),
+        branch: branch.clone(),
         last_commit,
         model_name: req.model_name.to_string(),
         model_dimension: req.embedder.dimension() as i64,
@@ -272,6 +279,22 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         chunk_count: counts.2,
         indexed_at: now_stamp(),
     })?;
+
+    // Stamp the extractor only when the whole branch was produced by it: a full
+    // run, or an incremental one over an index already stamped with it. An
+    // incremental run over an older index re-parses just the changed files, so
+    // stamping it would hide the rest — the very thing this record is for.
+    let current_extractor = devctx_parse::extractor_fingerprint();
+    if full_reindex || !prev_extractor_stale {
+        req.store
+            .set_index_meta(&repo_path, &branch, EXTRACTOR_META_KEY, &current_extractor)?;
+    } else {
+        result.extractor_stale = true;
+        eprintln!(
+            "· this index was built by an older extractor; an incremental run keeps its old \
+             symbols and edges. Run `devctx index --full` to rebuild it"
+        );
+    }
 
     if let Some(metric) = &had_hnsw {
         req.store.enable_hnsw(metric)?;

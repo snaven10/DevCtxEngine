@@ -12,6 +12,7 @@ pub mod git;
 pub mod id;
 pub mod pipeline;
 
+pub use devctx_parse::extractor_fingerprint;
 pub use error::{IndexError, Result};
 pub use git::{Change, GitRepo, GitState};
 pub use id::chunk_id;
@@ -484,6 +485,61 @@ mod tests {
             .filter(|h| h.point.metadata.file == "b.rs")
             .count();
         assert_eq!(b_hits, 0, "stale b.rs vectors remain");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_from_an_older_extractor_stays_stale_until_a_full_run() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_extractor_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "a.rs", "pub fn a() -> i32 { 1 }\n");
+        commit_all(&dir, "init");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        let r1 = index(&store, &dir);
+        let repo_path = GitRepo::open(&dir)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .to_string();
+        let branch = r1.branch.clone();
+        let now = extractor_fingerprint();
+        assert!(
+            !store.extractor_stale(&repo_path, &branch, &now).unwrap(),
+            "a fresh index carries the current extractor"
+        );
+        assert!(!r1.extractor_stale);
+
+        // An index made by another extractor (or by none at all).
+        store
+            .set_index_meta(&repo_path, &branch, "extractor", "v0-old")
+            .unwrap();
+        assert!(store.extractor_stale(&repo_path, &branch, &now).unwrap());
+        write(&dir, "b.rs", "pub fn b() -> i32 { 2 }\n");
+        commit_all(&dir, "add b");
+        let r2 = index(&store, &dir);
+        assert!(!r2.full_reindex);
+        assert!(r2.extractor_stale, "an incremental run must not hide it");
+        assert!(store.extractor_stale(&repo_path, &branch, &now).unwrap());
+
+        let r3 = run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: false,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+            exclude: &[],
+            branch: None,
+        })
+        .unwrap();
+        assert!(r3.full_reindex && !r3.extractor_stale);
+        assert!(!store.extractor_stale(&repo_path, &branch, &now).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

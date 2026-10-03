@@ -16,7 +16,7 @@ pub mod types;
 pub use error::{ParseError, Result};
 pub use lang::{lang_for_extension, raw_text_language, Lang};
 pub use parser::LanguageParser;
-pub use registry::LangDef;
+pub use registry::{extractor_fingerprint, LangDef, EXTRACTOR_VERSION};
 pub use routes::{extract_routes, Route};
 pub use types::{GraphEdge, Import, ParsedFile, Symbol};
 

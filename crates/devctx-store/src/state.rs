@@ -8,6 +8,9 @@ use duckdb::params;
 use crate::error::Result;
 use crate::store::Store;
 
+/// The `index_meta` key under which the extractor fingerprint is stored.
+pub const EXTRACTOR_META_KEY: &str = "extractor";
+
 /// One `index_state` row: what was last indexed for a (repo_path, branch).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRecord {
@@ -123,6 +126,55 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// One `index_meta` value for a (repo_path, branch), if recorded.
+    pub fn get_index_meta(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT value FROM index_meta WHERE repo_path = ? AND branch = ? AND key = ?",
+        )?;
+        match stmt.query_row(params![repo_path, branch, key], |r| r.get::<_, String>(0)) {
+            Ok(v) => Ok(Some(v)),
+            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Insert or replace one `index_meta` value.
+    pub fn set_index_meta(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM index_meta WHERE repo_path = ? AND branch = ? AND key = ?",
+            params![repo_path, branch, key],
+        )?;
+        self.conn.execute(
+            "INSERT INTO index_meta (repo_path, branch, key, value) VALUES (?, ?, ?, ?)",
+            params![repo_path, branch, key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the index of a (repo_path, branch) was built by an extractor
+    /// other than `current` (an [`extractor fingerprint`]). An index with no
+    /// recorded extractor — every index made before this existed — counts as
+    /// stale: its extractor is unknown, and "unknown" must not read as "fine".
+    ///
+    /// [`extractor fingerprint`]: EXTRACTOR_META_KEY
+    pub fn extractor_stale(&self, repo_path: &str, branch: &str, current: &str) -> Result<bool> {
+        Ok(self
+            .get_index_meta(repo_path, branch, EXTRACTOR_META_KEY)?
+            .as_deref()
+            != Some(current))
     }
 
     /// The last-indexed content hash for a file, if recorded.
@@ -264,6 +316,26 @@ mod tests {
         };
         store.save_index_record(&rec).unwrap();
         assert_eq!(store.get_index_record("/repo", "main").unwrap(), Some(rec));
+    }
+
+    #[test]
+    fn a_store_without_index_meta_reports_a_stale_extractor() {
+        let store = Store::open_in_memory(3).unwrap();
+        // Simulates a database created before the table existed.
+        store.conn.execute_batch("DROP TABLE index_meta;").unwrap();
+        crate::schema::init_schema(&store.conn, 3).unwrap();
+        assert!(store.extractor_stale("/repo", "main", "v1-x").unwrap());
+        store
+            .set_index_meta("/repo", "main", EXTRACTOR_META_KEY, "v1-x")
+            .unwrap();
+        assert!(!store.extractor_stale("/repo", "main", "v1-x").unwrap());
+        assert!(store.extractor_stale("/repo", "main", "v2-y").unwrap());
+        assert!(store.extractor_stale("/repo", "dev", "v1-x").unwrap());
+        // Replacing, not appending.
+        store
+            .set_index_meta("/repo", "main", EXTRACTOR_META_KEY, "v2-y")
+            .unwrap();
+        assert!(!store.extractor_stale("/repo", "main", "v2-y").unwrap());
     }
 
     /// Totals must survive a run that changed nothing: an incremental index

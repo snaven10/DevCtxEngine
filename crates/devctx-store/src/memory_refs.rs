@@ -452,6 +452,10 @@ impl Store {
             "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
             params![repo_path, branch],
         )?;
+        self.conn.execute(
+            "DELETE FROM index_meta WHERE repo_path = ? AND branch = ?",
+            params![repo_path, branch],
+        )?;
         Ok(n as usize)
     }
 

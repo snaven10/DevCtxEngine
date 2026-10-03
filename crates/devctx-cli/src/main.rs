@@ -3367,6 +3367,9 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         );
     }
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);
+    if res.extractor_stale {
+        println!("  index built by an older extractor; run `devctx index --full` to rebuild it");
+    }
 
     if cfg.storage.hnsw {
         if store.enable_hnsw(&cfg.storage.metric)? {
