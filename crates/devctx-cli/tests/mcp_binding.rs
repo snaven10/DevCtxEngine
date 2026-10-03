@@ -1329,3 +1329,252 @@ fn an_mcp_whose_binary_was_replaced_can_still_start_a_server() {
         "the server should have started from the replaced binary: {msg}"
     );
 }
+
+// --- MCP lifecycle (PLAN-008 D2) ---------------------------------------------
+
+const INIT_MSGS: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"#,
+    r#""2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"1"}}}"#,
+    "\n",
+    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    "\n",
+);
+
+/// Wait for `child` to exit, polling, and return how long it took (or `None`
+/// if it was still running at `limit`; the child is then killed by PID).
+fn wait_exit(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let t0 = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return Some(t0.elapsed());
+        }
+        if t0.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The client closing stdin ends the session: after a completed handshake the
+/// MCP exits promptly instead of lingering as an orphan.
+#[test]
+fn the_mcp_exits_when_its_client_closes_stdin() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = Tmp::new("lc_eof");
+    let home = tmp.home();
+    let cwd = tmp.dir("empty");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&cwd)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(INIT_MSGS.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    // Keep stdin open until the handshake reply, then close it on purpose.
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    loop {
+        let line = lines.next().expect("MCP closed early").unwrap();
+        if line.contains(r#""id":1"#) {
+            break;
+        }
+    }
+    drop(stdin);
+    let took = wait_exit(&mut child, std::time::Duration::from_secs(10))
+        .expect("the MCP did not exit after stdin closed");
+    assert!(took.as_secs_f32() < 3.0, "exit took {took:?}");
+}
+
+/// A tool still running on the blocking pool must not keep the process alive
+/// after the client is gone. The project's server is frozen (SIGSTOP): it is
+/// alive and advertised, so the MCP routes `index_status` to it and the call
+/// sits in the blocking pool until its request timeout.
+#[test]
+fn the_mcp_exits_after_eof_even_with_a_blocking_tool_in_flight() {
+    use std::io::Write;
+    let tmp = Tmp::new("lc_eof_busy");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+
+    let server = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{}", free_port())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning a hand-run server");
+    let pid = server.id();
+    let _server = KillOnDrop(server);
+    let advert = root.join(".devctx/state/serve.json");
+    let t0 = std::time::Instant::now();
+    while !advert.exists() {
+        assert!(t0.elapsed().as_secs() < 60, "the server never advertised");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let signal = |sig: &str| {
+        Command::new("kill")
+            .args([sig, &pid.to_string()])
+            .status()
+            .expect("kill")
+    };
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .env("DEVCTX_DAEMON_TIMEOUT_SECS", "60")
+        .current_dir(&root)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+    let replies = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        use std::io::Read;
+        let mut out = child.stdout.take().unwrap();
+        let replies = replies.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = out.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                replies
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    let call = |id: u32| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"index_status","arguments":{{}}}}}}"#
+        )
+    };
+    stdin.write_all(INIT_MSGS.as_bytes()).unwrap();
+    // First call, against the live server: the MCP connects and keeps the connection.
+    stdin.write_all(call(2).as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+    let t0 = std::time::Instant::now();
+    while !replies.lock().unwrap().contains(r#""id":2"#) {
+        assert!(t0.elapsed().as_secs() < 60, "the first call never answered");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Now freeze the server: the next call goes out on the open connection and hangs.
+    assert!(signal("-STOP").success());
+    stdin.write_all(call(3).as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(child.try_wait().unwrap().is_none(), "exited before EOF");
+    assert!(
+        !replies.lock().unwrap().contains(r#""id":3"#),
+        "the call already finished, so nothing was in flight: {}",
+        replies.lock().unwrap()
+    );
+    drop(stdin);
+    let took = wait_exit(&mut child, std::time::Duration::from_secs(30));
+    let _ = signal("-CONT");
+    let took = took.expect("the MCP stayed alive after EOF with a tool in flight");
+    // rmcp drains in-flight requests for up to 5 s, then the runtime gets 1 s.
+    assert!(took.as_secs_f32() < 8.0, "exit took {took:?}");
+}
+
+/// Reinstalling devctx under a running MCP must not take it down: it keeps
+/// answering, and says its binary was replaced so the agent can suggest a restart.
+#[test]
+fn a_replaced_binary_is_reported_and_the_mcp_keeps_answering() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = Tmp::new("lc_replaced");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+    // `index_status` reads the repository's state, so it has to be a git repo.
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    // Run from a private copy so replacing it cannot touch the build output.
+    let bin_dir = tmp.dir("bin");
+    let exe = bin_dir.join("devctx");
+    std::fs::copy(env!("CARGO_BIN_EXE_devctx"), &exe).unwrap();
+
+    let mut child = Command::new(&exe)
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(INIT_MSGS.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut ask = |id: u64, tool: &str| -> serde_json::Value {
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{{}}}}}}"#
+        );
+        stdin.write_all(call.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+        loop {
+            let line = lines.next().expect("MCP closed early").unwrap();
+            let Ok(m) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if m.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                return m;
+            }
+        }
+    };
+    let text = |m: &serde_json::Value| -> serde_json::Value {
+        let t = m["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no text in: {m}"));
+        serde_json::from_str(t).unwrap()
+    };
+
+    let before = text(&ask(2, "index_status"));
+    assert_eq!(before["mcp"]["binary_replaced"], false, "{before}");
+    assert!(before["mcp"].get("hint").is_none());
+
+    // What `install -m755 new ~/.local/bin/devctx` does: a new inode takes the path.
+    let staged = bin_dir.join("devctx.new");
+    std::fs::copy(env!("CARGO_BIN_EXE_devctx"), &staged).unwrap();
+    std::fs::rename(&staged, &exe).unwrap();
+
+    let after = text(&ask(3, "index_status"));
+    assert_eq!(after["mcp"]["binary_replaced"], true, "{after}");
+    assert_eq!(after["mcp"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(after["mcp"]["installed_version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        after["mcp"]["hint"].as_str().unwrap().contains("restart"),
+        "{after}"
+    );
+    // The same session still serves other tools.
+    let listed = text(&ask(4, "list_projects"));
+    assert_eq!(listed["mcp"]["binary_replaced"], true, "{listed}");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the MCP exited on its own"
+    );
+
+    drop(stdin);
+    let _ = wait_exit(&mut child, std::time::Duration::from_secs(10));
+}

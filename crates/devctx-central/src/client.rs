@@ -212,8 +212,9 @@ fn log_sink(paths: &CentralPaths) -> std::process::Stdio {
 /// Returns a handle the caller can poll to tell "not up yet" apart from "it is
 /// never coming up".
 fn spawn(paths: &CentralPaths) -> Result<Arc<Mutex<Option<std::process::ExitStatus>>>> {
+    // Not `current_exe()`: after a reinstall it ends in " (deleted)" and cannot be spawned.
     let exe_path =
-        std::env::current_exe().map_err(|e| CentralError::Io(e, PathBuf::from("<current exe>")))?;
+        devctx_core::self_exe().map_err(|e| CentralError::Io(e, PathBuf::from("<current exe>")))?;
     let mut cmd = std::process::Command::new(&exe_path);
     cmd.args([
         "serve",
