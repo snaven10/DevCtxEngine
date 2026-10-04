@@ -99,3 +99,13 @@ Reintentar después de enviar duplicaría escrituras: la política lo prohíbe y
 - `FAILURE_BACKOFF` baja de 8 s a 3 s: también memoizaba Busy / "shutting down" y fallaba al instante 8 s con
   el serve ya de vuelta (el punto 8 de arriba queda como "3 s").
 - Código muerto: se elimina `Backend::remote` (connect `None`, sin llamadores).
+
+### Fixup D2b (review final)
+
+- `a_slow_connect_does_not_hold_the_link_lock_and_is_single_flight` solo discriminaba por `try_lock` con
+  un `sleep(150ms)`: un hilo tardío daba falso verde. Ahora el conector se queda esperando en una
+  compuerta (`mpsc`), se espera por sondeo a que arranque, el segundo hilo llega con el primero
+  provablemente en vuelo y se comprueba que el conector no corre dos veces.
+- `a_dropped_syn_gives_up_at_the_connect_timeout` acotaba a 10 s sin comprobar el presupuesto de 2 s:
+  ahora afirma `CONNECT_TIMEOUT <= 2 s` y que la llamada vuelve en < 5 s (SYN descartado ≈ 2 s; red
+  inalcanzable, antes).

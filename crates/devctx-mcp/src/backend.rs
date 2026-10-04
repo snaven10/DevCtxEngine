@@ -814,14 +814,27 @@ mod tests {
 
     /// M-1: the Link lock is not held while the connector runs, and concurrent
     /// callers share one connect instead of queueing a connector each.
+    ///
+    /// Deterministic: the connector parks on a gate, so the second caller
+    /// arrives while the first is provably still connecting (a failure cached
+    /// for the back-off cannot mask a second connector run).
     #[test]
     fn a_slow_connect_does_not_hold_the_link_lock_and_is_single_flight() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let wait_for = |what: &str, cond: &dyn Fn() -> bool| {
+            let t = std::time::Instant::now();
+            while !cond() {
+                assert!(t.elapsed() < Duration::from_secs(10), "timed out: {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
         let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
         let c = calls.clone();
         let connect: Connector = Arc::new(move || {
             c.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(700));
+            let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(10));
             Err("hung".to_string())
         });
         let client = Arc::new(RemoteClient::new(connect));
@@ -829,15 +842,32 @@ mod tests {
             let cl = client.clone();
             std::thread::spawn(move || cl.target().unwrap_err())
         };
-        std::thread::sleep(Duration::from_millis(150));
+        wait_for("the connector to start", &|| {
+            calls.load(Ordering::SeqCst) == 1
+        });
         assert!(
             client.link.try_lock().is_ok(),
             "the Link mutex must be free while the connector runs"
         );
+        let arrived = Arc::new(AtomicBool::new(false));
         let second = {
-            let cl = client.clone();
-            std::thread::spawn(move || cl.target().unwrap_err())
+            let (cl, a) = (client.clone(), arrived.clone());
+            std::thread::spawn(move || {
+                a.store(true, Ordering::SeqCst);
+                cl.target().unwrap_err()
+            })
         };
+        wait_for("the second caller to start", &|| {
+            arrived.load(Ordering::SeqCst)
+        });
+        // Time for it to reach the connector if it were going to.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second caller must wait for the first connect, not start its own"
+        );
+        release.send(()).unwrap();
         assert_eq!(first.join().unwrap(), "hung");
         assert_eq!(second.join().unwrap(), "hung");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one connector run");
@@ -854,6 +884,10 @@ mod tests {
         let agent = client.agent(Duration::from_secs(30));
         let t = std::time::Instant::now();
         let _ = agent.get("http://10.255.255.1:9/x").call();
-        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        // The connect budget is CONNECT_TIMEOUT (2 s): a dropped SYN returns
+        // at about that, an unreachable network sooner, and never near the
+        // 30 s request deadline. A few seconds of slack for a loaded machine.
+        assert!(CONNECT_TIMEOUT <= Duration::from_secs(2));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     }
 }

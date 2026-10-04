@@ -107,6 +107,20 @@ pub fn remove_own_serve_file(cfg: &ProjectConfig) {
     }
 }
 
+/// The pid `serve.json` currently advertises.
+fn advertised_pid(cfg: &ProjectConfig) -> Option<u32> {
+    std::fs::read(serve_file(cfg))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ServeInfo>(&raw).ok())
+        .and_then(|i| i.pid)
+}
+
+/// Whether "started background server" is true: the server that answered is
+/// the process this call spawned, not one that won the race.
+fn announce_spawn(spawned_pid: u32, advertised: Option<u32>) -> bool {
+    advertised == Some(spawned_pid)
+}
+
 /// A reachable server we can route requests to.
 #[derive(Clone)]
 pub struct Remote {
@@ -196,8 +210,14 @@ pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
     let spawned = spawn_server(cfg).map_err(|e| EnsureError::Spawn(format!("{e:#}")))?;
     // Said only once it is up: when the serve cannot start (the lock is held,
     // the port is taken) "started" would be a lie printed right before the error.
+    // And only when the server that came up is OURS: when another one won the
+    // race and our spawn exited, we started nothing.
     let started = |r: Remote| {
-        eprintln!("· started background server (devctx serve); it stays warm for later commands");
+        if announce_spawn(spawned.pid, advertised_pid(cfg)) {
+            eprintln!(
+                "· started background server (devctx serve); it stays warm for later commands"
+            );
+        }
         Ok(r)
     };
     for _ in 0..WAIT_TICKS {
@@ -358,6 +378,7 @@ fn human_age(secs: u64) -> String {
 
 /// What a spawned `devctx serve` is doing.
 struct Spawned {
+    pid: u32,
     exited: std::sync::Arc<std::sync::Mutex<Option<std::process::ExitStatus>>>,
     log: PathBuf,
     /// Length of `serve.log` before this spawn, so a stale line from an earlier
@@ -436,6 +457,7 @@ fn spawn_server(cfg: &ProjectConfig) -> Result<Spawned> {
     let child = cmd
         .spawn()
         .with_context(|| format!("spawning {}", exe.display()))?;
+    let pid = child.id();
     let exited = std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot = std::sync::Arc::clone(&exited);
     std::thread::spawn(move || {
@@ -447,6 +469,7 @@ fn spawn_server(cfg: &ProjectConfig) -> Result<Spawned> {
         }
     });
     Ok(Spawned {
+        pid,
         exited,
         log,
         log_offset,
@@ -1129,10 +1152,20 @@ mod tests {
         let text = describe_process(child.id());
         let _ = child.kill();
         let _ = child.wait();
+        // 2.3 s of sleep plus whatever a loaded CI machine adds: the point is
+        // seconds, not the days the procfs lookup time would have claimed.
         assert!(
-            text.contains("running for 2s") || text.contains("running for 3s"),
+            (2..=6).any(|n| text.contains(&format!("running for {n}s"))),
             "{text}"
         );
+    }
+
+    /// N1: the "started" line is for OUR spawn only.
+    #[test]
+    fn only_our_own_spawn_is_announced() {
+        assert!(announce_spawn(42, Some(42)));
+        assert!(!announce_spawn(42, Some(43)), "another server won the race");
+        assert!(!announce_spawn(42, None));
     }
 
     #[test]

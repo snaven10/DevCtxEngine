@@ -361,6 +361,16 @@ Cada TASK llena su `## Resultado` con:
 - Ejecución de P0 en la rama `feat/plan-008-p0`, con compilación y tests autorizados; la sesión
   `debug-devctx-mcp-process` revisa cada lote y hace la verificación de campo antes de 0.8.3.
 
+## Pendientes para P1 (surgidos en la revisión final de P0)
+
+- **m-2 (macOS):** `Handle::wait_exit` fuera de Linux sondea `!owns()` cada 50 ms; debería usar
+  kqueue (`EVFILT_PROC` / `NOTE_EXIT`) para esperar la salida real, como el pidfd en Linux.
+- **m-4:** la guardia de la caché de modelos solo comprueba `resolve_model_cache`; no cubre tests
+  fuera de `devctx-cli/tests` (p. ej. el test `#[ignore]` de minilm usa el `model_cache_dir()` real),
+  ni un `CARGO_TARGET_DIR` relativo, ni `build.target-dir` de `.cargo/config`.
+- **D1b:** no hay test e2e de `serve --stop` contra un checkpoint final real de más de 6 s (el
+  camino paciente de `terminate_patient` solo se prueba con procesos de mentira).
+
 ## 13. Cierre
 
 <!-- SE LLENA AL CERRAR EL PLAN -->

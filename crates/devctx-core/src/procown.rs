@@ -126,9 +126,15 @@ pub(crate) fn lstart_token(lstart: &str) -> u64 {
 pub(crate) fn ps_info(pid: u32) -> PsInfo {
     #[cfg(unix)]
     {
+        // `-ww`: BSD `ps` cuts `command` to the terminal width (79 without a
+        // tty) otherwise, and a long path would lose its `serve`. `TZ=UTC`:
+        // `lstart` is local time, and the token recorded by a server in one
+        // timezone must equal the one a client in another recomputes.
         let out = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "lstart=,command="])
+            .args(["-ww", "-p", &pid.to_string(), "-o", "lstart=,command="])
             .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .env_remove("COLUMNS")
             .stderr(std::process::Stdio::null())
             .output();
         match out {
@@ -171,10 +177,54 @@ pub fn is_server_pid(pid: u32) -> bool {
     }
 }
 
-/// [`is_server_proc`] over a `ps` command column (space-separated).
+/// [`is_server_proc`] over a `ps` command column. `ps` joins argv with plain
+/// spaces, so a path that holds spaces (`/Users/John Doe/bin/devctx serve`)
+/// cannot be split blindly: each token whose basename starts with `devctx` is
+/// tried as the end of argv[0] (the words before it being part of an absolute
+/// path), and the rest is the arguments.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn ps_command_is_server(command: &str) -> bool {
-    is_server_proc(None, command.replace(' ', "\0").as_bytes())
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    let Some(first) = toks.first() else {
+        return false;
+    };
+    (0..toks.len()).any(|i| {
+        let base = toks[i].rsplit('/').next().unwrap_or("");
+        if !base.starts_with("devctx") || (i > 0 && !first.starts_with('/')) {
+            return false;
+        }
+        let mut cmdline = toks[..=i].join(" ").into_bytes();
+        for a in &toks[i + 1..] {
+            cmdline.push(0);
+            cmdline.extend_from_slice(a.as_bytes());
+        }
+        is_server_proc(None, &cmdline)
+    })
+}
+
+/// `ps -ww -o command= -p <pid>`, trimmed; `None` if the process is gone or
+/// `ps` cannot be run. Off Linux only.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_command(pid: u32) -> Option<String> {
+    match ps_info(pid) {
+        PsInfo::Proc { command, .. } => Some(command),
+        _ => None,
+    }
+}
+
+/// Whether a `ps` command column carries `flag` as a whole argument.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn ps_command_has(command: &str, flag: &str) -> bool {
+    ps_command_is_server(command) && command.split_whitespace().any(|a| a == flag)
+}
+
+/// The cwd out of `lsof -a -p <pid> -d cwd -Fn` (`p<pid>`, `fcwd`, `n<path>`).
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn parse_lsof_cwd(out: &str) -> Option<std::path::PathBuf> {
+    out.lines()
+        .find_map(|l| l.strip_prefix('n'))
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// Seconds since `pid` started. Linux: its start ticks against `/proc/uptime`
@@ -256,18 +306,49 @@ pub fn cwd_is(pid: u32, root: &Path) -> bool {
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         cwd == root
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // No /proc: `lsof` (shipped with macOS) names the cwd. Without it the
+        // answer is "cannot vouch", which leaves the process Unverified.
+        let Ok(o) = std::process::Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+            .env("LC_ALL", "C")
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        let Some(cwd) = parse_lsof_cwd(&String::from_utf8_lossy(&o.stdout)) else {
+            return false;
+        };
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        std::fs::canonicalize(&cwd).unwrap_or(cwd) == root
+    }
+    #[cfg(not(unix))]
     {
         let _ = (pid, root);
         false
     }
 }
 
-/// Whether `pid`'s command line contains `flag` as an argument.
+/// Whether `pid` is a `devctx` server whose command line contains `flag` as
+/// an argument. Off Linux that is `ps`'s command column, not `/proc`.
 pub fn cmdline_has(pid: u32, flag: &str) -> bool {
-    std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|c| c.split(|b| *b == 0).any(|a| a == flag.as_bytes()))
-        .unwrap_or(false)
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|c| c.split(|b| *b == 0).any(|a| a == flag.as_bytes()))
+            .unwrap_or(false)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        ps_command(pid).is_some_and(|c| ps_command_has(&c, flag))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, flag);
+        false
+    }
 }
 
 /// Classify the pid a discovery file advertises.
@@ -548,9 +629,13 @@ pub fn terminate_patient(
         (&patient, patience_cap),
         kill_wait,
         |h, limit, owns| h.wait_exit(limit, owns),
+        |h, sig| h.signal(sig),
     )
 }
 
+/// The body of [`terminate_patient`], with the two OS interactions injected:
+/// `wait` (until exit) and `send` (a signal; `Err(errno)` when refused), so
+/// tests can model a refusal without signalling a real foreign process.
 fn terminate_with(
     handle: &Handle,
     owns: impl Fn() -> bool,
@@ -558,13 +643,14 @@ fn terminate_with(
     (patient, patience_cap): (&dyn Fn() -> bool, Duration),
     kill_wait: Duration,
     wait: impl Fn(&Handle, Duration, &dyn Fn() -> bool) -> bool,
+    send: impl Fn(&Handle, i32) -> Result<(), i32>,
 ) -> Termination {
     if !owns() {
         return Termination::Gone;
     }
     #[cfg(unix)]
     {
-        if handle.signal(libc::SIGTERM) == Err(libc::EPERM) {
+        if send(handle, libc::SIGTERM) == Err(libc::EPERM) {
             return Termination::NoPermission;
         }
         if wait(handle, term_wait, &owns) {
@@ -578,12 +664,12 @@ fn terminate_with(
             }
             waited += slice;
         }
-        if handle.signal(libc::SIGKILL) == Err(libc::EPERM) {
+        if send(handle, libc::SIGKILL) == Err(libc::EPERM) {
             return Termination::NoPermission;
         }
     }
     #[cfg(not(unix))]
-    let _ = (handle, term_wait, patient, patience_cap);
+    let _ = (handle, term_wait, patient, patience_cap, &send);
     if wait(handle, kill_wait, &owns) {
         Termination::Gone
     } else {
@@ -660,6 +746,44 @@ mod pure_tests {
         );
         assert_eq!(classify_ps(PsInfo::Absent, 7, Some(t), no), Ownership::Gone);
         assert_eq!(parse_ps_line("garbage"), PsInfo::Unknown);
+    }
+
+    /// m-1: `ps` joins argv with spaces, so a path with spaces must still read
+    /// as `devctx serve`, and nothing else may.
+    #[test]
+    fn a_ps_command_with_spaces_in_the_path_is_still_a_server() {
+        let is = ps_command_is_server;
+        assert!(is(
+            "/Users/John Doe/.local/bin/devctx serve --addr 127.0.0.1:1"
+        ));
+        assert!(is("/Users/John Doe/My Tools/devctx --verbose serve"));
+        assert!(is("/opt/homebrew/Cellar/devctx/0.8.3/bin/devctx api"));
+        assert!(is("devctx serve --central"));
+        assert!(!is("/Users/John Doe/bin/devctx mcp"));
+        assert!(!is("/Users/John Doe/bin/devctx search serve"));
+        assert!(!is("vim devctx serve"));
+        assert!(!is("/usr/bin/vim serve"));
+        assert!(!is(""));
+    }
+
+    /// I-3: the off-Linux fallbacks for a `serve.json` that predates the
+    /// recorded start time.
+    #[test]
+    fn the_off_linux_fallbacks_read_ps_and_lsof_output() {
+        let c = "/Users/John Doe/bin/devctx serve --central --addr 127.0.0.1:2";
+        assert!(ps_command_has(c, "--central"));
+        assert!(!ps_command_has("/Users/u/bin/devctx serve", "--central"));
+        // The flag of something that is not a devctx server proves nothing.
+        assert!(!ps_command_has("/usr/bin/vim serve --central", "--central"));
+        assert_eq!(
+            parse_lsof_cwd("p123\nfcwd\nn/Users/John Doe/repo\n"),
+            Some(std::path::PathBuf::from("/Users/John Doe/repo"))
+        );
+        assert_eq!(parse_lsof_cwd("p123\nfcwd\n"), None);
+        assert_eq!(parse_lsof_cwd(""), None);
+        // With the fallbacks vouching, an old file's server is Ours.
+        let info = parse_ps_line(&format!("Thu Oct  3 09:15:02 2026 {c}"));
+        assert_eq!(classify_ps(info, 7, None, |_| true), Ownership::Ours);
     }
 
     /// Launched through `/proc/self/exe`, argv[0] says nothing; the executable
@@ -843,6 +967,7 @@ mod tests {
                 std::thread::sleep(limit);
                 false
             },
+            |h, sig| h.signal(sig),
         );
         assert_eq!(out, Termination::Survived);
         reap(c);
@@ -882,20 +1007,27 @@ mod tests {
     }
 
     /// A signal the kernel refuses is reported as such, not as "survived".
-    /// Needs a process we may not signal: pid 1 for a non-root user.
+    /// The refusal is injected: a real signal to a foreign process (pid 1)
+    /// could take a container down.
     #[test]
     fn a_refused_signal_is_reported_as_no_permission() {
-        // SAFETY: plain syscall.
-        if unsafe { libc::geteuid() } == 0 {
-            return; // root may signal pid 1: never run this as root.
-        }
-        let out = terminate(
-            1,
+        let sent = std::cell::RefCell::new(Vec::new());
+        // No real process: the handle is never used by the injected sender.
+        let handle = Handle::open(u32::MAX - 1);
+        let out = terminate_with(
+            &handle,
             || true,
             Duration::from_millis(100),
+            (&|| false, Duration::ZERO),
             Duration::from_millis(100),
+            |_, _, _| panic!("a refused SIGTERM must not wait"),
+            |_, sig| {
+                sent.borrow_mut().push(sig);
+                Err(libc::EPERM)
+            },
         );
         assert_eq!(out, Termination::NoPermission);
+        assert_eq!(*sent.borrow(), vec![libc::SIGTERM]);
         assert!(out
             .failure("server", 1)
             .unwrap()

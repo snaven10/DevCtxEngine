@@ -1183,23 +1183,31 @@ pub fn do_index_progress(state: &AppState) -> Result<String, String> {
 /// "branch X is not indexed; search answers from branch X" (the same branch on
 /// both sides) in a repository that had never been indexed at all.
 fn no_record_hint(indexed_branches: &[String], chosen: &BranchChoice, current: &str) -> String {
-    if indexed_branches.is_empty() {
-        // No record for any branch: nothing to fall back to either.
-        "nothing indexed yet; run `devctx index`".to_string()
-    } else if !chosen.indexed {
-        "nothing is indexed for this repository; run devctx index".to_string()
-    } else if chosen.branch == current {
-        // Rows with no completed record: an index that was cut short.
+    // What `chosen` says is what search will do: it is decided by which
+    // branches hold ROWS, while `indexed_branches` lists completed RECORDS.
+    // The two differ exactly in the cases worth telling apart.
+    if chosen.indexed && chosen.branch == current {
+        // Rows without a completed record: an index that was cut short, on a
+        // first run or a later one alike.
         format!(
             "branch {current} has rows but no completed index record (an interrupted run?); \
              run `devctx index` to finish it"
         )
-    } else {
+    } else if chosen.indexed {
         // Name the branch search will actually use, not every candidate.
         format!(
             "branch {current} is not indexed; search and the graph tools answer from branch \
              {}; run devctx index to index this one",
             chosen.branch
+        )
+    } else if indexed_branches.is_empty() {
+        "nothing indexed yet; run `devctx index`".to_string()
+    } else {
+        // Records exist, but no branch has rows to answer from.
+        format!(
+            "branch {current} is not indexed, and the records of other branches ({}) have no \
+             rows to answer from; run `devctx index`",
+            indexed_branches.join(", ")
         )
     }
 }
@@ -5800,21 +5808,32 @@ mod tests {
         }
     }
 
-    /// N3: a repository that was never indexed says so, instead of "branch X
-    /// is not indexed; answering from branch X".
+    /// N3/m-3: each situation gets its own accurate sentence, whatever the
+    /// records say about other branches.
     #[test]
-    fn a_repository_never_indexed_gets_its_own_message() {
-        let hint = no_record_hint(&[], &choice("main", true), "main");
-        assert!(hint.contains("nothing indexed yet"), "{hint}");
-        assert!(hint.contains("devctx index"), "{hint}");
+    fn each_no_record_situation_gets_its_own_message() {
+        // Never indexed: no rows, no records.
         let hint = no_record_hint(&[], &choice("main", false), "main");
         assert!(hint.contains("nothing indexed yet"), "{hint}");
-        // Rows without a record: not the same sentence as a fallback.
-        let hint = no_record_hint(&["dev".into()], &choice("main", true), "main");
-        assert!(hint.contains("no completed index record"), "{hint}");
-        assert!(!hint.contains("answer from branch main"), "{hint}");
+        assert!(hint.contains("devctx index"), "{hint}");
+        // Rows for the current branch and no record, first index interrupted:
+        // not "nothing indexed", and the same sentence as with other records.
+        let first = no_record_hint(&[], &choice("main", true), "main");
+        assert!(
+            first.contains("has rows but no completed index record"),
+            "{first}"
+        );
+        assert!(!first.contains("nothing indexed"), "{first}");
+        let later = no_record_hint(&["dev".into()], &choice("main", true), "main");
+        assert_eq!(first, later);
         // A real fallback still names the branch it answers from.
         let hint = no_record_hint(&["dev".into()], &choice("dev", true), "main");
         assert!(hint.contains("answer from branch dev"), "{hint}");
+        // Records for other branches but no rows anywhere: not "nothing is
+        // indexed for this repository" (records exist) and no false fallback.
+        let hint = no_record_hint(&["dev".into()], &choice("main", false), "main");
+        assert!(hint.contains("records of other branches (dev)"), "{hint}");
+        assert!(!hint.contains("nothing indexed"), "{hint}");
+        assert!(!hint.contains("answer from branch"), "{hint}");
     }
 }

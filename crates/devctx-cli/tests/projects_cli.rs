@@ -569,3 +569,27 @@ fn init_with_a_model_that_is_not_on_disk_names_the_download_command() {
     assert!(err.contains("devctx models --download ml-granite"), "{err}");
     assert!(!repo.join(".devctx").join("config.yaml").exists());
 }
+
+/// m-5: `--yes` is "defaults without asking": with a model whose files are
+/// missing it does not download (CI would pull hundreds of MB), it names the
+/// command, and `--download` is the explicit way to opt in.
+#[test]
+fn init_yes_does_not_download_and_names_the_command() {
+    let tmp = Tmp::new("init_yes_nodl");
+    let repo = tmp.repo("alpha");
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .env("DEVCTX_MODEL_CACHE", tmp.0.join("empty-cache"))
+        .current_dir(&repo)
+        .args(["init", "--yes", "--model", "ml-granite"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("devctx models --download ml-granite"), "{err}");
+    assert!(!err.contains("fetching them now"), "{err}");
+    assert!(!tmp.0.join("empty-cache").join("ml-granite").exists());
+    assert!(!repo.join(".devctx").join("config.yaml").exists());
+}

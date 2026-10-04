@@ -271,3 +271,19 @@ Revisión: TASK-009 podía cortar un índice legítimo y salir con el WAL sin pl
 - **No verificado:** un checkpoint final real de >6 s con `serve --stop` de punta a punta (la
   paciencia está probada en `procown` y el marcador en `remote`); EIO real de drvfs; reconstrucción
   HNSW con la extensión VSS ausente (la rama `Ok(false)` no se ejercita en tests).
+
+### Fixup D2b (review final)
+
+- **N4 completo:** `devctx models` aún imprimía `devctx models download <model>` (inexistente); ahora
+  `devctx models --download <model>`, igual que los comentarios de `main.rs`/`models.rs`. Test:
+  `the_models_listing_names_the_real_download_command`.
+- **m-5:** `init --yes` descargaba cientos de MB (CI) y lo hacía antes de aplicar `offline`. Ahora
+  `may_download(offline, yes, --download, tty)`: nunca con `offline: true` (respuesta del asistente o
+  default de la máquina), nunca con `--yes` solo ni sin terminal (el error trae el comando exacto
+  `devctx models --download <m>`), solo en terminal interactiva o con la bandera explícita nueva
+  `init --download`. La descarga ocurre DESPUÉS de confirmar el resumen (el selector de modelo del
+  asistente ya no descarga). Tests: `init_downloads_model_files_only_when_it_may`,
+  `a_missing_model_is_deferred_when_fetching_and_refused_otherwise`,
+  `init_yes_does_not_download_and_names_the_command`.
+- **Nits de test:** `the_age_shown_is_the_process_age...` acepta 2..=6 s; ver TASK-004 (single-flight y
+  SYN descartado) y TASK-001 (I-4: sin SIGTERM a PID 1).

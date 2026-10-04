@@ -127,3 +127,12 @@ obligatorio cuando hay fallback.
   "nothing indexed yet; run `devctx index`"; filas sin registro completo en la rama actual -> "has rows but no
   completed index record (an interrupted run?)"; fallback real -> el texto de siempre. Test:
   `a_repository_never_indexed_gets_its_own_message`.
+
+### Fixup D2b (review final) — m-3
+
+- `no_record_hint` era inconsistente (filas de un primer índice interrumpido decían "nothing indexed
+  yet"; sin filas pero con registros de otras ramas decía "nothing is indexed for this repository").
+  Ahora decide por lo que search va a hacer (`chosen`): filas de la rama actual sin registro →
+  "has rows but no completed index record" (con o sin otros registros); fallback → nombra la rama;
+  sin filas y sin registros → "nothing indexed yet"; sin filas pero con registros de otras ramas → lo
+  dice y las nombra. Test: `each_no_record_situation_gets_its_own_message`.

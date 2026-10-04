@@ -69,9 +69,14 @@ enum Command {
         /// Directory for this project's index. Default: inside the repository.
         #[arg(long)]
         state_dir: Option<String>,
-        /// Take the defaults without asking, and without confirming.
+        /// Take the defaults without asking, and without confirming. Never
+        /// downloads model files by itself: add `--download` for that.
         #[arg(long)]
         yes: bool,
+        /// Download the chosen model's files if they are missing (hundreds of
+        /// MB), without asking. Ignored when the machine is set to offline.
+        #[arg(long)]
+        download: bool,
     },
     /// List the embedding models available, or download one that needs files.
     Models {
@@ -505,7 +510,8 @@ fn main() -> Result<()> {
             model,
             state_dir,
             yes,
-        } => cmd_init(path, name, group, model, state_dir, yes),
+            download,
+        } => cmd_init(path, name, group, model, state_dir, yes, download),
         Command::Models { download } => cmd_models(download),
         Command::Update => models::self_update("snaven10/DevCtxEngine", env!("CARGO_PKG_VERSION")),
         Command::Status => cmd_status(),
@@ -967,15 +973,33 @@ fn cmd_tui(project: Option<String>) -> Result<()> {
     devctx_tui::run(cfg, server)
 }
 
+/// Whether `init` may download model files now. Never when the configuration
+/// says offline; never behind a script's back (`--yes`, or no terminal) unless
+/// `--download` was passed; otherwise on an interactive terminal, where the
+/// person picked or named the model.
+fn may_download(
+    offline: devctx_core::config::Offline,
+    yes: bool,
+    download_flag: bool,
+    tty: bool,
+) -> bool {
+    if offline == devctx_core::config::Offline::True {
+        return false;
+    }
+    download_flag || (!yes && tty)
+}
+
 /// Resolve `--model` into an embeddings config, refusing what cannot work.
 ///
 /// A user-defined ONNX model needs its files on disk, and the failure without
 /// them arrives later, at the first index. Checking here turns it into a
-/// sentence about running `models download`.
+/// sentence about running `models --download <model>`. When `will_fetch` the
+/// missing files are not an error: `model_dir` stays empty and the caller
+/// downloads them once the answers are confirmed.
 fn choose_model(
     key: &str,
     base: &devctx_core::config::Embeddings,
-    fetch: bool,
+    will_fetch: bool,
 ) -> Result<devctx_core::config::Embeddings> {
     let spec = devctx_embed::registry::find_local(key).ok_or_else(|| {
         anyhow!("unknown model `{key}`; run `devctx models` to see what there is")
@@ -986,16 +1010,11 @@ fn choose_model(
     out.model_dir = if spec.builtin.is_some() {
         String::new()
     } else {
-        // `fetch`: the caller asked for this model outright (`--yes`, or a
-        // person at a terminal naming it with `--model`), so getting its files
-        // is the consequence of the request. Otherwise (a script, an agent)
-        // nothing is downloaded behind its back: it gets the exact command.
-        if fetch && models::local_dir(key).is_none() {
-            eprintln!("`{key}` needs its files; fetching them now.");
-            models::download(key)?;
+        match models::local_dir(key) {
+            Some(dir) => dir.to_string_lossy().into_owned(),
+            None if will_fetch => String::new(),
+            None => bail!(missing_files_message(key)),
         }
-        let dir = models::local_dir(key).ok_or_else(|| anyhow!(missing_files_message(key)))?;
-        dir.to_string_lossy().into_owned()
     };
     Ok(out)
 }
@@ -1005,7 +1024,7 @@ fn missing_files_message(key: &str) -> String {
     format!(
         "`{key}` is a user-defined ONNX model and its files are not on this machine yet. \
          Fetch them with `devctx models --download {key}` and run this again, or pass \
-         `--yes` to download them as part of `init`."
+         `--download` to fetch them as part of `init` (not when offline)."
     )
 }
 
@@ -2950,6 +2969,7 @@ fn cmd_init(
     model: Option<String>,
     state_dir: Option<String>,
     yes: bool,
+    download: bool,
 ) -> Result<()> {
     let root = match path {
         Some(p) => p,
@@ -3020,15 +3040,15 @@ fn cmd_init(
         defaults.reranking = cfg.reranking.clone();
         copied = Some(cfg);
     }
+    // What the offline setting will be, known before any file is fetched: a
+    // machine or an answer that says "never go online" must stop the download.
+    let offline = answers.offline.unwrap_or(defaults.embeddings.offline);
+    let will_fetch = {
+        use std::io::IsTerminal as _;
+        may_download(offline, yes, download, std::io::stdin().is_terminal())
+    };
     if let Some(key) = &answers.model {
-        {
-            use std::io::IsTerminal as _;
-            defaults.embeddings = choose_model(
-                key,
-                &defaults.embeddings,
-                yes || std::io::stdin().is_terminal(),
-            )?;
-        }
+        defaults.embeddings = choose_model(key, &defaults.embeddings, will_fetch)?;
     }
     if let Some(o) = answers.offline {
         defaults.embeddings.offline = o;
@@ -3048,6 +3068,15 @@ fn cmd_init(
                 wizard_text::Text::new(answers.language.unwrap_or_default()).nothing_written()
             );
             return Ok(());
+        }
+    }
+
+    // The files are fetched only now, once the person has confirmed (or there
+    // was nobody to ask and `--download` said so): not before the summary.
+    if let Some(key) = &answers.model {
+        if will_fetch && defaults.embeddings.model_dir.is_empty() {
+            let dir = models::download(key)?;
+            defaults.embeddings.model_dir = dir.to_string_lossy().into_owned();
         }
     }
 
@@ -3825,6 +3854,70 @@ fn render_table(hits: &[SearchResult]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// m-5: `init` downloads hundreds of MB only where someone is there to
+    /// want it, and never against an offline setting.
+    #[test]
+    fn init_downloads_model_files_only_when_it_may() {
+        use devctx_core::config::Offline::{Auto, False, True};
+        // (offline, yes, --download, tty) -> may download
+        assert!(
+            may_download(Auto, false, false, true),
+            "a person at a terminal"
+        );
+        assert!(!may_download(Auto, false, false, false), "a script");
+        assert!(
+            !may_download(Auto, true, false, true),
+            "--yes alone asks nothing, fetches nothing"
+        );
+        assert!(!may_download(Auto, true, false, false), "CI with --yes");
+        assert!(
+            may_download(False, true, true, false),
+            "explicit --download"
+        );
+        // Offline wins over everything, an explicit flag included.
+        assert!(!may_download(True, false, true, true));
+        assert!(!may_download(True, true, true, false));
+    }
+
+    #[test]
+    fn a_missing_model_is_deferred_when_fetching_and_refused_otherwise() {
+        let _guard = TempModelCache::new();
+        let base = devctx_core::config::Embeddings::default();
+        let err = choose_model("ml-granite", &base, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("devctx models --download ml-granite"), "{err}");
+        let deferred = choose_model("ml-granite", &base, true).unwrap();
+        assert_eq!(deferred.model, "ml-granite");
+        assert!(
+            deferred.model_dir.is_empty(),
+            "downloaded later, after confirming"
+        );
+        // Built-in models never need files.
+        assert!(choose_model("minilm-l6", &base, false)
+            .unwrap()
+            .model_dir
+            .is_empty());
+    }
+
+    /// Points the model cache at an empty directory for one test.
+    struct TempModelCache(std::path::PathBuf);
+    impl TempModelCache {
+        fn new() -> Self {
+            let d = std::env::temp_dir().join(format!("devctx_main_mc_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            std::env::set_var("DEVCTX_MODEL_CACHE", &d);
+            TempModelCache(d)
+        }
+    }
+    impl Drop for TempModelCache {
+        fn drop(&mut self) {
+            std::env::remove_var("DEVCTX_MODEL_CACHE");
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// The defect that hid the longest, in the cheapest possible form.
     ///
     /// `local_recall` read the server's answer with `as_array()`. `/recall`

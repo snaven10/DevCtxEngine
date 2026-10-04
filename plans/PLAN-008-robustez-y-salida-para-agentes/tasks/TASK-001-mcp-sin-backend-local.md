@@ -165,3 +165,27 @@ ser accionable (causa + comando). `serve.log` puede crecer: truncar.
   start_time distinto). Test: `terminate_returns_only_after_the_process_has_exited` (`owns` pasa a falso al
   instante mientras el proceso sigue cerrando: no debe volver antes). No se reprodujo el campo con un
   `index --full` real.
+
+### Fixup D2b (review final)
+
+- **I-4:** `a_refused_signal_is_reported_as_no_permission` mandaba un SIGTERM REAL al PID 1 (en un
+  contenedor con PID 1 no-root del mismo uid, tini/dumb-init, tumbaba el contenedor/CI). Ahora
+  `terminate_with` recibe el envío de señales como parámetro (`send`) y el test inyecta `EPERM`; ningún
+  test señala un proceso ajeno.
+- **I-1 (macOS):** BSD `ps` recorta `command` al ancho de terminal (79 sin TTY): una ruta larga perdía el
+  `serve` y el pid pasaba a `Gone` (con `serve.json` borrado y el server vivo). `ps_info` usa `-ww` y
+  `env_remove("COLUMNS")`.
+- **I-2 (macOS):** `lstart` es hora local; el token que guarda el serve (su TZ) y el que recalcula el
+  cliente (otra TZ: MCP/launchd) divergían. `ps_info` fuerza `TZ=UTC`.
+- **I-3 (macOS, actualización):** un `serve.json` escrito antes de D2 no tiene `start_time` y el fallback
+  no funcionaba fuera de Linux (`cwd_is` siempre falso, `cmdline_has` leía `/proc`) → `Unverified` y
+  `serve --stop` fallaba siempre justo tras actualizar. Ahora `cwd_is` usa `lsof -a -p <pid> -d cwd -Fn`
+  (`parse_lsof_cwd`) y `cmdline_has` la columna de `ps -ww` (`ps_command_has`, exige además que sea un
+  devctx serve). Parseo en funciones puras con test
+  (`the_off_linux_fallbacks_read_ps_and_lsof_output`). No verificado en macOS real.
+- **m-1:** `ps_command_is_server` reemplazaba espacios por `\0` y una ruta con espacios
+  (`/Users/John Doe/...`) rompía argv0. Ahora prueba cada token cuyo basename empieza por `devctx` como
+  fin de argv0 (con la ruta absoluta antes). Test: `a_ps_command_with_spaces_in_the_path_is_still_a_server`.
+- **N1:** "started background server" solo se imprime si el serve que respondió es el que ESTE comando
+  lanzó (`announce_spawn`: pid de `serve.json` == pid del hijo). Test: `only_our_own_spawn_is_announced`.
+- **Pendiente P1:** ver la lista "Pendientes para P1" del plan (m-2 kqueue).
