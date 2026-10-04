@@ -481,10 +481,14 @@ fn owns_server(cfg: &ProjectConfig, info: &ServeInfo) -> bool {
 
 /// How long a server gets to exit on SIGTERM, and then on SIGKILL.
 ///
-/// Above the server's own stop timeline (grace 3 s + exit checkpoint budget
-/// 1.5 s, see `devctx_api::Lifecycle`), so SIGKILL never lands in the middle of
-/// the checkpoint the stop is waiting for.
-const TERM_WAIT: Duration = Duration::from_secs(5);
+/// Derived from the server's own stop timeline ([`devctx_api::STOP_TIMELINE`]:
+/// grace + exit checkpoint budget, 4.5 s) plus a margin wide enough for a
+/// loaded machine (a 0.5 s margin measured 0.4 s of slack on WSL), so SIGKILL
+/// never lands in the middle of the checkpoint the stop is waiting for. A
+/// server that is still checkpointing past it says so (see
+/// [`checkpointing`]) and is waited for.
+const TERM_WAIT: Duration =
+    Duration::from_millis(devctx_api::STOP_TIMELINE.as_millis() as u64 + 1500);
 const KILL_WAIT: Duration = Duration::from_secs(3);
 
 /// SIGTERM wait for a server that reports an indexing run in flight: it
@@ -523,8 +527,40 @@ fn term_wait_for(info: &ServeInfo, term: Duration) -> Duration {
     }
 }
 
+/// The warning for an `/index` answer that reports the run was cancelled (the
+/// server was stopping), or `None` for a run that completed.
+///
+/// A cancelled answer is a well-formed success as far as HTTP goes, and every
+/// client used to read it as one: `devctx index` exited 0, `projects reindex`
+/// printed a summary, the watcher logged "re-indexed" and dropped the files it
+/// had not reached.
+pub fn index_cancelled(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if !v["cancelled"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    Some(format!(
+        "indexing was cancelled because the server stopped, after {} file(s); what was indexed \
+         is saved, and running `devctx index` again finishes the job",
+        v["files_indexed"].as_u64().unwrap_or(0)
+    ))
+}
+
+/// Whether server `pid` is taking its final checkpoint right now: it holds
+/// [`devctx_api::checkpoint_marker`] with its pid in it. By then the server's
+/// listener is closed, so this file is the only way to ask.
+fn checkpointing(cfg: &ProjectConfig, pid: u32) -> bool {
+    std::fs::read_to_string(devctx_api::checkpoint_marker(cfg))
+        .is_ok_and(|s| s.trim() == pid.to_string())
+}
+
 /// Stop the advertised server and report whether it is gone. Never deletes
 /// the discovery file: that is only right once the process is gone.
+///
+/// Past `term`, the wait goes on — up to [`INDEX_TERM_WAIT`] in all — for as
+/// long as the server reports a checkpoint in progress: a final checkpoint of
+/// a large WAL can outlast any fixed wait, and SIGKILL in the middle of it is
+/// the one outcome this whole shutdown exists to avoid.
 fn terminate_ours(
     cfg: &ProjectConfig,
     info: &ServeInfo,
@@ -534,7 +570,14 @@ fn terminate_ours(
     let Some(pid) = info.pid else {
         return procown::Termination::Gone;
     };
-    procown::terminate(pid, || owns_server(cfg, info), term, kill)
+    procown::terminate_patient(
+        pid,
+        || owns_server(cfg, info),
+        term,
+        || checkpointing(cfg, pid),
+        term.max(INDEX_TERM_WAIT),
+        kill,
+    )
 }
 
 /// Stop any background server holding this project's DB so the caller can take
@@ -1107,6 +1150,36 @@ mod tests {
         c.project.path = dir.to_string_lossy().to_string();
         c.storage.db_path = dir.join("index.duckdb").to_string_lossy().to_string();
         c
+    }
+
+    #[test]
+    fn a_cancelled_index_answer_is_recognised() {
+        let warn = index_cancelled(r#"{"cancelled":true,"files_indexed":3,"commit":"abc"}"#)
+            .expect("a cancelled run must be reported as such");
+        assert!(warn.contains("3 file(s)"), "{warn}");
+        assert!(index_cancelled(r#"{"files_indexed":3,"commit":"abc"}"#).is_none());
+        assert!(index_cancelled(r#"{"cancelled":false}"#).is_none());
+        assert!(index_cancelled("not json").is_none());
+    }
+
+    /// D1b: `serve --stop` keeps waiting only for the server it signalled,
+    /// and only while that server says it is checkpointing — a marker left by
+    /// another (dead, or recycled) pid does not hold SIGKILL off.
+    #[test]
+    fn the_checkpoint_marker_speaks_only_for_its_own_pid() {
+        let dir = std::env::temp_dir().join(format!("devctx_ckpt_marker_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        assert!(!checkpointing(&cfg, 4242), "no marker, no patience");
+        std::fs::write(devctx_api::checkpoint_marker(&cfg), "4242").unwrap();
+        assert!(checkpointing(&cfg, 4242));
+        assert!(!checkpointing(&cfg, 4243), "someone else's marker");
+        assert!(
+            TERM_WAIT >= devctx_api::STOP_TIMELINE + Duration::from_secs(1),
+            "the plain wait must clear the server's own timeline with room to spare"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn advertise(cfg: &ProjectConfig, pid: u32) {

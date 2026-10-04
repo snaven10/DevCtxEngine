@@ -20,7 +20,9 @@
 //! apart and fails with `LockAcquisition`), and would leave one more stuck
 //! thread behind. So a stall **poisons** the model for the rest of the process:
 //! every later load of it fails at once with the same instruction — restart the
-//! server — instead of a confusing lock error after five seconds.
+//! server — instead of a confusing lock error after five seconds. The poison
+//! lasts only as long as its cause: an abandoned loader that does finish after
+//! all (the link came back) releases the lock, and lifts the poison with it.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -71,6 +73,13 @@ fn poison(what: &str) {
         .insert(what.to_string());
 }
 
+/// The loader of `what` finished: whatever lock it held is released.
+fn unpoison(what: &str) {
+    if let Some(set) = poisoned_lock().as_mut() {
+        set.remove(what);
+    }
+}
+
 fn poisoned_error(what: &str) -> String {
     format!(
         "{STALL_MARKER}: an earlier load of {what} in this process stopped receiving data and \
@@ -116,18 +125,35 @@ pub fn guard_load<T: Send + 'static>(
     what: &str,
     load: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
+    guard_load_with(what, stall_limit(), load)
+}
+
+/// [`guard_load`] with the stall limit passed in rather than read from
+/// [`MODEL_STALL_ENV`] — the environment is process-global, and a test that
+/// set it leaked a one-second limit into every other test of the binary.
+fn guard_load_with<T: Send + 'static>(
+    what: &str,
+    limit: Option<Duration>,
+    load: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
     if is_poisoned(what) {
         return Err(poisoned_error(what));
     }
-    let Some(limit) = stall_limit() else {
+    let Some(limit) = limit else {
         return Ok(load());
     };
     let cache = crate::dirs::model_cache_dir();
     let (tx, rx) = mpsc::channel();
+    let name = what.to_string();
     std::thread::Builder::new()
         .name("model-load".into())
         .spawn(move || {
-            let _ = tx.send(load());
+            let value = load();
+            // Finished — in time, or long after it was abandoned: either way
+            // it no longer holds the cache lock, and the model may be tried
+            // again.
+            unpoison(&name);
+            let _ = tx.send(value);
         })
         .map_err(|e| format!("spawning the loader for {what}: {e}"))?;
 
@@ -176,9 +202,9 @@ mod tests {
     /// restart instruction — not run (and hang, or fail on the lock) again.
     #[test]
     fn a_stalled_load_poisons_the_model_for_the_process() {
-        std::env::set_var(MODEL_STALL_ENV, "1");
+        let limit = Some(Duration::from_secs(1));
         let key = format!("test-stall-{}", std::process::id());
-        let err = guard_load(&key, || std::thread::sleep(Duration::from_secs(30)))
+        let err = guard_load_with(&key, limit, || std::thread::sleep(Duration::from_secs(30)))
             .expect_err("a load that never finishes must stall");
         assert!(is_stall_error(&err), "{err}");
         assert!(err.contains("devctx serve --stop"), "{err}");
@@ -187,7 +213,7 @@ mod tests {
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = ran.clone();
         let t0 = Instant::now();
-        let again = guard_load(&key, move || {
+        let again = guard_load_with(&key, limit, move || {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         })
         .expect_err("a poisoned model must not be loaded again");
@@ -202,7 +228,33 @@ mod tests {
             "the loader must not run again"
         );
         // Other models are unaffected.
-        assert_eq!(guard_load("another-model", || 3).unwrap(), 3);
+        assert_eq!(guard_load_with("another-model", limit, || 3).unwrap(), 3);
+    }
+
+    /// D1b nit: the poison is about a lock the abandoned loader holds. When
+    /// that loader finishes after all, the lock is gone and so is the reason
+    /// to refuse the model.
+    #[test]
+    fn the_poison_lifts_once_the_abandoned_loader_finishes() {
+        let key = format!("test-unpoison-{}", std::process::id());
+        let err = guard_load_with(&key, Some(Duration::from_millis(300)), || {
+            std::thread::sleep(Duration::from_millis(1500))
+        })
+        .expect_err("it stalls past the limit");
+        assert!(is_stall_error(&err));
+        assert!(is_poisoned(&key));
+        let t0 = Instant::now();
+        while is_poisoned(&key) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "the poison outlived the loader"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            guard_load_with(&key, Some(Duration::from_secs(5)), || 9).unwrap(),
+            9
+        );
     }
 
     #[test]

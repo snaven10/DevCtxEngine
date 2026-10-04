@@ -121,8 +121,12 @@ pub async fn serve_with(
     on_exit: impl Fn() + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
     let on_exit: ExitHook = Arc::new(on_exit);
+    let marker = checkpoint_marker(&cfg);
     let state = Arc::new(AppState::build(cfg)?);
-    let life = Arc::new(Lifecycle::default());
+    let life = Arc::new(Lifecycle {
+        marker: Some(marker),
+        ..Default::default()
+    });
     let activity = Arc::new(Mutex::new(Instant::now()));
     let app = router(Api {
         state: state.clone(),
@@ -201,10 +205,38 @@ pub async fn serve_with(
     while life.within_hard_cap() && state.index_winding_down(INDEX_CANCEL_QUIET) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    life.final_checkpoint.store(CKPT_RUNNING, Ordering::SeqCst);
-    state.checkpoint_for_exit();
+    // Claimed, not just announced: a watchdog that read "not started" a moment
+    // ago may be entering `exit_now` right now, and two checkpoints racing —
+    // one of them cut short by the other's `_exit` — is the failure this
+    // state exists to prevent.
+    if !life.claim_orderly_checkpoint() {
+        // `exit_now` owns the exit and ends the process within its budget.
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    life.begin_checkpoint_marker();
+    // Frozen for good: the runtime's wind-down below may still run blocking
+    // tasks (a request whose client left, a cancelled index past the cap),
+    // and none of them may write after this checkpoint.
+    state.checkpoint_for_exit(ORDERLY_FREEZE_WAIT);
+    life.end_checkpoint_marker();
     life.final_checkpoint.store(CKPT_DONE, Ordering::SeqCst);
     Ok(())
+}
+
+/// The file a stopping server holds while it takes its final checkpoint,
+/// containing its pid: `serve.checkpointing`, next to `serve.json`.
+///
+/// `devctx serve --stop` cannot ask the server over HTTP by then — the
+/// listener is the first thing a stop closes — so this is how it learns that
+/// the process it is waiting on is folding its WAL, and keeps waiting rather
+/// than sending SIGKILL into the middle of it.
+pub fn checkpoint_marker(cfg: &ProjectConfig) -> std::path::PathBuf {
+    let db = cfg.db_path();
+    db.parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("serve.checkpointing")
 }
 
 /// What a server undoes about itself before a watchdog ends the process
@@ -212,11 +244,30 @@ pub async fn serve_with(
 type ExitHook = Arc<dyn Fn() + Send + Sync>;
 
 /// How long a stop request has to complete in an orderly way before the
-/// watchdog may end the process. `DEVCTX_SHUTDOWN_GRACE_SECS` overrides it.
+/// watchdog may end the process. `DEVCTX_SHUTDOWN_GRACE_SECS` overrides it,
+/// downwards only: see [`STOP_TIMELINE`].
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 3;
 
 /// How long the exit checkpoint may take before the process leaves without it.
 const CHECKPOINT_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The longest a server with no index in flight takes to end after SIGTERM:
+/// the grace (at most [`DEFAULT_SHUTDOWN_GRACE_SECS`]) plus the exit
+/// checkpoint's budget. `devctx serve --stop` waits this plus a margin before
+/// SIGKILL. The grace override is clamped to the default so a larger value
+/// cannot push the timeline past what the client waits — which used to land
+/// SIGKILL in the middle of the checkpoint the stop was waiting for.
+pub const STOP_TIMELINE: Duration = Duration::from_millis(
+    DEFAULT_SHUTDOWN_GRACE_SECS * 1000 + CHECKPOINT_BUDGET.as_millis() as u64,
+);
+
+/// How long the exit path waits for a write already running before it
+/// checkpoints regardless: a slice of [`CHECKPOINT_BUDGET`], since the
+/// checkpoint itself must fit in the rest.
+const EXIT_FREEZE_WAIT: Duration = Duration::from_millis(500);
+
+/// The same wait on the orderly path, which has no budget to fit in.
+const ORDERLY_FREEZE_WAIT: Duration = Duration::from_secs(5);
 
 /// The longest a stop request waits for a cancelled indexing run (or the final
 /// checkpoint) that is still making progress. `devctx serve --stop` waits this
@@ -235,9 +286,15 @@ const RUNTIME_WIND_DOWN: Duration = Duration::from_secs(5);
 /// overrides it (the tests use a fraction of a second).
 const DEFAULT_VANISH_POLL: Duration = Duration::from_secs(10);
 
-// `Lifecycle::final_checkpoint`: 0 (the default) is "not started".
+// `Lifecycle::final_checkpoint`.
+/// Not started (the default).
+const CKPT_IDLE: u8 = 0;
+/// The orderly path is taking the final checkpoint.
 const CKPT_RUNNING: u8 = 1;
+/// The final checkpoint is taken; nothing is left to save.
 const CKPT_DONE: u8 = 2;
+/// `exit_now` claimed the checkpoint and is ending the process.
+const CKPT_EXITING: u8 = 3;
 
 /// Where the server is in its shutdown, shared by the orderly path and the
 /// watchdog threads.
@@ -257,10 +314,15 @@ const CKPT_DONE: u8 = 2;
 ///   `FORCE CHECKPOINT` if a transaction blocks it, then `_exit`.
 /// * **t = 60 s** ([`INDEX_CANCEL_CAP`]) — exit now regardless.
 ///
-/// `serve --stop` waits 5 s before SIGKILL — above grace + checkpoint budget
-/// (4.5 s) — and `INDEX_CANCEL_CAP` + 5 s when the server says an index is in
-/// flight, so the signal never lands in the middle of the checkpoint it is
-/// waiting for.
+/// `serve --stop` waits [`STOP_TIMELINE`] (grace + checkpoint budget, 4.5 s)
+/// plus a margin before SIGKILL, `INDEX_CANCEL_CAP` + 5 s when the server says
+/// an index is in flight, and — whichever it chose — keeps waiting while the
+/// server holds its [`checkpoint_marker`], so the signal never lands in the
+/// middle of the checkpoint it is waiting for.
+///
+/// The final checkpoint is taken exactly once, by whichever of the orderly
+/// path and `exit_now` claims [`Lifecycle::final_checkpoint`] first; the other
+/// waits for it.
 #[derive(Default)]
 struct Lifecycle {
     /// Non-health requests being served right now.
@@ -271,6 +333,8 @@ struct Lifecycle {
     final_checkpoint: AtomicU8,
     /// Set by the first thread to start ending the process.
     exiting: AtomicBool,
+    /// [`checkpoint_marker`] for this server; `None` in tests without one.
+    marker: Option<std::path::PathBuf>,
 }
 
 impl Lifecycle {
@@ -292,6 +356,62 @@ impl Lifecycle {
     fn within_hard_cap(&self) -> bool {
         self.since_stop() < INDEX_CANCEL_CAP
     }
+
+    /// The orderly path's claim on the final checkpoint; `false` when
+    /// `exit_now` got there first (and is ending the process).
+    fn claim_orderly_checkpoint(&self) -> bool {
+        self.final_checkpoint
+            .compare_exchange(CKPT_IDLE, CKPT_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// `exit_now`'s claim on the final checkpoint.
+    fn claim_exit_checkpoint(&self) -> ExitClaim {
+        match self.final_checkpoint.compare_exchange(
+            CKPT_IDLE,
+            CKPT_EXITING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => ExitClaim::Ours,
+            Err(CKPT_RUNNING) => ExitClaim::OrderlyRunning,
+            Err(_) => ExitClaim::Done,
+        }
+    }
+
+    /// Wait (at most `cap`) for the orderly path's checkpoint to finish.
+    fn wait_orderly_checkpoint(&self, cap: Duration) {
+        let deadline = Instant::now() + cap;
+        while self.final_checkpoint.load(Ordering::SeqCst) == CKPT_RUNNING
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Say "checkpointing" to a `devctx serve --stop` waiting on this process.
+    fn begin_checkpoint_marker(&self) {
+        if let Some(m) = &self.marker {
+            let _ = std::fs::write(m, std::process::id().to_string());
+        }
+    }
+
+    fn end_checkpoint_marker(&self) {
+        if let Some(m) = &self.marker {
+            let _ = std::fs::remove_file(m);
+        }
+    }
+}
+
+/// What `exit_now` found when it went to take the final checkpoint.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitClaim {
+    /// Nobody had started it: `exit_now` takes it.
+    Ours,
+    /// The orderly path is taking it: wait, do not `_exit` over it.
+    OrderlyRunning,
+    /// Already taken (or being taken by another exit): just leave.
+    Done,
 }
 
 /// Middleware: count the non-health requests in flight (the vanished-project
@@ -312,10 +432,16 @@ async fn count_in_flight(State(life): State<Arc<Lifecycle>>, req: Request, next:
 }
 
 fn shutdown_grace() -> Duration {
-    let secs: u64 = std::env::var("DEVCTX_SHUTDOWN_GRACE_SECS")
-        .ok()
+    grace_from(std::env::var("DEVCTX_SHUTDOWN_GRACE_SECS").ok().as_deref())
+}
+
+/// The grace for an override value; never above the default, which is what
+/// [`STOP_TIMELINE`] — and so the client's SIGKILL — is built on.
+fn grace_from(value: Option<&str>) -> Duration {
+    let secs: u64 = value
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS);
+        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS)
+        .min(DEFAULT_SHUTDOWN_GRACE_SECS);
     Duration::from_secs(secs)
 }
 
@@ -348,14 +474,24 @@ fn hard_exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
-/// Fold the write-ahead log, undo the advertisement and end the process.
+/// Freeze and fold the write-ahead log, undo the advertisement and end the
+/// process.
 ///
-/// The checkpoint runs on its own thread with a budget: this is the path taken
-/// when something is already wrong, and a checkpoint that blocks would turn a
-/// watchdog into one more thing that hangs. It escalates to `FORCE CHECKPOINT`
-/// when an open transaction (an indexing run mid-file) refuses the plain one —
-/// see [`AppState::checkpoint_for_exit`]. Skipped when the orderly path already
-/// took the final checkpoint.
+/// The final checkpoint happens once: if the orderly path already claimed it
+/// ([`CKPT_RUNNING`]) this waits for it to finish — up to [`INDEX_CANCEL_CAP`]
+/// — instead of `_exit`ing in the middle of it; if it is done, this just
+/// leaves. Otherwise this claims it, atomically, so the orderly path cannot
+/// start one behind it.
+///
+/// The advertisement goes first (`on_exit`), then the database is frozen and
+/// checkpointed on a helper thread that `_exit`s itself the moment the
+/// checkpoint returns: frozen, no write can land after the checkpoint, and
+/// ending on that same thread leaves no window for one either. The calling
+/// thread is the budget: a checkpoint that blocks (a stuck connection, a
+/// poisoned lock) must not turn a watchdog into one more thing that hangs, so
+/// after [`CHECKPOINT_BUDGET`] it leaves without it. The checkpoint escalates
+/// to `FORCE CHECKPOINT` when an open transaction refuses the plain one — see
+/// [`AppState::checkpoint_for_exit`].
 fn exit_now(state: &Arc<AppState>, life: &Lifecycle, on_exit: &ExitHook, code: i32) -> ! {
     if life.exiting.swap(true, Ordering::SeqCst) {
         // Another watchdog is already ending the process.
@@ -364,23 +500,37 @@ fn exit_now(state: &Arc<AppState>, life: &Lifecycle, on_exit: &ExitHook, code: i
         }
     }
     state.cancel_indexing();
-    if life.final_checkpoint.load(Ordering::SeqCst) != CKPT_DONE {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let s = state.clone();
-        let _ = std::thread::Builder::new()
-            .name("exit-checkpoint".into())
-            .spawn(move || {
-                let folded = s.checkpoint_for_exit();
-                let _ = tx.send(folded);
-            });
-        if rx.recv_timeout(CHECKPOINT_BUDGET).is_err() {
-            eprintln!(
-                "DevCtxEngine: the exit checkpoint did not finish within {:?}; leaving without it",
-                CHECKPOINT_BUDGET
-            );
+    match life.claim_exit_checkpoint() {
+        ExitClaim::Ours => {}
+        ExitClaim::OrderlyRunning => {
+            life.wait_orderly_checkpoint(INDEX_CANCEL_CAP);
+            on_exit();
+            hard_exit(code)
+        }
+        ExitClaim::Done => {
+            on_exit();
+            hard_exit(code)
         }
     }
     on_exit();
+    life.begin_checkpoint_marker();
+    let s = state.clone();
+    let marker = life.marker.clone();
+    let _ = std::thread::Builder::new()
+        .name("exit-checkpoint".into())
+        .spawn(move || {
+            s.checkpoint_for_exit(EXIT_FREEZE_WAIT);
+            if let Some(m) = &marker {
+                let _ = std::fs::remove_file(m);
+            }
+            hard_exit(code)
+        });
+    std::thread::sleep(CHECKPOINT_BUDGET);
+    eprintln!(
+        "DevCtxEngine: the exit checkpoint did not finish within {CHECKPOINT_BUDGET:?}; \
+         leaving without it"
+    );
+    life.end_checkpoint_marker();
     hard_exit(code)
 }
 
@@ -406,7 +556,9 @@ fn arm_exit_watchdog(state: Arc<AppState>, life: Arc<Lifecycle>, on_exit: ExitHo
                         hard_exit(0);
                     }
                     // Never cut the final checkpoint short: that is the exact
-                    // WAL this whole shutdown exists to fold.
+                    // WAL this whole shutdown exists to fold. (`exit_now`
+                    // re-checks under a claim, so reading "not started" here
+                    // just before the orderly path starts is safe too.)
                     CKPT_RUNNING if elapsed < INDEX_CANCEL_CAP => continue,
                     _ => {}
                 }
@@ -462,10 +614,16 @@ fn spawn_idle_watchdog(
             // an embedding model and a reranker in memory. A panic cannot
             // leave an `Instant` half-written, so the value behind the lock
             // is still sound. Take it and carry on.
-            let idle_for = match act.lock() {
+            let since_request = match act.lock() {
                 Ok(t) => t.elapsed(),
                 Err(poisoned) => poisoned.into_inner().elapsed(),
             };
+            // An indexing run's last move (or its end) counts as activity: its
+            // request was stamped when it started, and the run is still
+            // answering for a while after it marks itself finished.
+            let idle_for = state
+                .last_index_activity()
+                .map_or(since_request, |at| since_request.min(at.elapsed()));
             if idle_for < timeout {
                 continue;
             }
@@ -531,14 +689,19 @@ pub(crate) async fn track(
     req: Request,
     next: Next,
 ) -> Response {
-    if req.uri().path() != "/health" {
-        // Recover from poisoning rather than skip the write: dropping it would
-        // freeze the clock at the last successful request, and a busy server
-        // would then look idle and shut down under load.
-        let mut t = act.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        *t = Instant::now();
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
     }
-    next.run(req).await
+    // Recover from poisoning rather than skip the write: dropping it would
+    // freeze the clock at the last successful request, and a busy server
+    // would then look idle and shut down under load.
+    let stamp = || *act.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    stamp();
+    let response = next.run(req).await;
+    // And again on the way out: the idle window is "time since the last
+    // answer", not since a long request began.
+    stamp();
+    response
 }
 
 /// Blocking entry point: build a Tokio runtime and serve.
@@ -1090,6 +1253,57 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode as HttpStatus};
     use tower::ServiceExt;
+
+    /// D1b item 7: the grace override only shortens the timeline. A larger
+    /// value used to push "grace + checkpoint budget" past the 5 s the client
+    /// waits, so SIGKILL landed in the middle of the exit checkpoint.
+    #[test]
+    fn the_grace_override_cannot_outgrow_the_stop_timeline() {
+        assert_eq!(grace_from(None), Duration::from_secs(3));
+        assert_eq!(grace_from(Some("1")), Duration::from_secs(1));
+        assert_eq!(grace_from(Some("0")), Duration::ZERO);
+        assert_eq!(grace_from(Some("30")), Duration::from_secs(3));
+        assert_eq!(grace_from(Some("junk")), Duration::from_secs(3));
+        assert!(grace_from(Some("99")) + CHECKPOINT_BUDGET <= STOP_TIMELINE);
+    }
+
+    /// D1b item 5: the watchdog may read "not started" just before the
+    /// orderly path starts its checkpoint. The claim is atomic, so whichever
+    /// arrives second finds out — and `exit_now` waits for a running
+    /// checkpoint instead of `_exit`ing in the middle of it.
+    #[test]
+    fn the_final_checkpoint_is_claimed_once() {
+        let life = Lifecycle::default();
+        assert!(life.claim_orderly_checkpoint());
+        assert_eq!(life.claim_exit_checkpoint(), ExitClaim::OrderlyRunning);
+        assert!(!life.claim_orderly_checkpoint(), "never twice");
+
+        // exit_now waits for it, and only as long as it runs.
+        let life = Arc::new(Lifecycle::default());
+        assert!(life.claim_orderly_checkpoint());
+        let finishing = life.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            finishing
+                .final_checkpoint
+                .store(CKPT_DONE, Ordering::SeqCst);
+        });
+        let t0 = Instant::now();
+        life.wait_orderly_checkpoint(Duration::from_secs(10));
+        let waited = t0.elapsed();
+        t.join().unwrap();
+        assert!(
+            waited >= Duration::from_millis(250) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+        assert_eq!(life.claim_exit_checkpoint(), ExitClaim::Done);
+
+        // The other order: exit_now first, the orderly path stands aside.
+        let life = Lifecycle::default();
+        assert_eq!(life.claim_exit_checkpoint(), ExitClaim::Ours);
+        assert!(!life.claim_orderly_checkpoint());
+        assert_eq!(life.claim_exit_checkpoint(), ExitClaim::Done);
+    }
 
     fn test_cfg(dir: &std::path::Path) -> ProjectConfig {
         let path = dir.to_string_lossy().to_string();

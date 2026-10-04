@@ -121,7 +121,12 @@ impl SharedProgress {
     /// over while it is still embedding files.
     fn finish(&self) {
         if self.owns.swap(false, Ordering::SeqCst) {
-            self.lock().running = false;
+            let mut p = self.lock();
+            p.running = false;
+            // The end of a run is activity too: the idle timer counts from
+            // here, not from the request that started it long ago (see
+            // `AppState::last_index_activity`).
+            p.advanced = Some(Instant::now());
         }
     }
 }
@@ -389,11 +394,23 @@ impl AppState {
     /// (which aborts other connections' open transactions — they are about to
     /// die with the process anyway) when the plain one is refused. Returns
     /// whether the WAL was folded.
-    pub fn checkpoint_for_exit(&self) -> bool {
+    ///
+    /// The database is [frozen](Store::freeze) first — waiting at most
+    /// `freeze_wait` for a statement already running — so nothing written
+    /// after this checkpoint can reach a WAL the process will not fold: an
+    /// indexing thread still alive at `_exit` has its next write refused
+    /// instead.
+    pub fn checkpoint_for_exit(&self, freeze_wait: Duration) -> bool {
         let store = self
             .primary
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !store.freeze(freeze_wait) {
+            eprintln!(
+                "DevCtxEngine: a write was still running {freeze_wait:?} into the exit; \
+                 checkpointing anyway (FORCE aborts it)"
+            );
+        }
         match store.try_checkpoint() {
             Ok(()) => true,
             Err(plain) => match store.force_checkpoint() {
@@ -978,6 +995,17 @@ fn do_index_inner(
     // An explicit request wins over the project's default, which wins over the
     // checked-out branch.
     let target_branch = branch.or_else(|| state.default_branch());
+    // The run stays "running" until this function returns — through pruning
+    // other branches and the report, which still write to the database — so
+    // neither the idle timer nor a stop request reads it as over while it is
+    // not. Dropped on every path, including an error.
+    struct Finish<'a>(&'a SharedProgress);
+    impl Drop for Finish<'_> {
+        fn drop(&mut self) {
+            self.0.finish();
+        }
+    }
+    let _finish = Finish(&sink);
     let run = index_run(IndexRequest {
         store: &store,
         embedder: embedder.as_ref(),
@@ -989,9 +1017,6 @@ fn do_index_inner(
         exclude: &state.cfg.indexing.exclude,
         branch: target_branch.as_deref(),
     });
-    // Before the `?`: a run that fails still has to stop reporting itself as
-    // running, or the next poller waits on something that is already over.
-    sink.finish();
     let res = run.map_err(|e| e.to_string())?;
     if res.cancelled {
         // The server is going away: say what happened and touch nothing else
@@ -1062,6 +1087,22 @@ impl AppState {
             return false;
         }
         self.vanish_strikes.fetch_add(1, Ordering::SeqCst) + 1 >= VANISH_STRIKES
+    }
+
+    /// When an indexing run last moved — reached a file, reported a phase, or
+    /// finished. `None` before the first run.
+    ///
+    /// The idle timer counts from the later of this and the last request: a
+    /// run's request was stamped when it *started*, minutes ago, and between
+    /// the run marking itself finished and its answer leaving the server there
+    /// is still work (pruning branches, the report). Counting only requests,
+    /// an idle window shorter than the run killed the server in that gap, with
+    /// the answer unsent.
+    pub fn last_index_activity(&self) -> Option<Instant> {
+        self.index_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .advanced
     }
 
     /// Whether an indexing run is in flight at all, advancing or not.

@@ -524,17 +524,38 @@ pub fn terminate(
     term_wait: Duration,
     kill_wait: Duration,
 ) -> Termination {
+    terminate_patient(pid, owns, term_wait, || false, term_wait, kill_wait)
+}
+
+/// [`terminate`], with patience: past `term_wait`, keep waiting on SIGTERM —
+/// up to `patience_cap` in all — for as long as `patient()` says the process
+/// is doing something that must not be cut short (a server folding its WAL
+/// says so through its checkpoint marker). SIGKILL comes only after that.
+pub fn terminate_patient(
+    pid: u32,
+    owns: impl Fn() -> bool,
+    term_wait: Duration,
+    patient: impl Fn() -> bool,
+    patience_cap: Duration,
+    kill_wait: Duration,
+) -> Termination {
     // Open the handle before verifying, so what is verified is what is signalled.
     let handle = Handle::open(pid);
-    terminate_with(&handle, owns, term_wait, kill_wait, |h, limit, owns| {
-        h.wait_exit(limit, owns)
-    })
+    terminate_with(
+        &handle,
+        owns,
+        term_wait,
+        (&patient, patience_cap),
+        kill_wait,
+        |h, limit, owns| h.wait_exit(limit, owns),
+    )
 }
 
 fn terminate_with(
     handle: &Handle,
     owns: impl Fn() -> bool,
     term_wait: Duration,
+    (patient, patience_cap): (&dyn Fn() -> bool, Duration),
     kill_wait: Duration,
     wait: impl Fn(&Handle, Duration, &dyn Fn() -> bool) -> bool,
 ) -> Termination {
@@ -549,12 +570,20 @@ fn terminate_with(
         if wait(handle, term_wait, &owns) {
             return Termination::Gone;
         }
+        let mut waited = term_wait;
+        while waited < patience_cap && patient() {
+            let slice = Duration::from_millis(250).min(patience_cap - waited);
+            if wait(handle, slice, &owns) {
+                return Termination::Gone;
+            }
+            waited += slice;
+        }
         if handle.signal(libc::SIGKILL) == Err(libc::EPERM) {
             return Termination::NoPermission;
         }
     }
     #[cfg(not(unix))]
-    let _ = (handle, term_wait);
+    let _ = (handle, term_wait, patient, patience_cap);
     if wait(handle, kill_wait, &owns) {
         Termination::Gone
     } else {
@@ -759,6 +788,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// D1b: a server past the plain SIGTERM wait that says it is still
+    /// checkpointing gets the patience it asks for — it exits on its own, not
+    /// by SIGKILL — and one that does not say so is escalated as before.
+    #[test]
+    fn patience_holds_sigkill_off_while_the_process_asks_for_it() {
+        use std::os::unix::process::ExitStatusExt;
+        for patient in [true, false] {
+            let dir = tmp(if patient { "patient" } else { "impatient" });
+            let mut c = fake_server(
+                &dir,
+                "trap 'sleep 2; exit 0' TERM\nwhile :; do sleep 0.1; done\n",
+            );
+            let pid = c.id();
+            assert!(wait_until(|| is_server_pid(pid), Duration::from_secs(3)));
+            let t = start_time(pid);
+            std::thread::sleep(Duration::from_millis(300));
+            let owns = || classify(pid, t, |_| false) == Ownership::Ours;
+            let out = terminate_patient(
+                pid,
+                owns,
+                Duration::from_millis(300),
+                || patient,
+                Duration::from_secs(10),
+                Duration::from_secs(3),
+            );
+            assert!(out.is_gone());
+            let status = c.wait().unwrap();
+            if patient {
+                assert_eq!(status.code(), Some(0), "it was killed: {status:?}");
+            } else {
+                assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[test]
     fn a_process_that_cannot_be_stopped_is_reported_alive() {
         let dir = tmp("alive");
@@ -772,6 +837,7 @@ mod tests {
             &handle,
             || true,
             Duration::from_millis(100),
+            (&|| false, Duration::ZERO),
             Duration::from_millis(100),
             |_, limit, _| {
                 std::thread::sleep(limit);

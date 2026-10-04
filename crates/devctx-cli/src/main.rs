@@ -726,6 +726,9 @@ fn reindex_one(root: &std::path::Path, full: bool) -> Result<String> {
         bail!("could not reach or start a server for this project");
     };
     let raw = r.index(full, None)?;
+    if let Some(warning) = remote::index_cancelled(&raw) {
+        bail!("{warning}");
+    }
     let v: serde_json::Value = serde_json::from_str(&raw).context("parsing the index result")?;
     Ok(format!(
         "{} @ {} — {} files, {} symbols, {} chunks ({} skipped)",
@@ -3342,7 +3345,14 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         let out = r.index(full, branch.as_deref());
         ticker.stop();
         match out {
-            Ok(report) => println!("{report}"),
+            Ok(report) => {
+                println!("{report}");
+                // Not an `Ok`: the run did not finish, and a script chaining
+                // `devctx index && …` must not carry on as if it had.
+                if let Some(warning) = remote::index_cancelled(&report) {
+                    bail!("{warning}");
+                }
+            }
             Err(e) => return Err(still_running_or(&r, e)),
         }
         return Ok(());
@@ -3356,8 +3366,19 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
     let store = open_store(&cfg, embedder.dimension())?;
 
     // Golden rule for bulk loads: don't maintain the HNSW index row-by-row.
-    // For a full reindex, drop it up front and rebuild once after the load.
+    // For a full reindex, drop it up front and rebuild once after the load —
+    // noted as owed *before* the drop, like the pipeline's own drop, so a
+    // process killed mid-run leaves the rebuild to the next run instead of
+    // losing the index for good. With the note in place the pipeline rebuilds
+    // it at the end of the run (once), and the rebuild below only covers
+    // what it could not.
     if full && cfg.storage.hnsw {
+        store.set_index_meta(
+            "",
+            "",
+            devctx_index::PENDING_HNSW_META_KEY,
+            &cfg.storage.metric,
+        )?;
         store.drop_hnsw()?;
     }
 
@@ -3409,7 +3430,20 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         println!("  index built by an older extractor; run `devctx index --full` to rebuild it");
     }
 
-    if cfg.storage.hnsw {
+    let wanted_metric = if cfg.storage.metric.trim().eq_ignore_ascii_case("ip")
+        || cfg
+            .storage
+            .metric
+            .trim()
+            .eq_ignore_ascii_case("inner_product")
+    {
+        "ip"
+    } else {
+        "cosine"
+    };
+    if cfg.storage.hnsw && store.hnsw_metric().as_deref() == Some(wanted_metric) {
+        println!("  HNSW index ready (VSS, metric {wanted_metric})");
+    } else if cfg.storage.hnsw {
         if store.enable_hnsw(&cfg.storage.metric)? {
             println!(
                 "  HNSW index ready (VSS, metric {})",
@@ -3423,7 +3457,11 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
             eprintln!("  HNSW requested but the VSS extension is unavailable; using brute-force");
         }
     }
-    if cfg.storage.fts {
+    // The pipeline rebuilds a BM25 index it took down; build one here only
+    // when it is not there.
+    if cfg.storage.fts && store.has_fts() {
+        println!("  FTS index ready (BM25)");
+    } else if cfg.storage.fts {
         if store.rebuild_fts()? {
             println!("  FTS index ready (BM25)");
         } else {

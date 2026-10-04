@@ -104,6 +104,15 @@ struct Serve {
     child: Child,
     port: u16,
     root: PathBuf,
+    /// The server's stderr, kept so a failure can say what the server saw.
+    log: PathBuf,
+}
+
+impl Serve {
+    /// What the server wrote to stderr so far.
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
 }
 
 impl Drop for Serve {
@@ -125,6 +134,7 @@ fn start_serve_env(
     envs: &[(&str, &str)],
 ) -> Serve {
     let port = free_port();
+    let log = tmp.0.join(format!("serve-{port}.log"));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_devctx"));
     for (k, v) in envs {
         cmd.env(k, v);
@@ -136,7 +146,7 @@ fn start_serve_env(
         .args(["serve", "--addr", &format!("127.0.0.1:{port}")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(std::fs::File::create(&log).expect("creating the serve log"));
     if let Some(secs) = idle {
         cmd.args(["--idle", &secs.to_string()]);
     }
@@ -148,6 +158,7 @@ fn start_serve_env(
         child,
         port,
         root: root.to_path_buf(),
+        log,
     };
     let t0 = Instant::now();
     while http(port, "GET", "/health", "", Duration::from_secs(2)).is_none() {
@@ -624,7 +635,11 @@ fn an_idle_server_waits_for_an_index_that_is_advancing() {
         .recv_timeout(Duration::from_secs(60))
         .expect("the index never answered")
         .expect("the server died before answering");
-    assert!(reply.contains("\"files_indexed\""), "{reply}");
+    assert!(
+        reply.contains("\"files_indexed\""),
+        "reply: {reply:?}\nserver log:\n{}",
+        serve.log()
+    );
     assert!(!reply.contains("\"cancelled\""), "{reply}");
     let took = exits_within(&mut serve.child, Duration::from_secs(15));
     eprintln!("D1 idle exit after an advancing index: {took:?}");
@@ -663,6 +678,42 @@ fn sigterm_during_an_index_cancels_it_and_leaves_a_sound_database() {
     assert_database_sound(&tmp, &root, &fake, 40);
 }
 
+/// D1b item 3: `devctx index` routed to a server that cancels the run (it is
+/// stopping) must not exit 0 as if the index were complete: it says the run
+/// was cancelled and fails, so `devctx index && …` does not carry on.
+#[test]
+fn devctx_index_fails_when_the_server_cancels_its_run() {
+    let tmp = Tmp::new("clicancel");
+    let root = custom_project(&tmp, 40);
+    let fake = FakeEmbedder::start(Duration::from_millis(300), None);
+    let mut serve = start_indexing_serve(&tmp, &root, &fake, None, &[]);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_devctx"));
+    for (k, v) in embed_env(&fake) {
+        cmd.env(k, v);
+    }
+    let client = cmd
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_MODEL_CACHE", tmp.cache())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .arg("index")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_files(serve.port, 3, Duration::from_secs(60));
+    sigterm(&serve.child);
+    let out = client.wait_with_output().unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    exits_within(&mut serve.child, Duration::from_secs(30)).expect("serve survived SIGTERM");
+    assert!(!out.status.success(), "a cancelled run exited 0:\n{said}");
+    assert!(said.contains("cancelled"), "{said}");
+}
+
 /// Item 3: `devctx serve --stop` sees the index and waits for the cancellation
 /// instead of escalating to SIGKILL in the middle of it.
 #[test]
@@ -696,33 +747,81 @@ fn serve_stop_during_an_index_waits_for_the_cancellation() {
     assert_database_sound(&tmp, &root, &fake, 40);
 }
 
-/// Items 1–2: an index stuck *inside* a file (its embedding request never
-/// answers) cannot reach a file boundary. The watchdog waits out the quiet
-/// window, then forces the exit — and the forced exit still folds the WAL, so
-/// the database opens cleanly and survives a full reindex.
+/// Items 1–2, D1b items 2 and 4: an index stuck *inside a file's writes*
+/// (the test seam `DEVCTX_TEST_STALL_IN_WRITE` holds it there, after the
+/// file's old vectors were deleted) cannot reach a file boundary. The watchdog
+/// waits out the quiet window and forces the exit — and the database must be
+/// sound *without* a `--full` to paper over it: the WAL folded, and no file
+/// whose recorded hash says "indexed, unchanged" while its vectors are gone.
+///
+/// The run is a `--full` over an existing index, the one case where such a
+/// hole is permanent: the content did not change, so no incremental run would
+/// ever look at the file again.
 #[test]
 fn a_forced_exit_mid_index_leaves_a_sound_database() {
     let tmp = Tmp::new("forceidx");
-    let root = custom_project(&tmp, 30);
-    let stuck = FakeEmbedder::start(Duration::from_millis(100), Some(5));
-    let mut serve = start_indexing_serve(&tmp, &root, &stuck, None, &[]);
-    let _answer = start_index(serve.port, "{}");
+    let files = 30;
+    let root = custom_project(&tmp, files);
+    let fake = FakeEmbedder::start(Duration::from_millis(50), None);
+    let first = devctx_direct(&tmp, &root, &fake, &["index"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let mut serve = start_indexing_serve(
+        &tmp,
+        &root,
+        &fake,
+        None,
+        &[("DEVCTX_TEST_STALL_IN_WRITE", "5")],
+    );
+    let _answer = start_index(serve.port, r#"{"full":true}"#);
     let t0 = Instant::now();
-    while stuck.served.load(Ordering::SeqCst) <= 5 {
+    while !serve.log().contains("test seam: stalled inside the writes") {
         assert!(
             t0.elapsed() < Duration::from_secs(60),
-            "never reached the stall"
+            "never reached the stall:\n{}",
+            serve.log()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
 
     sigterm(&serve.child);
     let took = exits_within(&mut serve.child, Duration::from_secs(40));
-    eprintln!("D1 forced exit with an index stuck mid-file: {took:?}");
-    let took = took.expect("serve survived SIGTERM with an index stuck mid-file");
+    eprintln!("D1 forced exit with an index stuck mid-write: {took:?}");
+    let took = took.expect("serve survived SIGTERM with an index stuck mid-write");
     assert!(took <= Duration::from_secs(25), "took {took:?}");
     assert!(!serve_json(&serve.root).exists(), "serve.json left behind");
     assert!(wal_folded(&root), "the forced exit left the WAL behind");
-    let healthy = FakeEmbedder::start(Duration::from_millis(0), None);
-    assert_database_sound(&tmp, &root, &healthy, 30);
+
+    {
+        let store = devctx_store::Store::open(&db_path(&root), DIM)
+            .expect("the database does not open after the forced exit");
+        let holes = store.files_missing_vectors().unwrap();
+        assert!(
+            holes.is_empty(),
+            "files recorded as indexed with no vectors (a write cut half-way): {holes:?}\n{}",
+            serve.log()
+        );
+        assert!(
+            store.count(&Default::default()).unwrap() > 0,
+            "the earlier index is still there"
+        );
+    }
+    // The ART indexes are intact: an incremental run (which begins by deleting
+    // the changed file's rows) works without a `--full`.
+    std::fs::write(
+        root.join("m000.rs"),
+        "pub fn changed() -> u32 {\n    7\n}\n",
+    )
+    .unwrap();
+    let inc = devctx_direct(&tmp, &root, &fake, &["index"]);
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&inc.stdout),
+        String::from_utf8_lossy(&inc.stderr)
+    );
+    assert!(inc.status.success(), "an incremental run failed: {out}");
+    assert!(!out.contains("Failed to delete all rows"), "{out}");
 }
