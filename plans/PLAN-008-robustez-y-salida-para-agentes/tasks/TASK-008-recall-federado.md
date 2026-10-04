@@ -67,3 +67,10 @@ Ninguno nuevo; cambia el texto de errores (contrato no estructurado).
 6. **Contrato JSON:** `recall`/`search` de grupo: nuevo `skipped_missing: [{project, path}]`; `failed_projects[].error` ahora empieza por `<miembro> (<ruta>): `; el texto de `warning`/error pasa de `First failure:` a `Failures:` (hasta 3, `| ` separados, `(and N more)`). Miembros ausentes no cuentan como inalcanzables.
 7. **M-6:** el hijo ya pasa por el serve (`ensure_cli` en la CLI); solo abre el DuckDB local si `DEVCTX_NO_AUTOSERVE` o fallo de spawn, tras `check_unlocked`; es seguro porque el MCP ya no sostiene ningún `Store`. El hijo recibe `clean_git_env` en todos los sitios. Documentado en el doc de `run_in_member`.
 8. **No verificado:** el ejecutable realmente reinstalado en `~/.local/bin` (prohibido tocarlo); hook con `/proc/self/exe` sin test dedicado; `models.rs` self-update con binario borrado.
+
+### Fixup D1 (review)
+
+- Con TODOS los miembros ausentes en disco (`present` vacío, `skipped_missing` no) no había
+  `warning` y la respuesta salía solo del tier compartido sin avisar. Nuevo `all_missing_warning`
+  en `devctx-mcp/src/state.rs`, usado por el fan-out de `search` y de `recall` (solo cuando se
+  consultó el tier local). Test: `all_members_missing_is_said_out_loud`.

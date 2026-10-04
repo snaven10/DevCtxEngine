@@ -141,3 +141,51 @@ Un directorio de proyecto en un disco montado de forma intermitente haría salir
    tiempos en WSL2 con caché de modelos caliente.
 8. **Números:** ver punto 2 y caché de modelos. Servers `target/debug/devctx serve` vivos tras la
    suite completa: 0.
+
+### Fixup D1 (review)
+
+Revisión: TASK-009 podía cortar un índice legítimo y salir con el WAL sin plegar. Arreglado:
+
+1. **SIGTERM durante `/index` (bloqueante).** `AppState::cancel_indexing` (flag `index_cancel`) se
+   levanta al recibir la señal; `ProgressSink::cancelled` lo consulta entre archivos y el pipeline
+   (`devctx-index/src/pipeline.rs::run`) para, no poda, no avanza el `IndexRecord`, hace checkpoint y
+   devuelve `IndexResult::cancelled` (`/index` responde `{"cancelled":true,…}`). HNSW/FTS caídos
+   quedan anotados en `index_meta` (`PENDING_HNSW_META_KEY`/`PENDING_FTS_META_KEY`, escritos ANTES
+   del drop) y los reconstruye el siguiente run completo que quede solo en esa base
+   (`Store::instance_id`). El watchdog de stop no fuerza la salida mientras el índice cancelado
+   reporte progreso (≤15 s de silencio), con tope duro `INDEX_CANCEL_CAP` = 60 s.
+2. **Watchdog nunca desarmado.** `Lifecycle::final_checkpoint` (running/done): con el checkpoint
+   final en curso el watchdog espera (≤60 s); con él hecho sale sin repetirlo.
+3. **Tiempos `--stop`.** Gracia 3 s + presupuesto de checkpoint 1.5 s (4.5 s) < `TERM_WAIT` 5 s;
+   si `/index/progress` dice `running`, `serve --stop`/`reclaim_db` esperan 65 s antes de SIGKILL.
+   Línea de tiempo documentada en `devctx-api/src/lib.rs::Lifecycle`.
+4. **`project_vanished` (bloqueante).** Solo `ErrorKind::NotFound`, 3 polls seguidos
+   (`VANISH_STRIKES`); watchdog propio (`DEVCTX_VANISH_POLL_MS`, 10 s por defecto) que corre sin
+   `--idle` y difiere con requests en vuelo (middleware `count_in_flight`) o índice avanzando.
+5. **`guard_load`.** Un stall envenena el modelo en el proceso (`modelload::is_poisoned`); los
+   reintentos fallan al instante con "restart the server (`devctx serve --stop`)"; `init_on`
+   (embed/rerank) no cae a CPU si el error es un stall (`is_stall_error`).
+6. **Fases sin progreso (bloqueante).** `ProgressSink::phase` (+ `heartbeat` cada 5 s) en poda,
+   HNSW, FTS y checkpoint; el progreso arranca (`SharedProgress::begin`) antes de cargar el modelo
+   y la carga solo marca progreso cuando la caché de modelos crece (`cache_fingerprint`).
+7. **Tests.** Unit: `only_an_index_that_moved_recently_is_exempt_from_idle`,
+   `a_phase_report_renews_the_exemption`, `cancelling_reaches_every_run_through_its_sink`,
+   `a_project_counts_as_vanished_only_after_repeated_not_found`,
+   `a_permission_error_is_not_a_missing_directory`, `a_stalled_load_poisons_the_model_for_the_process`,
+   `a_forced_checkpoint_folds_the_wal_past_an_open_write_transaction`, 4 del pipeline (cancelación,
+   fases, índices pendientes). Integración (`serve_lifecycle.rs`, `#![cfg(unix)]`, embedder
+   `custom` falso por HTTP): `an_idle_server_waits_for_an_index_that_is_advancing`,
+   `sigterm_during_an_index_cancels_it_and_leaves_a_sound_database`,
+   `serve_stop_during_an_index_waits_for_the_cancellation`,
+   `a_forced_exit_mid_index_leaves_a_sound_database` (WAL plegado + `status` + `index --full` sin
+   "Failed to delete all rows"); `an_idle_server_exits_even_with_an_index_stuck` ahora sí ejercita la
+   rama de estancamiento (`DEVCTX_INDEX_STALL_SECS=2`). Contra el código previo fallan 5 de ellos;
+   el de salida forzada pasa también antes (es guardia de regresión).
+- **Menores:** `exit_now` sale con `libc::_exit` (sin destructores estáticos de DuckDB) y escala a
+  `FORCE CHECKPOINT` (`AppState::checkpoint_for_exit`); el central hace checkpoint antes de salir
+  por idle; doc de `do_search_project` despegada de `run_in_member`.
+- **Hallazgo:** con el DuckDB embebido, un `CHECKPOINT` simple NO es rechazado por otra
+  transacción de escritura abierta (pliega lo confirmado); el riesgo real era el corte por tiempo
+  y la espera del mutex, no el rechazo. `FORCE CHECKPOINT` queda como escalada.
+- **No verificado:** fallos EIO reales de drvfs/9p (simulado con EACCES); `heartbeat` en un HNSW
+  >900 s real; el camino ordenado (fin de `main`) sigue usando `exit` normal.
