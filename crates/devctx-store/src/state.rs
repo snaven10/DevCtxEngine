@@ -164,6 +164,16 @@ impl Store {
         Ok(())
     }
 
+    /// Forget one `index_meta` value (a branch whose record is missing, as
+    /// every index made before the extractor fingerprint existed).
+    pub fn delete_index_meta(&self, repo_path: &str, branch: &str, key: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM index_meta WHERE repo_path = ? AND branch = ? AND key = ?",
+            params![repo_path, branch, key],
+        )?;
+        Ok(())
+    }
+
     /// Whether the index of a (repo_path, branch) was built by an extractor
     /// other than `current` (an [`extractor fingerprint`]). An index with no
     /// recorded extractor — every index made before this existed — counts as

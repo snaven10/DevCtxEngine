@@ -46,6 +46,12 @@ impl GitRepo {
         })
     }
 
+    /// A repository whose top-level directory is already known, so nothing is
+    /// spawned. `root` must be what [`GitRepo::open`] returned for it.
+    pub fn at_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     /// The work-tree root.
     pub fn root(&self) -> &Path {
         &self.root
@@ -58,6 +64,14 @@ impl GitRepo {
             .and_then(|n| n.to_str())
             .unwrap_or("repo")
             .to_string()
+    }
+
+    /// The current branch (`HEAD` when detached): one git call, for callers
+    /// that do not need the commit [`GitRepo::state`] also reads.
+    pub fn branch(&self) -> String {
+        run(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "HEAD".to_string())
     }
 
     /// Read the current HEAD commit and branch.

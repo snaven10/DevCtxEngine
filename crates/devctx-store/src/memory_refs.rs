@@ -462,12 +462,14 @@ impl Store {
     /// Whether this repository has any rows for `branch` — what search asks
     /// before narrowing to it.
     pub fn has_branch_rows(&self, repo: &str, branch: &str) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM vectors WHERE repo = ? AND branch = ? LIMIT 1",
+        // EXISTS stops at the first row; count(*) would tally the whole branch,
+        // and this runs several times per search.
+        let found: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM vectors WHERE repo = ? AND branch = ?)",
             params![repo, branch],
             |r| r.get(0),
         )?;
-        Ok(n > 0)
+        Ok(found)
     }
 
     /// Which of `files` this repository actually has indexed.

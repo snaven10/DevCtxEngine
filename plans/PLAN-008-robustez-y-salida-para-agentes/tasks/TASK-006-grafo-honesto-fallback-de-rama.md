@@ -108,3 +108,12 @@ obligatorio cuando hay fallback.
 - **M-11:** `do_search_project` conserva `omitted_for_budget` del hijo (si además recorta, suma los conteos); `do_build_context` ya no pierde `branch_fallback`.
 - **I-3:** `graph_branch`, el chequeo de `extractor_stale` y `prune_untracked_branches` (preexistente) usaban `state.root`; ahora usan `AppState::repo_path()` = toplevel de git, igual que pipeline e `index_status`. Tests (devctx-mcp): `a_project_in_a_repo_subdirectory_keys_the_store_by_the_git_toplevel`, `a_symlinked_project_path_keys_the_store_by_the_real_toplevel`, `search_and_the_graph_tools_pick_the_same_branch_and_say_so`.
 - **No cubierto con test:** `memories_by_symbol`/`build_context`/`devctx routes` con fallback (tocan central o el embedder); la regla es la misma función.
+
+### Fixup B2 (review)
+
+- **`report_index`:** leía `index_totals` bajo la ruta canónica del registro; el store archiva por toplevel de git, así que en un subdirectorio de monorepo (o con `\\?\` en Windows) `projects list` mostraba 0/0/0. Ahora `totals_for_root` usa `repo_key(root)`; la ruta canónica queda solo como clave del registro. Test: `report_totals_are_read_under_the_git_toplevel`.
+- **Latencia:** `AppState` cachea el toplevel (`OnceLock`, un spawn la primera vez) y `repo_branch` lee solo la rama (`GitRepo::branch`, sin el `rev-parse HEAD`). Spawns de git por `pick_branch`: 4 -> 1 (medido con `GIT_TRACE`: 8 `rev-parse` para 2 llamadas antes; 2 después, más el toplevel único). `has_branch_rows` usa `SELECT EXISTS` (antes `count(*)`).
+- **Extracciones testeables:** `symbol_branch` (`memories_by_symbol_queries_the_fallback_branch`), `fallback_note`/`close_context` (`build_context_fallback_note`: con 0 resultados el aviso de rama va DESPUÉS de "nothing indexed matched"), `merge_omitted` (conserva `items` del hijo y suma conteos). `memories_by_symbol` omite `branch_fallback` cuando el match es `text-inference` (no depende de la rama).
+- **Rama indexada pero vacía:** `branch_fallback.why` dice "is indexed but empty" si hay registro sin filas (`an_indexed_but_empty_current_branch_is_described_as_such`); `index_status` agrega `empty: true` y su hint. El hint de "no indexada" nombra la rama que se usará.
+- **`devctx routes` local:** `graph_target` devuelve también `extractor_stale` y la CLI imprime el aviso por stderr.
+- Test del symlink reescrito: `project.path` es un symlink al toplevel mismo (sin `sub/`).

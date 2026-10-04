@@ -2381,7 +2381,7 @@ fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
         return Ok(());
     }
     let store = open_store(&cfg, configured_dimension(&cfg))?;
-    let (repo, branch, fallback) = devctx_mcp::state::graph_target(
+    let (repo, branch, fallback, stale) = devctx_mcp::state::graph_target(
         &store,
         &project_root(&cfg)?,
         cfg.indexing.default_branch(),
@@ -2391,6 +2391,9 @@ fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
     if let Some(f) = &fallback {
         let why = f.get("why").and_then(|w| w.as_str()).unwrap_or_default();
         eprintln!("· branch_fallback: {why}");
+    }
+    if stale {
+        eprintln!("· warning: {}", devctx_mcp::state::STALE_EXTRACTOR_WARNING);
     }
     if routes.is_empty() {
         println!("No routes.");

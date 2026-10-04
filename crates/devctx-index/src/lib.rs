@@ -325,6 +325,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The index of a version that predates `index_meta` has no extractor
+    /// record at all. `--full` must treat that as stale too: copy nothing.
+    #[test]
+    fn a_full_run_does_not_copy_from_a_branch_with_no_extractor_record() {
+        let dir = two_branch_repo("no_record");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let repo_path = GitRepo::open(&dir)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .to_string();
+        index_branch(&store, &dir, "feature", true);
+        store
+            .delete_index_meta(&repo_path, "feature", "extractor")
+            .unwrap();
+        assert!(store
+            .get_index_meta(&repo_path, "feature", "extractor")
+            .unwrap()
+            .is_none());
+
+        let main = index_branch(&store, &dir, "main", true);
+        assert!(main.full_reindex);
+        // The discriminating assertion: the JOIN on index_meta finds no row.
+        assert_eq!(main.files_copied, 0, "an unrecorded branch is not a source");
+        assert!(main.files_indexed > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Branches share commits, so the file they share must not be embedded
     /// twice — that is what makes keeping several branches indexed affordable.
     #[test]
@@ -332,16 +361,23 @@ mod tests {
         let dir = two_branch_repo("dedup");
         let store = Store::open_in_memory(DIM).unwrap();
         index_branch(&store, &dir, "main", true);
+        // The key the pipeline files rows under is git's toplevel, which is
+        // not `dir` when the temp dir is a symlink (macOS `/var`).
+        let repo_path = GitRepo::open(&dir)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .to_string();
 
         // `a.py` is byte-identical on both branches; `b.py` is not.
         let hash_a = store
-            .get_file_hash(&dir.to_string_lossy(), "main", "a.py")
+            .get_file_hash(&repo_path, "main", "a.py")
             .unwrap()
             .expect("indexed on main");
         assert_eq!(
             store
                 .branch_with_same_content(
-                    &dir.to_string_lossy(),
+                    &repo_path,
                     "a.py",
                     &hash_a,
                     "main",
@@ -358,7 +394,7 @@ mod tests {
         assert_eq!(
             store
                 .branch_with_same_content(
-                    &dir.to_string_lossy(),
+                    &repo_path,
                     "a.py",
                     &hash_a,
                     "feature",
@@ -370,11 +406,11 @@ mod tests {
             "the shared file was recognised as already indexed"
         );
         let hash_b_main = store
-            .get_file_hash(&dir.to_string_lossy(), "main", "b.py")
+            .get_file_hash(&repo_path, "main", "b.py")
             .unwrap()
             .unwrap();
         let hash_b_feat = store
-            .get_file_hash(&dir.to_string_lossy(), "feature", "b.py")
+            .get_file_hash(&repo_path, "feature", "b.py")
             .unwrap()
             .unwrap();
         assert_ne!(hash_b_main, hash_b_feat, "the changed file must differ");
