@@ -85,3 +85,17 @@ Reintentar después de enviar duplicaría escrituras: la política lo prohíbe y
    máquina); después pasó limpia, sin tocar el test.
 8. **Números:** fallo de conexión ya conocido: respuesta inmediata durante 8 s en vez de ~3,4 s (Busy) o hasta 60 s
    (colgado) por tool.
+
+### Fixup D2 (review)
+
+- **Corrección del Resultado (punto 3, M-1):** NO estaba resuelto. `connect()` seguía corriendo con el mutex
+  `Link` tomado: el backoff solo mitigaba, y el primer connect contra un serve lanzado que ni respondía ni salía
+  (hasta `WAIT_TICKS` = 60 s + probe) encolaba a todas las demás tools detrás. Ahora `RemoteClient::target`
+  es single-flight: un mutex `connecting` serializa los connectors y `link` se toma solo para leer/escribir
+  estado (`known()`), nunca a través de `connect()`; los que esperan ven el resultado del primero (target o
+  fallo recordado). Test: `a_slow_connect_does_not_hold_the_link_lock_and_is_single_flight`.
+- `timeout_connect(2 s)` en el agente (`CONNECT_TIMEOUT`): un SYN descartado ya no consume los 120 s (1800 s en
+  `index_repo`). Test: `a_dropped_syn_gives_up_at_the_connect_timeout`.
+- `FAILURE_BACKOFF` baja de 8 s a 3 s: también memoizaba Busy / "shutting down" y fallaba al instante 8 s con
+  el serve ya de vuelta (el punto 8 de arriba queda como "3 s").
+- Código muerto: se elimina `Backend::remote` (connect `None`, sin llamadores).

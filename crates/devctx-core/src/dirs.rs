@@ -77,7 +77,12 @@ mod tests {
     fn the_model_cache_hangs_off_the_data_directory() {
         let data = data_dir().expect("a home in the test environment");
         let models = model_cache_dir().expect("a model cache");
-        assert_eq!(models, data.join("models"));
+        // `DEVCTX_MODEL_CACHE` (set by the test runs that keep a private cache)
+        // moves it elsewhere by design; unset, it hangs off the data directory.
+        match env_dir(MODEL_CACHE_ENV) {
+            Some(explicit) => assert_eq!(models, explicit),
+            None => assert_eq!(models, data.join("models")),
+        }
         assert!(
             models.is_absolute(),
             "a relative cache would land in the working directory: {models:?}"

@@ -1136,6 +1136,33 @@ pub fn do_index_progress(state: &AppState) -> Result<String, String> {
     .to_string())
 }
 
+/// What `index_status` says when the checked-out branch has no index record.
+///
+/// Three different situations used to share one sentence that read
+/// "branch X is not indexed; search answers from branch X" (the same branch on
+/// both sides) in a repository that had never been indexed at all.
+fn no_record_hint(indexed_branches: &[String], chosen: &BranchChoice, current: &str) -> String {
+    if indexed_branches.is_empty() {
+        // No record for any branch: nothing to fall back to either.
+        "nothing indexed yet; run `devctx index`".to_string()
+    } else if !chosen.indexed {
+        "nothing is indexed for this repository; run devctx index".to_string()
+    } else if chosen.branch == current {
+        // Rows with no completed record: an index that was cut short.
+        format!(
+            "branch {current} has rows but no completed index record (an interrupted run?); \
+             run `devctx index` to finish it"
+        )
+    } else {
+        // Name the branch search will actually use, not every candidate.
+        format!(
+            "branch {current} is not indexed; search and the graph tools answer from branch \
+             {}; run devctx index to index this one",
+            chosen.branch
+        )
+    }
+}
+
 /// `index_status` tool: report the last-indexed record for the repo/branch.
 pub fn do_index_status(state: &AppState) -> Result<String, String> {
     let store = state.open_store()?;
@@ -1155,16 +1182,7 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
                 &state_git.branch,
                 state.default_branch().as_deref(),
             );
-            let hint = if !chosen.indexed {
-                "nothing is indexed for this repository; run devctx index".to_string()
-            } else {
-                // Name the branch search will actually use, not every candidate.
-                format!(
-                    "branch {} is not indexed; search and the graph tools answer from branch \
-                     {}; run devctx index to index this one",
-                    state_git.branch, chosen.branch
-                )
-            };
+            let hint = no_record_hint(&indexed_branches, &chosen, &state_git.branch);
             json!({
                 "indexed": false,
                 "branch": state_git.branch,
@@ -1208,11 +1226,17 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
                 .unwrap_or(true);
             if empty {
                 v["empty"] = json!(true);
-                v["hint"] = json!(format!(
+                let empty_hint = format!(
                     "branch {} is indexed but empty (no rows); search and the graph tools \
                      answer from another branch if one has rows",
                     r.branch
-                ));
+                );
+                // Both can apply (an old extractor that found nothing): keep the
+                // stale-extractor advice instead of overwriting it.
+                v["hint"] = json!(match v["hint"].as_str() {
+                    Some(stale_hint) => format!("{stale_hint}. Also: {empty_hint}"),
+                    None => empty_hint,
+                });
             }
             v
         }
@@ -5692,5 +5716,64 @@ mod tests {
         assert_eq!(graph["branch"], "main");
         assert_eq!(graph["branch_fallback"]["used"], "main");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// B2: an index that is both stale (old extractor) and empty reports both
+    /// hints; the second used to overwrite the first.
+    #[test]
+    fn a_stale_and_empty_index_reports_both_hints() {
+        let (state, repo) = subdir_project("b2");
+        let (_, branch) = state.repo_branch().unwrap();
+        {
+            let store = state.open_store().unwrap();
+            store
+                .save_index_record(&devctx_store::IndexRecord {
+                    repo_path: state.repo_path(),
+                    branch: branch.clone(),
+                    last_commit: "abc".into(),
+                    model_name: "m".into(),
+                    model_dimension: GRAPH_DIM as i64,
+                    file_count: 0,
+                    symbol_count: 0,
+                    chunk_count: 0,
+                    indexed_at: "2026-10-04T00:00:00Z".into(),
+                })
+                .unwrap();
+        }
+        let v: Value = serde_json::from_str(&do_index_status(&state).unwrap()).unwrap();
+        assert_eq!(v["extractor_stale"], true, "{v}");
+        assert_eq!(v["empty"], true, "{v}");
+        let hint = v["hint"].as_str().unwrap();
+        assert!(hint.contains("older extractor"), "{hint}");
+        assert!(hint.contains("indexed but empty"), "{hint}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn choice(branch: &str, indexed: bool) -> BranchChoice {
+        BranchChoice {
+            repo: "r".into(),
+            branch: branch.into(),
+            fallback: None,
+            indexed,
+            extractor_stale: false,
+        }
+    }
+
+    /// N3: a repository that was never indexed says so, instead of "branch X
+    /// is not indexed; answering from branch X".
+    #[test]
+    fn a_repository_never_indexed_gets_its_own_message() {
+        let hint = no_record_hint(&[], &choice("main", true), "main");
+        assert!(hint.contains("nothing indexed yet"), "{hint}");
+        assert!(hint.contains("devctx index"), "{hint}");
+        let hint = no_record_hint(&[], &choice("main", false), "main");
+        assert!(hint.contains("nothing indexed yet"), "{hint}");
+        // Rows without a record: not the same sentence as a fallback.
+        let hint = no_record_hint(&["dev".into()], &choice("main", true), "main");
+        assert!(hint.contains("no completed index record"), "{hint}");
+        assert!(!hint.contains("answer from branch main"), "{hint}");
+        // A real fallback still names the branch it answers from.
+        let hint = no_record_hint(&["dev".into()], &choice("dev", true), "main");
+        assert!(hint.contains("answer from branch dev"), "{hint}");
     }
 }

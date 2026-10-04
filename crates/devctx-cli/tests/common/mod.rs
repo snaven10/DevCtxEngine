@@ -14,19 +14,34 @@ use std::process::{Child, Command};
 /// half-finished downloads in the way of whoever ran next. The cache is content
 /// addressed and read-only once filled, so sharing it is safe.
 ///
-/// `DEVCTX_MODEL_CACHE` if the caller set it, otherwise the user's real model
-/// cache (the same precedent as DuckDB's extension cache).
+/// `DEVCTX_MODEL_CACHE` if the caller set it, otherwise a cache of the tests'
+/// own under the cargo target directory (`test-model-cache`): never the user's
+/// real `~/.local/share/devctx/models`, which a test run must not read, fill
+/// or race a running server over. The first run that needs a model downloads
+/// it into the dedicated cache; later runs reuse it.
 pub fn shared_model_cache() -> PathBuf {
-    if let Some(explicit) = std::env::var_os("DEVCTX_MODEL_CACHE").filter(|v| !v.is_empty()) {
+    resolve_model_cache(
+        std::env::var_os("DEVCTX_MODEL_CACHE"),
+        std::env::var_os("CARGO_TARGET_DIR"),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+/// The pure part of [`shared_model_cache`].
+pub fn resolve_model_cache(
+    explicit: Option<std::ffi::OsString>,
+    target_dir: Option<std::ffi::OsString>,
+    manifest_dir: &Path,
+) -> PathBuf {
+    if let Some(explicit) = explicit.filter(|v| !v.is_empty()) {
         return PathBuf::from(explicit);
     }
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(xdg).join("devctx").join("models");
-    }
-    let home = std::env::var_os("HOME")
+    let target = target_dir
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".local/share/devctx/models")
+        // crates/<name> -> workspace root -> target
+        .unwrap_or_else(|| manifest_dir.join("..").join("..").join("target"));
+    target.join("test-model-cache")
 }
 
 /// Make `home/models` (a test's `DEVCTX_HOME`) point at [`shared_model_cache`].

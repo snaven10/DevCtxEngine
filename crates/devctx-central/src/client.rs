@@ -305,19 +305,28 @@ fn stop_with(paths: &CentralPaths, term: Duration, kill: Duration) -> Result<()>
     };
     match ownership(&info) {
         Ownership::Gone => remove_serve_file(paths),
-        Ownership::Unverified => eprintln!(
-            "· pid {pid} is a devctx server but not verifiably the central daemon; not signalling it"
-        ),
+        // Not `Ok`: a stop that stopped nothing must not exit 0 (and the lock
+        // message sends people here).
+        Ownership::Unverified => {
+            return Err(CentralError::Request(format!(
+                "pid {pid} looks like the central daemon but cannot be tied to {} (it predates \
+                 start times, or this platform cannot confirm the process); not signalling it \
+                 and keeping the file. If it is yours, stop it yourself with `kill {pid}` and \
+                 delete {}.",
+                path.display(),
+                path.display()
+            )))
+        }
         Ownership::Ours => {
-            if procown::terminate(pid, || ownership(&info) == Ownership::Ours, term, kill) {
-                println!("Stopped the central daemon (pid {pid}).");
-                remove_serve_file(paths);
-            } else {
+            let out = procown::terminate(pid, || ownership(&info) == Ownership::Ours, term, kill);
+            if let Some(why) = out.failure("central daemon", pid) {
                 return Err(CentralError::Request(format!(
-                    "central daemon {pid} survived SIGTERM and SIGKILL; keeping {} so it stays discoverable",
+                    "{why}; keeping {} so it stays discoverable",
                     path.display()
                 )));
             }
+            println!("Stopped the central daemon (pid {pid}).");
+            remove_serve_file(paths);
         }
     }
     Ok(())

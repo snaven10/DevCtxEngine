@@ -117,3 +117,13 @@ obligatorio cuando hay fallback.
 - **Rama indexada pero vacía:** `branch_fallback.why` dice "is indexed but empty" si hay registro sin filas (`an_indexed_but_empty_current_branch_is_described_as_such`); `index_status` agrega `empty: true` y su hint. El hint de "no indexada" nombra la rama que se usará.
 - **`devctx routes` local:** `graph_target` devuelve también `extractor_stale` y la CLI imprime el aviso por stderr.
 - Test del symlink reescrito: `project.path` es un symlink al toplevel mismo (sin `sub/`).
+
+### Fixup D2 (review) — B2 y N3
+
+- B2: la pista de "indexed but empty" ya no pisa la de extractor viejo cuando aplican ambas: se concatenan
+  (`stale. Also: empty`). Test: `a_stale_and_empty_index_reports_both_hints`.
+- N3: en un repo sin ningún índice `index_status` decía "branch X is not indexed; ... answer from branch X" (misma
+  rama a ambos lados) con `indexed_branches` vacío. `no_record_hint` separa los casos: sin registros ->
+  "nothing indexed yet; run `devctx index`"; filas sin registro completo en la rama actual -> "has rows but no
+  completed index record (an interrupted run?)"; fallback real -> el texto de siempre. Test:
+  `a_repository_never_indexed_gets_its_own_message`.

@@ -972,6 +972,7 @@ fn cmd_tui(project: Option<String>) -> Result<()> {
 fn choose_model(
     key: &str,
     base: &devctx_core::config::Embeddings,
+    fetch: bool,
 ) -> Result<devctx_core::config::Embeddings> {
     let spec = devctx_embed::registry::find_local(key).ok_or_else(|| {
         anyhow!("unknown model `{key}`; run `devctx models` to see what there is")
@@ -982,15 +983,27 @@ fn choose_model(
     out.model_dir = if spec.builtin.is_some() {
         String::new()
     } else {
-        let dir = models::local_dir(key).ok_or_else(|| {
-            anyhow!(
-                "`{key}` is a user-defined ONNX model and its files are not on this \
-                 machine yet. Run `devctx models download {key}` first."
-            )
-        })?;
+        // `fetch`: the caller asked for this model outright (`--yes`, or a
+        // person at a terminal naming it with `--model`), so getting its files
+        // is the consequence of the request. Otherwise (a script, an agent)
+        // nothing is downloaded behind its back: it gets the exact command.
+        if fetch && models::local_dir(key).is_none() {
+            eprintln!("`{key}` needs its files; fetching them now.");
+            models::download(key)?;
+        }
+        let dir = models::local_dir(key).ok_or_else(|| anyhow!(missing_files_message(key)))?;
         dir.to_string_lossy().into_owned()
     };
     Ok(out)
+}
+
+/// The sentence for a user-defined ONNX model whose files are not on disk.
+fn missing_files_message(key: &str) -> String {
+    format!(
+        "`{key}` is a user-defined ONNX model and its files are not on this machine yet. \
+         Fetch them with `devctx models --download {key}` and run this again, or pass \
+         `--yes` to download them as part of `init`."
+    )
 }
 
 /// Make this project's model the machine's default, and the vector space that
@@ -3005,7 +3018,14 @@ fn cmd_init(
         copied = Some(cfg);
     }
     if let Some(key) = &answers.model {
-        defaults.embeddings = choose_model(key, &defaults.embeddings)?;
+        {
+            use std::io::IsTerminal as _;
+            defaults.embeddings = choose_model(
+                key,
+                &defaults.embeddings,
+                yes || std::io::stdin().is_terminal(),
+            )?;
+        }
     }
     if let Some(o) = answers.offline {
         defaults.embeddings.offline = o;

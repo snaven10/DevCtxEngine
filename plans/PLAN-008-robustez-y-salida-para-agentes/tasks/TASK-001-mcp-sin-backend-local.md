@@ -140,3 +140,28 @@ ser accionable (causa + comando). `serve.log` puede crecer: truncar.
    - **6:** el fallback sin `start_time` exige cwd == raíz del proyecto (canonicalizado), no "dentro"; cwd `(deleted)` nunca coincide. `Unverified` no se mata NI se des-anuncia (`stop` avisa y conserva `serve.json`).
    - **TOCTOU:** en Linux se abre un pidfd antes de verificar y la señal va por `pidfd_send_signal`; si falla `pidfd_open` cae a `kill(2)` (ventana documentada). Fuera de Linux/unix sin verificación de dueño, como antes.
    - **No verificado:** macOS/Windows; `pidfd_send_signal` en kernels < 5.3 (cae a `kill`).
+
+### Fixup D2 (review sobre Fixup C: propiedad de procesos)
+
+- Fuera de Linux `is_server_pid` era solo `kill -0` y `classify` devolvía `Ours` para cualquier PID vivo: tras un
+  reinicio de Mac, `serve --stop` / TUI / `serve --central --stop` hacían SIGTERM y luego SIGKILL a lo que heredó
+  el número. Ahora `ps -p <pid> -o lstart=,command=` debe confirmar un `devctx serve|api` y el `lstart` (token
+  FNV-1a, solo se compara) se guarda como `start_time`; lo que `ps` no confirma es `Unverified` (no se señala ni
+  se borra `serve.json`) y `ps` ausente / Windows también. Windows queda documentado como preexistente (sin
+  `kill -0` el pid era `Gone` y `stop` borraba `serve.json` sin parar nada); ahora al menos no borra. Tests
+  puros en todas las plataformas: `off_linux_only_ps_confirmation_makes_a_pid_ours`.
+- `terminate` devuelve `Termination { Gone, Survived, NoPermission }`: el errno de `pidfd_send_signal`/`kill` ya
+  no se ignora (EPERM con un serve de otro usuario/sudo esperaba 8 s y decía "survived"; ahora
+  "no permission to signal PID N"). Test: `a_refused_signal_is_reported_as_no_permission` (pid 1; no corre como
+  root).
+- `serve --stop` y `serve --central --stop` con `Unverified` fallan con exit != 0 y texto accionable ("if it's
+  yours, `kill <pid>` and delete <serve.json>"); antes salían con 0 sin hacer nada y el mensaje de lock
+  recomendaba justo ese comando (bucle).
+- N2 (campo: `serve --stop` + `search` inmediato dio "Conflicting lock (PID <el que se detenía>)"): causa
+  probable confirmada en el diseño: `terminate` esperaba a que `/proc/<pid>/cmdline` dejara de parecer un serve,
+  pero el kernel vacía `cmdline` al soltar el `mm` (`exit_mm`), ANTES de cerrar descriptores (`exit_files`): en un
+  proceso grande el desmontaje del espacio de direcciones deja una ventana en la que "ya no es nuestro" y el
+  lock de DuckDB sigue tomado. Ahora la espera es a la SALIDA real (poll del pidfd; sin pidfd, estado Z/ausente o
+  start_time distinto). Test: `terminate_returns_only_after_the_process_has_exited` (`owns` pasa a falso al
+  instante mientras el proceso sigue cerrando: no debe volver antes). No se reprodujo el campo con un
+  `index --full` real.

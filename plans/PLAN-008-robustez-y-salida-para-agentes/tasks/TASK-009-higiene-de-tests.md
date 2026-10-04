@@ -189,3 +189,20 @@ Revisión: TASK-009 podía cortar un índice legítimo y salir con el WAL sin pl
   y la espera del mutex, no el rechazo. `FORCE CHECKPOINT` queda como escalada.
 - **No verificado:** fallos EIO reales de drvfs/9p (simulado con EACCES); `heartbeat` en un HNSW
   >900 s real; el camino ordenado (fin de `main`) sigue usando `exit` normal.
+
+### Fixup D2 (review)
+
+- Los tests ya NUNCA caen por defecto en `~/.local/share/devctx/models` (35bfb7d enlazaba `DEVCTX_HOME/models`
+  a la caché real si `DEVCTX_MODEL_CACHE` no estaba): `common::shared_model_cache` usa
+  `$CARGO_TARGET_DIR|<workspace>/target` + `test-model-cache`. La primera corrida que necesite un modelo lo
+  descarga ahí. Test: `without_an_explicit_cache_the_tests_never_use_the_users_real_models` (projects_cli).
+- El test `dirs::the_model_cache_hangs_off_the_data_directory` ahora tolera `DEVCTX_MODEL_CACHE` seteado (el
+  default de producción no cambia: sigue colgando de `data_dir()`).
+- `common::stop_servers_under` sigue usando `procown::terminate` (ahora devuelve `Termination`; el resultado se
+  ignora como antes y los restos se verifican con `servers_under`).
+- N4: `devctx init --model ml-granite` sin los archivos del modelo ya no falla con un comando inexistente
+  (`models download`): con `--yes` o en terminal los descarga; sin terminal ni `--yes` el error trae el comando
+  exacto `devctx models --download <m>`. Test: `init_with_a_model_that_is_not_on_disk_names_the_download_command`.
+  La descarga con `--yes` no se probó (requiere red).
+- No verificado: `an_idle_server_waits_for_an_index_that_is_advancing` (serve_lifecycle) falla con >=2 hilos de
+  test y pasa sola o con `--test-threads=1`; se reprodujo idéntico sobre el padre (sin estos cambios).

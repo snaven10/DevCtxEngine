@@ -194,18 +194,23 @@ pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
         return Err(EnsureError::Disabled);
     }
     let spawned = spawn_server(cfg).map_err(|e| EnsureError::Spawn(format!("{e:#}")))?;
-    eprintln!("· started background server (devctx serve); it stays warm for later commands");
+    // Said only once it is up: when the serve cannot start (the lock is held,
+    // the port is taken) "started" would be a lie printed right before the error.
+    let started = |r: Remote| {
+        eprintln!("· started background server (devctx serve); it stays warm for later commands");
+        Ok(r)
+    };
     for _ in 0..WAIT_TICKS {
         std::thread::sleep(WAIT_TICK);
         match probe(cfg) {
-            Discovery::Up(r) => return Ok(r),
+            Discovery::Up(r) => return started(r),
             Discovery::Busy { pid, addr } => return Err(EnsureError::Busy { pid, addr }),
             Discovery::Down => {}
         }
         if spawned.exited.lock().is_ok_and(|e| e.is_some()) {
             // It may have exited because another server won the race and is up.
             if let Discovery::Up(r) = probe(cfg) {
-                return Ok(r);
+                return started(r);
             }
             return Err(EnsureError::Failed {
                 cause: spawned.failure_hint(),
@@ -234,7 +239,20 @@ pub fn ensure(cfg: &ProjectConfig) -> Option<Remote> {
 /// another process, where opening it can only fail, so the failure is returned
 /// now, naming the holder and how to release it.
 pub fn ensure_cli(cfg: &ProjectConfig) -> Result<Option<Remote>> {
-    match ensure_checked(cfg) {
+    cli_outcome(cfg, ensure_checked(cfg), |p| {
+        Ok(devctx_store::Store::check_unlocked(p)?)
+    })
+}
+
+/// [`ensure_cli`] over an already-computed answer; `check` is "can this file be
+/// opened" (injected so the lock-holder cases are testable without another
+/// process holding a DuckDB file).
+fn cli_outcome(
+    cfg: &ProjectConfig,
+    ensured: Result<Remote, EnsureError>,
+    check: impl Fn(&Path) -> Result<()>,
+) -> Result<Option<Remote>> {
+    match ensured {
         Ok(r) => Ok(Some(r)),
         Err(EnsureError::Busy { pid, addr }) => Err(anyhow::anyhow!(
             "the index of {} is held by PID {pid} (the server at {addr}, alive but not \
@@ -244,18 +262,18 @@ pub fn ensure_cli(cfg: &ProjectConfig) -> Result<Option<Remote>> {
         Err(EnsureError::Failed { cause: Some(c) }) if is_lock_error(&c) => {
             Err(anyhow::anyhow!(lock_message(cfg, &c)))
         }
-        // Nothing to ask and the caller will open the store itself — after
-        // loading whatever model it needs, which can take longer than the lock
-        // does to fail. Find out first.
-        Err(EnsureError::Disabled) => {
-            match devctx_store::Store::check_unlocked(&cfg.db_path()) {
+        // Nothing to ask (disabled, could not launch, or it died without a
+        // lock cause in its log — or one cut short) and the caller will open
+        // the store itself, after loading whatever model it needs, which can
+        // take longer than the lock does to fail. Find out first.
+        Err(EnsureError::Disabled | EnsureError::Spawn(_) | EnsureError::Failed { .. }) => {
+            match check(&cfg.db_path()) {
                 Err(e) if is_lock_error(&format!("{e:#}")) => {
                     Err(anyhow::anyhow!(lock_message(cfg, &format!("{e:#}"))))
                 }
                 _ => Ok(None),
             }
         }
-        Err(_) => Ok(None),
     }
 }
 
@@ -275,7 +293,8 @@ fn lock_holder_pid(text: &str) -> Option<u32> {
 /// own text (from the error or from `serve.log`).
 pub fn lock_message(cfg: &ProjectConfig, detail: &str) -> String {
     const REMEDY: &str = "If it is a `devctx mcp` from an old session, close that session; \
-                          otherwise `devctx serve --stop`.";
+                          otherwise `devctx serve --stop` (if that refuses, it says how to \
+                          release it by hand).";
     let name = &cfg.project.name;
     match lock_holder_pid(detail) {
         Some(pid) => format!(
@@ -289,7 +308,7 @@ pub fn lock_message(cfg: &ProjectConfig, detail: &str) -> String {
 /// A short account of a process for a human: its command line, whether its
 /// binary was replaced, and for how long it has been running. Linux reads
 /// `/proc`; elsewhere (or if the process is gone) there is just a word.
-fn describe_process(pid: u32) -> String {
+pub(crate) fn describe_process(pid: u32) -> String {
     #[cfg(target_os = "linux")]
     {
         let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
@@ -314,23 +333,20 @@ fn describe_process(pid: u32) -> String {
         if deleted {
             parts.push("its binary was replaced (deleted)".to_string());
         }
-        if let Some(age) = std::fs::metadata(format!("/proc/{pid}"))
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-        {
-            parts.push(format!("running for {}", human_age(age.as_secs())));
+        if let Some(age) = procown::age_secs(pid) {
+            parts.push(format!("running for {}", human_age(age)));
         }
         parts.join(", ")
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pid;
-        "another process".to_string()
+        match procown::age_secs(pid) {
+            Some(age) => format!("another process, running for {}", human_age(age)),
+            None => "another process".to_string(),
+        }
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn human_age(secs: u64) -> String {
     match secs {
         0..=89 => format!("{secs}s"),
@@ -509,9 +525,14 @@ fn term_wait_for(info: &ServeInfo, term: Duration) -> Duration {
 
 /// Stop the advertised server and report whether it is gone. Never deletes
 /// the discovery file: that is only right once the process is gone.
-fn terminate_ours(cfg: &ProjectConfig, info: &ServeInfo, term: Duration, kill: Duration) -> bool {
+fn terminate_ours(
+    cfg: &ProjectConfig,
+    info: &ServeInfo,
+    term: Duration,
+    kill: Duration,
+) -> procown::Termination {
     let Some(pid) = info.pid else {
-        return true;
+        return procown::Termination::Gone;
     };
     procown::terminate(pid, || owns_server(cfg, info), term, kill)
 }
@@ -542,7 +563,7 @@ fn reclaim_db_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> bool 
             // The file goes only with the process: dropping it while the server
             // lives leaves it unadvertised and holding the lock.
             let term = term_wait_for(&info, term);
-            if terminate_ours(cfg, &info, term, kill) {
+            if terminate_ours(cfg, &info, term, kill).is_gone() {
                 remove_serve_file(cfg);
                 true
             } else {
@@ -550,6 +571,18 @@ fn reclaim_db_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> bool 
             }
         }
     }
+}
+
+/// What to tell someone whose `--stop` refused because the pid cannot be tied
+/// to the file: why nothing was signalled, and the manual way out.
+pub fn unverified_message(pid: u32, serve_json: &Path, what: &str) -> String {
+    format!(
+        "pid {pid} looks like a {what} but cannot be tied to {} (it predates start times, or \
+         this platform cannot confirm the process); not signalling it and keeping the file. \
+         If it is yours, stop it yourself with `kill {pid}` and delete {}.",
+        serve_json.display(),
+        serve_json.display()
+    )
 }
 
 /// Stop the server advertised for this project (SIGTERM, then SIGKILL if it
@@ -569,12 +602,9 @@ fn stop_server_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> Resu
         Ownership::Gone => remove_serve_file(cfg),
         Ownership::Unverified => {
             let pid = info.pid.unwrap_or_default();
-            eprintln!(
-                "· pid {pid} is a devctx server but cannot be tied to this project (serve.json \
-                 predates start times and its working directory differs); not signalling it \
-                 and keeping {}",
-                path.display()
-            );
+            // Not an `Ok`: the caller (a person, a script) asked for a stop and
+            // nothing was stopped, and the lock message sends them here.
+            anyhow::bail!("{}", unverified_message(pid, &path, "devctx server"));
         }
         Ownership::Ours => {
             let pid = info.pid.unwrap_or_default();
@@ -584,10 +614,16 @@ fn stop_server_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> Resu
             // measured 61 seconds — before giving up and falling back to a local
             // open.
             let term = term_wait_for(&info, term);
-            if !terminate_ours(cfg, &info, term, kill) {
+            let out = terminate_ours(cfg, &info, term, kill);
+            if let Some(why) = out.failure("server", pid) {
                 anyhow::bail!(
-                    "server {pid} survived SIGTERM and SIGKILL; keeping {} so it stays discoverable",
-                    path.display()
+                    "{why}; keeping {} so it stays discoverable{}",
+                    path.display(),
+                    if out == procown::Termination::NoPermission {
+                        format!(". Stop it as the user that owns it (`kill {pid}`)")
+                    } else {
+                        String::new()
+                    }
                 );
             }
             println!("Stopped server (pid {pid}).");
@@ -614,7 +650,12 @@ const HEALTH_QUICK: Duration = Duration::from_millis(400);
 /// server (indexing, embedding) can take seconds to answer `/health`, and
 /// reading that as "dead" is how a second process ends up fighting it for the
 /// database.
-const HEALTH_PATIENT: Duration = Duration::from_secs(3);
+///
+/// 1.5 s: with [`HEALTH_QUICK`] a Busy verdict costs 1.9 s, inside the CLI's
+/// 2 s fast-fail target (it was 3.4 s). A server that needs between 1.5 and
+/// 3 s to answer `/health` now reads as Busy instead of Up; the next call
+/// reaches it.
+const HEALTH_PATIENT: Duration = Duration::from_millis(1500);
 
 /// What a `/health` request found.
 enum Health {
@@ -970,6 +1011,85 @@ mod tests {
         assert_eq!(lock_holder_pid(msg), Some(4242));
         assert_eq!(lock_holder_pid("no pid here"), None);
         assert!(!is_lock_error("disk full"));
+        // DuckDB rewords the message (no "(PID "): still a lock error, and the
+        // explanation falls back to its own text instead of inventing a pid.
+        let reworded = "IO Error: Could not set lock on file \"/x/index.duckdb\": \
+                        Conflicting lock is held by process 4242";
+        assert!(is_lock_error(reworded));
+        assert_eq!(lock_holder_pid(reworded), None);
+        let cfg = cfg_at(Path::new("/x"));
+        let text = lock_message(&cfg, reworded);
+        assert!(text.contains("held by another process"), "{text}");
+        assert!(text.contains("process 4242"), "{text}");
+    }
+
+    /// TASK-002 item 10: when the serve could not start for a reason that is
+    /// not (visibly) the lock — it never launched, or its log says nothing, or
+    /// the lock line was cut off — the CLI still asks the file before loading a
+    /// model, so the answer is the fast lock message, not a slow open.
+    #[test]
+    fn every_unanswered_start_checks_the_lock_before_the_caller_loads_a_model() {
+        let cfg = cfg_at(Path::new("/x"));
+        let locked = |_: &Path| -> Result<()> {
+            anyhow::bail!(
+                "Could not set lock on file: Conflicting lock is held in /usr/bin/devctx (PID 99)"
+            )
+        };
+        for err in [
+            EnsureError::Disabled,
+            EnsureError::Spawn("no such file".into()),
+            EnsureError::Failed { cause: None },
+            EnsureError::Failed {
+                cause: Some("no answer after 60s".into()),
+            },
+            EnsureError::Failed {
+                cause: Some("something unrelated, and the lock line was truncated".into()),
+            },
+        ] {
+            let label = format!("{err:?}");
+            let out = cli_outcome(&cfg, Err(err), locked);
+            let msg = out
+                .err()
+                .unwrap_or_else(|| panic!("{label}: not refused"))
+                .to_string();
+            assert!(msg.contains("PID 99"), "{label}: {msg}");
+        }
+        // Not locked: the caller opens the store itself, as before.
+        let free = |_: &Path| -> Result<()> { Ok(()) };
+        assert!(cli_outcome(&cfg, Err(EnsureError::Spawn("x".into())), free)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn an_unverified_stop_says_what_to_do_by_hand() {
+        let msg = unverified_message(
+            77,
+            Path::new("/p/.devctx/state/serve.json"),
+            "devctx server",
+        );
+        assert!(msg.contains("`kill 77`"), "{msg}");
+        assert!(msg.contains("/p/.devctx/state/serve.json"), "{msg}");
+    }
+
+    /// Field: a three-day process read "running for 2s" (the mtime of
+    /// `/proc/<pid>` is when the inode was first looked up, not when the
+    /// process started).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_age_shown_is_the_process_age_not_the_procfs_lookup_time() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2300));
+        let text = describe_process(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            text.contains("running for 2s") || text.contains("running for 3s"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1271,7 +1391,12 @@ mod tests {
         let cfg = cfg_at(&dir);
         let mut child = fake_server(&dir.join("nested"), "sleep 30\n");
         advertise_at(&cfg, closed_port(), child.id(), None);
-        stop_server_with(&cfg, Duration::from_millis(200), Duration::from_millis(200)).unwrap();
+        // Refusing is a failure (non-zero exit), with the way out spelled out.
+        let err = stop_server_with(&cfg, Duration::from_millis(200), Duration::from_millis(200))
+            .expect_err("a stop that stopped nothing must not succeed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("`kill {}`", child.id())), "{msg}");
+        assert!(msg.contains("serve.json"), "{msg}");
         assert!(
             child.try_wait().unwrap().is_none(),
             "an unverified server was killed"

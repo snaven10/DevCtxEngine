@@ -61,3 +61,19 @@ Leer `/proc` es Linux-only: en otras plataformas el mensaje omite el cmdline, nu
 6. **Contrato JSON:** sin cambios. Nuevo mensaje de error CLI: `the index of <proyecto> is held by PID N (<cmdline>, running for <edad>). If it is a `devctx mcp` from an old session, close that session; otherwise `devctx serve --stop`.`
 7. **No verificado:** plataformas sin `/proc`; TUI ante `Busy` (ahora falla en vez de `reclaim_db`, sin test); el mensaje cuando el binario del dueño está `(deleted)` (sin test).
 8. **Números:** lock ajeno -> error en < 2 s (test completo 0,8 s; antes ~63 s). Desviación: "started <hora>" se dio como antigüedad ("running for 3h"), sin dependencia de formato de fechas.
+
+### Fixup D2 (review)
+
+- Busy (serve.json + proceso vivo que no responde): `HEALTH_PATIENT` baja de 3 s a 1,5 s, así que el veredicto
+  cuesta 0,4 + 1,5 = 1,9 s, dentro del objetivo de 2 s (eran 3,4 s). Excepción conocida: un serve que tarda entre
+  1,5 y 3 s en contestar `/health` ahora se lee como Busy en vez de Up; la llamada siguiente lo alcanza.
+- `ensure_cli` (`cli_outcome`): `Spawn(..)` y `Failed` sin causa de lock (o con la línea cortada a 600 caracteres)
+  también hacen `Store::check_unlocked` antes de devolver `Ok(None)`, para que quien llama no cargue el embedder
+  antes de que `open_store` reformule. Test: `every_unanswered_start_checks_the_lock_before_the_caller_loads_a_model`.
+- "running for": ya no usa el mtime de `/proc/<pid>` (el inode se crea al primer lookup: un MCP de 3 días decía
+  "2s"); ahora `procown::age_secs` (start ticks de `/proc/<pid>/stat` + `/proc/uptime` + `sysconf(_SC_CLK_TCK)`;
+  `ps -o etime=` fuera de Linux). Test: `the_age_shown_is_the_process_age_not_the_procfs_lookup_time`.
+- Test del formato de mensaje de DuckDB sin "(PID " en `the_lock_holder_pid_is_read_from_duckdbs_message`.
+- N1: "· started background server" se imprime solo tras un arranque exitoso (antes salía antes del error de PID).
+- El remedio del mensaje de lock ya no manda en bucle a `serve --stop`: ese comando ahora falla (exit != 0) y dice
+  cómo liberar a mano (ver TASK-001 Fixup D2).
