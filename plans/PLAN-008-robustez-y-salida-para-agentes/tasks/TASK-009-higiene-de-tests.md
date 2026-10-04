@@ -206,3 +206,68 @@ Revisión: TASK-009 podía cortar un índice legítimo y salir con el WAL sin pl
   La descarga con `--yes` no se probó (requiere red).
 - No verificado: `an_idle_server_waits_for_an_index_that_is_advancing` (serve_lifecycle) falla con >=2 hilos de
   test y pasa sola o con `--test-threads=1`; se reprodujo idéntico sobre el padre (sin estos cambios).
+
+### Fixup D1b (review)
+
+- **Corrección a D1 punto 1 (marcas pendientes).** No las salda "el siguiente full": las salda
+  *cualquier* run que termine siendo el último en vuelo sobre esa base (full, incremental o la lista
+  de paths del watcher), y lo hace reconstruyendo HNSW/FTS sobre toda la base. Eso es lo correcto
+  (nadie más lo haría; mientras tanto las búsquedas van por fuerza bruta). Lo que estaba mal: la
+  marca se borraba aunque `enable_hnsw`/`rebuild_fts` devolviera `Ok(false)` (extensión no
+  disponible). Ahora solo se borra si la reconstrucción ocurrió (`pipeline.rs::run`).
+- **Escrituras por archivo atómicas (menor 4).** `Store::in_transaction` / `in_transaction_opt`
+  (reentrante; `upsert` se une a la transacción abierta). `index_file` parsea/trocea/embebe primero
+  y luego escribe delete+upsert+edges+routes+`file_state` en UNA transacción; la ruta de copia entre
+  ramas y `delete_file` también. Coste medido (`bench_index_small_fixture`, 300 archivos, store en
+  disco, debug, mediana de 3): 22.9 s antes, 19.7 s después (−14 %: menos commits).
+- **Congelado antes del checkpoint de salida (2).** `Store::freeze(wait)`: flag compartido por todas
+  las conexiones del mismo open + `RwLock` (cada escritura toma el lado compartido durante su
+  sentencia vía `Store::w()`); tras el freeze toda escritura falla con `StoreError::Frozen` y no llega
+  al WAL. `AppState::checkpoint_for_exit(freeze_wait)` congela primero. `exit_now`: `on_exit` antes
+  del checkpoint, y el hilo del checkpoint hace `_exit` en cuanto vuelve (el hilo llamante es el
+  presupuesto de 1.5 s). El camino ordenado también congela (el wind-down del runtime ya no puede
+  escribir).
+- **Carrera watchdog/camino ordenado (5).** `Lifecycle::claim_orderly_checkpoint` /
+  `claim_exit_checkpoint` (CAS `IDLE→RUNNING` / `IDLE→EXITING`): si `exit_now` encuentra
+  `RUNNING` espera a `DONE` (≤60 s) en vez de cortar; si el ordenado llega tarde, se aparta.
+- **Fases post-bucle (1).** `cancelled()` antes de los drops iniciales (un run que arranca tras el
+  stop no tira HNSW/FTS), dentro de la poda (para entre archivos, no avanza el record) y antes de cada
+  reconstrucción (se salta; la marca la deja para el siguiente run).
+- **Clientes (3).** `remote::index_cancelled`: `devctx index` (remoto) y `projects reindex` avisan y
+  salen ≠ 0; el watcher re-encola el lote (`Outcome::Cancelled`, pausa 5 s).
+- **`stop` sin índice.** `TERM_WAIT` = `devctx_api::STOP_TIMELINE` (gracia 3 s + 1.5 s) + 1.5 s = 6 s,
+  y `procown::terminate_patient` sigue esperando (≤65 s) mientras exista
+  `devctx_api::checkpoint_marker` (`serve.checkpointing`, con el pid) — el listener ya está cerrado
+  durante el checkpoint final, así que `/health` no sirve para preguntarlo.
+- **Gracia (7).** `DEVCTX_SHUTDOWN_GRACE_SECS` solo acorta (`grace_from`, tope 3 s).
+- **Central (6).** El checkpoint de salida por idle usa su propia conexión clonada (no el mutex) +
+  freeze + FORCE; el idle no sale con requests en vuelo salvo que lleven ≥4 ventanas (atascadas).
+- **Nits.** `cmd_index --full` anota `PENDING_HNSW` antes de su `drop_hnsw` y ya no reconstruye
+  HNSW/FTS dos veces; `modelload::guard_load_with` (el test ya no hace `set_var`); el envenenamiento
+  se levanta cuando el loader abandonado termina (`unpoison`).
+- **Flaky `an_idle_server_waits_for_an_index_that_is_advancing` — causa raíz.** No era el tiempo del
+  test: `do_index_inner` llamaba `sink.finish()` (running=false) ANTES de `prune_untracked_branches` +
+  `report_index`, y el reloj de idle se sellaba solo al *inicio* del request. En esa ventana el
+  watchdog veía "sin índice" e "idle 9.9 s" (desde el inicio del `/index`) y hacía `_exit` con la
+  respuesta sin enviar (`reply: ""`; log del serve: `idle for 9.98s` justo tras `finish`). Con más
+  hilos esa ventana se alarga. Arreglo: `finish` por guardia al final de `do_index_inner`, `finish`
+  sella `advanced`, el watchdog cuenta `AppState::last_index_activity` como actividad y `track`
+  sella también al terminar el request. 5/5 corridas verdes con paralelismo por defecto (el padre
+  falló 3 de 4).
+- **Tests nuevos.** Store: `a_frozen_store_refuses_writes_and_leaves_the_wal_alone`,
+  `a_freeze_waits_for_a_write_in_progress_up_to_its_budget`,
+  `a_transaction_commits_everything_or_nothing`. Index:
+  `a_stop_after_the_files_skips_the_rebuilds_and_keeps_them_owed`, `a_stop_during_the_prune_stops_it`,
+  `a_run_started_after_the_stop_drops_nothing` (los 3 fallan con el pipeline padre),
+  `a_write_attempted_after_the_freeze_never_reaches_the_wal`. API: `the_final_checkpoint_is_claimed_once`,
+  `the_grace_override_cannot_outgrow_the_stop_timeline`. Core: `patience_holds_sigkill_off_while_the_process_asks_for_it`,
+  `the_poison_lifts_once_the_abandoned_loader_finishes`. CLI: `the_checkpoint_marker_speaks_only_for_its_own_pid`,
+  `a_cancelled_index_answer_is_recognised`, `a_cancelled_answer_is_not_a_success`,
+  `devctx_index_fails_when_the_server_cancels_its_run` (falla en el padre: sale 0). Reescrito
+  `a_forced_exit_mid_index_leaves_a_sound_database`: `--full` sobre un índice existente, atascado
+  DENTRO de las escrituras de un archivo (seam `DEVCTX_TEST_STALL_IN_WRITE`), verifica sin `--full`
+  (`Store::files_missing_vectors` vacío + incremental sin "Failed to delete"); con la estructura
+  padre (autocommits) falla con `[("master","m003.rs")]`.
+- **No verificado:** un checkpoint final real de >6 s con `serve --stop` de punta a punta (la
+  paciencia está probada en `procown` y el marcador en `remote`); EIO real de drvfs; reconstrucción
+  HNSW con la extensión VSS ausente (la rama `Ok(false)` no se ejercita en tests).
