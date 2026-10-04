@@ -95,3 +95,9 @@ obligatorio cuando hay fallback.
    `search` solo reporta fallback cuando cae a la rama por defecto (no cuando va sin filtro).
 7. **No verificado:** REVFA_FrontEnd real; el cambio de forma de `search`/rutas en clientes externos; `graph_edges`.
 8. **Números:** sin medición de tiempo; `mcp_binding` completo ~200 s.
+
+### Fixup (review)
+
+- **Regresión:** `search` devuelve `{results, branch_fallback}` en toda búsqueda respondida desde la rama por defecto (y, desde TASK-007, rutas devuelven `{routes, warning|branch_fallback}`). Los consumidores internos asumían array: `search_one` (fan-out de grupo) inyectaba el wrapper como un hit sin `file`; `do_search_project` devolvía vacío en silencio; la tabla de `devctx search` imprimía "No results."; la TUI (F1 ruteada) y la UI web (`index.html`) también perdían los hits.
+- **Arreglo:** un único lector, `devctx_core::search_hits(&Value) -> SearchHits { hits, branch_fallback, omitted, warning }` (acepta array pelado u objeto con `results`/`routes`/`hits`; un wrapper nunca se vuelve hit). Usado en `search_one`, `do_search_project`, `print_remote_search`, TUI y la UI web. El grupo propaga las notas por miembro en `member_notes`; `search_project` conserva `branch_fallback`/`warning`; la tabla imprime la línea de nota/aviso. Las formas de respuesta no cambian (unificación = TASK-010).
+- **Tests:** 7 unitarios del helper (todas las formas); integración `search_shapes_cli.rs`: grupo con un miembro indexado en `main` y checkout en `feat` devuelve hits reales con `file` y reporta su fallback; tabla con serve en fallback imprime filas.

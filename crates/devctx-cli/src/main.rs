@@ -3682,12 +3682,25 @@ fn print_remote_search(json: &str, format: OutputFormat) -> Result<()> {
         OutputFormat::Json => println!("{json}"),
         OutputFormat::Table => {
             let hits: serde_json::Value = serde_json::from_str(json)?;
-            let arr = hits.as_array().cloned().unwrap_or_default();
-            if arr.is_empty() {
+            // Bare array, or `{results, branch_fallback, ...}` when the serve
+            // answered from another branch or truncated to budget.
+            let answer = devctx_core::search_hits(&hits);
+            if let Some(f) = &answer.branch_fallback {
+                println!("Note: answered from another branch: {f}");
+            }
+            if let Some(w) = &answer.warning {
+                println!(
+                    "Warning: {}",
+                    w.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| w.to_string())
+                );
+            }
+            if answer.hits.is_empty() {
                 println!("No results.");
                 return Ok(());
             }
-            for h in arr {
+            for h in answer.hits {
                 let s = |k| h.get(k).and_then(|v| v.as_str()).unwrap_or("");
                 let i = |k| h.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
                 let sym = if s("symbol").is_empty() {

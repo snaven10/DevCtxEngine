@@ -1117,6 +1117,7 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 2.0.20",
 ]

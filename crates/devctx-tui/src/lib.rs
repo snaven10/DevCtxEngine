@@ -193,9 +193,11 @@ impl Engine {
                         "query": query, "limit": LIMIT, "mode": m, "rerank": false,
                     }),
                 )?;
-                Ok(v.as_array()
-                    .map(|a| a.iter().map(json_to_hit).collect())
-                    .unwrap_or_default())
+                Ok(devctx_core::search_hits(&v)
+                    .hits
+                    .iter()
+                    .map(json_to_hit)
+                    .collect())
             }
         }
     }

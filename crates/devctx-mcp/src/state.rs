@@ -1862,7 +1862,7 @@ fn search_one(
     limit: usize,
     language: Option<&str>,
     mode: &str,
-) -> Result<Vec<Value>, String> {
+) -> Result<devctx_core::SearchHits, String> {
     // Not opening the store directly: DuckDB allows one writing process per
     // file, and a running `devctx serve` for that project owns it. Re-entering
     // our own binary with its working directory set is what the single-project
@@ -1896,10 +1896,10 @@ fn search_one(
             .unwrap_or("search failed")
             .to_string());
     }
-    match serde_json::from_slice::<Value>(&out.stdout).map_err(|e| e.to_string())? {
-        Value::Array(v) => Ok(v),
-        other => Ok(vec![other]),
-    }
+    // The answer is a bare array or `{results, branch_fallback, ...}`; the
+    // helper reads both and never turns the wrapper into a hit.
+    let v = serde_json::from_slice::<Value>(&out.stdout).map_err(|e| e.to_string())?;
+    Ok(devctx_core::search_hits(&v))
 }
 
 /// Search every member of a group and return one fused ranking.
@@ -1964,7 +1964,7 @@ pub fn do_search_group(
 
     // Run in bounded batches. Sequentially this is eleven round trips one after
     // another; the members are independent, so that latency is pure waste.
-    let mut results: Vec<(String, Result<Vec<Value>, String>)> = Vec::new();
+    let mut results: Vec<(String, Result<devctx_core::SearchHits, String>)> = Vec::new();
     for batch in targets.chunks(FANOUT_CONCURRENCY) {
         std::thread::scope(|scope| {
             let handles: Vec<_> = batch
@@ -1993,9 +1993,18 @@ pub fn do_search_group(
 
     let mut failed = Vec::new();
     let mut per_member: Vec<(String, Vec<Value>)> = Vec::new();
+    // What each member said about its own answer (branch fallback, stale
+    // index): a member answered from another branch is still an answer, but the
+    // reader has to be told which one it was.
+    let mut member_notes = serde_json::Map::new();
     for (name, r) in results {
         match r {
-            Ok(hits) => per_member.push((name, hits)),
+            Ok(answer) => {
+                if let Some(notes) = answer.notes_json() {
+                    member_notes.insert(name.clone(), notes);
+                }
+                per_member.push((name, answer.hits));
+            }
             // One member being down is not the search failing: the rest still
             // have an answer, and saying which one went missing beats refusing.
             Err(e) => failed.push(json!({ "project": name, "error": e })),
@@ -2054,6 +2063,9 @@ pub fn do_search_group(
     }
     if !failed.is_empty() {
         out["failed_projects"] = json!(failed);
+    }
+    if !member_notes.is_empty() {
+        out["member_notes"] = Value::Object(member_notes);
     }
     if let Some(warning) = fan_out_warning(&failed, members.len())? {
         out["warning"] = json!(warning);
@@ -2290,7 +2302,8 @@ pub fn do_search_project(
             .to_string());
     }
     let hits: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
-    let items = hits.as_array().cloned().unwrap_or_default();
+    let answer = devctx_core::search_hits(&hits);
+    let items = answer.hits.clone();
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
@@ -2300,6 +2313,12 @@ pub fn do_search_project(
     let mut out = json!({ "project": project, "path": path, "hits": kept });
     if !dropped.is_empty() {
         out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+    }
+    if let Some(f) = &answer.branch_fallback {
+        out["branch_fallback"] = f.clone();
+    }
+    if let Some(w) = &answer.warning {
+        out["warning"] = w.clone();
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
