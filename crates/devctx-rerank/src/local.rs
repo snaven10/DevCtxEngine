@@ -192,7 +192,10 @@ fn build(key: &str, model_dir: Option<&Path>, device: Device) -> Result<(TextRer
         opts = opts.with_cache_dir(cache);
     }
     init_on(device, |eps| {
-        TextRerank::try_new(opts.clone().with_execution_providers(eps))
+        // hf-hub's download has no read timeout: guard it (see `modelload`).
+        let opts = opts.clone().with_execution_providers(eps);
+        devctx_core::modelload::guard_load(key, move || TextRerank::try_new(opts))
+            .map_err(RerankError::Backend)?
             .map_err(|e| RerankError::Backend(e.to_string()))
     })
 }

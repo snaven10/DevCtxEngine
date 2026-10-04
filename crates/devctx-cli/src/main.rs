@@ -1276,7 +1276,14 @@ fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Resu
             Ok(())
         }
     };
-    let result = devctx_api::run_blocking_ready(cfg.clone(), socket, token, idle, advertise);
+    // A watchdog that ends the process (idle, or a stop that could not unwind)
+    // never returns here, so the advertisement is withdrawn through this hook.
+    let withdraw = {
+        let cfg = cfg.clone();
+        move || remote::remove_own_serve_file(&cfg)
+    };
+    let result =
+        devctx_api::run_blocking_ready(cfg.clone(), socket, token, idle, advertise, withdraw);
     // Only if it is still ours: a server that failed to bind must not delete
     // the file belonging to the healthy one that beat it to the port.
     remote::remove_own_serve_file(&cfg);

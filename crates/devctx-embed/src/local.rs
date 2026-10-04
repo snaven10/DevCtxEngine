@@ -170,7 +170,10 @@ fn load_builtin(
         opts = opts.with_max_length(max);
     }
     init_on(device, |eps| {
-        TextEmbedding::try_new(opts.clone().with_execution_providers(eps))
+        // hf-hub's download has no read timeout: guard it (see `modelload`).
+        let opts = opts.clone().with_execution_providers(eps);
+        devctx_core::modelload::guard_load(spec.key, move || TextEmbedding::try_new(opts))
+            .map_err(EmbedError::Backend)?
             .map_err(|e| EmbedError::Backend(e.to_string()))
     })
 }

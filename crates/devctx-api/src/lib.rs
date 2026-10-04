@@ -100,19 +100,26 @@ pub async fn serve(
     token: Option<String>,
     idle: Option<Duration>,
 ) -> anyhow::Result<()> {
-    serve_with(cfg, addr, token, idle, || Ok(())).await
+    serve_with(cfg, addr, token, idle, || Ok(()), || {}).await
 }
 
 /// [`serve`] with a hook that runs once the store is open and the port is
 /// bound — the moment this process really owns the database and can be
 /// advertised. A failing hook aborts the start.
+///
+/// `on_exit` undoes that advertisement. It runs on the paths that end the
+/// process from a watchdog thread (idle timeout, a stop request that could not
+/// unwind in time), where the caller's own cleanup after `serve` returns never
+/// gets to run.
 pub async fn serve_with(
     cfg: ProjectConfig,
     addr: SocketAddr,
     token: Option<String>,
     idle: Option<Duration>,
     ready: impl FnOnce() -> anyhow::Result<()>,
+    on_exit: impl Fn() + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
+    let on_exit: ExitHook = Arc::new(on_exit);
     let state = Arc::new(AppState::build(cfg)?);
     let activity = Arc::new(Mutex::new(Instant::now()));
     let app = router(Api {
@@ -127,40 +134,7 @@ pub async fn serve_with(
     eprintln!("DevCtxEngine API listening on http://{addr}");
 
     if let Some(timeout) = idle {
-        let act = activity.clone();
-        let closing = state.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                // A poisoned lock means a thread panicked holding it, not that a
-                // request just arrived. Reading that as `unwrap_or_default()` —
-                // `Duration::ZERO`, i.e. "busy right now" — silenced this timer
-                // for the rest of the process's life, which is the exact runaway
-                // it exists to prevent: the server then lingers forever, holding
-                // an embedding model and a reranker in memory. A panic cannot
-                // leave an `Instant` half-written, so the value behind the lock
-                // is still sound. Take it and carry on.
-                let idle_for = match act.lock() {
-                    Ok(t) => t.elapsed(),
-                    Err(poisoned) => poisoned.into_inner().elapsed(),
-                };
-                if idle_for >= timeout {
-                    // "No requests lately" is not the same as "nothing to do".
-                    // Indexing runs inside this process and can take far longer
-                    // than the idle window; the client that asked for it stops
-                    // polling as soon as its own read times out, and exiting
-                    // here discarded a nearly complete run.
-                    if closing.is_indexing() {
-                        continue;
-                    }
-                    eprintln!("DevCtxEngine server idle for {idle_for:?}; shutting down.");
-                    // `exit` runs no destructors, so the database would keep a
-                    // write-ahead log no process is ever going to fold in.
-                    closing.checkpoint();
-                    std::process::exit(0);
-                }
-            }
-        });
+        spawn_idle_watchdog(timeout, activity.clone(), state.clone(), on_exit.clone());
     }
 
     // Staying warm for the next command is the point of the server; holding a
@@ -190,14 +164,133 @@ pub async fn serve_with(
     // `devctx serve --stop` sends a plain TERM, whose default action is just as
     // abrupt as `exit`. Catching it buys the one thing that matters: a
     // checkpoint before the connection disappears.
+    //
+    // Graceful shutdown waits for every open connection, and a request stuck in
+    // a blocking task (an `/index` whose model download went quiet) never ends:
+    // so a plain TERM was caught, logged, and then ignored for as long as the
+    // process lived. The watchdog is a plain thread, armed *now*, that finishes
+    // the job if the orderly path has not.
+    let closing = state.clone();
+    let hook = on_exit.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = terminate().await;
             eprintln!("DevCtxEngine server terminating; checkpointing.");
+            arm_exit_watchdog(closing, hook);
         })
         .await?;
     state.checkpoint();
     Ok(())
+}
+
+/// What a server undoes about itself before a watchdog ends the process
+/// (removing its `serve.json`).
+type ExitHook = Arc<dyn Fn() + Send + Sync>;
+
+/// How long a stop request has to complete in an orderly way before the
+/// watchdog ends the process. `DEVCTX_SHUTDOWN_GRACE_SECS` overrides it.
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 5;
+
+/// How long the final checkpoint may take before the process leaves without it.
+const CHECKPOINT_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long the runtime may take to wind down its blocking pool on the way out.
+const RUNTIME_WIND_DOWN: Duration = Duration::from_secs(5);
+
+fn shutdown_grace() -> Duration {
+    let secs: u64 = std::env::var("DEVCTX_SHUTDOWN_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Fold the write-ahead log, undo the advertisement and end the process.
+///
+/// The checkpoint runs on its own thread with a budget: this is the path taken
+/// when something is already wrong, and a checkpoint that blocks would turn a
+/// watchdog into one more thing that hangs. `exit` runs no destructors, which
+/// is why the checkpoint is explicit.
+fn exit_now(state: &Arc<AppState>, on_exit: &ExitHook, code: i32) -> ! {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let s = state.clone();
+    let _ = std::thread::Builder::new()
+        .name("exit-checkpoint".into())
+        .spawn(move || {
+            s.checkpoint();
+            let _ = tx.send(());
+        });
+    let _ = rx.recv_timeout(CHECKPOINT_BUDGET);
+    on_exit();
+    std::process::exit(code)
+}
+
+/// After a stop request, end the process if the orderly shutdown has not.
+fn arm_exit_watchdog(state: Arc<AppState>, on_exit: ExitHook) {
+    let grace = shutdown_grace();
+    let _ = std::thread::Builder::new()
+        .name("stop-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(grace);
+            eprintln!(
+                "DevCtxEngine server did not stop within {}s of the request \
+                 (a blocking task is stuck); forcing exit.",
+                grace.as_secs()
+            );
+            exit_now(&state, &on_exit, 0);
+        });
+}
+
+/// Exit after `timeout` with no non-health request.
+///
+/// A plain thread, not a task: a task dies with the runtime's workers, and the
+/// one timer whose whole job is to end a process that is not behaving must not
+/// depend on the runtime behaving.
+fn spawn_idle_watchdog(
+    timeout: Duration,
+    act: Arc<Mutex<Instant>>,
+    state: Arc<AppState>,
+    on_exit: ExitHook,
+) {
+    // Polling every 30 s is plenty for a window of minutes; a short window (the
+    // tests use seconds) has to be noticed within a fraction of itself.
+    let poll = (timeout / 4).clamp(Duration::from_millis(250), Duration::from_secs(30));
+    let _ = std::thread::Builder::new()
+        .name("idle-watchdog".into())
+        .spawn(move || loop {
+            std::thread::sleep(poll);
+            // A poisoned lock means a thread panicked holding it, not that a
+            // request just arrived. Reading that as `unwrap_or_default()` —
+            // `Duration::ZERO`, i.e. "busy right now" — silenced this timer
+            // for the rest of the process's life, which is the exact runaway
+            // it exists to prevent: the server then lingers forever, holding
+            // an embedding model and a reranker in memory. A panic cannot
+            // leave an `Instant` half-written, so the value behind the lock
+            // is still sound. Take it and carry on.
+            let idle_for = match act.lock() {
+                Ok(t) => t.elapsed(),
+                Err(poisoned) => poisoned.into_inner().elapsed(),
+            };
+            if state.project_vanished() {
+                eprintln!("DevCtxEngine project directory is gone; shutting down.");
+                exit_now(&state, &on_exit, 0);
+            }
+            if idle_for < timeout {
+                continue;
+            }
+            // "No requests lately" is not the same as "nothing to do".
+            // Indexing runs inside this process and can take far longer than
+            // the idle window; the client that asked for it stops polling as
+            // soon as its own read times out, and exiting here discarded a
+            // nearly complete run. Only a run that is still advancing counts:
+            // one that has not moved for a long time is stuck, and a stuck run
+            // must not make the server immortal.
+            if state.is_indexing() {
+                continue;
+            }
+            eprintln!("DevCtxEngine server idle for {idle_for:?}; shutting down.");
+            exit_now(&state, &on_exit, 0);
+        });
 }
 
 /// Resolves when the process is asked to stop (SIGTERM, or Ctrl-C).
@@ -241,21 +334,29 @@ pub fn run_blocking(
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(cfg, addr, token, idle))
+    let result = rt.block_on(serve(cfg, addr, token, idle));
+    // Dropping a runtime waits, without a limit, for its blocking pool. Bound it.
+    rt.shutdown_timeout(RUNTIME_WIND_DOWN);
+    result
 }
 
-/// [`run_blocking`] with the [`serve_with`] hook.
+/// [`run_blocking`] with the [`serve_with`] hooks.
 pub fn run_blocking_ready(
     cfg: ProjectConfig,
     addr: SocketAddr,
     token: Option<String>,
     idle: Option<Duration>,
     ready: impl FnOnce() -> anyhow::Result<()>,
+    on_exit: impl Fn() + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve_with(cfg, addr, token, idle, ready))
+    let result = rt.block_on(serve_with(cfg, addr, token, idle, ready, on_exit));
+    // The implicit drop waited for the blocking pool with no limit: a model
+    // download that never answered kept a "stopped" server alive forever.
+    rt.shutdown_timeout(RUNTIME_WIND_DOWN);
+    result
 }
 
 // --- request bodies / query params ---

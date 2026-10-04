@@ -121,10 +121,13 @@ pub async fn serve(
     eprintln!("DevCtxEngine central store listening on http://{addr}");
 
     if let Some(timeout) = idle {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                // See the same loop in `lib.rs::serve`: a poisoned lock read as
+        // A plain thread, so the timer does not depend on the runtime's workers.
+        let poll = (timeout / 4).clamp(Duration::from_millis(250), Duration::from_secs(30));
+        let _ = std::thread::Builder::new()
+            .name("idle-watchdog".into())
+            .spawn(move || loop {
+                std::thread::sleep(poll);
+                // See the same loop in `lib.rs`: a poisoned lock read as
                 // `Duration::ZERO` makes this server immortal instead of idle.
                 let idle_for = match activity.lock() {
                     Ok(t) => t.elapsed(),
@@ -134,8 +137,7 @@ pub async fn serve(
                     eprintln!("Central store idle for {idle_for:?}; shutting down.");
                     std::process::exit(0);
                 }
-            }
-        });
+            });
     }
 
     if sweep_every > 0 {
@@ -222,7 +224,10 @@ pub fn run_blocking(
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(central, addr, token, idle, announce))
+    let result = rt.block_on(serve(central, addr, token, idle, announce));
+    // Bounded: the implicit drop waits for the blocking pool with no limit.
+    rt.shutdown_timeout(Duration::from_secs(5));
+    result
 }
 
 // --- request bodies / query params ---

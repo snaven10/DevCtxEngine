@@ -46,6 +46,9 @@ pub struct IndexProgress {
     pub done: usize,
     /// The file it reached last.
     pub file: String,
+    /// When the run last moved (started, or reached a file). `running` with an
+    /// old stamp is a run that is stuck, not one that is working.
+    pub advanced: Option<Instant>,
 }
 
 /// Writes an indexing run's progress where a request handler can read it.
@@ -103,6 +106,7 @@ impl ProgressSink for SharedProgress {
         p.total = total;
         p.done = 0;
         p.file.clear();
+        p.advanced = Some(Instant::now());
     }
 
     fn file(&self, path: &str) {
@@ -113,6 +117,7 @@ impl ProgressSink for SharedProgress {
         p.done += 1;
         p.file.clear();
         p.file.push_str(path);
+        p.advanced = Some(Instant::now());
     }
 }
 
@@ -883,17 +888,44 @@ fn do_index_inner(
 /// would queue behind the very work it reports on and arrive too late to be
 /// worth reporting.
 impl AppState {
+    /// Whether the project this server owns has been deleted from under it (its
+    /// directory or its `.devctx/`). Such a server serves nothing anyone can
+    /// reach again, and the test-suite leak of PLAN-008 B9 was exactly one.
+    pub fn project_vanished(&self) -> bool {
+        !self.root.join(".devctx").is_dir()
+    }
+
     /// Whether an indexing run is in flight right now.
     ///
     /// The idle watchdog asks before shutting the server down: indexing happens
     /// *inside* the server, so a run whose client has stopped asking about it is
     /// still real work, and exiting would throw away everything it has done.
+    ///
+    /// Only a run that is still *advancing* counts. One that is `running` but
+    /// has not reached a new file for [`index_stall_limit`] is stuck, and
+    /// exempting it from the idle timeout forever made a wedged server
+    /// immortal (PLAN-008 B11).
     pub fn is_indexing(&self) -> bool {
-        self.index_progress
+        let p = self
+            .index_progress
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .running
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        p.running
+            && p.advanced
+                .is_none_or(|at| at.elapsed() < index_stall_limit())
     }
+}
+
+/// How long an indexing run may go without reaching a new file before it stops
+/// excusing the server from its idle timeout. `DEVCTX_INDEX_STALL_SECS`
+/// overrides the 15 minutes (tests use seconds). Generous on purpose: one very
+/// large file is slow, not stuck.
+fn index_stall_limit() -> Duration {
+    let secs: u64 = std::env::var("DEVCTX_INDEX_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900);
+    Duration::from_secs(secs)
 }
 
 pub fn do_index_progress(state: &AppState) -> Result<String, String> {
