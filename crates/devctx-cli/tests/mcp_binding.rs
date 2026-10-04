@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod common;
+
 /// Serialises every test that writes a memory — across test binaries, not just
 /// within this one.
 ///
@@ -76,6 +78,7 @@ impl Tmp {
         let dir = std::env::temp_dir().join(format!("devctx_bind_it_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        common::share_models(&dir.join("central"));
         Self(dir)
     }
 
@@ -128,6 +131,8 @@ impl Drop for Tmp {
             .env("DEVCTX_HOME", self.home())
             .args(["serve", "--central", "--stop"])
             .output();
+        // Whatever those did not reach (no `serve.json`, a server mid-spawn).
+        common::reap_servers_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -1279,15 +1284,16 @@ fn call_tool_timed_with(
 ) -> (serde_json::Value, std::time::Duration) {
     use std::io::{BufRead, BufReader, Write};
 
-    let mut child = Command::new(exe)
-        .env("DEVCTX_HOME", home)
-        .current_dir(cwd)
-        .arg("mcp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawning the MCP server");
+    let mut child = common::spawn_retrying(
+        Command::new(exe)
+            .env("DEVCTX_HOME", home)
+            .current_dir(cwd)
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawning the MCP server");
     let mut stdin = child.stdin.take().expect("stdin");
     let init = concat!(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"#,
@@ -1483,7 +1489,7 @@ fn an_mcp_whose_binary_was_replaced_can_still_start_a_server() {
         .expect("running git init");
     assert!(git.success());
     let copy = tmp.0.join("devctx-copy");
-    std::fs::copy(env!("CARGO_BIN_EXE_devctx"), &copy).expect("copying the binary");
+    common::install_copy(Path::new(env!("CARGO_BIN_EXE_devctx")), &copy);
 
     let (msg, _) = call_tool_timed(&copy, &home, &root, "index_status", || {
         std::fs::remove_file(&copy).expect("deleting the running binary");
@@ -1705,17 +1711,18 @@ fn a_replaced_binary_is_reported_and_the_mcp_keeps_answering() {
     // Run from a private copy so replacing it cannot touch the build output.
     let bin_dir = tmp.dir("bin");
     let exe = bin_dir.join("devctx");
-    std::fs::copy(env!("CARGO_BIN_EXE_devctx"), &exe).unwrap();
+    common::install_copy(Path::new(env!("CARGO_BIN_EXE_devctx")), &exe);
 
-    let mut child = Command::new(&exe)
-        .env("DEVCTX_HOME", &home)
-        .current_dir(&root)
-        .arg("mcp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawning the MCP server");
+    let mut child = common::spawn_retrying(
+        Command::new(&exe)
+            .env("DEVCTX_HOME", &home)
+            .current_dir(&root)
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawning the MCP server");
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(INIT_MSGS.as_bytes()).unwrap();
     stdin.flush().unwrap();
@@ -1749,9 +1756,7 @@ fn a_replaced_binary_is_reported_and_the_mcp_keeps_answering() {
     assert!(before["mcp"].get("hint").is_none());
 
     // What `install -m755 new ~/.local/bin/devctx` does: a new inode takes the path.
-    let staged = bin_dir.join("devctx.new");
-    std::fs::copy(env!("CARGO_BIN_EXE_devctx"), &staged).unwrap();
-    std::fs::rename(&staged, &exe).unwrap();
+    common::install_copy(Path::new(env!("CARGO_BIN_EXE_devctx")), &exe);
 
     let after = text(&ask(3, "index_status"));
     assert_eq!(after["mcp"]["binary_replaced"], true, "{after}");
@@ -1978,13 +1983,10 @@ fn group_recall_works_from_an_mcp_whose_binary_was_deleted() {
     remember_local(&home, &api, "api keeps its retry policy in retry.rs");
     remember_local(&home, &web, "web keeps its retry policy in backoff.ts");
 
-    // Copy, fsync and rename: exec-ing a file another fd still has open for
-    // writing fails with ETXTBSY.
-    let staged = tmp.0.join("devctx-staged");
-    std::fs::copy(env!("CARGO_BIN_EXE_devctx"), &staged).expect("copying the binary");
-    std::fs::File::open(&staged).unwrap().sync_all().unwrap();
+    // Copy, fsync, close and rename: exec-ing a file another fd still has open
+    // for writing fails with ETXTBSY (the spawn also retries on it).
     let copy = tmp.0.join("devctx-copy");
-    std::fs::rename(&staged, &copy).unwrap();
+    common::install_copy(Path::new(env!("CARGO_BIN_EXE_devctx")), &copy);
 
     let (msg, _) = call_tool_timed_with(
         &copy,

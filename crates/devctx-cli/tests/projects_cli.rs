@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod common;
+
 /// A scratch directory that cleans up after itself.
 struct Tmp(PathBuf);
 
@@ -19,6 +21,7 @@ impl Tmp {
         let dir = std::env::temp_dir().join(format!("devctx_cli_it_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        common::share_models(&dir.join("central"));
         Self(dir)
     }
 
@@ -41,6 +44,7 @@ impl Drop for Tmp {
             .env("DEVCTX_HOME", self.home())
             .args(["serve", "--central", "--stop"])
             .output();
+        common::reap_servers_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }

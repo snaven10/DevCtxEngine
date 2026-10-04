@@ -8,6 +8,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+mod common;
+
 /// A scratch central home that cleans up after itself.
 /// Serialises every test that writes a memory — across test binaries, not just
 /// within this one.
@@ -70,6 +72,7 @@ impl Tmp {
         let dir = std::env::temp_dir().join(format!("devctx_mcp_it_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        common::share_models(&dir.join("central"));
         Self(dir)
     }
 
@@ -106,6 +109,7 @@ impl Drop for Tmp {
             .env("DEVCTX_HOME", self.home())
             .args(["serve", "--central", "--stop"])
             .output();
+        common::reap_servers_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }

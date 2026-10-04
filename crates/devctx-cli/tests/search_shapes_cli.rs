@@ -9,6 +9,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod common;
+
 /// Serialises tests that load the embedding model, across test binaries (same
 /// lock file as `mcp_binding.rs` and `git_env_cli.rs`).
 struct EmbedLock(PathBuf);
@@ -59,6 +61,7 @@ impl Tmp {
             std::env::temp_dir().join(format!("devctx_shapes_it_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        common::share_models(&root.join("central"));
         Self {
             root,
             projects: Vec::new(),
@@ -83,6 +86,7 @@ impl Drop for Tmp {
             .env("DEVCTX_HOME", self.home())
             .args(["serve", "--central", "--stop"])
             .output();
+        common::reap_servers_under(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
