@@ -370,6 +370,20 @@ Cada TASK llena su `## Resultado` con:
   ni un `CARGO_TARGET_DIR` relativo, ni `build.target-dir` de `.cargo/config`.
 - **D1b:** no hay test e2e de `serve --stop` contra un checkpoint final real de más de 6 s (el
   camino paciente de `terminate_patient` solo se prueba con procesos de mentira).
+- **Idle exit con el listener abierto:** el idle watchdog del serve y del central congela y hace
+  checkpoint mientras axum todavía acepta requests. `e4f0cc9` cerró la pérdida de datos (upserts
+  atómicos y detrás del gate), pero la ventana sigue: cerrar el listener o responder 503 antes del
+  freeze la elimina de raíz.
+- **`in_tx` tras un panic:** si `f` hace panic dentro de `Store::in_transaction`, `in_tx` queda en
+  `true` y las transacciones siguientes de esa conexión corren sin `BEGIN` propio. Resetearlo con un
+  guard.
+- **`ps_command_is_server` fuera de Linux** acepta `/usr/bin/vim /x/devctx serve` (un token
+  `devctx*` en cualquier posición de los argumentos, no solo como argv0).
+- **Borrado de rama en `memory_refs.rs` (~430)** sin transacción: un corte a mitad deja la rama a
+  medio borrar (se repara en la siguiente poda).
+- **Test `devctx_index_fails_when_the_server_cancels_its_run`** usa `wait_with_output()` sin timeout:
+  si el CLI se cuelga, se cuelga la suite.
+- **`init` interactivo con granite + offline** guarda un `model_dir` vacío en la config.
 
 ## 13. Cierre
 
