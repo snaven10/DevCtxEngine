@@ -51,7 +51,7 @@ distinto del actual, aunque el commit coincida (PLAN-008 B8). Sin migrar tablas 
 
 - [x] Test de store: DB sin `index_meta` se abre sin error y reporta `extractor_stale: true`.
 - [x] Test: indexar → `extractor_stale: false`; cambiar el fingerprint (inyectado) → `true`.
-- [x] `devctx status` en un DB 0.8.2 existente: abre, crea la tabla, avisa una vez.
+- [ ] `devctx status` en un DB 0.8.2 existente: abre, crea la tabla, avisa una vez. **No cumplido tal cual:** abre y crea la tabla (cubierto por test de store), pero el aviso se repite en cada llamada (`index_status`, tools de grafo, `index` incremental) hasta correr `devctx index --full`; no hay "una sola vez". Tampoco se probó contra un DB 0.8.2 real.
 
 ## Riesgos
 
@@ -94,3 +94,8 @@ documenta en TASK-015; es honesto, no un falso positivo.
    no consulta el índice y no avisa; `search` no lleva el aviso (no es tool de grafo).
 8. **Números:** sin medición.
 
+### Fixup (review)
+
+- **I-2 (`--full` no curaba un índice multi-rama):** verificado por lectura de código: con `full_reindex`, `index_file` copiaba filas de otra rama con el mismo `content_hash` (`branch_with_same_content`) sin mirar el extractor, y luego se sellaba el fingerprint actual. Arreglo: `branch_with_same_content` recibe el fingerprint actual y hace JOIN con `index_meta`; solo ofrece ramas selladas con ese fingerprint (una rama vieja o sin registro ya no es fuente). Test: `a_full_run_does_not_copy_rows_from_a_stale_branch` (devctx-index).
+- **M-10:** el criterio 3 se desmarcó y se documenta el comportamiento real: el aviso se repite en cada llamada hasta un `--full`. Las corridas incrementales nunca re-sellan un índice viejo. El fingerprint NO cubre las versiones de las gramáticas tree-sitter ni `routes.rs`: un cambio en ellas exige subir `EXTRACTOR_VERSION` a mano (comentario junto a la constante en `devctx-parse/src/registry.rs`). Sigue sin verificarse contra un DB 0.8.2 real.
+- **I-3 (clave `repo_path`):** `graph_branch` y el chequeo de `extractor_stale` usaban `state.root` (`project.path`) mientras pipeline e `index_status` usan el toplevel de git. Ahora todo pasa por `AppState::repo_path()` / `repo_key()` (toplevel de git). Ver TASK-006.

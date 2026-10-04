@@ -229,21 +229,36 @@ impl Store {
     ///
     /// `content_hash` is what makes that safe: identical bytes give an
     /// identical hash, so a hit means the chunks already in the store are the
-    /// chunks this branch would have produced.
+    /// chunks this branch would have produced — *provided the same extractor
+    /// produced them*. Rows also carry symbols and edges, so only branches
+    /// whose `index_meta` records `extractor` (the current fingerprint) are
+    /// offered; a branch from an older extractor, or one with no record, would
+    /// smuggle its stale symbols into a branch about to be stamped fresh.
     pub fn branch_with_same_content(
         &self,
         repo_path: &str,
         file: &str,
         content_hash: &str,
         except_branch: &str,
+        extractor: &str,
     ) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT branch FROM file_state
-             WHERE repo_path = ? AND file_path = ? AND content_hash = ? AND branch <> ?
+            "SELECT f.branch FROM file_state f
+             JOIN index_meta m
+               ON m.repo_path = f.repo_path AND m.branch = f.branch AND m.key = ?
+             WHERE f.repo_path = ? AND f.file_path = ? AND f.content_hash = ?
+               AND f.branch <> ? AND m.value = ?
              LIMIT 1",
         )?;
         match stmt.query_row(
-            duckdb::params![repo_path, file, content_hash, except_branch],
+            duckdb::params![
+                EXTRACTOR_META_KEY,
+                repo_path,
+                file,
+                content_hash,
+                except_branch,
+                extractor
+            ],
             |r| r.get::<_, String>(0),
         ) {
             Ok(b) => Ok(Some(b)),

@@ -84,6 +84,12 @@ const SOURCES: &[&str] = &[
 /// normalisation, edge resolution, symbol kinds). Bump it whenever a change
 /// there alters what a re-parse of the same source produces; the embedded
 /// `languages/*.json` are covered by the hash and need no bump.
+///
+/// What the fingerprint does NOT cover: the tree-sitter grammar versions
+/// (a `Cargo.lock` bump that changes parse trees) and the route extraction in
+/// `devctx-index`'s `routes.rs`. A change to either needs a manual bump here,
+/// or existing indexes keep reading as fresh. Only a full run (`index --full`)
+/// stamps the fingerprint; incremental runs never re-stamp an older index.
 pub const EXTRACTOR_VERSION: u32 = 1;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.

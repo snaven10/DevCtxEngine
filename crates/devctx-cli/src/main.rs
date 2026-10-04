@@ -2381,13 +2381,17 @@ fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
         return Ok(());
     }
     let store = open_store(&cfg, configured_dimension(&cfg))?;
-    let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
-    let routes = store.search_routes(
-        &git.short_name(),
-        &git.state().branch,
-        method.as_deref(),
-        path.as_deref(),
-    )?;
+    let (repo, branch, fallback) = devctx_mcp::state::graph_target(
+        &store,
+        &project_root(&cfg)?,
+        cfg.indexing.default_branch(),
+    )
+    .map_err(|e| anyhow!(e))?;
+    let routes = store.search_routes(&repo, &branch, method.as_deref(), path.as_deref())?;
+    if let Some(f) = &fallback {
+        let why = f.get("why").and_then(|w| w.as_str()).unwrap_or_default();
+        eprintln!("· branch_fallback: {why}");
+    }
     if routes.is_empty() {
         println!("No routes.");
         return Ok(());

@@ -518,10 +518,13 @@ impl Ctx<'_> {
         // Safe because the key is the content hash: identical bytes, identical
         // chunks. What differs between the two rows is only which branch they
         // are filed under.
-        if let Some(src) =
-            self.store
-                .branch_with_same_content(self.repo_path, file, &hash, self.branch)?
-        {
+        if let Some(src) = self.store.branch_with_same_content(
+            self.repo_path,
+            file,
+            &hash,
+            self.branch,
+            &devctx_parse::extractor_fingerprint(),
+        )? {
             let (language, symbols, chunks) =
                 self.store
                     .copy_file_rows(self.repo_short, &src, self.branch, file)?;

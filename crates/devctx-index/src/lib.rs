@@ -288,6 +288,43 @@ mod tests {
         assert_eq!(files_on(&store, "main"), vec!["a.py", "b.py"]);
     }
 
+    /// `--full` must cure a stale index, so it may not copy rows another branch
+    /// holds from an older extractor: copying them and then stamping the branch
+    /// fresh would hide the very staleness the stamp exists to report.
+    #[test]
+    fn a_full_run_does_not_copy_rows_from_a_stale_branch() {
+        let dir = two_branch_repo("stale_copy");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let repo_path = GitRepo::open(&dir)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .to_string();
+        index_branch(&store, &dir, "feature", true);
+        store
+            .set_index_meta(&repo_path, "feature", "extractor", "v0-old")
+            .unwrap();
+
+        let main = index_branch(&store, &dir, "main", true);
+        assert!(main.full_reindex);
+        assert_eq!(main.files_copied, 0, "stale rows must not be copied");
+        assert!(!main.extractor_stale);
+        let now = extractor_fingerprint();
+        assert!(!store.extractor_stale(&repo_path, "main", &now).unwrap());
+
+        // Control: main is now fresh, so a fresh branch may copy from it.
+        store
+            .set_index_meta(&repo_path, "feature", "extractor", &now)
+            .unwrap();
+        let again = index_branch(&store, &dir, "feature", true);
+        assert!(
+            again.files_copied > 0,
+            "a current-extractor branch is a valid source"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Branches share commits, so the file they share must not be embedded
     /// twice — that is what makes keeping several branches indexed affordable.
     #[test]
@@ -303,7 +340,13 @@ mod tests {
             .expect("indexed on main");
         assert_eq!(
             store
-                .branch_with_same_content(&dir.to_string_lossy(), "a.py", &hash_a, "main")
+                .branch_with_same_content(
+                    &dir.to_string_lossy(),
+                    "a.py",
+                    &hash_a,
+                    "main",
+                    &extractor_fingerprint()
+                )
                 .unwrap(),
             None,
             "only main has it so far"
@@ -314,7 +357,13 @@ mod tests {
         // Now the shared file resolves across branches, and the changed one does not.
         assert_eq!(
             store
-                .branch_with_same_content(&dir.to_string_lossy(), "a.py", &hash_a, "feature")
+                .branch_with_same_content(
+                    &dir.to_string_lossy(),
+                    "a.py",
+                    &hash_a,
+                    "feature",
+                    &extractor_fingerprint()
+                )
                 .unwrap()
                 .as_deref(),
             Some("main"),

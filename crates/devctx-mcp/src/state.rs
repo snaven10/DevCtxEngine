@@ -348,11 +348,28 @@ impl AppState {
         self.cfg.indexing.default_branch().map(str::to_string)
     }
 
+    /// The key the store files this project's index under: git's top-level
+    /// directory, which is what the indexing pipeline uses. Not `self.root`
+    /// (the configured project path), which differs when the project is a
+    /// subdirectory of the repository or reached through a symlink.
+    pub fn repo_path(&self) -> String {
+        repo_key(&self.root)
+    }
+
     /// The short repo name + branch (for graph queries), from git.
     pub fn repo_branch(&self) -> Result<(String, String), String> {
         let git = GitRepo::open(&self.root).map_err(|e| e.to_string())?;
         Ok((git.short_name(), git.state().branch))
     }
+}
+
+/// The `repo_path` key the store uses for the repository containing `root`:
+/// git's top-level directory (as the indexing pipeline records it), falling
+/// back to `root` itself when it is not a git repository.
+pub fn repo_key(root: &std::path::Path) -> String {
+    GitRepo::open(root)
+        .map(|g| g.root().to_string_lossy().into_owned())
+        .unwrap_or_else(|_| root.to_string_lossy().into_owned())
 }
 
 /// The store vector dimension for a config, read from the registry so we don't
@@ -457,7 +474,7 @@ fn prune_untracked_branches(state: &AppState, store: &devctx_store::Store) -> us
     let Ok((repo, current)) = state.repo_branch() else {
         return 0;
     };
-    let repo_path = state.root.to_string_lossy().to_string();
+    let repo_path = state.repo_path();
     let Ok(indexed) = store.indexed_branches(&repo_path) else {
         return 0;
     };
@@ -483,40 +500,24 @@ fn prune_untracked_branches(state: &AppState, store: &devctx_store::Store) -> us
 /// most wants to search.
 ///
 /// So: the checked-out branch if it has rows, else the configured default if it
-/// has rows, else no filter — which is exactly the behaviour of every version
-/// before branches were tracked, and correct for the single-branch store that
-/// most repositories are.
+/// has rows, else the most recently indexed branch with rows (the same rule as
+/// the graph tools, via `pick_graph_branch`), else no filter — which is exactly
+/// the behaviour of every version before branches were tracked.
 fn search_branch(
     state: &AppState,
     store: &devctx_store::Store,
 ) -> (SearchFilter, Option<BranchFallback>) {
-    let unfiltered = SearchFilter::default();
-    let Ok((repo, branch)) = state.repo_branch() else {
-        return (unfiltered, None);
-    };
-    let has = |b: &str| store.has_branch_rows(&repo, b).unwrap_or(false);
-    if has(&branch) {
-        let filter = SearchFilter {
-            repo: Some(repo),
-            branch: Some(branch),
-            ..unfiltered
-        };
-        return (filter, None);
-    }
-    match state.default_branch().filter(|b| has(b)) {
-        Some(b) => {
-            let fallback = BranchFallback {
-                current: branch,
-                used: b.clone(),
-            };
+    // One rule for search and graph: see `pick_graph_branch`.
+    match pick_branch(state, store) {
+        Ok(c) if c.indexed => {
             let filter = SearchFilter {
-                repo: Some(repo),
-                branch: Some(b),
-                ..unfiltered
+                repo: Some(c.repo),
+                branch: Some(c.branch),
+                ..SearchFilter::default()
             };
-            (filter, Some(fallback))
+            (filter, c.fallback)
         }
-        None => (unfiltered, None),
+        _ => (SearchFilter::default(), None),
     }
 }
 
@@ -629,17 +630,44 @@ fn pick_graph_branch(
     }
 }
 
-fn graph_branch(state: &AppState, store: &devctx_store::Store) -> Result<BranchChoice, String> {
+/// The branch choice for this project, without insisting that something is
+/// indexed (callers that can answer from nothing — `graph`, `search` — use this).
+fn pick_branch(state: &AppState, store: &devctx_store::Store) -> Result<BranchChoice, String> {
     let (repo, current) = state.repo_branch()?;
-    let repo_path = state.root.to_string_lossy().to_string();
-    pick_graph_branch(
+    let repo_path = state.repo_path();
+    Ok(pick_graph_branch(
         store,
         &repo,
         &repo_path,
         &current,
         state.default_branch().as_deref(),
-    )
-    .ready()
+    ))
+}
+
+fn graph_branch(state: &AppState, store: &devctx_store::Store) -> Result<BranchChoice, String> {
+    pick_branch(state, store)?.ready()
+}
+
+/// The branch a graph-shaped query should run against for the repository at
+/// `root`, for callers that hold a store but no [`AppState`] (the local CLI).
+/// Returns `(repo, branch, branch_fallback)`; `branch_fallback` is the same
+/// JSON note the MCP tools emit.
+pub fn graph_target(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+) -> Result<(String, String, Option<Value>), String> {
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let c = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.state().branch,
+        default_branch,
+    );
+    let fallback = c.fallback.as_ref().map(BranchFallback::to_json);
+    Ok((c.repo, c.branch, fallback))
 }
 
 /// Parse an optional mode string into a [`SearchMode`] (default vector).
@@ -1335,7 +1363,8 @@ pub fn do_graph(
     hide_synthetic: bool,
 ) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = pick_branch(state, &store)?;
+    let (repo, branch) = (chosen.repo.clone(), chosen.branch.clone());
     let edges = store
         .graph_edges(&repo, &branch, kind.as_deref(), file.as_deref(), limit)
         .map_err(|e| e.to_string())?;
@@ -1398,13 +1427,14 @@ pub fn do_graph(
         })
         .collect();
 
-    Ok(json!({
+    let mut out = json!({
         "repo": repo,
         "branch": branch,
         "nodes": nodes,
         "edges": out_edges,
-    })
-    .to_string())
+    });
+    chosen.annotate(&mut out);
+    Ok(out.to_string())
 }
 
 /// Tell the registry what an indexing run produced, so `projects list` reflects
@@ -2312,7 +2342,17 @@ pub fn do_search_project(
     });
     let mut out = json!({ "project": project, "path": path, "hits": kept });
     if !dropped.is_empty() {
-        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+        // The child may already have dropped hits for its own budget; those
+        // count too, or the caller is told less than was left out.
+        let child = answer
+            .omitted
+            .as_ref()
+            .and_then(|o| o.get("count"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0) as usize;
+        out["omitted_for_budget"] = json!({ "count": dropped.len() + child, "items": dropped });
+    } else if let Some(o) = &answer.omitted {
+        out["omitted_for_budget"] = o.clone();
     }
     if let Some(f) = &answer.branch_fallback {
         out["branch_fallback"] = f.clone();
@@ -3229,6 +3269,19 @@ pub fn do_build_context(
     // Fetch more than will fit: the budget, not the limit, decides where to stop.
     let raw = do_search(state, query, 30, None, SearchMode::Vector, false)?;
     let hits: Vec<Value> = parse_memories(&raw);
+    // `do_search` says when it answered from another branch; a prose answer
+    // must say so too, since the code below may differ from what is checked out.
+    let fallback_note = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("branch_fallback").cloned())
+        .map(|f| {
+            format!(
+                "[devctx] branch_fallback: {}\n",
+                f.get("why")
+                    .and_then(|w| w.as_str())
+                    .unwrap_or("answered from another branch")
+            )
+        });
     let mut code_files: Vec<String> = Vec::new();
     let mut head = "## Code\n\n";
     for h in &hits {
@@ -3289,6 +3342,10 @@ pub fn do_build_context(
             "\n[devctx] {dropped} further item(s) did not fit in {max_tokens} tokens. \
              Raise max_tokens, or narrow the query.\n"
         ));
+    }
+    if let Some(note) = fallback_note {
+        out.push('\n');
+        out.push_str(&note);
     }
     if out.is_empty() {
         out.push_str("[devctx] nothing indexed matched this query.\n");
@@ -3358,17 +3415,32 @@ pub fn do_memories_by_symbol(
     limit: usize,
 ) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch().unwrap_or_default();
+    // Same branch rule as the graph tools: the junction rows are filed under
+    // the branch that was indexed, which is not the checked-out one on a branch
+    // nobody has indexed yet.
+    let (repo, branch, fallback) = match pick_branch(state, &store) {
+        Ok(c) if c.indexed => (c.repo, c.branch, c.fallback),
+        _ => {
+            let (r, b) = state.repo_branch().unwrap_or_default();
+            (r, b, None)
+        }
+    };
     let linked = store
         .memory_ids_for_symbol(symbol, &repo, &branch, limit)
         .map_err(|e| e.to_string())?;
-    linked_response(
+    let raw = linked_response(
         &store,
         symbol,
         linked,
         devctx_store::short_label(symbol),
         limit,
-    )
+    )?;
+    let Some(f) = fallback else {
+        return Ok(raw);
+    };
+    let mut v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    v["branch_fallback"] = f.to_json();
+    Ok(v.to_string())
 }
 
 /// `memories_by_file` tool: the decisions recorded about a file, plus the plan tasks that
@@ -4770,5 +4842,141 @@ mod tests {
             store.branches_by_recency(REPO_PATH).unwrap(),
             vec!["develop".to_string(), "main".to_string()]
         );
+    }
+
+    // --- repo_path key and branch rule shared by search and graph (review fixup) ---
+
+    fn sh(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A project living in `<repo>/sub` (git's toplevel is `<repo>`), checked out
+    /// on `feat/x`, whose store was indexed on `main` the way the pipeline does:
+    /// keyed by the git toplevel.
+    fn subdir_project(tag: &str) -> (AppState, PathBuf) {
+        let repo =
+            std::env::temp_dir().join(format!("devctx_mcp_subdir_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("sub/a.rs"), "pub fn greet() {}\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-q", "-m", "init"]);
+        sh(&repo, &["checkout", "-q", "-b", "feat/x"]);
+
+        let mut cfg = ProjectConfig::default();
+        cfg.project.path = repo.join("sub").to_string_lossy().into_owned();
+        cfg.state_dir = repo.join("state").to_string_lossy().into_owned();
+        let state = AppState::build(cfg).unwrap();
+
+        let git = GitRepo::open(&repo).unwrap();
+        let repo_path = git.root().to_string_lossy().into_owned();
+        let store = state.open_store().unwrap();
+        let dim = configured_dimension(&state.cfg);
+        store
+            .set_index_meta(
+                &repo_path,
+                "main",
+                devctx_store::EXTRACTOR_META_KEY,
+                &devctx_index::extractor_fingerprint(),
+            )
+            .unwrap();
+        store
+            .upsert(&[VectorPoint {
+                id: "p1".into(),
+                vector: vec![0.0; dim],
+                text: "pub fn greet() {}".into(),
+                metadata: VectorMetadata {
+                    repo: git.short_name(),
+                    branch: "main".into(),
+                    file: "sub/a.rs".into(),
+                    symbol: "greet".into(),
+                    symbol_type: "function".into(),
+                    language: "rust".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    ..Default::default()
+                },
+            }])
+            .unwrap();
+        store
+            .save_index_record(&devctx_store::IndexRecord {
+                repo_path,
+                branch: "main".into(),
+                last_commit: "abc".into(),
+                model_name: "m".into(),
+                model_dimension: dim as i64,
+                file_count: 1,
+                symbol_count: 1,
+                chunk_count: 1,
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+            })
+            .unwrap();
+        (state, repo)
+    }
+
+    #[test]
+    fn a_project_in_a_repo_subdirectory_keys_the_store_by_the_git_toplevel() {
+        let (state, repo) = subdir_project("key");
+        assert_ne!(state.root, repo, "the project is not the toplevel");
+        assert_eq!(
+            state.repo_path(),
+            GitRepo::open(&repo).unwrap().root().to_string_lossy()
+        );
+        let store = state.open_store().unwrap();
+        // Before the fix this read `state.root`, found no record, and so
+        // reported a fresh index as stale, and the recency fallback found nothing.
+        let c = graph_branch(&state, &store).expect("main is indexed");
+        assert_eq!(c.branch, "main");
+        assert!(!c.extractor_stale, "{c:?}");
+        assert!(c.fallback.is_some());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_path_keys_the_store_by_the_real_toplevel() {
+        let (state, repo) = subdir_project("link");
+        let link = std::env::temp_dir().join(format!("devctx_mcp_link_{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let mut cfg = state.cfg.clone();
+        cfg.project.path = link.join("sub").to_string_lossy().into_owned();
+        drop(state);
+        let state = AppState::build(cfg).unwrap();
+        let store = state.open_store().unwrap();
+        let c = graph_branch(&state, &store).expect("main is indexed");
+        assert_eq!(c.branch, "main");
+        assert!(!c.extractor_stale, "{c:?}");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn search_and_the_graph_tools_pick_the_same_branch_and_say_so() {
+        let (state, repo) = subdir_project("rule");
+        let store = state.open_store().unwrap();
+        // No default configured, nothing indexed on `feat/x`: before the fix
+        // search ran unfiltered and said nothing.
+        let (filter, fallback) = search_branch(&state, &store);
+        assert_eq!(filter.branch.as_deref(), Some("main"));
+        let f = fallback.expect("search must report the fallback");
+        assert_eq!((f.current.as_str(), f.used.as_str()), ("feat/x", "main"));
+
+        let graph: Value =
+            serde_json::from_str(&do_graph(&state, None, None, 10, false, false).unwrap()).unwrap();
+        assert_eq!(graph["branch"], "main");
+        assert_eq!(graph["branch_fallback"]["used"], "main");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
