@@ -212,6 +212,16 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     }
 
     let excluded = build_exclude(req.exclude);
+    let cancelled = || req.progress.is_some_and(|p| p.cancelled());
+    // A run that starts after the stop request has nothing to do but must not
+    // take the derived indexes down on its way: dropping them is a write, and
+    // the rebuild it would owe is one nobody is going to run in this process.
+    if cancelled() {
+        return Ok(IndexResult {
+            cancelled: true,
+            ..Default::default()
+        });
+    }
     let in_flight = InFlight::enter(req.store);
     // A run that was cut short (cancelled, killed) after dropping the derived
     // indexes left a note saying so; honour it as if they were still there.
@@ -324,6 +334,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         cfg: ChunkConfig::default(),
         indexed: HashSet::new(),
         excluded,
+        written: 0,
     };
 
     let mut result = IndexResult {
@@ -354,7 +365,6 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     if let Some(p) = req.progress {
         p.start(changes.len());
     }
-    let cancelled = || req.progress.is_some_and(|p| p.cancelled());
     for change in changes {
         // Between files, never inside one: every write so far is committed, so
         // stopping here leaves nothing half-done for the checkpoint to fold.
@@ -381,6 +391,30 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         }
     }
 
+    // Prune stale files: previously indexed but not re-indexed this full run.
+    // Checked for a stop between files like the loop above: a cancelled prune
+    // leaves the rest of the stale files for the next full run, which is what
+    // a cancelled loop does with the files it did not reach.
+    if !result.cancelled && !prev_files.is_empty() {
+        if let Some(p) = req.progress {
+            p.phase("prune");
+        }
+        for file in &prev_files {
+            if ctx.indexed.contains(file) {
+                continue;
+            }
+            if cancelled() {
+                result.cancelled = true;
+                break;
+            }
+            if let Some(p) = req.progress {
+                p.phase("prune");
+            }
+            ctx.delete_file(file)?;
+            result.files_pruned += 1;
+        }
+    }
+
     if result.cancelled {
         // Nothing past this point is safe or useful for a partial run: pruning
         // would delete every file the run did not reach, the index record would
@@ -394,22 +428,6 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         );
         heartbeat(req.progress, "checkpoint", || req.store.checkpoint());
         return Ok(result);
-    }
-
-    // Prune stale files: previously indexed but not re-indexed this full run.
-    if !prev_files.is_empty() {
-        if let Some(p) = req.progress {
-            p.phase("prune");
-        }
-    }
-    for file in &prev_files {
-        if !ctx.indexed.contains(file) {
-            if let Some(p) = req.progress {
-                p.phase("prune");
-            }
-            ctx.delete_file(file)?;
-            result.files_pruned += 1;
-        }
     }
 
     // A path-list run indexes uncommitted work, so HEAD is not what it covered:
@@ -458,6 +476,18 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // every one of its remaining inserts maintain the graph. The note is read
     // again here because a concurrent run may have dropped an index this one
     // never saw.
+    //
+    // So the run that settles a note is *whichever run finishes last* — a
+    // full one, an incremental one, or a watcher's one-file save alike — and
+    // it settles it by doing the rebuild, over the whole database. The note is
+    // cleared only once the rebuild really happened: an extension that is not
+    // available reports `false`, and the index stays owed rather than being
+    // declared rebuilt.
+    //
+    // A stop request skips both rebuilds — each can take minutes on a large
+    // repository, which is exactly the time a shutdown does not have — and
+    // the notes keep them owed to the next run. Checked before each, since
+    // the first can be long enough for the request to arrive during it.
     if in_flight.alone() {
         let hnsw = had_hnsw.or_else(|| {
             req.store
@@ -466,8 +496,11 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 .flatten()
         });
         if let Some(metric) = &hnsw {
-            heartbeat(req.progress, "hnsw", || req.store.enable_hnsw(metric))?;
-            req.store.delete_index_meta("", "", PENDING_HNSW_META_KEY)?;
+            if cancelled() {
+                eprintln!("· the server is stopping; the HNSW index is left for the next run");
+            } else if heartbeat(req.progress, "hnsw", || req.store.enable_hnsw(metric))? {
+                req.store.delete_index_meta("", "", PENDING_HNSW_META_KEY)?;
+            }
         }
         let fts = had_fts
             || req
@@ -477,8 +510,11 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 .flatten()
                 .is_some();
         if fts {
-            heartbeat(req.progress, "fts", || req.store.rebuild_fts())?;
-            req.store.delete_index_meta("", "", PENDING_FTS_META_KEY)?;
+            if cancelled() {
+                eprintln!("· the server is stopping; the BM25 index is left for the next run");
+            } else if heartbeat(req.progress, "fts", || req.store.rebuild_fts())? {
+                req.store.delete_index_meta("", "", PENDING_FTS_META_KEY)?;
+            }
         }
     }
     // An indexing run is where the write-ahead log comes from, and a WAL that
@@ -614,18 +650,47 @@ struct Ctx<'a> {
     indexed: HashSet<String>,
     /// Compiled `indexing.exclude` patterns.
     excluded: Gitignore,
+    /// Files that reached the write step this run (for [`stall_inside_write`]).
+    written: usize,
+}
+
+/// Test seam: `DEVCTX_TEST_STALL_IN_WRITE=<n>` stalls the run for good inside
+/// the writes of the n-th file it writes, after the first of them.
+///
+/// The serve-lifecycle tests need an index stuck *mid-write* — not between
+/// files, where every write is already committed and any exit is clean — to
+/// prove that a forced exit leaves no half-written file behind. Nothing else
+/// can hold a run there deterministically. Read once; unset (always, outside
+/// those tests) it costs one branch per file.
+fn stall_inside_write(nth: usize) {
+    static AT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| {
+        std::env::var("DEVCTX_TEST_STALL_IN_WRITE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    if *at == Some(nth) {
+        eprintln!("· test seam: stalled inside the writes of file #{nth}");
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
 }
 
 impl Ctx<'_> {
+    /// Forget a file: its vectors, edges, routes and state, as one
+    /// transaction (see `index_file` for why one).
     fn delete_file(&self, file: &str) -> Result<()> {
-        self.store
-            .delete_by_file(self.repo_short, self.branch, file)?;
-        self.store
-            .delete_file_edges(self.repo_short, self.branch, file)?;
-        self.store
-            .delete_file_routes(self.repo_short, self.branch, file)?;
-        self.store
-            .delete_file_state(self.repo_path, self.branch, file)?;
+        self.store.in_transaction(|| {
+            self.store
+                .delete_by_file(self.repo_short, self.branch, file)?;
+            self.store
+                .delete_file_edges(self.repo_short, self.branch, file)?;
+            self.store
+                .delete_file_routes(self.repo_short, self.branch, file)?;
+            self.store
+                .delete_file_state(self.repo_path, self.branch, file)
+        })?;
         Ok(())
     }
 
@@ -683,10 +748,6 @@ impl Ctx<'_> {
             }
         }
 
-        // Replace any existing vectors for this file.
-        self.store
-            .delete_by_file(self.repo_short, self.branch, file)?;
-
         // Branches share commits: a feature branch differs from its base in a
         // handful of files and is byte-identical in the other thousand. When
         // some other branch already holds this exact content, its chunks are
@@ -704,19 +765,29 @@ impl Ctx<'_> {
             self.branch,
             &devctx_parse::extractor_fingerprint(),
         )? {
-            let (language, symbols, chunks) =
+            // One transaction, like the embedding path below; rolled back
+            // (the old rows kept) when the source turns out to hold nothing.
+            let copied = self.store.in_transaction_opt(|| {
                 self.store
-                    .copy_file_rows(self.repo_short, &src, self.branch, file)?;
-            if chunks > 0 {
+                    .delete_by_file(self.repo_short, self.branch, file)?;
+                let (language, symbols, chunks) =
+                    self.store
+                        .copy_file_rows(self.repo_short, &src, self.branch, file)?;
+                if chunks == 0 {
+                    return Ok(None);
+                }
                 self.store.save_file_state(&devctx_store::FileState {
                     repo_path: self.repo_path.to_string(),
                     branch: self.branch.to_string(),
                     file_path: file.to_string(),
-                    content_hash: hash,
+                    content_hash: hash.clone(),
                     language,
                     symbol_count: symbols as i64,
                     chunk_count: chunks as i64,
                 })?;
+                Ok(Some((symbols, chunks)))
+            })?;
+            if let Some((symbols, chunks)) = copied {
                 self.indexed.insert(file.to_string());
                 result.files_indexed += 1;
                 result.files_copied += 1;
@@ -726,49 +797,73 @@ impl Ctx<'_> {
             }
         }
 
-        let (language, symbol_count, chunk_count) = match lang {
+        // Everything slow or fallible that writes nothing — parsing, chunking,
+        // the embedding round trip — happens first. Only then the writes, as
+        // one transaction: the old vectors out, the new ones in, edges, routes
+        // and the content hash commit together or not at all. Five separate
+        // autocommits let a process that ended between the first and the last
+        // leave a file whose recorded hash said "indexed, unchanged" over no
+        // vectors — a hole no incremental run would ever revisit.
+        let (language, parsed, chunks) = match lang {
             // Parseable code: chunk + embed, plus call-graph edges and routes.
             Some(lang) => {
                 let parsed = parse(lang, &content)?;
                 let chunks = chunk_file(file, &content, &parsed, &self.cfg);
-                self.embed_and_store(file, &parsed.language, &chunks)?;
-                self.store_edges(file, &parsed)?;
-                self.store_routes(file, &content)?;
-                result.symbols += parsed.symbols.len();
-                (parsed.language.clone(), parsed.symbols.len(), chunks.len())
+                (parsed.language.clone(), Some(parsed), chunks)
             }
             // Raw text (markdown/json/yaml/kotlin/…): one file-spanning chunk (or
             // blocks). Route extraction still runs (e.g. Kotlin Spring), returning
             // nothing for non-route file types.
             None => {
                 let rl = raw_lang.expect("raw language checked above");
-                let chunks = chunk_raw_text(file, &content, &self.cfg);
-                self.embed_and_store(file, rl, &chunks)?;
-                self.store_routes(file, &content)?;
-                (rl.to_string(), 0, chunks.len())
+                (
+                    rl.to_string(),
+                    None,
+                    chunk_raw_text(file, &content, &self.cfg),
+                )
             }
         };
+        let points = self.embed(file, &language, &chunks)?;
+        let symbol_count = parsed.as_ref().map_or(0, |p| p.symbols.len());
+        let chunk_count = chunks.len();
 
-        self.store.save_file_state(&FileState {
-            repo_path: self.repo_path.to_string(),
-            branch: self.branch.to_string(),
-            file_path: file.to_string(),
-            content_hash: hash,
-            language,
-            symbol_count: symbol_count as i64,
-            chunk_count: chunk_count as i64,
+        self.written += 1;
+        let nth = self.written;
+        self.store.in_transaction(|| {
+            self.store
+                .delete_by_file(self.repo_short, self.branch, file)?;
+            if !points.is_empty() {
+                self.store.upsert(&points)?;
+            }
+            stall_inside_write(nth);
+            if let Some(parsed) = &parsed {
+                self.store_edges(file, parsed)?;
+            }
+            self.store_routes(file, &content)?;
+            self.store.save_file_state(&FileState {
+                repo_path: self.repo_path.to_string(),
+                branch: self.branch.to_string(),
+                file_path: file.to_string(),
+                content_hash: hash.clone(),
+                language: language.clone(),
+                symbol_count: symbol_count as i64,
+                chunk_count: chunk_count as i64,
+            })?;
+            Ok(())
         })?;
         self.indexed.insert(file.to_string());
 
         result.files_indexed += 1;
+        result.symbols += symbol_count;
         result.chunks += chunk_count;
         Ok(())
     }
 
-    /// Embed `chunks` and upsert them as vectors for `file` under `language`.
-    fn embed_and_store(&self, file: &str, language: &str, chunks: &[Chunk]) -> Result<()> {
+    /// Embed `chunks` into the points to store for `file` under `language`.
+    /// Writes nothing: the caller stores them inside the file's transaction.
+    fn embed(&self, file: &str, language: &str, chunks: &[Chunk]) -> Result<Vec<VectorPoint>> {
         if chunks.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
         let vectors = self.embedder.embed(&texts)?;
@@ -802,11 +897,14 @@ impl Ctx<'_> {
                 },
             });
         }
-        self.store.upsert(&points)?;
-        Ok(())
+        Ok(points)
     }
 
-    fn store_edges(&self, file: &str, parsed: &devctx_parse::ParsedFile) -> Result<()> {
+    fn store_edges(
+        &self,
+        file: &str,
+        parsed: &devctx_parse::ParsedFile,
+    ) -> devctx_store::Result<()> {
         let edges: Vec<StoredEdge> = parsed
             .edges
             .iter()
@@ -820,10 +918,9 @@ impl Ctx<'_> {
             .collect();
         self.store
             .replace_file_edges(self.repo_short, self.branch, file, &edges)
-            .map_err(Into::into)
     }
 
-    fn store_routes(&self, file: &str, content: &str) -> Result<()> {
+    fn store_routes(&self, file: &str, content: &str) -> devctx_store::Result<()> {
         let routes: Vec<StoredRoute> = extract_routes(content, Path::new(file))
             .into_iter()
             .map(|r| StoredRoute {
@@ -839,7 +936,6 @@ impl Ctx<'_> {
             .collect();
         self.store
             .replace_file_routes(self.repo_short, self.branch, file, &routes, &now_stamp())
-            .map_err(Into::into)
     }
 }
 

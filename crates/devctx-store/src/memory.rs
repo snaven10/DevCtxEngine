@@ -73,7 +73,7 @@ impl Store {
     pub fn upsert_memory(&self, m: &Memory) -> Result<()> {
         self.conn
             .execute("DELETE FROM memories WHERE id = ?", params![m.id])?;
-        self.conn.execute(
+        self.w()?.execute(
             &format!(
                 "INSERT INTO memories ({MEM_COLS}) VALUES \
                  (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -136,7 +136,7 @@ impl Store {
 
     /// Soft-delete a memory (records the timestamp).
     pub fn delete_memory(&self, id: &str, now: &str) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "UPDATE memories SET deleted_at = ? WHERE id = ?",
             params![now, id],
         )?;
@@ -202,7 +202,7 @@ impl Store {
         if existed == 0 {
             return Ok(false);
         }
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM vectors WHERE id = ? OR id LIKE ? || '_c%'",
             params![id, id],
         )?;
@@ -233,7 +233,7 @@ impl Store {
         if n == 0 {
             return Ok(0);
         }
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM vectors WHERE EXISTS (
                  SELECT 1 FROM memories m
                  WHERE m.project = ?

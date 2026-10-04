@@ -62,7 +62,7 @@ impl Store {
     pub fn upsert_project(&self, p: &ProjectRecord) -> Result<()> {
         self.conn
             .execute("DELETE FROM projects WHERE name = ?", params![p.name])?;
-        self.conn.execute(
+        self.w()?.execute(
             &format!(
                 "INSERT INTO projects ({PROJ_COLS}) VALUES \
                  (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -130,7 +130,7 @@ impl Store {
 
     /// Activate or deactivate a project. Returns whether a row was affected.
     pub fn set_project_active(&self, name: &str, active: bool, now: &str) -> Result<bool> {
-        let n = self.conn.execute(
+        let n = self.w()?.execute(
             "UPDATE projects SET active = ?, updated_at = ? WHERE name = ?",
             params![active, now, name],
         )?;
@@ -152,7 +152,7 @@ impl Store {
         stats: &ProjectIndexStats,
         now: &str,
     ) -> Result<bool> {
-        let n = self.conn.execute(
+        let n = self.w()?.execute(
             "UPDATE projects SET last_commit = ?, last_branch = ?, last_indexed_at = ?,
                     file_count = ?, symbol_count = ?, chunk_count = ?, updated_at = ?
              WHERE name = ?",

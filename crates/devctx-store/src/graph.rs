@@ -68,7 +68,7 @@ impl Store {
         source_file: &str,
         edges: &[StoredEdge],
     ) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM graph_edges WHERE repo = ? AND branch = ? AND source_file = ?",
             params![repo, branch, source_file],
         )?;
@@ -77,7 +77,7 @@ impl Store {
             if !seen.insert((&e.source, &e.target, &e.kind)) {
                 continue;
             }
-            self.conn.execute(
+            self.w()?.execute(
                 "INSERT INTO graph_edges
                     (source, target, kind, source_file, target_file, line, repo, branch, metadata)
                  VALUES (?, ?, ?, ?, '', ?, ?, ?, '')",
@@ -97,7 +97,7 @@ impl Store {
 
     /// Delete all edges originating in a file.
     pub fn delete_file_edges(&self, repo: &str, branch: &str, source_file: &str) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM graph_edges WHERE repo = ? AND branch = ? AND source_file = ?",
             params![repo, branch, source_file],
         )?;

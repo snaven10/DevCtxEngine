@@ -1203,4 +1203,271 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Cancels at a named phase, or once `files` files have been started.
+    struct CancelAt {
+        phase: Option<&'static str>,
+        files: usize,
+        seen: std::sync::atomic::AtomicUsize,
+        hit: std::sync::atomic::AtomicBool,
+        phases: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CancelAt {
+        fn phase(name: &'static str) -> Self {
+            Self::new(Some(name), usize::MAX)
+        }
+        fn after_files(files: usize) -> Self {
+            Self::new(None, files)
+        }
+        fn new(phase: Option<&'static str>, files: usize) -> Self {
+            Self {
+                phase,
+                files,
+                seen: Default::default(),
+                hit: Default::default(),
+                phases: Default::default(),
+            }
+        }
+        fn phases(&self) -> Vec<String> {
+            self.phases.lock().unwrap().clone()
+        }
+    }
+
+    impl ProgressSink for CancelAt {
+        fn start(&self, _total: usize) {}
+        fn file(&self, _path: &str) {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn phase(&self, name: &str) {
+            self.phases.lock().unwrap().push(name.to_string());
+            if self.phase == Some(name) {
+                self.hit.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn cancelled(&self) -> bool {
+            self.hit.load(std::sync::atomic::Ordering::SeqCst)
+                || self.seen.load(std::sync::atomic::Ordering::SeqCst) >= self.files
+        }
+    }
+
+    fn repo_path_of(dir: &Path) -> String {
+        GitRepo::open(dir)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// D1b item 1: a stop that arrives after the file loop — here, once every
+    /// file has been started — skips the derived-index rebuilds (minutes on a
+    /// large repository, which a shutdown does not have) and keeps them owed.
+    /// The data itself is complete, so the run is not "cancelled" and its
+    /// record advances.
+    #[test]
+    fn a_stop_after_the_files_skips_the_rebuilds_and_keeps_them_owed() {
+        let dir = five_file_repo("skiprebuild");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index(&store, &dir);
+        for i in 0..5 {
+            write(
+                &dir,
+                &format!("m{i}.py"),
+                &format!("def h{i}():\n    return {i}1\n"),
+            );
+        }
+        commit_all(&dir, "touch");
+        store
+            .set_index_meta("", "", PENDING_FTS_META_KEY, "1")
+            .unwrap();
+        store
+            .set_index_meta("", "", PENDING_HNSW_META_KEY, "cosine")
+            .unwrap();
+        let sink = CancelAt::after_files(5);
+        let r = run_with(&store, &dir, false, &sink);
+        assert!(!r.cancelled, "every file was written");
+        assert_eq!(r.files_indexed, 5);
+        let phases = sink.phases();
+        assert!(
+            !phases.iter().any(|p| p == "hnsw" || p == "fts"),
+            "a stopping server must not start a rebuild: {phases:?}"
+        );
+        assert!(phases.iter().any(|p| p == "checkpoint"), "{phases:?}");
+        for key in [PENDING_FTS_META_KEY, PENDING_HNSW_META_KEY] {
+            assert!(
+                store.get_index_meta("", "", key).unwrap().is_some(),
+                "{key} must stay owed"
+            );
+        }
+        let head = GitRepo::open(&dir).unwrap().state().commit;
+        let rec = store
+            .get_index_record(&repo_path_of(&dir), "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec.last_commit, head,
+            "the files are all in; the record advances"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1b item 1: a stop during the prune stops it between files, like the
+    /// file loop: nothing more is deleted and the record is not advanced.
+    #[test]
+    fn a_stop_during_the_prune_stops_it() {
+        let dir = five_file_repo("pruncancel");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let first = index(&store, &dir);
+        let before = store
+            .get_index_record(&repo_path_of(&dir), "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.files_indexed, 5);
+        std::fs::remove_file(dir.join("m3.py")).unwrap();
+        std::fs::remove_file(dir.join("m4.py")).unwrap();
+        commit_all(&dir, "drop two");
+        let sink = CancelAt::phase("prune");
+        let r = run_with(&store, &dir, true, &sink);
+        assert!(r.cancelled, "the stop came in during the prune");
+        assert_eq!(r.files_pruned, 0, "nothing deleted after the stop");
+        assert_eq!(files_on(&store, "main").len(), 5);
+        let after = store
+            .get_index_record(&repo_path_of(&dir), "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.last_commit, before.last_commit);
+        let done = index_branch(&store, &dir, "main", true);
+        assert_eq!(done.files_pruned, 2, "the next full run finishes the prune");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1b item 1: a run that starts after the stop request drops nothing —
+    /// it would only leave a rebuild owed that nobody runs in this process.
+    #[test]
+    fn a_run_started_after_the_stop_drops_nothing() {
+        let dir = five_file_repo("latestart");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index(&store, &dir);
+        let has_fts = store.rebuild_fts().unwrap();
+        let r = run_with(&store, &dir, true, &CancelAfter::new(0));
+        assert!(r.cancelled);
+        assert_eq!(r.files_indexed, 0);
+        assert!(
+            store
+                .get_index_meta("", "", PENDING_FTS_META_KEY)
+                .unwrap()
+                .is_none(),
+            "no derived index was taken down, so none is owed"
+        );
+        if has_fts {
+            assert!(store.has_fts(), "the BM25 index is still there");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1b item 2: the exit path freezes the database, checkpoints and ends
+    /// the process while the indexing thread is still running. The thread's
+    /// next write must fail rather than land in a WAL nothing will fold — and
+    /// what it had committed before the freeze must be whole files only.
+    #[test]
+    fn a_write_attempted_after_the_freeze_never_reaches_the_wal() {
+        struct FreezeAfter {
+            files: usize,
+            seen: std::sync::atomic::AtomicUsize,
+            exit_conn: std::sync::Mutex<Store>,
+        }
+        impl ProgressSink for FreezeAfter {
+            fn start(&self, _total: usize) {}
+            fn file(&self, _path: &str) {
+                let n = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n == self.files + 1 {
+                    // What `exit_now` does, from another connection.
+                    let exit = self.exit_conn.lock().unwrap();
+                    assert!(exit.freeze(std::time::Duration::from_secs(1)));
+                    exit.force_checkpoint().unwrap();
+                }
+            }
+        }
+        let dir = five_file_repo("freeze");
+        let db = dir.join("idx.duckdb");
+        let wal = dir.join("idx.duckdb.wal");
+        let store = Store::open(&db, DIM).unwrap();
+        let sink = FreezeAfter {
+            files: 2,
+            seen: Default::default(),
+            exit_conn: std::sync::Mutex::new(store.try_clone().unwrap()),
+        };
+        let err = run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: false,
+            model_name: "minilm-l6",
+            progress: Some(&sink),
+            paths: None,
+            exclude: &[],
+            branch: None,
+        })
+        .expect_err("the first write after the freeze must fail the run");
+        assert!(err.to_string().contains("frozen"), "{err}");
+        let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_len, 0, "a write after the freeze reached the WAL");
+        drop(sink);
+        drop(store);
+        let reopened = Store::open(&db, DIM).unwrap();
+        assert!(reopened.files_missing_vectors().unwrap().is_empty());
+        let states = reopened
+            .list_file_states(&repo_path_of(&dir), "main")
+            .unwrap();
+        assert_eq!(
+            states.len(),
+            2,
+            "exactly the files committed before the freeze: {states:?}"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1b item 4: what one transaction per file costs. A file-backed store
+    /// (the WAL is where per-commit cost lives), `DEVCTX_BENCH_FILES` small
+    /// files, a full run timed three times. Run with
+    /// `cargo test -p devctx-index -- --ignored --nocapture bench_index_small_fixture`.
+    #[test]
+    #[ignore = "perf measurement; run explicitly"]
+    fn bench_index_small_fixture() {
+        let n: usize = std::env::var("DEVCTX_BENCH_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_bench_tx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for i in 0..n {
+            write(
+                &dir,
+                &format!("src/m{i:04}.rs"),
+                &format!(
+                    "pub fn f{i}(x: u32) -> u32 {{\n    g{i}(x) + {i}\n}}\n\nfn g{i}(x: u32) -> u32 {{\n    x * 2\n}}\n"
+                ),
+            );
+        }
+        commit_all(&dir, "fixture");
+        let mut times = Vec::new();
+        for round in 0..3 {
+            let db = dir.join(format!("bench{round}.duckdb"));
+            let store = Store::open(&db, DIM).unwrap();
+            let t0 = std::time::Instant::now();
+            let r = index_branch(&store, &dir, "main", true);
+            times.push(t0.elapsed());
+            assert_eq!(r.files_indexed, n);
+        }
+        times.sort();
+        eprintln!(
+            "\nfull index of {n} files, 3 rounds: {times:?} (median {:?})\n",
+            times[1]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

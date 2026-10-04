@@ -199,7 +199,7 @@ impl Store {
     /// Best-effort by contract — the caller saves the memory first and links it
     /// after, so a repository with no graph yet still remembers.
     pub fn extract_symbol_refs(&self, m: &Memory) -> Result<usize> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM memory_symbol_references WHERE memory_id = ?",
             params![m.id],
         )?;
@@ -235,7 +235,7 @@ impl Store {
         }
 
         for r in &rows {
-            self.conn.execute(
+            self.w()?.execute(
                 "INSERT INTO memory_symbol_references
                  (memory_id, symbol, file, line, repo, branch, source)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -430,29 +430,29 @@ impl Store {
             params![repo, branch],
             |r| r.get(0),
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM vectors WHERE repo = ? AND branch = ?",
             params![repo, branch],
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM graph_edges WHERE repo = ? AND branch = ?",
             params![repo, branch],
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM routes WHERE repo = ? AND branch = ?",
             params![repo, branch],
         )?;
         // Keyed by the absolute path, not the short name, like the rest of
         // `file_state` and `index_state`.
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM file_state WHERE repo_path = ? AND branch = ?",
             params![repo_path, branch],
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
             params![repo_path, branch],
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM index_meta WHERE repo_path = ? AND branch = ?",
             params![repo_path, branch],
         )?;

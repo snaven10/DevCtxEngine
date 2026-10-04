@@ -2,6 +2,9 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::time::{Duration, Instant};
 
 use devctx_core::types::{SearchFilter, SearchResult, VectorMetadata, VectorPoint};
 use duckdb::types::Value;
@@ -70,8 +73,33 @@ pub struct Store {
     /// whenever the index is created or dropped.
     metric_cache: std::sync::Mutex<Option<Option<String>>>,
     /// Shared by every connection cloned from the same open (see
-    /// [`instance_id`](Self::instance_id)).
-    instance: std::sync::Arc<()>,
+    /// [`instance_id`](Self::instance_id) and [`freeze`](Self::freeze)).
+    shared: Arc<Shared>,
+    /// Whether this connection is inside [`in_transaction`](Self::in_transaction).
+    in_tx: AtomicBool,
+}
+
+/// State common to every connection of one open database.
+#[derive(Default)]
+struct Shared {
+    /// Set by [`Store::freeze`]: every later write fails.
+    frozen: AtomicBool,
+    /// Writers hold the read side for one statement; a freeze takes the write
+    /// side to wait out the statements already running.
+    gate: RwLock<()>,
+}
+
+/// A connection borrowed for one write; see [`Store::w`].
+pub(crate) struct WriteConn<'a> {
+    _gate: RwLockReadGuard<'a, ()>,
+    conn: &'a Connection,
+}
+
+impl std::ops::Deref for WriteConn<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
 }
 
 impl Store {
@@ -87,7 +115,8 @@ impl Store {
             conn,
             dim,
             metric_cache: std::sync::Mutex::new(None),
-            instance: std::sync::Arc::new(()),
+            shared: Arc::new(Shared::default()),
+            in_tx: AtomicBool::new(false),
         };
         store.apply_resource_limits(); // before any query can allocate against the defaults
         schema::init_schema(&store.conn, dim)?;
@@ -112,7 +141,8 @@ impl Store {
             conn,
             dim,
             metric_cache: std::sync::Mutex::new(None),
-            instance: std::sync::Arc::new(()),
+            shared: Arc::new(Shared::default()),
+            in_tx: AtomicBool::new(false),
         };
         store.apply_resource_limits();
         schema::init_schema(&store.conn, dim)?;
@@ -125,7 +155,7 @@ impl Store {
     /// other open (including another in-memory store). Stable while any of
     /// those connections lives.
     pub fn instance_id(&self) -> usize {
-        std::sync::Arc::as_ptr(&self.instance) as usize
+        Arc::as_ptr(&self.shared) as *const () as usize
     }
 
     /// The store's fixed vector dimension.
@@ -173,7 +203,8 @@ impl Store {
             conn,
             dim: self.dim,
             metric_cache: std::sync::Mutex::new(None),
-            instance: self.instance.clone(),
+            shared: self.shared.clone(),
+            in_tx: AtomicBool::new(false),
         };
         store.load_extensions();
         Ok(store)
@@ -241,7 +272,7 @@ impl Store {
         // Only one may exist: two indexes on the same column would both be
         // maintained on every insert, for no gain.
         self.drop_hnsw()?;
-        self.conn.execute_batch(&format!(
+        self.w()?.execute_batch(&format!(
             "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw_{metric} \
              ON vectors USING HNSW (vector) WITH (metric = '{metric}');",
         ))?;
@@ -291,7 +322,7 @@ impl Store {
     /// far faster than loading into an indexed table. Best-effort no-op when the
     /// VSS extension or index is absent.
     pub fn drop_hnsw(&self) -> Result<()> {
-        let _ = self.conn.execute_batch(
+        let _ = self.w()?.execute_batch(
             "DROP INDEX IF EXISTS idx_vectors_hnsw; \
              DROP INDEX IF EXISTS idx_vectors_hnsw_cosine; \
              DROP INDEX IF EXISTS idx_vectors_hnsw_ip;",
@@ -310,7 +341,7 @@ impl Store {
         if !self.load_fts() {
             return Ok(false);
         }
-        self.conn
+        self.w()?
             .execute_batch("PRAGMA create_fts_index('vectors', 'id', 'text', overwrite = 1);")?;
         // This is DDL, and a process that dies before the next checkpoint
         // leaves it stranded in the WAL — DuckDB cannot replay it on the next
@@ -349,7 +380,7 @@ impl Store {
     /// there are entries that depend on it" and refused to open ever again.
     pub fn drop_fts(&self) -> Result<()> {
         if self.load_fts() {
-            let _ = self.conn.execute_batch("PRAGMA drop_fts_index('vectors');");
+            let _ = self.w()?.execute_batch("PRAGMA drop_fts_index('vectors');");
             self.checkpoint();
         }
         Ok(())
@@ -441,14 +472,14 @@ impl Store {
         let mut repaired = Vec::new();
         for table in self.table_names()? {
             let tmp = format!("devctx_repair_{table}");
-            self.conn
+            self.w()?
                 .execute_batch(&format!("DROP TABLE IF EXISTS {tmp};"))?;
-            self.conn.execute_batch(&format!(
+            self.w()?.execute_batch(&format!(
                 "CREATE TABLE {tmp} AS SELECT * FROM {table};
                  DROP TABLE {table};"
             ))?;
             schema::init_schema(&self.conn, dim)?;
-            self.conn.execute_batch(&format!(
+            self.w()?.execute_batch(&format!(
                 "INSERT INTO {table} SELECT * FROM {tmp};
                  DROP TABLE {tmp};"
             ))?;
@@ -521,18 +552,122 @@ impl Store {
             }
         }
 
-        self.conn.execute_batch("BEGIN TRANSACTION")?;
-        let result = self.upsert_inner(points);
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
+        // Inside a caller's transaction (one file's writes, see
+        // `in_transaction`) the rows simply join it; DuckDB has no nested
+        // transactions to open here.
+        if self.in_tx.load(Ordering::SeqCst) {
+            return self.upsert_inner(points);
         }
+        self.in_transaction(|| self.upsert_inner(points))
+    }
+
+    /// Run `f` as one transaction: every write it makes is committed together,
+    /// or — on an error, or a process that dies part-way — none of them is.
+    ///
+    /// The unit an indexing run writes per file. Its five writes (the old
+    /// vectors out, the new ones in, edges, routes, the file's content hash)
+    /// used to be five autocommits, and a process ending between the first and
+    /// the last left a file whose hash said "indexed, unchanged" over no
+    /// vectors at all: a hole no incremental run would ever look at again.
+    ///
+    /// Re-entrant: a call made while this connection is already inside one
+    /// runs `f` in the outer transaction.
+    pub fn in_transaction<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.in_tx.load(Ordering::SeqCst) {
+            return f();
+        }
+        self.w()?.execute_batch("BEGIN TRANSACTION")?;
+        self.in_tx.store(true, Ordering::SeqCst);
+        let result = f();
+        let result = match result {
+            Ok(v) => match self.w().and_then(|c| Ok(c.execute_batch("COMMIT")?)) {
+                Ok(()) => Ok(v),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            // Never gated: a rollback writes nothing to the WAL, and a frozen
+            // store must still be able to abandon what it started.
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        self.in_tx.store(false, Ordering::SeqCst);
+        result
+    }
+
+    /// [`in_transaction`](Self::in_transaction), rolled back — nothing kept —
+    /// when `f` decides there was nothing to do (`Ok(None)`). Not for use
+    /// inside another transaction, where there is nothing of its own to roll
+    /// back.
+    pub fn in_transaction_opt<T>(
+        &self,
+        f: impl FnOnce() -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        let mut nothing = false;
+        let out = self.in_transaction(|| match f()? {
+            Some(v) => Ok(Some(v)),
+            None => {
+                nothing = true;
+                Err(StoreError::Decode("nothing to commit".into()))
+            }
+        });
+        if nothing {
+            return Ok(None);
+        }
+        out
+    }
+
+    /// The connection, for a statement that writes — or an error once the
+    /// database has been [frozen](Self::freeze).
+    ///
+    /// The returned guard holds the freeze gate's shared side for as long as
+    /// the statement runs (it lives until the end of the caller's expression),
+    /// so a freeze cannot slip in between "not frozen yet" and the write.
+    pub(crate) fn w(&self) -> Result<WriteConn<'_>> {
+        let gate = self
+            .shared
+            .gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.shared.frozen.load(Ordering::SeqCst) {
+            return Err(StoreError::Frozen);
+        }
+        Ok(WriteConn {
+            _gate: gate,
+            conn: &self.conn,
+        })
+    }
+
+    /// Refuse every write from now on, on this connection and on every
+    /// connection [cloned](Self::try_clone) from the same open. Returns once no
+    /// write is in progress any more — or after `wait`, whichever comes first
+    /// (`false` then: some statement was still running).
+    ///
+    /// For the last moments of a process: freeze, then checkpoint, then end.
+    /// A write that landed between the exit checkpoint and `_exit` — an
+    /// indexing thread's next autocommit — sat alone in a fresh WAL, and
+    /// replaying an `INSERT` into a table with a `PRIMARY KEY` after a
+    /// checkpoint is exactly what leaves the ART index without its entries
+    /// (see [`checkpoint`](Self::checkpoint)). Frozen, that write fails instead.
+    /// Checkpoints and rollbacks are not writes and stay allowed.
+    pub fn freeze(&self, wait: Duration) -> bool {
+        self.shared.frozen.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + wait;
+        loop {
+            match self.shared.gate.try_write() {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return true,
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Whether [`freeze`](Self::freeze) was called on this database.
+    pub fn is_frozen(&self) -> bool {
+        self.shared.frozen.load(Ordering::SeqCst)
     }
 
     fn upsert_inner(&self, points: &[VectorPoint]) -> Result<()> {
@@ -551,7 +686,7 @@ impl Store {
             // 1) Delete any existing rows for these ids in a single statement.
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let del_ids: Vec<Value> = chunk.iter().map(|p| Value::Text(p.id.clone())).collect();
-            self.conn.execute(
+            self.w()?.execute(
                 &format!("DELETE FROM vectors WHERE id IN ({placeholders})"),
                 params_from_iter(del_ids),
             )?;
@@ -566,7 +701,7 @@ impl Store {
                 ));
                 params.extend(row_params(&p.id, &p.text, &p.metadata));
             }
-            self.conn.execute(
+            self.w()?.execute(
                 &format!("INSERT INTO vectors ({COLS}) VALUES {}", tuples.join(", ")),
                 params_from_iter(params),
             )?;
@@ -642,7 +777,7 @@ impl Store {
 
     /// Delete every vector for a given file.
     pub fn delete_by_file(&self, repo: &str, branch: &str, file: &str) -> Result<usize> {
-        let n = self.conn.execute(
+        let n = self.w()?.execute(
             "DELETE FROM vectors WHERE repo = ? AND branch = ? AND file = ?",
             [repo, branch, file],
         )?;
@@ -658,13 +793,13 @@ impl Store {
         }
         let placeholders = vec!["?"; ids.len()].join(", ");
         let sql = format!("DELETE FROM vectors WHERE id IN ({placeholders})");
-        let n = self.conn.execute(&sql, params_from_iter(ids.iter()))?;
+        let n = self.w()?.execute(&sql, params_from_iter(ids.iter()))?;
         Ok(n)
     }
 
     /// Update the `file` column for every row of a renamed file.
     pub fn rename_file(&self, repo: &str, branch: &str, old: &str, new: &str) -> Result<usize> {
-        let n = self.conn.execute(
+        let n = self.w()?.execute(
             "UPDATE vectors SET file = ? WHERE repo = ? AND branch = ? AND file = ?",
             [new, repo, branch, old],
         )?;
@@ -990,6 +1125,149 @@ mod tests {
         assert_eq!(reopened.get_index_meta("/r", "main", "k2").unwrap(), None);
         drop(reopened);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("devctx_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn wal_len(dir: &Path) -> u64 {
+        std::fs::metadata(dir.join("index.duckdb.wal"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    fn point(id: &str, file: &str) -> VectorPoint {
+        VectorPoint {
+            id: id.into(),
+            vector: vec![0.5; 4],
+            text: format!("text {id}"),
+            metadata: VectorMetadata {
+                repo: "demo".into(),
+                branch: "main".into(),
+                file: file.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// PLAN-008 TASK-009 fixup D1b (item 2): the exit path checkpoints and then
+    /// `_exit`s while an indexing thread is still alive. Once frozen, a write
+    /// from any connection of the database — the indexing thread's next
+    /// autocommit into a table with a PRIMARY KEY — must fail instead of
+    /// landing in a fresh WAL that nothing will fold before the process ends.
+    #[test]
+    fn a_frozen_store_refuses_writes_and_leaves_the_wal_alone() {
+        let dir = scratch("freeze");
+        let path = dir.join("index.duckdb");
+        let store = Store::open(&path, 4).unwrap();
+        store.set_index_meta("/r", "main", "k", "before").unwrap();
+        let indexer = store.try_clone().unwrap();
+        assert!(store.freeze(Duration::from_secs(1)), "nothing was writing");
+        store.try_checkpoint().expect("a checkpoint is not a write");
+        assert_eq!(wal_len(&dir), 0, "the exit checkpoint folded the WAL");
+
+        let refused = [
+            indexer
+                .save_file_state(&crate::FileState {
+                    repo_path: "/r".into(),
+                    branch: "main".into(),
+                    file_path: "a.rs".into(),
+                    content_hash: "h".into(),
+                    language: "rust".into(),
+                    symbol_count: 0,
+                    chunk_count: 1,
+                })
+                .err(),
+            indexer.set_index_meta("/r", "main", "k2", "after").err(),
+            indexer.upsert(&[point("p", "a.rs")]).err(),
+            indexer.delete_by_file("demo", "main", "a.rs").err(),
+        ];
+        for (i, e) in refused.into_iter().enumerate() {
+            assert!(
+                matches!(e, Some(StoreError::Frozen)),
+                "write #{i} after the freeze was not refused: {e:?}"
+            );
+        }
+        assert!(indexer.is_frozen(), "the freeze covers cloned connections");
+        assert_eq!(
+            wal_len(&dir),
+            0,
+            "no write reached the WAL after the freeze"
+        );
+        drop(indexer);
+        drop(store);
+        let reopened = Store::open(&path, 4).unwrap();
+        assert_eq!(
+            reopened
+                .get_index_meta("/r", "main", "k")
+                .unwrap()
+                .as_deref(),
+            Some("before")
+        );
+        assert_eq!(reopened.get_index_meta("/r", "main", "k2").unwrap(), None);
+        assert!(
+            !reopened.is_frozen(),
+            "a freeze lasts one process, not the file"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A freeze waits for a statement already running (it may be the commit
+    /// of a file's writes), but only as long as it is told to.
+    #[test]
+    fn a_freeze_waits_for_a_write_in_progress_up_to_its_budget() {
+        let store = Store::open_in_memory(4).unwrap();
+        let other = store.try_clone().unwrap();
+        let running = other.w().unwrap();
+        let t0 = Instant::now();
+        assert!(
+            !store.freeze(Duration::from_millis(200)),
+            "a write is still running"
+        );
+        assert!(t0.elapsed() >= Duration::from_millis(200));
+        drop(running);
+        assert!(store.freeze(Duration::from_millis(200)));
+        assert!(matches!(other.w().err(), Some(StoreError::Frozen)));
+    }
+
+    /// One transaction is all or nothing, and an upsert inside it joins it
+    /// rather than committing on its own.
+    #[test]
+    fn a_transaction_commits_everything_or_nothing() {
+        let store = Store::open_in_memory(4).unwrap();
+        store.upsert(&[point("old", "a.rs")]).unwrap();
+        let failed: Result<()> = store.in_transaction(|| {
+            store.delete_by_file("demo", "main", "a.rs")?;
+            store.upsert(&[point("new", "a.rs")])?;
+            Err(StoreError::Decode("die half-way".into()))
+        });
+        assert!(failed.is_err());
+        let ids: Vec<String> = store
+            .scroll_all("demo", "main")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, vec!["old".to_string()], "the delete was rolled back");
+
+        store
+            .in_transaction(|| {
+                store.delete_by_file("demo", "main", "a.rs")?;
+                store.upsert(&[point("new", "a.rs")])
+            })
+            .unwrap();
+        let ids: Vec<String> = store
+            .scroll_all("demo", "main")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, vec!["new".to_string()]);
     }
 
     #[test]

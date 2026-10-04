@@ -105,11 +105,11 @@ impl Store {
 
     /// Insert or replace an index record.
     pub fn save_index_record(&self, rec: &IndexRecord) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
             params![rec.repo_path, rec.branch],
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "INSERT INTO index_state (repo_path, branch, last_commit, model_name,
                 model_dimension, file_count, symbol_count, chunk_count, indexed_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -153,11 +153,11 @@ impl Store {
         key: &str,
         value: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM index_meta WHERE repo_path = ? AND branch = ? AND key = ?",
             params![repo_path, branch, key],
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "INSERT INTO index_meta (repo_path, branch, key, value) VALUES (?, ?, ?, ?)",
             params![repo_path, branch, key, value],
         )?;
@@ -167,7 +167,7 @@ impl Store {
     /// Forget one `index_meta` value (a branch whose record is missing, as
     /// every index made before the extractor fingerprint existed).
     pub fn delete_index_meta(&self, repo_path: &str, branch: &str, key: &str) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM index_meta WHERE repo_path = ? AND branch = ? AND key = ?",
             params![repo_path, branch, key],
         )?;
@@ -207,11 +207,11 @@ impl Store {
 
     /// Insert or replace a file-state row.
     pub fn save_file_state(&self, fs: &FileState) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
             params![fs.repo_path, fs.branch, fs.file_path],
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "INSERT INTO file_state (repo_path, branch, file_path, content_hash, language,
                 symbol_count, chunk_count)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -301,11 +301,34 @@ impl Store {
     }
 
     pub fn delete_file_state(&self, repo_path: &str, branch: &str, file: &str) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
             params![repo_path, branch, file],
         )?;
         Ok(())
+    }
+
+    /// Files whose state row says they hold chunks while `vectors` holds none
+    /// for them, as `(branch, file)`.
+    ///
+    /// The signature of a file whose writes were cut half-way: its content
+    /// hash recorded (so every incremental run skips it as unchanged) over
+    /// vectors already deleted. One transaction per file makes it impossible;
+    /// this is how a test — or a curious operator — proves it. Vectors are
+    /// keyed by the repository's short name and state rows by its path, so the
+    /// match is on branch and file, which is exact for a store holding one
+    /// repository (every project store does).
+    pub fn files_missing_vectors(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.branch, f.file_path FROM file_state f
+             WHERE f.chunk_count > 0
+               AND NOT EXISTS (SELECT 1 FROM vectors v
+                               WHERE v.branch = f.branch AND v.file = f.file_path)
+             ORDER BY f.branch, f.file_path",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// All file paths with recorded state for a (repo_path, branch). Used to

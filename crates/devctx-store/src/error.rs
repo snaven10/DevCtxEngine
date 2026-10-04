@@ -25,6 +25,11 @@ pub enum StoreError {
     #[error("decode error: {0}")]
     Decode(String),
 
+    /// The database was frozen for the process to end (see `Store::freeze`):
+    /// no write may reach the write-ahead log any more.
+    #[error("the database is frozen: the server is shutting down and accepts no more writes")]
+    Frozen,
+
     /// An I/O failure (e.g. creating the database directory).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
