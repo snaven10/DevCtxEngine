@@ -23,6 +23,11 @@ pub struct ServeInfo {
     /// Owner process id (informational).
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Kernel start time of `pid` (`/proc/<pid>/stat` field 22), so a recycled
+    /// pid is never mistaken for this server. Absent in files written by older
+    /// servers and off Linux.
+    #[serde(default)]
+    pub start_time: Option<u64>,
 }
 
 /// A snapshot of the indexing run happening inside the server.
@@ -56,6 +61,7 @@ pub fn write_serve_file(cfg: &ProjectConfig, addr: SocketAddr, token: Option<&st
         addr: addr.to_string(),
         token: token.map(str::to_string),
         pid: Some(std::process::id()),
+        start_time: proc_start_time(std::process::id()),
     };
     let path = serve_file(cfg);
     if let Some(parent) = path.parent() {
@@ -407,6 +413,8 @@ fn spawn_server(cfg: &ProjectConfig) -> Result<Spawned> {
     {
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
+        // `self_exe()` may be `/proc/self/exe`; keep a recognisable argv[0].
+        cmd.arg0("devctx");
     }
     let child = cmd
         .spawn()
@@ -440,16 +448,21 @@ pub fn running_server_url(cfg: &ProjectConfig) -> Option<String> {
 /// Whether `pid` is a live `devctx serve` (or `api`) process.
 ///
 /// "The pid exists" is not enough: pids are reused, and a `serve.json` left by
-/// a server that died can name a process that is now something else entirely —
-/// which a caller would then kill, or wait on, as if it were the server. On
-/// Linux the process's own `cmdline` settles it.
+/// a server that died can name a process that is now something else entirely.
+/// On Linux the process is identified by its binary (`/proc/<pid>/exe`, which
+/// survives a launch through `/proc/self/exe` and a replaced file) and its
+/// subcommand. This says it is *a* devctx server, not that it is *this
+/// project's*: see [`owns_server`].
 fn pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        match std::fs::read(format!("/proc/{pid}/cmdline")) {
-            Ok(raw) => cmdline_is_server(&raw),
-            Err(_) => false,
-        }
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        is_server_proc(exe.as_deref(), &cmdline)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -463,17 +476,81 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Whether a NUL-separated `/proc/<pid>/cmdline` is `…devctx… serve|api …`.
+/// Kernel start time of `pid` in clock ticks since boot (`/proc/<pid>/stat`
+/// field 22). `None` off Linux or when the process is gone.
+pub fn proc_start_time(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        parse_start_time(&stat)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Field 22 of a `/proc/<pid>/stat` line. The command name (field 2) may hold
+/// spaces and parentheses, so count from the last `)`.
 #[cfg(any(target_os = "linux", test))]
-fn cmdline_is_server(raw: &[u8]) -> bool {
-    let mut args = raw.split(|b| *b == 0).filter(|a| !a.is_empty());
-    let Some(exe) = args.next() else {
+fn parse_start_time(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // `rest` starts at field 3; field 22 is the 20th token after it.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Whether the advertised `info.pid` is verifiably THIS project's server: a
+/// devctx server process that either has the recorded start time or, for a file
+/// without one, runs from inside the project. A pid that fails this is never
+/// signalled: after a reboot another repository's server can hold the number.
+fn owns_server(cfg: &ProjectConfig, info: &ServeInfo) -> bool {
+    let Some(pid) = info.pid else {
         return false;
     };
-    let exe = String::from_utf8_lossy(exe);
-    let name = exe.rsplit('/').next().unwrap_or("");
-    // A replaced binary shows up as `devctx (deleted)` in some kernels' argv0.
-    name.starts_with("devctx") && args.any(|a| a == b"serve" || a == b"api")
+    if !pid_alive(pid) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match info.start_time {
+            Some(t) => proc_start_time(pid) == Some(t),
+            None => std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| {
+                let root = std::fs::canonicalize(&cfg.project.path)
+                    .unwrap_or_else(|_| PathBuf::from(&cfg.project.path));
+                cwd.starts_with(root)
+            }),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cfg;
+        true
+    }
+}
+
+/// Whether a process with this executable path and NUL-separated
+/// `/proc/<pid>/cmdline` is `devctx … serve|api`.
+///
+/// `exe` is `/proc/<pid>/exe`'s target. It is the reliable name: a server
+/// started through `/proc/self/exe` has that very string as argv[0], and after
+/// a reinstall the link reads `<path> (deleted)`, which is stripped. Without it
+/// argv[0] stands in. The subcommand is the first argument that is not a flag,
+/// so `devctx search api` is not a server.
+#[cfg(any(target_os = "linux", test))]
+fn is_server_proc(exe: Option<&str>, cmdline: &[u8]) -> bool {
+    let mut args = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty());
+    let Some(argv0) = args.next() else {
+        return false;
+    };
+    let argv0 = String::from_utf8_lossy(argv0);
+    let path = exe.unwrap_or(&argv0);
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    let name = path.rsplit('/').next().unwrap_or("");
+    name.starts_with("devctx")
+        && args
+            .find(|a| !a.starts_with(b"-"))
+            .is_some_and(|a| a == b"serve" || a == b"api")
 }
 
 /// Send SIGTERM to `pid`, quietly (no "No such process" noise on a race).
@@ -497,8 +574,13 @@ pub fn reclaim_db(cfg: &ProjectConfig) -> bool {
     let Some(pid) = info.pid else {
         return false;
     };
-    if !pid_alive(pid) {
-        remove_serve_file(cfg);
+    if !owns_server(cfg, &info) {
+        // Dead, recycled, or another project's server: nothing of ours to kill.
+        // Drop the stale advertisement only when the process is not a devctx
+        // server at all; a live foreign server keeps its own file.
+        if !pid_alive(pid) {
+            remove_serve_file(cfg);
+        }
         return false;
     }
     kill_pid(pid);
@@ -521,7 +603,7 @@ pub fn stop_server(cfg: &ProjectConfig) -> Result<()> {
         return Ok(());
     };
     let info: ServeInfo = serde_json::from_slice(&raw).context("parsing serve.json")?;
-    if let Some(pid) = info.pid.filter(|p| pid_alive(*p)) {
+    if let Some(pid) = info.pid.filter(|_| owns_server(cfg, &info)) {
         kill_pid(pid);
         // Wait for it to actually exit. Returning while it still holds the DuckDB
         // file means the next command spawns a server that cannot open the
@@ -566,13 +648,44 @@ const HEALTH_QUICK: Duration = Duration::from_millis(400);
 /// database.
 const HEALTH_PATIENT: Duration = Duration::from_secs(3);
 
-fn healthy(base: &str, timeout: Duration) -> bool {
-    ureq::AgentBuilder::new()
+/// What a `/health` request found.
+enum Health {
+    Ok,
+    /// Nothing listens on the port: the server is gone, whatever its pid is now.
+    Refused,
+    /// No answer in time, or an error answer: something may be there, busy.
+    NoAnswer,
+}
+
+fn health(base: &str, timeout: Duration) -> Health {
+    let res = ureq::AgentBuilder::new()
         .timeout(timeout)
         .build()
         .get(&format!("{base}/health"))
-        .call()
-        .is_ok()
+        .call();
+    match res {
+        Ok(_) => Health::Ok,
+        Err(e) if connection_refused(&e) => Health::Refused,
+        Err(_) => Health::NoAnswer,
+    }
+}
+
+fn connection_refused(e: &ureq::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+        {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
+fn healthy(base: &str, timeout: Duration) -> bool {
+    matches!(health(base, timeout), Health::Ok)
 }
 
 /// Discover a running server for this project, telling "gone" apart from
@@ -591,11 +704,15 @@ pub fn probe(cfg: &ProjectConfig) -> Discovery {
             token,
         })
     };
-    if healthy(&base, HEALTH_QUICK) {
-        return up(info.token);
+    match health(&base, HEALTH_QUICK) {
+        Health::Ok => return up(info.token),
+        // Nobody listens: the server is gone. A live pid on that number is a
+        // different process (pids are reused, across repositories too).
+        Health::Refused => return Discovery::Down,
+        Health::NoAnswer => {}
     }
     match info.pid {
-        Some(pid) if pid_alive(pid) => {
+        Some(pid) if owns_server(cfg, &info) => {
             if healthy(&base, HEALTH_PATIENT) {
                 up(info.token)
             } else {
@@ -898,6 +1015,7 @@ mod tests {
             addr: "127.0.0.1:1".into(),
             token: None,
             pid: Some(pid),
+            start_time: None,
         };
         let path = serve_file(cfg);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -936,14 +1054,103 @@ mod tests {
     /// A recycled pid must not count as a live server.
     #[test]
     fn only_a_devctx_serve_cmdline_counts_as_a_server() {
-        assert!(cmdline_is_server(
+        let is = is_server_proc;
+        assert!(is(
+            None,
             b"/home/u/.local/bin/devctx\0serve\0--addr\x00127.0.0.1:20111\x00"
         ));
-        assert!(cmdline_is_server(b"devctx\0api\0"));
-        assert!(!cmdline_is_server(b"/usr/bin/vim\0serve\0"));
-        assert!(!cmdline_is_server(b"/usr/bin/devctx\0mcp\0"));
-        assert!(!cmdline_is_server(b""));
-        // The test process itself is alive but is not a server.
-        assert!(!pid_alive(std::process::id()));
+        assert!(is(None, b"devctx\0api\0"));
+        assert!(!is(None, b"/usr/bin/vim\0serve\0"));
+        assert!(!is(None, b"/usr/bin/devctx\0mcp\0"));
+        assert!(!is(None, b""));
+        // M-3: the subcommand is the first non-flag argument, not any argument.
+        assert!(!is(None, b"devctx\0search\0api\0"));
+        assert!(!is(None, b"devctx\0index\0serve\0"));
+        assert!(is(None, b"devctx\0--verbose\0serve\0"));
+    }
+
+    /// I-1: launched through `/proc/self/exe`, argv[0] says nothing; the
+    /// executable link does, with or without its "(deleted)" suffix.
+    #[test]
+    fn a_server_started_through_proc_self_exe_is_recognised() {
+        let cmd = b"/proc/self/exe\0serve\0--addr\x00127.0.0.1:1\x00";
+        assert!(is_server_proc(Some("/home/u/.local/bin/devctx"), cmd));
+        assert!(is_server_proc(
+            Some("/home/u/.local/bin/devctx (deleted)"),
+            cmd
+        ));
+        assert!(!is_server_proc(Some("/usr/bin/vim"), cmd));
+        assert!(!is_server_proc(None, cmd));
+    }
+
+    #[test]
+    fn the_start_time_is_field_22_even_with_parens_in_the_name() {
+        let stat = "42 (we ird) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 777 23";
+        assert_eq!(parse_start_time(stat), Some(777));
+        assert_eq!(parse_start_time("garbage"), None);
+    }
+
+    /// The test process itself is alive but is not a server. A spawned `sleep`
+    /// keeps this independent of the test binary's own argv (e.g. `... serve`).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_live_process_that_is_not_a_server_does_not_count() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning sleep");
+        let pid = child.id();
+        assert!(!pid_alive(pid));
+        let dir = std::env::temp_dir().join(format!("devctx_owns_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        let info = ServeInfo {
+            addr: "127.0.0.1:1".into(),
+            token: None,
+            pid: Some(pid),
+            start_time: proc_start_time(pid),
+        };
+        assert!(!owns_server(&cfg, &info));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M-2: nothing listens on the advertised port, but its pid is alive (a
+    /// devctx process of someone else). Down — and it is never killed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_refused_port_is_down_even_if_the_pid_lives_and_is_never_killed() {
+        let dir = std::env::temp_dir().join(format!("devctx_refused_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        // A port nobody listens on.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // A live process posing as the advertised pid.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let info = ServeInfo {
+            addr: format!("127.0.0.1:{port}"),
+            token: None,
+            pid: Some(child.id()),
+            start_time: proc_start_time(child.id()),
+        };
+        std::fs::write(serve_file(&cfg), serde_json::to_vec(&info).unwrap()).unwrap();
+        assert!(matches!(probe(&cfg), Discovery::Down));
+        // Not a server of this project: reclaim must leave it alone.
+        assert!(!reclaim_db(&cfg));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the foreign pid was killed"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

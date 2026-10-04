@@ -18,7 +18,7 @@ pub use config::{ProjectConfig, CONFIG_FILE_NAME};
 pub use error::{Error, Result};
 pub use exe::self_exe;
 pub use fallback::CudaFallback;
-pub use gitenv::{clean_git_env, GIT_IDENTITY_ENV, GIT_REPO_ENV};
+pub use gitenv::{clean_git_env, git_vars_to_strip, GIT_IDENTITY_ENV, GIT_REPO_ENV};
 pub use hits::{search_hits, SearchHits};
 pub use rank::{fuse_by_rank, rank_score};
 pub use types::{SearchFilter, SearchResult, VectorMetadata, VectorPoint};

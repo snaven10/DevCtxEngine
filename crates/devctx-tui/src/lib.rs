@@ -464,7 +464,9 @@ enum JobDone {
 /// Run `devctx` with the given arguments, returning stdout.
 fn run_devctx(args: &[&str]) -> anyhow::Result<String> {
     let exe = std::env::current_exe()?;
-    let out = std::process::Command::new(exe).args(args).output()?;
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new(exe))
+        .args(args)
+        .output()?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("{}", err.trim().lines().last().unwrap_or("command failed"));
@@ -543,7 +545,7 @@ fn spawn_worker() -> (Sender<Job>, Receiver<JobDone>) {
 /// finds the project it should act on.
 fn index_in(path: &str) -> anyhow::Result<String> {
     let exe = std::env::current_exe()?;
-    let out = std::process::Command::new(exe)
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new(exe))
         .arg("index")
         .current_dir(path)
         .output()?;

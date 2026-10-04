@@ -240,6 +240,8 @@ fn spawn(paths: &CentralPaths) -> Result<Arc<Mutex<Option<std::process::ExitStat
     {
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
+        // `self_exe()` may be `/proc/self/exe`; keep a recognisable argv[0].
+        cmd.arg0("devctx");
     }
     let child = cmd
         .spawn()

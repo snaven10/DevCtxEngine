@@ -104,3 +104,7 @@ falla en silencio (`|| true`) y la capa 2 sigue protegiendo.
    en cada repo (reescribe el bloque entre los marcadores `# >>> devctx (managed) >>>`); mientras tanto la
    capa 2 (el serve y los `git` de devctx limpian el entorno solos) los protege. No hay migración automática.
 8. **Números:** el test de entorno tarda ~11 s (carga del modelo en el serve), el de worktree ~14 s.
+
+9. **Fixup (review):**
+   - **M-7:** `clean_git_env` ya no depende solo de una lista fija: quita todo `GIT_*` del entorno ambiente salvo una allowlist (`GIT_SSH*`, `GIT_TERMINAL_PROMPT`, `GIT_ASKPASS`, `GIT_EXEC_PATH`, `GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM`, `GIT_TRACE*`; son de transporte/diagnóstico, no eligen repositorio). Cubre `GIT_CONFIG_PARAMETERS` (git lo exporta a los hooks con `git -c`), `GIT_CONFIG_COUNT/KEY_n/VALUE_n`, `GIT_NAMESPACE`, `GIT_QUARANTINE_PATH`, `GIT_CEILING_DIRECTORIES`. `GIT_REPO_ENV` (y por tanto el `unset` del hook) incorpora los nombres fijos nuevos; los `KEY_n/VALUE_n` solo los limpia devctx. Aplicado también a los dos spawns de `devctx-tui/src/lib.rs`. Test: `a_hook_like_environment_is_stripped_but_transport_settings_stay`.
+   - **M-8:** los setups intencionales con `GIT_DIR`/`GIT_WORK_TREE` (p. ej. dotfiles con `--git-dir`) ya NO son respetados por los subprocesos de devctx: cada repo se localiza desde el directorio dado. Documentado en el comentario de `clean_git_env`.

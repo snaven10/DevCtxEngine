@@ -1480,6 +1480,36 @@ fn an_mcp_whose_binary_was_replaced_can_still_start_a_server() {
         msg.get("error").is_none(),
         "the server should have started from the replaced binary: {msg}"
     );
+
+    // I-1: that server was launched through `/proc/self/exe`. It must still be
+    // recognised as a devctx server, so `serve --stop` kills it instead of
+    // deleting its advertisement and leaving it holding the lock.
+    let info: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join(".devctx/state/serve.json")).expect("serve.json"),
+    )
+    .expect("parsing serve.json");
+    let pid = info["pid"].as_u64().expect("pid in serve.json");
+    let proc_dir = format!("/proc/{pid}");
+    assert!(
+        Path::new(&proc_dir).exists(),
+        "the server should be running"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .args(["serve", "--stop"])
+        .output()
+        .expect("running serve --stop");
+    assert!(out.status.success());
+    let t0 = std::time::Instant::now();
+    while Path::new(&proc_dir).exists() && t0.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let still = Path::new(&proc_dir).exists();
+    if still {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+    }
+    assert!(!still, "serve --stop left the server (pid {pid}) running");
 }
 
 // --- MCP lifecycle (PLAN-008 D2) ---------------------------------------------

@@ -1249,7 +1249,11 @@ fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Resu
     // precisely because nothing answered, and if something is alive after all
     // (busy, mid-index) killing it would turn a slow server into a dead one.
     // Left to fail on the lock instead, it reports the owner in `serve.log`.
-    if std::env::var_os(remote::AUTOSPAWN_ENV).is_none() {
+    let autospawned = std::env::var_os(remote::AUTOSPAWN_ENV).is_some();
+    // Meant for this process only: grandchildren (a hook's `devctx index`, an
+    // MCP's own spawns) must not read themselves as auto-spawned.
+    std::env::remove_var(remote::AUTOSPAWN_ENV);
+    if !autospawned {
         remote::reclaim_db(&cfg);
     }
     let socket: SocketAddr = addr
