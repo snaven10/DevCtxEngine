@@ -129,3 +129,14 @@ ser accionable (causa + comando). `serve.log` puede crecer: truncar.
    - **M-4:** el test unitario usa un `sleep` hijo (`#[cfg(target_os = "linux")]`), no el PID del propio test.
    - **Nit:** `cmd_serve` lee y luego elimina `DEVCTX_AUTOSPAWNED` para que los nietos no lo hereden.
    - **Tests de la hipótesis de TASK-004:** el cuelgue de `a_session_survives_its_serve_leaving` con otros serves vivos es consistente con serves huérfanos acumulados (I-1) reteniendo locks/CPU; no se pudo atribuir con certeza.
+
+10. **Fixup C (review, segunda ronda sobre propiedad de procesos):**
+   - **Módulo compartido** `devctx-core/src/procown.rs` (`is_server_proc`, `start_time`, `classify` → `Ours | Gone | Unverified`, `cwd_is`, `terminate`); lo usan `devctx-cli` y `devctx-central` (dependencia `libc` solo en unix).
+   - **1:** `stop_server`/`reclaim_db` borraban `serve.json` aunque el proceso siguiera vivo. Ahora `terminate`: SIGTERM, espera, SIGKILL, espera; el archivo se borra SOLO si el proceso desapareció (`stop_server` devuelve error y `reclaim_db` `false` si sobrevive). Tests con un servidor falso que ignora SIGTERM (copia de `sh` llamada `devctx` ejecutando `serve`).
+   - **2:** `probe` con `Refused` y proceso propio verificable → `Busy` (antes `Down` y `ensure` lanzaba otro serve contra el lock); `Down` solo si no es propio.
+   - **3:** `devctx-central::stop()` mataba el pid a ciegas. Ahora `ServeInfo` del central guarda `start_time` y `stop` usa la misma clasificación (archivos viejos: `--central` en el cmdline) y la misma regla escalar-y-borrar.
+   - **4:** `clean_git_env` usaba `std::env::vars()` (panic con variables no UTF-8; reproducido antes de arreglar); ahora `vars_os()` + `into_string().ok()`.
+   - **5:** `connection_refused` tiene test contra un `ureq::Error` real (puerto cerrado → true; listener mudo con timeout → false); el test de probe usa un proceso con pinta de `devctx serve` pero otro `start_time` (→ `Down`, no se mata, se borra el archivo obsoleto) y otro propio (→ `Busy`).
+   - **6:** el fallback sin `start_time` exige cwd == raíz del proyecto (canonicalizado), no "dentro"; cwd `(deleted)` nunca coincide. `Unverified` no se mata NI se des-anuncia (`stop` avisa y conserva `serve.json`).
+   - **TOCTOU:** en Linux se abre un pidfd antes de verificar y la señal va por `pidfd_send_signal`; si falla `pidfd_open` cae a `kill(2)` (ventana documentada). Fuera de Linux/unix sin verificación de dueño, como antes.
+   - **No verificado:** macOS/Windows; `pidfd_send_signal` en kernels < 5.3 (cae a `kill`).

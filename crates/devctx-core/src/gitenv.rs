@@ -74,7 +74,12 @@ pub fn git_vars_to_strip<'a>(vars: impl IntoIterator<Item = &'a str>) -> Vec<&'a
 /// `git` and `devctx` processes devctx spawns: each repository is located from
 /// the directory it is given.
 pub fn clean_git_env(cmd: &mut Command) -> &mut Command {
-    let ambient: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+    // `vars_os`, not `vars`: the latter panics on any non-UTF-8 name or value in
+    // the environment, which would kill every spawn. A name that is not UTF-8
+    // cannot be a `GIT_*` variable, so it is skipped.
+    let ambient: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .collect();
     for var in git_vars_to_strip(ambient.iter().map(String::as_str)) {
         cmd.env_remove(var);
     }
@@ -142,5 +147,29 @@ mod tests {
         for v in keep {
             assert!(!stripped.contains(&v), "{v} should stay");
         }
+    }
+
+    /// A non-UTF-8 variable anywhere in the environment used to panic
+    /// `std::env::vars()` and with it every spawn. Run in a child so the
+    /// poisoned variable never touches the test process.
+    #[test]
+    #[cfg(unix)]
+    fn a_non_utf8_environment_variable_does_not_panic() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut cmd = Command::new("env");
+        cmd.env("DEVCTX_BAD_VALUE", std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+        cmd.env(std::ffi::OsStr::from_bytes(b"DEVCTX_BAD_\xff_NAME"), "x");
+        cmd.env("GIT_DIR", "/nonexistent");
+        // `clean_git_env` reads *this* process's environment, so poison it too.
+        std::env::set_var("DEVCTX_POISON_OS", std::ffi::OsStr::from_bytes(b"\xff"));
+        let r = std::panic::catch_unwind(|| {
+            let mut c = Command::new("env");
+            clean_git_env(&mut c);
+        });
+        std::env::remove_var("DEVCTX_POISON_OS");
+        assert!(r.is_ok(), "clean_git_env panicked on a non-UTF-8 variable");
+        clean_git_env(&mut cmd);
+        let out = cmd.output().expect("running env");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("GIT_DIR="));
     }
 }

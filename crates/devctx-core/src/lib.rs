@@ -11,6 +11,7 @@ pub mod fallback;
 pub mod gitenv;
 pub mod hits;
 pub mod plans;
+pub mod procown;
 pub mod rank;
 pub mod types;
 

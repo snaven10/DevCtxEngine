@@ -1116,6 +1116,7 @@ name = "devctx-core"
 version = "0.8.2"
 dependencies = [
  "anyhow",
+ "libc",
  "serde",
  "serde_json",
  "serde_yaml",

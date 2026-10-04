@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use devctx_core::config::ProjectConfig;
+use devctx_core::procown::{self, Ownership};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -61,7 +62,7 @@ pub fn write_serve_file(cfg: &ProjectConfig, addr: SocketAddr, token: Option<&st
         addr: addr.to_string(),
         token: token.map(str::to_string),
         pid: Some(std::process::id()),
-        start_time: proc_start_time(std::process::id()),
+        start_time: procown::start_time(std::process::id()),
     };
     let path = serve_file(cfg);
     if let Some(parent) = path.parent() {
@@ -445,188 +446,113 @@ pub fn running_server_url(cfg: &ProjectConfig) -> Option<String> {
     discover(cfg).map(|r| r.base)
 }
 
-/// Whether `pid` is a live `devctx serve` (or `api`) process.
-///
-/// "The pid exists" is not enough: pids are reused, and a `serve.json` left by
-/// a server that died can name a process that is now something else entirely.
-/// On Linux the process is identified by its binary (`/proc/<pid>/exe`, which
-/// survives a launch through `/proc/self/exe` and a replaced file) and its
-/// subcommand. This says it is *a* devctx server, not that it is *this
-/// project's*: see [`owns_server`].
-fn pid_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            return false;
-        };
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
-        is_server_proc(exe.as_deref(), &cmdline)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-}
-
-/// Kernel start time of `pid` in clock ticks since boot (`/proc/<pid>/stat`
-/// field 22). `None` off Linux or when the process is gone.
-pub fn proc_start_time(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        parse_start_time(&stat)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-/// Field 22 of a `/proc/<pid>/stat` line. The command name (field 2) may hold
-/// spaces and parentheses, so count from the last `)`.
-#[cfg(any(target_os = "linux", test))]
-fn parse_start_time(stat: &str) -> Option<u64> {
-    let rest = &stat[stat.rfind(')')? + 1..];
-    // `rest` starts at field 3; field 22 is the 20th token after it.
-    rest.split_whitespace().nth(19)?.parse().ok()
-}
-
-/// Whether the advertised `info.pid` is verifiably THIS project's server: a
-/// devctx server process that either has the recorded start time or, for a file
-/// without one, runs from inside the project. A pid that fails this is never
-/// signalled: after a reboot another repository's server can hold the number.
-fn owns_server(cfg: &ProjectConfig, info: &ServeInfo) -> bool {
+/// What the advertised `info.pid` is. A pid that is not [`Ownership::Ours`] is
+/// never signalled: after a reboot another repository's server (or any program)
+/// can hold the number. Without a recorded start time (a file from an older
+/// server) the process must run from exactly the project root.
+fn ownership(cfg: &ProjectConfig, info: &ServeInfo) -> Ownership {
     let Some(pid) = info.pid else {
-        return false;
+        return Ownership::Gone;
     };
-    if !pid_alive(pid) {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        match info.start_time {
-            Some(t) => proc_start_time(pid) == Some(t),
-            None => std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| {
-                let root = std::fs::canonicalize(&cfg.project.path)
-                    .unwrap_or_else(|_| PathBuf::from(&cfg.project.path));
-                cwd.starts_with(root)
-            }),
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = cfg;
-        true
-    }
+    procown::classify(pid, info.start_time, |p| {
+        procown::cwd_is(p, Path::new(&cfg.project.path))
+    })
 }
 
-/// Whether a process with this executable path and NUL-separated
-/// `/proc/<pid>/cmdline` is `devctx … serve|api`.
-///
-/// `exe` is `/proc/<pid>/exe`'s target. It is the reliable name: a server
-/// started through `/proc/self/exe` has that very string as argv[0], and after
-/// a reinstall the link reads `<path> (deleted)`, which is stripped. Without it
-/// argv[0] stands in. The subcommand is the first argument that is not a flag,
-/// so `devctx search api` is not a server.
-#[cfg(any(target_os = "linux", test))]
-fn is_server_proc(exe: Option<&str>, cmdline: &[u8]) -> bool {
-    let mut args = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty());
-    let Some(argv0) = args.next() else {
-        return false;
-    };
-    let argv0 = String::from_utf8_lossy(argv0);
-    let path = exe.unwrap_or(&argv0);
-    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
-    let name = path.rsplit('/').next().unwrap_or("");
-    name.starts_with("devctx")
-        && args
-            .find(|a| !a.starts_with(b"-"))
-            .is_some_and(|a| a == b"serve" || a == b"api")
+fn owns_server(cfg: &ProjectConfig, info: &ServeInfo) -> bool {
+    ownership(cfg, info) == Ownership::Ours
 }
 
-/// Send SIGTERM to `pid`, quietly (no "No such process" noise on a race).
-fn kill_pid(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .stderr(std::process::Stdio::null())
-        .status();
+/// How long a server gets to exit on SIGTERM, and then on SIGKILL.
+const TERM_WAIT: Duration = Duration::from_secs(5);
+const KILL_WAIT: Duration = Duration::from_secs(3);
+
+/// Stop the advertised server and report whether it is gone. Never deletes
+/// the discovery file: that is only right once the process is gone.
+fn terminate_ours(cfg: &ProjectConfig, info: &ServeInfo, term: Duration, kill: Duration) -> bool {
+    let Some(pid) = info.pid else {
+        return true;
+    };
+    procown::terminate(pid, || owns_server(cfg, info), term, kill)
 }
 
 /// Stop any background server holding this project's DB so the caller can take
 /// exclusive ownership (used by interactive owners like the TUI). Returns
 /// whether a server was stopped. Best-effort and quiet.
 pub fn reclaim_db(cfg: &ProjectConfig) -> bool {
+    reclaim_db_with(cfg, TERM_WAIT, KILL_WAIT)
+}
+
+fn reclaim_db_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> bool {
     let Ok(raw) = std::fs::read(serve_file(cfg)) else {
         return false;
     };
     let Ok(info) = serde_json::from_slice::<ServeInfo>(&raw) else {
         return false;
     };
-    let Some(pid) = info.pid else {
-        return false;
-    };
-    if !owns_server(cfg, &info) {
-        // Dead, recycled, or another project's server: nothing of ours to kill.
-        // Drop the stale advertisement only when the process is not a devctx
-        // server at all; a live foreign server keeps its own file.
-        if !pid_alive(pid) {
+    match ownership(cfg, &info) {
+        Ownership::Gone => {
+            // Dead, or recycled into something else: the advertisement is stale.
             remove_serve_file(cfg);
+            false
         }
-        return false;
-    }
-    kill_pid(pid);
-    // Wait for it to exit and release the file lock.
-    for _ in 0..40 {
-        if !pid_alive(pid) {
-            break;
+        // A live server we cannot vouch for keeps its own file.
+        Ownership::Unverified => false,
+        Ownership::Ours => {
+            // The file goes only with the process: dropping it while the server
+            // lives leaves it unadvertised and holding the lock.
+            if terminate_ours(cfg, &info, term, kill) {
+                remove_serve_file(cfg);
+                true
+            } else {
+                false
+            }
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
-    remove_serve_file(cfg);
-    true
 }
 
-/// Stop the server advertised for this project (SIGTERM its pid, drop the file).
+/// Stop the server advertised for this project (SIGTERM, then SIGKILL if it
+/// ignores it; drop the file once it is gone).
 pub fn stop_server(cfg: &ProjectConfig) -> Result<()> {
+    stop_server_with(cfg, TERM_WAIT, KILL_WAIT)
+}
+
+fn stop_server_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> Result<()> {
     let path = serve_file(cfg);
     let Ok(raw) = std::fs::read(&path) else {
         println!("No server is registered for this project.");
         return Ok(());
     };
     let info: ServeInfo = serde_json::from_slice(&raw).context("parsing serve.json")?;
-    if let Some(pid) = info.pid.filter(|_| owns_server(cfg, &info)) {
-        kill_pid(pid);
-        // Wait for it to actually exit. Returning while it still holds the DuckDB
-        // file means the next command spawns a server that cannot open the
-        // database, and then waits out the full auto-spawn poll — a measured 61
-        // seconds — before giving up and falling back to a local open.
-        if !wait_for_exit(pid) {
-            eprintln!("· server {pid} did not exit promptly; the next command may be slow");
+    match ownership(cfg, &info) {
+        Ownership::Gone => remove_serve_file(cfg),
+        Ownership::Unverified => {
+            let pid = info.pid.unwrap_or_default();
+            eprintln!(
+                "· pid {pid} is a devctx server but cannot be tied to this project (serve.json \
+                 predates start times and its working directory differs); not signalling it \
+                 and keeping {}",
+                path.display()
+            );
         }
-        println!("Stopped server (pid {pid}).");
+        Ownership::Ours => {
+            let pid = info.pid.unwrap_or_default();
+            // Wait for it to actually exit. Returning while it still holds the
+            // DuckDB file means the next command spawns a server that cannot open
+            // the database, and then waits out the full auto-spawn poll — a
+            // measured 61 seconds — before giving up and falling back to a local
+            // open.
+            if !terminate_ours(cfg, &info, term, kill) {
+                anyhow::bail!(
+                    "server {pid} survived SIGTERM and SIGKILL; keeping {} so it stays discoverable",
+                    path.display()
+                );
+            }
+            println!("Stopped server (pid {pid}).");
+            remove_serve_file(cfg);
+        }
     }
-    remove_serve_file(cfg);
     Ok(())
-}
-
-/// Wait for a process to disappear, up to a few seconds. Returns whether it did.
-fn wait_for_exit(pid: u32) -> bool {
-    for _ in 0..50 {
-        if !pid_alive(pid) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
 }
 
 /// What [`probe`] found.
@@ -708,7 +634,18 @@ pub fn probe(cfg: &ProjectConfig) -> Discovery {
         Health::Ok => return up(info.token),
         // Nobody listens: the server is gone. A live pid on that number is a
         // different process (pids are reused, across repositories too).
-        Health::Refused => return Discovery::Down,
+        // — unless the process is verifiably OURS: then the listener is closed
+        // but the server is not gone (shutting down, wedged), it may still hold
+        // the lock, and spawning another would only hit it.
+        Health::Refused => {
+            return match info.pid {
+                Some(pid) if owns_server(cfg, &info) => Discovery::Busy {
+                    pid,
+                    addr: info.addr,
+                },
+                _ => Discovery::Down,
+            }
+        }
         Health::NoAnswer => {}
     }
     match info.pid {
@@ -1051,43 +988,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A recycled pid must not count as a live server.
-    #[test]
-    fn only_a_devctx_serve_cmdline_counts_as_a_server() {
-        let is = is_server_proc;
-        assert!(is(
-            None,
-            b"/home/u/.local/bin/devctx\0serve\0--addr\x00127.0.0.1:20111\x00"
-        ));
-        assert!(is(None, b"devctx\0api\0"));
-        assert!(!is(None, b"/usr/bin/vim\0serve\0"));
-        assert!(!is(None, b"/usr/bin/devctx\0mcp\0"));
-        assert!(!is(None, b""));
-        // M-3: the subcommand is the first non-flag argument, not any argument.
-        assert!(!is(None, b"devctx\0search\0api\0"));
-        assert!(!is(None, b"devctx\0index\0serve\0"));
-        assert!(is(None, b"devctx\0--verbose\0serve\0"));
+    /// A child running a copy of `sh` named `devctx` as `devctx serve`, so it
+    /// looks like a server to [`procown::is_server_pid`] without being one. The
+    /// script `serve` in `dir` is its program.
+    #[cfg(target_os = "linux")]
+    fn fake_server(dir: &Path, script: &str) -> std::process::Child {
+        use std::process::{Command, Stdio};
+        std::fs::create_dir_all(dir).unwrap();
+        let exe = dir.join("devctx");
+        if !exe.exists() {
+            std::fs::copy("/bin/sh", &exe).unwrap();
+        }
+        std::fs::write(dir.join("serve"), script).unwrap();
+        // A fork racing the copy can make the first exec fail with ETXTBSY.
+        for _ in 0..50 {
+            match Command::new(&exe)
+                .arg("serve")
+                .current_dir(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => {
+                    let pid = c.id();
+                    for _ in 0..100 {
+                        if procown::is_server_pid(pid) {
+                            return c;
+                        }
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                    panic!("the fake server never looked like one");
+                }
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("spawning the fake server: {e}"),
+            }
+        }
+        panic!("ETXTBSY never cleared");
     }
 
-    /// I-1: launched through `/proc/self/exe`, argv[0] says nothing; the
-    /// executable link does, with or without its "(deleted)" suffix.
-    #[test]
-    fn a_server_started_through_proc_self_exe_is_recognised() {
-        let cmd = b"/proc/self/exe\0serve\0--addr\x00127.0.0.1:1\x00";
-        assert!(is_server_proc(Some("/home/u/.local/bin/devctx"), cmd));
-        assert!(is_server_proc(
-            Some("/home/u/.local/bin/devctx (deleted)"),
-            cmd
-        ));
-        assert!(!is_server_proc(Some("/usr/bin/vim"), cmd));
-        assert!(!is_server_proc(None, cmd));
+    #[cfg(target_os = "linux")]
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
     }
 
-    #[test]
-    fn the_start_time_is_field_22_even_with_parens_in_the_name() {
-        let stat = "42 (we ird) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 777 23";
-        assert_eq!(parse_start_time(stat), Some(777));
-        assert_eq!(parse_start_time("garbage"), None);
+    #[cfg(target_os = "linux")]
+    fn advertise_at(cfg: &ProjectConfig, port: u16, pid: u32, start_time: Option<u64>) {
+        let info = ServeInfo {
+            addr: format!("127.0.0.1:{port}"),
+            token: None,
+            pid: Some(pid),
+            start_time,
+        };
+        std::fs::create_dir_all(serve_file(cfg).parent().unwrap()).unwrap();
+        std::fs::write(serve_file(cfg), serde_json::to_vec(&info).unwrap()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("devctx_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     /// The test process itself is alive but is not a server. A spawned `sleep`
@@ -1100,15 +1064,14 @@ mod tests {
             .spawn()
             .expect("spawning sleep");
         let pid = child.id();
-        assert!(!pid_alive(pid));
-        let dir = std::env::temp_dir().join(format!("devctx_owns_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!procown::is_server_pid(pid));
+        let dir = scratch("owns");
         let cfg = cfg_at(&dir);
         let info = ServeInfo {
             addr: "127.0.0.1:1".into(),
             token: None,
             pid: Some(pid),
-            start_time: proc_start_time(pid),
+            start_time: procown::start_time(pid),
         };
         assert!(!owns_server(&cfg, &info));
         let _ = child.kill();
@@ -1116,39 +1079,169 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M-2: nothing listens on the advertised port, but its pid is alive (a
-    /// devctx process of someone else). Down — and it is never killed.
+    /// M-2 (strengthened): the real `connection_refused` must see the
+    /// `io::Error` inside the `ureq::Error`, not reach `Down` by fallback.
     #[test]
-    #[cfg(target_os = "linux")]
-    fn a_refused_port_is_down_even_if_the_pid_lives_and_is_never_killed() {
-        let dir = std::env::temp_dir().join(format!("devctx_refused_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = cfg_at(&dir);
-        // A port nobody listens on.
+    fn connection_refused_recognises_a_real_ureq_error() {
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        // A live process posing as the advertised pid.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let info = ServeInfo {
-            addr: format!("127.0.0.1:{port}"),
-            token: None,
-            pid: Some(child.id()),
-            start_time: proc_start_time(child.id()),
-        };
-        std::fs::write(serve_file(&cfg), serde_json::to_vec(&info).unwrap()).unwrap();
+        let err = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .get(&format!("http://127.0.0.1:{port}/health"))
+            .call()
+            .expect_err("nothing listens there");
+        assert!(connection_refused(&err), "not detected in: {err:?}");
+        assert!(matches!(
+            health(&format!("http://127.0.0.1:{port}"), Duration::from_secs(2)),
+            Health::Refused
+        ));
+
+        // A listener that accepts and never answers is *not* a refusal.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let err = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .get(&format!("http://{addr}/health"))
+            .call()
+            .expect_err("it never answers");
+        assert!(!connection_refused(&err), "a timeout read as refused");
+        assert!(matches!(
+            health(&format!("http://{addr}"), Duration::from_millis(200)),
+            Health::NoAnswer
+        ));
+    }
+
+    /// M-2: a refused port whose advertised pid is a *different* server (same
+    /// binary and subcommand, other start time) is Down, and is never killed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_refused_port_with_someone_elses_server_pid_is_down_and_untouched() {
+        let dir = scratch("refused_foreign");
+        let cfg = cfg_at(&dir);
+        let mut child = fake_server(&dir.join("srv"), "sleep 30\n");
+        let real = procown::start_time(child.id()).unwrap();
+        advertise_at(&cfg, closed_port(), child.id(), Some(real + 1));
         assert!(matches!(probe(&cfg), Discovery::Down));
-        // Not a server of this project: reclaim must leave it alone.
-        assert!(!reclaim_db(&cfg));
+        assert!(!reclaim_db_with(
+            &cfg,
+            Duration::from_millis(200),
+            Duration::from_millis(200)
+        ));
         assert!(
             child.try_wait().unwrap().is_none(),
             "the foreign pid was killed"
         );
+        // Its start time proves the advertisement stale, so the file goes.
+        assert!(!serve_file(&cfg).exists());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reviewer's case: our own server, listener closed but process (and
+    /// lock) alive, must read as Busy — not Down, which would spawn a second
+    /// server straight into the lock.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_refused_port_with_our_live_server_is_busy_not_down() {
+        let dir = scratch("refused_ours");
+        let cfg = cfg_at(&dir);
+        let mut child = fake_server(&dir.join("srv"), "sleep 30\n");
+        advertise_at(
+            &cfg,
+            closed_port(),
+            child.id(),
+            procown::start_time(child.id()),
+        );
+        match probe(&cfg) {
+            Discovery::Busy { pid, .. } => assert_eq!(pid, child.id()),
+            Discovery::Down => panic!("our live server was reported Down"),
+            Discovery::Up(_) => panic!("nothing listens there"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Items 1 and 6: a server that ignores SIGTERM is escalated to SIGKILL and
+    /// the file goes only once it is gone.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stop_escalates_to_sigkill_and_only_then_drops_the_file() {
+        let dir = scratch("stop_escalate");
+        let cfg = cfg_at(&dir);
+        let mut child = fake_server(
+            &dir.join("srv"),
+            "trap '' TERM\nwhile :; do sleep 1; done\n",
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        advertise_at(
+            &cfg,
+            closed_port(),
+            child.id(),
+            procown::start_time(child.id()),
+        );
+        stop_server_with(&cfg, Duration::from_millis(400), Duration::from_secs(3)).unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "it must have been killed: {status:?}");
+        assert!(!serve_file(&cfg).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same, for `reclaim_db`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reclaim_escalates_to_sigkill_too() {
+        let dir = scratch("reclaim_escalate");
+        let cfg = cfg_at(&dir);
+        let mut child = fake_server(
+            &dir.join("srv"),
+            "trap '' TERM\nwhile :; do sleep 1; done\n",
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        advertise_at(
+            &cfg,
+            closed_port(),
+            child.id(),
+            procown::start_time(child.id()),
+        );
+        assert!(reclaim_db_with(
+            &cfg,
+            Duration::from_millis(400),
+            Duration::from_secs(3)
+        ));
+        assert!(!child.wait().unwrap().success(), "it must have been killed");
+        assert!(!serve_file(&cfg).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 6: an old `serve.json` (no start time) whose server's cwd is not the
+    /// project root is neither killed nor orphaned by `stop` — even when the
+    /// server runs from a *nested* directory ("inside" is not "is").
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_unverifiable_server_is_neither_killed_nor_unadvertised() {
+        let dir = scratch("unverified");
+        let cfg = cfg_at(&dir);
+        let mut child = fake_server(&dir.join("nested"), "sleep 30\n");
+        advertise_at(&cfg, closed_port(), child.id(), None);
+        stop_server_with(&cfg, Duration::from_millis(200), Duration::from_millis(200)).unwrap();
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "an unverified server was killed"
+        );
+        assert!(serve_file(&cfg).exists(), "its advertisement was dropped");
+        assert!(!reclaim_db_with(
+            &cfg,
+            Duration::from_millis(200),
+            Duration::from_millis(200)
+        ));
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(serve_file(&cfg).exists());
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use devctx_core::procown::{self, Ownership};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -29,6 +30,10 @@ pub struct ServeInfo {
     /// Owner process id (informational).
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Kernel start time of `pid`, so a recycled pid is never signalled as the
+    /// daemon. Absent in files written by older daemons and off Linux.
+    #[serde(default)]
+    pub start_time: Option<u64>,
 }
 
 /// A reachable central daemon.
@@ -61,6 +66,7 @@ pub fn write_serve_file(paths: &CentralPaths, addr: SocketAddr, token: Option<&s
         addr: addr.to_string(),
         token: token.map(str::to_string),
         pid: Some(std::process::id()),
+        start_time: procown::start_time(std::process::id()),
     };
     let path = serve_file(paths);
     if let Some(parent) = path.parent() {
@@ -264,8 +270,26 @@ fn spawn(paths: &CentralPaths) -> Result<Arc<Mutex<Option<std::process::ExitStat
     Ok(exited)
 }
 
-/// Stop the advertised central daemon.
+/// What the advertised pid is. The daemon has no project directory, so a file
+/// without a start time (an older daemon) is vouched for by `--central` on its
+/// command line.
+fn ownership(info: &ServeInfo) -> Ownership {
+    let Some(pid) = info.pid else {
+        return Ownership::Gone;
+    };
+    procown::classify(pid, info.start_time, |p| {
+        procown::cmdline_has(p, "--central")
+    })
+}
+
+/// Stop the advertised central daemon: SIGTERM, then SIGKILL if it ignores it.
+/// A pid that is not verifiably the daemon (after a reboot it may be anything)
+/// is never signalled, and the file is dropped only once the daemon is gone.
 pub fn stop(paths: &CentralPaths) -> Result<()> {
+    stop_with(paths, Duration::from_secs(5), Duration::from_secs(3))
+}
+
+fn stop_with(paths: &CentralPaths, term: Duration, kill: Duration) -> Result<()> {
     let path = serve_file(paths);
     let Ok(raw) = std::fs::read(&path) else {
         println!("No central daemon is running.");
@@ -275,14 +299,27 @@ pub fn stop(paths: &CentralPaths) -> Result<()> {
         remove_serve_file(paths);
         return Ok(());
     };
-    if let Some(pid) = info.pid {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .stderr(std::process::Stdio::null())
-            .status();
-        println!("Stopped the central daemon (pid {pid}).");
+    let Some(pid) = info.pid else {
+        remove_serve_file(paths);
+        return Ok(());
+    };
+    match ownership(&info) {
+        Ownership::Gone => remove_serve_file(paths),
+        Ownership::Unverified => eprintln!(
+            "· pid {pid} is a devctx server but not verifiably the central daemon; not signalling it"
+        ),
+        Ownership::Ours => {
+            if procown::terminate(pid, || ownership(&info) == Ownership::Ours, term, kill) {
+                println!("Stopped the central daemon (pid {pid}).");
+                remove_serve_file(paths);
+            } else {
+                return Err(CentralError::Request(format!(
+                    "central daemon {pid} survived SIGTERM and SIGKILL; keeping {} so it stays discoverable",
+                    path.display()
+                )));
+            }
+        }
     }
-    remove_serve_file(paths);
     Ok(())
 }
 
@@ -537,4 +574,131 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod stop_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+
+    /// A copy of `sh` named `devctx` running `devctx serve --central`, so it
+    /// passes the daemon check without being one.
+    fn fake_daemon(dir: &Path, script: &str) -> Child {
+        std::fs::create_dir_all(dir).unwrap();
+        let exe = dir.join("devctx");
+        if !exe.exists() {
+            std::fs::copy("/bin/sh", &exe).unwrap();
+        }
+        std::fs::write(dir.join("serve"), script).unwrap();
+        for _ in 0..50 {
+            match Command::new(&exe)
+                .args(["serve", "--central"])
+                .current_dir(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => {
+                    for _ in 0..100 {
+                        if procown::is_server_pid(c.id()) {
+                            return c;
+                        }
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                    panic!("the fake daemon never looked like one");
+                }
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("spawning the fake daemon: {e}"),
+            }
+        }
+        panic!("ETXTBSY never cleared");
+    }
+
+    fn scratch(name: &str) -> CentralPaths {
+        let dir = std::env::temp_dir().join(format!("devctx_cstop_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        CentralPaths::rooted_at(&dir)
+    }
+
+    fn advertise(paths: &CentralPaths, pid: u32, start_time: Option<u64>) {
+        let info = ServeInfo {
+            addr: "127.0.0.1:1".into(),
+            token: None,
+            pid: Some(pid),
+            start_time,
+        };
+        std::fs::write(&paths.serve_file, serde_json::to_vec(&info).unwrap()).unwrap();
+    }
+
+    /// Item 3: after a reboot the pid belongs to something else. It must not be
+    /// signalled; the stale file goes.
+    #[test]
+    fn stop_never_signals_a_pid_that_is_not_the_daemon() {
+        let paths = scratch("foreign");
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        advertise(&paths, sleeper.id(), procown::start_time(sleeper.id()));
+        stop_with(
+            &paths,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(
+            sleeper.try_wait().unwrap().is_none(),
+            "a foreign process died"
+        );
+        assert!(!paths.serve_file.exists());
+
+        // A real daemon-looking process with another start time: also untouched.
+        let mut other = fake_daemon(&paths.dir.join("d"), "sleep 30\n");
+        advertise(
+            &paths,
+            other.id(),
+            procown::start_time(other.id()).map(|t| t + 1),
+        );
+        stop_with(
+            &paths,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(other.try_wait().unwrap().is_none(), "another daemon died");
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// The daemon that ignores SIGTERM is escalated to SIGKILL, and the file
+    /// goes only once it is gone.
+    #[test]
+    fn stop_escalates_to_sigkill() {
+        let paths = scratch("escalate");
+        let mut d = fake_daemon(
+            &paths.dir.join("d"),
+            "trap '' TERM\nwhile :; do sleep 1; done\n",
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        advertise(&paths, d.id(), procown::start_time(d.id()));
+        stop_with(&paths, Duration::from_millis(400), Duration::from_secs(3)).unwrap();
+        assert!(!d.wait().unwrap().success(), "it must have been killed");
+        assert!(!paths.serve_file.exists());
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// An old file without a start time is vouched for by `--central`.
+    #[test]
+    fn an_old_file_without_start_time_is_matched_by_its_command_line() {
+        let paths = scratch("old");
+        let mut d = fake_daemon(&paths.dir.join("d"), "sleep 30\n");
+        advertise(&paths, d.id(), None);
+        stop_with(&paths, Duration::from_secs(3), Duration::from_secs(3)).unwrap();
+        let _ = d.wait();
+        assert!(!paths.serve_file.exists());
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
 }
