@@ -200,7 +200,7 @@ fn head_commit(path: &str) -> Option<String> {
 /// Index a project by running `devctx index` inside it, so the work goes
 /// through that project's own server rather than this process.
 fn index_project(path: &str) {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = devctx_core::self_exe() else {
         return;
     };
     let _ = devctx_core::clean_git_env(&mut std::process::Command::new(exe))

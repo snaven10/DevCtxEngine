@@ -1615,7 +1615,7 @@ fn cmd_mcp_configure(
 ) -> Result<()> {
     let cfg = load_project()?;
     let project_root = project_root(&cfg)?;
-    let exe = std::env::current_exe().context("resolving the devctx binary path")?;
+    let exe = devctx_core::self_exe().context("resolving the devctx binary path")?;
     mcp_configure::run(&Options {
         client,
         scope,

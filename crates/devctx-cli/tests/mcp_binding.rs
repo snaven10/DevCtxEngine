@@ -1265,6 +1265,18 @@ fn call_tool_timed(
     tool: &str,
     before_call: impl FnOnce(),
 ) -> (serde_json::Value, std::time::Duration) {
+    call_tool_timed_with(exe, home, cwd, tool, "{}", before_call)
+}
+
+/// [`call_tool_timed`] with explicit JSON `arguments`.
+fn call_tool_timed_with(
+    exe: &Path,
+    home: &Path,
+    cwd: &Path,
+    tool: &str,
+    arguments: &str,
+    before_call: impl FnOnce(),
+) -> (serde_json::Value, std::time::Duration) {
     use std::io::{BufRead, BufReader, Write};
 
     let mut child = Command::new(exe)
@@ -1302,7 +1314,7 @@ fn call_tool_timed(
     before_call();
     let started = std::time::Instant::now();
     let call = format!(
-        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{tool}","arguments":{{}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{tool}","arguments":{arguments}}}}}"#
     );
     stdin.write_all(call.as_bytes()).unwrap();
     stdin.write_all(b"\n").unwrap();
@@ -1842,4 +1854,153 @@ fn devctx_with_autoserve(home: &Path, cwd: &Path, args: &[&str]) -> std::process
         .args(args)
         .output()
         .expect("running devctx")
+}
+
+// --- Federated recall (PLAN-008 B5) --------------------------------------------
+
+/// Save a local memory in `repo` through the CLI.
+fn remember_local(home: &Path, repo: &Path, content: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", home)
+        .current_dir(repo)
+        .args(["remember", content, "--scope", "local"])
+        .output()
+        .expect("running devctx remember");
+    assert!(
+        out.status.success(),
+        "remember in {}:\n{}",
+        repo.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The contents a recall answered with.
+fn recalled_contents(answer: &serde_json::Value) -> String {
+    answer["memories"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `memories` array in: {answer}"))
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The member memories a group session recalls with `scope: local` and `all`.
+#[test]
+fn group_recall_local_and_all_return_the_members_memories() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("grouprecall");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let api = make_project(&home, &ws, "api", Some("ACME"));
+    let web = make_project(&home, &ws, "web", Some("ACME"));
+    remember_local(&home, &api, "api keeps its retry policy in retry.rs");
+    remember_local(&home, &web, "web keeps its retry policy in backoff.ts");
+
+    for scope in ["local", "all"] {
+        let answer = call_tool(
+            &home,
+            &ws,
+            "recall",
+            serde_json::json!({"query": "retry policy", "scope": scope}),
+        );
+        let text = recalled_contents(&answer);
+        assert!(
+            text.contains("retry.rs"),
+            "scope {scope}, api missing: {answer}"
+        );
+        assert!(
+            text.contains("backoff.ts"),
+            "scope {scope}, web missing: {answer}"
+        );
+    }
+}
+
+/// A member whose directory is gone is skipped by name and path, not counted as
+/// unreachable, and the other member still answers.
+#[test]
+fn group_recall_skips_a_member_whose_path_is_gone() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("recallmissing");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let api = make_project(&home, &ws, "api", Some("ACME"));
+    let web = make_project(&home, &ws, "web", Some("ACME"));
+    remember_local(&home, &api, "api keeps its retry policy in retry.rs");
+    remember_local(&home, &web, "web keeps its retry policy in backoff.ts");
+    // The registry drops a vanished path when the session binds, so the member
+    // has to disappear *after* that: a long-lived session whose checkout was
+    // removed under it. Stop web's server first so nothing is stranded.
+    let (msg, _) = call_tool_timed_with(
+        Path::new(env!("CARGO_BIN_EXE_devctx")),
+        &home,
+        &ws,
+        "recall",
+        r#"{"query":"retry policy","scope":"local"}"#,
+        || {
+            let _ = Command::new(env!("CARGO_BIN_EXE_devctx"))
+                .env("DEVCTX_HOME", &home)
+                .current_dir(&web)
+                .args(["serve", "--stop"])
+                .output();
+            std::fs::remove_dir_all(&web).unwrap();
+        },
+    );
+    let text = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in: {msg}"));
+    let answer: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| panic!("{text}"));
+    assert!(
+        recalled_contents(&answer).contains("retry.rs"),
+        "the surviving member should answer: {answer}"
+    );
+    let skipped = answer["skipped_missing"].to_string();
+    assert!(
+        skipped.contains("web") && skipped.contains(web.to_str().unwrap()),
+        "skipped_missing should name the member and its path: {answer}"
+    );
+    assert!(
+        answer.get("warning").is_none(),
+        "a missing checkout is not an unreachable member: {answer}"
+    );
+}
+
+/// B5 root cause: the MCP's own binary was replaced, so `current_exe()` ends in
+/// " (deleted)" and every fan-out child failed with ENOENT.
+#[test]
+fn group_recall_works_from_an_mcp_whose_binary_was_deleted() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("recalldeleted");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let api = make_project(&home, &ws, "api", Some("ACME"));
+    let web = make_project(&home, &ws, "web", Some("ACME"));
+    remember_local(&home, &api, "api keeps its retry policy in retry.rs");
+    remember_local(&home, &web, "web keeps its retry policy in backoff.ts");
+
+    // Copy, fsync and rename: exec-ing a file another fd still has open for
+    // writing fails with ETXTBSY.
+    let staged = tmp.0.join("devctx-staged");
+    std::fs::copy(env!("CARGO_BIN_EXE_devctx"), &staged).expect("copying the binary");
+    std::fs::File::open(&staged).unwrap().sync_all().unwrap();
+    let copy = tmp.0.join("devctx-copy");
+    std::fs::rename(&staged, &copy).unwrap();
+
+    let (msg, _) = call_tool_timed_with(
+        &copy,
+        &home,
+        &ws,
+        "recall",
+        r#"{"query":"retry policy","scope":"all"}"#,
+        || std::fs::remove_file(&copy).expect("deleting the running binary"),
+    );
+    let text = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in: {msg}"));
+    let answer: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| panic!("{text}"));
+    let found = recalled_contents(&answer);
+    assert!(
+        found.contains("retry.rs") && found.contains("backoff.ts"),
+        "the fan-out must run from a deleted binary: {text}"
+    );
 }

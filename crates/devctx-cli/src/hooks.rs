@@ -103,7 +103,16 @@ fn has_block(script: &str) -> bool {
 pub fn install(repo_root: &Path) -> Result<Vec<PathBuf>> {
     let dir = hooks_dir(repo_root)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let exe = std::env::current_exe().context("locating the devctx binary")?;
+    // The script embeds this path and outlives this process, so it has to be a
+    // path a later shell can run: never "… (deleted)", never `/proc/self/exe`
+    // (which names this process's own inode and dies with it).
+    let exe = devctx_core::self_exe().context("locating the devctx binary")?;
+    if exe.starts_with("/proc/") {
+        anyhow::bail!(
+            "this devctx binary was replaced on disk and no file exists at its old path, so \
+             the hooks would point nowhere; run `devctx init` again from the installed binary"
+        );
+    }
 
     let mut written = Vec::with_capacity(HOOKS.len());
     for hook in HOOKS {

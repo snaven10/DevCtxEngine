@@ -1951,11 +1951,80 @@ pub fn why_unbound(cwd: &std::path::Path, resolution: &Resolution) -> String {
 /// named one project, so this wakes exactly one server rather than all of them.
 /// The project's own server owns its database and keeps its model warm, so the
 /// search runs where it is cheapest.
+/// Run `devctx <args>` inside a member's repository and return its output.
+///
+/// Every fan-out re-enters this same binary with the member's directory as the
+/// working directory, so the child resolves that project and goes through its
+/// own server (`ensure_cli`): the MCP never opens a DuckDB itself. (When
+/// auto-spawn is disabled the child opens the store directly after a lock
+/// check; a brief local open is safe because this process holds no `Store`.)
+///
+/// The binary is [`devctx_core::self_exe`], not `current_exe()`: after a
+/// reinstall the latter ends in " (deleted)" and spawning it fails with ENOENT,
+/// which used to surface as a bare "No such file or directory". Every failure
+/// here names the member and its path, and says which binary was run.
+fn run_in_member<I, S>(
+    member: &str,
+    path: &std::path::Path,
+    args: I,
+) -> Result<std::process::Output, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let at = format!("{member} ({})", path.display());
+    if !path.is_dir() {
+        return Err(format!("{at}: the repository path does not exist"));
+    }
+    let exe = devctx_core::self_exe()
+        .map_err(|e| format!("{at}: could not locate the devctx binary to run: {e}"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    devctx_core::clean_git_env(&mut cmd);
+    cmd.args(args)
+        .current_dir(path)
+        .output()
+        .map_err(|e| format!("{at}: could not run {}: {e}", exe.display()))
+}
+
+/// The last line a failed child wrote, prefixed with who it was.
+fn child_failure(
+    member: &str,
+    path: &std::path::Path,
+    out: &std::process::Output,
+    fallback: &str,
+) -> String {
+    let err = String::from_utf8_lossy(&out.stderr);
+    format!(
+        "{member} ({}): {}",
+        path.display(),
+        err.trim().lines().last().unwrap_or(fallback)
+    )
+}
+
+/// Members whose repository directory is gone, split from the rest.
+///
+/// A registry row outliving its checkout is stale data, not an unreachable
+/// repository: it is reported on its own (`skipped_missing`) and does not count
+/// against "none of the members could be reached".
+fn split_missing(members: &[ProjectRow]) -> (Vec<&ProjectRow>, Vec<Value>) {
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    for m in members {
+        if m.path.is_dir() {
+            present.push(m);
+        } else {
+            missing.push(json!({ "project": m.name, "path": m.path.display().to_string() }));
+        }
+    }
+    (present, missing)
+}
+
 /// Run one member's search, returning its raw hit list.
 ///
 /// Separate from `do_search_project` because the group path needs the hits
 /// themselves to fuse, not the single-project envelope that wraps them.
 fn search_one(
+    member: &str,
     path: &std::path::Path,
     query: &str,
     limit: usize,
@@ -1966,34 +2035,25 @@ fn search_one(
     // file, and a running `devctx serve` for that project owns it. Re-entering
     // our own binary with its working directory set is what the single-project
     // path already does, and it routes through that server when one is up.
-    let out = devctx_core::clean_git_env(&mut std::process::Command::new(
-        std::env::current_exe().map_err(|e| e.to_string())?,
-    ))
-    .args([
-        "search",
-        query,
-        "--limit",
-        &limit.to_string(),
-        "--format",
-        "json",
-    ])
-    .args(language.iter().flat_map(|l| ["--language", *l]))
-    .args(match mode {
-        "keyword" => vec!["--keyword"],
-        "hybrid" => vec!["--hybrid"],
-        _ => vec![],
-    })
-    .current_dir(path)
-    .output()
-    .map_err(|e| e.to_string())?;
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        query.into(),
+        "--limit".into(),
+        limit.to_string(),
+        "--format".into(),
+        "json".into(),
+    ];
+    if let Some(l) = language {
+        args.extend(["--language".into(), l.into()]);
+    }
+    match mode {
+        "keyword" => args.push("--keyword".into()),
+        "hybrid" => args.push("--hybrid".into()),
+        _ => {}
+    }
+    let out = run_in_member(member, path, &args)?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("search failed")
-            .to_string());
+        return Err(child_failure(member, path, &out, "search failed"));
     }
     // The answer is a bare array or `{results, branch_fallback, ...}`; the
     // helper reads both and never turns the wrapper into a hit.
@@ -2040,9 +2100,11 @@ pub fn do_search_group(
         .max_by_key(|d| dims.iter().filter(|x| *x == d).count())
         .unwrap_or(0);
 
+    let (present, skipped_missing) = split_missing(members);
+    let reachable = present.len();
     let mut skipped = Vec::new();
     let mut targets: Vec<&ProjectRow> = Vec::new();
-    for m in members {
+    for m in present {
         if let Some(only) = only {
             if !only.iter().any(|n| n == &m.name) {
                 continue;
@@ -2073,7 +2135,7 @@ pub fn do_search_group(
                     scope.spawn(move || {
                         (
                             m.name.clone(),
-                            search_one(&m.path, query, limit, lang.as_deref(), mode),
+                            search_one(&m.name, &m.path, query, limit, lang.as_deref(), mode),
                         )
                     })
                 })
@@ -2163,10 +2225,13 @@ pub fn do_search_group(
     if !failed.is_empty() {
         out["failed_projects"] = json!(failed);
     }
+    if !skipped_missing.is_empty() {
+        out["skipped_missing"] = json!(skipped_missing);
+    }
     if !member_notes.is_empty() {
         out["member_notes"] = Value::Object(member_notes);
     }
-    if let Some(warning) = fan_out_warning(&failed, members.len())? {
+    if let Some(warning) = fan_out_warning(&failed, reachable)? {
         out["warning"] = json!(warning);
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
@@ -2188,15 +2253,28 @@ fn fan_out_warning(failed: &[Value], members: usize) -> Result<Option<String>, S
     if failed.is_empty() {
         return Ok(None);
     }
-    let first_error = failed
-        .first()
-        .and_then(|f| f.get("error").and_then(|e| e.as_str()))
-        .unwrap_or("no reason given");
+    // Each error already names its member and path; list up to three so one
+    // broken checkout does not hide that the others fail differently.
+    let causes: Vec<&str> = failed
+        .iter()
+        .filter_map(|f| f.get("error").and_then(|e| e.as_str()))
+        .take(3)
+        .collect();
+    let first_error = if causes.is_empty() {
+        "no reason given".to_string()
+    } else {
+        let more = failed.len().saturating_sub(causes.len());
+        let mut t = causes.join(" | ");
+        if more > 0 {
+            t.push_str(&format!(" (and {more} more)"));
+        }
+        t
+    };
     if members > 0 && failed.len() >= members {
         return Err(format!(
             "None of the {members} repositories in this group could be reached, so this \
              answer would come from the shared tier alone — which is not an answer to \
-             the question asked. First failure: {first_error}"
+             the question asked. Failures: {first_error}"
         ));
     }
     let names: Vec<&str> = failed
@@ -2205,7 +2283,7 @@ fn fan_out_warning(failed: &[Value], members: usize) -> Result<Option<String>, S
         .collect();
     Ok(Some(format!(
         "INCOMPLETE: {} of {members} repositories could not be reached ({}), so anything \
-         recorded only in them is missing here. First failure: {first_error}",
+         recorded only in them is missing here. Failures: {first_error}",
         failed.len(),
         names.join(", ")
     )))
@@ -2213,36 +2291,31 @@ fn fan_out_warning(failed: &[Value], members: usize) -> Result<Option<String>, S
 
 /// Recall from one member's own store, local tier only.
 fn recall_one_local(
+    member: &str,
     path: &std::path::Path,
     query: &str,
     limit: usize,
 ) -> Result<Vec<Value>, String> {
-    let out = devctx_core::clean_git_env(&mut std::process::Command::new(
-        std::env::current_exe().map_err(|e| e.to_string())?,
-    ))
-    .args([
-        "recall",
-        query,
-        "--limit",
-        &limit.to_string(),
-        "--scope",
-        "local",
-        "--format",
-        "json",
-    ])
-    .current_dir(path)
-    .output()
-    .map_err(|e| e.to_string())?;
+    let out = run_in_member(
+        member,
+        path,
+        [
+            "recall",
+            query,
+            "--limit",
+            &limit.to_string(),
+            "--scope",
+            "local",
+            "--format",
+            "json",
+        ],
+    )?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("recall failed")
-            .to_string());
+        return Err(child_failure(member, path, &out, "recall failed"));
     }
-    match serde_json::from_slice::<Value>(&out.stdout).map_err(|e| e.to_string())? {
+    match serde_json::from_slice::<Value>(&out.stdout)
+        .map_err(|e| format!("{member} ({}): unreadable answer: {e}", path.display()))?
+    {
         Value::Array(v) => Ok(v),
         Value::Object(m) => Ok(m
             .get("memories")
@@ -2292,18 +2365,23 @@ pub fn do_recall_group(
         }
     }
 
+    let (present, skipped_missing) = split_missing(members);
+    let reachable = present.len();
     if want_local {
         // Same reasoning as the code fan-out: the members are independent, so
         // querying them one after another buys latency and nothing else. A cold
         // project takes seconds, a warm one milliseconds.
         let mut gathered: Vec<(String, Result<Vec<Value>, String>)> = Vec::new();
-        for batch in members.chunks(FANOUT_CONCURRENCY) {
+        for batch in present.chunks(FANOUT_CONCURRENCY) {
             std::thread::scope(|scope_| {
                 let handles: Vec<_> = batch
                     .iter()
                     .map(|m| {
                         scope_.spawn(move || {
-                            (m.name.clone(), recall_one_local(&m.path, query, limit))
+                            (
+                                m.name.clone(),
+                                recall_one_local(&m.name, &m.path, query, limit),
+                            )
                         })
                     })
                     .collect();
@@ -2349,7 +2427,13 @@ pub fn do_recall_group(
     if !failed.is_empty() {
         out["failed_projects"] = json!(failed);
     }
-    if let Some(warning) = fan_out_warning(&failed, members.len())? {
+    if !skipped_missing.is_empty() {
+        out["skipped_missing"] = json!(skipped_missing);
+    }
+    // A scope without a local tier asked no member anything, so none can have
+    // failed; the count only matters when members were actually queried.
+    let queried = if want_local { reachable } else { 0 };
+    if let Some(warning) = fan_out_warning(&failed, queried)? {
         out["warning"] = json!(warning);
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
@@ -2370,35 +2454,30 @@ pub fn do_search_project(
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("no path recorded for `{project}`"))?;
 
-    let out = devctx_core::clean_git_env(&mut std::process::Command::new(
-        std::env::current_exe().map_err(|e| e.to_string())?,
-    ))
-    .args([
-        "search",
-        query,
-        "--limit",
-        &limit.to_string(),
-        "--format",
-        "json",
-    ])
-    .args(language.iter().flat_map(|l| ["--language", l]))
-    .args(match mode {
-        "keyword" => vec!["--keyword"],
-        "hybrid" => vec!["--hybrid"],
-        _ => vec![],
-    })
-    .current_dir(path)
-    .output()
-    .map_err(|e| e.to_string())?;
-
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        query.into(),
+        "--limit".into(),
+        limit.to_string(),
+        "--format".into(),
+        "json".into(),
+    ];
+    if let Some(l) = &language {
+        args.extend(["--language".into(), l.clone()]);
+    }
+    match mode {
+        "keyword" => args.push("--keyword".into()),
+        "hybrid" => args.push("--hybrid".into()),
+        _ => {}
+    }
+    let out = run_in_member(project, std::path::Path::new(path), &args)?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("search failed")
-            .to_string());
+        return Err(child_failure(
+            project,
+            std::path::Path::new(path),
+            &out,
+            "search failed",
+        ));
     }
     let hits: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
     let answer = devctx_core::search_hits(&hits);
@@ -3140,22 +3219,23 @@ fn move_to_project(project: &str, m: &devctx_store::Memory) -> Result<String, St
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("no path recorded for `{project}`"))?;
 
-    let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
-    devctx_core::clean_git_env(&mut cmd);
-    cmd.args(["remember", &m.content, "--type", &m.memory_type]);
-    if !m.title.is_empty() {
-        cmd.args(["--title", &m.title]);
+    let mut args: Vec<String> = vec![
+        "remember".into(),
+        m.content.clone(),
+        "--type".into(),
+        m.memory_type.clone(),
+    ];
+    for (flag, val) in [
+        ("--title", &m.title),
+        ("--topic", &m.topic_key),
+        ("--tags", &m.tags),
+        ("--files", &m.files),
+    ] {
+        if !val.is_empty() {
+            args.extend([flag.into(), val.clone()]);
+        }
     }
-    if !m.topic_key.is_empty() {
-        cmd.args(["--topic", &m.topic_key]);
-    }
-    if !m.tags.is_empty() {
-        cmd.args(["--tags", &m.tags]);
-    }
-    if !m.files.is_empty() {
-        cmd.args(["--files", &m.files]);
-    }
-    let out = cmd.current_dir(path).output().map_err(|e| e.to_string())?;
+    let out = run_in_member(project, std::path::Path::new(path), &args)?;
     if !out.status.success() {
         return Err(format!(
             "`{project}` refused the memory: {}",
@@ -3994,6 +4074,29 @@ mod tests {
         assert!(warning.contains("1 of 11"), "{warning}");
         assert!(warning.contains("api"), "name who is missing: {warning}");
         assert!(warning.contains("timed out"), "{warning}");
+    }
+
+    /// B5: a failure names the member and path, and the refusal lists up to
+    /// three of them rather than only the first.
+    #[test]
+    fn the_refusal_lists_up_to_three_failures() {
+        let failed: Vec<serde_json::Value> = (0..5)
+            .map(|i| serde_json::json!({ "project": format!("r{i}"), "error": format!("r{i} (/p/r{i}): boom{i}") }))
+            .collect();
+        let err = fan_out_warning(&failed, 5).expect_err("all failed");
+        for i in 0..3 {
+            assert!(err.contains(&format!("(/p/r{i}): boom{i}")), "{err}");
+        }
+        assert!(!err.contains("boom3"), "{err}");
+        assert!(err.contains("2 more"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_member_path_is_named_before_any_spawn() {
+        let err = super::run_in_member("web", std::path::Path::new("/no/such/dir"), ["x"])
+            .expect_err("path does not exist");
+        assert!(err.contains("web (/no/such/dir)"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
     }
 
     #[test]
