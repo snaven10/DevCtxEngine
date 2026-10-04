@@ -1730,3 +1730,86 @@ fn a_replaced_binary_is_reported_and_the_mcp_keeps_answering() {
     drop(stdin);
     let _ = wait_exit(&mut child, std::time::Duration::from_secs(10));
 }
+
+// --- Reconnection to a serve that left (PLAN-008 B2) -----------------------------
+
+fn serve_pid(root: &Path) -> u32 {
+    let text = std::fs::read_to_string(root.join(".devctx/state/serve.json")).expect("serve.json");
+    serde_json::from_str::<serde_json::Value>(&text).unwrap()["pid"]
+        .as_u64()
+        .expect("pid in serve.json") as u32
+}
+
+/// One MCP session outlives its serve: after `serve --stop` the next tool call
+/// — a write included, since the request never reached anyone — rediscovers
+/// and respawns the serve, and succeeds against a different process.
+#[test]
+fn a_session_survives_its_serve_leaving() {
+    use std::io::{BufRead, BufReader, Write};
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("reconnect");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    stdin.write_all(INIT_MSGS.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let mut ask = |id: u64, content: &str| -> serde_json::Value {
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"remember","arguments":{{"content":"{content}","scope":"local"}}}}}}"#
+        );
+        stdin.write_all(call.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+        loop {
+            let Some(Ok(line)) = lines.next() else {
+                panic!("the MCP closed before answering id {id}");
+            };
+            if let Ok(m) = serde_json::from_str::<serde_json::Value>(&line) {
+                if m.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                    return m;
+                }
+            }
+        }
+    };
+
+    let first = ask(2, "antes de que el serve salga");
+    assert!(first.get("error").is_none(), "first call: {first}");
+    let pid1 = serve_pid(&root);
+
+    let stop = devctx_with_autoserve(&home, &root, &["serve", "--stop"]);
+    assert!(stop.status.success(), "serve --stop failed");
+    let t0 = std::time::Instant::now();
+    while Path::new(&format!("/proc/{pid1}")).exists() {
+        assert!(t0.elapsed().as_secs() < 30, "the serve never exited");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let second = ask(3, "despues de que el serve salio");
+    assert!(
+        second.get("error").is_none(),
+        "the session must reconnect: {second}"
+    );
+    assert_ne!(serve_pid(&root), pid1, "a new serve must be answering");
+    drop(stdin);
+    let _ = child.wait();
+}
+
+fn devctx_with_autoserve(home: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", home)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("running devctx")
+}

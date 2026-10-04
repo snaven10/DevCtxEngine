@@ -234,7 +234,7 @@ binario instalado y sugieren reiniciar la sesión.
 | TASK-001 | El MCP nunca abre el DuckDB: backend remoto perezoso, `ensure` que detecta muerte, `serve.log`, exe `(deleted)` | P0 | — | `done` |
 | TASK-002 | CLI: fallo rápido ante un DB bloqueado, con PID y cómo liberarlo | P0 | TASK-001 | `done` |
 | TASK-003 | Ciclo de vida del MCP: salida en EOF y aviso de versión desfasada | P0 | — | `done` |
-| TASK-004 | Reconexión del cliente remoto ante un serve muerto | P0 | TASK-001 | `pending` |
+| TASK-004 | Reconexión del cliente remoto ante un serve muerto | P0 | TASK-001 | `done` |
 | TASK-005 | Entorno de git limpio en hooks, serve y subprocesos `git` | P0 | — | `done` |
 | TASK-006 | Grafo honesto: fallback de rama como `search` y avisos explícitos | P0 | — | `done` |
 | TASK-007 | Versión del extractor en `index_meta` y aviso de índice viejo | P0 | — | `done` |

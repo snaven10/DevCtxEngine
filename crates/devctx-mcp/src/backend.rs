@@ -27,14 +27,37 @@ pub struct ServerConn {
 /// reads when there is none.
 pub type Connector = Arc<dyn Fn() -> Result<ServerConn, String> + Send + Sync>;
 
+/// What the client currently knows about the server.
+#[derive(Default)]
+struct Link {
+    /// `(base, token)` of the server once connected.
+    target: Option<(String, Option<String>)>,
+    /// Bumped on every connection, so a failure seen on an old connection
+    /// cannot invalidate a newer one another thread already made.
+    generation: u64,
+    /// When the connector last failed, and why: for [`FAILURE_BACKOFF`].
+    failed: Option<(std::time::Instant, String)>,
+}
+
+/// How long a failed connection attempt is remembered. Without it every tool
+/// call re-runs the connector — up to a minute each against a hung server, one
+/// after another behind the lock — instead of failing at once with the reason.
+const FAILURE_BACKOFF: Duration = Duration::from_secs(8);
+
 /// A thin blocking HTTP client for the shared server's endpoints.
 ///
 /// The connection may not exist yet: an MCP never opens the project's database
 /// itself, and it does not need the server at startup either. The first call
-/// connects, and a call that finds no server fails with the reason and tries
-/// again next time.
+/// connects, and a call that finds no server fails with the reason; the next
+/// call (after a few seconds) tries again.
+///
+/// The connection is not permanent either: the server leaves on its own
+/// (`--idle`, `serve --stop`, a crash). A request that fails to *connect* drops
+/// the cached target, runs the connector again (rediscover or respawn) and is
+/// retried once. Only that: a request that may have reached the server (read
+/// timeout, an HTTP status) is never repeated, since it could duplicate a write.
 pub struct RemoteClient {
-    conn: std::sync::Mutex<Option<(String, Option<String>)>>,
+    link: std::sync::Mutex<Link>,
     connect: Option<Connector>,
 }
 
@@ -65,22 +88,58 @@ fn long_timeout() -> Duration {
     Duration::from_secs(LONG_TIMEOUT_SECS)
 }
 
+/// Whether a failed request may be repeated: only when it provably never
+/// reached the server (the connection was refused or could not be made).
+/// A read timeout, a connection cut after sending and any HTTP status all
+/// return `false`: the request may have been processed.
+fn should_retry(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::Transport(t) => matches!(
+            t.kind(),
+            ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns
+        ),
+        ureq::Error::Status(..) => false,
+    }
+}
+
 impl RemoteClient {
-    /// `(base, token)` of the server, connecting on first use. Held under the
-    /// lock so concurrent first calls spawn one server, not several.
-    fn target(&self) -> Result<(String, Option<String>), String> {
-        let mut slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(t) = slot.as_ref() {
-            return Ok(t.clone());
+    /// `((base, token), generation)` of the server, connecting on first use.
+    /// Held under the lock so concurrent calls spawn one server, not several.
+    fn target(&self) -> Result<((String, Option<String>), u64), String> {
+        let mut link = self.link.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = link.target.as_ref() {
+            return Ok((t.clone(), link.generation));
         }
         let connect = self
             .connect
             .as_ref()
             .ok_or_else(|| "no devctx server connection".to_string())?;
-        let c = connect()?;
-        let t = (c.base, c.token);
-        *slot = Some(t.clone());
-        Ok(t)
+        if let Some((at, why)) = link.failed.as_ref() {
+            if at.elapsed() < FAILURE_BACKOFF {
+                return Err(why.clone());
+            }
+        }
+        match connect() {
+            Ok(c) => {
+                let t = (c.base, c.token);
+                link.failed = None;
+                link.generation += 1;
+                link.target = Some(t.clone());
+                Ok((t, link.generation))
+            }
+            Err(e) => {
+                link.failed = Some((std::time::Instant::now(), e.clone()));
+                Err(e)
+            }
+        }
+    }
+
+    /// Forget the connection `generation`, unless a newer one replaced it.
+    fn invalidate(&self, generation: u64) {
+        let mut link = self.link.lock().unwrap_or_else(|p| p.into_inner());
+        if link.generation == generation {
+            link.target = None;
+        }
     }
 
     fn agent(&self, timeout: Duration) -> ureq::Agent {
@@ -94,13 +153,38 @@ impl RemoteClient {
         }
     }
 
+    /// Send with the current target; on a connect failure, reconnect and send
+    /// once more (see the type's doc for the rule).
+    fn request(
+        &self,
+        send: impl Fn(&str, &Option<String>) -> Result<ureq::Response, Box<ureq::Error>>,
+    ) -> Result<String, String> {
+        let ((base, token), generation) = self.target()?;
+        match send(&base, &token) {
+            Err(e) if self.connect.is_some() && should_retry(&e) => {
+                let first = e.to_string();
+                self.invalidate(generation);
+                let ((base, token), _) = self
+                    .target()
+                    .map_err(|why| format!("{first}; reconnecting failed: {why}"))?;
+                read(send(&base, &token).map_err(|e| *e))
+                    .map_err(|second| format!("{second} (retried once; first attempt: {first})"))
+            }
+            other => read(other.map_err(|e| *e)),
+        }
+    }
+
     fn get(&self, path: &str) -> Result<String, String> {
         self.get_timed(path, default_timeout())
     }
 
     fn get_timed(&self, path: &str, timeout: Duration) -> Result<String, String> {
-        let (base, token) = self.target()?;
-        read(Self::auth(self.agent(timeout).get(&format!("{base}{path}")), &token).call())
+        let agent = self.agent(timeout);
+        self.request(|base, token| {
+            Self::auth(agent.get(&format!("{base}{path}")), token)
+                .call()
+                .map_err(Box::new)
+        })
     }
 
     fn post(&self, path: &str, body: Value) -> Result<String, String> {
@@ -108,8 +192,12 @@ impl RemoteClient {
     }
 
     fn post_timed(&self, path: &str, body: Value, timeout: Duration) -> Result<String, String> {
-        let (base, token) = self.target()?;
-        read(Self::auth(self.agent(timeout).post(&format!("{base}{path}")), &token).send_json(body))
+        let agent = self.agent(timeout);
+        self.request(|base, token| {
+            Self::auth(agent.post(&format!("{base}{path}")), token)
+                .send_json(body.clone())
+                .map_err(Box::new)
+        })
     }
 }
 
@@ -163,7 +251,11 @@ impl Backend {
     pub fn remote(conn: ServerConn, identity: ProjectIdentity) -> Self {
         Backend::Remote(
             RemoteClient {
-                conn: std::sync::Mutex::new(Some((conn.base, conn.token))),
+                link: std::sync::Mutex::new(Link {
+                    target: Some((conn.base, conn.token)),
+                    generation: 1,
+                    failed: None,
+                }),
                 connect: None,
             },
             identity,
@@ -174,7 +266,7 @@ impl Backend {
     pub fn lazy(connect: Connector, identity: ProjectIdentity) -> Self {
         Backend::Remote(
             RemoteClient {
-                conn: std::sync::Mutex::new(None),
+                link: std::sync::Mutex::new(Link::default()),
                 connect: Some(connect),
             },
             identity,
@@ -621,5 +713,82 @@ mod tests {
             Backend::warn_if_provenance_was_ignored(answer.clone(), Some("REVFA")),
             answer
         );
+    }
+
+    // --- Retry policy (PLAN-008 B2) -------------------------------------------
+
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn a_refused_connection_is_retried() {
+        let url = format!("http://127.0.0.1:{}/x", closed_port());
+        let err = ureq::get(&url).call().unwrap_err();
+        assert!(should_retry(&err), "never sent, safe to repeat: {err}");
+    }
+
+    #[test]
+    fn a_read_timeout_is_not_retried() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/x", l.local_addr().unwrap());
+        // Accepts (kernel backlog) but never answers.
+        let err = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .post(&url)
+            .send_json(json!({}))
+            .unwrap_err();
+        assert!(!should_retry(&err), "may have been processed: {err}");
+    }
+
+    #[test]
+    fn an_http_status_is_not_retried() {
+        for code in [404u16, 500] {
+            let resp = ureq::Response::new(code, "x", "").unwrap();
+            assert!(!should_retry(&ureq::Error::Status(code, resp)), "{code}");
+        }
+    }
+
+    /// The connector runs again after a refused connection, exactly once more,
+    /// and the failure is remembered instead of re-running it per call.
+    #[test]
+    fn a_refused_connection_reconnects_once_and_failures_back_off() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let dead = format!("http://127.0.0.1:{}", closed_port());
+        let connect: Connector = Arc::new(move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ServerConn {
+                base: dead.clone(),
+                token: None,
+            })
+        });
+        let client = RemoteClient {
+            link: std::sync::Mutex::new(Link::default()),
+            connect: Some(connect),
+        };
+        let err = client.get("/status").unwrap_err();
+        assert!(err.contains("retried once"), "{err}");
+        // First connect + one reconnect, no more.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let failing: Connector = Arc::new({
+            let c = calls.clone();
+            move || {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("no server".to_string())
+            }
+        });
+        let client = RemoteClient {
+            link: std::sync::Mutex::new(Link::default()),
+            connect: Some(failing),
+        };
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..3 {
+            assert_eq!(client.get("/status").unwrap_err(), "no server");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before + 1);
     }
 }
