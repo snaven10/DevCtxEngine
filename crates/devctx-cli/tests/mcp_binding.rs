@@ -1398,6 +1398,64 @@ fn a_foreign_lock_is_reported_quickly_with_the_owner_pid() {
     );
 }
 
+/// The same lock seen from the CLI: `devctx search` must not spend a minute on
+/// it, and must say who holds the index and how to let go. Run both with the
+/// auto-spawn on (a server is tried and dies on the lock) and off.
+#[test]
+fn the_cli_fails_fast_on_a_foreign_lock_naming_the_pid_and_the_remedy() {
+    let tmp = Tmp::new("clilock");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{}", free_port())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning a hand-run server");
+    let pid = owner.id();
+    let _owner = KillOnDrop(owner);
+    let advert = root.join(".devctx/state/serve.json");
+    let t0 = std::time::Instant::now();
+    while !advert.exists() {
+        assert!(t0.elapsed().as_secs() < 60, "the server never advertised");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Invisible to discovery, still holding the lock.
+    std::fs::remove_file(&advert).unwrap();
+
+    for autoserve_off in [false, true] {
+        for args in [&["search", "x"][..], &["symbol", "x"][..]] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_devctx"));
+            cmd.env("DEVCTX_HOME", &home).current_dir(&root).args(args);
+            if autoserve_off {
+                cmd.env("DEVCTX_NO_AUTOSERVE", "1");
+            }
+            let t = std::time::Instant::now();
+            let out = cmd.output().expect("running devctx");
+            let elapsed = t.elapsed();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let what = format!("{args:?}, autoserve off: {autoserve_off}");
+            assert!(!out.status.success(), "{what}: should fail:\n{stderr}");
+            assert!(
+                stderr.contains(&format!("PID {pid}")),
+                "{what}: should name the owner {pid}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("serve --stop"),
+                "{what}: should say how to release it:\n{stderr}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "{what}: took {elapsed:?}, it must not wait out the old budget"
+            );
+        }
+    }
+}
+
 /// After a reinstall the running MCP's own executable is "…/devctx (deleted)";
 /// it must still be able to start a server.
 #[test]

@@ -722,7 +722,7 @@ fn reindex_one(root: &std::path::Path, full: bool) -> Result<String> {
     let cfg = ProjectConfig::load(&cfg_path)
         .with_context(|| format!("reading {}", cfg_path.display()))?;
 
-    let Some(r) = remote::ensure(&cfg) else {
+    let Some(r) = remote::ensure_cli(&cfg)? else {
         bail!("could not reach or start a server for this project");
     };
     let raw = r.index(full, None)?;
@@ -951,7 +951,7 @@ fn cmd_tui(project: Option<String>) -> Result<()> {
     // Route through the server (auto-spawned if needed) so the TUI never opens
     // the DB itself and coexists with other processes. Fall back to local only
     // when no server is available.
-    let server = match remote::ensure(&cfg) {
+    let server = match remote::ensure_cli(&cfg)? {
         Some(r) => {
             let (base, token) = r.into_parts();
             Some(devctx_tui::ServerConn { base, token })
@@ -1703,7 +1703,7 @@ fn cmd_remember(
     // all, rather than doing the central half here and then failing to open a
     // store something else holds. Found by smoke test: the link was skipped in
     // silence whenever a server happened to be up, which is the normal case.
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!(
             "{}",
             r.remember(
@@ -1880,7 +1880,7 @@ fn memories_of(v: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
 /// Recall a project's own memories, routing through its server when one is
 /// running so no second process takes the DuckDB lock.
 fn local_recall(cfg: &ProjectConfig, query: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
-    if let Some(r) = remote::ensure(cfg) {
+    if let Some(r) = remote::ensure_cli(cfg)? {
         let raw = r.recall(query, limit)?;
         let parsed: serde_json::Value = serde_json::from_str(&raw).context("parsing recall")?;
         // The endpoint answers `{"memories": [...]}`. This used to read it as a
@@ -1974,7 +1974,7 @@ fn repo_branch(cfg: &ProjectConfig) -> (String, String) {
 /// written into and the client for the shared memories that need linking.
 fn cmd_backfill_links(dry_run: bool, from_text: bool) -> Result<()> {
     let cfg = load_project()?;
-    let Some(r) = remote::ensure(&cfg) else {
+    let Some(r) = remote::ensure_cli(&cfg)? else {
         bail!(
             "backfilling needs this project's server; start one with `devctx serve` \
              (or run any indexing command, which spawns it)"
@@ -2041,7 +2041,7 @@ fn cmd_backfill_links(dry_run: bool, from_text: bool) -> Result<()> {
 /// `devctx symbol` — a symbol's definition and code.
 fn cmd_symbol(name: String, limit: usize) -> Result<()> {
     let cfg = load_project()?;
-    let raw = match remote::ensure(&cfg) {
+    let raw = match remote::ensure_cli(&cfg)? {
         Some(r) => r.read_symbol(&name, limit)?,
         None => {
             let store = open_store(&cfg, configured_dimension(&cfg))?;
@@ -2077,7 +2077,7 @@ fn cmd_symbol(name: String, limit: usize) -> Result<()> {
 /// is the process that already holds all three.
 fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Result<()> {
     let cfg = load_project()?;
-    let Some(r) = remote::ensure(&cfg) else {
+    let Some(r) = remote::ensure_cli(&cfg)? else {
         bail!(
             "`context` needs this project's server; start one with `devctx serve` \
              (or run any indexing command, which spawns it)"
@@ -2089,7 +2089,7 @@ fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Resu
 
 fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         let json: serde_json::Value = serde_json::from_str(&r.impact(&symbol, depth)?)?;
         println!("Impact of `{symbol}` (depth {depth}):");
         let merged: Vec<String> = json["resolved_symbols"]
@@ -2334,7 +2334,7 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
     let cfg = load_project()?;
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!(
             "{}",
             r.summarize(&content, query.as_deref(), tokens.unwrap_or(200))?
@@ -2372,7 +2372,7 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
 /// `devctx routes` — list framework-aware HTTP routes.
 fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!("{}", r.routes(method.as_deref(), path.as_deref())?);
         return Ok(());
     }
@@ -2702,7 +2702,7 @@ fn cmd_memory_purge(project: String, dry_run: bool) -> Result<()> {
 /// `devctx memory-stats` — show memory counts for the project.
 fn cmd_memory_stats() -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!("{}", r.memory_stats()?);
         return Ok(());
     }
@@ -3229,7 +3229,7 @@ fn cmd_status() -> Result<()> {
         return Ok(());
     };
     let cfg = ProjectConfig::load(&cfg_path)?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!("DevCtxEngine {} (server mode)", devctx_core::VERSION);
         println!("  config:   {}", cfg_path.display());
         println!("{}", r.status()?);
@@ -3295,7 +3295,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
     // otherwise whatever is checked out, which is what the pipeline does with
     // `None`.
     let branch = branch.or_else(|| cfg.indexing.default_branch().map(str::to_string));
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         // The server does the work, so nothing local can drive the bar. Poll it
         // instead: elapsed seconds alone cannot tell a run that is nearly done
         // from one that has barely started, and on a large repository both look
@@ -3501,7 +3501,7 @@ fn cmd_search(
     hybrid: bool,
 ) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         let mode = if hybrid {
             "hybrid"
         } else if keyword {
@@ -3597,7 +3597,14 @@ fn build_embedder(cfg: &ProjectConfig) -> Result<Box<dyn EmbeddingProvider>> {
 
 fn open_store(cfg: &ProjectConfig, dim: usize) -> Result<Store> {
     let path = cfg.db_path();
-    Ok(Store::open(&path, dim)?)
+    Store::open(&path, dim).map_err(|e| {
+        let text = format!("{e:#}");
+        if remote::is_lock_error(&text) {
+            anyhow::anyhow!(remote::lock_message(cfg, &text))
+        } else {
+            e.into()
+        }
+    })
 }
 
 /// Project name for memory scoping (config name, else db-derived fallback).

@@ -222,6 +222,117 @@ pub fn ensure(cfg: &ProjectConfig) -> Option<Remote> {
     ensure_checked(cfg).ok()
 }
 
+/// What a CLI command needs from [`ensure_checked`]: a server, or `None` to
+/// open the store itself — except when the database is demonstrably held by
+/// another process, where opening it can only fail, so the failure is returned
+/// now, naming the holder and how to release it.
+pub fn ensure_cli(cfg: &ProjectConfig) -> Result<Option<Remote>> {
+    match ensure_checked(cfg) {
+        Ok(r) => Ok(Some(r)),
+        Err(EnsureError::Busy { pid, addr }) => Err(anyhow::anyhow!(
+            "the index of {} is held by PID {pid} (the server at {addr}, alive but not \
+             answering; it is busy or hung). Wait for it, or release it with `devctx serve --stop`.",
+            cfg.project.name
+        )),
+        Err(EnsureError::Failed { cause: Some(c) }) if is_lock_error(&c) => {
+            Err(anyhow::anyhow!(lock_message(cfg, &c)))
+        }
+        // Nothing to ask and the caller will open the store itself — after
+        // loading whatever model it needs, which can take longer than the lock
+        // does to fail. Find out first.
+        Err(EnsureError::Disabled) => {
+            match devctx_store::Store::check_unlocked(&cfg.db_path()) {
+                Err(e) if is_lock_error(&format!("{e:#}")) => {
+                    Err(anyhow::anyhow!(lock_message(cfg, &format!("{e:#}"))))
+                }
+                _ => Ok(None),
+            }
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// Whether `text` is DuckDB refusing to open a file another process holds.
+pub fn is_lock_error(text: &str) -> bool {
+    text.contains("Could not set lock") || text.contains("Conflicting lock")
+}
+
+/// The PID DuckDB names in "Conflicting lock is held in <exe> (PID N)".
+fn lock_holder_pid(text: &str) -> Option<u32> {
+    let rest = &text[text.find("(PID ")? + 5..];
+    let end = rest.find(|c: char| !c.is_ascii_digit())?;
+    rest[..end].parse().ok()
+}
+
+/// The explanation for a database held by someone else; `detail` is DuckDB's
+/// own text (from the error or from `serve.log`).
+pub fn lock_message(cfg: &ProjectConfig, detail: &str) -> String {
+    const REMEDY: &str = "If it is a `devctx mcp` from an old session, close that session; \
+                          otherwise `devctx serve --stop`.";
+    let name = &cfg.project.name;
+    match lock_holder_pid(detail) {
+        Some(pid) => format!(
+            "the index of {name} is held by PID {pid} ({}). {REMEDY}",
+            describe_process(pid)
+        ),
+        None => format!("the index of {name} is held by another process ({detail}). {REMEDY}"),
+    }
+}
+
+/// A short account of a process for a human: its command line, whether its
+/// binary was replaced, and for how long it has been running. Linux reads
+/// `/proc`; elsewhere (or if the process is gone) there is just a word.
+fn describe_process(pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return "no longer running".to_string();
+        };
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let mut cmd = args.join(" ");
+        if cmd.chars().count() > 80 {
+            cmd = cmd.chars().take(77).collect::<String>() + "...";
+        }
+        let deleted = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .is_ok_and(|p| p.to_string_lossy().ends_with(" (deleted)"));
+        let mut parts = vec![if cmd.is_empty() {
+            "unknown command".to_string()
+        } else {
+            cmd
+        }];
+        if deleted {
+            parts.push("its binary was replaced (deleted)".to_string());
+        }
+        if let Some(age) = std::fs::metadata(format!("/proc/{pid}"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+        {
+            parts.push(format!("running for {}", human_age(age.as_secs())));
+        }
+        parts.join(", ")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        "another process".to_string()
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn human_age(secs: u64) -> String {
+    match secs {
+        0..=89 => format!("{secs}s"),
+        90..=5399 => format!("{}m", secs / 60),
+        5400..=172_799 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
 /// What a spawned `devctx serve` is doing.
 struct Spawned {
     exited: std::sync::Arc<std::sync::Mutex<Option<std::process::ExitStatus>>>,
@@ -755,6 +866,24 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_lock_holder_pid_is_read_from_duckdbs_message() {
+        let msg = "IO Error: Could not set lock on file \"/x/index.duckdb\": Conflicting lock \
+                   is held in /usr/bin/devctx (PID 4242) by user me.";
+        assert!(is_lock_error(msg));
+        assert_eq!(lock_holder_pid(msg), Some(4242));
+        assert_eq!(lock_holder_pid("no pid here"), None);
+        assert!(!is_lock_error("disk full"));
+    }
+
+    #[test]
+    fn ages_are_short_and_human() {
+        assert_eq!(human_age(5), "5s");
+        assert_eq!(human_age(600), "10m");
+        assert_eq!(human_age(7200), "2h");
+        assert_eq!(human_age(3 * 86_400), "3d");
+    }
+
     use super::*;
 
     fn cfg_at(dir: &Path) -> ProjectConfig {

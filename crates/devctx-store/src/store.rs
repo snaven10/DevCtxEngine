@@ -91,6 +91,16 @@ impl Store {
         Ok(store)
     }
 
+    /// Open and immediately release the database file at `path`, to learn
+    /// whether another process holds it — without loading a model or touching
+    /// the schema. A file that does not exist yet is not a conflict.
+    pub fn check_unlocked(path: &Path) -> Result<()> {
+        if path.exists() {
+            drop(Connection::open(path)?);
+        }
+        Ok(())
+    }
+
     /// Open an in-memory store (for tests).
     pub fn open_in_memory(dim: usize) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
