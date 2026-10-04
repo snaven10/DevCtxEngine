@@ -58,9 +58,14 @@ const PROJ_COLS: &str = "name, path, config_path, db_path, embed_provider, embed
     file_count, symbol_count, chunk_count, registered_at, updated_at, active";
 
 impl Store {
-    /// Insert or replace a project (by name).
+    /// Insert or replace a project (by name), as one transaction with both
+    /// statements gated — see [`Store::upsert_memory`] for why.
     pub fn upsert_project(&self, p: &ProjectRecord) -> Result<()> {
-        self.conn
+        self.in_transaction(|| self.upsert_project_inner(p))
+    }
+
+    fn upsert_project_inner(&self, p: &ProjectRecord) -> Result<()> {
+        self.w()?
             .execute("DELETE FROM projects WHERE name = ?", params![p.name])?;
         self.w()?.execute(
             &format!(
@@ -140,7 +145,7 @@ impl Store {
     /// Permanently remove a project row. Returns whether a row was deleted.
     pub fn delete_project(&self, name: &str) -> Result<bool> {
         let n = self
-            .conn
+            .w()?
             .execute("DELETE FROM projects WHERE name = ?", params![name])?;
         Ok(n > 0)
     }
@@ -242,6 +247,29 @@ mod tests {
     /// and `WHERE active = true` returning nothing while the rows sat there —
     /// which emptied `projects list` and made every `record_index` a silent
     /// no-op. Re-adding one would bring all of that back.
+    /// Same contract as a memory revision: a frozen store refuses the replace
+    /// whole and keeps the registry row it was replacing.
+    #[test]
+    fn a_frozen_store_refuses_a_project_replace_without_losing_the_row() {
+        let store = Store::open_in_memory(4).unwrap();
+        let original = proj("alpha", "/repos/alpha");
+        store.upsert_project(&original).unwrap();
+        assert!(store.freeze(std::time::Duration::from_secs(1)));
+
+        let mut moved = original.clone();
+        moved.path = "/repos/elsewhere".into();
+        assert!(matches!(
+            store.upsert_project(&moved),
+            Err(crate::StoreError::Frozen)
+        ));
+        assert!(matches!(
+            store.delete_project("alpha"),
+            Err(crate::StoreError::Frozen)
+        ));
+        let kept = store.get_project("alpha").unwrap().expect("row kept");
+        assert_eq!(kept.path, "/repos/alpha");
+    }
+
     #[test]
     fn the_projects_table_carries_no_index() {
         let store = Store::open_in_memory(4).unwrap();
