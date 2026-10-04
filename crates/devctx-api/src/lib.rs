@@ -5,7 +5,8 @@
 //! `/health`. See `docs/architecture-spec.md`.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, Request, State};
@@ -121,12 +122,17 @@ pub async fn serve_with(
 ) -> anyhow::Result<()> {
     let on_exit: ExitHook = Arc::new(on_exit);
     let state = Arc::new(AppState::build(cfg)?);
+    let life = Arc::new(Lifecycle::default());
     let activity = Arc::new(Mutex::new(Instant::now()));
     let app = router(Api {
         state: state.clone(),
         token,
     })
-    .layer(middleware::from_fn_with_state(activity.clone(), track));
+    .layer(middleware::from_fn_with_state(activity.clone(), track))
+    .layer(middleware::from_fn_with_state(
+        life.clone(),
+        count_in_flight,
+    ));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?;
@@ -134,8 +140,17 @@ pub async fn serve_with(
     eprintln!("DevCtxEngine API listening on http://{addr}");
 
     if let Some(timeout) = idle {
-        spawn_idle_watchdog(timeout, activity.clone(), state.clone(), on_exit.clone());
+        spawn_idle_watchdog(
+            timeout,
+            activity.clone(),
+            state.clone(),
+            life.clone(),
+            on_exit.clone(),
+        );
     }
+    // Independent of `--idle`: a server whose project was deleted serves
+    // nothing anyone can reach again, idle window or not.
+    spawn_vanish_watchdog(state.clone(), life.clone(), on_exit.clone());
 
     // Staying warm for the next command is the point of the server; holding a
     // cross-encoder the whole time is not. See `AppState::release_idle_models`.
@@ -163,23 +178,32 @@ pub async fn serve_with(
 
     // `devctx serve --stop` sends a plain TERM, whose default action is just as
     // abrupt as `exit`. Catching it buys the one thing that matters: a
-    // checkpoint before the connection disappears.
-    //
-    // Graceful shutdown waits for every open connection, and a request stuck in
-    // a blocking task (an `/index` whose model download went quiet) never ends:
-    // so a plain TERM was caught, logged, and then ignored for as long as the
-    // process lived. The watchdog is a plain thread, armed *now*, that finishes
-    // the job if the orderly path has not.
+    // checkpoint before the connection disappears. See [`Lifecycle`] for the
+    // whole timeline.
     let closing = state.clone();
     let hook = on_exit.clone();
+    let stopping = life.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = terminate().await;
             eprintln!("DevCtxEngine server terminating; checkpointing.");
-            arm_exit_watchdog(closing, hook);
+            stopping.mark_stop_requested();
+            // An `/index` in flight stops at its next file, commits, folds its
+            // WAL and answers — which is what lets graceful shutdown finish.
+            closing.cancel_indexing();
+            arm_exit_watchdog(closing, stopping, hook);
         })
         .await?;
-    state.checkpoint();
+
+    // A request whose client went away keeps running on the blocking pool:
+    // give a cancelled index the same bounded wait the watchdog gives it, so
+    // the final checkpoint does not abort its last file.
+    while life.within_hard_cap() && state.index_winding_down(INDEX_CANCEL_QUIET) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    life.final_checkpoint.store(CKPT_RUNNING, Ordering::SeqCst);
+    state.checkpoint_for_exit();
+    life.final_checkpoint.store(CKPT_DONE, Ordering::SeqCst);
     Ok(())
 }
 
@@ -188,14 +212,104 @@ pub async fn serve_with(
 type ExitHook = Arc<dyn Fn() + Send + Sync>;
 
 /// How long a stop request has to complete in an orderly way before the
-/// watchdog ends the process. `DEVCTX_SHUTDOWN_GRACE_SECS` overrides it.
-const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 5;
+/// watchdog may end the process. `DEVCTX_SHUTDOWN_GRACE_SECS` overrides it.
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 3;
 
-/// How long the final checkpoint may take before the process leaves without it.
-const CHECKPOINT_BUDGET: Duration = Duration::from_secs(2);
+/// How long the exit checkpoint may take before the process leaves without it.
+const CHECKPOINT_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The longest a stop request waits for a cancelled indexing run (or the final
+/// checkpoint) that is still making progress. `devctx serve --stop` waits this
+/// long, plus a margin, before escalating to SIGKILL when the server reports
+/// an index in flight.
+pub const INDEX_CANCEL_CAP: Duration = Duration::from_secs(60);
+
+/// A cancelled run that has not reported progress for this long is not
+/// winding down, it is stuck. Comfortably above the pipeline's heartbeat (5 s).
+const INDEX_CANCEL_QUIET: Duration = Duration::from_secs(15);
 
 /// How long the runtime may take to wind down its blocking pool on the way out.
 const RUNTIME_WIND_DOWN: Duration = Duration::from_secs(5);
+
+/// How often the vanished-project check runs. `DEVCTX_VANISH_POLL_MS`
+/// overrides it (the tests use a fraction of a second).
+const DEFAULT_VANISH_POLL: Duration = Duration::from_secs(10);
+
+// `Lifecycle::final_checkpoint`: 0 (the default) is "not started".
+const CKPT_RUNNING: u8 = 1;
+const CKPT_DONE: u8 = 2;
+
+/// Where the server is in its shutdown, shared by the orderly path and the
+/// watchdog threads.
+///
+/// The timeline of a stop request (`SIGTERM`, `devctx serve --stop`):
+///
+/// * **t = 0** — stop accepting connections, raise the indexing cancel flag,
+///   arm the stop watchdog. An `/index` in flight stops at its next file
+///   boundary, commits, checkpoints and answers; graceful shutdown then sees
+///   no connection left, and the orderly path takes the final checkpoint and
+///   returns.
+/// * **t = grace (3 s)** — if the process is still here, the watchdog looks at
+///   why. The final checkpoint is running → wait for it. A cancelled index is
+///   still reporting progress (within 15 s: finishing a file, folding its
+///   WAL) → wait for it. Otherwise (a request stuck on the network, a run that
+///   stopped moving) → exit now: checkpoint within 1.5 s, escalating to
+///   `FORCE CHECKPOINT` if a transaction blocks it, then `_exit`.
+/// * **t = 60 s** ([`INDEX_CANCEL_CAP`]) — exit now regardless.
+///
+/// `serve --stop` waits 5 s before SIGKILL — above grace + checkpoint budget
+/// (4.5 s) — and `INDEX_CANCEL_CAP` + 5 s when the server says an index is in
+/// flight, so the signal never lands in the middle of the checkpoint it is
+/// waiting for.
+#[derive(Default)]
+struct Lifecycle {
+    /// Non-health requests being served right now.
+    in_flight: AtomicUsize,
+    /// When the stop request arrived.
+    stop_requested: OnceLock<Instant>,
+    /// `CKPT_*`: the orderly path's final checkpoint.
+    final_checkpoint: AtomicU8,
+    /// Set by the first thread to start ending the process.
+    exiting: AtomicBool,
+}
+
+impl Lifecycle {
+    fn mark_stop_requested(&self) {
+        let _ = self.stop_requested.set(Instant::now());
+    }
+
+    fn stopping(&self) -> bool {
+        self.stop_requested.get().is_some()
+    }
+
+    fn since_stop(&self) -> Duration {
+        self.stop_requested
+            .get()
+            .map(Instant::elapsed)
+            .unwrap_or_default()
+    }
+
+    fn within_hard_cap(&self) -> bool {
+        self.since_stop() < INDEX_CANCEL_CAP
+    }
+}
+
+/// Middleware: count the non-health requests in flight (the vanished-project
+/// check does not end a server that is answering someone).
+async fn count_in_flight(State(life): State<Arc<Lifecycle>>, req: Request, next: Next) -> Response {
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    struct Guard(Arc<Lifecycle>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    life.in_flight.fetch_add(1, Ordering::SeqCst);
+    let _guard = Guard(life.clone());
+    next.run(req).await
+}
 
 fn shutdown_grace() -> Duration {
     let secs: u64 = std::env::var("DEVCTX_SHUTDOWN_GRACE_SECS")
@@ -205,39 +319,115 @@ fn shutdown_grace() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn vanish_poll() -> Duration {
+    std::env::var("DEVCTX_VANISH_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_VANISH_POLL)
+}
+
+/// End the process without running C++ static destructors.
+///
+/// `exit` runs `atexit` handlers and static destructors, DuckDB's among them,
+/// while other threads (an indexing run, the blocking pool) may still be inside
+/// DuckDB — the suspected source of the exit-time segfaults (status 139). Every
+/// caller has already checkpointed, and nothing else needs flushing but stdout.
+fn hard_exit(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(unix)]
+    // SAFETY: `_exit` takes an integer and never returns; it touches no Rust
+    // state, which is the point.
+    unsafe {
+        libc::_exit(code)
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code)
+}
+
 /// Fold the write-ahead log, undo the advertisement and end the process.
 ///
 /// The checkpoint runs on its own thread with a budget: this is the path taken
 /// when something is already wrong, and a checkpoint that blocks would turn a
-/// watchdog into one more thing that hangs. `exit` runs no destructors, which
-/// is why the checkpoint is explicit.
-fn exit_now(state: &Arc<AppState>, on_exit: &ExitHook, code: i32) -> ! {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let s = state.clone();
-    let _ = std::thread::Builder::new()
-        .name("exit-checkpoint".into())
-        .spawn(move || {
-            s.checkpoint();
-            let _ = tx.send(());
-        });
-    let _ = rx.recv_timeout(CHECKPOINT_BUDGET);
+/// watchdog into one more thing that hangs. It escalates to `FORCE CHECKPOINT`
+/// when an open transaction (an indexing run mid-file) refuses the plain one —
+/// see [`AppState::checkpoint_for_exit`]. Skipped when the orderly path already
+/// took the final checkpoint.
+fn exit_now(state: &Arc<AppState>, life: &Lifecycle, on_exit: &ExitHook, code: i32) -> ! {
+    if life.exiting.swap(true, Ordering::SeqCst) {
+        // Another watchdog is already ending the process.
+        loop {
+            std::thread::park();
+        }
+    }
+    state.cancel_indexing();
+    if life.final_checkpoint.load(Ordering::SeqCst) != CKPT_DONE {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = state.clone();
+        let _ = std::thread::Builder::new()
+            .name("exit-checkpoint".into())
+            .spawn(move || {
+                let folded = s.checkpoint_for_exit();
+                let _ = tx.send(folded);
+            });
+        if rx.recv_timeout(CHECKPOINT_BUDGET).is_err() {
+            eprintln!(
+                "DevCtxEngine: the exit checkpoint did not finish within {:?}; leaving without it",
+                CHECKPOINT_BUDGET
+            );
+        }
+    }
     on_exit();
-    std::process::exit(code)
+    hard_exit(code)
 }
 
-/// After a stop request, end the process if the orderly shutdown has not.
-fn arm_exit_watchdog(state: Arc<AppState>, on_exit: ExitHook) {
+/// After a stop request, end the process if the orderly shutdown has not —
+/// following the timeline on [`Lifecycle`].
+fn arm_exit_watchdog(state: Arc<AppState>, life: Arc<Lifecycle>, on_exit: ExitHook) {
     let grace = shutdown_grace();
     let _ = std::thread::Builder::new()
         .name("stop-watchdog".into())
         .spawn(move || {
-            std::thread::sleep(grace);
-            eprintln!(
-                "DevCtxEngine server did not stop within {}s of the request \
-                 (a blocking task is stuck); forcing exit.",
-                grace.as_secs()
-            );
-            exit_now(&state, &on_exit, 0);
+            let mut said_waiting = false;
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                let elapsed = life.since_stop();
+                if elapsed < grace {
+                    continue;
+                }
+                match life.final_checkpoint.load(Ordering::SeqCst) {
+                    // Checkpointed, and only the runtime's wind-down is left:
+                    // nothing to save, just leave.
+                    CKPT_DONE => {
+                        on_exit();
+                        hard_exit(0);
+                    }
+                    // Never cut the final checkpoint short: that is the exact
+                    // WAL this whole shutdown exists to fold.
+                    CKPT_RUNNING if elapsed < INDEX_CANCEL_CAP => continue,
+                    _ => {}
+                }
+                if elapsed < INDEX_CANCEL_CAP && state.index_winding_down(INDEX_CANCEL_QUIET) {
+                    if !said_waiting {
+                        eprintln!(
+                            "DevCtxEngine: waiting for the cancelled index to commit and \
+                             checkpoint (at most {}s after the stop request).",
+                            INDEX_CANCEL_CAP.as_secs()
+                        );
+                        said_waiting = true;
+                    }
+                    continue;
+                }
+                eprintln!(
+                    "DevCtxEngine server did not stop within {:.1}s of the request \
+                     (a blocking task is stuck); forcing exit.",
+                    elapsed.as_secs_f32()
+                );
+                exit_now(&state, &life, &on_exit, 0);
+            }
         });
 }
 
@@ -250,6 +440,7 @@ fn spawn_idle_watchdog(
     timeout: Duration,
     act: Arc<Mutex<Instant>>,
     state: Arc<AppState>,
+    life: Arc<Lifecycle>,
     on_exit: ExitHook,
 ) {
     // Polling every 30 s is plenty for a window of minutes; a short window (the
@@ -259,6 +450,10 @@ fn spawn_idle_watchdog(
         .name("idle-watchdog".into())
         .spawn(move || loop {
             std::thread::sleep(poll);
+            // A stop is under way: its own watchdog owns the exit.
+            if life.stopping() {
+                return;
+            }
             // A poisoned lock means a thread panicked holding it, not that a
             // request just arrived. Reading that as `unwrap_or_default()` —
             // `Duration::ZERO`, i.e. "busy right now" — silenced this timer
@@ -271,10 +466,6 @@ fn spawn_idle_watchdog(
                 Ok(t) => t.elapsed(),
                 Err(poisoned) => poisoned.into_inner().elapsed(),
             };
-            if state.project_vanished() {
-                eprintln!("DevCtxEngine project directory is gone; shutting down.");
-                exit_now(&state, &on_exit, 0);
-            }
             if idle_for < timeout {
                 continue;
             }
@@ -289,7 +480,33 @@ fn spawn_idle_watchdog(
                 continue;
             }
             eprintln!("DevCtxEngine server idle for {idle_for:?}; shutting down.");
-            exit_now(&state, &on_exit, 0);
+            exit_now(&state, &life, &on_exit, 0);
+        });
+}
+
+/// Exit once the project directory is really gone.
+///
+/// [`AppState::project_vanished`] only answers yes after repeated, definite
+/// "not found" results; on top of that the exit waits for requests and an
+/// advancing index to finish — a server mid-answer is not abandoned on a
+/// filesystem's say-so.
+fn spawn_vanish_watchdog(state: Arc<AppState>, life: Arc<Lifecycle>, on_exit: ExitHook) {
+    let poll = vanish_poll();
+    let _ = std::thread::Builder::new()
+        .name("vanish-watchdog".into())
+        .spawn(move || loop {
+            std::thread::sleep(poll);
+            if life.stopping() {
+                return;
+            }
+            if !state.project_vanished() {
+                continue;
+            }
+            if life.in_flight.load(Ordering::SeqCst) > 0 || state.is_indexing() {
+                continue;
+            }
+            eprintln!("DevCtxEngine project directory is gone; shutting down.");
+            exit_now(&state, &life, &on_exit, 0);
         });
 }
 

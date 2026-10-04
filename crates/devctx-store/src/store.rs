@@ -69,6 +69,9 @@ pub struct Store {
     /// larger slice than the vector scan it exists to speed up. Invalidated
     /// whenever the index is created or dropped.
     metric_cache: std::sync::Mutex<Option<Option<String>>>,
+    /// Shared by every connection cloned from the same open (see
+    /// [`instance_id`](Self::instance_id)).
+    instance: std::sync::Arc<()>,
 }
 
 impl Store {
@@ -84,6 +87,7 @@ impl Store {
             conn,
             dim,
             metric_cache: std::sync::Mutex::new(None),
+            instance: std::sync::Arc::new(()),
         };
         store.apply_resource_limits(); // before any query can allocate against the defaults
         schema::init_schema(&store.conn, dim)?;
@@ -108,11 +112,20 @@ impl Store {
             conn,
             dim,
             metric_cache: std::sync::Mutex::new(None),
+            instance: std::sync::Arc::new(()),
         };
         store.apply_resource_limits();
         schema::init_schema(&store.conn, dim)?;
         store.load_extensions();
         Ok(store)
+    }
+
+    /// Identifies the in-process database behind this connection: equal for a
+    /// store and every [`try_clone`](Self::try_clone) of it, different for any
+    /// other open (including another in-memory store). Stable while any of
+    /// those connections lives.
+    pub fn instance_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.instance) as usize
     }
 
     /// The store's fixed vector dimension.
@@ -160,6 +173,7 @@ impl Store {
             conn,
             dim: self.dim,
             metric_cache: std::sync::Mutex::new(None),
+            instance: self.instance.clone(),
         };
         store.load_extensions();
         Ok(store)
@@ -358,7 +372,31 @@ impl Store {
     /// Best-effort: a checkpoint can legitimately fail while another connection
     /// has an open transaction, and that is not worth failing a run over.
     pub fn checkpoint(&self) {
-        let _ = self.conn.execute_batch("CHECKPOINT;");
+        let _ = self.try_checkpoint();
+    }
+
+    /// [`checkpoint`](Self::checkpoint), reporting whether it happened.
+    ///
+    /// A plain `CHECKPOINT` refuses to run while another connection to the same
+    /// database has a write transaction open — exactly the situation on the way
+    /// out of a server whose indexing run is mid-file. Callers that are about
+    /// to end the process need to know, so they can escalate to
+    /// [`force_checkpoint`](Self::force_checkpoint).
+    pub fn try_checkpoint(&self) -> Result<()> {
+        self.conn.execute_batch("CHECKPOINT;")?;
+        Ok(())
+    }
+
+    /// Fold the WAL even if other connections have transactions open, aborting
+    /// them (DuckDB's `FORCE CHECKPOINT`).
+    ///
+    /// Only for the last moments of a process: whatever those transactions were
+    /// doing is lost — which it would be anyway once the process exits — but the
+    /// rows already committed are folded into the file instead of being left in
+    /// a WAL whose replay breaks the ART indexes (see `checkpoint`).
+    pub fn force_checkpoint(&self) -> Result<()> {
+        self.conn.execute_batch("FORCE CHECKPOINT;")?;
+        Ok(())
     }
 
     /// How many times bigger the database file is than the rows it holds, or
@@ -881,6 +919,77 @@ mod tests {
         // parameter, so nothing that could close the quote may pass.
         assert!(!is_size_literal("2GB'; DROP TABLE vectors; --"));
         assert!(!is_size_literal("2 GB"));
+    }
+
+    /// PLAN-008 TASK-009 fixup D1: the exit path checkpoints from a different
+    /// connection than the one an indexing run writes through. A plain
+    /// `CHECKPOINT` is refused while that run has a write transaction open —
+    /// and the process then exited with the WAL unfolded. The forced variant
+    /// must fold it regardless.
+    #[test]
+    fn a_forced_checkpoint_folds_the_wal_past_an_open_write_transaction() {
+        let dir = std::env::temp_dir().join(format!("devctx_force_ckpt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.duckdb");
+        let wal = dir.join("index.duckdb.wal");
+        let store = Store::open(&path, 4).unwrap();
+        store
+            .set_index_meta("/r", "main", "k", "committed")
+            .unwrap();
+        let other = store.try_clone().unwrap();
+        other.conn.execute_batch("BEGIN TRANSACTION").unwrap();
+        other
+            .set_index_meta("/r", "main", "k2", "in flight")
+            .unwrap();
+        assert!(
+            std::fs::metadata(&wal)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false),
+            "the committed write should sit in the WAL"
+        );
+        // Measured on the bundled DuckDB: a plain CHECKPOINT is *not* refused
+        // by an open transaction whose writes are still transaction-local; it
+        // folds what is committed. Whatever it does, it must not claim success
+        // and leave the WAL behind.
+        let plain = store.try_checkpoint();
+        let wal_after_plain = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            plain.is_err() || wal_after_plain == 0,
+            "a CHECKPOINT that reports success must have folded the WAL ({wal_after_plain} bytes left)"
+        );
+        // Another committed write, with the transaction still open: the forced
+        // variant the exit path escalates to must fold it too.
+        store
+            .set_index_meta("/r", "main", "k3", "committed later")
+            .unwrap();
+        store.force_checkpoint().expect("FORCE CHECKPOINT");
+        assert!(
+            std::fs::metadata(&wal)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true),
+            "the WAL must be folded after a forced checkpoint"
+        );
+        drop(other);
+        drop(store);
+        let reopened = Store::open(&path, 4).unwrap();
+        assert_eq!(
+            reopened
+                .get_index_meta("/r", "main", "k")
+                .unwrap()
+                .as_deref(),
+            Some("committed")
+        );
+        assert_eq!(
+            reopened
+                .get_index_meta("/r", "main", "k3")
+                .unwrap()
+                .as_deref(),
+            Some("committed later")
+        );
+        assert_eq!(reopened.get_index_meta("/r", "main", "k2").unwrap(), None);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

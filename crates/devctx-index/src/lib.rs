@@ -16,7 +16,9 @@ pub use devctx_parse::extractor_fingerprint;
 pub use error::{IndexError, Result};
 pub use git::{Change, GitRepo, GitState};
 pub use id::chunk_id;
-pub use pipeline::{run, IndexRequest, IndexResult, ProgressSink};
+pub use pipeline::{
+    run, IndexRequest, IndexResult, ProgressSink, PENDING_FTS_META_KEY, PENDING_HNSW_META_KEY,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1018,6 +1020,187 @@ mod tests {
         let r = index_excluding(&store, &dir, &["[".to_string()]);
         assert_eq!(r.files_indexed, 1, "a bad pattern must not stop indexing");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sink that cancels once `after` files have been started, and records
+    /// the phases it was told about.
+    struct CancelAfter {
+        after: usize,
+        seen: std::sync::atomic::AtomicUsize,
+        phases: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CancelAfter {
+        fn new(after: usize) -> Self {
+            Self {
+                after,
+                seen: std::sync::atomic::AtomicUsize::new(0),
+                phases: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn phases(&self) -> Vec<String> {
+            self.phases.lock().unwrap().clone()
+        }
+    }
+
+    impl ProgressSink for CancelAfter {
+        fn start(&self, _total: usize) {}
+        fn file(&self, _path: &str) {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn phase(&self, name: &str) {
+            self.phases.lock().unwrap().push(name.to_string());
+        }
+        fn cancelled(&self) -> bool {
+            self.seen.load(std::sync::atomic::Ordering::SeqCst) >= self.after
+        }
+    }
+
+    fn run_with(store: &Store, root: &Path, full: bool, sink: &dyn ProgressSink) -> IndexResult {
+        run(IndexRequest {
+            store,
+            embedder: &FakeEmbedder,
+            repo_root: root,
+            incremental: !full,
+            model_name: "minilm-l6",
+            progress: Some(sink),
+            paths: None,
+            exclude: &[],
+            branch: None,
+        })
+        .unwrap()
+    }
+
+    fn five_file_repo(tag: &str) -> PathBuf {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_cancel_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for i in 0..5 {
+            write(
+                &dir,
+                &format!("m{i}.py"),
+                &format!("def f{i}():\n    return {i}\n"),
+            );
+        }
+        commit_all(&dir, "five");
+        dir
+    }
+
+    /// PLAN-008 TASK-009 fixup D1: a server asked to stop cancels its index at
+    /// the next file boundary instead of being cut mid-run. The cancelled run
+    /// must not prune what it did not reach, nor advance the index record — the
+    /// next run starts over from the same commit and finishes the job.
+    #[test]
+    fn a_cancelled_run_stops_between_files_and_leaves_the_record_alone() {
+        let dir = five_file_repo("stop");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let first = index(&store, &dir);
+        assert_eq!(first.files_indexed, 5);
+        let repo_path = GitRepo::open(&dir)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .to_string();
+        let before = store.get_index_record(&repo_path, "main").unwrap().unwrap();
+
+        for i in 0..5 {
+            write(
+                &dir,
+                &format!("m{i}.py"),
+                &format!("def g{i}():\n    return {i}0\n"),
+            );
+        }
+        commit_all(&dir, "touch all");
+
+        let sink = CancelAfter::new(2);
+        let cut = run_with(&store, &dir, false, &sink);
+        assert!(cut.cancelled, "the run must report that it was cancelled");
+        assert_eq!(cut.files_indexed, 2, "it stops at the file boundary");
+        assert!(
+            sink.phases().iter().any(|p| p == "checkpoint"),
+            "a cancelled run still folds the WAL: {:?}",
+            sink.phases()
+        );
+        let after = store.get_index_record(&repo_path, "main").unwrap().unwrap();
+        assert_eq!(
+            after.last_commit, before.last_commit,
+            "a partial run must not claim the new commit"
+        );
+        assert_eq!(files_on(&store, "main").len(), 5, "nothing pruned");
+
+        let rest = index(&store, &dir);
+        assert!(!rest.cancelled);
+        assert_eq!(rest.files_indexed, 3, "the next run finishes the job");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full run that is cancelled must not prune the files it never reached.
+    #[test]
+    fn a_cancelled_full_run_prunes_nothing() {
+        let dir = five_file_repo("full");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index(&store, &dir);
+        let sink = CancelAfter::new(1);
+        let cut = run_with(&store, &dir, true, &sink);
+        assert!(cut.cancelled);
+        assert_eq!(cut.files_pruned, 0);
+        assert_eq!(files_on(&store, "main").len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The phases after the file loop report themselves, so a watcher measuring
+    /// "time since the run last moved" does not read them as a stuck run.
+    #[test]
+    fn the_phases_after_the_file_loop_report_progress() {
+        let dir = five_file_repo("phases");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index(&store, &dir);
+        std::fs::remove_file(dir.join("m4.py")).unwrap();
+        commit_all(&dir, "drop one");
+        // A full run over an index holding a file git no longer lists prunes it.
+        let sink = CancelAfter::new(usize::MAX);
+        let r = run_with(&store, &dir, true, &sink);
+        assert!(!r.cancelled);
+        assert_eq!(r.files_pruned, 1);
+        let phases = sink.phases();
+        assert!(phases.iter().any(|p| p == "prune"), "{phases:?}");
+        assert!(phases.iter().any(|p| p == "checkpoint"), "{phases:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dropped derived index is noted before the drop and the note survives a
+    /// cancelled run; the next complete run rebuilds it and clears the note.
+    #[test]
+    fn a_dropped_derived_index_is_owed_to_the_next_run() {
+        let dir = five_file_repo("pending");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index(&store, &dir);
+        // As if an earlier run had dropped the BM25 index and died.
+        store
+            .set_index_meta("", "", PENDING_FTS_META_KEY, "1")
+            .unwrap();
+        let cut = run_with(&store, &dir, true, &CancelAfter::new(0));
+        assert!(cut.cancelled);
+        assert!(
+            store
+                .get_index_meta("", "", PENDING_FTS_META_KEY)
+                .unwrap()
+                .is_some(),
+            "a cancelled run keeps the index owed"
+        );
+        let done = index(&store, &dir);
+        assert!(!done.cancelled);
+        assert!(
+            store
+                .get_index_meta("", "", PENDING_FTS_META_KEY)
+                .unwrap()
+                .is_none(),
+            "a complete run settles what was owed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -464,8 +464,48 @@ fn owns_server(cfg: &ProjectConfig, info: &ServeInfo) -> bool {
 }
 
 /// How long a server gets to exit on SIGTERM, and then on SIGKILL.
+///
+/// Above the server's own stop timeline (grace 3 s + exit checkpoint budget
+/// 1.5 s, see `devctx_api::Lifecycle`), so SIGKILL never lands in the middle of
+/// the checkpoint the stop is waiting for.
 const TERM_WAIT: Duration = Duration::from_secs(5);
 const KILL_WAIT: Duration = Duration::from_secs(3);
+
+/// SIGTERM wait for a server that reports an indexing run in flight: it
+/// cancels the run at the next file, commits and checkpoints, and may take up
+/// to [`devctx_api::INDEX_CANCEL_CAP`] doing so. Killing it sooner is what left
+/// unfolded WALs behind.
+const INDEX_TERM_WAIT: Duration = Duration::from_secs(devctx_api::INDEX_CANCEL_CAP.as_secs() + 5);
+
+/// Whether the advertised server says an indexing run is in flight. A quick,
+/// best-effort question: no answer means "no", and the normal wait applies.
+fn indexing_in_flight(info: &ServeInfo) -> bool {
+    let mut req = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .get(&format!("http://{}/index/progress", info.addr));
+    if let Some(t) = &info.token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    req.call()
+        .ok()
+        .and_then(|r| r.into_json::<IndexProgress>().ok())
+        .is_some_and(|p| p.running)
+}
+
+/// The SIGTERM wait for this server: longer when it is indexing.
+fn term_wait_for(info: &ServeInfo, term: Duration) -> Duration {
+    if indexing_in_flight(info) {
+        eprintln!(
+            "· the server is indexing; waiting up to {}s for it to stop at the next file \
+             and checkpoint",
+            INDEX_TERM_WAIT.as_secs()
+        );
+        term.max(INDEX_TERM_WAIT)
+    } else {
+        term
+    }
+}
 
 /// Stop the advertised server and report whether it is gone. Never deletes
 /// the discovery file: that is only right once the process is gone.
@@ -501,6 +541,7 @@ fn reclaim_db_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> bool 
         Ownership::Ours => {
             // The file goes only with the process: dropping it while the server
             // lives leaves it unadvertised and holding the lock.
+            let term = term_wait_for(&info, term);
             if terminate_ours(cfg, &info, term, kill) {
                 remove_serve_file(cfg);
                 true
@@ -542,6 +583,7 @@ fn stop_server_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> Resu
             // the database, and then waits out the full auto-spawn poll — a
             // measured 61 seconds — before giving up and falling back to a local
             // open.
+            let term = term_wait_for(&info, term);
             if !terminate_ours(cfg, &info, term, kill) {
                 anyhow::bail!(
                     "server {pid} survived SIGTERM and SIGKILL; keeping {} so it stays discoverable",

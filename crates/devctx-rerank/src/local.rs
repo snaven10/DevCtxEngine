@@ -110,6 +110,12 @@ fn init_on<T>(
                 eprintln!("devctx: reranking requested CUDA (device: cuda)");
                 match init(providers) {
                     Ok(model) => return Ok((model, true)),
+                    // A stalled download is not a CUDA problem, and retrying
+                    // on CPU would only queue behind the stuck loader's lock
+                    // (see `devctx_core::modelload`): report it as it is.
+                    Err(e) if devctx_core::modelload::is_stall_error(&e.to_string()) => {
+                        return Err(e)
+                    }
                     Err(e) => eprintln!(
                         "devctx: warning: CUDA failed for reranking ({e}); falling back to CPU. \
                          Check the NVIDIA driver, CUDA 12 toolkit and cuDNN 9."

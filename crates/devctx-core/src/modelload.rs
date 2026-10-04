@@ -13,9 +13,18 @@
 //! error and the stuck thread is abandoned (it dies with the process). This is
 //! progress-based, not a wall-clock cap, so a slow-but-moving download over a
 //! poor link is never cut off.
+//!
+//! An abandoned loader keeps whatever it holds — in particular hf-hub's
+//! exclusive `flock` on the model's cache entry. A second attempt in the same
+//! process cannot take that lock (hf-hub tries `LOCK_NB` five times a second
+//! apart and fails with `LockAcquisition`), and would leave one more stuck
+//! thread behind. So a stall **poisons** the model for the rest of the process:
+//! every later load of it fails at once with the same instruction — restart the
+//! server — instead of a confusing lock error after five seconds.
 
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Seconds without any growth of the model cache before a load is declared
@@ -31,6 +40,51 @@ pub fn stall_limit() -> Option<Duration> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_STALL_SECS);
     (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Marker present in every stall error, so callers can tell a stall from an
+/// ordinary load failure (and not, say, retry it on another device).
+pub const STALL_MARKER: &str = "model download stalled";
+
+/// Whether `message` is (or wraps) a stall reported by [`guard_load`].
+pub fn is_stall_error(message: &str) -> bool {
+    message.contains(STALL_MARKER)
+}
+
+/// Models whose load stalled in this process (see the module docs).
+static POISONED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn poisoned_lock() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+    POISONED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether a load of `what` already stalled in this process.
+pub fn is_poisoned(what: &str) -> bool {
+    poisoned_lock().as_ref().is_some_and(|s| s.contains(what))
+}
+
+fn poison(what: &str) {
+    poisoned_lock()
+        .get_or_insert_with(HashSet::new)
+        .insert(what.to_string());
+}
+
+fn poisoned_error(what: &str) -> String {
+    format!(
+        "{STALL_MARKER}: an earlier load of {what} in this process stopped receiving data and \
+         its download is still holding the model cache lock, so it cannot be retried here. \
+         Restart the server (`devctx serve --stop`; the next command starts a fresh one), or \
+         fetch the model with `devctx models --download`."
+    )
+}
+
+/// Fingerprint of the shared model cache (see [`fingerprint`]); `None` when no
+/// cache directory can be determined. Lets a caller tell a download that is
+/// moving from one that is not, e.g. to report progress while it waits.
+pub fn cache_fingerprint() -> Option<(u64, u64)> {
+    crate::dirs::model_cache_dir().map(|d| fingerprint(&d))
 }
 
 /// Total size and file count under `dir`, symlinks not followed. A cheap
@@ -62,6 +116,9 @@ pub fn guard_load<T: Send + 'static>(
     what: &str,
     load: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
+    if is_poisoned(what) {
+        return Err(poisoned_error(what));
+    }
     let Some(limit) = stall_limit() else {
         return Ok(load());
     };
@@ -90,10 +147,15 @@ pub fn guard_load<T: Send + 'static>(
             last = now;
             changed = Instant::now();
         } else if changed.elapsed() >= limit {
+            // The loader thread is abandoned with whatever it holds; see the
+            // module docs for why nothing in this process may try again.
+            poison(what);
             return Err(format!(
-                "loading {what} made no progress for {}s (no data arrived from the model host); \
-                 check the network, set HF_ENDPOINT to a reachable mirror, or fetch it with \
-                 `devctx models --download`. Raise {MODEL_STALL_ENV} if the link is that slow.",
+                "{STALL_MARKER}: loading {what} made no progress for {}s (no data arrived from \
+                 the model host); check the network, set HF_ENDPOINT to a reachable mirror, or \
+                 fetch it with `devctx models --download`. Raise {MODEL_STALL_ENV} if the link \
+                 is that slow. The stuck download keeps the model locked until this process \
+                 ends: restart the server (`devctx serve --stop`) before retrying.",
                 limit.as_secs()
             ));
         }
@@ -107,6 +169,40 @@ mod tests {
     #[test]
     fn a_load_that_finishes_returns_its_value() {
         assert_eq!(guard_load("m", || 7).unwrap(), 7);
+    }
+
+    /// Fixup D1 (item 5): once a load stalled, its thread still holds hf-hub's
+    /// lock, so the next attempt in the same process must fail at once with the
+    /// restart instruction — not run (and hang, or fail on the lock) again.
+    #[test]
+    fn a_stalled_load_poisons_the_model_for_the_process() {
+        std::env::set_var(MODEL_STALL_ENV, "1");
+        let key = format!("test-stall-{}", std::process::id());
+        let err = guard_load(&key, || std::thread::sleep(Duration::from_secs(30)))
+            .expect_err("a load that never finishes must stall");
+        assert!(is_stall_error(&err), "{err}");
+        assert!(err.contains("devctx serve --stop"), "{err}");
+        assert!(is_poisoned(&key));
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        let t0 = Instant::now();
+        let again = guard_load(&key, move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .expect_err("a poisoned model must not be loaded again");
+        assert!(is_stall_error(&again), "{again}");
+        assert!(again.contains("Restart the server"), "{again}");
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "it fails at once"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the loader must not run again"
+        );
+        // Other models are unaffected.
+        assert_eq!(guard_load("another-model", || 3).unwrap(), 3);
     }
 
     #[test]

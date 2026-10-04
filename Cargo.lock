@@ -1052,6 +1052,7 @@ dependencies = [
  "devctx-mcp",
  "devctx-memory",
  "devctx-store",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

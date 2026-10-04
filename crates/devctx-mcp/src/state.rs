@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -46,9 +46,13 @@ pub struct IndexProgress {
     pub done: usize,
     /// The file it reached last.
     pub file: String,
-    /// When the run last moved (started, or reached a file). `running` with an
-    /// old stamp is a run that is stuck, not one that is working.
+    /// When the run last moved (started, reached a file, or reported a phase
+    /// that is still working). `running` with an old stamp is a run that is
+    /// stuck, not one that is working.
     pub advanced: Option<Instant>,
+    /// What the run is doing when it is not on a file: `loading model`,
+    /// `files`, `prune`, `hnsw`, `fts`, `checkpoint`.
+    pub phase: String,
 }
 
 /// Writes an indexing run's progress where a request handler can read it.
@@ -61,16 +65,44 @@ pub struct IndexProgress {
 struct SharedProgress {
     shared: Arc<Mutex<IndexProgress>>,
     /// Whether this run is the one currently filling the slot. Decided at
-    /// [`ProgressSink::start`], since before diffing there is nothing to report.
+    /// [`SharedProgress::begin`] or [`ProgressSink::start`].
     owns: AtomicBool,
+    /// Set when the server is shutting down: the run stops at the next file.
+    cancel: Arc<AtomicBool>,
 }
 
 impl SharedProgress {
+    #[cfg(test)]
     fn new(shared: Arc<Mutex<IndexProgress>>) -> Self {
+        Self::with_cancel(shared, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_cancel(shared: Arc<Mutex<IndexProgress>>, cancel: Arc<AtomicBool>) -> Self {
         Self {
             shared,
             owns: AtomicBool::new(false),
+            cancel,
         }
+    }
+
+    /// Claim the slot before the run has anything to count: loading (perhaps
+    /// downloading) the model comes first and can take minutes, and a run that
+    /// only showed up once it had diffed was invisible — to a poller, and to
+    /// the idle watchdog, which then shut the server down under it.
+    fn begin(&self, phase: &str) {
+        let mut p = self.lock();
+        if p.running {
+            return;
+        }
+        self.owns.store(true, Ordering::SeqCst);
+        p.running = true;
+        p.run += 1;
+        p.total = 0;
+        p.done = 0;
+        p.file.clear();
+        p.phase.clear();
+        p.phase.push_str(phase);
+        p.advanced = Some(Instant::now());
     }
 
     /// A poisoned lock must never take an indexing run down with it: this is a
@@ -96,17 +128,35 @@ impl SharedProgress {
 
 impl ProgressSink for SharedProgress {
     fn start(&self, total: usize) {
-        let mut p = self.lock();
-        if p.running {
+        if self.owns.load(Ordering::SeqCst) {
+            // Claimed at `begin`; now the size of the run is known.
+            let mut p = self.lock();
+            p.total = total;
+            p.phase.clear();
+            p.phase.push_str("files");
+            p.advanced = Some(Instant::now());
             return;
         }
-        self.owns.store(true, Ordering::SeqCst);
-        p.running = true;
-        p.run += 1;
-        p.total = total;
-        p.done = 0;
-        p.file.clear();
+        self.begin("files");
+        if self.owns.load(Ordering::SeqCst) {
+            self.lock().total = total;
+        }
+    }
+
+    fn phase(&self, name: &str) {
+        if !self.owns.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut p = self.lock();
+        if p.phase != name {
+            p.phase.clear();
+            p.phase.push_str(name);
+        }
         p.advanced = Some(Instant::now());
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
     }
 
     fn file(&self, path: &str) {
@@ -189,6 +239,13 @@ pub struct AppState {
     reranker: Mutex<Option<Cached<Arc<dyn Reranker>>>>,
     /// How far the current indexing run has got, for `/index/progress`.
     index_progress: Arc<Mutex<IndexProgress>>,
+    /// Raised when the server is asked to stop: every indexing run in flight
+    /// (and any that starts afterwards) stops at its next file boundary,
+    /// commits, checkpoints and returns. See [`AppState::cancel_indexing`].
+    index_cancel: Arc<AtomicBool>,
+    /// Consecutive polls that found the project's `.devctx/` missing; see
+    /// [`AppState::project_vanished`].
+    vanish_strikes: AtomicU32,
 }
 
 impl AppState {
@@ -230,6 +287,8 @@ impl AppState {
             embedder: Mutex::new(None),
             reranker: Mutex::new(None),
             index_progress: Arc::new(Mutex::new(IndexProgress::default())),
+            index_cancel: Arc::new(AtomicBool::new(false)),
+            vanish_strikes: AtomicU32::new(0),
         })
     }
 
@@ -323,6 +382,54 @@ impl AppState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         store.checkpoint();
+    }
+
+    /// The checkpoint for a process that is about to end, whatever else is
+    /// running: a plain `CHECKPOINT` first, escalated to `FORCE CHECKPOINT`
+    /// (which aborts other connections' open transactions — they are about to
+    /// die with the process anyway) when the plain one is refused. Returns
+    /// whether the WAL was folded.
+    pub fn checkpoint_for_exit(&self) -> bool {
+        let store = self
+            .primary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match store.try_checkpoint() {
+            Ok(()) => true,
+            Err(plain) => match store.force_checkpoint() {
+                Ok(()) => true,
+                Err(forced) => {
+                    eprintln!(
+                        "DevCtxEngine: the exit checkpoint failed ({plain}; forced: {forced}); \
+                         the write-ahead log is left for the next open to replay"
+                    );
+                    false
+                }
+            },
+        }
+    }
+
+    /// Ask every indexing run to stop at its next file boundary (the server is
+    /// shutting down). Irreversible for this process: a run started afterwards
+    /// stops before its first file.
+    pub fn cancel_indexing(&self) {
+        self.index_cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether an indexing run is writing to the database and reported progress
+    /// within `quiet`. What the stop watchdog asks while a cancelled run winds
+    /// down: a run still moving is finishing its file or its checkpoint and
+    /// deserves the wait; one that is not is stuck.
+    ///
+    /// A run still loading its model does not count: it has written nothing,
+    /// it cannot be cancelled (the load is not ours to interrupt), and waiting
+    /// on it is waiting on the network.
+    pub fn index_winding_down(&self, quiet: Duration) -> bool {
+        let p = self
+            .index_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        p.running && p.phase != LOADING_MODEL && p.advanced.is_some_and(|at| at.elapsed() < quiet)
     }
 
     fn open_store(&self) -> Result<Store, String> {
@@ -817,6 +924,36 @@ pub fn do_index_paths(state: &AppState, paths: &[String]) -> Result<String, Stri
     do_index_inner(state, false, Some(paths), None)
 }
 
+/// Load the embedder, reporting progress whenever the model cache grows.
+///
+/// A model that has to be downloaded first can take minutes inside an
+/// `/index` request, and the run is real work all that time. Only *growth*
+/// counts: a download that stopped receiving data does not tick, so it loses
+/// the idle exemption like any other stuck run (and `guard_load` fails it).
+fn embedder_reporting(
+    state: &AppState,
+    sink: &SharedProgress,
+) -> Result<Arc<dyn EmbeddingProvider>, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let mut last = None;
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                rx.recv_timeout(Duration::from_secs(1))
+            {
+                let now = devctx_core::modelload::cache_fingerprint();
+                if last.is_some() && now != last {
+                    sink.phase(LOADING_MODEL);
+                }
+                last = now;
+            }
+        });
+        let out = state.embedder();
+        drop(tx);
+        out
+    })
+}
+
 fn do_index_inner(
     state: &AppState,
     full: bool,
@@ -824,8 +961,16 @@ fn do_index_inner(
     branch: Option<String>,
 ) -> Result<String, String> {
     let store = state.open_store()?;
-    let embedder = state.embedder()?;
-    let sink = SharedProgress::new(state.index_progress.clone());
+    let sink =
+        SharedProgress::with_cancel(state.index_progress.clone(), state.index_cancel.clone());
+    sink.begin(LOADING_MODEL);
+    let embedder = match embedder_reporting(state, &sink) {
+        Ok(e) => e,
+        Err(e) => {
+            sink.finish();
+            return Err(e);
+        }
+    };
     // Which branch this run is about. Declared config wins over what happens to
     // be checked out, so running `index` from a linked worktree keeps the
     // repository's trunk fresh instead of quietly indexing the worktree's
@@ -848,6 +993,19 @@ fn do_index_inner(
     // running, or the next poller waits on something that is already over.
     sink.finish();
     let res = run.map_err(|e| e.to_string())?;
+    if res.cancelled {
+        // The server is going away: say what happened and touch nothing else
+        // (pruning other branches is housekeeping, not something to start now).
+        return Ok(json!({
+            "cancelled": true,
+            "commit": res.commit,
+            "branch": res.branch,
+            "files_indexed": res.files_indexed,
+            "hint": "indexing was cancelled because the server is stopping; what was \
+                     indexed is saved, and the next `devctx index` resumes from the same commit",
+        })
+        .to_string());
+    }
 
     // Anything the config no longer declares is dropped now. Doing it here,
     // rather than in a command someone has to remember, is what keeps a branch
@@ -891,8 +1049,27 @@ impl AppState {
     /// Whether the project this server owns has been deleted from under it (its
     /// directory or its `.devctx/`). Such a server serves nothing anyone can
     /// reach again, and the test-suite leak of PLAN-008 B9 was exactly one.
+    ///
+    /// Only a definite "not found" counts, and only [`VANISH_STRIKES`] times in
+    /// a row: on WSL's `/mnt/c` (drvfs, 9p) a stat can fail transiently with
+    /// EIO or EACCES, and a directory can be missing for an instant during a
+    /// rename — reading either as "deleted" killed healthy servers. The caller
+    /// (the watchdog) additionally defers while requests or an index are in
+    /// flight.
     pub fn project_vanished(&self) -> bool {
-        !self.root.join(".devctx").is_dir()
+        if !dir_definitely_missing(&self.root.join(".devctx")) {
+            self.vanish_strikes.store(0, Ordering::SeqCst);
+            return false;
+        }
+        self.vanish_strikes.fetch_add(1, Ordering::SeqCst) + 1 >= VANISH_STRIKES
+    }
+
+    /// Whether an indexing run is in flight at all, advancing or not.
+    pub fn index_running(&self) -> bool {
+        self.index_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .running
     }
 
     /// Whether an indexing run is in flight right now.
@@ -913,6 +1090,20 @@ impl AppState {
         p.running
             && p.advanced
                 .is_none_or(|at| at.elapsed() < index_stall_limit())
+    }
+}
+
+/// The progress phase of a run that is still loading (or downloading) its model.
+const LOADING_MODEL: &str = "loading model";
+
+/// Consecutive "not found" polls before a project counts as deleted.
+pub const VANISH_STRIKES: u32 = 3;
+
+/// `path` is reported as not existing — not unreadable, not erroring.
+fn dir_definitely_missing(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(_) => false,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
 }
 
@@ -940,6 +1131,7 @@ pub fn do_index_progress(state: &AppState) -> Result<String, String> {
         "total": p.total,
         "done": p.done,
         "file": p.file,
+        "phase": p.phase,
     })
     .to_string())
 }
@@ -1977,12 +2169,6 @@ pub fn why_unbound(cwd: &std::path::Path, resolution: &Resolution) -> String {
     }
 }
 
-/// Search a *different* registered project.
-///
-/// Federating here is the right call, unlike for memory recall: the caller has
-/// named one project, so this wakes exactly one server rather than all of them.
-/// The project's own server owns its database and keeps its model warm, so the
-/// search runs where it is cheapest.
 /// Run `devctx <args>` inside a member's repository and return its output.
 ///
 /// Every fan-out re-enters this same binary with the member's directory as the
@@ -2263,10 +2449,30 @@ pub fn do_search_group(
     if !member_notes.is_empty() {
         out["member_notes"] = Value::Object(member_notes);
     }
-    if let Some(warning) = fan_out_warning(&failed, reachable)? {
+    if let Some(warning) = fan_out_warning(&failed, reachable)?
+        .or_else(|| all_missing_warning(reachable, skipped_missing.len(), "searched"))
+    {
         out["warning"] = json!(warning);
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// The fan-out had nobody to ask: every member's checkout is missing.
+///
+/// [`fan_out_warning`] only speaks about members that were tried and failed,
+/// and missing ones are deliberately not failures — so with *all* of them
+/// missing it stayed silent, and the answer (the shared tier alone, or
+/// nothing) read like a complete one. `None` when at least one member was
+/// present or none were missing.
+fn all_missing_warning(present: usize, missing: usize, verb: &str) -> Option<String> {
+    (present == 0 && missing > 0).then(|| {
+        format!(
+            "No repository of this group could be {verb}: all {missing} registered member(s) \
+             point at paths that no longer exist (see `skipped_missing`), so this answer \
+             contains nothing from the members' own stores. Re-register the moved checkouts \
+             (`devctx projects add <path>`) or remove the stale rows."
+        )
+    })
 }
 
 /// How a fan-out reports members it could not reach.
@@ -2465,12 +2671,21 @@ pub fn do_recall_group(
     // A scope without a local tier asked no member anything, so none can have
     // failed; the count only matters when members were actually queried.
     let queried = if want_local { reachable } else { 0 };
-    if let Some(warning) = fan_out_warning(&failed, queried)? {
+    let missing_asked = if want_local { skipped_missing.len() } else { 0 };
+    if let Some(warning) = fan_out_warning(&failed, queried)?
+        .or_else(|| all_missing_warning(queried, missing_asked, "queried"))
+    {
         out["warning"] = json!(warning);
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
+/// Search a *different* registered project.
+///
+/// Federating here is the right call, unlike for memory recall: the caller has
+/// named one project, so this wakes exactly one server rather than all of them.
+/// The project's own server owns its database and keeps its model warm, so the
+/// search runs where it is cheapest.
 pub fn do_search_project(
     project: &str,
     query: &str,
@@ -4144,6 +4359,17 @@ mod tests {
         assert!(fan_out_warning(&failed, 0).is_ok());
     }
 
+    /// TASK-008 fixup D1: every member missing on disk used to produce no
+    /// warning at all (missing is not "failed", and nothing was reachable).
+    #[test]
+    fn all_members_missing_is_said_out_loud() {
+        let w = super::all_missing_warning(0, 3, "queried").expect("must warn");
+        assert!(w.contains("all 3 registered member(s)"), "{w}");
+        assert!(w.contains("skipped_missing"), "{w}");
+        assert!(super::all_missing_warning(1, 3, "queried").is_none());
+        assert!(super::all_missing_warning(0, 0, "queried").is_none());
+    }
+
     use super::*;
     use devctx_core::{VectorMetadata, VectorPoint};
 
@@ -4392,6 +4618,140 @@ mod tests {
         assert_eq!(p.run, 2);
         assert_eq!(p.total, 788);
         assert_eq!(p.done, 0);
+    }
+
+    // --- PLAN-008 TASK-009 fixup D1: idle exemption, cancellation, vanishing ---
+
+    fn lifecycle_state(tag: &str) -> (AppState, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("devctx_mcp_life_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".devctx/state")).unwrap();
+        let mut cfg = ProjectConfig::default();
+        cfg.project.path = root.to_string_lossy().into_owned();
+        cfg.state_dir = root.join(".devctx/state").to_string_lossy().into_owned();
+        (AppState::build(cfg).unwrap(), root)
+    }
+
+    fn set_progress(state: &AppState, running: bool, advanced_ago: Duration) {
+        let mut p = state.index_progress.lock().unwrap();
+        p.running = running;
+        p.advanced = Instant::now().checked_sub(advanced_ago);
+    }
+
+    /// Item 7: the idle exemption is about *progress*. A run whose last sign of
+    /// life is older than the stall limit (900 s by default) is stuck and must
+    /// not hold the idle timer off; one that moved recently must.
+    #[test]
+    fn only_an_index_that_moved_recently_is_exempt_from_idle() {
+        let (state, root) = lifecycle_state("exempt");
+        assert!(!state.is_indexing(), "nothing running");
+
+        set_progress(&state, true, Duration::from_secs(5));
+        assert!(state.is_indexing(), "recent progress exempts the server");
+
+        set_progress(&state, true, Duration::from_secs(901));
+        assert!(
+            !state.is_indexing(),
+            "a run silent for longer than the stall limit is stuck"
+        );
+
+        set_progress(&state, false, Duration::from_secs(1));
+        assert!(!state.is_indexing(), "a finished run exempts nothing");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Item 6: phases after the file loop (prune, HNSW, FTS, checkpoint) and the
+    /// model load report themselves, which is what keeps the exemption alive
+    /// through them.
+    #[test]
+    fn a_phase_report_renews_the_exemption() {
+        let (state, root) = lifecycle_state("phase");
+        let sink =
+            SharedProgress::with_cancel(state.index_progress.clone(), state.index_cancel.clone());
+        sink.begin(LOADING_MODEL);
+        assert!(
+            state.is_indexing(),
+            "a run is visible before its model loads"
+        );
+        assert_eq!(state.index_progress.lock().unwrap().phase, "loading model");
+
+        sink.start(3);
+        {
+            let p = state.index_progress.lock().unwrap();
+            assert_eq!((p.run, p.total), (1, 3), "begin + start is one run");
+        }
+        set_progress(&state, true, Duration::from_secs(901));
+        assert!(!state.is_indexing());
+        sink.phase("hnsw");
+        assert!(state.is_indexing(), "the HNSW phase counts as progress");
+        assert!(state.index_winding_down(Duration::from_secs(15)));
+        assert_eq!(state.index_progress.lock().unwrap().phase, "hnsw");
+        sink.finish();
+        assert!(!state.index_running());
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Item 1: a stop request reaches the run through its sink.
+    #[test]
+    fn cancelling_reaches_every_run_through_its_sink() {
+        let (state, root) = lifecycle_state("cancel");
+        let sink =
+            SharedProgress::with_cancel(state.index_progress.clone(), state.index_cancel.clone());
+        assert!(!sink.cancelled());
+        state.cancel_indexing();
+        assert!(sink.cancelled());
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Item 4: only repeated, definite "not found" means the project is gone.
+    #[test]
+    fn a_project_counts_as_vanished_only_after_repeated_not_found() {
+        let (state, root) = lifecycle_state("vanish");
+        assert!(!state.project_vanished());
+        let devctx = root.join(".devctx");
+        let aside = root.join(".devctx-renamed");
+        std::fs::rename(&devctx, &aside).unwrap();
+        assert!(!state.project_vanished(), "one miss is not enough");
+        assert!(!state.project_vanished(), "two misses are not enough");
+        // Back before the third poll (a rename in progress): the count resets.
+        std::fs::rename(&aside, &devctx).unwrap();
+        assert!(!state.project_vanished());
+        std::fs::rename(&devctx, &aside).unwrap();
+        for _ in 1..VANISH_STRIKES {
+            assert!(!state.project_vanished());
+        }
+        assert!(state.project_vanished(), "{VANISH_STRIKES} misses in a row");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Item 4: an unreadable path (EACCES, as drvfs/9p can report transiently)
+    /// is not a missing one.
+    #[cfg(unix)]
+    #[test]
+    fn a_permission_error_is_not_a_missing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("devctx_mcp_eacces_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("locked/.devctx")).unwrap();
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let probe = dir.join("locked/.devctx");
+        let denied = std::fs::metadata(&probe)
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let missing = super::dir_definitely_missing(&probe);
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        if denied {
+            assert!(!missing, "EACCES must not read as deleted");
+        }
+        assert!(super::dir_definitely_missing(&dir.join("nope")));
     }
 
     // --- plan_status (TASK-002) ---

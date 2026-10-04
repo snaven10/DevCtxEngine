@@ -110,6 +110,7 @@ pub async fn serve(
         guard.config().reindex.every_seconds
     };
     let registry = api.central.clone();
+    let folding = api.central.clone();
     let activity = Arc::new(Mutex::new(Instant::now()));
     let app = router(api).layer(middleware::from_fn_with_state(activity.clone(), track));
     let (listener, addr) = bind_near(addr).await?;
@@ -135,7 +136,25 @@ pub async fn serve(
                 };
                 if idle_for >= timeout {
                     eprintln!("Central store idle for {idle_for:?}; shutting down.");
-                    std::process::exit(0);
+                    // `exit` runs no destructors, so the connection is never
+                    // closed: fold the WAL first (see `Store::checkpoint`), on
+                    // its own thread and with a budget — a request holding
+                    // the lock must not turn the idle exit into a hang.
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let central = folding.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("exit-checkpoint".into())
+                        .spawn(move || {
+                            let guard = central
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if guard.store().try_checkpoint().is_err() {
+                                let _ = guard.store().force_checkpoint();
+                            }
+                            let _ = tx.send(());
+                        });
+                    let _ = rx.recv_timeout(Duration::from_millis(1500));
+                    crate::hard_exit(0);
                 }
             });
     }

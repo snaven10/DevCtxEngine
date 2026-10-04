@@ -1,8 +1,9 @@
 //! The indexing pipeline: git diff → parse → chunk → embed → store.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use devctx_chunk::{chunk_file, chunk_raw_text, content_hash, Chunk, ChunkConfig};
 use devctx_core::types::{VectorMetadata, VectorPoint};
@@ -16,11 +17,111 @@ use crate::git::{Change, GitRepo};
 use crate::id::chunk_id;
 
 /// Receives progress updates during an indexing run (e.g. a CLI progress bar).
-pub trait ProgressSink {
+///
+/// `Sync` because long phases that cannot report per file (rebuilding the HNSW
+/// index, a checkpoint) are heartbeat from a helper thread — see [`heartbeat`].
+pub trait ProgressSink: Sync {
     /// Called once with the total number of changes to process.
     fn start(&self, total: usize);
     /// Called before each change is processed, with its file path.
     fn file(&self, path: &str);
+    /// The run is alive in a phase that is not "the next file": pruning,
+    /// rebuilding a derived index, checkpointing. Called repeatedly while such
+    /// a phase lasts, so a watcher that measures "time since the run last
+    /// moved" does not mistake a long rebuild for a stuck run.
+    fn phase(&self, _name: &str) {}
+    /// Whether the run should stop at the next file boundary (the server is
+    /// shutting down). Checked between files; a cancelled run commits what it
+    /// has, folds the WAL and returns with [`IndexResult::cancelled`] set.
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// How often a long, un-instrumentable phase reports that it is still alive.
+const HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// Run `op` while ticking `progress` every [`HEARTBEAT`].
+///
+/// For single statements that can run for many minutes on a big repository
+/// (building the HNSW graph, the BM25 index, a checkpoint of a large WAL): they
+/// are CPU-bound work inside DuckDB, not a wait on the network, so ticking
+/// while they run cannot make a wedged process look alive forever — they end.
+/// Without it the idle watchdog read a 15-minute HNSW build as a stuck run and
+/// killed a legitimate index in its last phase.
+fn heartbeat<T>(progress: Option<&dyn ProgressSink>, name: &str, op: impl FnOnce() -> T) -> T {
+    let Some(p) = progress else {
+        return op();
+    };
+    p.phase(name);
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(HEARTBEAT) {
+                p.phase(name);
+            }
+        });
+        let out = op();
+        drop(tx);
+        out
+    })
+}
+
+/// Index-meta key (repository- and branch-independent: `("", "")`) recording
+/// that the HNSW index was dropped for a run and not yet rebuilt; its value is
+/// the metric.
+pub const PENDING_HNSW_META_KEY: &str = "pending_hnsw";
+/// Same, for the BM25 index.
+pub const PENDING_FTS_META_KEY: &str = "pending_fts";
+
+/// Runs of [`run`] in flight, per database ([`Store::instance_id`]).
+///
+/// The derived indexes are database-wide while runs are per branch: a short
+/// run (a watcher's one-file save) finishing in the middle of a full one used
+/// to be harmless only because it never saw the indexes it would rebuild. Now
+/// that a dropped index is remembered ([`PENDING_HNSW_META_KEY`]) the last run
+/// to finish rebuilds it, so the long one is not left inserting into an HNSW
+/// graph.
+static RUNS_IN_FLIGHT: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+struct InFlight(usize);
+
+fn in_flight_map() -> std::sync::MutexGuard<'static, Option<HashMap<usize, usize>>> {
+    RUNS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl InFlight {
+    fn enter(store: &Store) -> Self {
+        let id = store.instance_id();
+        *in_flight_map()
+            .get_or_insert_with(HashMap::new)
+            .entry(id)
+            .or_insert(0) += 1;
+        InFlight(id)
+    }
+    /// Whether this is the only run left on its database.
+    fn alone(&self) -> bool {
+        in_flight_map()
+            .as_ref()
+            .and_then(|m| m.get(&self.0))
+            .is_none_or(|n| *n <= 1)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut guard = in_flight_map();
+        if let Some(m) = guard.as_mut() {
+            if let Some(n) = m.get_mut(&self.0) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.0);
+                }
+            }
+        }
+    }
 }
 
 /// Inputs for one indexing run.
@@ -93,6 +194,12 @@ pub struct IndexResult {
     /// extractor: only the changed files were re-parsed, so the rest still
     /// carries what the old extractor produced. `--full` clears it.
     pub extractor_stale: bool,
+    /// The run stopped early because [`ProgressSink::cancelled`] said so (the
+    /// server is shutting down). What it wrote is committed and checkpointed;
+    /// the index record was **not** advanced, so the next incremental run
+    /// starts from the same commit and the content-hash check skips the files
+    /// this one already did.
+    pub cancelled: bool,
 }
 
 /// Run the indexing pipeline against the repository containing `repo_root`.
@@ -105,10 +212,28 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     }
 
     let excluded = build_exclude(req.exclude);
+    let in_flight = InFlight::enter(req.store);
+    // A run that was cut short (cancelled, killed) after dropping the derived
+    // indexes left a note saying so; honour it as if they were still there.
+    let pending_hnsw = req
+        .store
+        .get_index_meta("", "", PENDING_HNSW_META_KEY)
+        .ok()
+        .flatten();
+    let pending_fts = req
+        .store
+        .get_index_meta("", "", PENDING_FTS_META_KEY)
+        .ok()
+        .flatten()
+        .is_some();
     // The BM25 index cannot survive the row deletions this run will make, so it
     // comes down first and goes back up at the end if it was there.
-    let had_fts = req.store.has_fts();
+    let had_fts = req.store.has_fts() || pending_fts;
     if had_fts {
+        // Noted *before* the drop: a process that dies anywhere between here
+        // and the rebuild must not lose the index for good.
+        req.store
+            .set_index_meta("", "", PENDING_FTS_META_KEY, "1")?;
         req.store.drop_fts()?;
     }
     // The HNSW index has to come down for the same reason, and for a larger
@@ -125,8 +250,10 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // Searches fall back to brute force while it is down, which is what FTS
     // already does and is the right trade: a slower search during an index
     // beats an index that does not finish.
-    let had_hnsw = req.store.hnsw_metric();
-    if had_hnsw.is_some() {
+    let had_hnsw = req.store.hnsw_metric().or(pending_hnsw);
+    if let Some(metric) = &had_hnsw {
+        req.store
+            .set_index_meta("", "", PENDING_HNSW_META_KEY, metric)?;
         req.store.drop_hnsw()?;
     }
     let git = GitRepo::open(req.repo_root)?;
@@ -227,7 +354,14 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     if let Some(p) = req.progress {
         p.start(changes.len());
     }
+    let cancelled = || req.progress.is_some_and(|p| p.cancelled());
     for change in changes {
+        // Between files, never inside one: every write so far is committed, so
+        // stopping here leaves nothing half-done for the checkpoint to fold.
+        if cancelled() {
+            result.cancelled = true;
+            break;
+        }
         if let Some(p) = req.progress {
             p.file(change_path(&change));
         }
@@ -247,9 +381,32 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         }
     }
 
+    if result.cancelled {
+        // Nothing past this point is safe or useful for a partial run: pruning
+        // would delete every file the run did not reach, the index record would
+        // claim a commit it did not cover, and rebuilding HNSW is the slowest
+        // step of all on the one path that must be quick. The pending notes keep
+        // the derived indexes owed to the next run; the checkpoint is the point.
+        eprintln!(
+            "· indexing cancelled after {} file(s) (the server is stopping); the next run \
+             resumes from the same commit",
+            ctx.indexed.len()
+        );
+        heartbeat(req.progress, "checkpoint", || req.store.checkpoint());
+        return Ok(result);
+    }
+
     // Prune stale files: previously indexed but not re-indexed this full run.
+    if !prev_files.is_empty() {
+        if let Some(p) = req.progress {
+            p.phase("prune");
+        }
+    }
     for file in &prev_files {
         if !ctx.indexed.contains(file) {
+            if let Some(p) = req.progress {
+                p.phase("prune");
+            }
             ctx.delete_file(file)?;
             result.files_pruned += 1;
         }
@@ -296,17 +453,39 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         );
     }
 
-    if let Some(metric) = &had_hnsw {
-        req.store.enable_hnsw(metric)?;
-    }
-    if had_fts {
-        req.store.rebuild_fts()?;
+    // Rebuild what this run (or an earlier, interrupted one) took down — but
+    // only as the last run in flight: rebuilding under a concurrent run makes
+    // every one of its remaining inserts maintain the graph. The note is read
+    // again here because a concurrent run may have dropped an index this one
+    // never saw.
+    if in_flight.alone() {
+        let hnsw = had_hnsw.or_else(|| {
+            req.store
+                .get_index_meta("", "", PENDING_HNSW_META_KEY)
+                .ok()
+                .flatten()
+        });
+        if let Some(metric) = &hnsw {
+            heartbeat(req.progress, "hnsw", || req.store.enable_hnsw(metric))?;
+            req.store.delete_index_meta("", "", PENDING_HNSW_META_KEY)?;
+        }
+        let fts = had_fts
+            || req
+                .store
+                .get_index_meta("", "", PENDING_FTS_META_KEY)
+                .ok()
+                .flatten()
+                .is_some();
+        if fts {
+            heartbeat(req.progress, "fts", || req.store.rebuild_fts())?;
+            req.store.delete_index_meta("", "", PENDING_FTS_META_KEY)?;
+        }
     }
     // An indexing run is where the write-ahead log comes from, and a WAL that
     // outlives its process leaves the ART indexes behind every PRIMARY KEY and
     // UNIQUE missing entries — see `Store::checkpoint`. Fold it in now, while a
     // connection is still open to do it.
-    req.store.checkpoint();
+    heartbeat(req.progress, "checkpoint", || req.store.checkpoint());
 
     // A full run deletes every row and writes them again, and DuckDB does not
     // hand the space of the deleted ones back to the file — a checkpoint folds
