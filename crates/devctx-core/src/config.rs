@@ -178,12 +178,20 @@ pub struct Storage {
 ///
 /// Written as `.gitignore` patterns, so `node_modules/` matches at any depth.
 /// They are applied *before* the user's `exclude`, which can therefore
-/// re-include with a `!` rule (`!vendor/`).
+/// re-include with a `!` rule (`!vendor/`, `!/target/`).
+///
+/// `build/` and `target/` are anchored to the repository root (`/build/`,
+/// `/target/`; PLAN-008 Q-3): nested, both are ordinary names for source —
+/// `src/x/build/Builder.java`, a Java package `com.acme.target` — while the
+/// output of Cargo, Gradle or a root `npm run build` lands at the root. A
+/// multi-module build that tracks per-module output adds `target/` (any depth)
+/// to `exclude`. `dist/` stays at any depth: a monorepo emits one per package,
+/// and it is not a name anyone gives a source directory.
 pub const DEFAULT_EXCLUDES: &[&str] = &[
     "node_modules/",
-    "target/",
+    "/target/",
     "dist/",
-    "build/",
+    "/build/",
     "vendor/",
     "third_party/",
     "bower_components/",
@@ -197,12 +205,14 @@ pub struct Indexing {
     /// Keep vendor / generated / build-output paths ([`DEFAULT_EXCLUDES`]) out
     /// of the index even when git tracks them. Default `true`; `false` turns
     /// the whole list off. Changing it (or `include_build`, or `exclude`)
-    /// makes the next `index` a full run, which prunes what no longer
-    /// qualifies.
+    /// makes the next `index` *reconcile* the index against the new set —
+    /// prune the files it now excludes, add the tracked files it no longer
+    /// excludes — without re-embedding anything else; the reconcile logs how
+    /// many files each pattern excluded.
     #[serde(default = "default_true")]
     pub default_excludes: bool,
 
-    /// Opt `build/` back in while the other defaults stay on. For repositories
+    /// Opt the root `/build/` back in while the other defaults stay on. For repositories
     /// where `build/` is source (Gradle `buildSrc`-style layouts, a Java
     /// package named `build`) rather than output.
     #[serde(default)]
@@ -262,7 +272,7 @@ impl Indexing {
             out.extend(
                 DEFAULT_EXCLUDES
                     .iter()
-                    .filter(|p| !(self.include_build && **p == "build/"))
+                    .filter(|p| !(self.include_build && **p == "/build/"))
                     .map(|p| p.to_string()),
             );
         }
@@ -291,8 +301,13 @@ impl Indexing {
 /// `search:` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchCfg {
-    /// Score multipliers for tests / docs / config hits (`0.6` each by
-    /// default). Set a kind to `1.0` to stop demoting it.
+    /// How far tests / docs / config hits are demoted (`0.6` each by
+    /// default). Not a score multiplier: the factor becomes a number of
+    /// *positions* — `round((1 − f) × 10)`, so `0.6` ranks such a hit as if it
+    /// were 4 places lower — because scores have no common scale across modes
+    /// (cosines cluster around 0.6–0.85, RRF is rank-based, cross-encoder
+    /// logits are unbounded). `1.0` stops demoting a kind; `0.0` sends it to
+    /// the end of the list. See `devctx_core::KindPenalty`.
     #[serde(default)]
     pub penalty: crate::kind::KindPenalty,
 }
@@ -647,7 +662,7 @@ mod tests {
         let cfg = ProjectConfig::from_yaml("{}").unwrap();
         assert!(cfg.indexing.default_excludes);
         let ex = cfg.indexing.effective_excludes();
-        for p in ["node_modules/", "target/", "dist/", "build/"] {
+        for p in ["node_modules/", "/target/", "dist/", "/build/"] {
             assert!(ex.iter().any(|e| e == p), "{p} missing from {ex:?}");
         }
 
@@ -655,7 +670,7 @@ mod tests {
             ProjectConfig::from_yaml("indexing:\n  include_build: true\n  exclude: [\"x/\"]\n")
                 .unwrap();
         let ex = cfg.indexing.effective_excludes();
-        assert!(!ex.iter().any(|e| e == "build/"));
+        assert!(!ex.iter().any(|e| e.contains("build")));
         assert!(ex.iter().any(|e| e == "dist/"));
         assert_eq!(
             ex.last().map(String::as_str),

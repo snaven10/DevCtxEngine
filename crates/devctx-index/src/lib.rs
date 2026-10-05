@@ -1620,4 +1620,148 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// PLAN-008 Q-3 precision: `build/` and `target/` are excluded at the
+    /// repository root only. Nested, both are ordinary source names.
+    #[test]
+    fn build_and_target_are_excluded_at_the_root_only() {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_rootex_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "src/lib.rs", "pub fn kept() -> i32 { 1 }\n");
+        write(
+            &dir,
+            "src/x/build/Builder.java",
+            "class Builder { int build() { return 1; } }\n",
+        );
+        write(
+            &dir,
+            "src/com/acme/target/Aim.java",
+            "class Aim { int aim() { return 2; } }\n",
+        );
+        write(&dir, "build/out.js", "export function out() { return 3 }\n");
+        write(&dir, "target/gen.rs", "pub fn gen() -> i32 { 4 }\n");
+        write(
+            &dir,
+            "pkg/web/dist/app.js",
+            "export function bundled() { return 5 }\n",
+        );
+        commit_all(&dir, "initial");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        let defaults = devctx_core::config::Indexing::default().effective_excludes();
+        index_excluding(&store, &dir, &defaults);
+        assert_eq!(
+            indexed_files(&store),
+            vec![
+                "src/com/acme/target/Aim.java".to_string(),
+                "src/lib.rs".to_string(),
+                "src/x/build/Builder.java".to_string(),
+            ],
+            "nested build/ and target/ are source; root ones and any dist/ are output"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reconcile names what each pattern removed, not just how many.
+    #[test]
+    fn exclude_counts_are_per_deciding_pattern() {
+        let ex = crate::pipeline::build_exclude(&[
+            "/build/".to_string(),
+            "dist/".to_string(),
+            "*.min.js".to_string(),
+        ]);
+        let files: Vec<String> = [
+            "build/a.js",
+            "build/b/c.js",
+            "web/dist/x.js",
+            "lib/jq.min.js",
+            ".devctx/state/x",
+            "src/kept.rs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            crate::pipeline::exclude_counts(&ex, &files),
+            vec![
+                ("/build/".to_string(), 2),
+                ("dist/".to_string(), 1),
+                ("*.min.js".to_string(), 1),
+                ("(devctx artifacts)".to_string(), 1),
+            ]
+        );
+    }
+
+    /// An exclude change on the same run as ordinary commits: the reconcile
+    /// must prune and add *and* the incremental diff must still be indexed.
+    #[test]
+    fn an_exclude_change_and_a_non_empty_diff_are_both_applied() {
+        let dir = repo_with_generated_files("exdiff");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_excluding(&store, &dir, &[]);
+        assert_eq!(indexed_files(&store).len(), 5);
+
+        write(&dir, "src/lib.rs", "pub fn kept() -> i32 { 10 }\n");
+        write(&dir, "src/new.rs", "pub fn fresh() -> i32 { 11 }\n");
+        commit_all(&dir, "change");
+
+        let defaults = devctx_core::config::Indexing::default().effective_excludes();
+        let res = index_excluding(&store, &dir, &defaults);
+        assert!(!res.full_reindex, "{res:?}");
+        assert_eq!(res.files_pruned, 4, "{res:?}");
+        assert_eq!(res.files_indexed, 2, "the diff was dropped: {res:?}");
+        assert_eq!(
+            indexed_files(&store),
+            vec!["src/lib.rs".to_string(), "src/new.rs".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reconcile cut by a stop request must not stamp the new exclude
+    /// fingerprint: the next run reconciles again and finishes the job.
+    #[test]
+    fn a_cancelled_reconcile_is_redone_by_the_next_run() {
+        let dir = repo_with_generated_files("excancel");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let defaults = devctx_core::config::Indexing::default().effective_excludes();
+        index_excluding(&store, &dir, &defaults);
+        assert_eq!(indexed_files(&store), vec!["src/lib.rs".to_string()]);
+
+        // Opting out brings four files back; stop after the first.
+        let sink = CancelAfter::new(1);
+        let res = run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: true,
+            model_name: "minilm-l6",
+            progress: Some(&sink),
+            paths: None,
+            exclude: &[],
+            branch: None,
+        })
+        .unwrap();
+        assert!(res.cancelled, "{res:?}");
+        assert!(indexed_files(&store).len() < 5);
+
+        let git = crate::git::GitRepo::open(&dir).unwrap();
+        let repo_path = git.root().to_string_lossy().to_string();
+        let branch = git.state().branch;
+        assert_eq!(
+            store
+                .get_index_meta(&repo_path, &branch, crate::pipeline::EXCLUDE_META_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(crate::pipeline::exclude_fingerprint(&defaults).as_str()),
+            "a cancelled reconcile stamped the new exclude set"
+        );
+
+        let res = index_excluding(&store, &dir, &[]);
+        assert!(!res.cancelled && !res.full_reindex, "{res:?}");
+        assert_eq!(indexed_files(&store).len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

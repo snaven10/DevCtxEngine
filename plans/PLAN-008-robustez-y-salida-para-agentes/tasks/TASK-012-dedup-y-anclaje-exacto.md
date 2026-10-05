@@ -104,3 +104,27 @@ fragmento más chico cuando rankea más alto.
   avisan `SKIPPED ...`. Los tests híbridos siguen degradando a vector-only (es el comportamiento de producción).
 - Gate: fmt --check; clippy --workspace --all-targets (con y sin `--features gpu`) 0 warnings;
   `TMPDIR=/var/tmp DEVCTX_MODEL_CACHE=/var/tmp/devctx-test-model-cache cargo test --workspace` verde.
+
+### Fixup F (review)
+
+- **I-2 (anclaje con LIMIT 3 antes del filtro y orden por ruta):** `anchor_identifiers` pide `ANCHOR_FETCH = 48`
+  definiciones por identificador y `rank_definitions` las ordena en Rust (Code primero, luego ruta y línea),
+  aplica `keeps` y recién entonces corta a `ANCHOR_MAX = 3`. Antes (A) con `include_tests=false` tres copias de test
+  que ordenaban antes ocupaban los 3 slots y el filtro las tiraba sin anclar nada; (B) `__mocks__/foo.service.ts`
+  ordenaba antes que `src/` y, al no penalizarse lo anclado, el mock ganaba a producción. Tests (fallan con la
+  lógica previa): `an_anchored_mock_never_outranks_the_production_definition` (mock + doc homónimos),
+  `test_copies_do_not_crowd_the_definition_out_of_anchoring`.
+- **M-4 (`identifier_tokens`):** extensiones que también son nombres de miembro (`c h m r go fs ex tf sh pl hs ml
+  log env db lock json html css sql conf cfg properties ini`) solo hacen "archivo" si el stem parece nombre de
+  archivo: todo en minúsculas o todo en mayúsculas y sin empezar por un receptor conocido (`this`, `self`,
+  `process`, `console`, `logger`, `req`, `res`, …). `process.env`, `this.db`, `logger.log`, `App.go`, `res.json`,
+  `this.state.db` → identificadores; `main.go`, `server.log`, `foo.h`, `app.db`, `README.md`, `app.module.json`
+  → archivos. Ambigüedad residual documentada (`mutex.lock` sí está como receptor; `server.lock` queda archivo).
+  Test: `member_names_that_look_like_extensions_are_identifiers` (falla con la lógica previa).
+- **M-5 (tercer pase de `symbol_definitions`):** el match en chunks `grouped` exige la línea de cabecera completa
+  que escribe `context_header` (`regexp_matches(text, '(^|\n)# [^\n]* > <name>(\n|$)')`, nombre escapado), en vez
+  de `contains(text, ' > name\n')`, que casaba código (`return a > limit\n`). Test (falla con la lógica previa):
+  `store::tests::a_grouped_definition_matches_the_header_line_not_the_code`.
+- **Nit:** la marca `anchored` en `search_items` (MCP) usa `devctx_search::anchor_tokens` (los 3 identificadores
+  que de verdad se buscan), no todos. Test: `anchor_tokens_are_the_truncated_identifier_set`.
+- Gate: ver TASK-011 Fixup F.

@@ -147,3 +147,46 @@ Ver PLAN-008 §7 (excludes y penalización). El factor es configurable para pode
   4 podados, `files_indexed == 0`, hash estampado); `a_changed_exclude_set_prunes_on_the_next_incremental_run`
   ahora también exige `!full_reindex` y que al volver a incluir solo se embeben los 4 archivos nuevos.
 - **I2 (de 012, toca el post-filtro de 011):** con filtro duro el pool es `max(400, 4×limit)`.
+
+### Fixup F (review)
+
+- **I-1 (pool del reranker con filtro duro):** tras `retain` + penalización + dedup, el pool se corta a
+  `max(r.pool(), 2×limit)` antes de `finalize` (`devctx-search/src/lib.rs`, `search_ranked`). Antes, con
+  `kind`/`include_tests=false` el cross-encoder puntuaba 400–800 candidatos. Test (falla con la lógica previa):
+  `a_hard_filter_does_not_hand_the_reranker_the_widened_pool` (500 chunks, reranker falso con pool 100 → ve 100,
+  antes 400).
+- **I-3 (modelo de penalización):** se cambió de `score × factor` a **degradación por posiciones**:
+  `KindPenalty::demotion(kind) = round((1 − f) × 10)` (0.6 → 4 posiciones; 1.0 → 0; ≤0.0 → al final). Un hit
+  penalizado en la posición `i` pasa a `i + d`; empates a favor del no penalizado. Elegido frente a normalizar a
+  [0,1] porque (a) los scores no tienen escala común entre modos (cosenos en ~0.6–0.85, RRF en milésimas, logits sin
+  rango), (b) una min–max depende del fondo del pool (cambia con `FILTERED_POOL`), (c) las posiciones son la unidad
+  que RRF ya usa. Costo aceptado: ignora *cuánto* mejor puntuó el penalizado, pero solo lo baja `d` puestos. Los
+  scores quedan monótonos (cada hit muestra `min(propio, anterior)`; nunca sube). Documentado en `apply_penalty`,
+  `KindPenalty` y `SearchCfg.penalty`. Tests: `a_clearly_more_relevant_config_stays_in_the_top_results_in_vector_mode`
+  (falla con ×0.6: el YAML a 0.85 caía detrás de todo el código ≥0.62), `a_marginally_more_relevant_readme_ranks_below_comparable_code`,
+  `the_penalty_keeps_scores_monotone_and_never_raises_one`; los tests previos del ranking pasan sin tocar sus asserts.
+- **M-1 (decisión del usuario, PLAN §12 precisión de Q-3):** `DEFAULT_EXCLUDES` ancla `/build/` y `/target/` a la
+  raíz; `node_modules/`, `dist/`, `vendor/`… siguen a cualquier profundidad (en monorepos cada paquete emite su
+  `dist/`). `include_build` filtra `/build/`. El reconcile registra los archivos excluidos por patrón
+  (`pipeline::exclude_counts`, `· the exclude set changed: N indexed file(s) are now excluded (/build/: 3, …)`).
+  Doc de `default_excludes` corregida ("full run" → reconcile) y opt-outs de `target/` documentados
+  (`exclude: ["target/"]` para cualquier profundidad, `exclude: ["!/target/"]` para reincluir). Tests:
+  `build_and_target_are_excluded_at_the_root_only` (`src/x/build/Builder.java` y `src/com/acme/target/Aim.java`
+  indexados; `/build/out.js`, `/target/gen.rs`, `pkg/web/dist/app.js` fuera), `exclude_counts_are_per_deciding_pattern`.
+  Cambiar los defaults cambia el fingerprint: el primer `index` tras actualizar hace un reconcile incremental.
+- **Nits:** `path_kind`: `requirements*.txt`, `CMakeLists.txt`, `constraints.txt` → Config; `*.xml` → Config
+  (`pom.xml`, `persistence.xml`); `*.cy.*` → Test en cualquier ruta. La TUI (motor local) usa `search.penalty`
+  del config (`rank_options`), antes la penalización por defecto.
+- **M-2 (documentado, sin cambio):** el reconcile lista los archivos trackeados que nunca se indexaron (binarios,
+  lenguajes sin parser, demasiado grandes) como altas; se saltan en `index_file` y engordan `files_skipped` en cada
+  reconcile (no en corridas incrementales normales).
+- **M-3 (documentado, sin cambio):** el reconcile actúa solo sobre la rama que se indexa; las ramas de fallback
+  (búsqueda contra otra rama indexada) siguen mostrando archivos recién excluidos hasta que esa rama se reindexe.
+- **M-6:** `an_exclude_change_and_a_non_empty_diff_are_both_applied` (poda 4 + indexa los 2 del diff en la misma
+  corrida) y `a_cancelled_reconcile_is_redone_by_the_next_run` (cancelado no estampa el fingerprint nuevo; la
+  siguiente corrida completa).
+- Gate: `cargo fmt --check`; `clippy --workspace --all-targets` con y sin `--features gpu`, 0 warnings;
+  `TMPDIR=/var/tmp DEVCTX_MODEL_CACHE=/var/tmp/devctx-test-model-cache cargo test --workspace` verde (sin flakes);
+  sin `target/debug/devctx serve` residuales.
+- **No verificado:** el efecto de la degradación por posiciones en un repo real (TASK-016); el valor `POSITIONS=10`
+  es una elección, no una calibración.

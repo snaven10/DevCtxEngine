@@ -887,17 +887,21 @@ impl Store {
         // text still carries in its per-function header (`# file > name`, or
         // `# file > Parent > name`). Without this pass a small getter — which
         // calls nothing, so is never a graph source either — looked external.
+        //
+        // The header is matched as a whole line that starts with `# `, as
+        // `context_header` in devctx-chunk writes it: a bare `' > name\n'`
+        // also matched code in the group (`return a > limit\n`).
+        let header = format!("(^|\n)# [^\n]* > {}(\n|$)", regex_escape(name));
         let sql = format!(
             "SELECT {COLS} FROM vectors
              WHERE repo = ? AND branch = ? AND NOT is_deletion
                AND symbol_type = 'grouped'
                AND (list_contains(string_split(regexp_replace(symbol, ' \\+[0-9]+$', ''), ', '), ?)
-                    OR contains(text, ' > ' || ? || chr(10))
-                    OR ends_with(text, ' > ' || ?))
+                    OR regexp_matches(text, ?))
              ORDER BY file, start_line LIMIT {limit}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([repo, branch, name, name, name], row_to_point)?;
+        let rows = stmt.query_map([repo, branch, name, header.as_str()], row_to_point)?;
         for r in rows {
             out.push(r?);
         }
@@ -1020,6 +1024,18 @@ impl Store {
         let _ = write!(s, "]::FLOAT[{}]", self.dim);
         s
     }
+}
+
+/// Escape `s` for a literal match inside an RE2 pattern.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Ordered SQL parameters for an INSERT row (vector is inlined separately).
@@ -1266,6 +1282,46 @@ mod tests {
         std::fs::metadata(dir.join("index.duckdb.wal"))
             .map(|m| m.len())
             .unwrap_or(0)
+    }
+
+    /// The per-function header of a grouped chunk is a whole `# ` line; code
+    /// in the group that merely reads `a > limit` is not a definition of
+    /// `limit`.
+    #[test]
+    fn a_grouped_definition_matches_the_header_line_not_the_code() {
+        let store = Store::open_in_memory(4).unwrap();
+        let grouped = |id: &str, text: &str| {
+            let mut p = point(id, &format!("{id}.js"));
+            p.text = text.into();
+            p.metadata.symbol = "a, b, c, d +2".into();
+            p.metadata.symbol_type = "grouped".into();
+            p.metadata.chunk_level = "function".into();
+            p
+        };
+        store
+            .upsert(&[
+                grouped(
+                    "code",
+                    "# code.js > check\nfunction check(a) {\n  return a > limit\n}",
+                ),
+                grouped(
+                    "def",
+                    "# def.js > other\nfunction other() {}\n\n# def.js > Box > limit\nfunction limit() {}",
+                ),
+                grouped("tail", "# tail.js > a\nfunction a() {}\n\n# tail.js > last"),
+            ])
+            .unwrap();
+        let ids = |name: &str| -> Vec<String> {
+            store
+                .symbol_definitions("demo", "main", name, 10)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect()
+        };
+        assert_eq!(ids("limit"), ["def"]);
+        assert_eq!(ids("last"), ["tail"], "a header on the last line");
+        assert!(ids("lim").is_empty(), "the name is matched whole");
     }
 
     fn point(id: &str, file: &str) -> VectorPoint {

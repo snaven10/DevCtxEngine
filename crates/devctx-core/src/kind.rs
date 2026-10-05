@@ -76,7 +76,13 @@ const CONFIG_EXTS: &[&str] = &[
     "ini",
     "cfg",
     "conf",
+    // Maven `pom.xml`, JPA `persistence.xml`, Spring and Android resources:
+    // XML in a source tree is configuration far more often than code.
+    "xml",
 ];
+
+/// Build and dependency manifests whose extension says "prose" or nothing.
+const CONFIG_NAMES: &[&str] = &["cmakelists.txt", "constraints.txt"];
 
 /// Extensions of languages where `FooTest.ext` / `FooTests.ext` / `FooIT.ext`
 /// is the test-naming convention (JUnit, xUnit, ScalaTest, PHPUnit...).
@@ -119,6 +125,8 @@ pub fn path_kind(path: &str, language: &str) -> PathKind {
         || lstem.starts_with("test_")
         || lstem.ends_with(".test")
         || lstem.ends_with(".spec")
+        // Cypress: `login.cy.ts` is a test wherever it lives.
+        || lstem.ends_with(".cy")
         || lname == "conftest.py"
         // JUnit and friends: the capital T keeps `Contest.java` and `Latest.cs` out.
         || (SUFFIX_TEST_EXTS.contains(&ext.as_str())
@@ -126,6 +134,13 @@ pub fn path_kind(path: &str, language: &str) -> PathKind {
             && stem.len() > 2);
     if in_dir(TEST_DIRS) || by_name {
         return PathKind::Test;
+    }
+
+    // Manifests named for their role (`requirements.txt`, `CMakeLists.txt`)
+    // are configuration even though `.txt` would make them prose.
+    if CONFIG_NAMES.contains(&lname.as_str()) || (lstem.starts_with("requirements") && ext == "txt")
+    {
+        return PathKind::Config;
     }
 
     // Doc
@@ -151,10 +166,18 @@ pub fn path_kind(path: &str, language: &str) -> PathKind {
     PathKind::Code
 }
 
-/// Multipliers applied to a hit's score by the kind of file it is in, so noise
-/// ranks lower without disappearing. `1.0` disables a penalty; `0.0` would
-/// bury the kind entirely (use the `kind` / `include_tests` filters to exclude
+/// How far a hit is demoted by the kind of file it is in, so noise ranks lower
+/// without disappearing. `1.0` disables a penalty; `0.0` buries the kind at
+/// the end of the list (use the `kind` / `include_tests` filters to exclude
 /// instead).
+///
+/// The factor is applied to the hit's *rank*, not its score: a penalised hit
+/// is placed [`demotion`](Self::demotion) positions lower than it ranked. A
+/// score multiplier meant something different in every mode — cosines cluster
+/// around 0.6–0.85, so `× 0.6` turned 0.85 into 0.51, below nearly all code
+/// (an exclusion in all but name); RRF scores span a few thousandths; a
+/// cross-encoder's logits have no fixed scale at all. Positions are the one
+/// unit every mode shares (RRF itself fuses by rank for the same reason).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct KindPenalty {
     /// Factor for [`PathKind::Test`].
@@ -189,6 +212,23 @@ impl KindPenalty {
         doc: 1.0,
         config: 1.0,
     };
+
+    /// Positions per unit of `1 − factor`: `0.6` demotes by 4, `0.9` by 1.
+    pub const POSITIONS: f32 = 10.0;
+
+    /// How many positions a hit of `kind` is moved down: `round((1 − f) ×
+    /// POSITIONS)`, `0` for code or a factor of `1.0` or more, and `None` for
+    /// a factor of `0.0` or less (bury it after every unpenalised hit).
+    pub fn demotion(&self, kind: PathKind) -> Option<usize> {
+        let f = self.factor(kind);
+        if f.is_nan() || f >= 1.0 {
+            return Some(0);
+        }
+        if f <= 0.0 {
+            return None;
+        }
+        Some(((1.0 - f) * Self::POSITIONS).round() as usize)
+    }
 
     /// The factor for `kind` (`Code` is always `1.0`).
     pub fn factor(&self, kind: PathKind) -> f32 {
@@ -226,6 +266,8 @@ mod tests {
             "spec/models/user_spec.rb",
             "Tests/Unit/FooTests.cs",
             "e2e/login.ts",
+            "src/app/login.cy.ts",
+            "cypress/login.cy.js",
         ] {
             assert_eq!(k(p), PathKind::Test, "{p}");
         }
@@ -255,6 +297,11 @@ mod tests {
             ".github/workflows/ci.yml",
             "package.json",
             "Cargo.toml",
+            "requirements.txt",
+            "backend/requirements-dev.txt",
+            "CMakeLists.txt",
+            "pom.xml",
+            "src/main/resources/META-INF/persistence.xml",
         ] {
             assert_eq!(k(p), PathKind::Config, "{p}");
         }
@@ -306,5 +353,15 @@ mod tests {
         assert_eq!(p.factor(PathKind::Code), 1.0);
         assert!(p.factor(PathKind::Test) < 1.0);
         assert_eq!(KindPenalty::NONE.factor(PathKind::Doc), 1.0);
+        assert_eq!(p.demotion(PathKind::Code), Some(0));
+        assert_eq!(p.demotion(PathKind::Test), Some(4));
+        let custom = KindPenalty {
+            test: 0.0,
+            doc: 0.9,
+            config: 1.5,
+        };
+        assert_eq!(custom.demotion(PathKind::Test), None, "0.0 buries");
+        assert_eq!(custom.demotion(PathKind::Doc), Some(1));
+        assert_eq!(custom.demotion(PathKind::Config), Some(0));
     }
 }

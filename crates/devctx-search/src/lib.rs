@@ -144,31 +144,61 @@ fn hit_kind(h: &SearchResult) -> PathKind {
 /// one hit in twenty still finds `limit` of them.
 const FILTERED_POOL: usize = 400;
 
-/// Multiply scores by the kind's factor and re-sort (stable). A negative score
-/// (cross-encoder logits, cosine below zero) is divided instead, so a penalty
-/// always moves a hit *down* whatever the sign. A no-op when nothing is
-/// penalised, so an already-ordered list is never reshuffled.
-fn apply_penalty(mut hits: Vec<SearchResult>, penalty: &KindPenalty) -> Vec<SearchResult> {
-    let mut touched = false;
-    for h in &mut hits {
-        let f = penalty.factor(hit_kind(h));
-        if f != 1.0 && f > 0.0 {
-            h.score = if h.score >= 0.0 {
-                h.score * f
-            } else {
-                h.score / f
+/// Demote penalised kinds by *position*, not by score (PLAN-008 fixup F, I-3).
+///
+/// `hits` is in rank order. A hit at 0-based position `i` whose kind demotes by
+/// `d` positions ([`KindPenalty::demotion`]) is re-ranked at `i + d`; ties go
+/// to the unpenalised hit, then to the original order; a kind demoted by
+/// `None` (factor `0.0`) goes after everything else.
+///
+/// Why positions: the scores this runs on have no common scale. Vector search
+/// (the CLI and MCP default) returns cosines packed into ~0.6–0.85, where the
+/// old `score × 0.6` turned a 0.85 README into 0.51 — below nearly every code
+/// hit, an exclusion in all but name; RRF scores differ by thousandths, so the
+/// same factor meant something else there; cross-encoder logits are unbounded
+/// and signed. A position shift means the same in every mode and does not
+/// depend on how deep the pool was fetched (a min–max normalisation would:
+/// its floor is whatever the pool's last hit scored). The cost is that it
+/// ignores *how much* better a penalised hit scored: a config file that is
+/// clearly the answer still drops `d` places — but only `d`, so it stays in
+/// the top results, while a README that edges out comparable code by a hair
+/// now ranks below it.
+///
+/// Scores are kept monotone for the caller (anything that reads them as
+/// relevance, e.g. `build_context`'s budget): each hit shows the lower of its
+/// own score and the one above it, so a penalty only ever lowers a score. A
+/// no-op when nothing is penalised.
+fn apply_penalty(hits: Vec<SearchResult>, penalty: &KindPenalty) -> Vec<SearchResult> {
+    let demotions: Vec<Option<usize>> =
+        hits.iter().map(|h| penalty.demotion(hit_kind(h))).collect();
+    if demotions.iter().all(|d| *d == Some(0)) {
+        return hits;
+    }
+    let n = hits.len();
+    // (effective position, penalised?, original position)
+    let mut keyed: Vec<((usize, bool, usize), SearchResult)> = hits
+        .into_iter()
+        .zip(demotions)
+        .enumerate()
+        .map(|(i, (h, d))| {
+            let pos = match d {
+                Some(d) => i.saturating_add(d),
+                None => n.saturating_add(i),
             };
-            touched = true;
+            ((pos, d != Some(0), i), h)
+        })
+        .collect();
+    keyed.sort_by_key(|(k, _)| *k);
+    let mut out: Vec<SearchResult> = Vec::with_capacity(n);
+    for (_, mut h) in keyed {
+        if let Some(prev) = out.last() {
+            if h.score > prev.score {
+                h.score = prev.score;
+            }
         }
+        out.push(h);
     }
-    if touched {
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
-    hits
+    out
 }
 
 /// Run a search in the requested mode, with the default kind penalty and no
@@ -255,9 +285,14 @@ pub fn search_ranked(
     if opts.filters() {
         candidates.retain(|h| opts.keeps(hit_kind(h)));
     }
-    let candidates = dedup_hits(apply_penalty(candidates, &opts.penalty));
+    let mut candidates = dedup_hits(apply_penalty(candidates, &opts.penalty));
     let ranked = match reranker {
-        Some(_) => {
+        Some(r) => {
+            // A cross-encoder costs per candidate. A hard filter widens the
+            // fetch to `FILTERED_POOL` per retriever and hybrid fusion can
+            // double that, so without this cut the reranker scored 400–800
+            // pairs — tens of seconds — where it asked for `r.pool()`.
+            candidates.truncate(r.pool().max(limit.saturating_mul(2)));
             let all = candidates.len();
             let mut r = apply_penalty(finalize(candidates, query, all, reranker)?, &opts.penalty);
             r.truncate(limit);
@@ -276,6 +311,11 @@ pub fn search_ranked(
 
 /// How many definitions one identifier may pin to the front.
 const ANCHOR_MAX: usize = 3;
+
+/// Definitions fetched per identifier before ranking them in Rust: enough that
+/// a homonymous mock, a doc heading and an `e2e/` copy cannot crowd the real
+/// definition out of the [`ANCHOR_MAX`] that are pinned.
+const ANCHOR_FETCH: usize = 48;
 
 /// How many identifier tokens of one query are looked up. Each costs one or
 /// two queries over `vectors`; a pasted stack trace names dozens.
@@ -380,6 +420,75 @@ const FILE_EXTENSIONS: &[&str] = &[
     "cmake",
 ];
 
+/// Extensions that are also everyday member names: `process.env`, `this.db`,
+/// `logger.log`, `App.go`, `res.json`, `mutex.lock`; and the one- and
+/// two-letter ones that read as short fields (`.h`, `.c`, `.m`, `.r`, `.fs`,
+/// `.ex`, `.tf`). For these the extension alone does not make a file name; the
+/// stem decides ([`looks_like_file_stem`]). `rs`, `md`, `ts`, `js`, `py`... stay
+/// unambiguous: nobody names a member that.
+const AMBIGUOUS_EXTENSIONS: &[&str] = &[
+    "c",
+    "h",
+    "m",
+    "r",
+    "go",
+    "fs",
+    "ex",
+    "tf",
+    "sh",
+    "pl",
+    "hs",
+    "ml",
+    "log",
+    "env",
+    "db",
+    "lock",
+    "json",
+    "html",
+    "css",
+    "sql",
+    "conf",
+    "cfg",
+    "properties",
+    "ini",
+];
+
+/// Receivers that make `x.member` an access, whatever `member` is.
+const RECEIVERS: &[&str] = &[
+    "this", "self", "super", "cls", "process", "console", "logger", "log", "window", "document",
+    "global", "os", "sys", "req", "res", "request", "response", "ctx", "mutex", "conn", "client",
+    "state", "props",
+];
+
+/// Does everything before the extension read like a file stem rather than a
+/// receiver?
+///
+/// A file stem is lowercase (`main.go`, `server.log`, `app.db`, `foo.h`,
+/// `app.module.json`) or all caps (`README.md`, `CONFIG.env`), and does not
+/// start with one of the [`RECEIVERS`] (`this`, `process`, `logger`...). A
+/// capital inside it (`App.go`, `userRepo.db`) or a receiver first
+/// (`this.state.db`) reads as a qualified identifier. Ambiguous on its face —
+/// `mutex.lock` and `server.lock` look alike — so the known receivers settle
+/// the common cases and everything else stays a file name: an identifier left
+/// unanchored is a missed boost, a file name looked up as a symbol costs a
+/// query and pins nothing.
+fn looks_like_file_stem(parts: &[&str]) -> bool {
+    let Some((_, stem)) = parts.split_last() else {
+        return false;
+    };
+    if stem.is_empty() || stem.first().is_some_and(|f| RECEIVERS.contains(f)) {
+        return false;
+    }
+    let all_lower = stem.iter().all(|p| !p.chars().any(char::is_uppercase));
+    let all_upper = stem.iter().all(|p| {
+        p.chars().any(char::is_alphabetic)
+            && p.chars()
+                .filter(|c| c.is_alphabetic())
+                .all(char::is_uppercase)
+    });
+    all_lower || all_upper
+}
+
 /// Is this dotted token a file name (`state.rs`), a version (`v0.8.4`) or an
 /// abbreviation (`e.g`, `i.e`) rather than a qualified identifier?
 fn dotted_non_identifier(tok: &str) -> bool {
@@ -391,7 +500,9 @@ fn dotted_non_identifier(tok: &str) -> bool {
         .last()
         .map(|p| p.to_ascii_lowercase())
         .unwrap_or_default();
-    if FILE_EXTENSIONS.contains(&last.as_str()) {
+    if FILE_EXTENSIONS.contains(&last.as_str())
+        && (!AMBIGUOUS_EXTENSIONS.contains(&last.as_str()) || looks_like_file_stem(&parts))
+    {
         return true;
     }
     // A version: `v0`, `8`, `4` — a segment that is (v +) digits.
@@ -455,6 +566,15 @@ pub fn identifier_tokens(query: &str) -> Vec<String> {
     out
 }
 
+/// The identifier tokens anchoring actually looks up: the first
+/// [`ANCHOR_TOKENS`] of [`identifier_tokens`]. Whoever marks hits as
+/// `anchored` must use this set, not every identifier of the query.
+pub fn anchor_tokens(query: &str) -> Vec<String> {
+    let mut tokens = identifier_tokens(query);
+    tokens.truncate(ANCHOR_TOKENS);
+    tokens
+}
+
 /// Put the definitions of identifier-shaped query tokens in front of `ranked`.
 ///
 /// BM25 ranks a chunk that *mentions* `do_memories_by_symbol` many times above
@@ -475,25 +595,21 @@ fn anchor_identifiers(
     ranked: Vec<SearchResult>,
     opts: &RankOptions,
 ) -> Vec<SearchResult> {
-    let mut tokens = identifier_tokens(query);
-    tokens.truncate(ANCHOR_TOKENS);
+    let tokens = anchor_tokens(query);
     if tokens.is_empty() {
         return ranked;
     }
     let mut pinned: Vec<VectorPoint> = Vec::new();
     for t in &tokens {
         let found = store
-            .symbol_matches(filter, t, ANCHOR_MAX)
+            .symbol_matches(filter, t, ANCHOR_FETCH)
             .unwrap_or_default();
-        for p in found {
+        for p in rank_definitions(found, opts) {
             if !pinned.iter().any(|q| q.id == p.id) {
                 pinned.push(p);
             }
         }
     }
-    // A definition is never demoted by the penalty — the query named it — but
-    // an explicit hard filter still applies to it.
-    pinned.retain(|p| opts.keeps(path_kind(&p.metadata.file, &p.metadata.language)));
     pinned.truncate((limit / 2).max(1));
     if pinned.is_empty() {
         return ranked;
@@ -511,6 +627,30 @@ fn anchor_identifiers(
     let mut out = dedup_hits(out);
     out.truncate(limit);
     out
+}
+
+/// The [`ANCHOR_MAX`] definitions of one identifier worth pinning, out of what
+/// the store found (in path order).
+///
+/// Production code first, then everything else, each by path: an anchored
+/// definition is not penalised (the query named it), so without this a
+/// `__mocks__/foo.service.ts` — which sorts before `src/` — was pinned above
+/// the real `FooService`. The hard filter applies *before* the cut, so with
+/// `include_tests: false` three test copies that sort first can no longer use
+/// up the slots and leave the real definition unpinned.
+fn rank_definitions(mut found: Vec<VectorPoint>, opts: &RankOptions) -> Vec<VectorPoint> {
+    found.retain(|p| opts.keeps(path_kind(&p.metadata.file, &p.metadata.language)));
+    found.sort_by(|a, b| {
+        let code =
+            |p: &VectorPoint| path_kind(&p.metadata.file, &p.metadata.language) != PathKind::Code;
+        (code(a), &a.metadata.file, a.metadata.start_line).cmp(&(
+            code(b),
+            &b.metadata.file,
+            b.metadata.start_line,
+        ))
+    });
+    found.truncate(ANCHOR_MAX);
+    found
 }
 
 /// Chunk levels that summarise a range rather than hold its code: the `file`
@@ -1542,5 +1682,279 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SearchError::MissingEmbedder(_)));
+    }
+
+    /// I-1: a hard filter widens the fetch to `FILTERED_POOL` per retriever;
+    /// the cross-encoder must still only see what it asked for.
+    #[test]
+    fn a_hard_filter_does_not_hand_the_reranker_the_widened_pool() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let pts: Vec<VectorPoint> = (0..500)
+            .map(|i| {
+                code(
+                    &format!("c{i}"),
+                    "main",
+                    &format!("src/m{i}.rs"),
+                    (1, 9),
+                    "f",
+                    "database",
+                    [0.0, 1.0, 0.0, 0.0],
+                )
+            })
+            .collect();
+        store.upsert(&pts).unwrap();
+        let seen = Recording(std::sync::Mutex::new(0));
+        let opts = RankOptions {
+            include_tests: false,
+            ..Default::default()
+        };
+        let hits = search_ranked(
+            &store,
+            "database",
+            &SearchFilter::default(),
+            5,
+            SearchMode::Vector,
+            Some(&KwEmbedder),
+            Some(&seen),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 5);
+        let n = *seen.0.lock().unwrap();
+        assert_eq!(n, 100, "the reranker scored {n} candidates, not its pool");
+    }
+
+    /// A production definition and homonymous test copies, plus callers that
+    /// out-rank all of them, so only anchoring can put a definition first.
+    fn homonym_store(tests: &[&str]) -> Store {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mut pts = vec![
+            code(
+                "c1",
+                "main",
+                "src/a.ts",
+                (1, 9),
+                "useIt",
+                "FooService FooService database",
+                [0.0, 1.0, 0.0, 0.0],
+            ),
+            code(
+                "c2",
+                "main",
+                "src/b.ts",
+                (1, 9),
+                "useMore",
+                "FooService FooService database",
+                [0.0, 1.0, 0.0, 0.0],
+            ),
+            code(
+                "real",
+                "main",
+                "src/app/foo.service.ts",
+                (1, 40),
+                "FooService",
+                "class FooService { real }",
+                [0.0, 0.0, 1.0, 0.0],
+            ),
+        ];
+        for (i, f) in tests.iter().enumerate() {
+            pts.push(code(
+                &format!("t{i}"),
+                "main",
+                f,
+                (1, 9),
+                "FooService",
+                "class FooService { fake }",
+                [0.0, 0.0, 1.0, 0.0],
+            ));
+        }
+        store.upsert(&pts).unwrap();
+        let _ = store.rebuild_fts().unwrap();
+        store
+    }
+
+    fn hybrid_ids(store: &Store, query: &str, opts: &RankOptions) -> Vec<String> {
+        ids(&search_ranked(
+            store,
+            query,
+            &SearchFilter::default(),
+            6,
+            SearchMode::Hybrid,
+            Some(&KwEmbedder),
+            None,
+            opts,
+        )
+        .unwrap())
+    }
+
+    /// I-2 (B): `__mocks__/` sorts before `src/`; the mock used to be pinned
+    /// first and, anchored hits being unpenalised, beat production.
+    #[test]
+    fn an_anchored_mock_never_outranks_the_production_definition() {
+        let store = homonym_store(&["__mocks__/foo.service.ts", "docs/FooService.md"]);
+        let hits = hybrid_ids(&store, "FooService database", &RankOptions::default());
+        assert_eq!(hits.first().map(String::as_str), Some("real"), "{hits:?}");
+    }
+
+    /// I-2 (A): with `include_tests: false`, three test copies that sort
+    /// before the real definition used to take every anchoring slot and be
+    /// dropped by the filter afterwards — nothing was pinned at all.
+    #[test]
+    fn test_copies_do_not_crowd_the_definition_out_of_anchoring() {
+        let store = homonym_store(&[
+            "__mocks__/foo.service.ts",
+            "app/foo.service.spec.ts",
+            "e2e/foo.service.ts",
+        ]);
+        let opts = RankOptions {
+            include_tests: false,
+            ..Default::default()
+        };
+        let hits = hybrid_ids(&store, "FooService database", &opts);
+        assert_eq!(hits.first().map(String::as_str), Some("real"), "{hits:?}");
+        assert!(!hits.iter().any(|h| h.starts_with('t')), "{hits:?}");
+    }
+
+    /// A unit vector on the "database" axis at cosine `c` from the query.
+    fn at_cos(c: f32) -> [f32; DIM] {
+        [0.0, c, (1.0 - c * c).sqrt(), 0.0]
+    }
+
+    /// I-3: in vector mode cosines cluster in ~0.6–0.85. `score × 0.6` sent a
+    /// config file that is clearly the answer (0.85) below every code hit
+    /// (0.51 < 0.62); demoting by positions keeps it in the top results.
+    #[test]
+    fn a_clearly_more_relevant_config_stays_in_the_top_results_in_vector_mode() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mut pts = vec![code(
+            "cfg",
+            "main",
+            "config/pool.yaml",
+            (1, 9),
+            "",
+            "database pool settings",
+            at_cos(0.85),
+        )];
+        for (i, c) in [0.75, 0.72, 0.70, 0.68, 0.65, 0.62].iter().enumerate() {
+            pts.push(code(
+                &format!("c{i}"),
+                "main",
+                &format!("src/m{i}.rs"),
+                (1, 9),
+                "f",
+                "database",
+                at_cos(*c),
+            ));
+        }
+        store.upsert(&pts).unwrap();
+        let hits = run_ranked(&store, &RankOptions::default());
+        let pos = hits.iter().position(|h| h == "cfg").unwrap();
+        assert!(pos <= 4, "the config fell to position {pos}: {hits:?}");
+        assert!(pos >= 1, "the penalty still demotes it: {hits:?}");
+    }
+
+    /// I-3, the other side: a README that edges out comparable code by a hair
+    /// still ranks below it.
+    #[test]
+    fn a_marginally_more_relevant_readme_ranks_below_comparable_code() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        store
+            .upsert(&[
+                code(
+                    "readme",
+                    "main",
+                    "README.md",
+                    (1, 9),
+                    "",
+                    "database",
+                    at_cos(0.80),
+                ),
+                code(
+                    "code",
+                    "main",
+                    "src/db.rs",
+                    (1, 9),
+                    "f",
+                    "database",
+                    at_cos(0.79),
+                ),
+            ])
+            .unwrap();
+        let hits = run_ranked(&store, &RankOptions::default());
+        assert_eq!(hits, ["code", "readme"]);
+    }
+
+    /// The penalty reorders but never raises a score, and leaves the list
+    /// monotone for whoever reads scores as relevance.
+    #[test]
+    fn the_penalty_keeps_scores_monotone_and_never_raises_one() {
+        let mk = |id: &str, file: &str, score: f32| SearchResult {
+            score,
+            point: code(id, "main", file, (1, 9), "", id, [0.0; DIM]),
+        };
+        let input = vec![
+            mk("doc", "README.md", 0.9),
+            mk("a", "src/a.rs", 0.8),
+            mk("b", "src/b.rs", 0.7),
+        ];
+        let out = apply_penalty(input, &KindPenalty::default());
+        assert_eq!(ids(&out), ["a", "b", "doc"]);
+        let scores: Vec<f32> = out.iter().map(|h| h.score).collect();
+        assert_eq!(scores, [0.8, 0.7, 0.7]);
+
+        // Factor 0.0 buries; NONE leaves the list untouched.
+        let bury = KindPenalty {
+            doc: 0.0,
+            ..KindPenalty::NONE
+        };
+        let many: Vec<SearchResult> = std::iter::once(mk("doc", "README.md", 1.0))
+            .chain((0..20).map(|i| mk(&format!("c{i}"), &format!("src/{i}.rs"), 0.5)))
+            .collect();
+        assert_eq!(
+            ids(&apply_penalty(many.clone(), &bury)).last().unwrap(),
+            "doc"
+        );
+        assert_eq!(
+            ids(&apply_penalty(many.clone(), &KindPenalty::NONE)),
+            ids(&many)
+        );
+    }
+
+    /// M-4: a qualified name whose last segment is also an extension is an
+    /// identifier unless the stem reads like a file name.
+    #[test]
+    fn member_names_that_look_like_extensions_are_identifiers() {
+        for q in [
+            "process.env",
+            "this.db",
+            "logger.log",
+            "App.go",
+            "res.json",
+            "this.state.db",
+        ] {
+            assert_eq!(identifier_tokens(q), [q], "{q}");
+        }
+        for q in [
+            "main.go",
+            "server.log",
+            "foo.h",
+            "util.c",
+            "app.db",
+            "README.md",
+            "state.rs",
+            "app.module.json",
+            "index.html",
+        ] {
+            assert!(identifier_tokens(q).is_empty(), "{q} is a file name");
+        }
+    }
+
+    /// Only the first `ANCHOR_TOKENS` identifiers are looked up; the `anchored`
+    /// marking must use the same set.
+    #[test]
+    fn anchor_tokens_are_the_truncated_identifier_set() {
+        let q = "alpha_one beta_two gamma_three delta_four";
+        assert_eq!(identifier_tokens(q).len(), 4);
+        assert_eq!(anchor_tokens(q), ["alpha_one", "beta_two", "gamma_three"]);
     }
 }

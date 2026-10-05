@@ -639,7 +639,7 @@ fn search_items(
     // Hits pinned because the query named their symbol say so, so an agent can
     // tell "ranked first" from "is the definition of what you typed".
     if mode != SearchMode::Vector {
-        let idents = devctx_search::identifier_tokens(query);
+        let idents = devctx_search::anchor_tokens(query);
         for (item, hit) in items.iter_mut().zip(&hits) {
             let m = &hit.point.metadata;
             let is_def = !matches!(m.chunk_level.as_str(), "memory" | "memory_chunk")

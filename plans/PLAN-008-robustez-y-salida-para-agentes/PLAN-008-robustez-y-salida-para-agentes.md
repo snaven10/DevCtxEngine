@@ -357,6 +357,14 @@ Cada TASK llena su `## Resultado` con:
   worktree principal; el commit del worktree entra al índice cuando llega a una rama trackeada.
 - **Q-3 → sí, con opt-out (2026-10-04).** `build/` entra en los excludes por defecto junto con
   `node_modules`, `target` y `dist`; una opción de config permite volver a indexarlo.
+  - **Precisión de Q-3 (2026-10-05).** `build/` y `target/` se anclan a la **raíz del repo**
+    (`/build/`, `/target/`), no a cualquier profundidad: `src/x/build/Builder.java` o un paquete
+    Java `target` son código. El primer reconcile registra cuántos archivos excluye cada patrón.
+    `node_modules/`, `dist/`, `vendor/`, `third_party/`, `bower_components/` siguen a cualquier
+    profundidad: en monorepos cada paquete emite su `dist/` y nadie llama `dist` a un directorio
+    de fuentes. Quien quiera `target/` a cualquier profundidad (Maven multi-módulo con `target/`
+    trackeado) lo añade en `indexing.exclude: ["target/"]`; quien quiera indexar el `/target/`
+    raíz lo reincluye con `indexing.exclude: ["!/target/"]`.
 - **Q-4 → OK.** `search_routes` 20, `plan_status` 25 planes, `memories_by_*` 5 recortadas a 600
   caracteres.
 - Ejecución de P0 en la rama `feat/plan-008-p0`, con compilación y tests autorizados; la sesión

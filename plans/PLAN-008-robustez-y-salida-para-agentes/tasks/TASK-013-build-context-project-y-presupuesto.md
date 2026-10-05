@@ -72,3 +72,11 @@ medirlo y reportarlo.
 6. **Contrato:** `build_context` (MCP) acepta `project`, `kind`, `include_tests`; `POST /context` acepta `kind`, `include_tests`. Salida prosa: primera línea `[devctx] context from <repo>` (con `(best match among N members)` si eligió por score); cierre `[devctx] omitted: N item(s), reason: budget (T tokens)...` (una sola vez); `[devctx] branch_fallback: ...` se mantiene. Memorias: `[memory] <id> — <título>` + primeras líneas (6 líneas / 500 chars), sin marca de truncado por ítem.
 7. **No verificado:** consulta de campo en revfa (TASK-016); el margen de selección `PICK_MARGIN=0.03` sobre media top-3 de coseno es heurístico, sin calibrar en campo; no hay test de integración end-to-end del grupo (la selección se prueba sobre `choose_member`/`member_score`, la fan-out reusa `search_one` ya cubierto).
 8. **Parámetros/números:** búsqueda `hybrid` limit 30, rerank off; memorias ≤35% del presupuesto; un chunk ≤ max(presupuesto/3, 600 chars); doc inicial >6 líneas se deja en 3 + "N doc lines trimmed"; selección: top-3 por miembro (vector), margen 0.03. Costo de selección: N búsquedas (una por miembro, lotes de 4) más la de contexto; igual que `search` en grupo; no medido en tiempo.
+
+### Fixup F (review)
+
+- Sin cambios en `build_context`. Efecto indirecto: `search_ranked` ya no multiplica scores por 0.6 sino que
+  degrada por posiciones y deja los scores monótonos (`min(propio, anterior)`), así que `member_score` (media
+  top-3) deja de castigar ×0.6 al miembro cuyo mejor hit es un doc/test/config; y el pool del reranker se corta a
+  `max(pool, 2×limit)` también con filtro duro (TASK-011 Fixup F, I-1). Los tests de `build_context`/`group_pick`
+  pasan sin cambios.

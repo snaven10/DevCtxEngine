@@ -398,6 +398,18 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
             .cloned()
             .collect();
         now_excluded.sort();
+        let counts = exclude_counts(&ctx.excluded, &now_excluded);
+        if !counts.is_empty() {
+            let per = counts
+                .iter()
+                .map(|(p, n)| format!("{p}: {n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "· the exclude set changed: {} indexed file(s) are now excluded ({per})",
+                now_excluded.len()
+            );
+        }
         let listed: HashSet<String> = changes.iter().map(|c| change_path(c).to_string()).collect();
         let tracked = match &read_from {
             Some(b) => git.changes_at(b, None)?,
@@ -667,7 +679,7 @@ pub fn exclude_fingerprint(patterns: &[String]) -> String {
 /// depth — which is what anyone writing these patterns expects. An unparseable
 /// pattern is dropped rather than failing the run; refusing to index because one
 /// line of config is malformed helps nobody.
-fn build_exclude(patterns: &[String]) -> Gitignore {
+pub(crate) fn build_exclude(patterns: &[String]) -> Gitignore {
     if patterns.is_empty() {
         return Gitignore::empty();
     }
@@ -676,6 +688,30 @@ fn build_exclude(patterns: &[String]) -> Gitignore {
         let _ = b.add_line(None, p);
     }
     b.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+/// How many of `files` each exclude pattern covers, in first-seen order of
+/// the patterns (the one that decided each file: for a gitignore set, the last
+/// matching rule). Files under one of devctx's own directories, which no
+/// pattern decides, are counted under `(devctx artifacts)`.
+///
+/// Logged by the reconcile so a changed default — `/build/` anchored to the
+/// root, a new `*.generated.*` — says what it removed instead of just how many.
+pub(crate) fn exclude_counts(excluded: &Gitignore, files: &[String]) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for f in files {
+        let path = Path::new(f);
+        let key = match excluded.matched_path_or_any_parents(path, false) {
+            ignore::Match::Ignore(g) => g.original().to_string(),
+            _ if is_own_artifact(path) => "(devctx artifacts)".to_string(),
+            _ => continue,
+        };
+        match out.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => out.push((key, 1)),
+        }
+    }
+    out
 }
 
 /// A minified line is longer than any line a person writes. 1,000 characters is
