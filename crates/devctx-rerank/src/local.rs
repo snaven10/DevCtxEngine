@@ -110,6 +110,12 @@ fn init_on<T>(
                 eprintln!("devctx: reranking requested CUDA (device: cuda)");
                 match init(providers) {
                     Ok(model) => return Ok((model, true)),
+                    // A stalled download is not a CUDA problem, and retrying
+                    // on CPU would only queue behind the stuck loader's lock
+                    // (see `devctx_core::modelload`): report it as it is.
+                    Err(e) if devctx_core::modelload::is_stall_error(&e.to_string()) => {
+                        return Err(e)
+                    }
                     Err(e) => eprintln!(
                         "devctx: warning: CUDA failed for reranking ({e}); falling back to CPU. \
                          Check the NVIDIA driver, CUDA 12 toolkit and cuDNN 9."
@@ -192,7 +198,10 @@ fn build(key: &str, model_dir: Option<&Path>, device: Device) -> Result<(TextRer
         opts = opts.with_cache_dir(cache);
     }
     init_on(device, |eps| {
-        TextRerank::try_new(opts.clone().with_execution_providers(eps))
+        // hf-hub's download has no read timeout: guard it (see `modelload`).
+        let opts = opts.clone().with_execution_providers(eps);
+        devctx_core::modelload::guard_load(key, move || TextRerank::try_new(opts))
+            .map_err(RerankError::Backend)?
             .map_err(|e| RerankError::Backend(e.to_string()))
     })
 }

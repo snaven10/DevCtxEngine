@@ -8,6 +8,9 @@ use duckdb::params;
 use crate::error::Result;
 use crate::store::Store;
 
+/// The `index_meta` key under which the extractor fingerprint is stored.
+pub const EXTRACTOR_META_KEY: &str = "extractor";
+
 /// One `index_state` row: what was last indexed for a (repo_path, branch).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRecord {
@@ -102,11 +105,11 @@ impl Store {
 
     /// Insert or replace an index record.
     pub fn save_index_record(&self, rec: &IndexRecord) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
             params![rec.repo_path, rec.branch],
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "INSERT INTO index_state (repo_path, branch, last_commit, model_name,
                 model_dimension, file_count, symbol_count, chunk_count, indexed_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -123,6 +126,65 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// One `index_meta` value for a (repo_path, branch), if recorded.
+    pub fn get_index_meta(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT value FROM index_meta WHERE repo_path = ? AND branch = ? AND key = ?",
+        )?;
+        match stmt.query_row(params![repo_path, branch, key], |r| r.get::<_, String>(0)) {
+            Ok(v) => Ok(Some(v)),
+            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Insert or replace one `index_meta` value.
+    pub fn set_index_meta(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.w()?.execute(
+            "DELETE FROM index_meta WHERE repo_path = ? AND branch = ? AND key = ?",
+            params![repo_path, branch, key],
+        )?;
+        self.w()?.execute(
+            "INSERT INTO index_meta (repo_path, branch, key, value) VALUES (?, ?, ?, ?)",
+            params![repo_path, branch, key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Forget one `index_meta` value (a branch whose record is missing, as
+    /// every index made before the extractor fingerprint existed).
+    pub fn delete_index_meta(&self, repo_path: &str, branch: &str, key: &str) -> Result<()> {
+        self.w()?.execute(
+            "DELETE FROM index_meta WHERE repo_path = ? AND branch = ? AND key = ?",
+            params![repo_path, branch, key],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the index of a (repo_path, branch) was built by an extractor
+    /// other than `current` (an [`extractor fingerprint`]). An index with no
+    /// recorded extractor — every index made before this existed — counts as
+    /// stale: its extractor is unknown, and "unknown" must not read as "fine".
+    ///
+    /// [`extractor fingerprint`]: EXTRACTOR_META_KEY
+    pub fn extractor_stale(&self, repo_path: &str, branch: &str, current: &str) -> Result<bool> {
+        Ok(self
+            .get_index_meta(repo_path, branch, EXTRACTOR_META_KEY)?
+            .as_deref()
+            != Some(current))
     }
 
     /// The last-indexed content hash for a file, if recorded.
@@ -145,11 +207,11 @@ impl Store {
 
     /// Insert or replace a file-state row.
     pub fn save_file_state(&self, fs: &FileState) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
             params![fs.repo_path, fs.branch, fs.file_path],
         )?;
-        self.conn.execute(
+        self.w()?.execute(
             "INSERT INTO file_state (repo_path, branch, file_path, content_hash, language,
                 symbol_count, chunk_count)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -177,21 +239,36 @@ impl Store {
     ///
     /// `content_hash` is what makes that safe: identical bytes give an
     /// identical hash, so a hit means the chunks already in the store are the
-    /// chunks this branch would have produced.
+    /// chunks this branch would have produced — *provided the same extractor
+    /// produced them*. Rows also carry symbols and edges, so only branches
+    /// whose `index_meta` records `extractor` (the current fingerprint) are
+    /// offered; a branch from an older extractor, or one with no record, would
+    /// smuggle its stale symbols into a branch about to be stamped fresh.
     pub fn branch_with_same_content(
         &self,
         repo_path: &str,
         file: &str,
         content_hash: &str,
         except_branch: &str,
+        extractor: &str,
     ) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT branch FROM file_state
-             WHERE repo_path = ? AND file_path = ? AND content_hash = ? AND branch <> ?
+            "SELECT f.branch FROM file_state f
+             JOIN index_meta m
+               ON m.repo_path = f.repo_path AND m.branch = f.branch AND m.key = ?
+             WHERE f.repo_path = ? AND f.file_path = ? AND f.content_hash = ?
+               AND f.branch <> ? AND m.value = ?
              LIMIT 1",
         )?;
         match stmt.query_row(
-            duckdb::params![repo_path, file, content_hash, except_branch],
+            duckdb::params![
+                EXTRACTOR_META_KEY,
+                repo_path,
+                file,
+                content_hash,
+                except_branch,
+                extractor
+            ],
             |r| r.get::<_, String>(0),
         ) {
             Ok(b) => Ok(Some(b)),
@@ -211,12 +288,47 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Branches with an `index_state` record for this repository, most recently
+    /// indexed first. What "the last indexed branch" means when neither the
+    /// checked-out nor the default branch has anything.
+    pub fn branches_by_recency(&self, repo_path: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT branch FROM index_state WHERE repo_path = ? ORDER BY indexed_at DESC, branch",
+        )?;
+        let rows = stmt.query_map(duckdb::params![repo_path], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn delete_file_state(&self, repo_path: &str, branch: &str, file: &str) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
             params![repo_path, branch, file],
         )?;
         Ok(())
+    }
+
+    /// Files whose state row says they hold chunks while `vectors` holds none
+    /// for them, as `(branch, file)`.
+    ///
+    /// The signature of a file whose writes were cut half-way: its content
+    /// hash recorded (so every incremental run skips it as unchanged) over
+    /// vectors already deleted. One transaction per file makes it impossible;
+    /// this is how a test — or a curious operator — proves it. Vectors are
+    /// keyed by the repository's short name and state rows by its path, so the
+    /// match is on branch and file, which is exact for a store holding one
+    /// repository (every project store does).
+    pub fn files_missing_vectors(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.branch, f.file_path FROM file_state f
+             WHERE f.chunk_count > 0
+               AND NOT EXISTS (SELECT 1 FROM vectors v
+                               WHERE v.branch = f.branch AND v.file = f.file_path)
+             ORDER BY f.branch, f.file_path",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// All file paths with recorded state for a (repo_path, branch). Used to
@@ -252,6 +364,26 @@ mod tests {
         };
         store.save_index_record(&rec).unwrap();
         assert_eq!(store.get_index_record("/repo", "main").unwrap(), Some(rec));
+    }
+
+    #[test]
+    fn a_store_without_index_meta_reports_a_stale_extractor() {
+        let store = Store::open_in_memory(3).unwrap();
+        // Simulates a database created before the table existed.
+        store.conn.execute_batch("DROP TABLE index_meta;").unwrap();
+        crate::schema::init_schema(&store.conn, 3).unwrap();
+        assert!(store.extractor_stale("/repo", "main", "v1-x").unwrap());
+        store
+            .set_index_meta("/repo", "main", EXTRACTOR_META_KEY, "v1-x")
+            .unwrap();
+        assert!(!store.extractor_stale("/repo", "main", "v1-x").unwrap());
+        assert!(store.extractor_stale("/repo", "main", "v2-y").unwrap());
+        assert!(store.extractor_stale("/repo", "dev", "v1-x").unwrap());
+        // Replacing, not appending.
+        store
+            .set_index_meta("/repo", "main", EXTRACTOR_META_KEY, "v2-y")
+            .unwrap();
+        assert!(!store.extractor_stale("/repo", "main", "v2-y").unwrap());
     }
 
     /// Totals must survive a run that changed nothing: an incremental index

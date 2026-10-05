@@ -12,6 +12,7 @@
 //! plain `devctx projects list` acceptable.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -110,8 +111,22 @@ pub async fn serve(
         guard.config().reindex.every_seconds
     };
     let registry = api.central.clone();
+    // The exit checkpoint's own connection to the same database, taken now so
+    // that it never needs the mutex: a request holding it for minutes (a
+    // large import, a re-embedding) used to leave the idle exit choosing
+    // between waiting on that request and leaving with the WAL unfolded.
+    let folding = {
+        let guard = api.central.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        guard.store().try_clone()?
+    };
     let activity = Arc::new(Mutex::new(Instant::now()));
-    let app = router(api).layer(middleware::from_fn_with_state(activity.clone(), track));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let app = router(api)
+        .layer(middleware::from_fn_with_state(activity.clone(), track))
+        .layer(middleware::from_fn_with_state(
+            in_flight.clone(),
+            count_requests,
+        ));
     let (listener, addr) = bind_near(addr).await?;
     // Announce only now, and with the port actually bound. Advertising the
     // requested one before binding was fine while a taken port meant the daemon
@@ -121,21 +136,52 @@ pub async fn serve(
     eprintln!("DevCtxEngine central store listening on http://{addr}");
 
     if let Some(timeout) = idle {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                // See the same loop in `lib.rs::serve`: a poisoned lock read as
+        // A plain thread, so the timer does not depend on the runtime's workers.
+        let poll = (timeout / 4).clamp(Duration::from_millis(250), Duration::from_secs(30));
+        let mut exit_store = Some(folding);
+        let _ = std::thread::Builder::new()
+            .name("idle-watchdog".into())
+            .spawn(move || loop {
+                std::thread::sleep(poll);
+                // See the same loop in `lib.rs`: a poisoned lock read as
                 // `Duration::ZERO` makes this server immortal instead of idle.
                 let idle_for = match activity.lock() {
                     Ok(t) => t.elapsed(),
                     Err(poisoned) => poisoned.into_inner().elapsed(),
                 };
-                if idle_for >= timeout {
-                    eprintln!("Central store idle for {idle_for:?}; shutting down.");
-                    std::process::exit(0);
+                if idle_for < timeout {
+                    continue;
                 }
-            }
-        });
+                // A request still being answered is not idleness: the clock
+                // was stamped when it began. Only one running for several
+                // windows is taken for stuck, so it cannot make the daemon
+                // immortal either.
+                if in_flight.load(Ordering::SeqCst) > 0 && idle_for < timeout * STUCK_WINDOWS {
+                    continue;
+                }
+                eprintln!("Central store idle for {idle_for:?}; shutting down.");
+                // `exit` runs no destructors, so the connection is never
+                // closed: freeze and fold the WAL first (see
+                // `Store::checkpoint`, `Store::freeze`), on the daemon's own
+                // exit connection and with a budget. `FORCE` aborts the
+                // transaction of a request still running; frozen, nothing it
+                // does next can write. The helper ends the process itself the
+                // moment the checkpoint returns.
+                let store = exit_store.take();
+                let _ = std::thread::Builder::new()
+                    .name("exit-checkpoint".into())
+                    .spawn(move || {
+                        if let Some(store) = store {
+                            store.freeze(Duration::from_millis(500));
+                            if store.try_checkpoint().is_err() {
+                                let _ = store.force_checkpoint();
+                            }
+                        }
+                        crate::hard_exit(0);
+                    });
+                std::thread::sleep(Duration::from_millis(1500));
+                crate::hard_exit(0);
+            });
     }
 
     if sweep_every > 0 {
@@ -162,6 +208,26 @@ pub async fn serve(
     Ok(())
 }
 
+/// How many idle windows a single request may run before the idle exit stops
+/// waiting for it.
+const STUCK_WINDOWS: u32 = 4;
+
+/// Middleware: count the non-health requests being answered.
+async fn count_requests(State(n): State<Arc<AtomicUsize>>, req: Request, next: Next) -> Response {
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    struct Guard(Arc<AtomicUsize>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    n.fetch_add(1, Ordering::SeqCst);
+    let _guard = Guard(n.clone());
+    next.run(req).await
+}
+
 /// Registered projects whose HEAD has moved since they were last indexed.
 ///
 /// Deliberately compares `git rev-parse HEAD` against the recorded commit
@@ -185,7 +251,7 @@ fn stale_projects(registry: &Arc<Mutex<Central>>) -> Vec<(String, String)> {
 }
 
 fn head_commit(path: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new("git"))
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "HEAD"])
@@ -200,10 +266,10 @@ fn head_commit(path: &str) -> Option<String> {
 /// Index a project by running `devctx index` inside it, so the work goes
 /// through that project's own server rather than this process.
 fn index_project(path: &str) {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = devctx_core::self_exe() else {
         return;
     };
-    let _ = std::process::Command::new(exe)
+    let _ = devctx_core::clean_git_env(&mut std::process::Command::new(exe))
         .arg("index")
         .current_dir(path)
         .stdout(std::process::Stdio::null())
@@ -222,7 +288,10 @@ pub fn run_blocking(
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(central, addr, token, idle, announce))
+    let result = rt.block_on(serve(central, addr, token, idle, announce));
+    // Bounded: the implicit drop waits for the blocking pool with no limit.
+    rt.shutdown_timeout(Duration::from_secs(5));
+    result
 }
 
 // --- request bodies / query params ---

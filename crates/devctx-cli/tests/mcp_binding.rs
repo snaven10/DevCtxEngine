@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod common;
+
 /// Serialises every test that writes a memory — across test binaries, not just
 /// within this one.
 ///
@@ -76,6 +78,7 @@ impl Tmp {
         let dir = std::env::temp_dir().join(format!("devctx_bind_it_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        common::share_models(&dir.join("central"));
         Self(dir)
     }
 
@@ -128,6 +131,8 @@ impl Drop for Tmp {
             .env("DEVCTX_HOME", self.home())
             .args(["serve", "--central", "--stop"])
             .output();
+        // Whatever those did not reach (no `serve.json`, a server mid-spawn).
+        common::reap_servers_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -495,6 +500,7 @@ fn scope_defaults_follow_the_binding() {
 /// another repository's code with no sign that it did.
 #[test]
 fn a_project_hint_selects_the_member() {
+    let _serial = EmbedLock::acquire();
     let tmp = Tmp::new("hint");
     let home = tmp.home();
     let ws = tmp.dir("workspace");
@@ -505,6 +511,7 @@ fn a_project_hint_selects_the_member() {
     // one answered.
     std::fs::write(alpha.join("who.txt"), "i am alpha").unwrap();
     std::fs::write(beta.join("who.txt"), "i am beta").unwrap();
+    std::fs::write(beta.join("lib.rs"), "pub fn beta_marker() {}\n").unwrap();
 
     // Some code tools ask git where the repository root is, so the members have
     // to be real repositories rather than registered directories.
@@ -541,7 +548,10 @@ fn a_project_hint_selects_the_member() {
     // `read_file` returns a bare string, and `annotate` deliberately leaves
     // those alone rather than changing a shape callers already parse. A tool
     // that answers with an object carries `resolved_project`, which is how a
-    // caller tells an honoured hint from a silently ignored one.
+    // caller tells an honoured hint from a silently ignored one. The member has
+    // to be indexed first: a graph tool answers "nothing indexed" with an
+    // explicit error, not an object (PLAN-008 TASK-006).
+    index_directly(&home, &beta);
     let obj = call_tool(
         &home,
         &ws,
@@ -553,6 +563,95 @@ fn a_project_hint_selects_the_member() {
         Some("beta"),
         "an object answer must name the project it resolved to, got: {obj}"
     );
+}
+
+/// Index a repository in-process (no server), the way `devctx index` does with
+/// autoserve off. The repository must already be a git repo with a commit.
+fn index_directly(home: &Path, repo: &Path) {
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", home)
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(repo)
+        .arg("index")
+        .output()
+        .expect("running devctx index");
+    assert!(
+        out.status.success(),
+        "index: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn git_in(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// PLAN-008 TASK-006 (B4) — the graph answers from an indexed branch, and says so.
+///
+/// Indexed on one branch, checked out on another nobody indexed: `search` has
+/// always fallen back, but the graph tools filtered by the current branch and
+/// answered `[]` with no explanation. Now they use the same rule and carry
+/// `branch_fallback`; and a repository with no index at all is an error, not `[]`.
+#[test]
+fn graph_tools_fall_back_to_the_indexed_branch_and_say_so() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("graphbranch");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let repo = make_project(&home, &ws, "solo", None);
+    std::fs::write(repo.join("lib.rs"), "pub fn alpha_marker() {}\n").unwrap();
+    git_in(&repo, &["init", "-q", "-b", "trunk"]);
+    git_in(&repo, &["config", "user.email", "t@t"]);
+    git_in(&repo, &["config", "user.name", "t"]);
+    git_in(&repo, &["add", "-A"]);
+    git_in(&repo, &["commit", "-qm", "init"]);
+
+    // Nothing indexed yet: an explicit error, not an empty answer.
+    let msg = call_tool_raw(
+        &home,
+        &repo,
+        "read_symbol",
+        serde_json::json!({"name": "alpha_marker"}),
+    );
+    let err = msg["error"]["message"].as_str().unwrap_or_default();
+    assert!(err.contains("has no index for any branch"), "got: {msg}");
+
+    index_directly(&home, &repo);
+
+    // The indexed branch itself: no new field.
+    let on_trunk = call_tool(
+        &home,
+        &repo,
+        "read_symbol",
+        serde_json::json!({"name": "alpha_marker"}),
+    );
+    assert!(on_trunk.get("branch_fallback").is_none(), "{on_trunk}");
+    assert!(!on_trunk["definitions"].as_array().unwrap().is_empty());
+
+    // A branch nobody indexed.
+    git_in(&repo, &["checkout", "-q", "-b", "feat/not-indexed"]);
+    let on_feature = call_tool(
+        &home,
+        &repo,
+        "read_symbol",
+        serde_json::json!({"name": "alpha_marker"}),
+    );
+    assert!(
+        !on_feature["definitions"].as_array().unwrap().is_empty(),
+        "the graph must answer from the indexed branch, got: {on_feature}"
+    );
+    assert_eq!(on_feature["branch_fallback"]["current"], "feat/not-indexed");
+    assert_eq!(on_feature["branch_fallback"]["used"], "trunk");
 }
 
 /// Call a tool and return the raw JSON-RPC message, so a test can assert on an
@@ -1139,5 +1238,771 @@ fn web_without_any_project_fails_with_the_unbound_explanation() {
     assert!(
         stderr.contains("neither inside a DevCtxEngine repository nor above one"),
         "the why-unbound explanation should be appended:\n{stderr}"
+    );
+}
+
+// --- the MCP never owns the database ---------------------------------------
+
+/// The `host:port` an auto-spawned server for `root` binds, derived the way
+/// `remote::auto_addr` does (FNV-1a over the project path as written in the
+/// project's config). Duplicated on purpose: the test pins the contract.
+fn auto_port(root: &Path) -> u16 {
+    let cfg = std::fs::read_to_string(root.join(".devctx/config.yaml")).unwrap();
+    let path = cfg
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("path:"))
+        .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .expect("project.path in config.yaml");
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in path.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    20000 + (h % 12000) as u16
+}
+
+/// Like `call_tool_raw`, but runs `exe` and times only the tool call (from the
+/// moment the handshake is done), with `before_call` run in between.
+fn call_tool_timed(
+    exe: &Path,
+    home: &Path,
+    cwd: &Path,
+    tool: &str,
+    before_call: impl FnOnce(),
+) -> (serde_json::Value, std::time::Duration) {
+    call_tool_timed_with(exe, home, cwd, tool, "{}", before_call)
+}
+
+/// [`call_tool_timed`] with explicit JSON `arguments`.
+fn call_tool_timed_with(
+    exe: &Path,
+    home: &Path,
+    cwd: &Path,
+    tool: &str,
+    arguments: &str,
+    before_call: impl FnOnce(),
+) -> (serde_json::Value, std::time::Duration) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut child = common::spawn_retrying(
+        Command::new(exe)
+            .env("DEVCTX_HOME", home)
+            .current_dir(cwd)
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawning the MCP server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let init = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"#,
+        r#""2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+    );
+    stdin.write_all(init.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    let mut wait_for = |id: u64| loop {
+        let Some(Ok(line)) = lines.next() else {
+            let _ = child.kill();
+            panic!("the MCP server closed before answering id {id}");
+        };
+        if let Ok(m) = serde_json::from_str::<serde_json::Value>(&line) {
+            if m.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                return m;
+            }
+        }
+    };
+    wait_for(1);
+    before_call();
+    let started = std::time::Instant::now();
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{tool}","arguments":{arguments}}}}}"#
+    );
+    stdin.write_all(call.as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+    let msg = wait_for(2);
+    let elapsed = started.elapsed();
+    drop(stdin);
+    let _ = child.wait();
+    (msg, elapsed)
+}
+
+/// B1: a server that cannot come up used to push the MCP into opening the
+/// DuckDB itself — and holding it, locked, for the whole session. Here the
+/// project's port is taken by a listener that never answers: the tool must
+/// fail with an explanation, and the database must be free afterwards.
+#[test]
+fn a_port_held_by_a_mute_listener_errors_and_leaves_the_database_free() {
+    let tmp = Tmp::new("mute");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+    let _mute = std::net::TcpListener::bind(("127.0.0.1", auto_port(&root)))
+        .expect("the project's auto port is free for the test");
+
+    let (msg, _) = call_tool_timed(
+        Path::new(env!("CARGO_BIN_EXE_devctx")),
+        &home,
+        &root,
+        "index_status",
+        || {},
+    );
+    let err = msg["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an error while no server can start, got: {msg}"));
+    assert!(err.contains("no devctx server"), "unexpected error: {err}");
+
+    // Nothing is left holding the file: a direct open works.
+    let out = devctx(&home, &["status"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && !combined.contains("lock"),
+        "the database should be openable after the MCP failed:\n{combined}"
+    );
+}
+
+/// A lock someone else holds: the tool answers fast and names the owner.
+#[test]
+fn a_foreign_lock_is_reported_quickly_with_the_owner_pid() {
+    let tmp = Tmp::new("foreign");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{}", free_port())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning a hand-run server");
+    let pid = owner.id();
+    let _owner = KillOnDrop(owner);
+    let advert = root.join(".devctx/state/serve.json");
+    let t0 = std::time::Instant::now();
+    while !advert.exists() {
+        assert!(t0.elapsed().as_secs() < 60, "the server never advertised");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Invisible to discovery, still holding the lock.
+    std::fs::remove_file(&advert).unwrap();
+
+    let (msg, elapsed) = call_tool_timed(
+        Path::new(env!("CARGO_BIN_EXE_devctx")),
+        &home,
+        &root,
+        "index_status",
+        || {},
+    );
+    let err = msg["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an error, got: {msg}"));
+    assert!(
+        err.contains(&pid.to_string()),
+        "the error should name the lock owner {pid}: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "took {elapsed:?}: it must not wait out the old 60s budget"
+    );
+}
+
+/// The same lock seen from the CLI: `devctx search` must not spend a minute on
+/// it, and must say who holds the index and how to let go. Run both with the
+/// auto-spawn on (a server is tried and dies on the lock) and off.
+#[test]
+fn the_cli_fails_fast_on_a_foreign_lock_naming_the_pid_and_the_remedy() {
+    let tmp = Tmp::new("clilock");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{}", free_port())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning a hand-run server");
+    let pid = owner.id();
+    let _owner = KillOnDrop(owner);
+    let advert = root.join(".devctx/state/serve.json");
+    let t0 = std::time::Instant::now();
+    while !advert.exists() {
+        assert!(t0.elapsed().as_secs() < 60, "the server never advertised");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Invisible to discovery, still holding the lock.
+    std::fs::remove_file(&advert).unwrap();
+
+    for autoserve_off in [false, true] {
+        for args in [&["search", "x"][..], &["symbol", "x"][..]] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_devctx"));
+            cmd.env("DEVCTX_HOME", &home).current_dir(&root).args(args);
+            if autoserve_off {
+                cmd.env("DEVCTX_NO_AUTOSERVE", "1");
+            }
+            let t = std::time::Instant::now();
+            let out = cmd.output().expect("running devctx");
+            let elapsed = t.elapsed();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let what = format!("{args:?}, autoserve off: {autoserve_off}");
+            assert!(!out.status.success(), "{what}: should fail:\n{stderr}");
+            assert!(
+                stderr.contains(&format!("PID {pid}")),
+                "{what}: should name the owner {pid}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("serve --stop"),
+                "{what}: should say how to release it:\n{stderr}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "{what}: took {elapsed:?}, it must not wait out the old budget"
+            );
+        }
+    }
+}
+
+/// After a reinstall the running MCP's own executable is "…/devctx (deleted)";
+/// it must still be able to start a server.
+#[test]
+fn an_mcp_whose_binary_was_replaced_can_still_start_a_server() {
+    let tmp = Tmp::new("replaced");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+    // `index_status` asks git which branch it is on.
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .expect("running git init");
+    assert!(git.success());
+    let copy = tmp.0.join("devctx-copy");
+    common::install_copy(Path::new(env!("CARGO_BIN_EXE_devctx")), &copy);
+
+    let (msg, _) = call_tool_timed(&copy, &home, &root, "index_status", || {
+        std::fs::remove_file(&copy).expect("deleting the running binary");
+    });
+    assert!(
+        msg.get("error").is_none(),
+        "the server should have started from the replaced binary: {msg}"
+    );
+
+    // I-1: that server was launched through `/proc/self/exe`. It must still be
+    // recognised as a devctx server, so `serve --stop` kills it instead of
+    // deleting its advertisement and leaving it holding the lock.
+    let info: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join(".devctx/state/serve.json")).expect("serve.json"),
+    )
+    .expect("parsing serve.json");
+    let pid = info["pid"].as_u64().expect("pid in serve.json");
+    let proc_dir = format!("/proc/{pid}");
+    assert!(
+        Path::new(&proc_dir).exists(),
+        "the server should be running"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .args(["serve", "--stop"])
+        .output()
+        .expect("running serve --stop");
+    assert!(out.status.success());
+    let t0 = std::time::Instant::now();
+    while Path::new(&proc_dir).exists() && t0.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let still = Path::new(&proc_dir).exists();
+    if still {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+    }
+    assert!(!still, "serve --stop left the server (pid {pid}) running");
+}
+
+// --- MCP lifecycle (PLAN-008 D2) ---------------------------------------------
+
+const INIT_MSGS: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"#,
+    r#""2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"1"}}}"#,
+    "\n",
+    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    "\n",
+);
+
+/// Wait for `child` to exit, polling, and return how long it took (or `None`
+/// if it was still running at `limit`; the child is then killed by PID).
+fn wait_exit(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let t0 = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return Some(t0.elapsed());
+        }
+        if t0.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The client closing stdin ends the session: after a completed handshake the
+/// MCP exits promptly instead of lingering as an orphan.
+#[test]
+fn the_mcp_exits_when_its_client_closes_stdin() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = Tmp::new("lc_eof");
+    let home = tmp.home();
+    let cwd = tmp.dir("empty");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&cwd)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(INIT_MSGS.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    // Keep stdin open until the handshake reply, then close it on purpose.
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    loop {
+        let line = lines.next().expect("MCP closed early").unwrap();
+        if line.contains(r#""id":1"#) {
+            break;
+        }
+    }
+    drop(stdin);
+    let took = wait_exit(&mut child, std::time::Duration::from_secs(10))
+        .expect("the MCP did not exit after stdin closed");
+    assert!(took.as_secs_f32() < 3.0, "exit took {took:?}");
+}
+
+/// A tool still running on the blocking pool must not keep the process alive
+/// after the client is gone. The project's server is frozen (SIGSTOP): it is
+/// alive and advertised, so the MCP routes `index_status` to it and the call
+/// sits in the blocking pool until its request timeout.
+#[test]
+fn the_mcp_exits_after_eof_even_with_a_blocking_tool_in_flight() {
+    use std::io::Write;
+    let tmp = Tmp::new("lc_eof_busy");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+
+    let server = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{}", free_port())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning a hand-run server");
+    let pid = server.id();
+    let _server = KillOnDrop(server);
+    let advert = root.join(".devctx/state/serve.json");
+    let t0 = std::time::Instant::now();
+    while !advert.exists() {
+        assert!(t0.elapsed().as_secs() < 60, "the server never advertised");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let signal = |sig: &str| {
+        Command::new("kill")
+            .args([sig, &pid.to_string()])
+            .status()
+            .expect("kill")
+    };
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .env("DEVCTX_DAEMON_TIMEOUT_SECS", "60")
+        .current_dir(&root)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+    let replies = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        use std::io::Read;
+        let mut out = child.stdout.take().unwrap();
+        let replies = replies.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = out.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                replies
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    let call = |id: u32| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"index_status","arguments":{{}}}}}}"#
+        )
+    };
+    stdin.write_all(INIT_MSGS.as_bytes()).unwrap();
+    // First call, against the live server: the MCP connects and keeps the connection.
+    stdin.write_all(call(2).as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+    let t0 = std::time::Instant::now();
+    while !replies.lock().unwrap().contains(r#""id":2"#) {
+        assert!(t0.elapsed().as_secs() < 60, "the first call never answered");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Now freeze the server: the next call goes out on the open connection and hangs.
+    assert!(signal("-STOP").success());
+    stdin.write_all(call(3).as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(child.try_wait().unwrap().is_none(), "exited before EOF");
+    assert!(
+        !replies.lock().unwrap().contains(r#""id":3"#),
+        "the call already finished, so nothing was in flight: {}",
+        replies.lock().unwrap()
+    );
+    drop(stdin);
+    let took = wait_exit(&mut child, std::time::Duration::from_secs(30));
+    let _ = signal("-CONT");
+    let took = took.expect("the MCP stayed alive after EOF with a tool in flight");
+    // rmcp drains in-flight requests for up to 5 s, then the runtime gets 1 s.
+    assert!(took.as_secs_f32() < 8.0, "exit took {took:?}");
+}
+
+/// Reinstalling devctx under a running MCP must not take it down: it keeps
+/// answering, and says its binary was replaced so the agent can suggest a restart.
+#[test]
+fn a_replaced_binary_is_reported_and_the_mcp_keeps_answering() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = Tmp::new("lc_replaced");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+    // `index_status` reads the repository's state, so it has to be a git repo.
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    // Run from a private copy so replacing it cannot touch the build output.
+    let bin_dir = tmp.dir("bin");
+    let exe = bin_dir.join("devctx");
+    common::install_copy(Path::new(env!("CARGO_BIN_EXE_devctx")), &exe);
+
+    let mut child = common::spawn_retrying(
+        Command::new(&exe)
+            .env("DEVCTX_HOME", &home)
+            .current_dir(&root)
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawning the MCP server");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(INIT_MSGS.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut ask = |id: u64, tool: &str| -> serde_json::Value {
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{{}}}}}}"#
+        );
+        stdin.write_all(call.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+        loop {
+            let line = lines.next().expect("MCP closed early").unwrap();
+            let Ok(m) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if m.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                return m;
+            }
+        }
+    };
+    let text = |m: &serde_json::Value| -> serde_json::Value {
+        let t = m["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no text in: {m}"));
+        serde_json::from_str(t).unwrap()
+    };
+
+    let before = text(&ask(2, "index_status"));
+    assert_eq!(before["mcp"]["binary_replaced"], false, "{before}");
+    assert!(before["mcp"].get("hint").is_none());
+
+    // What `install -m755 new ~/.local/bin/devctx` does: a new inode takes the path.
+    common::install_copy(Path::new(env!("CARGO_BIN_EXE_devctx")), &exe);
+
+    let after = text(&ask(3, "index_status"));
+    assert_eq!(after["mcp"]["binary_replaced"], true, "{after}");
+    assert_eq!(after["mcp"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(after["mcp"]["installed_version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        after["mcp"]["hint"].as_str().unwrap().contains("restart"),
+        "{after}"
+    );
+    // The same session still serves other tools.
+    let listed = text(&ask(4, "list_projects"));
+    assert_eq!(listed["mcp"]["binary_replaced"], true, "{listed}");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the MCP exited on its own"
+    );
+
+    drop(stdin);
+    let _ = wait_exit(&mut child, std::time::Duration::from_secs(10));
+}
+
+// --- Reconnection to a serve that left (PLAN-008 B2) -----------------------------
+
+fn serve_pid(root: &Path) -> u32 {
+    let text = std::fs::read_to_string(root.join(".devctx/state/serve.json")).expect("serve.json");
+    serde_json::from_str::<serde_json::Value>(&text).unwrap()["pid"]
+        .as_u64()
+        .expect("pid in serve.json") as u32
+}
+
+/// One MCP session outlives its serve: after `serve --stop` the next tool call
+/// — a write included, since the request never reached anyone — rediscovers
+/// and respawns the serve, and succeeds against a different process.
+#[test]
+fn a_session_survives_its_serve_leaving() {
+    use std::io::{BufRead, BufReader, Write};
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("reconnect");
+    let home = tmp.home();
+    let root = make_project(&home, &tmp.0, "alpha", None);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", &home)
+        .current_dir(&root)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the MCP server");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    stdin.write_all(INIT_MSGS.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let mut ask = |id: u64, content: &str| -> serde_json::Value {
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"remember","arguments":{{"content":"{content}","scope":"local"}}}}}}"#
+        );
+        stdin.write_all(call.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+        loop {
+            let Some(Ok(line)) = lines.next() else {
+                panic!("the MCP closed before answering id {id}");
+            };
+            if let Ok(m) = serde_json::from_str::<serde_json::Value>(&line) {
+                if m.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                    return m;
+                }
+            }
+        }
+    };
+
+    let first = ask(2, "antes de que el serve salga");
+    assert!(first.get("error").is_none(), "first call: {first}");
+    let pid1 = serve_pid(&root);
+
+    let stop = devctx_with_autoserve(&home, &root, &["serve", "--stop"]);
+    assert!(stop.status.success(), "serve --stop failed");
+    let t0 = std::time::Instant::now();
+    while Path::new(&format!("/proc/{pid1}")).exists() {
+        assert!(t0.elapsed().as_secs() < 30, "the serve never exited");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let second = ask(3, "despues de que el serve salio");
+    assert!(
+        second.get("error").is_none(),
+        "the session must reconnect: {second}"
+    );
+    assert_ne!(serve_pid(&root), pid1, "a new serve must be answering");
+    drop(stdin);
+    let _ = child.wait();
+}
+
+fn devctx_with_autoserve(home: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", home)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("running devctx")
+}
+
+// --- Federated recall (PLAN-008 B5) --------------------------------------------
+
+/// Save a local memory in `repo` through the CLI.
+fn remember_local(home: &Path, repo: &Path, content: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", home)
+        .current_dir(repo)
+        .args(["remember", content, "--scope", "local"])
+        .output()
+        .expect("running devctx remember");
+    assert!(
+        out.status.success(),
+        "remember in {}:\n{}",
+        repo.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The contents a recall answered with.
+fn recalled_contents(answer: &serde_json::Value) -> String {
+    answer["memories"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `memories` array in: {answer}"))
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The member memories a group session recalls with `scope: local` and `all`.
+#[test]
+fn group_recall_local_and_all_return_the_members_memories() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("grouprecall");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let api = make_project(&home, &ws, "api", Some("ACME"));
+    let web = make_project(&home, &ws, "web", Some("ACME"));
+    remember_local(&home, &api, "api keeps its retry policy in retry.rs");
+    remember_local(&home, &web, "web keeps its retry policy in backoff.ts");
+
+    for scope in ["local", "all"] {
+        let answer = call_tool(
+            &home,
+            &ws,
+            "recall",
+            serde_json::json!({"query": "retry policy", "scope": scope}),
+        );
+        let text = recalled_contents(&answer);
+        assert!(
+            text.contains("retry.rs"),
+            "scope {scope}, api missing: {answer}"
+        );
+        assert!(
+            text.contains("backoff.ts"),
+            "scope {scope}, web missing: {answer}"
+        );
+    }
+}
+
+/// A member whose directory is gone is skipped by name and path, not counted as
+/// unreachable, and the other member still answers.
+#[test]
+fn group_recall_skips_a_member_whose_path_is_gone() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("recallmissing");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let api = make_project(&home, &ws, "api", Some("ACME"));
+    let web = make_project(&home, &ws, "web", Some("ACME"));
+    remember_local(&home, &api, "api keeps its retry policy in retry.rs");
+    remember_local(&home, &web, "web keeps its retry policy in backoff.ts");
+    // The registry drops a vanished path when the session binds, so the member
+    // has to disappear *after* that: a long-lived session whose checkout was
+    // removed under it. Stop web's server first so nothing is stranded.
+    let (msg, _) = call_tool_timed_with(
+        Path::new(env!("CARGO_BIN_EXE_devctx")),
+        &home,
+        &ws,
+        "recall",
+        r#"{"query":"retry policy","scope":"local"}"#,
+        || {
+            let _ = Command::new(env!("CARGO_BIN_EXE_devctx"))
+                .env("DEVCTX_HOME", &home)
+                .current_dir(&web)
+                .args(["serve", "--stop"])
+                .output();
+            std::fs::remove_dir_all(&web).unwrap();
+        },
+    );
+    let text = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in: {msg}"));
+    let answer: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| panic!("{text}"));
+    assert!(
+        recalled_contents(&answer).contains("retry.rs"),
+        "the surviving member should answer: {answer}"
+    );
+    let skipped = answer["skipped_missing"].to_string();
+    assert!(
+        skipped.contains("web") && skipped.contains(web.to_str().unwrap()),
+        "skipped_missing should name the member and its path: {answer}"
+    );
+    assert!(
+        answer.get("warning").is_none(),
+        "a missing checkout is not an unreachable member: {answer}"
+    );
+}
+
+/// B5 root cause: the MCP's own binary was replaced, so `current_exe()` ends in
+/// " (deleted)" and every fan-out child failed with ENOENT.
+#[test]
+fn group_recall_works_from_an_mcp_whose_binary_was_deleted() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("recalldeleted");
+    let home = tmp.home();
+    let ws = tmp.dir("workspace");
+    let api = make_project(&home, &ws, "api", Some("ACME"));
+    let web = make_project(&home, &ws, "web", Some("ACME"));
+    remember_local(&home, &api, "api keeps its retry policy in retry.rs");
+    remember_local(&home, &web, "web keeps its retry policy in backoff.ts");
+
+    // Copy, fsync, close and rename: exec-ing a file another fd still has open
+    // for writing fails with ETXTBSY (the spawn also retries on it).
+    let copy = tmp.0.join("devctx-copy");
+    common::install_copy(Path::new(env!("CARGO_BIN_EXE_devctx")), &copy);
+
+    let (msg, _) = call_tool_timed_with(
+        &copy,
+        &home,
+        &ws,
+        "recall",
+        r#"{"query":"retry policy","scope":"all"}"#,
+        || std::fs::remove_file(&copy).expect("deleting the running binary"),
+    );
+    let text = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in: {msg}"));
+    let answer: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| panic!("{text}"));
+    let found = recalled_contents(&answer);
+    assert!(
+        found.contains("retry.rs") && found.contains("backoff.ts"),
+        "the fan-out must run from a deleted binary: {text}"
     );
 }

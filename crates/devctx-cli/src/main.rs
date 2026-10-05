@@ -69,9 +69,14 @@ enum Command {
         /// Directory for this project's index. Default: inside the repository.
         #[arg(long)]
         state_dir: Option<String>,
-        /// Take the defaults without asking, and without confirming.
+        /// Take the defaults without asking, and without confirming. Never
+        /// downloads model files by itself: add `--download` for that.
         #[arg(long)]
         yes: bool,
+        /// Download the chosen model's files if they are missing (hundreds of
+        /// MB), without asking. Ignored when the machine is set to offline.
+        #[arg(long)]
+        download: bool,
     },
     /// List the embedding models available, or download one that needs files.
     Models {
@@ -505,7 +510,8 @@ fn main() -> Result<()> {
             model,
             state_dir,
             yes,
-        } => cmd_init(path, name, group, model, state_dir, yes),
+            download,
+        } => cmd_init(path, name, group, model, state_dir, yes, download),
         Command::Models { download } => cmd_models(download),
         Command::Update => models::self_update("snaven10/DevCtxEngine", env!("CARGO_PKG_VERSION")),
         Command::Status => cmd_status(),
@@ -722,10 +728,13 @@ fn reindex_one(root: &std::path::Path, full: bool) -> Result<String> {
     let cfg = ProjectConfig::load(&cfg_path)
         .with_context(|| format!("reading {}", cfg_path.display()))?;
 
-    let Some(r) = remote::ensure(&cfg) else {
+    let Some(r) = remote::ensure_cli(&cfg)? else {
         bail!("could not reach or start a server for this project");
     };
     let raw = r.index(full, None)?;
+    if let Some(warning) = remote::index_cancelled(&raw) {
+        bail!("{warning}");
+    }
     let v: serde_json::Value = serde_json::from_str(&raw).context("parsing the index result")?;
     Ok(format!(
         "{} @ {} — {} files, {} symbols, {} chunks ({} skipped)",
@@ -951,7 +960,7 @@ fn cmd_tui(project: Option<String>) -> Result<()> {
     // Route through the server (auto-spawned if needed) so the TUI never opens
     // the DB itself and coexists with other processes. Fall back to local only
     // when no server is available.
-    let server = match remote::ensure(&cfg) {
+    let server = match remote::ensure_cli(&cfg)? {
         Some(r) => {
             let (base, token) = r.into_parts();
             Some(devctx_tui::ServerConn { base, token })
@@ -964,14 +973,33 @@ fn cmd_tui(project: Option<String>) -> Result<()> {
     devctx_tui::run(cfg, server)
 }
 
+/// Whether `init` may download model files now. Never when the configuration
+/// says offline; never behind a script's back (`--yes`, or no terminal) unless
+/// `--download` was passed; otherwise on an interactive terminal, where the
+/// person picked or named the model.
+fn may_download(
+    offline: devctx_core::config::Offline,
+    yes: bool,
+    download_flag: bool,
+    tty: bool,
+) -> bool {
+    if offline == devctx_core::config::Offline::True {
+        return false;
+    }
+    download_flag || (!yes && tty)
+}
+
 /// Resolve `--model` into an embeddings config, refusing what cannot work.
 ///
 /// A user-defined ONNX model needs its files on disk, and the failure without
 /// them arrives later, at the first index. Checking here turns it into a
-/// sentence about running `models download`.
+/// sentence about running `models --download <model>`. When `will_fetch` the
+/// missing files are not an error: `model_dir` stays empty and the caller
+/// downloads them once the answers are confirmed.
 fn choose_model(
     key: &str,
     base: &devctx_core::config::Embeddings,
+    will_fetch: bool,
 ) -> Result<devctx_core::config::Embeddings> {
     let spec = devctx_embed::registry::find_local(key).ok_or_else(|| {
         anyhow!("unknown model `{key}`; run `devctx models` to see what there is")
@@ -982,15 +1010,22 @@ fn choose_model(
     out.model_dir = if spec.builtin.is_some() {
         String::new()
     } else {
-        let dir = models::local_dir(key).ok_or_else(|| {
-            anyhow!(
-                "`{key}` is a user-defined ONNX model and its files are not on this \
-                 machine yet. Run `devctx models download {key}` first."
-            )
-        })?;
-        dir.to_string_lossy().into_owned()
+        match models::local_dir(key) {
+            Some(dir) => dir.to_string_lossy().into_owned(),
+            None if will_fetch => String::new(),
+            None => bail!(missing_files_message(key)),
+        }
     };
     Ok(out)
+}
+
+/// The sentence for a user-defined ONNX model whose files are not on disk.
+fn missing_files_message(key: &str) -> String {
+    format!(
+        "`{key}` is a user-defined ONNX model and its files are not on this machine yet. \
+         Fetch them with `devctx models --download {key}` and run this again, or pass \
+         `--download` to fetch them as part of `init` (not when offline)."
+    )
 }
 
 /// Make this project's model the machine's default, and the vector space that
@@ -1244,18 +1279,46 @@ fn cmd_serve(addr: String, token: Option<String>, idle: u64, stop: bool) -> Resu
     if stop {
         return remote::stop_server(&cfg);
     }
-    remote::reclaim_db(&cfg); // replace any auto-spawned daemon
+    // A person typing `devctx serve` means "this one, now": replace whatever
+    // is advertised. An auto-spawned server must never do that — it is spawned
+    // precisely because nothing answered, and if something is alive after all
+    // (busy, mid-index) killing it would turn a slow server into a dead one.
+    // Left to fail on the lock instead, it reports the owner in `serve.log`.
+    let autospawned = std::env::var_os(remote::AUTOSPAWN_ENV).is_some();
+    // Meant for this process only: grandchildren (a hook's `devctx index`, an
+    // MCP's own spawns) must not read themselves as auto-spawned.
+    std::env::remove_var(remote::AUTOSPAWN_ENV);
+    if !autospawned {
+        remote::reclaim_db(&cfg);
+    }
     let socket: SocketAddr = addr
         .parse()
         .with_context(|| format!("invalid --addr `{addr}`"))?;
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
 
-    remote::write_serve_file(&cfg, socket, token.as_deref())?;
-    println!("DevCtxEngine server (owns the DB) → http://{addr}");
-    println!("Other `devctx` commands will route through it while it runs. Ctrl-C to stop.");
-
     let idle = (idle > 0).then(|| std::time::Duration::from_secs(idle));
-    let result = devctx_api::run_blocking(cfg.clone(), socket, token, idle);
+    // Advertise only once the store is open and the port bound: a process that
+    // dies on the lock must not leave a `serve.json` pointing at nothing.
+    let advertise = {
+        let cfg = cfg.clone();
+        let token = token.clone();
+        move || {
+            remote::write_serve_file(&cfg, socket, token.as_deref())?;
+            println!("DevCtxEngine server (owns the DB) → http://{socket}");
+            println!(
+                "Other `devctx` commands will route through it while it runs. Ctrl-C to stop."
+            );
+            Ok(())
+        }
+    };
+    // A watchdog that ends the process (idle, or a stop that could not unwind)
+    // never returns here, so the advertisement is withdrawn through this hook.
+    let withdraw = {
+        let cfg = cfg.clone();
+        move || remote::remove_own_serve_file(&cfg)
+    };
+    let result =
+        devctx_api::run_blocking_ready(cfg.clone(), socket, token, idle, advertise, withdraw);
     // Only if it is still ours: a server that failed to bind must not delete
     // the file belonging to the healthy one that beat it to the port.
     remote::remove_own_serve_file(&cfg);
@@ -1501,7 +1564,7 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
     };
 
     let binding = match cfg {
-        Some(cfg) => devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg)?)),
+        Some(cfg) => devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg))),
         None => {
             let cwd = std::env::current_dir().unwrap_or_default();
             match devctx_mcp::state::resolve_under(&cwd) {
@@ -1512,7 +1575,7 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
                         row.name,
                         cwd.display()
                     );
-                    devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg)?))
+                    devctx_mcp::Binding::Project(std::sync::Arc::new(mcp_backend(cfg)))
                 }
                 devctx_mcp::state::Resolution::Group { name, members } => {
                     // Open only the default member here. The others are opened
@@ -1529,7 +1592,7 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
                     let default_name = default.name.clone();
                     devctx_mcp::Binding::Group {
                         name,
-                        default: std::sync::Arc::new(mcp_backend(cfg)?),
+                        default: std::sync::Arc::new(mcp_backend(cfg)),
                         default_name,
                         members,
                     }
@@ -1550,30 +1613,37 @@ fn cmd_mcp(project: Option<PathBuf>) -> Result<()> {
         std::sync::Arc::new(|root: &std::path::Path| {
             let cfg = ProjectConfig::load(&root.join(devctx_core::CONFIG_FILE_NAME))
                 .map_err(|e| format!("loading project at {}: {e}", root.display()))?;
-            mcp_backend(cfg).map_err(|e| e.to_string())
+            Ok(mcp_backend(cfg))
         }),
     )
 }
 
 /// A tool backend for one project.
 ///
-/// Routes through a shared server (auto-spawned if needed) so many MCP sessions
-/// plus the web/CLI/TUI of the same project coexist without lock fights; owning
-/// the database here is the fallback when no server can be reached.
-fn mcp_backend(cfg: ProjectConfig) -> Result<devctx_mcp::Backend> {
-    let server = match remote::ensure(&cfg) {
-        Some(r) => {
-            let (base, token) = r.into_parts();
-            eprintln!("DevCtxEngine MCP → routing to {base}");
-            Some(devctx_mcp::ServerConn { base, token })
-        }
-        None => {
-            remote::reclaim_db(&cfg);
-            eprintln!("DevCtxEngine MCP → local database");
-            None
-        }
+/// The MCP never owns the database: it routes to the project's server and
+/// finds or starts it on the first tool call, not here. Opening the store as a
+/// fallback is what used to make one MCP hold the DuckDB lock for the whole
+/// session whenever the server could not be reached.
+fn mcp_backend(cfg: ProjectConfig) -> devctx_mcp::Backend {
+    let name = if cfg.project.name.is_empty() {
+        "default".to_string()
+    } else {
+        cfg.project.name.clone()
     };
-    devctx_mcp::backend_for(cfg, server)
+    let path = cfg.project.path.clone();
+    let for_connect = cfg.clone();
+    let connect: devctx_mcp::Connector =
+        std::sync::Arc::new(move || match remote::ensure_checked(&for_connect) {
+            Ok(r) => {
+                let (base, token) = r.into_parts();
+                eprintln!("DevCtxEngine MCP → routing to {base}");
+                Ok(devctx_mcp::ServerConn { base, token })
+            }
+            Err(e) => Err(format!(
+                "no devctx server for {name}: {e}. Try `devctx serve` in {path}"
+            )),
+        });
+    devctx_mcp::backend_for(&cfg, connect)
 }
 
 /// `devctx mcp configure` — register DevCtxEngine as an MCP server in an AI client.
@@ -1587,7 +1657,7 @@ fn cmd_mcp_configure(
 ) -> Result<()> {
     let cfg = load_project()?;
     let project_root = project_root(&cfg)?;
-    let exe = std::env::current_exe().context("resolving the devctx binary path")?;
+    let exe = devctx_core::self_exe().context("resolving the devctx binary path")?;
     mcp_configure::run(&Options {
         client,
         scope,
@@ -1679,7 +1749,7 @@ fn cmd_remember(
     // all, rather than doing the central half here and then failing to open a
     // store something else holds. Found by smoke test: the link was skipped in
     // silence whenever a server happened to be up, which is the normal case.
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!(
             "{}",
             r.remember(
@@ -1856,7 +1926,7 @@ fn memories_of(v: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
 /// Recall a project's own memories, routing through its server when one is
 /// running so no second process takes the DuckDB lock.
 fn local_recall(cfg: &ProjectConfig, query: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
-    if let Some(r) = remote::ensure(cfg) {
+    if let Some(r) = remote::ensure_cli(cfg)? {
         let raw = r.recall(query, limit)?;
         let parsed: serde_json::Value = serde_json::from_str(&raw).context("parsing recall")?;
         // The endpoint answers `{"memories": [...]}`. This used to read it as a
@@ -1950,7 +2020,7 @@ fn repo_branch(cfg: &ProjectConfig) -> (String, String) {
 /// written into and the client for the shared memories that need linking.
 fn cmd_backfill_links(dry_run: bool, from_text: bool) -> Result<()> {
     let cfg = load_project()?;
-    let Some(r) = remote::ensure(&cfg) else {
+    let Some(r) = remote::ensure_cli(&cfg)? else {
         bail!(
             "backfilling needs this project's server; start one with `devctx serve` \
              (or run any indexing command, which spawns it)"
@@ -2017,7 +2087,7 @@ fn cmd_backfill_links(dry_run: bool, from_text: bool) -> Result<()> {
 /// `devctx symbol` — a symbol's definition and code.
 fn cmd_symbol(name: String, limit: usize) -> Result<()> {
     let cfg = load_project()?;
-    let raw = match remote::ensure(&cfg) {
+    let raw = match remote::ensure_cli(&cfg)? {
         Some(r) => r.read_symbol(&name, limit)?,
         None => {
             let store = open_store(&cfg, configured_dimension(&cfg))?;
@@ -2053,7 +2123,7 @@ fn cmd_symbol(name: String, limit: usize) -> Result<()> {
 /// is the process that already holds all three.
 fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Result<()> {
     let cfg = load_project()?;
-    let Some(r) = remote::ensure(&cfg) else {
+    let Some(r) = remote::ensure_cli(&cfg)? else {
         bail!(
             "`context` needs this project's server; start one with `devctx serve` \
              (or run any indexing command, which spawns it)"
@@ -2065,7 +2135,7 @@ fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Resu
 
 fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         let json: serde_json::Value = serde_json::from_str(&r.impact(&symbol, depth)?)?;
         println!("Impact of `{symbol}` (depth {depth}):");
         let merged: Vec<String> = json["resolved_symbols"]
@@ -2310,7 +2380,7 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
     let cfg = load_project()?;
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!(
             "{}",
             r.summarize(&content, query.as_deref(), tokens.unwrap_or(200))?
@@ -2348,18 +2418,25 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
 /// `devctx routes` — list framework-aware HTTP routes.
 fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!("{}", r.routes(method.as_deref(), path.as_deref())?);
         return Ok(());
     }
     let store = open_store(&cfg, configured_dimension(&cfg))?;
-    let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
-    let routes = store.search_routes(
-        &git.short_name(),
-        &git.state().branch,
-        method.as_deref(),
-        path.as_deref(),
-    )?;
+    let (repo, branch, fallback, stale) = devctx_mcp::state::graph_target(
+        &store,
+        &project_root(&cfg)?,
+        cfg.indexing.default_branch(),
+    )
+    .map_err(|e| anyhow!(e))?;
+    let routes = store.search_routes(&repo, &branch, method.as_deref(), path.as_deref())?;
+    if let Some(f) = &fallback {
+        let why = f.get("why").and_then(|w| w.as_str()).unwrap_or_default();
+        eprintln!("· branch_fallback: {why}");
+    }
+    if stale {
+        eprintln!("· warning: {}", devctx_mcp::state::STALE_EXTRACTOR_WARNING);
+    }
     if routes.is_empty() {
         println!("No routes.");
         return Ok(());
@@ -2678,7 +2755,7 @@ fn cmd_memory_purge(project: String, dry_run: bool) -> Result<()> {
 /// `devctx memory-stats` — show memory counts for the project.
 fn cmd_memory_stats() -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!("{}", r.memory_stats()?);
         return Ok(());
     }
@@ -2892,6 +2969,7 @@ fn cmd_init(
     model: Option<String>,
     state_dir: Option<String>,
     yes: bool,
+    download: bool,
 ) -> Result<()> {
     let root = match path {
         Some(p) => p,
@@ -2962,8 +3040,15 @@ fn cmd_init(
         defaults.reranking = cfg.reranking.clone();
         copied = Some(cfg);
     }
+    // What the offline setting will be, known before any file is fetched: a
+    // machine or an answer that says "never go online" must stop the download.
+    let offline = answers.offline.unwrap_or(defaults.embeddings.offline);
+    let will_fetch = {
+        use std::io::IsTerminal as _;
+        may_download(offline, yes, download, std::io::stdin().is_terminal())
+    };
     if let Some(key) = &answers.model {
-        defaults.embeddings = choose_model(key, &defaults.embeddings)?;
+        defaults.embeddings = choose_model(key, &defaults.embeddings, will_fetch)?;
     }
     if let Some(o) = answers.offline {
         defaults.embeddings.offline = o;
@@ -2983,6 +3068,15 @@ fn cmd_init(
                 wizard_text::Text::new(answers.language.unwrap_or_default()).nothing_written()
             );
             return Ok(());
+        }
+    }
+
+    // The files are fetched only now, once the person has confirmed (or there
+    // was nobody to ask and `--download` said so): not before the summary.
+    if let Some(key) = &answers.model {
+        if will_fetch && defaults.embeddings.model_dir.is_empty() {
+            let dir = models::download(key)?;
+            defaults.embeddings.model_dir = dir.to_string_lossy().into_owned();
         }
     }
 
@@ -3138,7 +3232,7 @@ impl ServerProgress {
 /// registered and configured but never indexed. Saying so at the moment of
 /// registering costs nothing and saves a confusing failure later.
 fn is_git_repo(path: &std::path::Path) -> bool {
-    std::process::Command::new("git")
+    devctx_core::clean_git_env(&mut std::process::Command::new("git"))
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -3205,7 +3299,7 @@ fn cmd_status() -> Result<()> {
         return Ok(());
     };
     let cfg = ProjectConfig::load(&cfg_path)?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         println!("DevCtxEngine {} (server mode)", devctx_core::VERSION);
         println!("  config:   {}", cfg_path.display());
         println!("{}", r.status()?);
@@ -3271,7 +3365,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
     // otherwise whatever is checked out, which is what the pipeline does with
     // `None`.
     let branch = branch.or_else(|| cfg.indexing.default_branch().map(str::to_string));
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         // The server does the work, so nothing local can drive the bar. Poll it
         // instead: elapsed seconds alone cannot tell a run that is nearly done
         // from one that has barely started, and on a large repository both look
@@ -3280,7 +3374,14 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         let out = r.index(full, branch.as_deref());
         ticker.stop();
         match out {
-            Ok(report) => println!("{report}"),
+            Ok(report) => {
+                println!("{report}");
+                // Not an `Ok`: the run did not finish, and a script chaining
+                // `devctx index && …` must not carry on as if it had.
+                if let Some(warning) = remote::index_cancelled(&report) {
+                    bail!("{warning}");
+                }
+            }
             Err(e) => return Err(still_running_or(&r, e)),
         }
         return Ok(());
@@ -3294,8 +3395,19 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
     let store = open_store(&cfg, embedder.dimension())?;
 
     // Golden rule for bulk loads: don't maintain the HNSW index row-by-row.
-    // For a full reindex, drop it up front and rebuild once after the load.
+    // For a full reindex, drop it up front and rebuild once after the load —
+    // noted as owed *before* the drop, like the pipeline's own drop, so a
+    // process killed mid-run leaves the rebuild to the next run instead of
+    // losing the index for good. With the note in place the pipeline rebuilds
+    // it at the end of the run (once), and the rebuild below only covers
+    // what it could not.
     if full && cfg.storage.hnsw {
+        store.set_index_meta(
+            "",
+            "",
+            devctx_index::PENDING_HNSW_META_KEY,
+            &cfg.storage.metric,
+        )?;
         store.drop_hnsw()?;
     }
 
@@ -3343,8 +3455,24 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         );
     }
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);
+    if res.extractor_stale {
+        println!("  index built by an older extractor; run `devctx index --full` to rebuild it");
+    }
 
-    if cfg.storage.hnsw {
+    let wanted_metric = if cfg.storage.metric.trim().eq_ignore_ascii_case("ip")
+        || cfg
+            .storage
+            .metric
+            .trim()
+            .eq_ignore_ascii_case("inner_product")
+    {
+        "ip"
+    } else {
+        "cosine"
+    };
+    if cfg.storage.hnsw && store.hnsw_metric().as_deref() == Some(wanted_metric) {
+        println!("  HNSW index ready (VSS, metric {wanted_metric})");
+    } else if cfg.storage.hnsw {
         if store.enable_hnsw(&cfg.storage.metric)? {
             println!(
                 "  HNSW index ready (VSS, metric {})",
@@ -3358,7 +3486,11 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
             eprintln!("  HNSW requested but the VSS extension is unavailable; using brute-force");
         }
     }
-    if cfg.storage.fts {
+    // The pipeline rebuilds a BM25 index it took down; build one here only
+    // when it is not there.
+    if cfg.storage.fts && store.has_fts() {
+        println!("  FTS index ready (BM25)");
+    } else if cfg.storage.fts {
         if store.rebuild_fts()? {
             println!("  FTS index ready (BM25)");
         } else {
@@ -3474,7 +3606,7 @@ fn cmd_search(
     hybrid: bool,
 ) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure(&cfg) {
+    if let Some(r) = remote::ensure_cli(&cfg)? {
         let mode = if hybrid {
             "hybrid"
         } else if keyword {
@@ -3570,7 +3702,14 @@ fn build_embedder(cfg: &ProjectConfig) -> Result<Box<dyn EmbeddingProvider>> {
 
 fn open_store(cfg: &ProjectConfig, dim: usize) -> Result<Store> {
     let path = cfg.db_path();
-    Ok(Store::open(&path, dim)?)
+    Store::open(&path, dim).map_err(|e| {
+        let text = format!("{e:#}");
+        if remote::is_lock_error(&text) {
+            anyhow::anyhow!(remote::lock_message(cfg, &text))
+        } else {
+            e.into()
+        }
+    })
 }
 
 /// Project name for memory scoping (config name, else db-derived fallback).
@@ -3655,12 +3794,25 @@ fn print_remote_search(json: &str, format: OutputFormat) -> Result<()> {
         OutputFormat::Json => println!("{json}"),
         OutputFormat::Table => {
             let hits: serde_json::Value = serde_json::from_str(json)?;
-            let arr = hits.as_array().cloned().unwrap_or_default();
-            if arr.is_empty() {
+            // Bare array, or `{results, branch_fallback, ...}` when the serve
+            // answered from another branch or truncated to budget.
+            let answer = devctx_core::search_hits(&hits);
+            if let Some(f) = &answer.branch_fallback {
+                println!("Note: answered from another branch: {f}");
+            }
+            if let Some(w) = &answer.warning {
+                println!(
+                    "Warning: {}",
+                    w.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| w.to_string())
+                );
+            }
+            if answer.hits.is_empty() {
                 println!("No results.");
                 return Ok(());
             }
-            for h in arr {
+            for h in answer.hits {
                 let s = |k| h.get(k).and_then(|v| v.as_str()).unwrap_or("");
                 let i = |k| h.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
                 let sym = if s("symbol").is_empty() {
@@ -3702,6 +3854,70 @@ fn render_table(hits: &[SearchResult]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// m-5: `init` downloads hundreds of MB only where someone is there to
+    /// want it, and never against an offline setting.
+    #[test]
+    fn init_downloads_model_files_only_when_it_may() {
+        use devctx_core::config::Offline::{Auto, False, True};
+        // (offline, yes, --download, tty) -> may download
+        assert!(
+            may_download(Auto, false, false, true),
+            "a person at a terminal"
+        );
+        assert!(!may_download(Auto, false, false, false), "a script");
+        assert!(
+            !may_download(Auto, true, false, true),
+            "--yes alone asks nothing, fetches nothing"
+        );
+        assert!(!may_download(Auto, true, false, false), "CI with --yes");
+        assert!(
+            may_download(False, true, true, false),
+            "explicit --download"
+        );
+        // Offline wins over everything, an explicit flag included.
+        assert!(!may_download(True, false, true, true));
+        assert!(!may_download(True, true, true, false));
+    }
+
+    #[test]
+    fn a_missing_model_is_deferred_when_fetching_and_refused_otherwise() {
+        let _guard = TempModelCache::new();
+        let base = devctx_core::config::Embeddings::default();
+        let err = choose_model("ml-granite", &base, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("devctx models --download ml-granite"), "{err}");
+        let deferred = choose_model("ml-granite", &base, true).unwrap();
+        assert_eq!(deferred.model, "ml-granite");
+        assert!(
+            deferred.model_dir.is_empty(),
+            "downloaded later, after confirming"
+        );
+        // Built-in models never need files.
+        assert!(choose_model("minilm-l6", &base, false)
+            .unwrap()
+            .model_dir
+            .is_empty());
+    }
+
+    /// Points the model cache at an empty directory for one test.
+    struct TempModelCache(std::path::PathBuf);
+    impl TempModelCache {
+        fn new() -> Self {
+            let d = std::env::temp_dir().join(format!("devctx_main_mc_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            std::env::set_var("DEVCTX_MODEL_CACHE", &d);
+            TempModelCache(d)
+        }
+    }
+    impl Drop for TempModelCache {
+        fn drop(&mut self) {
+            std::env::remove_var("DEVCTX_MODEL_CACHE");
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// The defect that hid the longest, in the cheapest possible form.
     ///
     /// `local_recall` read the server's answer with `as_array()`. `/recall`

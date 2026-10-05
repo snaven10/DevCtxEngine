@@ -272,7 +272,9 @@ async function doSearch() {
   $('searchList').className = 'empty';
   $('searchList').textContent = 'searching…';
   try {
-    const hits = await postJSON('/search', { query: q, limit: 15, mode: 'hybrid' });
+    const resp = await postJSON('/search', { query: q, limit: 15, mode: 'hybrid' });
+    // A bare array, or {results, branch_fallback, ...} when answered from another branch.
+    const hits = Array.isArray(resp) ? resp : (resp.results || []);
     $('searchHeader').textContent = `matches (${hits.length})`;
     if (!hits.length) { $('searchList').textContent = 'no matches.'; return; }
     $('searchList').className = '';

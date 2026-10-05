@@ -10,7 +10,7 @@
 //! Most are built into fastembed and download themselves on first use. Granite
 //! is not: it is loaded as a user-defined ONNX model from a directory the user
 //! provides, and without that directory it fails to load — clearly, but only at
-//! the moment someone tries to index. `models download` fetches it so that
+//! the moment someone tries to index. `models --download <model>` fetches it so that
 //! moment never arrives.
 
 use std::path::{Path, PathBuf};
@@ -86,19 +86,23 @@ pub fn list(configured: Option<&str>) -> Result<()> {
     if let Some(c) = configured {
         println!("* currently configured for new projects (`{c}`).");
     }
-    println!(
-        "FILES: `automatic` downloads itself on first use; `download` needs\n\
-         `devctx models download <model>` once; `ready` is already on this machine.\n\
-         \n\
-         Changing the model after indexing means re-indexing everything and\n\
-         re-embedding every memory, so choose before the first `devctx index`.\n\
-         Non-English code or comments? Pick a multilingual one: the English\n\
-         models embed Spanish perfectly happily, just badly."
-    );
+    println!("{}", files_legend());
     Ok(())
 }
 
-/// `devctx models download <key>` — fetch a user-defined ONNX model.
+/// The footer of `devctx models`: what the FILES column means and the exact
+/// command that fetches a `download` model.
+fn files_legend() -> &'static str {
+    "FILES: `automatic` downloads itself on first use; `download` needs\n\
+     `devctx models --download <model>` once; `ready` is already on this machine.\n\
+     \n\
+     Changing the model after indexing means re-indexing everything and\n\
+     re-embedding every memory, so choose before the first `devctx index`.\n\
+     Non-English code or comments? Pick a multilingual one: the English\n\
+     models embed Spanish perfectly happily, just badly."
+}
+
+/// `devctx models --download <key>` — fetch a user-defined ONNX model.
 pub fn download(key: &str) -> Result<PathBuf> {
     let spec = find_local(key).ok_or_else(|| {
         anyhow!("unknown model `{key}`; run `devctx models` to see what there is")
@@ -158,7 +162,7 @@ pub fn download(key: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Ask which model to use, offering the registry and fetching what is chosen.
+/// Ask which model to use, offering the registry.
 ///
 /// Returns `None` when there is nobody to ask — no terminal, which is the case
 /// for a script or an agent — so the caller falls back to the machine default
@@ -221,12 +225,9 @@ pub fn prompt(
         anyhow!("unknown model `{key}`; run `devctx models` to see what there is")
     })?;
 
-    // Fetch it now rather than letting the first index fail on a missing
-    // directory: the answer was given here, so the consequence belongs here.
-    if spec.builtin.is_none() && local_dir(&key).is_none() {
-        eprintln!("`{key}` needs its files; fetching them now.");
-        download(&key)?;
-    }
+    // Missing files are fetched by `init` after the remaining answers (the
+    // offline one among them) are in and confirmed, not here.
+    let _ = spec;
     Ok(Some(key))
 }
 
@@ -354,4 +355,18 @@ pub fn self_update(repo: &str, current: &str) -> Result<()> {
          in each project, and reconnect any MCP client."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// N4: the footer used to name `devctx models download <model>`, a command
+    /// that does not exist; the flag is `--download`.
+    #[test]
+    fn the_models_listing_names_the_real_download_command() {
+        let t = files_legend();
+        assert!(t.contains("devctx models --download <model>"), "{t}");
+        assert!(!t.contains("models download"), "{t}");
+    }
 }

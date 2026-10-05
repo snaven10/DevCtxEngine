@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod common;
+
 /// A scratch directory that cleans up after itself.
 struct Tmp(PathBuf);
 
@@ -19,6 +21,7 @@ impl Tmp {
         let dir = std::env::temp_dir().join(format!("devctx_cli_it_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        common::share_models(&dir.join("central"));
         Self(dir)
     }
 
@@ -41,6 +44,7 @@ impl Drop for Tmp {
             .env("DEVCTX_HOME", self.home())
             .args(["serve", "--central", "--stop"])
             .output();
+        common::reap_servers_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -501,4 +505,91 @@ fn routed_and_direct_agree_on_shape_not_just_content() {
             args.join(" ")
         );
     }
+}
+
+/// Test hygiene: a run without `DEVCTX_MODEL_CACHE` must never resolve to the
+/// user's real data directory, whichever way HOME / XDG_DATA_HOME point.
+#[test]
+fn without_an_explicit_cache_the_tests_never_use_the_users_real_models() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for target in [None, Some(std::ffi::OsString::from("/tmp/some-target"))] {
+        let got = common::resolve_model_cache(None, target.clone(), manifest);
+        assert!(got.ends_with("test-model-cache"), "{got:?}");
+        for real in [
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/devctx")),
+            std::env::var_os("XDG_DATA_HOME").map(|x| PathBuf::from(x).join("devctx")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(!got.starts_with(&real), "{got:?} is under {real:?}");
+        }
+    }
+    // An explicit cache still wins, and an empty one counts as unset.
+    assert_eq!(
+        common::resolve_model_cache(Some("/x/cache".into()), None, manifest),
+        Path::new("/x/cache")
+    );
+    assert!(
+        common::resolve_model_cache(Some("".into()), None, manifest).ends_with("test-model-cache")
+    );
+    // What the suites actually use (with the variable unset in the environment).
+    if std::env::var_os("DEVCTX_MODEL_CACHE").is_none() {
+        let got = common::shared_model_cache();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        assert!(
+            !got.starts_with(home.join(".local/share/devctx")),
+            "{got:?}"
+        );
+    }
+}
+
+/// N4 (field): `init --model ml-granite` on a machine without the model's
+/// files used to fail with a command that does not exist (`models download`).
+/// Without a terminal and without `--yes` nothing is downloaded behind the
+/// caller's back: the error carries the exact command to run.
+#[test]
+fn init_with_a_model_that_is_not_on_disk_names_the_download_command() {
+    let tmp = Tmp::new("init_model_missing");
+    let repo = tmp.repo("alpha");
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        // An empty cache of its own: whatever the shared one holds is not the point.
+        .env("DEVCTX_MODEL_CACHE", tmp.0.join("empty-cache"))
+        .current_dir(&repo)
+        .args(["init", "--model", "ml-granite"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("devctx models --download ml-granite"), "{err}");
+    assert!(!repo.join(".devctx").join("config.yaml").exists());
+}
+
+/// m-5: `--yes` is "defaults without asking": with a model whose files are
+/// missing it does not download (CI would pull hundreds of MB), it names the
+/// command, and `--download` is the explicit way to opt in.
+#[test]
+fn init_yes_does_not_download_and_names_the_command() {
+    let tmp = Tmp::new("init_yes_nodl");
+    let repo = tmp.repo("alpha");
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .env("DEVCTX_MODEL_CACHE", tmp.0.join("empty-cache"))
+        .current_dir(&repo)
+        .args(["init", "--yes", "--model", "ml-granite"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("devctx models --download ml-granite"), "{err}");
+    assert!(!err.contains("fetching them now"), "{err}");
+    assert!(!tmp.0.join("empty-cache").join("ml-granite").exists());
+    assert!(!repo.join(".devctx").join("config.yaml").exists());
 }

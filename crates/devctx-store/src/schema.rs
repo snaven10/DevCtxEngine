@@ -12,9 +12,25 @@ use crate::error::Result;
 pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
     conn.execute_batch(&vectors_ddl(dim))?;
     drop_legacy_memory_ref_pk(conn);
+    let had_index_meta = table_exists(conn, "index_meta");
     conn.execute_batch(RELATIONAL_DDL)?;
+    if !had_index_meta {
+        // A table created on an existing database is DDL in the WAL; a process
+        // dying before the next checkpoint leaves a log whose replay breaks
+        // the ART indexes (see `Store::checkpoint`). Best-effort, as there.
+        let _ = conn.execute_batch("CHECKPOINT;");
+    }
     drop_broken_project_indexes(conn);
     Ok(())
+}
+
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = ?",
+        [name],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 
 /// Drop `memory_symbol_references` if it still carries the PRIMARY KEY an
@@ -233,6 +249,16 @@ CREATE TABLE IF NOT EXISTS file_state (
     symbol_count INTEGER,
     chunk_count  INTEGER,
     PRIMARY KEY (repo_path, branch, file_path)
+);
+
+-- Facts about how a branch's index was produced (today: `extractor`). A table
+-- of its own so that no existing table changes shape.
+CREATE TABLE IF NOT EXISTS index_meta (
+    repo_path VARCHAR,
+    branch    VARCHAR,
+    key       VARCHAR,
+    value     VARCHAR,
+    PRIMARY KEY (repo_path, branch, key)
 );
 
 CREATE TABLE IF NOT EXISTS branch_lineage (

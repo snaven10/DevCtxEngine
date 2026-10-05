@@ -70,10 +70,18 @@ pub(crate) const MEM_COLS: &str =
 
 impl Store {
     /// Insert or replace a memory (by id).
+    ///
+    /// One transaction, both statements gated: a replace that lost its insert
+    /// — to a [frozen](Store::freeze) store, or a process ending in between —
+    /// must not keep its delete, or the memory being revised is simply gone.
     pub fn upsert_memory(&self, m: &Memory) -> Result<()> {
-        self.conn
+        self.in_transaction(|| self.upsert_memory_inner(m))
+    }
+
+    fn upsert_memory_inner(&self, m: &Memory) -> Result<()> {
+        self.w()?
             .execute("DELETE FROM memories WHERE id = ?", params![m.id])?;
-        self.conn.execute(
+        self.w()?.execute(
             &format!(
                 "INSERT INTO memories ({MEM_COLS}) VALUES \
                  (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -136,7 +144,7 @@ impl Store {
 
     /// Soft-delete a memory (records the timestamp).
     pub fn delete_memory(&self, id: &str, now: &str) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "UPDATE memories SET deleted_at = ? WHERE id = ?",
             params![now, id],
         )?;
@@ -202,11 +210,11 @@ impl Store {
         if existed == 0 {
             return Ok(false);
         }
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM vectors WHERE id = ? OR id LIKE ? || '_c%'",
             params![id, id],
         )?;
-        self.conn
+        self.w()?
             .execute("DELETE FROM memories WHERE id = ?", params![id])?;
         Ok(true)
     }
@@ -233,7 +241,7 @@ impl Store {
         if n == 0 {
             return Ok(0);
         }
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM vectors WHERE EXISTS (
                  SELECT 1 FROM memories m
                  WHERE m.project = ?
@@ -241,7 +249,7 @@ impl Store {
              )",
             params![project],
         )?;
-        self.conn
+        self.w()?
             .execute("DELETE FROM memories WHERE project = ?", params![project])?;
         Ok(n)
     }
@@ -327,6 +335,26 @@ mod tests {
             .find_memory_by_topic("proj", "nope")
             .unwrap()
             .is_none());
+    }
+
+    /// A revision that reaches a frozen store must fail whole. Its delete used
+    /// to run ungated in autocommit: the insert then failed with `Frozen` and
+    /// the memory being revised was gone for good, folded by the exit
+    /// checkpoint — an idle exit freezes while the listener still accepts.
+    #[test]
+    fn a_frozen_store_refuses_a_revision_without_losing_the_original() {
+        let store = Store::open_in_memory(3).unwrap();
+        let original = mem("mem_a", "auth", "decision");
+        store.upsert_memory(&original).unwrap();
+        assert!(store.freeze(std::time::Duration::from_secs(1)));
+
+        let mut revised = original.clone();
+        revised.content = "revised".into();
+        assert!(matches!(
+            store.upsert_memory(&revised),
+            Err(crate::StoreError::Frozen)
+        ));
+        assert_eq!(store.get_memory("mem_a").unwrap(), Some(original));
     }
 
     /// Export needs the whole set, not a page of it: `recent_memories` caps at a

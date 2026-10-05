@@ -88,30 +88,73 @@ pub fn run(cfg: &ProjectConfig, root: &Path, debounce: Duration) -> Result<()> {
         if due.is_some_and(|t| Instant::now() >= t) && !pending.is_empty() {
             let batch: Vec<String> = pending.drain().collect();
             due = None;
-            report(cfg, &batch);
+            if let Requeue::Yes = report(cfg, &batch) {
+                // The server stopped mid-batch: try the whole batch again
+                // after a pause (the next request starts a fresh server, and
+                // the content-hash check skips what was already done).
+                pending.extend(batch);
+                due = Some(Instant::now() + debounce.max(REQUEUE_PAUSE));
+            }
         }
     }
     Ok(())
 }
 
+/// How long a batch whose run was cancelled waits before it is sent again.
+const REQUEUE_PAUSE: Duration = Duration::from_secs(5);
+
+/// Whether a batch has to be sent again.
+enum Requeue {
+    Yes,
+    No,
+}
+
+/// What the server did with a batch.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The run completed, re-indexing this many files.
+    Indexed(usize),
+    /// The server was stopping and cancelled the run part-way (the warning).
+    Cancelled(String),
+}
+
 /// Index a batch, printing a one-line summary. Never fatal: a watcher that dies
 /// on a transient failure is worse than one that logs and carries on.
-fn report(cfg: &ProjectConfig, paths: &[String]) {
+fn report(cfg: &ProjectConfig, paths: &[String]) -> Requeue {
     let n = paths.len();
     match index_paths(cfg, paths) {
-        Ok(indexed) => println!("· {n} file(s) changed → {indexed} re-indexed"),
-        Err(e) => eprintln!("· indexing {n} file(s) failed: {e}"),
+        Ok(Outcome::Indexed(indexed)) => {
+            println!("· {n} file(s) changed → {indexed} re-indexed");
+            Requeue::No
+        }
+        Ok(Outcome::Cancelled(warning)) => {
+            eprintln!("· {warning}; the {n} file(s) will be sent again");
+            Requeue::Yes
+        }
+        Err(e) => {
+            eprintln!("· indexing {n} file(s) failed: {e}");
+            Requeue::No
+        }
     }
 }
 
 /// Send the batch to the project's server, which owns the database.
-fn index_paths(cfg: &ProjectConfig, paths: &[String]) -> Result<usize> {
+fn index_paths(cfg: &ProjectConfig, paths: &[String]) -> Result<Outcome> {
     let Some(r) = remote::ensure(cfg) else {
         anyhow::bail!("no project server and one could not be started");
     };
-    let raw = r.index_paths(paths)?;
-    let v: serde_json::Value = serde_json::from_str(&raw).context("parsing the index result")?;
-    Ok(v["files_indexed"].as_u64().unwrap_or(0) as usize)
+    outcome(&r.index_paths(paths)?)
+}
+
+/// Read an `/index` answer.
+fn outcome(raw: &str) -> Result<Outcome> {
+    if let Some(warning) = remote::index_cancelled(raw) {
+        return Ok(Outcome::Cancelled(warning));
+    }
+    let v: serde_json::Value = serde_json::from_str(raw).context("parsing the index result")?;
+    Ok(Outcome::Indexed(
+        v["files_indexed"].as_u64().unwrap_or(0) as usize
+    ))
 }
 
 /// Whether an event actually changed file content.
@@ -253,6 +296,20 @@ mod tests {
         assert_eq!(
             relevant(root, Path::new("/repo/src/lib.rs"), &ig),
             Some("src/lib.rs".to_string())
+        );
+    }
+
+    /// D1b item 3: a run the stopping server cancelled is not "re-indexed" —
+    /// the batch has to go out again, not be dropped.
+    #[test]
+    fn a_cancelled_answer_is_not_a_success() {
+        assert!(matches!(
+            outcome(r#"{"cancelled":true,"files_indexed":1}"#).unwrap(),
+            Outcome::Cancelled(_)
+        ));
+        assert_eq!(
+            outcome(r#"{"files_indexed":2}"#).unwrap(),
+            Outcome::Indexed(2)
         );
     }
 

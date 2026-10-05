@@ -1,0 +1,191 @@
+# TASK-001 — El MCP nunca abre el DuckDB: backend remoto perezoso, `ensure` que detecta muerte, `serve.log`, exe `(deleted)`
+
+- **Plan:** PLAN-008 — Robustez del ciclo de vida y salida útil para agentes
+- **Especialista:** rust (modelo sugerido: opus para el diseño del backend perezoso, sonnet para el resto)
+- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+- **Depende de:** —
+- **Estado:** `done`
+
+---
+
+## Objetivo
+
+Que un proceso `devctx mcp` no pueda retener nunca el archivo DuckDB de un proyecto (PLAN-008 B1,
+D1), y que cuando no hay servidor el error llegue en ~1-2 s con la causa real en vez de 60 s de
+espera seguidos de un `Backend::Local` que bloquea a todos los demás.
+
+## Contexto verificado
+
+- `crates/devctx-cli/src/main.rs:1563-1577` — `mcp_backend`: `remote::ensure` → `None` →
+  `remote::reclaim_db(&cfg)` (mata el serve anunciado) → `devctx_mcp::backend_for(cfg, None)`.
+- `crates/devctx-mcp/src/lib.rs:1266-1281` — `backend_for(cfg, None)` → `Backend::local(AppState::build(cfg)?)`.
+- `crates/devctx-mcp/src/state.rs:205` — `Store::open`; `state.rs:167-171` — `primary: Arc<Mutex<Store>>`
+  vive lo que el proceso.
+- Caches del backend: `Binding::Project` (`lib.rs:376`), `Binding::Group.default` (`lib.rs:384`),
+  `hinted` (`lib.rs:410`, `lib.rs:492-512`), `use_project` (`lib.rs:904`). Todos guardan
+  `Arc<Backend>` y por eso no pueden "cambiar" de local a remoto.
+- `crates/devctx-cli/src/remote.rs:129-148` — `ensure`: 200 × 300 ms sin mirar si el hijo murió.
+- `remote.rs:152-168` — `spawn_server`: stderr a `/dev/null` (`:157-159`), `current_exe()` (`:153`).
+- `remote.rs:259-279` — `discover`: health-check de 400 ms; un serve ocupado se da por muerto.
+- `main.rs:1242-1262` — `cmd_serve`: `reclaim_db` (`:1247`) **antes** de escribir `serve.json`
+  (`:1253`) y de abrir el store (`run_blocking`, `:1258`).
+- Patrón a copiar: `crates/devctx-central/src/client.rs:128-157` (`ensure` con `exited`),
+  `:170-208` (`serve.log` y lectura de la causa).
+- Los 24 métodos de `Backend` tienen brazo `Remote` (`rg -c "Backend::Remote\(" backend.rs` = 24).
+- En Linux, `std::env::current_exe()` lee `/proc/self/exe`; con el binario reemplazado devuelve
+  `"<ruta> (deleted)"` y `Command::new` falla con ENOENT.
+
+## Archivos
+
+- **Modificar:** `crates/devctx-cli/src/remote.rs` (`ensure`, `spawn_server`, `discover`, helper de log)
+- **Modificar:** `crates/devctx-cli/src/main.rs` (`mcp_backend`, `cmd_serve`)
+- **Modificar:** `crates/devctx-mcp/src/backend.rs` (variante remota perezosa)
+- **Modificar:** `crates/devctx-mcp/src/lib.rs` (`backend_for` del MCP sin rama local)
+- **Crear o modificar:** helper `self_exe()` en `crates/devctx-core` (lo reusa TASK-008)
+- **Tests:** `crates/devctx-cli/tests/mcp_binding.rs`
+
+## Pasos
+
+- [x] **Paso 1 — `self_exe()`.** `devctx_core::self_exe() -> io::Result<PathBuf>`: `current_exe()`;
+      si la ruta termina en ` (deleted)` o no existe, usar la ruta sin el sufijo si existe (el binario
+      instalado nuevo); si tampoco, `/proc/self/exe` (sigue ejecutando el viejo). Test unitario sobre
+      la función pura de normalización de la cadena.
+- [x] **Paso 2 — `serve.log` del proyecto.** `spawn_server` manda stderr a
+      `.devctx/state/serve.log` (append, truncado a un tamaño razonable), usa `self_exe()`, y devuelve
+      un handle para saber si el hijo salió (hilo con `wait()`, como `client.rs`).
+- [x] **Paso 3 — `ensure` con causa.** Devuelve `Result<Remote, EnsureError>` (o equivalente) en vez
+      de `Option`: corta en cuanto el hijo sale y adjunta la última línea útil de `serve.log`
+      (lock + PID, puerto tomado, config inválida). Mantener una función `ensure_opt` para los
+      callers CLI que hoy usan `Option` hasta TASK-002.
+- [x] **Paso 4 — `discover` tolerante.** Si `serve.json` existe y su PID está vivo, un `/health` lento
+      no lo convierte en muerto: reintentar con timeout mayor (p. ej. 3 s) y, si sigue sin contestar,
+      devolver "ocupado" — nunca spawnear otro ni matarlo. "PID vivo" significa que el proceso existe
+      **y** su cmdline (`/proc/<pid>/cmdline`) es un `devctx serve`: los PIDs se reutilizan, y un PID
+      reciclado por otro programa no puede contar como serve vivo.
+- [x] **Paso 5 — `cmd_serve`.** Abrir el store (o al menos tomar el lock) **antes** de escribir
+      `serve.json`; si falla, escribir la causa a stderr (→ `serve.log`) y salir con código ≠ 0.
+      `reclaim_db` al arrancar solo cuando el serve fue lanzado a mano (no auto-spawn), o eliminarlo
+      del arranque: decidir y justificar en el Resultado.
+- [x] **Paso 6 — Backend remoto perezoso.** Nueva forma de `Backend::Remote` que guarda el
+      `ProjectConfig`/identidad y una closure de conexión; la conexión se intenta en la primera
+      llamada y se reintenta en las siguientes si no la hay. Sin servidor → error
+      `"no devctx server for <proyecto>: <causa del serve.log>. Probá `devctx serve` en <ruta>"`.
+- [x] **Paso 7 — `mcp_backend` sin local.** Quitar `reclaim_db` y la rama `None → backend_for(cfg,
+      None)`; el MCP siempre construye el backend perezoso. `devctx_mcp::backend_for(cfg, None)`
+      queda solo para quien de verdad es dueño (tests internos / web), o se elimina si nadie más lo usa.
+
+## Criterios de aceptación
+
+- [x] Test `mcp_binding`: **puerto tomado por un listener mudo** (el test abre un `TcpListener` en el
+      puerto de `auto_addr` del proyecto o escribe un `serve.json` que apunta a él) → la tool devuelve
+      error explícito; a continuación el test abre el DB (p. ej. `devctx status` con
+      `DEVCTX_NO_AUTOSERVE=1`) sin error de lock.
+- [x] Test `mcp_binding`: **lock ajeno** (el test lanza `devctx serve --addr <libre>` a mano y borra su
+      `serve.json`) → la tool vuelve en < 2 s con un error que contiene el PID del dueño.
+- [x] Con el binario reemplazado bajo un MCP vivo (simulable en test copiando el binario a un tmp,
+      lanzando el MCP desde la copia y borrándola), el MCP sigue pudiendo lanzar un serve.
+- [x] `rg -n "reclaim_db" crates/devctx-cli/src/main.rs` no muestra el camino del MCP.
+- [x] Ningún test existente de `mcp_binding`/`mcp_tools` cambia de comportamiento salvo los que
+      dependían del fallback local (listarlos en el Resultado).
+
+## Riesgos
+
+Sin fallback local, un serve que no arranca deja las tools caídas en esa sesión; el error tiene que
+ser accionable (causa + comando). `serve.log` puede crecer: truncar.
+
+## Resultado
+
+1. **Estado final:** `done`.
+2. **Repro antes/después.** Antes: con el serve inalcanzable, `mcp_backend` esperaba 60 s y caía a
+   `Backend::Local`, que retenía el DuckDB toda la sesión. Después: cubierto por tres tests
+   (`mcp_binding`), ver 5. Con lock ajeno el error aparece así (extracto real del test): contiene el
+   PID del dueño y la tool vuelve en < 2 s.
+3. **Causa raíz:** confirmada tal como en §2 (B1). Hallazgo adicional: `auto_addr` generaba puertos en
+   20000-59999, que se solapan con el rango efímero del kernel (32768-60999); con el fallback local
+   oculto era invisible, y al quitarlo un test (`a_project_hint_selects_the_member`) falló una vez en
+   corrida paralela con `Address already in use`. Rango reducido a 20000-31999.
+4. **Archivos y símbolos.**
+   - `devctx_core::self_exe() -> io::Result<PathBuf>` y `devctx_core::exe::resolve_exe(&Path, impl Fn(&Path)->bool)` (nuevo `exe.rs`).
+   - `remote::ensure_checked(&ProjectConfig) -> Result<Remote, EnsureError>` (corta cuando el hijo sale; adjunta cola de `serve.log`); `remote::ensure` queda como `Option` (callers CLI, hasta TASK-002).
+   - `remote::probe(&ProjectConfig) -> Discovery {Up, Busy{pid,addr}, Down}`; `discover` delega. `pid_alive` valida `/proc/<pid>/cmdline` (`devctx … serve|api`). `stop_server` solo mata si el PID es un serve.
+   - `remote::serve_log(&cfg)`, `remote::AUTOSPAWN_ENV` (`DEVCTX_AUTOSPAWNED`).
+   - `devctx_api::serve_with` / `run_blocking_ready(cfg, addr, token, idle, ready)`: `serve.json` se escribe tras abrir el store y bindear.
+   - `devctx_mcp::Connector`, `Backend::lazy(connect, identity)`, `RemoteClient` conecta en la primera llamada; `ProjectIdentity.plans_root` (nuevo campo) y `plan_status` en proceso sin Store.
+   - `devctx_mcp::backend_for(&ProjectConfig, Connector) -> Backend` (antes `(cfg, Option<ServerConn>) -> Result`): sin rama local. `mcp_backend` en `main.rs` ya no llama `reclaim_db`.
+   - `cmd_serve`: `reclaim_db` solo si el serve lo lanzó una persona (sin `DEVCTX_AUTOSPAWNED`); decisión: el auto-spawn existe porque nada contestó y, si aun así hay un serve vivo (ocupado), matarlo lo convertiría en muerto; falla por lock y deja la causa en `serve.log`.
+5. **Tests nuevos** (`crates/devctx-cli/tests/mcp_binding.rs`): `a_port_held_by_a_mute_listener_errors_and_leaves_the_database_free`,
+   `a_foreign_lock_is_reported_quickly_with_the_owner_pid` (< 2 s), `an_mcp_whose_binary_was_replaced_can_still_start_a_server`.
+   Unitarios: `devctx-core` `exe::tests` (4), `remote::tests::only_a_devctx_serve_cmdline_counts_as_a_server`.
+   Comando: `cargo test --no-fail-fast -p devctx-core -p devctx-mcp -p devctx-api -p devctx-cli` → core 70+6, mcp 41+4, api 1, cli unit 52, `mcp_binding` 23, `mcp_tools` 8 (1 ignored, previo), `plan_status_cli` 9, `projects_cli` 10 (1 ignored, previo): 0 fallos. `cargo clippy ... --all-targets` sin warnings; `cargo fmt --all` aplicado.
+   Ningún test existente de `mcp_binding`/`mcp_tools` cambió de comportamiento (ninguno dependía del fallback local).
+6. **Contrato JSON:** sin cambios. Nuevo error de tool: `no devctx server for <proyecto>: <causa>. Try `devctx serve` in <ruta>`.
+7. **No verificado:** reconexión ante un serve que muere con el MCP vivo (TASK-004, la conexión cacheada no se invalida); el comportamiento de los demás callers CLI de `ensure` ante `Busy` (TASK-002); `current_exe()` en `state.rs` (TASK-008); plataformas sin `/proc` (cae a `kill -0`, sin chequeo de cmdline); la primera llamada de un MCP recién arrancado ahora paga el arranque del serve (antes, el arranque).
+8. **Números:** lock ajeno → error en < 2 s (antes: 60 s + local); `mcp_binding` completo 56 s.
+
+9. **Fixup (review):**
+   - **I-1:** `self_exe()` puede devolver `/proc/self/exe`; el serve lanzado así llevaba argv[0] = `/proc/self/exe`, `pid_alive` lo daba por muerto y `stop_server`/`reclaim_db` borraban `serve.json` sin matarlo (huérfano 900 s reteniendo el lock). Ahora `pid_alive` identifica por `/proc/<pid>/exe` (sin el sufijo ` (deleted)`; basename `devctx*`) y por subcomando (`is_server_proc`); además `spawn_server` (`remote.rs`) y `devctx-central/src/client.rs` fijan `arg0("devctx")`. Corregido el comentario falso sobre argv0. El test `an_mcp_whose_binary_was_replaced_can_still_start_a_server` ahora corre `serve --stop` y afirma que el PID desaparece (antes dejaba un serve por corrida).
+   - **M-2:** `ECONNREFUSED` en `/health` = `Down` (nadie escucha; un PID vivo en ese número es otro proceso). `serve.json` guarda `start_time` (campo 22 de `/proc/<pid>/stat`); `owns_server` exige ese start time (o, en archivos viejos sin él, que el cwd del proceso esté dentro del proyecto) antes de tratar el PID como serve de este proyecto o matarlo (`probe`, `reclaim_db`, `stop_server`). Fuera de Linux sigue `kill -0` sin verificación de dueño.
+   - **M-3:** el subcomando es el primer argumento que no es flag (`devctx search api` ya no cuenta).
+   - **M-4:** el test unitario usa un `sleep` hijo (`#[cfg(target_os = "linux")]`), no el PID del propio test.
+   - **Nit:** `cmd_serve` lee y luego elimina `DEVCTX_AUTOSPAWNED` para que los nietos no lo hereden.
+   - **Tests de la hipótesis de TASK-004:** el cuelgue de `a_session_survives_its_serve_leaving` con otros serves vivos es consistente con serves huérfanos acumulados (I-1) reteniendo locks/CPU; no se pudo atribuir con certeza.
+
+10. **Fixup C (review, segunda ronda sobre propiedad de procesos):**
+   - **Módulo compartido** `devctx-core/src/procown.rs` (`is_server_proc`, `start_time`, `classify` → `Ours | Gone | Unverified`, `cwd_is`, `terminate`); lo usan `devctx-cli` y `devctx-central` (dependencia `libc` solo en unix).
+   - **1:** `stop_server`/`reclaim_db` borraban `serve.json` aunque el proceso siguiera vivo. Ahora `terminate`: SIGTERM, espera, SIGKILL, espera; el archivo se borra SOLO si el proceso desapareció (`stop_server` devuelve error y `reclaim_db` `false` si sobrevive). Tests con un servidor falso que ignora SIGTERM (copia de `sh` llamada `devctx` ejecutando `serve`).
+   - **2:** `probe` con `Refused` y proceso propio verificable → `Busy` (antes `Down` y `ensure` lanzaba otro serve contra el lock); `Down` solo si no es propio.
+   - **3:** `devctx-central::stop()` mataba el pid a ciegas. Ahora `ServeInfo` del central guarda `start_time` y `stop` usa la misma clasificación (archivos viejos: `--central` en el cmdline) y la misma regla escalar-y-borrar.
+   - **4:** `clean_git_env` usaba `std::env::vars()` (panic con variables no UTF-8; reproducido antes de arreglar); ahora `vars_os()` + `into_string().ok()`.
+   - **5:** `connection_refused` tiene test contra un `ureq::Error` real (puerto cerrado → true; listener mudo con timeout → false); el test de probe usa un proceso con pinta de `devctx serve` pero otro `start_time` (→ `Down`, no se mata, se borra el archivo obsoleto) y otro propio (→ `Busy`).
+   - **6:** el fallback sin `start_time` exige cwd == raíz del proyecto (canonicalizado), no "dentro"; cwd `(deleted)` nunca coincide. `Unverified` no se mata NI se des-anuncia (`stop` avisa y conserva `serve.json`).
+   - **TOCTOU:** en Linux se abre un pidfd antes de verificar y la señal va por `pidfd_send_signal`; si falla `pidfd_open` cae a `kill(2)` (ventana documentada). Fuera de Linux/unix sin verificación de dueño, como antes.
+   - **No verificado:** macOS/Windows; `pidfd_send_signal` en kernels < 5.3 (cae a `kill`).
+
+### Fixup D2 (review sobre Fixup C: propiedad de procesos)
+
+- Fuera de Linux `is_server_pid` era solo `kill -0` y `classify` devolvía `Ours` para cualquier PID vivo: tras un
+  reinicio de Mac, `serve --stop` / TUI / `serve --central --stop` hacían SIGTERM y luego SIGKILL a lo que heredó
+  el número. Ahora `ps -p <pid> -o lstart=,command=` debe confirmar un `devctx serve|api` y el `lstart` (token
+  FNV-1a, solo se compara) se guarda como `start_time`; lo que `ps` no confirma es `Unverified` (no se señala ni
+  se borra `serve.json`) y `ps` ausente / Windows también. Windows queda documentado como preexistente (sin
+  `kill -0` el pid era `Gone` y `stop` borraba `serve.json` sin parar nada); ahora al menos no borra. Tests
+  puros en todas las plataformas: `off_linux_only_ps_confirmation_makes_a_pid_ours`.
+- `terminate` devuelve `Termination { Gone, Survived, NoPermission }`: el errno de `pidfd_send_signal`/`kill` ya
+  no se ignora (EPERM con un serve de otro usuario/sudo esperaba 8 s y decía "survived"; ahora
+  "no permission to signal PID N"). Test: `a_refused_signal_is_reported_as_no_permission` (pid 1; no corre como
+  root).
+- `serve --stop` y `serve --central --stop` con `Unverified` fallan con exit != 0 y texto accionable ("if it's
+  yours, `kill <pid>` and delete <serve.json>"); antes salían con 0 sin hacer nada y el mensaje de lock
+  recomendaba justo ese comando (bucle).
+- N2 (campo: `serve --stop` + `search` inmediato dio "Conflicting lock (PID <el que se detenía>)"): causa
+  probable confirmada en el diseño: `terminate` esperaba a que `/proc/<pid>/cmdline` dejara de parecer un serve,
+  pero el kernel vacía `cmdline` al soltar el `mm` (`exit_mm`), ANTES de cerrar descriptores (`exit_files`): en un
+  proceso grande el desmontaje del espacio de direcciones deja una ventana en la que "ya no es nuestro" y el
+  lock de DuckDB sigue tomado. Ahora la espera es a la SALIDA real (poll del pidfd; sin pidfd, estado Z/ausente o
+  start_time distinto). Test: `terminate_returns_only_after_the_process_has_exited` (`owns` pasa a falso al
+  instante mientras el proceso sigue cerrando: no debe volver antes). No se reprodujo el campo con un
+  `index --full` real.
+
+### Fixup D2b (review final)
+
+- **I-4:** `a_refused_signal_is_reported_as_no_permission` mandaba un SIGTERM REAL al PID 1 (en un
+  contenedor con PID 1 no-root del mismo uid, tini/dumb-init, tumbaba el contenedor/CI). Ahora
+  `terminate_with` recibe el envío de señales como parámetro (`send`) y el test inyecta `EPERM`; ningún
+  test señala un proceso ajeno.
+- **I-1 (macOS):** BSD `ps` recorta `command` al ancho de terminal (79 sin TTY): una ruta larga perdía el
+  `serve` y el pid pasaba a `Gone` (con `serve.json` borrado y el server vivo). `ps_info` usa `-ww` y
+  `env_remove("COLUMNS")`.
+- **I-2 (macOS):** `lstart` es hora local; el token que guarda el serve (su TZ) y el que recalcula el
+  cliente (otra TZ: MCP/launchd) divergían. `ps_info` fuerza `TZ=UTC`.
+- **I-3 (macOS, actualización):** un `serve.json` escrito antes de D2 no tiene `start_time` y el fallback
+  no funcionaba fuera de Linux (`cwd_is` siempre falso, `cmdline_has` leía `/proc`) → `Unverified` y
+  `serve --stop` fallaba siempre justo tras actualizar. Ahora `cwd_is` usa `lsof -a -p <pid> -d cwd -Fn`
+  (`parse_lsof_cwd`) y `cmdline_has` la columna de `ps -ww` (`ps_command_has`, exige además que sea un
+  devctx serve). Parseo en funciones puras con test
+  (`the_off_linux_fallbacks_read_ps_and_lsof_output`). No verificado en macOS real.
+- **m-1:** `ps_command_is_server` reemplazaba espacios por `\0` y una ruta con espacios
+  (`/Users/John Doe/...`) rompía argv0. Ahora prueba cada token cuyo basename empieza por `devctx` como
+  fin de argv0 (con la ruta absoluta antes). Test: `a_ps_command_with_spaces_in_the_path_is_still_a_server`.
+- **N1:** "started background server" solo se imprime si el serve que respondió es el que ESTE comando
+  lanzó (`announce_spawn`: pid de `serve.json` == pid del hijo). Test: `only_our_own_spawn_is_announced`.
+- **Pendiente P1:** ver la lista "Pendientes para P1" del plan (m-2 kqueue).

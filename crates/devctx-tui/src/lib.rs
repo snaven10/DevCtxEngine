@@ -193,9 +193,11 @@ impl Engine {
                         "query": query, "limit": LIMIT, "mode": m, "rerank": false,
                     }),
                 )?;
-                Ok(v.as_array()
-                    .map(|a| a.iter().map(json_to_hit).collect())
-                    .unwrap_or_default())
+                Ok(devctx_core::search_hits(&v)
+                    .hits
+                    .iter()
+                    .map(json_to_hit)
+                    .collect())
             }
         }
     }
@@ -461,8 +463,10 @@ enum JobDone {
 
 /// Run `devctx` with the given arguments, returning stdout.
 fn run_devctx(args: &[&str]) -> anyhow::Result<String> {
-    let exe = std::env::current_exe()?;
-    let out = std::process::Command::new(exe).args(args).output()?;
+    let exe = devctx_core::self_exe()?;
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new(exe))
+        .args(args)
+        .output()?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("{}", err.trim().lines().last().unwrap_or("command failed"));
@@ -540,8 +544,8 @@ fn spawn_worker() -> (Sender<Job>, Receiver<JobDone>) {
 /// `devctx` has no global `-C`, so the working directory is how the command
 /// finds the project it should act on.
 fn index_in(path: &str) -> anyhow::Result<String> {
-    let exe = std::env::current_exe()?;
-    let out = std::process::Command::new(exe)
+    let exe = devctx_core::self_exe()?;
+    let out = devctx_core::clean_git_env(&mut std::process::Command::new(exe))
         .arg("index")
         .current_dir(path)
         .output()?;

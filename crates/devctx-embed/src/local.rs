@@ -126,6 +126,12 @@ fn init_on<T>(
                 eprintln!("devctx: embeddings requested CUDA (device: cuda)");
                 match init(providers) {
                     Ok(model) => return Ok((model, true)),
+                    // A stalled download is not a CUDA problem, and retrying
+                    // on CPU would only queue behind the stuck loader's lock
+                    // (see `devctx_core::modelload`): report it as it is.
+                    Err(e) if devctx_core::modelload::is_stall_error(&e.to_string()) => {
+                        return Err(e)
+                    }
                     Err(e) => eprintln!(
                         "devctx: warning: CUDA failed for embeddings ({e}); falling back to CPU. \
                          Check the NVIDIA driver, CUDA 12 toolkit and cuDNN 9."
@@ -170,7 +176,10 @@ fn load_builtin(
         opts = opts.with_max_length(max);
     }
     init_on(device, |eps| {
-        TextEmbedding::try_new(opts.clone().with_execution_providers(eps))
+        // hf-hub's download has no read timeout: guard it (see `modelload`).
+        let opts = opts.clone().with_execution_providers(eps);
+        devctx_core::modelload::guard_load(spec.key, move || TextEmbedding::try_new(opts))
+            .map_err(EmbedError::Backend)?
             .map_err(|e| EmbedError::Backend(e.to_string()))
     })
 }

@@ -80,6 +80,42 @@ const SOURCES: &[&str] = &[
     include_str!("../languages/rust.json"),
 ];
 
+/// Manual version of the extraction *logic* in `parser.rs` (receiver
+/// normalisation, edge resolution, symbol kinds). Bump it whenever a change
+/// there alters what a re-parse of the same source produces; the embedded
+/// `languages/*.json` are covered by the hash and need no bump.
+///
+/// What the fingerprint does NOT cover: the tree-sitter grammar versions
+/// (a `Cargo.lock` bump that changes parse trees) and the route extraction in
+/// `devctx-index`'s `routes.rs`. A change to either needs a manual bump here,
+/// or existing indexes keep reading as fresh. Only a full run (`index --full`)
+/// stamps the fingerprint; incremental runs never re-stamp an older index.
+pub const EXTRACTOR_VERSION: u32 = 1;
+
+/// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
+fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// `v<EXTRACTOR_VERSION>-<fnv1a of every source>` for the given definitions.
+fn fingerprint_of(version: u32, sources: &[&str]) -> String {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for src in sources {
+        h = fnv1a(h, src.as_bytes());
+        h = fnv1a(h, &[0]); // keeps ["ab", "c"] apart from ["a", "bc"]
+    }
+    format!("v{version}-{h:016x}")
+}
+
+/// What produced an index: [`EXTRACTOR_VERSION`] plus a hash of the embedded
+/// language definitions. An index stamped with a different value was built by
+/// an extractor that may have produced different symbols and edges.
+pub fn extractor_fingerprint() -> String {
+    fingerprint_of(EXTRACTOR_VERSION, SOURCES)
+}
+
 /// Every language with a wired parser.
 ///
 /// Parsed once. A malformed file panics here rather than degrading into "that
@@ -180,5 +216,28 @@ mod tests {
     fn tsx_is_recorded_as_typescript() {
         assert_eq!(by_name("tsx").unwrap().language(), "typescript");
         assert_eq!(by_name("java").unwrap().language(), "java");
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn the_fingerprint_is_stable_between_calls() {
+        assert_eq!(extractor_fingerprint(), extractor_fingerprint());
+        assert!(extractor_fingerprint().starts_with("v1-"));
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_a_definition_or_the_version() {
+        let base = fingerprint_of(1, &["{\"a\":1}", "{}"]);
+        assert_eq!(base, fingerprint_of(1, &["{\"a\":1}", "{}"]));
+        assert_ne!(base, fingerprint_of(1, &["{\"a\":2}", "{}"]));
+        assert_ne!(base, fingerprint_of(2, &["{\"a\":1}", "{}"]));
+        assert_ne!(
+            fingerprint_of(1, &["ab", "c"]),
+            fingerprint_of(1, &["a", "bc"])
+        );
     }
 }

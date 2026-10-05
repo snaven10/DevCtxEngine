@@ -39,12 +39,12 @@ impl Store {
         routes: &[StoredRoute],
         now: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM routes WHERE repo = ? AND branch = ? AND file = ?",
             params![repo, branch, file],
         )?;
         for r in routes {
-            self.conn.execute(
+            self.w()?.execute(
                 &format!(
                     "INSERT INTO routes ({ROUTE_COLS}) \
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING"
@@ -69,7 +69,7 @@ impl Store {
 
     /// Delete all routes originating in a file.
     pub fn delete_file_routes(&self, repo: &str, branch: &str, file: &str) -> Result<()> {
-        self.conn.execute(
+        self.w()?.execute(
             "DELETE FROM routes WHERE repo = ? AND branch = ? AND file = ?",
             params![repo, branch, file],
         )?;

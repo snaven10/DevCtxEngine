@@ -23,10 +23,54 @@ pub struct ServerConn {
     pub token: Option<String>,
 }
 
+/// Finds (spawning if needed) the project's server; the error is what the agent
+/// reads when there is none.
+pub type Connector = Arc<dyn Fn() -> Result<ServerConn, String> + Send + Sync>;
+
+/// What the client currently knows about the server.
+#[derive(Default)]
+struct Link {
+    /// `(base, token)` of the server once connected.
+    target: Option<(String, Option<String>)>,
+    /// Bumped on every connection, so a failure seen on an old connection
+    /// cannot invalidate a newer one another thread already made.
+    generation: u64,
+    /// When the connector last failed, and why: for [`FAILURE_BACKOFF`].
+    failed: Option<(std::time::Instant, String)>,
+}
+
+/// How long a failed connection attempt is remembered. Without it every tool
+/// call re-runs the connector — up to a minute each against a hung server, one
+/// after another behind the lock — instead of failing at once with the reason.
+///
+/// Short on purpose: it also memoises a Busy / "shutting down" answer, and the
+/// serve can be back a moment later; a longer window would keep failing
+/// instantly after it is.
+const FAILURE_BACKOFF: Duration = Duration::from_secs(3);
+
+/// Budget to open the TCP connection. A dropped SYN (full backlog on a hung
+/// serve) must not consume the whole request deadline (120 s; 1800 s for
+/// `index_repo`).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A thin blocking HTTP client for the shared server's endpoints.
+///
+/// The connection may not exist yet: an MCP never opens the project's database
+/// itself, and it does not need the server at startup either. The first call
+/// connects, and a call that finds no server fails with the reason; the next
+/// call (after a few seconds) tries again.
+///
+/// The connection is not permanent either: the server leaves on its own
+/// (`--idle`, `serve --stop`, a crash). A request that fails to *connect* drops
+/// the cached target, runs the connector again (rediscover or respawn) and is
+/// retried once. Only that: a request that may have reached the server (read
+/// timeout, an HTTP status) is never repeated, since it could duplicate a write.
 pub struct RemoteClient {
-    base: String,
-    token: Option<String>,
+    link: std::sync::Mutex<Link>,
+    /// Held while the connector runs (see [`RemoteClient::target`]); `link`
+    /// is not.
+    connecting: std::sync::Mutex<()>,
+    connect: Option<Connector>,
 }
 
 /// Default per-call timeout for a routed request, in seconds. This used to be a
@@ -56,15 +100,123 @@ fn long_timeout() -> Duration {
     Duration::from_secs(LONG_TIMEOUT_SECS)
 }
 
+/// Whether a failed request may be repeated: only when it provably never
+/// reached the server (the connection was refused or could not be made).
+/// A read timeout, a connection cut after sending and any HTTP status all
+/// return `false`: the request may have been processed.
+fn should_retry(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::Transport(t) => matches!(
+            t.kind(),
+            ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns
+        ),
+        ureq::Error::Status(..) => false,
+    }
+}
+
 impl RemoteClient {
-    fn agent(&self, timeout: Duration) -> ureq::Agent {
-        ureq::AgentBuilder::new().timeout(timeout).build()
+    fn new(connect: Connector) -> Self {
+        RemoteClient {
+            link: std::sync::Mutex::new(Link::default()),
+            connecting: std::sync::Mutex::new(()),
+            connect: Some(connect),
+        }
     }
 
-    fn auth(&self, req: ureq::Request) -> ureq::Request {
-        match &self.token {
+    /// `((base, token), generation)` of the server, connecting on first use.
+    ///
+    /// Single-flight: `connecting` serialises the *connectors* (so concurrent
+    /// calls spawn one server, not several) while `link` is held only for
+    /// reads and writes of the state, never across `connect()`. A connect that
+    /// takes a minute against a hung server therefore blocks only the calls
+    /// that need that very connection; the waiters then see its outcome (the
+    /// target, or the remembered failure) instead of running the connector again.
+    fn target(&self) -> Result<((String, Option<String>), u64), String> {
+        if let Some(found) = self.known()? {
+            return Ok(found);
+        }
+        let connect = self
+            .connect
+            .as_ref()
+            .ok_or_else(|| "no devctx server connection".to_string())?;
+        let _flight = self.connecting.lock().unwrap_or_else(|p| p.into_inner());
+        // Someone may have connected (or failed) while this call waited.
+        if let Some(found) = self.known()? {
+            return Ok(found);
+        }
+        match connect() {
+            Ok(c) => {
+                let t = (c.base, c.token);
+                let mut link = self.link.lock().unwrap_or_else(|p| p.into_inner());
+                link.failed = None;
+                link.generation += 1;
+                link.target = Some(t.clone());
+                Ok((t, link.generation))
+            }
+            Err(e) => {
+                let mut link = self.link.lock().unwrap_or_else(|p| p.into_inner());
+                link.failed = Some((std::time::Instant::now(), e.clone()));
+                Err(e)
+            }
+        }
+    }
+
+    /// The cached target, or the remembered failure while it is fresh; `None`
+    /// when the connector has to run. Never calls it, so the lock is brief.
+    #[allow(clippy::type_complexity)]
+    fn known(&self) -> Result<Option<((String, Option<String>), u64)>, String> {
+        let link = self.link.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = link.target.as_ref() {
+            return Ok(Some((t.clone(), link.generation)));
+        }
+        if let Some((at, why)) = link.failed.as_ref() {
+            if self.connect.is_some() && at.elapsed() < FAILURE_BACKOFF {
+                return Err(why.clone());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Forget the connection `generation`, unless a newer one replaced it.
+    fn invalidate(&self, generation: u64) {
+        let mut link = self.link.lock().unwrap_or_else(|p| p.into_inner());
+        if link.generation == generation {
+            link.target = None;
+        }
+    }
+
+    fn agent(&self, timeout: Duration) -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT.min(timeout))
+            .timeout(timeout)
+            .build()
+    }
+
+    fn auth(req: ureq::Request, token: &Option<String>) -> ureq::Request {
+        match token {
             Some(t) => req.set("Authorization", &format!("Bearer {t}")),
             None => req,
+        }
+    }
+
+    /// Send with the current target; on a connect failure, reconnect and send
+    /// once more (see the type's doc for the rule).
+    fn request(
+        &self,
+        send: impl Fn(&str, &Option<String>) -> Result<ureq::Response, Box<ureq::Error>>,
+    ) -> Result<String, String> {
+        let ((base, token), generation) = self.target()?;
+        match send(&base, &token) {
+            Err(e) if self.connect.is_some() && should_retry(&e) => {
+                let first = e.to_string();
+                self.invalidate(generation);
+                let ((base, token), _) = self
+                    .target()
+                    .map_err(|why| format!("{first}; reconnecting failed: {why}"))?;
+                read(send(&base, &token).map_err(|e| *e))
+                    .map_err(|second| format!("{second} (retried once; first attempt: {first})"))
+            }
+            other => read(other.map_err(|e| *e)),
         }
     }
 
@@ -73,10 +225,12 @@ impl RemoteClient {
     }
 
     fn get_timed(&self, path: &str, timeout: Duration) -> Result<String, String> {
-        read(
-            self.auth(self.agent(timeout).get(&format!("{}{path}", self.base)))
-                .call(),
-        )
+        let agent = self.agent(timeout);
+        self.request(|base, token| {
+            Self::auth(agent.get(&format!("{base}{path}")), token)
+                .call()
+                .map_err(Box::new)
+        })
     }
 
     fn post(&self, path: &str, body: Value) -> Result<String, String> {
@@ -84,10 +238,12 @@ impl RemoteClient {
     }
 
     fn post_timed(&self, path: &str, body: Value, timeout: Duration) -> Result<String, String> {
-        read(
-            self.auth(self.agent(timeout).post(&format!("{}{path}", self.base)))
-                .send_json(body),
-        )
+        let agent = self.agent(timeout);
+        self.request(|base, token| {
+            Self::auth(agent.post(&format!("{base}{path}")), token)
+                .send_json(body.clone())
+                .map_err(Box::new)
+        })
     }
 }
 
@@ -128,6 +284,9 @@ pub enum Backend {
 pub struct ProjectIdentity {
     pub name: String,
     pub group: String,
+    /// Where this project's `plans/` live. `plan_status` only reads markdown, so
+    /// it is answered here, in process, without a server and without a `Store`.
+    pub plans_root: Option<devctx_core::plans::PlansRoot>,
 }
 
 impl Backend {
@@ -135,14 +294,9 @@ impl Backend {
         Backend::Local(state)
     }
 
-    pub fn remote(conn: ServerConn, identity: ProjectIdentity) -> Self {
-        Backend::Remote(
-            RemoteClient {
-                base: conn.base,
-                token: conn.token,
-            },
-            identity,
-        )
+    /// A backend whose server is found on first use (see [`RemoteClient`]).
+    pub fn lazy(connect: Connector, identity: ProjectIdentity) -> Self {
+        Backend::Remote(RemoteClient::new(connect), identity)
     }
 
     pub fn search(
@@ -227,6 +381,9 @@ impl Backend {
     pub fn plan_status(&self, plan: Option<&str>) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_plan_status(s, plan),
+            Backend::Remote(_, id) if id.plans_root.is_some() => {
+                crate::state::plan_status_budgeted(id.plans_root.as_ref().unwrap(), plan)
+            }
             Backend::Remote(r, _) => match plan {
                 Some(p) => r.get(&format!("/plans/status?plan={}", urlencode(p))),
                 None => r.get("/plans/status"),
@@ -582,5 +739,155 @@ mod tests {
             Backend::warn_if_provenance_was_ignored(answer.clone(), Some("REVFA")),
             answer
         );
+    }
+
+    // --- Retry policy (PLAN-008 B2) -------------------------------------------
+
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn a_refused_connection_is_retried() {
+        let url = format!("http://127.0.0.1:{}/x", closed_port());
+        let err = ureq::get(&url).call().unwrap_err();
+        assert!(should_retry(&err), "never sent, safe to repeat: {err}");
+    }
+
+    #[test]
+    fn a_read_timeout_is_not_retried() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/x", l.local_addr().unwrap());
+        // Accepts (kernel backlog) but never answers.
+        let err = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .post(&url)
+            .send_json(json!({}))
+            .unwrap_err();
+        assert!(!should_retry(&err), "may have been processed: {err}");
+    }
+
+    #[test]
+    fn an_http_status_is_not_retried() {
+        for code in [404u16, 500] {
+            let resp = ureq::Response::new(code, "x", "").unwrap();
+            assert!(!should_retry(&ureq::Error::Status(code, resp)), "{code}");
+        }
+    }
+
+    /// The connector runs again after a refused connection, exactly once more,
+    /// and the failure is remembered instead of re-running it per call.
+    #[test]
+    fn a_refused_connection_reconnects_once_and_failures_back_off() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let dead = format!("http://127.0.0.1:{}", closed_port());
+        let connect: Connector = Arc::new(move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ServerConn {
+                base: dead.clone(),
+                token: None,
+            })
+        });
+        let client = RemoteClient::new(connect);
+        let err = client.get("/status").unwrap_err();
+        assert!(err.contains("retried once"), "{err}");
+        // First connect + one reconnect, no more.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let failing: Connector = Arc::new({
+            let c = calls.clone();
+            move || {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("no server".to_string())
+            }
+        });
+        let client = RemoteClient::new(failing);
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..3 {
+            assert_eq!(client.get("/status").unwrap_err(), "no server");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+    }
+
+    /// M-1: the Link lock is not held while the connector runs, and concurrent
+    /// callers share one connect instead of queueing a connector each.
+    ///
+    /// Deterministic: the connector parks on a gate, so the second caller
+    /// arrives while the first is provably still connecting (a failure cached
+    /// for the back-off cannot mask a second connector run).
+    #[test]
+    fn a_slow_connect_does_not_hold_the_link_lock_and_is_single_flight() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let wait_for = |what: &str, cond: &dyn Fn() -> bool| {
+            let t = std::time::Instant::now();
+            while !cond() {
+                assert!(t.elapsed() < Duration::from_secs(10), "timed out: {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let c = calls.clone();
+        let connect: Connector = Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            Err("hung".to_string())
+        });
+        let client = Arc::new(RemoteClient::new(connect));
+        let first = {
+            let cl = client.clone();
+            std::thread::spawn(move || cl.target().unwrap_err())
+        };
+        wait_for("the connector to start", &|| {
+            calls.load(Ordering::SeqCst) == 1
+        });
+        assert!(
+            client.link.try_lock().is_ok(),
+            "the Link mutex must be free while the connector runs"
+        );
+        let arrived = Arc::new(AtomicBool::new(false));
+        let second = {
+            let (cl, a) = (client.clone(), arrived.clone());
+            std::thread::spawn(move || {
+                a.store(true, Ordering::SeqCst);
+                cl.target().unwrap_err()
+            })
+        };
+        wait_for("the second caller to start", &|| {
+            arrived.load(Ordering::SeqCst)
+        });
+        // Time for it to reach the connector if it were going to.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second caller must wait for the first connect, not start its own"
+        );
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), "hung");
+        assert_eq!(second.join().unwrap(), "hung");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one connector run");
+    }
+
+    /// The agent has its own connect budget: a dropped SYN must not eat the
+    /// whole request deadline.
+    #[test]
+    fn a_dropped_syn_gives_up_at_the_connect_timeout() {
+        // 10.255.255.1 is unroutable: the SYN goes unanswered (or the network
+        // is unreachable at once, which is also fast). Either way the call
+        // returns well before the 30 s request deadline.
+        let client = RemoteClient::new(Arc::new(|| Err("unused".into())));
+        let agent = client.agent(Duration::from_secs(30));
+        let t = std::time::Instant::now();
+        let _ = agent.get("http://10.255.255.1:9/x").call();
+        // The connect budget is CONNECT_TIMEOUT (2 s): a dropped SYN returns
+        // at about that, an unreachable network sooner, and never near the
+        // 30 s request deadline. A few seconds of slack for a loaded machine.
+        assert!(CONNECT_TIMEOUT <= Duration::from_secs(2));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     }
 }

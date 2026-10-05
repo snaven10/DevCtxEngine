@@ -6,6 +6,7 @@
 //! See `docs/architecture-spec.md` §8 for the process model.
 
 pub mod backend;
+pub mod lifecycle;
 pub mod state;
 
 use std::collections::HashMap;
@@ -23,8 +24,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
 
-pub use backend::{Backend, ServerConn};
-use state::AppState;
+pub use backend::{Backend, Connector, ServerConn};
 
 /// Parameters for the `search` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -542,6 +542,14 @@ impl DevctxServer {
         (root.source == devctx_core::plans::PlansRootSource::Workspace).then_some(root)
     }
 
+    /// This process's version and whether its binary was replaced (PLAN-008 D2).
+    /// Off the async threads: it may run `<exe> --version`, capped at 2 s.
+    async fn mcp_info(&self) -> serde_json::Value {
+        tokio::task::spawn_blocking(lifecycle::mcp_json)
+            .await
+            .unwrap_or(serde_json::Value::Null)
+    }
+
     /// Add one field to a JSON object result, leaving other shapes untouched.
     fn note(out: String, key: &str, value: serde_json::Value) -> String {
         match serde_json::from_str::<serde_json::Value>(&out) {
@@ -658,7 +666,8 @@ impl DevctxServer {
         repo and branch, and whether the index is up to date.")]
     async fn index_status(&self) -> Result<String, ErrorData> {
         let backend = self.bound()?;
-        run_blocking(move || backend.index_status()).await
+        let out = run_blocking(move || backend.index_status()).await?;
+        Ok(Self::note(out, "mcp", self.mcp_info().await))
     }
 
     /// Save a memory (decision, insight, note) for later recall.
@@ -889,6 +898,7 @@ impl DevctxServer {
             Some(backend) => run_blocking(move || backend.list_projects(all)).await,
             None => run_blocking(move || state::do_list_projects(None, "", all)).await,
         }?;
+        let out = Self::note(out, "mcp", self.mcp_info().await);
         // `bound: null` used to mean "no project". With group bindings it would
         // also mean "a whole product", and an agent must be able to tell those
         // apart before deciding whether it needs to call `use_project` at all.
@@ -1261,23 +1271,38 @@ where
     }
 }
 
-/// Build a backend for a project already resolved to a config: route through
-/// its shared server when there is one, else own the database here.
-pub fn backend_for(cfg: ProjectConfig, server: Option<ServerConn>) -> anyhow::Result<Backend> {
-    Ok(match server {
-        Some(conn) => Backend::remote(
-            conn,
-            crate::backend::ProjectIdentity {
-                name: if cfg.project.name.is_empty() {
-                    "default".to_string()
-                } else {
-                    cfg.project.name.clone()
-                },
-                group: cfg.project.group.clone(),
+/// Build the backend for a project already resolved to a config.
+///
+/// Always remote: the MCP never opens the project's database. `connect` finds
+/// (or starts) the project's server the first time a tool needs it, so a
+/// missing server is an error on that call — with its cause — rather than a
+/// process that quietly took the DuckDB lock for as long as the session lives.
+pub fn backend_for(cfg: &ProjectConfig, connect: backend::Connector) -> Backend {
+    let root = if cfg.project.path.is_empty() {
+        std::env::current_dir().ok()
+    } else {
+        Some(std::path::PathBuf::from(&cfg.project.path))
+    };
+    let plans_root = root.map(|r| {
+        devctx_core::plans::resolve_plans_root(
+            Some(&r),
+            None,
+            !cfg.project.group.trim().is_empty(),
+            state::home_dir().as_deref(),
+        )
+    });
+    Backend::lazy(
+        connect,
+        crate::backend::ProjectIdentity {
+            name: if cfg.project.name.is_empty() {
+                "default".to_string()
+            } else {
+                cfg.project.name.clone()
             },
-        ),
-        None => Backend::local(Arc::new(AppState::build(cfg)?)),
-    })
+            group: cfg.project.group.clone(),
+            plans_root,
+        },
+    )
 }
 
 /// Serve the DevCtxEngine MCP server over stdio until the client disconnects.
@@ -1294,6 +1319,7 @@ pub async fn serve_stdio(backend: Option<Backend>, connect: Connect) -> anyhow::
 
 /// Serve with a binding the caller resolved, which may be a whole group.
 pub async fn serve_stdio_bound(binding: Binding, connect: Connect) -> anyhow::Result<()> {
+    lifecycle::init();
     let service = DevctxServer::with_binding(binding, connect)
         .serve(rmcp::transport::stdio())
         .await?;
@@ -1315,5 +1341,16 @@ pub fn run_stdio_bound(binding: Binding, connect: Connect) -> anyhow::Result<()>
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve_stdio_bound(binding, connect))
+    let served = rt.block_on(serve_stdio_bound(binding, connect));
+    // The client closing stdin ends the session. rmcp first gives in-flight
+    // requests up to 5 s to answer (so `echo '{...}' | devctx mcp` still gets its
+    // reply); after that, dropping the runtime would wait for every
+    // `spawn_blocking` still running (an `index_repo`, a federated `recall`) and
+    // keep an orphaned MCP alive for as long as it takes. Cap that wait too:
+    // the worst case from EOF to exit is ~5 s + `SHUTDOWN_GRACE`.
+    rt.shutdown_timeout(SHUTDOWN_GRACE);
+    served
 }
+
+/// How long in-flight blocking tool calls may delay the exit once the service loop ended.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);

@@ -7,8 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use devctx_core::config::ProjectConfig;
@@ -46,6 +46,13 @@ pub struct IndexProgress {
     pub done: usize,
     /// The file it reached last.
     pub file: String,
+    /// When the run last moved (started, reached a file, or reported a phase
+    /// that is still working). `running` with an old stamp is a run that is
+    /// stuck, not one that is working.
+    pub advanced: Option<Instant>,
+    /// What the run is doing when it is not on a file: `loading model`,
+    /// `files`, `prune`, `hnsw`, `fts`, `checkpoint`.
+    pub phase: String,
 }
 
 /// Writes an indexing run's progress where a request handler can read it.
@@ -58,16 +65,44 @@ pub struct IndexProgress {
 struct SharedProgress {
     shared: Arc<Mutex<IndexProgress>>,
     /// Whether this run is the one currently filling the slot. Decided at
-    /// [`ProgressSink::start`], since before diffing there is nothing to report.
+    /// [`SharedProgress::begin`] or [`ProgressSink::start`].
     owns: AtomicBool,
+    /// Set when the server is shutting down: the run stops at the next file.
+    cancel: Arc<AtomicBool>,
 }
 
 impl SharedProgress {
+    #[cfg(test)]
     fn new(shared: Arc<Mutex<IndexProgress>>) -> Self {
+        Self::with_cancel(shared, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_cancel(shared: Arc<Mutex<IndexProgress>>, cancel: Arc<AtomicBool>) -> Self {
         Self {
             shared,
             owns: AtomicBool::new(false),
+            cancel,
         }
+    }
+
+    /// Claim the slot before the run has anything to count: loading (perhaps
+    /// downloading) the model comes first and can take minutes, and a run that
+    /// only showed up once it had diffed was invisible — to a poller, and to
+    /// the idle watchdog, which then shut the server down under it.
+    fn begin(&self, phase: &str) {
+        let mut p = self.lock();
+        if p.running {
+            return;
+        }
+        self.owns.store(true, Ordering::SeqCst);
+        p.running = true;
+        p.run += 1;
+        p.total = 0;
+        p.done = 0;
+        p.file.clear();
+        p.phase.clear();
+        p.phase.push_str(phase);
+        p.advanced = Some(Instant::now());
     }
 
     /// A poisoned lock must never take an indexing run down with it: this is a
@@ -86,23 +121,47 @@ impl SharedProgress {
     /// over while it is still embedding files.
     fn finish(&self) {
         if self.owns.swap(false, Ordering::SeqCst) {
-            self.lock().running = false;
+            let mut p = self.lock();
+            p.running = false;
+            // The end of a run is activity too: the idle timer counts from
+            // here, not from the request that started it long ago (see
+            // `AppState::last_index_activity`).
+            p.advanced = Some(Instant::now());
         }
     }
 }
 
 impl ProgressSink for SharedProgress {
     fn start(&self, total: usize) {
-        let mut p = self.lock();
-        if p.running {
+        if self.owns.load(Ordering::SeqCst) {
+            // Claimed at `begin`; now the size of the run is known.
+            let mut p = self.lock();
+            p.total = total;
+            p.phase.clear();
+            p.phase.push_str("files");
+            p.advanced = Some(Instant::now());
             return;
         }
-        self.owns.store(true, Ordering::SeqCst);
-        p.running = true;
-        p.run += 1;
-        p.total = total;
-        p.done = 0;
-        p.file.clear();
+        self.begin("files");
+        if self.owns.load(Ordering::SeqCst) {
+            self.lock().total = total;
+        }
+    }
+
+    fn phase(&self, name: &str) {
+        if !self.owns.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut p = self.lock();
+        if p.phase != name {
+            p.phase.clear();
+            p.phase.push_str(name);
+        }
+        p.advanced = Some(Instant::now());
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
     }
 
     fn file(&self, path: &str) {
@@ -113,6 +172,7 @@ impl ProgressSink for SharedProgress {
         p.done += 1;
         p.file.clear();
         p.file.push_str(path);
+        p.advanced = Some(Instant::now());
     }
 }
 
@@ -161,6 +221,10 @@ impl<T: Clone> Cached<T> {
 pub struct AppState {
     cfg: ProjectConfig,
     root: PathBuf,
+    /// Git's top-level directory for `root`, found once (one `git` spawn) and
+    /// reused: it cannot change while the server runs, and every search and
+    /// graph call needs it. Unset until git first answers.
+    toplevel: OnceLock<PathBuf>,
     /// Where `plans/` is read from (PLAN-007 DD-3): the project's own root, or the workspace
     /// that holds the plans of a group member. Decided once, at construction.
     plans_root: PlansRoot,
@@ -180,6 +244,13 @@ pub struct AppState {
     reranker: Mutex<Option<Cached<Arc<dyn Reranker>>>>,
     /// How far the current indexing run has got, for `/index/progress`.
     index_progress: Arc<Mutex<IndexProgress>>,
+    /// Raised when the server is asked to stop: every indexing run in flight
+    /// (and any that starts afterwards) stops at its next file boundary,
+    /// commits, checkpoints and returns. See [`AppState::cancel_indexing`].
+    index_cancel: Arc<AtomicBool>,
+    /// Consecutive polls that found the project's `.devctx/` missing; see
+    /// [`AppState::project_vanished`].
+    vanish_strikes: AtomicU32,
 }
 
 impl AppState {
@@ -212,6 +283,7 @@ impl AppState {
         Ok(Self {
             cfg,
             root,
+            toplevel: OnceLock::new(),
             plans_root,
             primary: Arc::new(Mutex::new(primary)),
             embed_settings,
@@ -220,6 +292,8 @@ impl AppState {
             embedder: Mutex::new(None),
             reranker: Mutex::new(None),
             index_progress: Arc::new(Mutex::new(IndexProgress::default())),
+            index_cancel: Arc::new(AtomicBool::new(false)),
+            vanish_strikes: AtomicU32::new(0),
         })
     }
 
@@ -315,6 +389,66 @@ impl AppState {
         store.checkpoint();
     }
 
+    /// The checkpoint for a process that is about to end, whatever else is
+    /// running: a plain `CHECKPOINT` first, escalated to `FORCE CHECKPOINT`
+    /// (which aborts other connections' open transactions — they are about to
+    /// die with the process anyway) when the plain one is refused. Returns
+    /// whether the WAL was folded.
+    ///
+    /// The database is [frozen](Store::freeze) first — waiting at most
+    /// `freeze_wait` for a statement already running — so nothing written
+    /// after this checkpoint can reach a WAL the process will not fold: an
+    /// indexing thread still alive at `_exit` has its next write refused
+    /// instead.
+    pub fn checkpoint_for_exit(&self, freeze_wait: Duration) -> bool {
+        let store = self
+            .primary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !store.freeze(freeze_wait) {
+            eprintln!(
+                "DevCtxEngine: a write was still running {freeze_wait:?} into the exit; \
+                 checkpointing anyway (FORCE aborts it)"
+            );
+        }
+        match store.try_checkpoint() {
+            Ok(()) => true,
+            Err(plain) => match store.force_checkpoint() {
+                Ok(()) => true,
+                Err(forced) => {
+                    eprintln!(
+                        "DevCtxEngine: the exit checkpoint failed ({plain}; forced: {forced}); \
+                         the write-ahead log is left for the next open to replay"
+                    );
+                    false
+                }
+            },
+        }
+    }
+
+    /// Ask every indexing run to stop at its next file boundary (the server is
+    /// shutting down). Irreversible for this process: a run started afterwards
+    /// stops before its first file.
+    pub fn cancel_indexing(&self) {
+        self.index_cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether an indexing run is writing to the database and reported progress
+    /// within `quiet`. What the stop watchdog asks while a cancelled run winds
+    /// down: a run still moving is finishing its file or its checkpoint and
+    /// deserves the wait; one that is not is stuck.
+    ///
+    /// A run still loading its model does not count: it has written nothing,
+    /// it cannot be cancelled (the load is not ours to interrupt), and waiting
+    /// on it is waiting on the network.
+    pub fn index_winding_down(&self, quiet: Duration) -> bool {
+        let p = self
+            .index_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        p.running && p.phase != LOADING_MODEL && p.advanced.is_some_and(|at| at.elapsed() < quiet)
+    }
+
     fn open_store(&self) -> Result<Store, String> {
         // Hand out a fresh connection to the same in-process database; the mutex
         // is held only for the cheap clone, not for the query.
@@ -348,11 +482,43 @@ impl AppState {
         self.cfg.indexing.default_branch().map(str::to_string)
     }
 
-    /// The short repo name + branch (for graph queries), from git.
-    pub fn repo_branch(&self) -> Result<(String, String), String> {
-        let git = GitRepo::open(&self.root).map_err(|e| e.to_string())?;
-        Ok((git.short_name(), git.state().branch))
+    /// The key the store files this project's index under: git's top-level
+    /// directory, which is what the indexing pipeline uses. Not `self.root`
+    /// (the configured project path), which differs when the project is a
+    /// subdirectory of the repository or reached through a symlink.
+    pub fn repo_path(&self) -> String {
+        match self.git() {
+            Ok(g) => g.root().to_string_lossy().into_owned(),
+            Err(_) => self.root.to_string_lossy().into_owned(),
+        }
     }
+
+    /// The repository, with its top-level directory cached after the first
+    /// success so later calls spawn nothing.
+    fn git(&self) -> Result<GitRepo, String> {
+        if let Some(top) = self.toplevel.get() {
+            return Ok(GitRepo::at_root(top.clone()));
+        }
+        let git = GitRepo::open(&self.root).map_err(|e| e.to_string())?;
+        let _ = self.toplevel.set(git.root().to_path_buf());
+        Ok(git)
+    }
+
+    /// The short repo name + branch (for graph queries), from git. One `git`
+    /// spawn once the top level is cached (the branch itself can change).
+    pub fn repo_branch(&self) -> Result<(String, String), String> {
+        let git = self.git()?;
+        Ok((git.short_name(), git.branch()))
+    }
+}
+
+/// The `repo_path` key the store uses for the repository containing `root`:
+/// git's top-level directory (as the indexing pipeline records it), falling
+/// back to `root` itself when it is not a git repository.
+pub fn repo_key(root: &std::path::Path) -> String {
+    GitRepo::open(root)
+        .map(|g| g.root().to_string_lossy().into_owned())
+        .unwrap_or_else(|_| root.to_string_lossy().into_owned())
 }
 
 /// The store vector dimension for a config, read from the registry so we don't
@@ -371,10 +537,11 @@ pub fn do_search(
     rerank: bool,
 ) -> Result<String, String> {
     let store = state.open_store()?;
+    let (branch_filter, fallback) = search_branch(state, &store);
     let filter = SearchFilter {
         languages: language.into_iter().collect(),
         exclude_deletions: true,
-        ..search_branch(state, &store)
+        ..branch_filter
     };
     // Keyword search needs the BM25 index, which is opt-in and therefore usually
     // absent. Building it here — the user has just asked for the feature — turns
@@ -431,14 +598,17 @@ pub fn do_search(
         let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
         format!("{file}:{line}")
     });
-    if dropped.is_empty() {
+    if dropped.is_empty() && fallback.is_none() {
         return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
     }
-    serde_json::to_string_pretty(&json!({
-        "results": kept,
-        "omitted_for_budget": { "count": dropped.len(), "items": dropped },
-    }))
-    .map_err(|e| e.to_string())
+    let mut out = json!({ "results": kept });
+    if !dropped.is_empty() {
+        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+    }
+    if let Some(f) = &fallback {
+        out["branch_fallback"] = f.to_json();
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// Drop rows for branches the config no longer lists. Returns rows removed.
@@ -453,7 +623,7 @@ fn prune_untracked_branches(state: &AppState, store: &devctx_store::Store) -> us
     let Ok((repo, current)) = state.repo_branch() else {
         return 0;
     };
-    let repo_path = state.root.to_string_lossy().to_string();
+    let repo_path = state.repo_path();
     let Ok(indexed) = store.indexed_branches(&repo_path) else {
         return 0;
     };
@@ -479,30 +649,194 @@ fn prune_untracked_branches(state: &AppState, store: &devctx_store::Store) -> us
 /// most wants to search.
 ///
 /// So: the checked-out branch if it has rows, else the configured default if it
-/// has rows, else no filter — which is exactly the behaviour of every version
-/// before branches were tracked, and correct for the single-branch store that
-/// most repositories are.
-fn search_branch(state: &AppState, store: &devctx_store::Store) -> SearchFilter {
-    let unfiltered = SearchFilter::default();
-    let Ok((repo, branch)) = state.repo_branch() else {
-        return unfiltered;
-    };
-    let has = |b: &str| store.has_branch_rows(&repo, b).unwrap_or(false);
-    if has(&branch) {
-        return SearchFilter {
-            repo: Some(repo),
-            branch: Some(branch),
-            ..unfiltered
+/// has rows, else the most recently indexed branch with rows (the same rule as
+/// the graph tools, via `pick_graph_branch`), else no filter — which is exactly
+/// the behaviour of every version before branches were tracked.
+fn search_branch(
+    state: &AppState,
+    store: &devctx_store::Store,
+) -> (SearchFilter, Option<BranchFallback>) {
+    // One rule for search and graph: see `pick_graph_branch`.
+    match pick_branch(state, store) {
+        Ok(c) if c.indexed => {
+            let filter = SearchFilter {
+                repo: Some(c.repo),
+                branch: Some(c.branch),
+                ..SearchFilter::default()
+            };
+            (filter, c.fallback)
+        }
+        _ => (SearchFilter::default(), None),
+    }
+}
+
+/// The checked-out branch had nothing indexed, so an answer came from another.
+///
+/// Reported in the tool output, never silently: the other branch may hold code
+/// that has since changed in the one the caller is standing in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchFallback {
+    current: String,
+    used: String,
+    /// The checked-out branch has an index record but no rows (an index that
+    /// ran and found nothing), as opposed to never having been indexed.
+    current_empty: bool,
+}
+
+impl BranchFallback {
+    fn to_json(&self) -> Value {
+        let state = if self.current_empty {
+            "is indexed but empty"
+        } else {
+            "is not indexed"
         };
+        json!({
+            "current": self.current,
+            "used": self.used,
+            "why": format!(
+                "current branch {} {state}; answering from branch {}",
+                self.current, self.used
+            ),
+        })
     }
-    match state.default_branch().filter(|b| has(b)) {
-        Some(b) => SearchFilter {
-            repo: Some(repo),
-            branch: Some(b),
-            ..unfiltered
-        },
-        None => unfiltered,
+}
+
+/// The branch a graph query (symbols, references, routes, impact) runs against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchChoice {
+    repo: String,
+    branch: String,
+    fallback: Option<BranchFallback>,
+    /// `false` when no branch has rows at all.
+    indexed: bool,
+    /// The chosen branch was indexed by an older (or unknown) extractor, so
+    /// symbols and edges may differ from what a fresh index would hold.
+    extractor_stale: bool,
+}
+
+/// The line the graph tools add, and `index_status` repeats, for such an index.
+///
+/// An index made before `index_meta` existed (devctx <= 0.8.2) reads as stale
+/// too, and a new branch indexed from it copies nothing from it: each new
+/// branch re-embeds everything until one `devctx index --full` stamps it.
+pub const STALE_EXTRACTOR_WARNING: &str =
+    "index generated by an older extractor (or by a version that left no record); \
+     reindex (devctx index --full). Until then new branches re-embed every file instead \
+     of copying from this one";
+
+impl BranchChoice {
+    /// The branch to query, or the explicit "nothing indexed" error — an empty
+    /// answer from an empty index reads as "no such symbol", which is false.
+    fn ready(self) -> Result<Self, String> {
+        if self.indexed {
+            Ok(self)
+        } else {
+            Err(format!(
+                "{} has no index for any branch; run devctx index",
+                self.repo
+            ))
+        }
     }
+
+    /// Adds `branch_fallback` when the branch is not the current one and
+    /// `warning` when its index comes from an older extractor.
+    fn annotate(&self, out: &mut Value) {
+        if let Some(f) = &self.fallback {
+            out["branch_fallback"] = f.to_json();
+        }
+        if self.extractor_stale {
+            out["warning"] = json!(STALE_EXTRACTOR_WARNING);
+        }
+    }
+}
+
+/// Same rule as [`search_branch`] — checked-out branch if it has rows, else the
+/// configured default if it has rows — plus one more step the graph needs
+/// because it cannot run unfiltered: the most recently indexed branch that has
+/// rows. If none does, `indexed` is false.
+fn pick_graph_branch(
+    store: &devctx_store::Store,
+    repo: &str,
+    repo_path: &str,
+    current: &str,
+    default: Option<&str>,
+) -> BranchChoice {
+    let has = |b: &str| store.has_branch_rows(repo, b).unwrap_or(false);
+    let choice = |branch: &str, indexed: bool| BranchChoice {
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        fallback: (indexed && branch != current).then(|| BranchFallback {
+            current: current.to_string(),
+            used: branch.to_string(),
+            current_empty: store
+                .get_index_record(repo_path, current)
+                .map(|r| r.is_some())
+                .unwrap_or(false),
+        }),
+        indexed,
+        // A failed read counts as unknown, which is stale: never a silent "fine".
+        extractor_stale: indexed
+            && store
+                .extractor_stale(repo_path, branch, &devctx_index::extractor_fingerprint())
+                .unwrap_or(true),
+    };
+    if has(current) {
+        return choice(current, true);
+    }
+    if let Some(d) = default.filter(|d| has(d)) {
+        return choice(d, true);
+    }
+    let latest = store
+        .branches_by_recency(repo_path)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|b| has(b));
+    match latest {
+        Some(b) => choice(&b, true),
+        None => choice(current, false),
+    }
+}
+
+/// The branch choice for this project, without insisting that something is
+/// indexed (callers that can answer from nothing — `graph`, `search` — use this).
+fn pick_branch(state: &AppState, store: &devctx_store::Store) -> Result<BranchChoice, String> {
+    let (repo, current) = state.repo_branch()?;
+    let repo_path = state.repo_path();
+    Ok(pick_graph_branch(
+        store,
+        &repo,
+        &repo_path,
+        &current,
+        state.default_branch().as_deref(),
+    ))
+}
+
+fn graph_branch(state: &AppState, store: &devctx_store::Store) -> Result<BranchChoice, String> {
+    pick_branch(state, store)?.ready()
+}
+
+/// The branch a graph-shaped query should run against for the repository at
+/// `root`, for callers that hold a store but no [`AppState`] (the local CLI).
+/// Returns `(repo, branch, branch_fallback, extractor_stale)`; `branch_fallback`
+/// is the same JSON note the MCP tools emit, and `extractor_stale` says the
+/// chosen branch was indexed by an older extractor (see
+/// [`STALE_EXTRACTOR_WARNING`]).
+pub fn graph_target(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+) -> Result<(String, String, Option<Value>, bool), String> {
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let c = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    );
+    let fallback = c.fallback.as_ref().map(BranchFallback::to_json);
+    Ok((c.repo, c.branch, fallback, c.extractor_stale))
 }
 
 /// Parse an optional mode string into a [`SearchMode`] (default vector).
@@ -607,6 +941,36 @@ pub fn do_index_paths(state: &AppState, paths: &[String]) -> Result<String, Stri
     do_index_inner(state, false, Some(paths), None)
 }
 
+/// Load the embedder, reporting progress whenever the model cache grows.
+///
+/// A model that has to be downloaded first can take minutes inside an
+/// `/index` request, and the run is real work all that time. Only *growth*
+/// counts: a download that stopped receiving data does not tick, so it loses
+/// the idle exemption like any other stuck run (and `guard_load` fails it).
+fn embedder_reporting(
+    state: &AppState,
+    sink: &SharedProgress,
+) -> Result<Arc<dyn EmbeddingProvider>, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let mut last = None;
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                rx.recv_timeout(Duration::from_secs(1))
+            {
+                let now = devctx_core::modelload::cache_fingerprint();
+                if last.is_some() && now != last {
+                    sink.phase(LOADING_MODEL);
+                }
+                last = now;
+            }
+        });
+        let out = state.embedder();
+        drop(tx);
+        out
+    })
+}
+
 fn do_index_inner(
     state: &AppState,
     full: bool,
@@ -614,8 +978,16 @@ fn do_index_inner(
     branch: Option<String>,
 ) -> Result<String, String> {
     let store = state.open_store()?;
-    let embedder = state.embedder()?;
-    let sink = SharedProgress::new(state.index_progress.clone());
+    let sink =
+        SharedProgress::with_cancel(state.index_progress.clone(), state.index_cancel.clone());
+    sink.begin(LOADING_MODEL);
+    let embedder = match embedder_reporting(state, &sink) {
+        Ok(e) => e,
+        Err(e) => {
+            sink.finish();
+            return Err(e);
+        }
+    };
     // Which branch this run is about. Declared config wins over what happens to
     // be checked out, so running `index` from a linked worktree keeps the
     // repository's trunk fresh instead of quietly indexing the worktree's
@@ -623,6 +995,17 @@ fn do_index_inner(
     // An explicit request wins over the project's default, which wins over the
     // checked-out branch.
     let target_branch = branch.or_else(|| state.default_branch());
+    // The run stays "running" until this function returns — through pruning
+    // other branches and the report, which still write to the database — so
+    // neither the idle timer nor a stop request reads it as over while it is
+    // not. Dropped on every path, including an error.
+    struct Finish<'a>(&'a SharedProgress);
+    impl Drop for Finish<'_> {
+        fn drop(&mut self) {
+            self.0.finish();
+        }
+    }
+    let _finish = Finish(&sink);
     let run = index_run(IndexRequest {
         store: &store,
         embedder: embedder.as_ref(),
@@ -634,10 +1017,20 @@ fn do_index_inner(
         exclude: &state.cfg.indexing.exclude,
         branch: target_branch.as_deref(),
     });
-    // Before the `?`: a run that fails still has to stop reporting itself as
-    // running, or the next poller waits on something that is already over.
-    sink.finish();
     let res = run.map_err(|e| e.to_string())?;
+    if res.cancelled {
+        // The server is going away: say what happened and touch nothing else
+        // (pruning other branches is housekeeping, not something to start now).
+        return Ok(json!({
+            "cancelled": true,
+            "commit": res.commit,
+            "branch": res.branch,
+            "files_indexed": res.files_indexed,
+            "hint": "indexing was cancelled because the server is stopping; what was \
+                     indexed is saved, and the next `devctx index` resumes from the same commit",
+        })
+        .to_string());
+    }
 
     // Anything the config no longer declares is dropped now. Doing it here,
     // rather than in a command someone has to remember, is what keeps a branch
@@ -648,7 +1041,7 @@ fn do_index_inner(
     if pruned > 0 {
         eprintln!("· dropped {pruned} row(s) of branches this project no longer tracks");
     }
-    Ok(json!({
+    let mut report = json!({
         "commit": res.commit,
         "branch": res.branch,
         "full_reindex": res.full_reindex,
@@ -660,8 +1053,15 @@ fn do_index_inner(
         "files_copied": res.files_copied,
         "symbols": res.symbols,
         "chunks": res.chunks,
-    })
-    .to_string())
+    });
+    if res.extractor_stale {
+        report["extractor_stale"] = json!(true);
+        report["hint"] = json!(
+            "this index was built by an older extractor and an incremental run keeps its old \
+             symbols and edges; run `devctx index --full` to rebuild it"
+        );
+    }
+    Ok(report.to_string())
 }
 
 /// How far the indexing run in this server has got.
@@ -671,17 +1071,93 @@ fn do_index_inner(
 /// would queue behind the very work it reports on and arrive too late to be
 /// worth reporting.
 impl AppState {
-    /// Whether an indexing run is in flight right now.
+    /// Whether the project this server owns has been deleted from under it (its
+    /// directory or its `.devctx/`). Such a server serves nothing anyone can
+    /// reach again, and the test-suite leak of PLAN-008 B9 was exactly one.
     ///
-    /// The idle watchdog asks before shutting the server down: indexing happens
-    /// *inside* the server, so a run whose client has stopped asking about it is
-    /// still real work, and exiting would throw away everything it has done.
-    pub fn is_indexing(&self) -> bool {
+    /// Only a definite "not found" counts, and only [`VANISH_STRIKES`] times in
+    /// a row: on WSL's `/mnt/c` (drvfs, 9p) a stat can fail transiently with
+    /// EIO or EACCES, and a directory can be missing for an instant during a
+    /// rename — reading either as "deleted" killed healthy servers. The caller
+    /// (the watchdog) additionally defers while requests or an index are in
+    /// flight.
+    pub fn project_vanished(&self) -> bool {
+        if !dir_definitely_missing(&self.root.join(".devctx")) {
+            self.vanish_strikes.store(0, Ordering::SeqCst);
+            return false;
+        }
+        self.vanish_strikes.fetch_add(1, Ordering::SeqCst) + 1 >= VANISH_STRIKES
+    }
+
+    /// When an indexing run last moved — reached a file, reported a phase, or
+    /// finished. `None` before the first run.
+    ///
+    /// The idle timer counts from the later of this and the last request: a
+    /// run's request was stamped when it *started*, minutes ago, and between
+    /// the run marking itself finished and its answer leaving the server there
+    /// is still work (pruning branches, the report). Counting only requests,
+    /// an idle window shorter than the run killed the server in that gap, with
+    /// the answer unsent.
+    pub fn last_index_activity(&self) -> Option<Instant> {
+        self.index_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .advanced
+    }
+
+    /// Whether an indexing run is in flight at all, advancing or not.
+    pub fn index_running(&self) -> bool {
         self.index_progress
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .running
     }
+
+    /// Whether an indexing run is in flight right now.
+    ///
+    /// The idle watchdog asks before shutting the server down: indexing happens
+    /// *inside* the server, so a run whose client has stopped asking about it is
+    /// still real work, and exiting would throw away everything it has done.
+    ///
+    /// Only a run that is still *advancing* counts. One that is `running` but
+    /// has not reached a new file for [`index_stall_limit`] is stuck, and
+    /// exempting it from the idle timeout forever made a wedged server
+    /// immortal (PLAN-008 B11).
+    pub fn is_indexing(&self) -> bool {
+        let p = self
+            .index_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        p.running
+            && p.advanced
+                .is_none_or(|at| at.elapsed() < index_stall_limit())
+    }
+}
+
+/// The progress phase of a run that is still loading (or downloading) its model.
+const LOADING_MODEL: &str = "loading model";
+
+/// Consecutive "not found" polls before a project counts as deleted.
+pub const VANISH_STRIKES: u32 = 3;
+
+/// `path` is reported as not existing — not unreadable, not erroring.
+fn dir_definitely_missing(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(_) => false,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// How long an indexing run may go without reaching a new file before it stops
+/// excusing the server from its idle timeout. `DEVCTX_INDEX_STALL_SECS`
+/// overrides the 15 minutes (tests use seconds). Generous on purpose: one very
+/// large file is slow, not stuck.
+fn index_stall_limit() -> Duration {
+    let secs: u64 = std::env::var("DEVCTX_INDEX_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900);
+    Duration::from_secs(secs)
 }
 
 pub fn do_index_progress(state: &AppState) -> Result<String, String> {
@@ -696,22 +1172,82 @@ pub fn do_index_progress(state: &AppState) -> Result<String, String> {
         "total": p.total,
         "done": p.done,
         "file": p.file,
+        "phase": p.phase,
     })
     .to_string())
+}
+
+/// What `index_status` says when the checked-out branch has no index record.
+///
+/// Three different situations used to share one sentence that read
+/// "branch X is not indexed; search answers from branch X" (the same branch on
+/// both sides) in a repository that had never been indexed at all.
+fn no_record_hint(indexed_branches: &[String], chosen: &BranchChoice, current: &str) -> String {
+    // What `chosen` says is what search will do: it is decided by which
+    // branches hold ROWS, while `indexed_branches` lists completed RECORDS.
+    // The two differ exactly in the cases worth telling apart.
+    if chosen.indexed && chosen.branch == current {
+        // Rows without a completed record: an index that was cut short, on a
+        // first run or a later one alike.
+        format!(
+            "branch {current} has rows but no completed index record (an interrupted run?); \
+             run `devctx index` to finish it"
+        )
+    } else if chosen.indexed {
+        // Name the branch search will actually use, not every candidate.
+        format!(
+            "branch {current} is not indexed; search and the graph tools answer from branch \
+             {}; run devctx index to index this one",
+            chosen.branch
+        )
+    } else if indexed_branches.is_empty() {
+        "nothing indexed yet; run `devctx index`".to_string()
+    } else {
+        // Records exist, but no branch has rows to answer from.
+        format!(
+            "branch {current} is not indexed, and the records of other branches ({}) have no \
+             rows to answer from; run `devctx index`",
+            indexed_branches.join(", ")
+        )
+    }
 }
 
 /// `index_status` tool: report the last-indexed record for the repo/branch.
 pub fn do_index_status(state: &AppState) -> Result<String, String> {
     let store = state.open_store()?;
-    let git = GitRepo::open(&state.root).map_err(|e| e.to_string())?;
+    let git = state.git()?;
     let state_git = git.state();
     let repo_path = git.root().to_string_lossy().to_string();
     let record = store
         .get_index_record(&repo_path, &state_git.branch)
         .map_err(|e| e.to_string())?;
     let value = match record {
-        None => json!({ "indexed": false, "branch": state_git.branch }),
-        Some(r) => json!({
+        None => {
+            let indexed_branches = store.branches_by_recency(&repo_path).unwrap_or_default();
+            let chosen = pick_graph_branch(
+                &store,
+                &git.short_name(),
+                &repo_path,
+                &state_git.branch,
+                state.default_branch().as_deref(),
+            );
+            let hint = no_record_hint(&indexed_branches, &chosen, &state_git.branch);
+            json!({
+                "indexed": false,
+                "branch": state_git.branch,
+                "indexed_branches": indexed_branches,
+                "hint": hint,
+            })
+        }
+        Some(r) => {
+            let stale = store
+                .extractor_stale(
+                    &repo_path,
+                    &r.branch,
+                    &devctx_index::extractor_fingerprint(),
+                )
+                .unwrap_or(true);
+            let mut v = json!({
             "indexed": true,
             "branch": r.branch,
             "last_commit": r.last_commit,
@@ -723,7 +1259,36 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
             "indexed_at": r.indexed_at,
             "head_commit": state_git.commit,
             "up_to_date": r.last_commit == state_git.commit,
-        }),
+            "extractor_stale": stale,
+            });
+            if stale {
+                v["hint"] = json!(
+                    "index built by an older extractor (or one that left no record, as in \
+                     releases up to 0.8.2); run `devctx index --full` to rebuild it. Until \
+                     then new branches re-embed every file instead of copying"
+                );
+            }
+            // A record with no rows: the index ran and found nothing to keep.
+            // Say so rather than let `indexed: true` read as "searchable".
+            let empty = !store
+                .has_branch_rows(&git.short_name(), &r.branch)
+                .unwrap_or(true);
+            if empty {
+                v["empty"] = json!(true);
+                let empty_hint = format!(
+                    "branch {} is indexed but empty (no rows); search and the graph tools \
+                     answer from another branch if one has rows",
+                    r.branch
+                );
+                // Both can apply (an old extractor that found nothing): keep the
+                // stale-extractor advice instead of overwriting it.
+                v["hint"] = json!(match v["hint"].as_str() {
+                    Some(stale_hint) => format!("{stale_hint}. Also: {empty_hint}"),
+                    None => empty_hint,
+                });
+            }
+            v
+        }
     };
     Ok(value.to_string())
 }
@@ -1156,7 +1721,8 @@ pub fn do_graph(
     hide_synthetic: bool,
 ) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = pick_branch(state, &store)?;
+    let (repo, branch) = (chosen.repo.clone(), chosen.branch.clone());
     let edges = store
         .graph_edges(&repo, &branch, kind.as_deref(), file.as_deref(), limit)
         .map_err(|e| e.to_string())?;
@@ -1219,13 +1785,14 @@ pub fn do_graph(
         })
         .collect();
 
-    Ok(json!({
+    let mut out = json!({
         "repo": repo,
         "branch": branch,
         "nodes": nodes,
         "edges": out_edges,
-    })
-    .to_string())
+    });
+    chosen.annotate(&mut out);
+    Ok(out.to_string())
 }
 
 /// Tell the registry what an indexing run produced, so `projects list` reflects
@@ -1234,15 +1801,14 @@ pub fn do_graph(
 /// Best-effort: a repository need not be registered at all, and a central store
 /// that cannot be reached is no reason to fail an index that already succeeded.
 pub fn report_index(store: &Store, root: &std::path::Path, res: &devctx_index::IndexResult) {
+    // The registry is keyed by the canonical project path...
     let Ok(path) = std::fs::canonicalize(root) else {
         return;
     };
     let repo_path = path.to_string_lossy().into_owned();
-    // Totals, not this run's deltas: an incremental run that found nothing
-    // changed would otherwise report the project as empty.
-    let (files, symbols, chunks) = store
-        .index_totals(&repo_path, &res.branch)
-        .unwrap_or((0, 0, 0));
+    // ...but the store files the index under git's toplevel, which differs in a
+    // monorepo subdirectory (and from `\\?\` paths on Windows).
+    let (files, symbols, chunks) = totals_for_root(store, root, &res.branch);
     if let Ok(c) = central() {
         if c.record_index(&repo_path, &res.commit, &res.branch, files, symbols, chunks)
             .is_ok()
@@ -1270,6 +1836,15 @@ pub fn report_index(store: &Store, root: &std::path::Path, res: &devctx_index::I
         }
         Err(e) => eprintln!("warning: could not record the index in the central registry: {e}"),
     }
+}
+
+/// Totals, not this run's deltas: an incremental run that found nothing
+/// changed would otherwise report the project as empty. Read under the key the
+/// store uses (the git toplevel), never the registry's canonical path.
+fn totals_for_root(store: &Store, root: &std::path::Path, branch: &str) -> (i64, i64, i64) {
+    store
+        .index_totals(&repo_key(root), branch)
+        .unwrap_or((0, 0, 0))
 }
 
 /// Reach the central store, auto-spawning the daemon if needed.
@@ -1667,58 +2242,114 @@ pub fn why_unbound(cwd: &std::path::Path, resolution: &Resolution) -> String {
     }
 }
 
-/// Search a *different* registered project.
+/// Run `devctx <args>` inside a member's repository and return its output.
 ///
-/// Federating here is the right call, unlike for memory recall: the caller has
-/// named one project, so this wakes exactly one server rather than all of them.
-/// The project's own server owns its database and keeps its model warm, so the
-/// search runs where it is cheapest.
+/// Every fan-out re-enters this same binary with the member's directory as the
+/// working directory, so the child resolves that project and goes through its
+/// own server (`ensure_cli`): the MCP never opens a DuckDB itself. (When
+/// auto-spawn is disabled the child opens the store directly after a lock
+/// check; a brief local open is safe because this process holds no `Store`.)
+///
+/// The binary is [`devctx_core::self_exe`], not `current_exe()`: after a
+/// reinstall the latter ends in " (deleted)" and spawning it fails with ENOENT,
+/// which used to surface as a bare "No such file or directory". Every failure
+/// here names the member and its path, and says which binary was run.
+fn run_in_member<I, S>(
+    member: &str,
+    path: &std::path::Path,
+    args: I,
+) -> Result<std::process::Output, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let at = format!("{member} ({})", path.display());
+    if !path.is_dir() {
+        return Err(format!("{at}: the repository path does not exist"));
+    }
+    let exe = devctx_core::self_exe()
+        .map_err(|e| format!("{at}: could not locate the devctx binary to run: {e}"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    devctx_core::clean_git_env(&mut cmd);
+    cmd.args(args)
+        .current_dir(path)
+        .output()
+        .map_err(|e| format!("{at}: could not run {}: {e}", exe.display()))
+}
+
+/// The last line a failed child wrote, prefixed with who it was.
+fn child_failure(
+    member: &str,
+    path: &std::path::Path,
+    out: &std::process::Output,
+    fallback: &str,
+) -> String {
+    let err = String::from_utf8_lossy(&out.stderr);
+    format!(
+        "{member} ({}): {}",
+        path.display(),
+        err.trim().lines().last().unwrap_or(fallback)
+    )
+}
+
+/// Members whose repository directory is gone, split from the rest.
+///
+/// A registry row outliving its checkout is stale data, not an unreachable
+/// repository: it is reported on its own (`skipped_missing`) and does not count
+/// against "none of the members could be reached".
+fn split_missing(members: &[ProjectRow]) -> (Vec<&ProjectRow>, Vec<Value>) {
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    for m in members {
+        if m.path.is_dir() {
+            present.push(m);
+        } else {
+            missing.push(json!({ "project": m.name, "path": m.path.display().to_string() }));
+        }
+    }
+    (present, missing)
+}
+
 /// Run one member's search, returning its raw hit list.
 ///
 /// Separate from `do_search_project` because the group path needs the hits
 /// themselves to fuse, not the single-project envelope that wraps them.
 fn search_one(
+    member: &str,
     path: &std::path::Path,
     query: &str,
     limit: usize,
     language: Option<&str>,
     mode: &str,
-) -> Result<Vec<Value>, String> {
+) -> Result<devctx_core::SearchHits, String> {
     // Not opening the store directly: DuckDB allows one writing process per
     // file, and a running `devctx serve` for that project owns it. Re-entering
     // our own binary with its working directory set is what the single-project
     // path already does, and it routes through that server when one is up.
-    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args([
-            "search",
-            query,
-            "--limit",
-            &limit.to_string(),
-            "--format",
-            "json",
-        ])
-        .args(language.iter().flat_map(|l| ["--language", *l]))
-        .args(match mode {
-            "keyword" => vec!["--keyword"],
-            "hybrid" => vec!["--hybrid"],
-            _ => vec![],
-        })
-        .current_dir(path)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        query.into(),
+        "--limit".into(),
+        limit.to_string(),
+        "--format".into(),
+        "json".into(),
+    ];
+    if let Some(l) = language {
+        args.extend(["--language".into(), l.into()]);
+    }
+    match mode {
+        "keyword" => args.push("--keyword".into()),
+        "hybrid" => args.push("--hybrid".into()),
+        _ => {}
+    }
+    let out = run_in_member(member, path, &args)?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("search failed")
-            .to_string());
+        return Err(child_failure(member, path, &out, "search failed"));
     }
-    match serde_json::from_slice::<Value>(&out.stdout).map_err(|e| e.to_string())? {
-        Value::Array(v) => Ok(v),
-        other => Ok(vec![other]),
-    }
+    // The answer is a bare array or `{results, branch_fallback, ...}`; the
+    // helper reads both and never turns the wrapper into a hit.
+    let v = serde_json::from_slice::<Value>(&out.stdout).map_err(|e| e.to_string())?;
+    Ok(devctx_core::search_hits(&v))
 }
 
 /// Search every member of a group and return one fused ranking.
@@ -1760,9 +2391,11 @@ pub fn do_search_group(
         .max_by_key(|d| dims.iter().filter(|x| *x == d).count())
         .unwrap_or(0);
 
+    let (present, skipped_missing) = split_missing(members);
+    let reachable = present.len();
     let mut skipped = Vec::new();
     let mut targets: Vec<&ProjectRow> = Vec::new();
-    for m in members {
+    for m in present {
         if let Some(only) = only {
             if !only.iter().any(|n| n == &m.name) {
                 continue;
@@ -1783,7 +2416,7 @@ pub fn do_search_group(
 
     // Run in bounded batches. Sequentially this is eleven round trips one after
     // another; the members are independent, so that latency is pure waste.
-    let mut results: Vec<(String, Result<Vec<Value>, String>)> = Vec::new();
+    let mut results: Vec<(String, Result<devctx_core::SearchHits, String>)> = Vec::new();
     for batch in targets.chunks(FANOUT_CONCURRENCY) {
         std::thread::scope(|scope| {
             let handles: Vec<_> = batch
@@ -1793,7 +2426,7 @@ pub fn do_search_group(
                     scope.spawn(move || {
                         (
                             m.name.clone(),
-                            search_one(&m.path, query, limit, lang.as_deref(), mode),
+                            search_one(&m.name, &m.path, query, limit, lang.as_deref(), mode),
                         )
                     })
                 })
@@ -1812,9 +2445,18 @@ pub fn do_search_group(
 
     let mut failed = Vec::new();
     let mut per_member: Vec<(String, Vec<Value>)> = Vec::new();
+    // What each member said about its own answer (branch fallback, stale
+    // index): a member answered from another branch is still an answer, but the
+    // reader has to be told which one it was.
+    let mut member_notes = serde_json::Map::new();
     for (name, r) in results {
         match r {
-            Ok(hits) => per_member.push((name, hits)),
+            Ok(answer) => {
+                if let Some(notes) = answer.notes_json() {
+                    member_notes.insert(name.clone(), notes);
+                }
+                per_member.push((name, answer.hits));
+            }
             // One member being down is not the search failing: the rest still
             // have an answer, and saying which one went missing beats refusing.
             Err(e) => failed.push(json!({ "project": name, "error": e })),
@@ -1874,10 +2516,36 @@ pub fn do_search_group(
     if !failed.is_empty() {
         out["failed_projects"] = json!(failed);
     }
-    if let Some(warning) = fan_out_warning(&failed, members.len())? {
+    if !skipped_missing.is_empty() {
+        out["skipped_missing"] = json!(skipped_missing);
+    }
+    if !member_notes.is_empty() {
+        out["member_notes"] = Value::Object(member_notes);
+    }
+    if let Some(warning) = fan_out_warning(&failed, reachable)?
+        .or_else(|| all_missing_warning(reachable, skipped_missing.len(), "searched"))
+    {
         out["warning"] = json!(warning);
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// The fan-out had nobody to ask: every member's checkout is missing.
+///
+/// [`fan_out_warning`] only speaks about members that were tried and failed,
+/// and missing ones are deliberately not failures — so with *all* of them
+/// missing it stayed silent, and the answer (the shared tier alone, or
+/// nothing) read like a complete one. `None` when at least one member was
+/// present or none were missing.
+fn all_missing_warning(present: usize, missing: usize, verb: &str) -> Option<String> {
+    (present == 0 && missing > 0).then(|| {
+        format!(
+            "No repository of this group could be {verb}: all {missing} registered member(s) \
+             point at paths that no longer exist (see `skipped_missing`), so this answer \
+             contains nothing from the members' own stores. Re-register the moved checkouts \
+             (`devctx projects add <path>`) or remove the stale rows."
+        )
+    })
 }
 
 /// How a fan-out reports members it could not reach.
@@ -1896,15 +2564,28 @@ fn fan_out_warning(failed: &[Value], members: usize) -> Result<Option<String>, S
     if failed.is_empty() {
         return Ok(None);
     }
-    let first_error = failed
-        .first()
-        .and_then(|f| f.get("error").and_then(|e| e.as_str()))
-        .unwrap_or("no reason given");
+    // Each error already names its member and path; list up to three so one
+    // broken checkout does not hide that the others fail differently.
+    let causes: Vec<&str> = failed
+        .iter()
+        .filter_map(|f| f.get("error").and_then(|e| e.as_str()))
+        .take(3)
+        .collect();
+    let first_error = if causes.is_empty() {
+        "no reason given".to_string()
+    } else {
+        let more = failed.len().saturating_sub(causes.len());
+        let mut t = causes.join(" | ");
+        if more > 0 {
+            t.push_str(&format!(" (and {more} more)"));
+        }
+        t
+    };
     if members > 0 && failed.len() >= members {
         return Err(format!(
             "None of the {members} repositories in this group could be reached, so this \
              answer would come from the shared tier alone — which is not an answer to \
-             the question asked. First failure: {first_error}"
+             the question asked. Failures: {first_error}"
         ));
     }
     let names: Vec<&str> = failed
@@ -1913,7 +2594,7 @@ fn fan_out_warning(failed: &[Value], members: usize) -> Result<Option<String>, S
         .collect();
     Ok(Some(format!(
         "INCOMPLETE: {} of {members} repositories could not be reached ({}), so anything \
-         recorded only in them is missing here. First failure: {first_error}",
+         recorded only in them is missing here. Failures: {first_error}",
         failed.len(),
         names.join(", ")
     )))
@@ -1921,12 +2602,15 @@ fn fan_out_warning(failed: &[Value], members: usize) -> Result<Option<String>, S
 
 /// Recall from one member's own store, local tier only.
 fn recall_one_local(
+    member: &str,
     path: &std::path::Path,
     query: &str,
     limit: usize,
 ) -> Result<Vec<Value>, String> {
-    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args([
+    let out = run_in_member(
+        member,
+        path,
+        [
             "recall",
             query,
             "--limit",
@@ -1935,20 +2619,14 @@ fn recall_one_local(
             "local",
             "--format",
             "json",
-        ])
-        .current_dir(path)
-        .output()
-        .map_err(|e| e.to_string())?;
+        ],
+    )?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("recall failed")
-            .to_string());
+        return Err(child_failure(member, path, &out, "recall failed"));
     }
-    match serde_json::from_slice::<Value>(&out.stdout).map_err(|e| e.to_string())? {
+    match serde_json::from_slice::<Value>(&out.stdout)
+        .map_err(|e| format!("{member} ({}): unreadable answer: {e}", path.display()))?
+    {
         Value::Array(v) => Ok(v),
         Value::Object(m) => Ok(m
             .get("memories")
@@ -1998,18 +2676,23 @@ pub fn do_recall_group(
         }
     }
 
+    let (present, skipped_missing) = split_missing(members);
+    let reachable = present.len();
     if want_local {
         // Same reasoning as the code fan-out: the members are independent, so
         // querying them one after another buys latency and nothing else. A cold
         // project takes seconds, a warm one milliseconds.
         let mut gathered: Vec<(String, Result<Vec<Value>, String>)> = Vec::new();
-        for batch in members.chunks(FANOUT_CONCURRENCY) {
+        for batch in present.chunks(FANOUT_CONCURRENCY) {
             std::thread::scope(|scope_| {
                 let handles: Vec<_> = batch
                     .iter()
                     .map(|m| {
                         scope_.spawn(move || {
-                            (m.name.clone(), recall_one_local(&m.path, query, limit))
+                            (
+                                m.name.clone(),
+                                recall_one_local(&m.name, &m.path, query, limit),
+                            )
                         })
                     })
                     .collect();
@@ -2055,12 +2738,27 @@ pub fn do_recall_group(
     if !failed.is_empty() {
         out["failed_projects"] = json!(failed);
     }
-    if let Some(warning) = fan_out_warning(&failed, members.len())? {
+    if !skipped_missing.is_empty() {
+        out["skipped_missing"] = json!(skipped_missing);
+    }
+    // A scope without a local tier asked no member anything, so none can have
+    // failed; the count only matters when members were actually queried.
+    let queried = if want_local { reachable } else { 0 };
+    let missing_asked = if want_local { skipped_missing.len() } else { 0 };
+    if let Some(warning) = fan_out_warning(&failed, queried)?
+        .or_else(|| all_missing_warning(queried, missing_asked, "queried"))
+    {
         out["warning"] = json!(warning);
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
+/// Search a *different* registered project.
+///
+/// Federating here is the right call, unlike for memory recall: the caller has
+/// named one project, so this wakes exactly one server rather than all of them.
+/// The project's own server owns its database and keeps its model warm, so the
+/// search runs where it is cheapest.
 pub fn do_search_project(
     project: &str,
     query: &str,
@@ -2076,36 +2774,34 @@ pub fn do_search_project(
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("no path recorded for `{project}`"))?;
 
-    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args([
-            "search",
-            query,
-            "--limit",
-            &limit.to_string(),
-            "--format",
-            "json",
-        ])
-        .args(language.iter().flat_map(|l| ["--language", l]))
-        .args(match mode {
-            "keyword" => vec!["--keyword"],
-            "hybrid" => vec!["--hybrid"],
-            _ => vec![],
-        })
-        .current_dir(path)
-        .output()
-        .map_err(|e| e.to_string())?;
-
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        query.into(),
+        "--limit".into(),
+        limit.to_string(),
+        "--format".into(),
+        "json".into(),
+    ];
+    if let Some(l) = &language {
+        args.extend(["--language".into(), l.clone()]);
+    }
+    match mode {
+        "keyword" => args.push("--keyword".into()),
+        "hybrid" => args.push("--hybrid".into()),
+        _ => {}
+    }
+    let out = run_in_member(project, std::path::Path::new(path), &args)?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("search failed")
-            .to_string());
+        return Err(child_failure(
+            project,
+            std::path::Path::new(path),
+            &out,
+            "search failed",
+        ));
     }
     let hits: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
-    let items = hits.as_array().cloned().unwrap_or_default();
+    let answer = devctx_core::search_hits(&hits);
+    let items = answer.hits.clone();
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
@@ -2113,10 +2809,39 @@ pub fn do_search_project(
         format!("{file}:{line}")
     });
     let mut out = json!({ "project": project, "path": path, "hits": kept });
-    if !dropped.is_empty() {
-        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+    if let Some(o) = merge_omitted(dropped, answer.omitted.as_ref()) {
+        out["omitted_for_budget"] = o;
+    }
+    if let Some(f) = &answer.branch_fallback {
+        out["branch_fallback"] = f.clone();
+    }
+    if let Some(w) = &answer.warning {
+        out["warning"] = w.clone();
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// The `omitted_for_budget` note of a proxied answer: what this process dropped
+/// (`dropped`, named) plus what the child already dropped for its own budget.
+/// Both count, and both lists of names survive, or the caller is told less than
+/// was left out.
+fn merge_omitted(dropped: Vec<String>, child: Option<&Value>) -> Option<Value> {
+    let child_count = child
+        .and_then(|o| o.get("count"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0) as usize;
+    if dropped.is_empty() {
+        return child.cloned();
+    }
+    let dropped_here = dropped.len();
+    let mut items: Vec<Value> = dropped.into_iter().map(Value::String).collect();
+    if let Some(theirs) = child
+        .and_then(|o| o.get("items"))
+        .and_then(|i| i.as_array())
+    {
+        items.extend(theirs.iter().cloned());
+    }
+    Some(json!({ "count": dropped_here + child_count, "items": items }))
 }
 
 /// `list_projects` tool: every repository DevCtxEngine knows about.
@@ -2814,21 +3539,23 @@ fn move_to_project(project: &str, m: &devctx_store::Memory) -> Result<String, St
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("no path recorded for `{project}`"))?;
 
-    let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
-    cmd.args(["remember", &m.content, "--type", &m.memory_type]);
-    if !m.title.is_empty() {
-        cmd.args(["--title", &m.title]);
+    let mut args: Vec<String> = vec![
+        "remember".into(),
+        m.content.clone(),
+        "--type".into(),
+        m.memory_type.clone(),
+    ];
+    for (flag, val) in [
+        ("--title", &m.title),
+        ("--topic", &m.topic_key),
+        ("--tags", &m.tags),
+        ("--files", &m.files),
+    ] {
+        if !val.is_empty() {
+            args.extend([flag.into(), val.clone()]);
+        }
     }
-    if !m.topic_key.is_empty() {
-        cmd.args(["--topic", &m.topic_key]);
-    }
-    if !m.tags.is_empty() {
-        cmd.args(["--tags", &m.tags]);
-    }
-    if !m.files.is_empty() {
-        cmd.args(["--files", &m.files]);
-    }
-    let out = cmd.current_dir(path).output().map_err(|e| e.to_string())?;
+    let out = run_in_member(project, std::path::Path::new(path), &args)?;
     if !out.status.success() {
         return Err(format!(
             "`{project}` refused the memory: {}",
@@ -2893,12 +3620,13 @@ pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<
 /// `impact_analysis` tool: blast radius (transitive callers/callees) of a symbol.
 pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
+    let (repo, branch) = (&chosen.repo, &chosen.branch);
     let resolved = store
-        .resolve_symbol(&repo, &branch, symbol)
+        .resolve_symbol(repo, branch, symbol)
         .map_err(|e| e.to_string())?;
     let impact = store
-        .impact_analysis(&repo, &branch, symbol, depth)
+        .impact_analysis(repo, branch, symbol, depth)
         .map_err(|e| e.to_string())?;
     let to_json = |v: &[(String, usize)]| -> Vec<Value> {
         v.iter()
@@ -2929,6 +3657,7 @@ pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String,
     if let Some(names) = merged_declarations(symbol, &resolved) {
         out["resolved_symbols"] = json!(names);
     }
+    chosen.annotate(&mut out);
     let dropped_total = up_dropped.len() + down_dropped.len();
     if dropped_total > 0 {
         out["omitted_for_budget"] = json!({
@@ -3022,6 +3751,9 @@ pub fn do_build_context(
     // Fetch more than will fit: the budget, not the limit, decides where to stop.
     let raw = do_search(state, query, 30, None, SearchMode::Vector, false)?;
     let hits: Vec<Value> = parse_memories(&raw);
+    // `do_search` says when it answered from another branch; a prose answer
+    // must say so too, since the code below may differ from what is checked out.
+    let fallback_note = fallback_note(&raw);
     let mut code_files: Vec<String> = Vec::new();
     let mut head = "## Code\n\n";
     for h in &hits {
@@ -3083,10 +3815,36 @@ pub fn do_build_context(
              Raise max_tokens, or narrow the query.\n"
         ));
     }
+    close_context(&mut out, fallback_note);
+    Ok(out)
+}
+
+/// The tail of a `build_context` answer. The "nothing matched" line goes first:
+/// the branch note is context for an answer, and must not hide that there was
+/// none.
+fn close_context(out: &mut String, fallback_note: Option<String>) {
     if out.is_empty() {
         out.push_str("[devctx] nothing indexed matched this query.\n");
     }
-    Ok(out)
+    if let Some(note) = fallback_note {
+        out.push('\n');
+        out.push_str(&note);
+    }
+}
+
+/// The prose line for `do_search`'s `branch_fallback`, if its answer has one.
+fn fallback_note(raw: &str) -> Option<String> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("branch_fallback").cloned())
+        .map(|f| {
+            format!(
+                "[devctx] branch_fallback: {}\n",
+                f.get("why")
+                    .and_then(|w| w.as_str())
+                    .unwrap_or("answered from another branch")
+            )
+        })
 }
 
 /// Pull the `memories` array out of one of our own JSON answers.
@@ -3119,11 +3877,11 @@ fn parse_memories(raw: &str) -> Vec<Value> {
 /// miss rather than padded with the nearest neighbours.
 pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
     let found = store
-        .symbol_definitions(&repo, &branch, name, limit)
+        .symbol_definitions(&chosen.repo, &chosen.branch, name, limit)
         .map_err(|e| e.to_string())?;
-    Ok(json!({
+    let mut out = json!({
         "symbol": name,
         "definitions": found.iter().map(|p| json!({
             "symbol": p.metadata.symbol,
@@ -3134,8 +3892,9 @@ pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<Stri
             "end_line": p.metadata.end_line,
             "code": p.text,
         })).collect::<Vec<_>>(),
-    })
-    .to_string())
+    });
+    chosen.annotate(&mut out);
+    Ok(out.to_string())
 }
 
 /// `memories_by_symbol` tool: the decisions recorded about a symbol.
@@ -3150,17 +3909,47 @@ pub fn do_memories_by_symbol(
     limit: usize,
 ) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch().unwrap_or_default();
+    // Same branch rule as the graph tools: the junction rows are filed under
+    // the branch that was indexed, which is not the checked-out one on a branch
+    // nobody has indexed yet.
+    let (repo, branch, fallback) = symbol_branch(state, &store);
     let linked = store
         .memory_ids_for_symbol(symbol, &repo, &branch, limit)
         .map_err(|e| e.to_string())?;
-    linked_response(
+    let raw = linked_response(
         &store,
         symbol,
         linked,
         devctx_store::short_label(symbol),
         limit,
-    )
+    )?;
+    let Some(f) = fallback else {
+        return Ok(raw);
+    };
+    let mut v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    // A text-inference match never looked at a branch, so saying which branch
+    // answered would be false precision.
+    if v["matched_by"] != "text-inference" {
+        v["branch_fallback"] = f.to_json();
+    }
+    Ok(v.to_string())
+}
+
+/// The `(repo, branch, fallback)` junction rows are looked up under: the branch
+/// the graph tools use (the junction is filed under the indexed branch, which
+/// is not the checked-out one on a branch nobody has indexed yet), or the
+/// checked-out one when nothing is indexed at all.
+fn symbol_branch(
+    state: &AppState,
+    store: &devctx_store::Store,
+) -> (String, String, Option<BranchFallback>) {
+    match pick_branch(state, store) {
+        Ok(c) if c.indexed => (c.repo, c.branch, c.fallback),
+        _ => {
+            let (r, b) = state.repo_branch().unwrap_or_default();
+            (r, b, None)
+        }
+    }
 }
 
 /// `memories_by_file` tool: the decisions recorded about a file, plus the plan tasks that
@@ -3395,12 +4184,12 @@ fn value_json(v: Value, sources: &str) -> Value {
 /// `get_references` tool: all call sites of a symbol.
 pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
     let resolved = store
-        .resolve_symbol(&repo, &branch, symbol)
+        .resolve_symbol(&chosen.repo, &chosen.branch, symbol)
         .map_err(|e| e.to_string())?;
     let refs = store
-        .find_references(&repo, &branch, symbol)
+        .find_references(&chosen.repo, &chosen.branch, symbol)
         .map_err(|e| e.to_string())?;
     let arr: Vec<Value> = refs
         .iter()
@@ -3416,6 +4205,7 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
     if let Some(names) = merged_declarations(symbol, &resolved) {
         out["resolved_symbols"] = json!(names);
     }
+    chosen.annotate(&mut out);
     if !dropped.is_empty() {
         out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
     }
@@ -3429,24 +4219,32 @@ pub fn do_search_routes(
     path: Option<String>,
 ) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
     let routes = store
-        .search_routes(&repo, &branch, method.as_deref(), path.as_deref())
+        .search_routes(
+            &chosen.repo,
+            &chosen.branch,
+            method.as_deref(),
+            path.as_deref(),
+        )
         .map_err(|e| e.to_string())?;
-    routes_to_json(&routes)
+    routes_to_json(&routes, &chosen)
 }
 
 /// `routes_for_handler` tool: routes served by a handler symbol.
 pub fn do_routes_for_handler(state: &AppState, handler: &str) -> Result<String, String> {
     let store = state.open_store()?;
-    let (repo, branch) = state.repo_branch()?;
+    let chosen = graph_branch(state, &store)?;
     let routes = store
-        .routes_for_handler(&repo, &branch, handler)
+        .routes_for_handler(&chosen.repo, &chosen.branch, handler)
         .map_err(|e| e.to_string())?;
-    routes_to_json(&routes)
+    routes_to_json(&routes, &chosen)
 }
 
-fn routes_to_json(routes: &[devctx_store::StoredRoute]) -> Result<String, String> {
+fn routes_to_json(
+    routes: &[devctx_store::StoredRoute],
+    chosen: &BranchChoice,
+) -> Result<String, String> {
     let arr: Vec<Value> = routes
         .iter()
         .map(|r| {
@@ -3466,14 +4264,15 @@ fn routes_to_json(routes: &[devctx_store::StoredRoute]) -> Result<String, String
         let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
         format!("{method} {path}")
     });
-    if dropped.is_empty() {
+    if dropped.is_empty() && chosen.fallback.is_none() && !chosen.extractor_stale {
         return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
     }
-    serde_json::to_string_pretty(&json!({
-        "routes": kept,
-        "omitted_for_budget": { "count": dropped.len(), "items": dropped },
-    }))
-    .map_err(|e| e.to_string())
+    let mut out = json!({ "routes": kept });
+    if !dropped.is_empty() {
+        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+    }
+    chosen.annotate(&mut out);
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// `summarize` tool: condense `content`, optionally focused on `query`.
@@ -3597,6 +4396,29 @@ mod tests {
         assert!(warning.contains("timed out"), "{warning}");
     }
 
+    /// B5: a failure names the member and path, and the refusal lists up to
+    /// three of them rather than only the first.
+    #[test]
+    fn the_refusal_lists_up_to_three_failures() {
+        let failed: Vec<serde_json::Value> = (0..5)
+            .map(|i| serde_json::json!({ "project": format!("r{i}"), "error": format!("r{i} (/p/r{i}): boom{i}") }))
+            .collect();
+        let err = fan_out_warning(&failed, 5).expect_err("all failed");
+        for i in 0..3 {
+            assert!(err.contains(&format!("(/p/r{i}): boom{i}")), "{err}");
+        }
+        assert!(!err.contains("boom3"), "{err}");
+        assert!(err.contains("2 more"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_member_path_is_named_before_any_spawn() {
+        let err = super::run_in_member("web", std::path::Path::new("/no/such/dir"), ["x"])
+            .expect_err("path does not exist");
+        assert!(err.contains("web (/no/such/dir)"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
     #[test]
     fn nothing_failing_says_nothing() {
         assert!(fan_out_warning(&[], 11).unwrap().is_none());
@@ -3608,6 +4430,17 @@ mod tests {
     fn an_empty_group_does_not_refuse() {
         let failed = vec![serde_json::json!({ "project": "x", "error": "boom" })];
         assert!(fan_out_warning(&failed, 0).is_ok());
+    }
+
+    /// TASK-008 fixup D1: every member missing on disk used to produce no
+    /// warning at all (missing is not "failed", and nothing was reachable).
+    #[test]
+    fn all_members_missing_is_said_out_loud() {
+        let w = super::all_missing_warning(0, 3, "queried").expect("must warn");
+        assert!(w.contains("all 3 registered member(s)"), "{w}");
+        assert!(w.contains("skipped_missing"), "{w}");
+        assert!(super::all_missing_warning(1, 3, "queried").is_none());
+        assert!(super::all_missing_warning(0, 0, "queried").is_none());
     }
 
     use super::*;
@@ -3858,6 +4691,140 @@ mod tests {
         assert_eq!(p.run, 2);
         assert_eq!(p.total, 788);
         assert_eq!(p.done, 0);
+    }
+
+    // --- PLAN-008 TASK-009 fixup D1: idle exemption, cancellation, vanishing ---
+
+    fn lifecycle_state(tag: &str) -> (AppState, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("devctx_mcp_life_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".devctx/state")).unwrap();
+        let mut cfg = ProjectConfig::default();
+        cfg.project.path = root.to_string_lossy().into_owned();
+        cfg.state_dir = root.join(".devctx/state").to_string_lossy().into_owned();
+        (AppState::build(cfg).unwrap(), root)
+    }
+
+    fn set_progress(state: &AppState, running: bool, advanced_ago: Duration) {
+        let mut p = state.index_progress.lock().unwrap();
+        p.running = running;
+        p.advanced = Instant::now().checked_sub(advanced_ago);
+    }
+
+    /// Item 7: the idle exemption is about *progress*. A run whose last sign of
+    /// life is older than the stall limit (900 s by default) is stuck and must
+    /// not hold the idle timer off; one that moved recently must.
+    #[test]
+    fn only_an_index_that_moved_recently_is_exempt_from_idle() {
+        let (state, root) = lifecycle_state("exempt");
+        assert!(!state.is_indexing(), "nothing running");
+
+        set_progress(&state, true, Duration::from_secs(5));
+        assert!(state.is_indexing(), "recent progress exempts the server");
+
+        set_progress(&state, true, Duration::from_secs(901));
+        assert!(
+            !state.is_indexing(),
+            "a run silent for longer than the stall limit is stuck"
+        );
+
+        set_progress(&state, false, Duration::from_secs(1));
+        assert!(!state.is_indexing(), "a finished run exempts nothing");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Item 6: phases after the file loop (prune, HNSW, FTS, checkpoint) and the
+    /// model load report themselves, which is what keeps the exemption alive
+    /// through them.
+    #[test]
+    fn a_phase_report_renews_the_exemption() {
+        let (state, root) = lifecycle_state("phase");
+        let sink =
+            SharedProgress::with_cancel(state.index_progress.clone(), state.index_cancel.clone());
+        sink.begin(LOADING_MODEL);
+        assert!(
+            state.is_indexing(),
+            "a run is visible before its model loads"
+        );
+        assert_eq!(state.index_progress.lock().unwrap().phase, "loading model");
+
+        sink.start(3);
+        {
+            let p = state.index_progress.lock().unwrap();
+            assert_eq!((p.run, p.total), (1, 3), "begin + start is one run");
+        }
+        set_progress(&state, true, Duration::from_secs(901));
+        assert!(!state.is_indexing());
+        sink.phase("hnsw");
+        assert!(state.is_indexing(), "the HNSW phase counts as progress");
+        assert!(state.index_winding_down(Duration::from_secs(15)));
+        assert_eq!(state.index_progress.lock().unwrap().phase, "hnsw");
+        sink.finish();
+        assert!(!state.index_running());
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Item 1: a stop request reaches the run through its sink.
+    #[test]
+    fn cancelling_reaches_every_run_through_its_sink() {
+        let (state, root) = lifecycle_state("cancel");
+        let sink =
+            SharedProgress::with_cancel(state.index_progress.clone(), state.index_cancel.clone());
+        assert!(!sink.cancelled());
+        state.cancel_indexing();
+        assert!(sink.cancelled());
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Item 4: only repeated, definite "not found" means the project is gone.
+    #[test]
+    fn a_project_counts_as_vanished_only_after_repeated_not_found() {
+        let (state, root) = lifecycle_state("vanish");
+        assert!(!state.project_vanished());
+        let devctx = root.join(".devctx");
+        let aside = root.join(".devctx-renamed");
+        std::fs::rename(&devctx, &aside).unwrap();
+        assert!(!state.project_vanished(), "one miss is not enough");
+        assert!(!state.project_vanished(), "two misses are not enough");
+        // Back before the third poll (a rename in progress): the count resets.
+        std::fs::rename(&aside, &devctx).unwrap();
+        assert!(!state.project_vanished());
+        std::fs::rename(&devctx, &aside).unwrap();
+        for _ in 1..VANISH_STRIKES {
+            assert!(!state.project_vanished());
+        }
+        assert!(state.project_vanished(), "{VANISH_STRIKES} misses in a row");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Item 4: an unreadable path (EACCES, as drvfs/9p can report transiently)
+    /// is not a missing one.
+    #[cfg(unix)]
+    #[test]
+    fn a_permission_error_is_not_a_missing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("devctx_mcp_eacces_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("locked/.devctx")).unwrap();
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let probe = dir.join("locked/.devctx");
+        let denied = std::fs::metadata(&probe)
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let missing = super::dir_definitely_missing(&probe);
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        if denied {
+            assert!(!missing, "EACCES must not read as deleted");
+        }
+        assert!(super::dir_definitely_missing(&dir.join("nope")));
     }
 
     // --- plan_status (TASK-002) ---
@@ -4242,7 +5209,7 @@ mod tests {
             line: 999,
             ..Default::default()
         });
-        let out = routes_to_json(&routes).unwrap();
+        let out = routes_to_json(&routes, &on_current_branch()).unwrap();
         std::env::remove_var("DEVCTX_MAX_OUTPUT_TOKENS");
         let value: Value = serde_json::from_str(&out).unwrap();
         let omitted = value["omitted_for_budget"]["count"].as_u64().unwrap();
@@ -4265,7 +5232,7 @@ mod tests {
             line: 1,
             ..Default::default()
         }];
-        let out = routes_to_json(&routes).unwrap();
+        let out = routes_to_json(&routes, &on_current_branch()).unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
         assert!(value.is_array(), "{out}");
     }
@@ -4304,5 +5271,569 @@ mod tests {
         assert!(dropped.is_empty());
         let content = kept[0]["content"].as_str().unwrap();
         assert!(content.contains("[devctx] truncated"), "{content:?}");
+    }
+
+    fn on_current_branch() -> BranchChoice {
+        BranchChoice {
+            repo: "demo".into(),
+            branch: "main".into(),
+            fallback: None,
+            indexed: true,
+            extractor_stale: false,
+        }
+    }
+
+    // --- graph branch fallback (PLAN-008 TASK-006) ---
+
+    const GRAPH_DIM: usize = 3;
+    const REPO_PATH: &str = "/tmp/devctx-graph-branch-demo";
+
+    /// A store indexed only on `main`: one definition, one call edge, one route.
+    fn store_indexed_on(branch: &str) -> Store {
+        let store = Store::open_in_memory(GRAPH_DIM).unwrap();
+        store
+            .set_index_meta(
+                REPO_PATH,
+                branch,
+                devctx_store::EXTRACTOR_META_KEY,
+                &devctx_index::extractor_fingerprint(),
+            )
+            .unwrap();
+        store
+            .upsert(&[VectorPoint {
+                id: "p1".into(),
+                vector: vec![0.0; GRAPH_DIM],
+                text: "fn greet() {}".into(),
+                metadata: VectorMetadata {
+                    repo: "demo".into(),
+                    branch: branch.into(),
+                    file: "a.rs".into(),
+                    symbol: "greet".into(),
+                    symbol_type: "function".into(),
+                    language: "rust".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    ..Default::default()
+                },
+            }])
+            .unwrap();
+        store
+            .replace_file_edges(
+                "demo",
+                branch,
+                "b.rs",
+                &[devctx_store::StoredEdge {
+                    source: "main_fn".into(),
+                    target: "greet".into(),
+                    kind: "calls".into(),
+                    source_file: "b.rs".into(),
+                    line: 3,
+                }],
+            )
+            .unwrap();
+        store
+            .replace_file_routes(
+                "demo",
+                branch,
+                "r.rs",
+                &[devctx_store::StoredRoute {
+                    framework: "axum".into(),
+                    http_method: "GET".into(),
+                    path: "/hello".into(),
+                    handler_class: String::new(),
+                    handler_method: "greet".into(),
+                    handler_symbol: "greet".into(),
+                    file: "r.rs".into(),
+                    line: 1,
+                }],
+                "2026-10-03T00:00:00Z",
+            )
+            .unwrap();
+        store
+            .save_index_record(&devctx_store::IndexRecord {
+                repo_path: REPO_PATH.into(),
+                branch: branch.into(),
+                last_commit: "abc".into(),
+                model_name: "m".into(),
+                model_dimension: GRAPH_DIM as i64,
+                file_count: 1,
+                symbol_count: 1,
+                chunk_count: 1,
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn a_branch_nobody_indexed_answers_the_graph_from_the_indexed_one() {
+        let store = store_indexed_on("main");
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "feat/x", None);
+        assert!(c.indexed);
+        assert_eq!(c.branch, "main");
+        let f = c.fallback.as_ref().expect("a fallback must be reported");
+        assert_eq!((f.current.as_str(), f.used.as_str()), ("feat/x", "main"));
+
+        // Every graph query, run on the chosen branch, finds what `main` has.
+        let defs = store
+            .symbol_definitions(&c.repo, &c.branch, "greet", 5)
+            .unwrap();
+        assert_eq!(defs.len(), 1);
+        let refs = store.find_references(&c.repo, &c.branch, "greet").unwrap();
+        assert_eq!(refs.len(), 1);
+        let routes = store
+            .search_routes(&c.repo, &c.branch, None, Some("hello"))
+            .unwrap();
+        assert_eq!(routes.len(), 1);
+        let impact = store
+            .impact_analysis(&c.repo, &c.branch, "greet", 2)
+            .unwrap();
+        assert!(!impact.upstream.is_empty());
+
+        // And the output says so.
+        let mut out = json!({ "symbol": "greet" });
+        c.annotate(&mut out);
+        assert_eq!(out["branch_fallback"]["current"], "feat/x");
+        assert_eq!(out["branch_fallback"]["used"], "main");
+        assert!(out["branch_fallback"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("feat/x is not indexed"));
+        let routes_out = routes_to_json(&routes, &c).unwrap();
+        assert!(routes_out.contains("branch_fallback"), "{routes_out}");
+    }
+
+    #[test]
+    fn the_configured_default_wins_over_the_most_recent() {
+        let store = store_indexed_on("main");
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "feat/x", Some("main"));
+        assert_eq!(c.branch, "main");
+        assert!(c.fallback.is_some());
+        // A default with no rows is skipped, not trusted.
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "feat/x", Some("develop"));
+        assert_eq!(c.branch, "main");
+    }
+
+    #[test]
+    fn the_indexed_current_branch_adds_no_field() {
+        let store = store_indexed_on("main");
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "main", Some("other"));
+        assert_eq!(c.branch, "main");
+        assert!(c.fallback.is_none());
+        let mut out = json!({ "symbol": "greet" });
+        c.annotate(&mut out);
+        assert!(out.get("branch_fallback").is_none());
+        let routes = store.search_routes("demo", "main", None, None).unwrap();
+        assert!(
+            routes_to_json(&routes, &c)
+                .unwrap()
+                .trim_start()
+                .starts_with('['),
+            "shape unchanged when the current branch is indexed"
+        );
+    }
+
+    #[test]
+    fn an_index_without_extractor_record_warns_in_every_graph_answer() {
+        let store = store_indexed_on("main");
+        // An index stamped by some other extractor (a missing record is the
+        // same answer, covered in the store's own test).
+        store
+            .set_index_meta(
+                REPO_PATH,
+                "main",
+                devctx_store::EXTRACTOR_META_KEY,
+                "v0-old",
+            )
+            .unwrap();
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "main", None);
+        assert!(c.extractor_stale);
+        let mut out = json!({ "symbol": "greet" });
+        c.annotate(&mut out);
+        assert!(out["warning"].as_str().unwrap().contains("older extractor"));
+        let routes = store.search_routes("demo", "main", None, None).unwrap();
+        let routed = routes_to_json(&routes, &c).unwrap();
+        assert!(routed.contains("older extractor"), "{routed}");
+
+        store
+            .set_index_meta(
+                REPO_PATH,
+                "main",
+                devctx_store::EXTRACTOR_META_KEY,
+                &devctx_index::extractor_fingerprint(),
+            )
+            .unwrap();
+        let fresh = pick_graph_branch(&store, "demo", REPO_PATH, "main", None);
+        assert!(!fresh.extractor_stale);
+        let mut out = json!({});
+        fresh.annotate(&mut out);
+        assert!(out.get("warning").is_none());
+    }
+
+    #[test]
+    fn an_empty_store_is_an_explicit_error_not_an_empty_answer() {
+        let store = Store::open_in_memory(GRAPH_DIM).unwrap();
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "main", None);
+        assert!(!c.indexed);
+        let err = c
+            .ready()
+            .expect_err("nothing indexed must not look like []");
+        assert!(err.contains("demo has no index for any branch"), "{err}");
+        assert!(err.contains("devctx index"), "{err}");
+    }
+
+    #[test]
+    fn the_most_recently_indexed_branch_is_the_last_resort() {
+        let store = store_indexed_on("main");
+        // A second branch, indexed later.
+        store
+            .upsert(&[VectorPoint {
+                id: "p2".into(),
+                vector: vec![0.0; GRAPH_DIM],
+                text: "fn other() {}".into(),
+                metadata: VectorMetadata {
+                    repo: "demo".into(),
+                    branch: "develop".into(),
+                    file: "c.rs".into(),
+                    symbol: "other".into(),
+                    ..Default::default()
+                },
+            }])
+            .unwrap();
+        store
+            .save_index_record(&devctx_store::IndexRecord {
+                repo_path: REPO_PATH.into(),
+                branch: "develop".into(),
+                last_commit: "def".into(),
+                model_name: "m".into(),
+                model_dimension: GRAPH_DIM as i64,
+                file_count: 1,
+                symbol_count: 1,
+                chunk_count: 1,
+                indexed_at: "2026-10-04T00:00:00Z".into(),
+            })
+            .unwrap();
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "feat/x", None);
+        assert_eq!(c.branch, "develop");
+        assert_eq!(
+            store.branches_by_recency(REPO_PATH).unwrap(),
+            vec!["develop".to_string(), "main".to_string()]
+        );
+    }
+
+    // --- repo_path key and branch rule shared by search and graph (review fixup) ---
+
+    fn sh(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A project living in `<repo>/sub` (git's toplevel is `<repo>`), checked out
+    /// on `feat/x`, whose store was indexed on `main` the way the pipeline does:
+    /// keyed by the git toplevel.
+    fn subdir_project(tag: &str) -> (AppState, PathBuf) {
+        let repo =
+            std::env::temp_dir().join(format!("devctx_mcp_subdir_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("sub/a.rs"), "pub fn greet() {}\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-q", "-m", "init"]);
+        sh(&repo, &["checkout", "-q", "-b", "feat/x"]);
+
+        let mut cfg = ProjectConfig::default();
+        cfg.project.path = repo.join("sub").to_string_lossy().into_owned();
+        cfg.state_dir = repo.join("state").to_string_lossy().into_owned();
+        let state = AppState::build(cfg).unwrap();
+
+        let git = GitRepo::open(&repo).unwrap();
+        let repo_path = git.root().to_string_lossy().into_owned();
+        let store = state.open_store().unwrap();
+        let dim = configured_dimension(&state.cfg);
+        store
+            .set_index_meta(
+                &repo_path,
+                "main",
+                devctx_store::EXTRACTOR_META_KEY,
+                &devctx_index::extractor_fingerprint(),
+            )
+            .unwrap();
+        store
+            .upsert(&[VectorPoint {
+                id: "p1".into(),
+                vector: vec![0.0; dim],
+                text: "pub fn greet() {}".into(),
+                metadata: VectorMetadata {
+                    repo: git.short_name(),
+                    branch: "main".into(),
+                    file: "sub/a.rs".into(),
+                    symbol: "greet".into(),
+                    symbol_type: "function".into(),
+                    language: "rust".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    ..Default::default()
+                },
+            }])
+            .unwrap();
+        store
+            .save_index_record(&devctx_store::IndexRecord {
+                repo_path,
+                branch: "main".into(),
+                last_commit: "abc".into(),
+                model_name: "m".into(),
+                model_dimension: dim as i64,
+                file_count: 1,
+                symbol_count: 1,
+                chunk_count: 1,
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+            })
+            .unwrap();
+        (state, repo)
+    }
+
+    #[test]
+    fn a_project_in_a_repo_subdirectory_keys_the_store_by_the_git_toplevel() {
+        let (state, repo) = subdir_project("key");
+        assert_ne!(state.root, repo, "the project is not the toplevel");
+        assert_eq!(
+            state.repo_path(),
+            GitRepo::open(&repo).unwrap().root().to_string_lossy()
+        );
+        let store = state.open_store().unwrap();
+        // Before the fix this read `state.root`, found no record, and so
+        // reported a fresh index as stale, and the recency fallback found nothing.
+        let c = graph_branch(&state, &store).expect("main is indexed");
+        assert_eq!(c.branch, "main");
+        assert!(!c.extractor_stale, "{c:?}");
+        assert!(c.fallback.is_some());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The project path IS the toplevel, reached through a symlink: not a
+    /// subdirectory, so only the symlink can explain a mismatch. `AppState`
+    /// does not canonicalize its root; git reports the real toplevel.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_path_keys_the_store_by_the_real_toplevel() {
+        let (state, repo) = subdir_project("link");
+        sh(&repo, &["checkout", "-q", "main"]);
+        let link = std::env::temp_dir().join(format!("devctx_mcp_link_{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let mut cfg = state.cfg.clone();
+        cfg.project.path = link.to_string_lossy().into_owned();
+        drop(state);
+        let state = AppState::build(cfg).unwrap();
+        assert_eq!(state.root, link, "the root stays the symlink");
+        assert_eq!(
+            state.repo_path(),
+            GitRepo::open(&repo).unwrap().root().to_string_lossy()
+        );
+        let store = state.open_store().unwrap();
+        let c = graph_branch(&state, &store).expect("main is indexed");
+        assert_eq!(c.branch, "main");
+        assert!(!c.extractor_stale, "{c:?}");
+        assert!(c.fallback.is_none(), "{c:?}");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// `memories_by_symbol` looks the junction up under the branch that was
+    /// indexed, not the checked-out one (`feat/x`, which has nothing).
+    #[test]
+    fn memories_by_symbol_queries_the_fallback_branch() {
+        let (state, repo) = subdir_project("symbranch");
+        let store = state.open_store().unwrap();
+        let (r, branch, fallback) = symbol_branch(&state, &store);
+        assert_eq!(r, GitRepo::open(&repo).unwrap().short_name());
+        assert_eq!(branch, "main");
+        let f = fallback.expect("the fallback is reported");
+        assert_eq!((f.current.as_str(), f.used.as_str()), ("feat/x", "main"));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn build_context_fallback_note() {
+        let raw = r#"{"results": [], "branch_fallback": {"why": "x"}}"#;
+        let note = fallback_note(raw).expect("a note");
+        assert_eq!(note, "[devctx] branch_fallback: x\n");
+        assert_eq!(fallback_note("[]"), None);
+        assert_eq!(fallback_note("not json"), None);
+
+        // With nothing to show, the note must not replace "nothing matched".
+        let mut out = String::new();
+        close_context(&mut out, Some(note));
+        let nothing = out.find("nothing indexed matched").expect("{out}");
+        let branch = out.find("branch_fallback: x").expect("{out}");
+        assert!(nothing < branch, "{out}");
+        let mut some = String::from("## Code\n");
+        close_context(&mut some, None);
+        assert_eq!(some, "## Code\n");
+    }
+
+    #[test]
+    fn merge_omitted_counts_both_sides_and_keeps_both_item_lists() {
+        assert_eq!(merge_omitted(vec![], None), None);
+        let child = json!({ "count": 3 });
+        assert_eq!(merge_omitted(vec![], Some(&child)), Some(child.clone()));
+        let merged = merge_omitted(vec!["a".into()], Some(&child)).unwrap();
+        assert_eq!(merged["count"], 4);
+        assert_eq!(merged["items"], json!(["a"]));
+        let child = json!({ "count": 2, "items": ["x:1", "y:2"] });
+        let merged = merge_omitted(vec!["a".into()], Some(&child)).unwrap();
+        assert_eq!(merged["count"], 3);
+        assert_eq!(merged["items"], json!(["a", "x:1", "y:2"]));
+    }
+
+    /// `projects list` reads the totals under the git toplevel; reading them
+    /// under the project path shows a monorepo subdirectory as empty.
+    #[test]
+    fn report_totals_are_read_under_the_git_toplevel() {
+        let (state, repo) = subdir_project("totals");
+        let store = state.open_store().unwrap();
+        store
+            .save_file_state(&devctx_store::FileState {
+                repo_path: state.repo_path(),
+                branch: "main".into(),
+                file_path: "sub/a.rs".into(),
+                content_hash: "h".into(),
+                language: "rust".into(),
+                symbol_count: 2,
+                chunk_count: 3,
+            })
+            .unwrap();
+        assert_eq!(totals_for_root(&store, &state.root, "main"), (1, 2, 3));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A branch with an index record but no rows is "indexed but empty", the
+    /// same thing `index_status` says, not "not indexed".
+    #[test]
+    fn an_indexed_but_empty_current_branch_is_described_as_such() {
+        let store = store_indexed_on("main");
+        store
+            .save_index_record(&devctx_store::IndexRecord {
+                repo_path: REPO_PATH.into(),
+                branch: "feat/x".into(),
+                last_commit: "abc".into(),
+                model_name: "m".into(),
+                model_dimension: GRAPH_DIM as i64,
+                file_count: 0,
+                symbol_count: 0,
+                chunk_count: 0,
+                indexed_at: "2026-10-04T00:00:00Z".into(),
+            })
+            .unwrap();
+        let c = pick_graph_branch(&store, "demo", REPO_PATH, "feat/x", None);
+        let why = c.fallback.expect("falls back").to_json()["why"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(why.contains("indexed but empty"), "{why}");
+        let never = pick_graph_branch(&store, "demo", REPO_PATH, "feat/y", None);
+        let why = never.fallback.unwrap().to_json()["why"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(why.contains("is not indexed"), "{why}");
+    }
+
+    #[test]
+    fn search_and_the_graph_tools_pick_the_same_branch_and_say_so() {
+        let (state, repo) = subdir_project("rule");
+        let store = state.open_store().unwrap();
+        // No default configured, nothing indexed on `feat/x`: before the fix
+        // search ran unfiltered and said nothing.
+        let (filter, fallback) = search_branch(&state, &store);
+        assert_eq!(filter.branch.as_deref(), Some("main"));
+        let f = fallback.expect("search must report the fallback");
+        assert_eq!((f.current.as_str(), f.used.as_str()), ("feat/x", "main"));
+
+        let graph: Value =
+            serde_json::from_str(&do_graph(&state, None, None, 10, false, false).unwrap()).unwrap();
+        assert_eq!(graph["branch"], "main");
+        assert_eq!(graph["branch_fallback"]["used"], "main");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// B2: an index that is both stale (old extractor) and empty reports both
+    /// hints; the second used to overwrite the first.
+    #[test]
+    fn a_stale_and_empty_index_reports_both_hints() {
+        let (state, repo) = subdir_project("b2");
+        let (_, branch) = state.repo_branch().unwrap();
+        {
+            let store = state.open_store().unwrap();
+            store
+                .save_index_record(&devctx_store::IndexRecord {
+                    repo_path: state.repo_path(),
+                    branch: branch.clone(),
+                    last_commit: "abc".into(),
+                    model_name: "m".into(),
+                    model_dimension: GRAPH_DIM as i64,
+                    file_count: 0,
+                    symbol_count: 0,
+                    chunk_count: 0,
+                    indexed_at: "2026-10-04T00:00:00Z".into(),
+                })
+                .unwrap();
+        }
+        let v: Value = serde_json::from_str(&do_index_status(&state).unwrap()).unwrap();
+        assert_eq!(v["extractor_stale"], true, "{v}");
+        assert_eq!(v["empty"], true, "{v}");
+        let hint = v["hint"].as_str().unwrap();
+        assert!(hint.contains("older extractor"), "{hint}");
+        assert!(hint.contains("indexed but empty"), "{hint}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn choice(branch: &str, indexed: bool) -> BranchChoice {
+        BranchChoice {
+            repo: "r".into(),
+            branch: branch.into(),
+            fallback: None,
+            indexed,
+            extractor_stale: false,
+        }
+    }
+
+    /// N3/m-3: each situation gets its own accurate sentence, whatever the
+    /// records say about other branches.
+    #[test]
+    fn each_no_record_situation_gets_its_own_message() {
+        // Never indexed: no rows, no records.
+        let hint = no_record_hint(&[], &choice("main", false), "main");
+        assert!(hint.contains("nothing indexed yet"), "{hint}");
+        assert!(hint.contains("devctx index"), "{hint}");
+        // Rows for the current branch and no record, first index interrupted:
+        // not "nothing indexed", and the same sentence as with other records.
+        let first = no_record_hint(&[], &choice("main", true), "main");
+        assert!(
+            first.contains("has rows but no completed index record"),
+            "{first}"
+        );
+        assert!(!first.contains("nothing indexed"), "{first}");
+        let later = no_record_hint(&["dev".into()], &choice("main", true), "main");
+        assert_eq!(first, later);
+        // A real fallback still names the branch it answers from.
+        let hint = no_record_hint(&["dev".into()], &choice("dev", true), "main");
+        assert!(hint.contains("answer from branch dev"), "{hint}");
+        // Records for other branches but no rows anywhere: not "nothing is
+        // indexed for this repository" (records exist) and no false fallback.
+        let hint = no_record_hint(&["dev".into()], &choice("main", false), "main");
+        assert!(hint.contains("records of other branches (dev)"), "{hint}");
+        assert!(!hint.contains("nothing indexed"), "{hint}");
+        assert!(!hint.contains("answer from branch"), "{hint}");
     }
 }

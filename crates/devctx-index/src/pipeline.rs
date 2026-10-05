@@ -1,14 +1,15 @@
 //! The indexing pipeline: git diff → parse → chunk → embed → store.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use devctx_chunk::{chunk_file, chunk_raw_text, content_hash, Chunk, ChunkConfig};
 use devctx_core::types::{VectorMetadata, VectorPoint};
 use devctx_embed::EmbeddingProvider;
 use devctx_parse::{detect_lang, extract_routes, parse, raw_text_language};
-use devctx_store::{FileState, IndexRecord, Store, StoredEdge, StoredRoute};
+use devctx_store::{FileState, IndexRecord, Store, StoredEdge, StoredRoute, EXTRACTOR_META_KEY};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::error::{IndexError, Result};
@@ -16,11 +17,111 @@ use crate::git::{Change, GitRepo};
 use crate::id::chunk_id;
 
 /// Receives progress updates during an indexing run (e.g. a CLI progress bar).
-pub trait ProgressSink {
+///
+/// `Sync` because long phases that cannot report per file (rebuilding the HNSW
+/// index, a checkpoint) are heartbeat from a helper thread — see [`heartbeat`].
+pub trait ProgressSink: Sync {
     /// Called once with the total number of changes to process.
     fn start(&self, total: usize);
     /// Called before each change is processed, with its file path.
     fn file(&self, path: &str);
+    /// The run is alive in a phase that is not "the next file": pruning,
+    /// rebuilding a derived index, checkpointing. Called repeatedly while such
+    /// a phase lasts, so a watcher that measures "time since the run last
+    /// moved" does not mistake a long rebuild for a stuck run.
+    fn phase(&self, _name: &str) {}
+    /// Whether the run should stop at the next file boundary (the server is
+    /// shutting down). Checked between files; a cancelled run commits what it
+    /// has, folds the WAL and returns with [`IndexResult::cancelled`] set.
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// How often a long, un-instrumentable phase reports that it is still alive.
+const HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// Run `op` while ticking `progress` every [`HEARTBEAT`].
+///
+/// For single statements that can run for many minutes on a big repository
+/// (building the HNSW graph, the BM25 index, a checkpoint of a large WAL): they
+/// are CPU-bound work inside DuckDB, not a wait on the network, so ticking
+/// while they run cannot make a wedged process look alive forever — they end.
+/// Without it the idle watchdog read a 15-minute HNSW build as a stuck run and
+/// killed a legitimate index in its last phase.
+fn heartbeat<T>(progress: Option<&dyn ProgressSink>, name: &str, op: impl FnOnce() -> T) -> T {
+    let Some(p) = progress else {
+        return op();
+    };
+    p.phase(name);
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(HEARTBEAT) {
+                p.phase(name);
+            }
+        });
+        let out = op();
+        drop(tx);
+        out
+    })
+}
+
+/// Index-meta key (repository- and branch-independent: `("", "")`) recording
+/// that the HNSW index was dropped for a run and not yet rebuilt; its value is
+/// the metric.
+pub const PENDING_HNSW_META_KEY: &str = "pending_hnsw";
+/// Same, for the BM25 index.
+pub const PENDING_FTS_META_KEY: &str = "pending_fts";
+
+/// Runs of [`run`] in flight, per database ([`Store::instance_id`]).
+///
+/// The derived indexes are database-wide while runs are per branch: a short
+/// run (a watcher's one-file save) finishing in the middle of a full one used
+/// to be harmless only because it never saw the indexes it would rebuild. Now
+/// that a dropped index is remembered ([`PENDING_HNSW_META_KEY`]) the last run
+/// to finish rebuilds it, so the long one is not left inserting into an HNSW
+/// graph.
+static RUNS_IN_FLIGHT: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+struct InFlight(usize);
+
+fn in_flight_map() -> std::sync::MutexGuard<'static, Option<HashMap<usize, usize>>> {
+    RUNS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl InFlight {
+    fn enter(store: &Store) -> Self {
+        let id = store.instance_id();
+        *in_flight_map()
+            .get_or_insert_with(HashMap::new)
+            .entry(id)
+            .or_insert(0) += 1;
+        InFlight(id)
+    }
+    /// Whether this is the only run left on its database.
+    fn alone(&self) -> bool {
+        in_flight_map()
+            .as_ref()
+            .and_then(|m| m.get(&self.0))
+            .is_none_or(|n| *n <= 1)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut guard = in_flight_map();
+        if let Some(m) = guard.as_mut() {
+            if let Some(n) = m.get_mut(&self.0) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.0);
+                }
+            }
+        }
+    }
 }
 
 /// Inputs for one indexing run.
@@ -89,6 +190,16 @@ pub struct IndexResult {
     pub symbols: usize,
     /// Total chunks stored.
     pub chunks: usize,
+    /// An incremental run left this branch's index on an older (or unknown)
+    /// extractor: only the changed files were re-parsed, so the rest still
+    /// carries what the old extractor produced. `--full` clears it.
+    pub extractor_stale: bool,
+    /// The run stopped early because [`ProgressSink::cancelled`] said so (the
+    /// server is shutting down). What it wrote is committed and checkpointed;
+    /// the index record was **not** advanced, so the next incremental run
+    /// starts from the same commit and the content-hash check skips the files
+    /// this one already did.
+    pub cancelled: bool,
 }
 
 /// Run the indexing pipeline against the repository containing `repo_root`.
@@ -101,10 +212,38 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     }
 
     let excluded = build_exclude(req.exclude);
+    let cancelled = || req.progress.is_some_and(|p| p.cancelled());
+    // A run that starts after the stop request has nothing to do but must not
+    // take the derived indexes down on its way: dropping them is a write, and
+    // the rebuild it would owe is one nobody is going to run in this process.
+    if cancelled() {
+        return Ok(IndexResult {
+            cancelled: true,
+            ..Default::default()
+        });
+    }
+    let in_flight = InFlight::enter(req.store);
+    // A run that was cut short (cancelled, killed) after dropping the derived
+    // indexes left a note saying so; honour it as if they were still there.
+    let pending_hnsw = req
+        .store
+        .get_index_meta("", "", PENDING_HNSW_META_KEY)
+        .ok()
+        .flatten();
+    let pending_fts = req
+        .store
+        .get_index_meta("", "", PENDING_FTS_META_KEY)
+        .ok()
+        .flatten()
+        .is_some();
     // The BM25 index cannot survive the row deletions this run will make, so it
     // comes down first and goes back up at the end if it was there.
-    let had_fts = req.store.has_fts();
+    let had_fts = req.store.has_fts() || pending_fts;
     if had_fts {
+        // Noted *before* the drop: a process that dies anywhere between here
+        // and the rebuild must not lose the index for good.
+        req.store
+            .set_index_meta("", "", PENDING_FTS_META_KEY, "1")?;
         req.store.drop_fts()?;
     }
     // The HNSW index has to come down for the same reason, and for a larger
@@ -121,8 +260,10 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // Searches fall back to brute force while it is down, which is what FTS
     // already does and is the right trade: a slower search during an index
     // beats an index that does not finish.
-    let had_hnsw = req.store.hnsw_metric();
-    if had_hnsw.is_some() {
+    let had_hnsw = req.store.hnsw_metric().or(pending_hnsw);
+    if let Some(metric) = &had_hnsw {
+        req.store
+            .set_index_meta("", "", PENDING_HNSW_META_KEY, metric)?;
         req.store.drop_hnsw()?;
     }
     let git = GitRepo::open(req.repo_root)?;
@@ -156,6 +297,9 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let model_changed = prev.as_ref().is_some_and(|p| {
         p.model_name != req.model_name || p.model_dimension as usize != req.embedder.dimension()
     });
+    let prev_extractor_stale =
+        req.store
+            .extractor_stale(&repo_path, &branch, &devctx_parse::extractor_fingerprint())?;
     let last_commit = prev.as_ref().map(|p| p.last_commit.clone());
     let can_incremental = req.incremental
         && !model_changed
@@ -190,6 +334,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         cfg: ChunkConfig::default(),
         indexed: HashSet::new(),
         excluded,
+        written: 0,
     };
 
     let mut result = IndexResult {
@@ -221,6 +366,12 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         p.start(changes.len());
     }
     for change in changes {
+        // Between files, never inside one: every write so far is committed, so
+        // stopping here leaves nothing half-done for the checkpoint to fold.
+        if cancelled() {
+            result.cancelled = true;
+            break;
+        }
         if let Some(p) = req.progress {
             p.file(change_path(&change));
         }
@@ -241,11 +392,42 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     }
 
     // Prune stale files: previously indexed but not re-indexed this full run.
-    for file in &prev_files {
-        if !ctx.indexed.contains(file) {
+    // Checked for a stop between files like the loop above: a cancelled prune
+    // leaves the rest of the stale files for the next full run, which is what
+    // a cancelled loop does with the files it did not reach.
+    if !result.cancelled && !prev_files.is_empty() {
+        if let Some(p) = req.progress {
+            p.phase("prune");
+        }
+        for file in &prev_files {
+            if ctx.indexed.contains(file) {
+                continue;
+            }
+            if cancelled() {
+                result.cancelled = true;
+                break;
+            }
+            if let Some(p) = req.progress {
+                p.phase("prune");
+            }
             ctx.delete_file(file)?;
             result.files_pruned += 1;
         }
+    }
+
+    if result.cancelled {
+        // Nothing past this point is safe or useful for a partial run: pruning
+        // would delete every file the run did not reach, the index record would
+        // claim a commit it did not cover, and rebuilding HNSW is the slowest
+        // step of all on the one path that must be quick. The pending notes keep
+        // the derived indexes owed to the next run; the checkpoint is the point.
+        eprintln!(
+            "· indexing cancelled after {} file(s) (the server is stopping); the next run \
+             resumes from the same commit",
+            ctx.indexed.len()
+        );
+        heartbeat(req.progress, "checkpoint", || req.store.checkpoint());
+        return Ok(result);
     }
 
     // A path-list run indexes uncommitted work, so HEAD is not what it covered:
@@ -262,8 +444,8 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     };
     let counts = totals;
     req.store.save_index_record(&IndexRecord {
-        repo_path,
-        branch,
+        repo_path: repo_path.clone(),
+        branch: branch.clone(),
         last_commit,
         model_name: req.model_name.to_string(),
         model_dimension: req.embedder.dimension() as i64,
@@ -273,17 +455,73 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         indexed_at: now_stamp(),
     })?;
 
-    if let Some(metric) = &had_hnsw {
-        req.store.enable_hnsw(metric)?;
+    // Stamp the extractor only when the whole branch was produced by it: a full
+    // run, or an incremental one over an index already stamped with it. An
+    // incremental run over an older index re-parses just the changed files, so
+    // stamping it would hide the rest — the very thing this record is for.
+    let current_extractor = devctx_parse::extractor_fingerprint();
+    if full_reindex || !prev_extractor_stale {
+        req.store
+            .set_index_meta(&repo_path, &branch, EXTRACTOR_META_KEY, &current_extractor)?;
+    } else {
+        result.extractor_stale = true;
+        eprintln!(
+            "· this index was built by an older extractor; an incremental run keeps its old \
+             symbols and edges. Run `devctx index --full` to rebuild it"
+        );
     }
-    if had_fts {
-        req.store.rebuild_fts()?;
+
+    // Rebuild what this run (or an earlier, interrupted one) took down — but
+    // only as the last run in flight: rebuilding under a concurrent run makes
+    // every one of its remaining inserts maintain the graph. The note is read
+    // again here because a concurrent run may have dropped an index this one
+    // never saw.
+    //
+    // So the run that settles a note is *whichever run finishes last* — a
+    // full one, an incremental one, or a watcher's one-file save alike — and
+    // it settles it by doing the rebuild, over the whole database. The note is
+    // cleared only once the rebuild really happened: an extension that is not
+    // available reports `false`, and the index stays owed rather than being
+    // declared rebuilt.
+    //
+    // A stop request skips both rebuilds — each can take minutes on a large
+    // repository, which is exactly the time a shutdown does not have — and
+    // the notes keep them owed to the next run. Checked before each, since
+    // the first can be long enough for the request to arrive during it.
+    if in_flight.alone() {
+        let hnsw = had_hnsw.or_else(|| {
+            req.store
+                .get_index_meta("", "", PENDING_HNSW_META_KEY)
+                .ok()
+                .flatten()
+        });
+        if let Some(metric) = &hnsw {
+            if cancelled() {
+                eprintln!("· the server is stopping; the HNSW index is left for the next run");
+            } else if heartbeat(req.progress, "hnsw", || req.store.enable_hnsw(metric))? {
+                req.store.delete_index_meta("", "", PENDING_HNSW_META_KEY)?;
+            }
+        }
+        let fts = had_fts
+            || req
+                .store
+                .get_index_meta("", "", PENDING_FTS_META_KEY)
+                .ok()
+                .flatten()
+                .is_some();
+        if fts {
+            if cancelled() {
+                eprintln!("· the server is stopping; the BM25 index is left for the next run");
+            } else if heartbeat(req.progress, "fts", || req.store.rebuild_fts())? {
+                req.store.delete_index_meta("", "", PENDING_FTS_META_KEY)?;
+            }
+        }
     }
     // An indexing run is where the write-ahead log comes from, and a WAL that
     // outlives its process leaves the ART indexes behind every PRIMARY KEY and
     // UNIQUE missing entries — see `Store::checkpoint`. Fold it in now, while a
     // connection is still open to do it.
-    req.store.checkpoint();
+    heartbeat(req.progress, "checkpoint", || req.store.checkpoint());
 
     // A full run deletes every row and writes them again, and DuckDB does not
     // hand the space of the deleted ones back to the file — a checkpoint folds
@@ -412,18 +650,47 @@ struct Ctx<'a> {
     indexed: HashSet<String>,
     /// Compiled `indexing.exclude` patterns.
     excluded: Gitignore,
+    /// Files that reached the write step this run (for [`stall_inside_write`]).
+    written: usize,
+}
+
+/// Test seam: `DEVCTX_TEST_STALL_IN_WRITE=<n>` stalls the run for good inside
+/// the writes of the n-th file it writes, after the first of them.
+///
+/// The serve-lifecycle tests need an index stuck *mid-write* — not between
+/// files, where every write is already committed and any exit is clean — to
+/// prove that a forced exit leaves no half-written file behind. Nothing else
+/// can hold a run there deterministically. Read once; unset (always, outside
+/// those tests) it costs one branch per file.
+fn stall_inside_write(nth: usize) {
+    static AT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| {
+        std::env::var("DEVCTX_TEST_STALL_IN_WRITE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    if *at == Some(nth) {
+        eprintln!("· test seam: stalled inside the writes of file #{nth}");
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
 }
 
 impl Ctx<'_> {
+    /// Forget a file: its vectors, edges, routes and state, as one
+    /// transaction (see `index_file` for why one).
     fn delete_file(&self, file: &str) -> Result<()> {
-        self.store
-            .delete_by_file(self.repo_short, self.branch, file)?;
-        self.store
-            .delete_file_edges(self.repo_short, self.branch, file)?;
-        self.store
-            .delete_file_routes(self.repo_short, self.branch, file)?;
-        self.store
-            .delete_file_state(self.repo_path, self.branch, file)?;
+        self.store.in_transaction(|| {
+            self.store
+                .delete_by_file(self.repo_short, self.branch, file)?;
+            self.store
+                .delete_file_edges(self.repo_short, self.branch, file)?;
+            self.store
+                .delete_file_routes(self.repo_short, self.branch, file)?;
+            self.store
+                .delete_file_state(self.repo_path, self.branch, file)
+        })?;
         Ok(())
     }
 
@@ -481,10 +748,6 @@ impl Ctx<'_> {
             }
         }
 
-        // Replace any existing vectors for this file.
-        self.store
-            .delete_by_file(self.repo_short, self.branch, file)?;
-
         // Branches share commits: a feature branch differs from its base in a
         // handful of files and is byte-identical in the other thousand. When
         // some other branch already holds this exact content, its chunks are
@@ -495,23 +758,36 @@ impl Ctx<'_> {
         // Safe because the key is the content hash: identical bytes, identical
         // chunks. What differs between the two rows is only which branch they
         // are filed under.
-        if let Some(src) =
-            self.store
-                .branch_with_same_content(self.repo_path, file, &hash, self.branch)?
-        {
-            let (language, symbols, chunks) =
+        if let Some(src) = self.store.branch_with_same_content(
+            self.repo_path,
+            file,
+            &hash,
+            self.branch,
+            &devctx_parse::extractor_fingerprint(),
+        )? {
+            // One transaction, like the embedding path below; rolled back
+            // (the old rows kept) when the source turns out to hold nothing.
+            let copied = self.store.in_transaction_opt(|| {
                 self.store
-                    .copy_file_rows(self.repo_short, &src, self.branch, file)?;
-            if chunks > 0 {
+                    .delete_by_file(self.repo_short, self.branch, file)?;
+                let (language, symbols, chunks) =
+                    self.store
+                        .copy_file_rows(self.repo_short, &src, self.branch, file)?;
+                if chunks == 0 {
+                    return Ok(None);
+                }
                 self.store.save_file_state(&devctx_store::FileState {
                     repo_path: self.repo_path.to_string(),
                     branch: self.branch.to_string(),
                     file_path: file.to_string(),
-                    content_hash: hash,
+                    content_hash: hash.clone(),
                     language,
                     symbol_count: symbols as i64,
                     chunk_count: chunks as i64,
                 })?;
+                Ok(Some((symbols, chunks)))
+            })?;
+            if let Some((symbols, chunks)) = copied {
                 self.indexed.insert(file.to_string());
                 result.files_indexed += 1;
                 result.files_copied += 1;
@@ -521,49 +797,73 @@ impl Ctx<'_> {
             }
         }
 
-        let (language, symbol_count, chunk_count) = match lang {
+        // Everything slow or fallible that writes nothing — parsing, chunking,
+        // the embedding round trip — happens first. Only then the writes, as
+        // one transaction: the old vectors out, the new ones in, edges, routes
+        // and the content hash commit together or not at all. Five separate
+        // autocommits let a process that ended between the first and the last
+        // leave a file whose recorded hash said "indexed, unchanged" over no
+        // vectors — a hole no incremental run would ever revisit.
+        let (language, parsed, chunks) = match lang {
             // Parseable code: chunk + embed, plus call-graph edges and routes.
             Some(lang) => {
                 let parsed = parse(lang, &content)?;
                 let chunks = chunk_file(file, &content, &parsed, &self.cfg);
-                self.embed_and_store(file, &parsed.language, &chunks)?;
-                self.store_edges(file, &parsed)?;
-                self.store_routes(file, &content)?;
-                result.symbols += parsed.symbols.len();
-                (parsed.language.clone(), parsed.symbols.len(), chunks.len())
+                (parsed.language.clone(), Some(parsed), chunks)
             }
             // Raw text (markdown/json/yaml/kotlin/…): one file-spanning chunk (or
             // blocks). Route extraction still runs (e.g. Kotlin Spring), returning
             // nothing for non-route file types.
             None => {
                 let rl = raw_lang.expect("raw language checked above");
-                let chunks = chunk_raw_text(file, &content, &self.cfg);
-                self.embed_and_store(file, rl, &chunks)?;
-                self.store_routes(file, &content)?;
-                (rl.to_string(), 0, chunks.len())
+                (
+                    rl.to_string(),
+                    None,
+                    chunk_raw_text(file, &content, &self.cfg),
+                )
             }
         };
+        let points = self.embed(file, &language, &chunks)?;
+        let symbol_count = parsed.as_ref().map_or(0, |p| p.symbols.len());
+        let chunk_count = chunks.len();
 
-        self.store.save_file_state(&FileState {
-            repo_path: self.repo_path.to_string(),
-            branch: self.branch.to_string(),
-            file_path: file.to_string(),
-            content_hash: hash,
-            language,
-            symbol_count: symbol_count as i64,
-            chunk_count: chunk_count as i64,
+        self.written += 1;
+        let nth = self.written;
+        self.store.in_transaction(|| {
+            self.store
+                .delete_by_file(self.repo_short, self.branch, file)?;
+            if !points.is_empty() {
+                self.store.upsert(&points)?;
+            }
+            stall_inside_write(nth);
+            if let Some(parsed) = &parsed {
+                self.store_edges(file, parsed)?;
+            }
+            self.store_routes(file, &content)?;
+            self.store.save_file_state(&FileState {
+                repo_path: self.repo_path.to_string(),
+                branch: self.branch.to_string(),
+                file_path: file.to_string(),
+                content_hash: hash.clone(),
+                language: language.clone(),
+                symbol_count: symbol_count as i64,
+                chunk_count: chunk_count as i64,
+            })?;
+            Ok(())
         })?;
         self.indexed.insert(file.to_string());
 
         result.files_indexed += 1;
+        result.symbols += symbol_count;
         result.chunks += chunk_count;
         Ok(())
     }
 
-    /// Embed `chunks` and upsert them as vectors for `file` under `language`.
-    fn embed_and_store(&self, file: &str, language: &str, chunks: &[Chunk]) -> Result<()> {
+    /// Embed `chunks` into the points to store for `file` under `language`.
+    /// Writes nothing: the caller stores them inside the file's transaction.
+    fn embed(&self, file: &str, language: &str, chunks: &[Chunk]) -> Result<Vec<VectorPoint>> {
         if chunks.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
         let vectors = self.embedder.embed(&texts)?;
@@ -597,11 +897,14 @@ impl Ctx<'_> {
                 },
             });
         }
-        self.store.upsert(&points)?;
-        Ok(())
+        Ok(points)
     }
 
-    fn store_edges(&self, file: &str, parsed: &devctx_parse::ParsedFile) -> Result<()> {
+    fn store_edges(
+        &self,
+        file: &str,
+        parsed: &devctx_parse::ParsedFile,
+    ) -> devctx_store::Result<()> {
         let edges: Vec<StoredEdge> = parsed
             .edges
             .iter()
@@ -615,10 +918,9 @@ impl Ctx<'_> {
             .collect();
         self.store
             .replace_file_edges(self.repo_short, self.branch, file, &edges)
-            .map_err(Into::into)
     }
 
-    fn store_routes(&self, file: &str, content: &str) -> Result<()> {
+    fn store_routes(&self, file: &str, content: &str) -> devctx_store::Result<()> {
         let routes: Vec<StoredRoute> = extract_routes(content, Path::new(file))
             .into_iter()
             .map(|r| StoredRoute {
@@ -634,7 +936,6 @@ impl Ctx<'_> {
             .collect();
         self.store
             .replace_file_routes(self.repo_short, self.branch, file, &routes, &now_stamp())
-            .map_err(Into::into)
     }
 }
 
