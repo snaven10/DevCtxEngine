@@ -3,7 +3,7 @@
 Notable changes per release. Dates are tag dates. The plan behind 0.8.3 – 0.9.0
 is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
 
-## Unreleased (0.9.0)
+## 0.9.0 — 2026-10-05
 
 The agent-facing half of PLAN-008 (P1): tool output that fits in a context
 window, honest ranking, and a project-aware `build_context`.
