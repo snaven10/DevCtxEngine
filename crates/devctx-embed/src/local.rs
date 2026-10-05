@@ -21,8 +21,10 @@ use crate::EmbedSettings;
 
 /// Default per-text character cap (RAM guard), overridable via env.
 const DEFAULT_MAX_CHARS: usize = 4096;
-/// Default embedding batch size, overridable via env.
-const DEFAULT_BATCH_SIZE: usize = 32;
+/// Default embedding batch size, overridable via env. Small on purpose: peak
+/// memory scales with the batch (activations of `batch x seq_len`), and with the
+/// old parallel split 8 peaked at 6.5 GB where 32 peaked at 18.2 GB.
+const DEFAULT_BATCH_SIZE: usize = 8;
 /// Candidate ONNX filenames inside a user-defined model directory.
 const ONNX_CANDIDATES: &[&str] = &[
     "onnx/model_quint8_avx2.onnx",
@@ -78,8 +80,16 @@ impl EmbeddingProvider for LocalProvider {
             .map(|t| t.chars().take(self.max_chars).collect())
             .collect();
         let mut out = self.model.run(|m| {
-            m.embed(capped.clone(), Some(self.batch_size))
+            embed_in_series(&capped, self.batch_size, |chunk| {
+                // `Some(len)`: fastembed splits its input in `par_chunks` over
+                // rayon, so any larger input runs up to one batch per core at
+                // once. A chunk of exactly one batch keeps a single in flight.
+                m.embed(
+                    chunk.iter().map(String::as_str).collect(),
+                    Some(chunk.len()),
+                )
                 .map_err(|e| EmbedError::Backend(e.to_string()))
+            })
         })?;
         for v in &mut out {
             l2_normalize(v);
@@ -94,6 +104,21 @@ impl EmbeddingProvider for LocalProvider {
     fn model_name(&self) -> &str {
         &self.name
     }
+}
+
+/// Embed `texts` one batch of at most `batch_size` at a time, strictly in
+/// order, so at most one batch is ever in flight. Output order and length match
+/// the input.
+fn embed_in_series(
+    texts: &[String],
+    batch_size: usize,
+    mut embed_batch: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>>,
+) -> Result<Vec<Vec<f32>>> {
+    let mut out = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(batch_size.max(1)) {
+        out.extend(embed_batch(chunk)?);
+    }
+    Ok(out)
 }
 
 /// The CUDA execution provider, or `None` when built without `--features gpu`.
@@ -260,6 +285,42 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn batches_run_in_series_and_keep_order_and_length() {
+        let texts: Vec<String> = (0..23).map(|i| i.to_string()).collect();
+        let in_flight = AtomicUsize::new(0);
+        let max_in_flight = AtomicUsize::new(0);
+        let sizes = std::sync::Mutex::new(Vec::new());
+        let out = super::embed_in_series(&texts, 8, |chunk| {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            max_in_flight.fetch_max(now, Ordering::SeqCst);
+            sizes.lock().unwrap().push(chunk.len());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let v = chunk
+                .iter()
+                .map(|t| vec![t.parse::<f32>().unwrap()])
+                .collect();
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(v)
+        })
+        .unwrap();
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+        assert_eq!(*sizes.lock().unwrap(), vec![8, 8, 7]);
+        assert_eq!(out.len(), 23);
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(v[0], i as f32, "order lost at {i}");
+        }
+        // A zero batch size cannot loop forever or panic.
+        assert_eq!(
+            super::embed_in_series(&texts, 0, |c| Ok(vec![vec![0.0]; c.len()]))
+                .unwrap()
+                .len(),
+            23
+        );
+    }
+
     use super::*;
 
     #[test]

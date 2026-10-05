@@ -7,9 +7,11 @@
 //! (project servers, the CLI, the TUI) reaches the registry and the global
 //! memories through it.
 //!
-//! It deliberately loads no model. Registry work is pure SQL, so startup is a
+//! It loads no model at startup. Registry work is pure SQL, so startup is a
 //! DuckDB open and nothing more — which is what makes auto-spawning it on a
-//! plain `devctx projects list` acceptable.
+//! plain `devctx projects list` acceptable. The first `remember`/`recall` does
+//! load the memory embedder (and a sweeper releases it again after
+//! `DEVCTX_MODEL_IDLE_SECS`, 300 by default, without use).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,6 +95,53 @@ async fn bind_near(addr: SocketAddr) -> anyhow::Result<(tokio::net::TcpListener,
     anyhow::bail!("no free port in the {TRIES} starting at {first}")
 }
 
+/// Return freed heap to the OS after the model is dropped (glibc only).
+#[cfg(target_env = "gnu")]
+fn trim_allocator() {
+    // SAFETY: `malloc_trim` takes no pointers and only touches the allocator's
+    // bookkeeping; callable from any thread.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn trim_allocator() {}
+
+/// Every `poll`, drop the central embedder if unused for `max_idle`.
+fn spawn_embedder_sweeper(
+    central: Arc<Mutex<Central>>,
+    max_idle: Duration,
+    poll: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll).await;
+            let c = central.clone();
+            // Dropping a model is not instant, and the lock may be held by a
+            // long request: neither belongs on an async worker.
+            let released = tokio::task::spawn_blocking(move || {
+                let released = match c.lock() {
+                    Ok(g) => g.release_idle_embedder(max_idle),
+                    Err(p) => p.into_inner().release_idle_embedder(max_idle),
+                };
+                if released {
+                    trim_allocator();
+                }
+                released
+            })
+            .await
+            .unwrap_or(false);
+            if released {
+                eprintln!(
+                    "Released the central embedding model after {}s unused.",
+                    max_idle.as_secs()
+                );
+            }
+        }
+    })
+}
+
 /// Serve the central API until stopped, exiting after `idle` with no non-health
 /// request when set.
 pub async fn serve(
@@ -111,6 +160,7 @@ pub async fn serve(
         guard.config().reindex.every_seconds
     };
     let registry = api.central.clone();
+    let api_central = api.central.clone();
     // The exit checkpoint's own connection to the same database, taken now so
     // that it never needs the mutex: a request holding it for minutes (a
     // large import, a re-embedding) used to leave the idle exit choosing
@@ -182,6 +232,16 @@ pub async fn serve(
                 std::thread::sleep(Duration::from_millis(1500));
                 crate::hard_exit(0);
             });
+    }
+
+    // Loaded on the first remember/recall, the embedder used to stay for the
+    // life of the daemon. Same policy and knob as the project servers.
+    if let Some(max_idle) = crate::model_idle() {
+        spawn_embedder_sweeper(
+            api_central.clone(),
+            max_idle,
+            (max_idle / 4).clamp(Duration::from_millis(250), Duration::from_secs(60)),
+        );
     }
 
     if sweep_every > 0 {
@@ -701,5 +761,58 @@ where
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("task failed: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod sweeper_tests {
+    use super::*;
+    use devctx_embed::EmbeddingProvider;
+
+    struct Fake;
+    impl EmbeddingProvider for Fake {
+        fn embed(&self, texts: &[String]) -> devctx_embed::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0; 384]).collect())
+        }
+        fn dimension(&self) -> usize {
+            384
+        }
+        fn model_name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweeper_releases_an_idle_embedder_and_recall_reloads_it() {
+        let dir = std::env::temp_dir().join("devctx_api_central_sweeper");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let central = Central::open_in(&dir)
+            .unwrap()
+            .with_embedder_factory(|_| Ok(Arc::new(Fake)));
+        let central = Arc::new(Mutex::new(central));
+        let handle = spawn_embedder_sweeper(
+            central.clone(),
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        );
+
+        central.lock().unwrap().recall("q", None, 3).unwrap();
+        assert!(central.lock().unwrap().embedder_loaded());
+
+        let mut gone = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if !central.lock().unwrap().embedder_loaded() {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "the idle embedder was never released");
+
+        central.lock().unwrap().recall("q", None, 3).unwrap();
+        assert!(central.lock().unwrap().embedder_loaded());
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
