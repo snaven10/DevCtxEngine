@@ -36,12 +36,38 @@ pub fn resolve_model_cache(
     if let Some(explicit) = explicit.filter(|v| !v.is_empty()) {
         return PathBuf::from(explicit);
     }
-    let target = target_dir
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        // crates/<name> -> workspace root -> target
-        .unwrap_or_else(|| manifest_dir.join("..").join("..").join("target"));
-    target.join("test-model-cache")
+    resolve_target_dir(
+        target_dir,
+        std::env::current_exe().ok().as_deref(),
+        manifest_dir,
+    )
+    .join("test-model-cache")
+}
+
+/// The cargo target directory, from whatever says where it is.
+///
+/// `CARGO_TARGET_DIR` when set, and a relative one is relative to the
+/// workspace root (where cargo is run from), not to the crate directory a test
+/// happens to run in. Without it, `build.target-dir` in a `.cargo/config` is
+/// invisible to a test, but the test binary itself sits in
+/// `<target>/<profile>/deps/`, which names the directory whatever set it.
+pub fn resolve_target_dir(
+    env_target: Option<std::ffi::OsString>,
+    exe: Option<&Path>,
+    manifest_dir: &Path,
+) -> PathBuf {
+    // crates/<name> -> workspace root
+    let root = manifest_dir.join("..").join("..");
+    if let Some(t) = env_target.filter(|v| !v.is_empty()).map(PathBuf::from) {
+        return if t.is_absolute() { t } else { root.join(t) };
+    }
+    if let Some(deps) = exe.and_then(|e| e.ancestors().find(|a| a.ends_with("deps"))) {
+        // <target>/<profile>/deps
+        if let Some(target) = deps.parent().and_then(Path::parent) {
+            return target.to_path_buf();
+        }
+    }
+    root.join("target")
 }
 
 /// Make `home/models` (a test's `DEVCTX_HOME`) point at [`shared_model_cache`].
@@ -169,4 +195,49 @@ pub fn reap_servers_under(root: &Path) {
     if !left.is_empty() && !std::thread::panicking() {
         panic!("devctx serve process(es) {left:?} outlived the test under {root:?}");
     }
+}
+
+/// `Child::wait_with_output` with a deadline: a CLI that hangs fails the test
+/// that started it instead of hanging the whole suite.
+///
+/// The child's piped stdout and stderr are drained on their own threads (a
+/// full pipe would otherwise block it for good). On timeout the child is
+/// killed and `Err` carries what it had printed so far.
+pub fn wait_with_timeout(
+    mut child: Child,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    fn drain<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let said = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned()
+                    + &String::from_utf8_lossy(&err.join().unwrap_or_default());
+                return Err(format!("still running after {limit:?}:\n{said}"));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
 }

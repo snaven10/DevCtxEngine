@@ -88,4 +88,16 @@ mod tests {
             "a relative cache would land in the working directory: {models:?}"
         );
     }
+
+    /// TASK-017 m-4: under `cargo test` the model cache is never the user's
+    /// real one — the workspace `.cargo/config.toml` pins it (an explicit
+    /// `DEVCTX_MODEL_CACHE` still wins, and is the caller's own choice).
+    #[test]
+    fn under_cargo_test_the_model_cache_is_not_the_users_real_one() {
+        let models = model_cache_dir().expect("a model cache");
+        if let Some(home) = home_dir() {
+            let real = home.join(".local").join("share").join("devctx");
+            assert!(!models.starts_with(&real), "{models:?} is under {real:?}");
+        }
+    }
 }

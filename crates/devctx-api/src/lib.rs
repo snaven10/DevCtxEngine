@@ -417,6 +417,13 @@ enum ExitClaim {
 /// Middleware: count the non-health requests in flight (the vanished-project
 /// check does not end a server that is answering someone).
 async fn count_in_flight(State(life): State<Arc<Lifecycle>>, req: Request, next: Next) -> Response {
+    // Once an exit has started the database is about to be frozen: a request
+    // admitted now would land on it half-way. Refuse everything (health too,
+    // so nobody reads "healthy" off a server that is leaving) with a 503 a
+    // client can retry against the next server.
+    if life.exiting.load(Ordering::SeqCst) {
+        return exiting_response();
+    }
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
@@ -429,6 +436,14 @@ async fn count_in_flight(State(life): State<Arc<Lifecycle>>, req: Request, next:
     life.in_flight.fetch_add(1, Ordering::SeqCst);
     let _guard = Guard(life.clone());
     next.run(req).await
+}
+
+/// The answer to any request that arrives while the process is ending.
+pub(crate) fn exiting_response() -> Response {
+    json_err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the server is shutting down".into(),
+    )
 }
 
 fn shutdown_grace() -> Duration {
@@ -1310,6 +1325,25 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode as HttpStatus};
     use tower::ServiceExt;
+
+    /// TASK-017 item 1: a request that arrives once an exit has started gets a
+    /// 503, not an answer from a store that is being frozen.
+    #[tokio::test]
+    async fn requests_during_an_exit_get_503() {
+        let life = Arc::new(Lifecycle::default());
+        let app = Router::new()
+            .route("/x", axum::routing::get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                life.clone(),
+                count_in_flight,
+            ));
+        let get = || Request::builder().uri("/x").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(get()).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        life.exiting.store(true, Ordering::SeqCst);
+        let resp = app.oneshot(get()).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::SERVICE_UNAVAILABLE);
+    }
 
     /// D1b item 7: the grace override only shortens the timeline. A larger
     /// value used to push "grace + checkpoint budget" past the 5 s the client

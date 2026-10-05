@@ -12,7 +12,7 @@
 //! plain `devctx projects list` acceptable.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -121,11 +121,18 @@ pub async fn serve(
     };
     let activity = Arc::new(Mutex::new(Instant::now()));
     let in_flight = Arc::new(AtomicUsize::new(0));
+    // Raised by the idle exit before it freezes the store: from then on every
+    // request is refused with a 503 instead of reaching a frozen database.
+    let exiting = Arc::new(AtomicBool::new(false));
     let app = router(api)
         .layer(middleware::from_fn_with_state(activity.clone(), track))
         .layer(middleware::from_fn_with_state(
             in_flight.clone(),
             count_requests,
+        ))
+        .layer(middleware::from_fn_with_state(
+            exiting.clone(),
+            refuse_while_exiting,
         ));
     let (listener, addr) = bind_near(addr).await?;
     // Announce only now, and with the port actually bound. Advertising the
@@ -160,6 +167,7 @@ pub async fn serve(
                     continue;
                 }
                 eprintln!("Central store idle for {idle_for:?}; shutting down.");
+                exiting.store(true, Ordering::SeqCst);
                 // `exit` runs no destructors, so the connection is never
                 // closed: freeze and fold the WAL first (see
                 // `Store::checkpoint`, `Store::freeze`), on the daemon's own
@@ -211,6 +219,18 @@ pub async fn serve(
 /// How many idle windows a single request may run before the idle exit stops
 /// waiting for it.
 const STUCK_WINDOWS: u32 = 4;
+
+/// Middleware: once the idle exit has started, answer 503 to everything.
+async fn refuse_while_exiting(
+    State(exiting): State<Arc<AtomicBool>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if exiting.load(Ordering::SeqCst) {
+        return crate::exiting_response();
+    }
+    next.run(req).await
+}
 
 /// Middleware: count the non-health requests being answered.
 async fn count_requests(State(n): State<Arc<AtomicUsize>>, req: Request, next: Next) -> Response {
@@ -701,5 +721,26 @@ where
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("task failed: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    /// TASK-017 item 1: the central daemon refuses requests once its idle exit
+    /// has started.
+    #[tokio::test]
+    async fn requests_during_the_idle_exit_get_503() {
+        let exiting = Arc::new(AtomicBool::new(false));
+        let app = Router::new().route("/x", get(|| async { "ok" })).layer(
+            middleware::from_fn_with_state(exiting.clone(), refuse_while_exiting),
+        );
+        let get = || Request::builder().uri("/x").body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(get()).await.unwrap().status(), 200);
+        exiting.store(true, Ordering::SeqCst);
+        assert_eq!(app.oneshot(get()).await.unwrap().status(), 503);
     }
 }

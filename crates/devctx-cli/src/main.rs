@@ -1040,6 +1040,38 @@ fn choose_model(
     Ok(out)
 }
 
+/// Where a model's files stand when `init` is about to write its config.
+#[derive(Debug, PartialEq, Eq)]
+enum ModelFiles {
+    /// Usable: the directory to record (empty for a built-in model).
+    Ready(String),
+    /// Missing, and `init` may fetch them once the answers are confirmed.
+    Fetch,
+    /// Missing, and nothing may fetch them: not a config to write.
+    Missing,
+}
+
+/// Decide what `init` records as `model_dir`. Pure, so the "never an empty
+/// one for a model that needs files" rule is tested without a terminal.
+fn model_files(
+    builtin: bool,
+    current_dir: &str,
+    on_disk: Option<PathBuf>,
+    will_fetch: bool,
+) -> ModelFiles {
+    if builtin {
+        return ModelFiles::Ready(current_dir.to_string());
+    }
+    if !current_dir.is_empty() {
+        return ModelFiles::Ready(current_dir.to_string());
+    }
+    match on_disk {
+        Some(dir) => ModelFiles::Ready(dir.to_string_lossy().into_owned()),
+        None if will_fetch => ModelFiles::Fetch,
+        None => ModelFiles::Missing,
+    }
+}
+
 /// The sentence for a user-defined ONNX model whose files are not on disk.
 fn missing_files_message(key: &str) -> String {
     format!(
@@ -3121,6 +3153,27 @@ fn cmd_init(
         defaults.reranking = r.clone();
     }
 
+    // Whatever model ends up configured — picked, copied or inherited from the
+    // machine's defaults — a user-defined ONNX one never goes into the config
+    // with an empty `model_dir`: the first index would fail much later, on a
+    // path that names nothing.
+    let mut fetch_key: Option<String> = None;
+    if defaults.embeddings.provider == "local" {
+        let key = defaults.embeddings.model.clone();
+        if let Some(spec) = devctx_embed::registry::find_local(&key) {
+            match model_files(
+                spec.builtin.is_some(),
+                &defaults.embeddings.model_dir,
+                models::local_dir(&key),
+                will_fetch,
+            ) {
+                ModelFiles::Ready(dir) => defaults.embeddings.model_dir = dir,
+                ModelFiles::Fetch => fetch_key = Some(key),
+                ModelFiles::Missing => bail!(missing_files_message(&key)),
+            }
+        }
+    }
+
     if !yes {
         println!(
             "\n{}",
@@ -3137,11 +3190,9 @@ fn cmd_init(
 
     // The files are fetched only now, once the person has confirmed (or there
     // was nobody to ask and `--download` said so): not before the summary.
-    if let Some(key) = &answers.model {
-        if will_fetch && defaults.embeddings.model_dir.is_empty() {
-            let dir = models::download(key)?;
-            defaults.embeddings.model_dir = dir.to_string_lossy().into_owned();
-        }
+    if let Some(key) = &fetch_key {
+        let dir = models::download(key)?;
+        defaults.embeddings.model_dir = dir.to_string_lossy().into_owned();
     }
 
     // Taken before `base` swallows the `None` case: a project that was NOT
@@ -3965,6 +4016,29 @@ fn render_table(hits: &[SearchResult]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// TASK-017 item 6: the rule for the `model_dir` `init` records.
+    #[test]
+    fn a_model_that_needs_files_never_gets_an_empty_model_dir() {
+        use super::{model_files, ModelFiles};
+        use std::path::PathBuf;
+        let on_disk = || Some(PathBuf::from("/m/ml-granite"));
+        assert_eq!(
+            model_files(true, "", None, false),
+            ModelFiles::Ready("".into())
+        );
+        assert_eq!(
+            model_files(false, "/x", None, false),
+            ModelFiles::Ready("/x".into())
+        );
+        assert_eq!(
+            model_files(false, "", on_disk(), false),
+            ModelFiles::Ready("/m/ml-granite".into())
+        );
+        assert_eq!(model_files(false, "", None, true), ModelFiles::Fetch);
+        // Offline (or no one to ask): no files and no way to get them.
+        assert_eq!(model_files(false, "", None, false), ModelFiles::Missing);
+    }
+
     /// m-5: `init` downloads hundreds of MB only where someone is there to
     /// want it, and never against an offline setting.
     #[test]

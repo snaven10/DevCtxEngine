@@ -247,7 +247,7 @@ binario instalado y sugieren reiniciar la sesión.
 | TASK-014 | `link_sources` correcto y sugerencias en `read_symbol` | P1 | TASK-006 | `done` |
 | TASK-015 | Docs EN + ES | P1 | TASK-013, TASK-014, TASK-007, TASK-005 | `pending` |
 | TASK-016 | Verificación de campo en `~/revfa` y este repo, antes/después | P1 | TASK-015, TASK-017 | `pending` |
-| TASK-017 | Pendientes del review de P0: idle exit, `in_tx`, procown fuera de Linux, transacciones y tests | P1 | — | `pending` |
+| TASK-017 | Pendientes del review de P0: idle exit, `in_tx`, procown fuera de Linux, transacciones y tests | P1 | — | `done` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
 

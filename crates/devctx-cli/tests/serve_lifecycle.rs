@@ -246,6 +246,49 @@ fn sigterm_stops_an_idle_server_within_two_seconds() {
     assert!(!serve_json(&serve.root).exists(), "serve.json left behind");
 }
 
+/// D1b (TASK-017 item 9): `serve --stop` against a server whose final
+/// checkpoint takes longer than the stop's fixed SIGTERM wait. The test seam
+/// `DEVCTX_TEST_SLOW_CHECKPOINT_MS` stretches the checkpoint to 9 s; the server
+/// holds its checkpoint marker meanwhile, so `--stop` keeps waiting instead of
+/// sending SIGKILL, and the server leaves cleanly (exit 0, WAL folded).
+#[test]
+fn serve_stop_waits_for_a_final_checkpoint_longer_than_its_fixed_wait() {
+    let tmp = Tmp::new("slowckpt");
+    let root = project(&tmp);
+    let mut serve = start_serve_env(
+        &tmp,
+        &root,
+        None,
+        None,
+        &[("DEVCTX_TEST_SLOW_CHECKPOINT_MS", "9000")],
+    );
+    let t0 = Instant::now();
+    let stop = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .args(["serve", "--stop"])
+        .output()
+        .unwrap();
+    let took = t0.elapsed();
+    let said = String::from_utf8_lossy(&stop.stderr);
+    assert!(stop.status.success(), "{said}");
+    assert!(
+        took > Duration::from_secs(8),
+        "the stop returned before the checkpoint could have finished: {took:?}\n{said}"
+    );
+    let code = exits_within(&mut serve.child, Duration::from_secs(5))
+        .and_then(|_| serve.child.try_wait().unwrap())
+        .expect("serve --stop returned with the server alive");
+    assert_eq!(
+        code.code(),
+        Some(0),
+        "the server must finish its checkpoint and exit 0, not die by SIGKILL: {code:?}"
+    );
+    assert!(!serve_json(&serve.root).exists(), "serve.json left behind");
+    assert!(wal_folded(&root), "the WAL outlived the server");
+}
+
 /// B10: SIGTERM while a blocking task is stuck in a download that never
 /// answers. The orderly path cannot finish (the connection stays open, the
 /// blocking pool never drains); the watchdog must.
@@ -703,7 +746,9 @@ fn devctx_index_fails_when_the_server_cancels_its_run() {
         .unwrap();
     wait_for_files(serve.port, 3, Duration::from_secs(60));
     sigterm(&serve.child);
-    let out = client.wait_with_output().unwrap();
+    // A CLI that hangs fails this test rather than the whole suite.
+    let out = common::wait_with_timeout(client, Duration::from_secs(60))
+        .unwrap_or_else(|e| panic!("`devctx index` never returned: {e}"));
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

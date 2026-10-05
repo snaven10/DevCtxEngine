@@ -507,6 +507,69 @@ fn routed_and_direct_agree_on_shape_not_just_content() {
     }
 }
 
+/// TASK-017 item 5: a child that never exits fails the helper after its
+/// deadline, with what it printed, instead of hanging the caller.
+#[test]
+fn a_hung_child_fails_the_wait_instead_of_hanging_the_suite() {
+    let child = Command::new("sh")
+        .args(["-c", "echo started; sleep 60"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    let err = common::wait_with_timeout(child, std::time::Duration::from_secs(1))
+        .expect_err("a hung child must time out");
+    assert!(err.contains("started"), "{err}");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+    let done = Command::new("sh")
+        .args(["-c", "echo ok"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = common::wait_with_timeout(done, std::time::Duration::from_secs(10)).unwrap();
+    assert!(out.status.success() && out.stdout == b"ok\n");
+}
+
+/// m-4: the target directory is found whichever way it was configured, and the
+/// workspace's cargo config pins the model cache for every test in the
+/// workspace (the `#[ignore]`d ones in other crates call
+/// `model_cache_dir()` directly, with no helper to go through).
+#[test]
+fn the_test_model_cache_is_pinned_for_the_whole_workspace() {
+    let manifest = Path::new("/ws/crates/devctx-cli");
+    // A relative CARGO_TARGET_DIR is relative to the workspace root.
+    let rel = common::resolve_target_dir(Some("out".into()), None, manifest);
+    assert_eq!(rel, Path::new("/ws/crates/devctx-cli/../../out"));
+    let abs = common::resolve_target_dir(Some("/abs/t".into()), None, manifest);
+    assert_eq!(abs, Path::new("/abs/t"));
+    // `build.target-dir` leaves no variable behind; the test binary's own
+    // location says where the target directory is.
+    let exe = Path::new("/somewhere/else/debug/deps/projects_cli-abc123");
+    assert_eq!(
+        common::resolve_target_dir(None, Some(exe), manifest),
+        Path::new("/somewhere/else")
+    );
+    assert_eq!(
+        common::resolve_target_dir(None, None, manifest),
+        Path::new("/ws/crates/devctx-cli/../../target")
+    );
+    // The cargo config sets `DEVCTX_MODEL_CACHE` for every test process.
+    let config = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".cargo")
+            .join("config.toml"),
+    )
+    .expect("the workspace .cargo/config.toml");
+    assert!(
+        config.contains("[env]") && config.contains("DEVCTX_MODEL_CACHE"),
+        "{config}"
+    );
+}
+
 /// Test hygiene: a run without `DEVCTX_MODEL_CACHE` must never resolve to the
 /// user's real data directory, whichever way HOME / XDG_DATA_HOME point.
 #[test]
@@ -566,6 +629,37 @@ fn init_with_a_model_that_is_not_on_disk_names_the_download_command() {
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("devctx models --download ml-granite"), "{err}");
+    assert!(!repo.join(".devctx").join("config.yaml").exists());
+}
+
+/// TASK-017 item 6: a machine default that names a files-needing model with
+/// no `model_dir` (what an earlier interactive `init` could leave behind),
+/// and the machine is offline. `init` used to inherit it and write a config
+/// with an empty `model_dir` that only failed at the first index; it now
+/// refuses and names the download command.
+#[test]
+fn init_never_writes_an_empty_model_dir_for_a_model_that_needs_files() {
+    let tmp = Tmp::new("init_empty_dir");
+    let repo = tmp.repo("alpha");
+    std::fs::create_dir_all(tmp.home()).unwrap();
+    std::fs::write(
+        tmp.home().join("config.yaml"),
+        "defaults:\n  embeddings:\n    provider: local\n    model: ml-granite\n    \
+         model_dir: \"\"\n    offline: true\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .env("DEVCTX_MODEL_CACHE", tmp.0.join("empty-cache"))
+        .current_dir(&repo)
+        .args(["init", "--yes"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
     assert!(err.contains("devctx models --download ml-granite"), "{err}");
     assert!(!repo.join(".devctx").join("config.yaml").exists());
 }

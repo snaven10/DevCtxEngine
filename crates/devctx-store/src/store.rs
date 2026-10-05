@@ -102,6 +102,24 @@ impl std::ops::Deref for WriteConn<'_> {
     }
 }
 
+/// Ends the transaction `Store::in_transaction` opened, whichever way `f`
+/// leaves: rolls it back unless it committed, and clears `in_tx`.
+struct TxGuard<'a> {
+    store: &'a Store,
+    finished: bool,
+}
+
+impl Drop for TxGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Never gated: a rollback writes nothing to the WAL, and a frozen
+            // store must still be able to abandon what it started.
+            let _ = self.store.conn.execute_batch("ROLLBACK");
+        }
+        self.store.in_tx.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Store {
     /// Open (creating if needed) a store at `path` with vector dimension `dim`.
     pub fn open(path: &Path, dim: usize) -> Result<Self> {
@@ -578,6 +596,13 @@ impl Store {
         }
         self.w()?.execute_batch("BEGIN TRANSACTION")?;
         self.in_tx.store(true, Ordering::SeqCst);
+        // If `f` panics, unwinding drops this guard: the transaction is rolled
+        // back and `in_tx` cleared, so the next call on this connection opens
+        // its own transaction instead of running bare inside a dead one.
+        let mut guard = TxGuard {
+            store: self,
+            finished: false,
+        };
         let result = f();
         let result = match result {
             Ok(v) => match self.w().and_then(|c| Ok(c.execute_batch("COMMIT")?)) {
@@ -586,12 +611,8 @@ impl Store {
             },
             Err(e) => Err(e),
         };
-        if result.is_err() {
-            // Never gated: a rollback writes nothing to the WAL, and a frozen
-            // store must still be able to abandon what it started.
-            let _ = self.conn.execute_batch("ROLLBACK");
-        }
-        self.in_tx.store(false, Ordering::SeqCst);
+        guard.finished = result.is_ok();
+        drop(guard);
         result
     }
 
@@ -1417,6 +1438,38 @@ mod tests {
         drop(running);
         assert!(store.freeze(Duration::from_millis(200)));
         assert!(matches!(other.w().err(), Some(StoreError::Frozen)));
+    }
+
+    /// TASK-017 item 2: a panic inside the transaction used to leave `in_tx`
+    /// true, so the next transaction on the connection ran without its own
+    /// `BEGIN` (and nothing was rolled back).
+    #[test]
+    fn a_panic_inside_a_transaction_rolls_back_and_resets_in_tx() {
+        let store = Store::open_in_memory(4).unwrap();
+        store.upsert(&[point("old", "a.rs")]).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = store.in_transaction(|| {
+                store.delete_by_file("demo", "main", "a.rs")?;
+                panic!("die half-way");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert!(!store.in_tx.load(Ordering::SeqCst), "in_tx must be reset");
+        let ids = |s: &Store| -> Vec<String> {
+            s.scroll_all("demo", "main")
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect()
+        };
+        assert_eq!(ids(&store), vec!["old".to_string()], "rolled back");
+        // The next transaction is a real one again: a failure undoes it.
+        let failed: Result<()> = store.in_transaction(|| {
+            store.delete_by_file("demo", "main", "a.rs")?;
+            Err(StoreError::Decode("again".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(ids(&store), vec!["old".to_string()]);
     }
 
     /// One transaction is all or nothing, and an upsert inside it joins it

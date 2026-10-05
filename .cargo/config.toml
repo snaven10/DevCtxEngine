@@ -1,0 +1,9 @@
+# Tests must never read, fill or race over the user's real model cache
+# (`~/.local/share/devctx/models`): that is where a running `devctx serve` keeps
+# its models. Pinning the cache here covers every test in the workspace, the
+# `#[ignore]`d ones that download a model included, whichever crate they live
+# in. An explicit `DEVCTX_MODEL_CACHE` in the environment still wins (no
+# `force`). `cargo run` sees it too: point `DEVCTX_MODEL_CACHE` elsewhere to
+# keep a development binary on a different cache.
+[env]
+DEVCTX_MODEL_CACHE = { value = "target/test-model-cache", relative = true }

@@ -190,7 +190,14 @@ pub(crate) fn ps_command_is_server(command: &str) -> bool {
     };
     (0..toks.len()).any(|i| {
         let base = toks[i].rsplit('/').next().unwrap_or("");
-        if !base.starts_with("devctx") || (i > 0 && !first.starts_with('/')) {
+        if !base.starts_with("devctx") {
+            return false;
+        }
+        // Words before the token are part of argv[0]'s path only if they
+        // continue an absolute path with a space in it. A later token that
+        // itself starts with `/` begins a new path: an argument of another
+        // program (`/usr/bin/vim /x/devctx serve`), not a directory name.
+        if i > 0 && (!first.starts_with('/') || toks[1..=i].iter().any(|t| t.starts_with('/'))) {
             return false;
         }
         let mut cmdline = toks[..=i].join(" ").into_bytes();
@@ -504,8 +511,72 @@ impl Handle {
         if let Some(t0) = self.start {
             return wait_until(|| exited(self.pid, t0), limit);
         }
+        // macOS: the kernel says when the process exits, as the pidfd does on
+        // Linux. `None` (kqueue unavailable, or it refused the pid) falls
+        // back to polling.
+        #[cfg(target_os = "macos")]
+        if let Some(exited) = kqueue_wait_exit(self.pid, limit) {
+            return exited;
+        }
         wait_until(|| !owns(), limit)
     }
+}
+
+/// Wait up to `limit` for `pid` to exit with `EVFILT_PROC` / `NOTE_EXIT`.
+///
+/// `Some(true)` once it exited (or was already gone: `ESRCH` on registration),
+/// `Some(false)` when `limit` ran out, `None` when kqueue cannot be used and
+/// the caller should poll instead.
+#[cfg(target_os = "macos")]
+fn kqueue_wait_exit(pid: u32, limit: Duration) -> Option<bool> {
+    // SAFETY: plain syscall.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return None;
+    }
+    let outcome = (|| {
+        // SAFETY: an all-zero `kevent` is a valid value; the fields we need
+        // are set below.
+        let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+        change.ident = pid as libc::uintptr_t;
+        change.filter = libc::EVFILT_PROC;
+        change.flags = libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT;
+        change.fflags = libc::NOTE_EXIT;
+        // Register only (no event list): a failure comes back as -1 + errno.
+        // SAFETY: `change` is one valid kevent; no output buffer is passed.
+        let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        if rc < 0 {
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                Some(true)
+            } else {
+                None
+            };
+        }
+        let deadline = Instant::now() + limit;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ts = libc::timespec {
+                tv_sec: left.as_secs() as libc::time_t,
+                tv_nsec: left.subsec_nanos() as libc::c_long,
+            };
+            // SAFETY: as above.
+            let mut out: libc::kevent = unsafe { std::mem::zeroed() };
+            // SAFETY: one valid output slot; `ts` outlives the call.
+            let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, &ts) };
+            if n > 0 {
+                return Some(true);
+            }
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return None;
+            }
+            if n == 0 || left.is_zero() {
+                return Some(false);
+            }
+        }
+    })();
+    // SAFETY: `kq` is the descriptor opened above.
+    unsafe { libc::close(kq) };
+    outcome
 }
 
 /// `Ok` for a successful syscall (or a vanished target), the errno otherwise.
@@ -644,6 +715,10 @@ pub fn terminate_patient(
     )
 }
 
+/// How long a process that was waited on patiently gets to leave once the work
+/// it was waited for is done, before SIGKILL.
+const AFTER_PATIENCE: Duration = Duration::from_secs(2);
+
 /// The body of [`terminate_patient`], with the two OS interactions injected:
 /// `wait` (until exit) and `send` (a signal; `Err(errno)` when refused), so
 /// tests can model a refusal without signalling a real foreign process.
@@ -668,12 +743,22 @@ fn terminate_with(
             return Termination::Gone;
         }
         let mut waited = term_wait;
+        let mut was_patient = false;
         while waited < patience_cap && patient() {
+            was_patient = true;
             let slice = Duration::from_millis(250).min(patience_cap - waited);
             if wait(handle, slice, &owns) {
                 return Termination::Gone;
             }
             waited += slice;
+        }
+        // The patience ended because the work it was waiting for finished
+        // (the checkpoint marker went away), not because it ran out: the
+        // process is on its way out, only the runtime's wind-down is left.
+        // SIGKILL here would land on a server that has done everything it was
+        // asked to and turn a clean exit into status 9.
+        if was_patient && waited < patience_cap && wait(handle, AFTER_PATIENCE, &owns) {
+            return Termination::Gone;
         }
         if send(handle, libc::SIGKILL) == Err(libc::EPERM) {
             return Termination::NoPermission;
@@ -790,6 +875,9 @@ mod pure_tests {
         assert!(!is("/Users/John Doe/bin/devctx mcp"));
         assert!(!is("/Users/John Doe/bin/devctx search serve"));
         assert!(!is("vim devctx serve"));
+        // TASK-017 item 3: devctx as an argument of another program.
+        assert!(!is("/usr/bin/vim /x/devctx serve"));
+        assert!(!is("/usr/bin/less /home/u/bin/devctx api"));
         assert!(!is("/usr/bin/vim serve"));
         assert!(!is(""));
     }
@@ -974,6 +1062,36 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// TASK-017 item 9 (found by its e2e test): the final checkpoint finishes
+    /// and its marker goes away a moment before the process is gone. Patience
+    /// used to end there and SIGKILL the server in its wind-down.
+    #[test]
+    fn a_finished_checkpoint_is_given_a_moment_to_exit_before_sigkill() {
+        let handle = Handle::open(u32::MAX - 1);
+        let left = std::cell::Cell::new(3u32);
+        let patient = || {
+            let n = left.get();
+            left.set(n.saturating_sub(1));
+            n > 0
+        };
+        let sent = std::cell::RefCell::new(Vec::new());
+        let out = terminate_with(
+            &handle,
+            || true,
+            Duration::from_millis(100),
+            (&patient, Duration::from_secs(60)),
+            Duration::from_millis(100),
+            // Gone only when given the post-patience wait.
+            |_, limit, _| limit == AFTER_PATIENCE,
+            |_, sig| {
+                sent.borrow_mut().push(sig);
+                Ok(())
+            },
+        );
+        assert_eq!(out, Termination::Gone);
+        assert_eq!(*sent.borrow(), vec![libc::SIGTERM], "no SIGKILL");
     }
 
     #[test]

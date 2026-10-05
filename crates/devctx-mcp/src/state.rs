@@ -411,6 +411,16 @@ impl AppState {
                  checkpointing anyway (FORCE aborts it)"
             );
         }
+        // Test seam: `DEVCTX_TEST_SLOW_CHECKPOINT_MS=<n>` makes the final
+        // checkpoint take n ms longer, so the e2e suite can prove that
+        // `serve --stop` waits for one that outlasts its fixed wait. Unset
+        // (always, outside those tests) it costs one environment lookup.
+        if let Some(ms) = std::env::var("DEVCTX_TEST_SLOW_CHECKPOINT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
         match store.try_checkpoint() {
             Ok(()) => true,
             Err(plain) => match store.force_checkpoint() {
