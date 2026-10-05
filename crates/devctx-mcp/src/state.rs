@@ -4089,8 +4089,51 @@ pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<Stri
             "code": p.text,
         })).collect::<Vec<_>>(),
     });
+    if found.is_empty() {
+        // Nothing to read is not the end of the answer: say what the name was
+        // probably meant to be, and whether it is code this repo does not own.
+        not_found_hints(&store, &chosen.repo, &chosen.branch, name, &mut out);
+    }
     chosen.annotate(&mut out);
     Ok(out.to_string())
+}
+
+/// Fields for a `read_symbol` that found no definition: `suggestions` (up to 5 —
+/// qualified forms of a bare name that the call graph knows, then the closest
+/// defined names) and, when the name is only ever a call target, `external: true`
+/// with `called_from` (call sites) and a `next_step`.
+fn not_found_hints(
+    store: &devctx_store::Store,
+    repo: &str,
+    branch: &str,
+    name: &str,
+    out: &mut Value,
+) {
+    const MAX_SUGGESTIONS: usize = 5;
+    let mut suggestions: Vec<String> = store
+        .resolve_symbol(repo, branch, name)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|q| q != name)
+        .take(MAX_SUGGESTIONS)
+        .collect();
+    for c in store
+        .symbol_suggestions(repo, branch, name, MAX_SUGGESTIONS)
+        .unwrap_or_default()
+    {
+        if suggestions.len() < MAX_SUGGESTIONS && !suggestions.contains(&c) {
+            suggestions.push(c);
+        }
+    }
+    out["suggestions"] = json!(suggestions);
+    if let Ok(Some(sites)) = store.external_call_sites(repo, branch, name) {
+        out["external"] = json!(true);
+        out["called_from"] = json!(sites);
+        out["next_step"] = json!(format!(
+            "`{name}` is called from {sites} place(s) but defined nowhere in this repository \
+             (a library or runtime function); `get_references` lists the call sites"
+        ));
+    }
 }
 
 /// `memories_by_symbol` tool: the decisions recorded about a symbol.
@@ -4121,6 +4164,7 @@ pub fn do_memories_by_symbol(
         symbol,
         linked,
         devctx_store::short_label(symbol),
+        &[],
         opts,
     )?;
     let Some(f) = fallback else {
@@ -4188,7 +4232,9 @@ pub fn do_memories_by_file(
         }
     }
 
-    let out = linked_response(&store, file, linked, file, opts)?;
+    let mut subjects = vec![file.to_string()];
+    subjects.extend(resolved.clone());
+    let out = linked_response(&store, file, linked, file, &subjects, opts)?;
     let plan_tasks = plan_tasks_for_file(&state.plans_root.root, file, resolved.as_deref());
     Ok(with_plan_tasks_field(out, plan_tasks))
 }
@@ -4275,6 +4321,7 @@ fn linked_response(
     subject: &str,
     linked: Vec<(String, String)>,
     fallback_label: &str,
+    file_subject: &[String],
     opts: MemoriesOpts,
 ) -> Result<String, String> {
     let mut out: Vec<Value> = Vec::new();
@@ -4305,14 +4352,10 @@ fn linked_response(
 
     let mut fallback_used = false;
     if out.is_empty() {
-        fallback_used = true;
         let mut seen = std::collections::HashSet::new();
-        for m in store
-            .memories_mentioning(fallback_label, LINKED_SCAN_CAP)
-            .unwrap_or_default()
-        {
-            if seen.insert(m.id.clone()) {
-                out.push(memory_json(&m, "inference"));
+        for m in text_fallback_local(store, fallback_label, file_subject) {
+            if seen.insert(m["id"].as_str().unwrap_or_default().to_string()) {
+                out.push(m);
             }
         }
         if let Ok(c) = central() {
@@ -4322,10 +4365,19 @@ fn linked_response(
             {
                 let id = v.get("id").and_then(|i| i.as_str()).unwrap_or_default();
                 if seen.insert(id.to_string()) {
-                    out.push(value_json(v, "inference"));
+                    let src = fallback_source(
+                        v.get("files").and_then(|f| f.as_str()).unwrap_or_default(),
+                        file_subject,
+                    );
+                    out.push(value_json(v, src));
                 }
             }
         }
+        // Words matched, but if every memory also names the file in its `files`
+        // field the answer is structural, not a text guess.
+        fallback_used = out
+            .iter()
+            .any(|m| m["link_sources"].as_str() != Some("files-field"));
     }
 
     out.sort_by(|a, b| {
@@ -4339,6 +4391,51 @@ fn linked_response(
     });
 
     Ok(linked_answer(subject, out, fallback_used, opts))
+}
+
+/// The local memories whose text or `files` mention `label`, each marked by
+/// [`fallback_source`]. Split out so the marking is testable without a central store.
+fn text_fallback_local(
+    store: &devctx_store::Store,
+    label: &str,
+    file_subject: &[String],
+) -> Vec<Value> {
+    store
+        .memories_mentioning(label, LINKED_SCAN_CAP)
+        .unwrap_or_default()
+        .iter()
+        .map(|m| memory_json(m, fallback_source(&m.files, file_subject)))
+        .collect()
+}
+
+/// `link_sources` of a memory found by the text fallback: `files-field` when its
+/// `files` field names one of `file_subject` (the same fact the junction records
+/// at write time — the junction row was missing, not the link), else `inference`.
+/// Paths compare normalized (`./`, `\\`) and by path suffix, so `a.rs` and
+/// `src/a.rs` are the same file.
+fn fallback_source(files: &str, file_subject: &[String]) -> &'static str {
+    let norm = |p: &str| {
+        p.trim()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_string()
+    };
+    let subjects: Vec<String> = file_subject
+        .iter()
+        .map(|s| norm(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let named = files.split([',', ';', '\n']).map(norm).any(|f| {
+        !f.is_empty()
+            && subjects
+                .iter()
+                .any(|s| f == *s || f.ends_with(&format!("/{s}")) || s.ends_with(&format!("/{f}")))
+    });
+    if named {
+        "files-field"
+    } else {
+        "inference"
+    }
 }
 
 /// The answer of `memories_by_symbol` / `memories_by_file` from the memories already gathered
@@ -6092,6 +6189,120 @@ mod tests {
         let hint = v["hint"].as_str().unwrap();
         assert!(hint.contains("older extractor"), "{hint}");
         assert!(hint.contains("indexed but empty"), "{hint}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// TASK-014: a memory whose `files` field names the file but has no junction
+    /// row is found by the text fallback, and is `files-field`, not `inference`.
+    #[test]
+    fn a_memory_naming_the_file_is_files_field_even_without_a_junction_row() {
+        let store = Store::open_in_memory(GRAPH_DIM).unwrap();
+        let mem = |id: &str, files: &str, content: &str| devctx_store::Memory {
+            id: id.into(),
+            title: id.into(),
+            content: content.into(),
+            files: files.into(),
+            updated_at: "2026-10-04T00:00:00Z".into(),
+            ..Default::default()
+        };
+        store
+            .upsert_memory(&mem("m_named", "src/a.rs, src/b.rs", "x"))
+            .unwrap();
+        store
+            .upsert_memory(&mem("m_text", "", "see src/a.rs for details"))
+            .unwrap();
+        let subjects = vec!["src/a.rs".to_string()];
+        let hits = text_fallback_local(&store, "src/a.rs", &subjects);
+        let src = |id: &str| {
+            hits.iter()
+                .find(|m| m["id"] == id)
+                .map(|m| m["link_sources"].as_str().unwrap().to_string())
+        };
+        assert_eq!(src("m_named").as_deref(), Some("files-field"));
+        assert_eq!(src("m_text").as_deref(), Some("inference"));
+    }
+
+    #[test]
+    fn fallback_source_compares_normalized_paths_and_suffixes() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            fallback_source("./src/a.rs", &s(&["src/a.rs"])),
+            "files-field"
+        );
+        assert_eq!(
+            fallback_source("src\\a.rs", &s(&["src/a.rs"])),
+            "files-field"
+        );
+        assert_eq!(fallback_source("src/a.rs", &s(&["a.rs"])), "files-field");
+        assert_eq!(fallback_source("a.rs", &s(&["src/a.rs"])), "files-field");
+        assert_eq!(fallback_source("src/aa.rs", &s(&["a.rs"])), "inference");
+        assert_eq!(fallback_source("src/a.rs", &[]), "inference");
+    }
+
+    /// TASK-014: a misspelled name gets the right one as a suggestion, a name only
+    /// ever called is `external`, and the branch_fallback field survives.
+    #[test]
+    fn read_symbol_not_found_suggests_and_marks_external() {
+        let (state, repo) = subdir_project("rs014");
+        {
+            let store = state.open_store().unwrap();
+            let git = GitRepo::open(&repo).unwrap();
+            let dim = configured_dimension(&state.cfg);
+            store
+                .upsert(&[VectorPoint {
+                    id: "p2".into(),
+                    vector: vec![0.0; dim],
+                    text: "class AuthService {}".into(),
+                    metadata: VectorMetadata {
+                        repo: git.short_name(),
+                        branch: "main".into(),
+                        file: "sub/auth.rs".into(),
+                        symbol: "AuthService".into(),
+                        symbol_type: "class".into(),
+                        language: "rust".into(),
+                        start_line: 1,
+                        end_line: 1,
+                        ..Default::default()
+                    },
+                }])
+                .unwrap();
+            let edge = |target: &str, line: i32| devctx_store::StoredEdge {
+                source: "T.test".into(),
+                target: target.into(),
+                kind: "calls".into(),
+                source_file: "sub/t.rs".into(),
+                line,
+            };
+            store
+                .replace_file_edges(
+                    &git.short_name(),
+                    "main",
+                    "sub/t.rs",
+                    &[edge("Assertions.assertEquals", 3), edge("assertEquals", 4)],
+                )
+                .unwrap();
+        }
+        let typo: Value =
+            serde_json::from_str(&do_read_symbol(&state, "AuthServce", 5).unwrap()).unwrap();
+        assert!(typo["definitions"].as_array().unwrap().is_empty());
+        let sugg: Vec<&str> = typo["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(sugg.contains(&"AuthService"), "{typo}");
+        assert!(typo.get("external").is_none(), "{typo}");
+        assert_eq!(typo["branch_fallback"]["used"], "main", "{typo}");
+
+        let ext: Value =
+            serde_json::from_str(&do_read_symbol(&state, "assertEquals", 5).unwrap()).unwrap();
+        assert_eq!(ext["external"], true, "{ext}");
+        assert_eq!(ext["called_from"], 2, "{ext}");
+
+        let found: Value =
+            serde_json::from_str(&do_read_symbol(&state, "greet", 5).unwrap()).unwrap();
+        assert!(found.get("suggestions").is_none() && found.get("external").is_none());
         let _ = std::fs::remove_dir_all(&repo);
     }
 

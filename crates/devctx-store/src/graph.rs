@@ -209,6 +209,37 @@ impl Store {
         })
     }
 
+    /// How a name appears in the call graph without being defined here:
+    /// `Some(call_sites)` when it is the target of at least one edge and never
+    /// the source of one (a library or JDK function called from this repo),
+    /// `None` otherwise. Matches the bare name and any `Type.name` form.
+    ///
+    /// The caller has already established there is no definition in `vectors`;
+    /// a name that makes calls of its own is defined here, so it is not external.
+    pub fn external_call_sites(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+    ) -> Result<Option<usize>> {
+        let count = |col: &str| -> Result<usize> {
+            let n: i64 = self.conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM graph_edges WHERE repo = ? AND branch = ?
+                       AND ({col} = ? OR ends_with({col}, '.' || ?))"
+                ),
+                params![repo, branch, name, name],
+                |r| r.get(0),
+            )?;
+            Ok(n as usize)
+        };
+        if count("source")? > 0 {
+            return Ok(None);
+        }
+        let sites = count("target")?;
+        Ok((sites > 0).then_some(sites))
+    }
+
     /// Direct callers of `symbol` (sources of edges targeting it).
     pub fn get_callers(&self, repo: &str, branch: &str, symbol: &str) -> Result<Vec<String>> {
         let names = self.resolve_symbol(repo, branch, symbol)?;

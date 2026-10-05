@@ -878,6 +878,48 @@ impl Store {
         Ok(out)
     }
 
+    /// Up to `n` symbol names of this repo/branch that `name` could be a slip for.
+    ///
+    /// Candidates come from SQL by cheap string tests (shared prefix, shared
+    /// suffix, or containing the name, all case-insensitive; capped), and are ranked
+    /// in memory: same name ignoring case, then prefix/suffix/substring, then
+    /// small edit distance on the last path segment. Edit distance runs only on
+    /// the capped candidate set, never on every symbol of a large repo.
+    pub fn symbol_suggestions(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+        n: usize,
+    ) -> Result<Vec<String>> {
+        let lname = name.to_lowercase();
+        if lname.chars().count() < 2 || n == 0 {
+            return Ok(Vec::new());
+        }
+        let head: String = lname.chars().take(3).collect();
+        let tail: String = {
+            let c: Vec<char> = lname.chars().collect();
+            c[c.len().saturating_sub(3)..].iter().collect()
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT symbol FROM vectors
+             WHERE repo = ? AND branch = ? AND NOT is_deletion
+               AND chunk_level NOT IN ('memory', 'memory_chunk')
+               AND symbol <> ''
+               AND (starts_with(lower(symbol), ?) OR ends_with(lower(symbol), ?)
+                    OR contains(lower(symbol), ?) OR contains(?, lower(symbol)))
+             LIMIT 2000",
+        )?;
+        let rows = stmt.query_map(params![repo, branch, head, tail, lname, lname], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut cands = Vec::new();
+        for r in rows {
+            cands.push(r?);
+        }
+        Ok(rank_suggestions(name, cands, n))
+    }
+
     /// Definitions of `name` among the rows `filter` admits — the exact symbol
     /// first, then `Class.name` / `mod::name` — without requiring a repo and
     /// branch the way [`symbol_definitions`](Self::symbol_definitions) does.
@@ -1515,5 +1557,76 @@ mod bench {
             "\nupsert {n} vectors (dim {DIM}):\n  row-wise: {row_wise:?}\n  batched : {batched:?}\n  speedup : {:.1}x\n",
             row_wise.as_secs_f64() / batched.as_secs_f64().max(1e-9)
         );
+    }
+}
+
+/// Rank candidate symbols against a name that matched nothing. Pure.
+fn rank_suggestions(name: &str, cands: Vec<String>, n: usize) -> Vec<String> {
+    let lname = name.to_lowercase();
+    let threshold = (lname.chars().count() / 3).max(2);
+    let mut scored: Vec<(u8, usize, String)> = Vec::new();
+    for c in cands {
+        let last = c.rsplit(['.', ':']).next().unwrap_or(&c).to_lowercase();
+        if last.is_empty() || c == name {
+            continue;
+        }
+        let dist = edit_distance(&lname, &last);
+        let class = if last == lname {
+            0
+        } else if last.starts_with(&lname) || last.ends_with(&lname) || last.contains(&lname) {
+            1
+        } else if dist <= threshold {
+            2
+        } else {
+            continue;
+        };
+        scored.push((class, dist, c));
+    }
+    scored.sort();
+    scored.dedup_by(|a, b| a.2 == b.2);
+    scored.into_iter().take(n).map(|(_, _, c)| c).collect()
+}
+
+/// Levenshtein distance over chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn suggestions_rank_exact_case_then_substring_then_edit_distance() {
+        let c = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let r = rank_suggestions(
+            "AuthServce",
+            c(&["AuthService", "Unrelated", "Other.Zzzz"]),
+            5,
+        );
+        assert_eq!(r[0], "AuthService");
+        assert!(!r.contains(&"Unrelated".to_string()));
+        let r = rank_suggestions("charge", c(&["Card.Charge", "Card.recharge", "zzz"]), 5);
+        assert_eq!(r[0], "Card.Charge");
+        assert_eq!(r[1], "Card.recharge");
+        assert_eq!(rank_suggestions("x1", c(&["x1"]), 5), Vec::<String>::new());
+    }
+
+    #[test]
+    fn edit_distance_basics() {
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "ab"), 2);
+        assert_eq!(edit_distance("same", "same"), 0);
     }
 }

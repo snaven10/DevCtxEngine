@@ -4,7 +4,7 @@
 - **Especialista:** rust (modelo sugerido: sonnet)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
 - **Depende de:** TASK-006
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -32,22 +32,22 @@ Que una memoria cuyo campo `files` nombra el archivo nunca se reporte como `infe
 
 ## Pasos
 
-- [ ] **Paso 1 — `link_sources`.** En el fallback de `linked_response`, si el `files` de la memoria
+- [x] **Paso 1 — `link_sources`.** En el fallback de `linked_response`, si el `files` de la memoria
       contiene el sujeto (comparando ruta normalizada y sufijo), marcar `files-field`; solo lo demás
       es `inference`. Investigar por qué la junction no tenía la fila (¿rama?, ¿ruta relativa vs
       absoluta?, ¿memoria central?) y anotarlo en el Resultado.
-- [ ] **Paso 2 — Sugerencias.** `read_symbol` sin definiciones → `suggestions`: hasta 5 símbolos por
+- [x] **Paso 2 — Sugerencias.** `read_symbol` sin definiciones → `suggestions`: hasta 5 símbolos por
       prefijo/sufijo/distancia de edición sobre `vectors.symbol` de la rama elegida (TASK-006).
-- [ ] **Paso 3 — Externo.** Si el nombre aparece como target en `graph_edges` pero nunca como
+- [x] **Paso 3 — Externo.** Si el nombre aparece como target en `graph_edges` pero nunca como
       definición ni source → `"external": true` + `"called_from": N` sitios (con `get_references`
       como siguiente paso sugerido).
 
 ## Criterios de aceptación
 
-- [ ] Test: memoria con `files: "src/a.rs"` sin fila de junction → `memories_by_file("src/a.rs")` la
+- [x] Test: memoria con `files: "src/a.rs"` sin fila de junction → `memories_by_file("src/a.rs")` la
       trae con `link_sources: "files-field"`.
-- [ ] Test: `read_symbol("AuthServce")` → `suggestions` contiene `AuthService`.
-- [ ] Test: `read_symbol("assertEquals")` en un repo con tests → `external: true`.
+- [x] Test: `read_symbol("AuthServce")` → `suggestions` contiene `AuthService`.
+- [x] Test: `read_symbol("assertEquals")` en un repo con tests → `external: true`.
 
 ## Riesgos
 
@@ -56,4 +56,11 @@ por prefijo/sufijo en SQL y rankear en memoria.
 
 ## Resultado
 
-<!-- Contrato: PLAN-008 §11 -->
+1. **Estado final:** `done`.
+2. **Repro antes/después:** antes, `linked_response` marcaba todo lo del fallback de texto como `"inference"` aunque `m.files` nombrara el archivo; `read_symbol("AuthServce")` devolvía `definitions: []` sin más. Después: `files-field` / `suggestions` / `external`. Cubierto por los tests de abajo (los tests nuevos no compilan/fallan en el padre: faltan `fallback_source`, `symbol_suggestions`, `external_call_sites`).
+3. **Causa raíz:** `state.rs` `linked_response` (fallback, antes `:3320`/`:3330`) hardcodeaba `"inference"`. La fila de junction falta cuando la memoria se guardó sin grafo/índice, se importó/migró, o el llamante usa otra grafía de la ruta (el lookup `memory_ids_for_file` es por igualdad exacta: `a.rs` vs `src/a.rs`). El fallback no mira ramas ni memoria central como causa; sí la ruta exacta. No se pudo reproducir con datos reales (sin acceso a stores del usuario).
+4. **Archivos/símbolos:** `devctx-store`: `Store::symbol_suggestions(repo, branch, name, n) -> Result<Vec<String>>` (store.rs), `Store::external_call_sites(repo, branch, name) -> Result<Option<usize>>` (graph.rs). `devctx-mcp/state.rs`: `linked_response(.., file_subject: &[String], ..)`, `text_fallback_local`, `fallback_source`, `not_found_hints`.
+5. **Tests:** `a_memory_naming_the_file_is_files_field_even_without_a_junction_row`, `fallback_source_compares_normalized_paths_and_suffixes`, `read_symbol_not_found_suggests_and_marks_external`, `suggestions_rank_exact_case_then_substring_then_edit_distance`, `edit_distance_basics`. `cargo test --workspace` con `TMPDIR=/var/tmp DEVCTX_MODEL_CACHE=/var/tmp/devctx-test-model-cache`: verde (38 suites); fmt y clippy (con y sin `--features gpu`) sin warnings.
+6. **Contrato JSON:** `read_symbol` sin definiciones agrega `suggestions: [..]` (hasta 5: formas calificadas del grafo y luego nombres cercanos por prefijo/sufijo/contiene/Levenshtein) y, si el nombre es solo target de llamadas, `external: true`, `called_from: N`, `next_step`. `branch_fallback` intacto. `memories_by_file`: en el fallback, `link_sources: "files-field"` si `files` nombra el archivo (ruta normalizada + sufijo); si todas lo son, `matched_by` pasa a `"junction"`.
+7. **No verificado:** rendimiento de `symbol_suggestions` en repos grandes (tope 2000 candidatos por SQL); no se probó la rama central (daemon) del fallback; `memories_by_symbol` no marca `files-field` (su sujeto no es un archivo).
+8. **Números:** n/a.
