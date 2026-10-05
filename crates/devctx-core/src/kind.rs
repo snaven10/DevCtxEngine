@@ -230,6 +230,26 @@ impl KindPenalty {
         Some(((1.0 - f) * Self::POSITIONS).round() as usize)
     }
 
+    /// What is wrong with these factors, in words for whoever wrote the config.
+    /// A factor above `1.0` reads like a boost, and there is none: the penalty
+    /// only ever demotes, so it is treated as `1.0` (fixup G).
+    pub fn warnings(&self) -> Vec<String> {
+        [
+            ("test", self.test),
+            ("doc", self.doc),
+            ("config", self.config),
+        ]
+        .iter()
+        .filter(|(_, f)| *f > 1.0)
+        .map(|(k, f)| {
+            format!(
+                "search.penalty.{k} = {f} is above 1.0: the penalty only demotes, there is no \
+                 boost, so it is treated as 1.0 (no penalty)"
+            )
+        })
+        .collect()
+    }
+
     /// The factor for `kind` (`Code` is always `1.0`).
     pub fn factor(&self, kind: PathKind) -> f32 {
         match kind {

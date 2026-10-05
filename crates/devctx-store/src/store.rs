@@ -535,7 +535,7 @@ impl Store {
         let mut out = Vec::new();
         for r in rows {
             let (point, score) = r?;
-            out.push(SearchResult { point, score });
+            out.push(SearchResult::new(point, score));
         }
         Ok(out)
     }
@@ -751,10 +751,10 @@ impl Store {
             // Scores stay comparable across metrics: cosine distance is
             // `1 - similarity`, negative inner product is `-similarity`, and on
             // unit-normalized vectors both similarities are the same number.
-            out.push(SearchResult {
+            out.push(SearchResult::new(
                 point,
-                score: if ip { -dist } else { 1.0 - dist },
-            });
+                if ip { -dist } else { 1.0 - dist },
+            ));
         }
         Ok(out)
     }

@@ -190,3 +190,27 @@ Ver PLAN-008 §7 (excludes y penalización). El factor es configurable para pode
   sin `target/debug/devctx serve` residuales.
 - **No verificado:** el efecto de la degradación por posiciones en un repo real (TASK-016); el valor `POSITIONS=10`
   es una elección, no una calibración.
+
+### Fixup G (review)
+
+- **Tope de la degradación por `limit`:** `d_eff = min(d, (limit − 1) / 2)` (`devctx_search::demoted_order`,
+  usado por `apply_penalty`). Con limit 3–4 un config que era el primero baja un puesto en vez de quedar fuera
+  (antes caía a la posición 4); `limit/2 + (limit−1)/2 < limit` deja lugar aun con las definiciones que el anclaje
+  antepone; con limit ≥ 10 el tope no actúa; con limit 1–2 no hay degradación. Tests:
+  `a_small_limit_caps_the_demotion_so_the_top_hit_survives_the_cut`, `a_clearly_relevant_config_survives_a_limit_of_three`
+  (ambos fallan sin el tope).
+- **`raw_score`:** el clamp de monotonía y el reranker guardan el score del retriever en `SearchResult.raw_score`
+  (expuesto en JSON solo si difiere, con `kind` y `language`). Test
+  `the_penalty_keeps_the_retriever_score_in_raw_score`. Lo usan la fusión y la selección de grupo (TASK-013 Fixup G).
+- **I-1 acotado:** el corte del pool antes del reranker aplica solo con filtro duro (`opts.filters()`); sin filtro,
+  hybrid vuelve a pasarle al reranker los candidatos de rank bajo.
+- **M-4:** el chequeo de receptor solo aplica si el stem tiene más de un segmento o la extensión es de miembro
+  (`env`, `db`, `log`, `json`, `lock`): `client.go`, `state.go`, `request.go`, `log.go`, `conn.go`, `ctx.go`,
+  `client.sh` son archivos; en `h`/`m`/`fs`/`hs` un stem PascalCase es archivo (`AppDelegate.h`, `Main.hs`).
+  Por esa regla `response.json`/`state.json` siguen siendo accesos (`response.json()`). Test
+  `receiver_named_files_and_pascal_case_headers_are_file_names`.
+- **Nits:** factor > 1.0 → aviso al cargar el config (`KindPenalty::warnings`, test
+  `a_penalty_factor_above_one_is_warned_about`); `/build/` y `/target/` documentados como anclados a la raíz del
+  repositorio git (no del proyecto); `a_marginally_more_relevant_readme…` marcado como guarda de regresión (pasa
+  también con ×0.6; lo que discrimina es el test del config claramente más relevante).
+

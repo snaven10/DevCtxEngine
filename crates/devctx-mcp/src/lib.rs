@@ -255,9 +255,11 @@ struct ReadSymbolReq {
 #[schemars(crate = "rmcp::schemars")]
 struct BuildContextReq {
     /// Build the brief from a different project than the one bound (this call
-    /// only): a registered name or a path inside it. In a group session without
-    /// it, the member that best matches the query is chosen and named — or you
-    /// are asked for `project` when two fit about equally.
+    /// only): a registered name or a path inside it — in a group session, a
+    /// member of the group. In a group session without it, the members whose
+    /// servers are running are compared and the best match answers, named with
+    /// how many members were scored; a close call adds an "ambiguous" warning
+    /// naming the others. Pass it to choose.
     #[serde(default)]
     project: Option<String>,
     /// What context is needed, in natural language.
@@ -468,7 +470,29 @@ pub struct DevctxServer {
     /// does not reopen a store on every call. Capped: a long session that walks
     /// a large workspace would otherwise hold a handle per repository forever.
     hinted: Arc<Mutex<HashMap<std::path::PathBuf, Arc<Backend>>>>,
+    /// `build_context`'s group member choices, per [`pick_cache_key`], for
+    /// [`PICK_CACHE_TTL`]: the same question asked again in a session is not
+    /// worth another fan-out.
+    picks: Arc<Mutex<HashMap<String, (std::time::Instant, state::GroupPick)>>>,
     tool_router: ToolRouter<Self>,
+}
+
+/// How long a group member choice is reused for the same question.
+const PICK_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The cache key of a group member choice: the query lowercased with its
+/// whitespace collapsed, and the kind selection (it changes what is compared).
+fn pick_cache_key(query: &str, sel: &devctx_search::KindSel) -> String {
+    let q = query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    format!(
+        "{q}\u{1f}{}\u{1f}{:?}",
+        sel.kind.as_deref().unwrap_or("").trim().to_lowercase(),
+        sel.include_tests
+    )
 }
 
 /// How many hint-resolved backends to keep open at once.
@@ -507,6 +531,7 @@ impl DevctxServer {
             connect,
             cwd: std::env::current_dir().unwrap_or_default(),
             hinted: Arc::new(Mutex::new(HashMap::new())),
+            picks: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -587,45 +612,66 @@ impl DevctxServer {
 
     /// The backend `build_context` answers from, and the line that names it.
     ///
-    /// A `project` is honoured as in the other tools — except that in a group an
-    /// unresolvable one is an error, not a quiet fall back to the default
-    /// member. Without `project`, a group session compares its members and
-    /// picks the best match (or asks for `project`); there is no default.
+    /// Outside a group this is `backend_for` (a `project` hint names the
+    /// project it resolved to; no hint, no line). In a group a `project` must
+    /// be a registered *member* — an unresolvable one or a project of another
+    /// group is an error, never a quiet fall back to the default member.
+    /// Without `project` the members whose servers are running are compared
+    /// and the best match answers, named, with how many were scored; see
+    /// [`state::pick_group_member`]. The choice is cached per (query, kind,
+    /// include_tests) for [`PICK_CACHE_TTL`].
     async fn context_backend(
         &self,
         project: Option<&str>,
         query: &str,
         sel: &devctx_search::KindSel,
     ) -> Result<(Arc<Backend>, Option<String>), ErrorData> {
-        let Binding::Group { members, .. } = self.binding() else {
+        let Binding::Group {
+            members,
+            default_name,
+            ..
+        } = self.binding()
+        else {
             let (b, resolved) = self.backend_for(project)?;
             return Ok((b, resolved));
         };
-        if let Some(p) = project {
-            if state::resolve_hint(p).is_none() {
-                let names: Vec<_> = members.iter().map(|m| m.name.as_str()).collect();
-                return Err(ErrorData::invalid_request(
-                    format!(
-                        "`project` {p:?} is not a registered project. Members of this group: {}",
-                        names.join(", ")
-                    ),
-                    None,
-                ));
-            }
-            let (b, resolved) = self.backend_for(Some(p))?;
-            return Ok((b, resolved));
+        if let Some(name) = state::group_context_target(project, &members, state::resolve_hint)
+            .map_err(|e| ErrorData::invalid_request(e, None))?
+        {
+            let (b, _) = self.backend_for(Some(&name))?;
+            return Ok((b, Some(name)));
         }
-        let (q, s) = (query.to_string(), sel.clone());
-        let (name, compared) =
-            tokio::task::spawn_blocking(move || state::pick_group_member(&members, &q, &s))
+        let key = pick_cache_key(query, sel);
+        let cached = self.picks.lock().ok().and_then(|c| {
+            c.get(&key)
+                .filter(|(at, _)| at.elapsed() < PICK_CACHE_TTL)
+                .map(|(_, p)| p.clone())
+        });
+        let (pick, from_cache) = match cached {
+            Some(p) => (p, true),
+            None => {
+                let (q, s, d) = (query.to_string(), sel.clone(), default_name.clone());
+                let p = tokio::task::spawn_blocking(move || {
+                    state::pick_group_member(&members, &q, &s, Some(&d))
+                })
                 .await
                 .map_err(|e| ErrorData::internal_error(format!("task failed: {e}"), None))?
                 .map_err(|e| ErrorData::invalid_request(e, None))?;
-        let (b, _) = self.backend_for(Some(&name))?;
-        Ok((
-            b,
-            Some(format!("{name} (best match among {compared} members)")),
-        ))
+                (p, false)
+            }
+        };
+        if !from_cache && pick.by_relevance {
+            if let Ok(mut c) = self.picks.lock() {
+                c.retain(|_, (at, _)| at.elapsed() < PICK_CACHE_TTL);
+                c.insert(key, (std::time::Instant::now(), pick.clone()));
+            }
+        }
+        let (b, _) = self.backend_for(Some(&pick.member))?;
+        let mut header = pick.header();
+        if from_cache {
+            header = header.replacen(" (", " (cached choice; ", 1);
+        }
+        Ok((b, Some(header)))
     }
 
     /// The plans root to answer `plan_status` from in this process, when the binding is a

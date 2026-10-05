@@ -69,7 +69,7 @@ medirlo y reportarlo.
 3. **Causa raíz:** confirmada. Además: `do_recall_scoped` y `do_search` presupuestaban por su cuenta (marca "truncated" por ítem) antes de que `build_context` viera los datos; ahora `build_context` toma los datos sin presupuestar (`recall_fused`, `search_items`) y reparte su propio `max_tokens`.
 4. **Archivos:** `devctx-mcp/src/{state,lib,backend}.rs`, `devctx-api/src/lib.rs`, `devctx-cli/src/{remote,main}.rs`. Nuevos/cambiados: `do_build_context(state, query, max_tokens, include_memories, &KindSel)`, `Backend::build_context(.., &KindSel)`, `RemoteClient::build_context(.., &KindSel)`, privados `recall_fused`, `search_items`, `group_targets`, `fan_out_search` (extraídos de `do_recall_scoped`/`do_search`/`do_search_group`, sin duplicar), `compose_context`, `memory_brief`, `trim_leading_doc`, `cap_lines`, `member_score`, `choose_member`, pub `pick_group_member(members, query, &KindSel) -> Result<(String, usize), String>`; `DevctxServer::context_backend`.
 5. **Tests** (`cargo test -p devctx-mcp --lib -- build_context group_pick`, 6/6 ok): `build_context_skips_a_chunk_that_does_not_fit_and_keeps_going` (en el padre el `break` perdía los chunks siguientes), `build_context_trims_a_long_leading_doc_before_the_body`, `build_context_memories_keep_to_a_share_and_never_stamp_truncation`, `group_pick_chooses_the_member_that_matches`, `group_pick_refuses_a_close_call_and_names_candidates`. En el padre las funciones no existen (no compilan); la conducta que fijan es la descrita en el punto 2. Gate completo: fmt, clippy (también `--features gpu`) y `cargo test --workspace`.
-6. **Contrato:** `build_context` (MCP) acepta `project`, `kind`, `include_tests`; `POST /context` acepta `kind`, `include_tests`. Salida prosa: primera línea `[devctx] context from <repo>` (con `(best match among N members)` si eligió por score); cierre `[devctx] omitted: N item(s), reason: budget (T tokens)...` (una sola vez); `[devctx] branch_fallback: ...` se mantiene. Memorias: `[memory] <id> — <título>` + primeras líneas (6 líneas / 500 chars), sin marca de truncado por ítem.
+6. **Contrato:** `build_context` (MCP) acepta `project`, `kind`, `include_tests`; `POST /context` acepta `kind`, `include_tests`. Salida prosa: primera línea `[devctx] context from <repo>` **solo en sesión de grupo o cuando la llamada trae `project`** (en un proyecto bindeado sin `project` no hay línea; corregido en Fixup G); en grupo sin `project`, `<repo> (best match S; k of M members scored[; failed: …][; not scored: …])` y, si fue reñido, una segunda línea `[devctx] ambiguous: also …`; cierre `[devctx] omitted: N item(s), reason: budget (T tokens)...` (una sola vez); `[devctx] branch_fallback: ...` se mantiene. Memorias: `[memory] <id> — <título>` + primeras líneas (6 líneas / 500 chars), sin marca de truncado por ítem.
 7. **No verificado:** consulta de campo en revfa (TASK-016); el margen de selección `PICK_MARGIN=0.03` sobre media top-3 de coseno es heurístico, sin calibrar en campo; no hay test de integración end-to-end del grupo (la selección se prueba sobre `choose_member`/`member_score`, la fan-out reusa `search_one` ya cubierto).
 8. **Parámetros/números:** búsqueda `hybrid` limit 30, rerank off; memorias ≤35% del presupuesto; un chunk ≤ max(presupuesto/3, 600 chars); doc inicial >6 líneas se deja en 3 + "N doc lines trimmed"; selección: top-3 por miembro (vector), margen 0.03. Costo de selección: N búsquedas (una por miembro, lotes de 4) más la de contexto; igual que `search` en grupo; no medido en tiempo.
 
@@ -80,3 +80,74 @@ medirlo y reportarlo.
   top-3) deja de castigar ×0.6 al miembro cuyo mejor hit es un doc/test/config; y el pool del reranker se corta a
   `max(pool, 2×limit)` también con filtro duro (TASK-011 Fixup F, I-1). Los tests de `build_context`/`group_pick`
   pasan sin cambios.
+
+### Fixup G (review)
+
+Contrato corregido (punto 6): la línea `[devctx] context from <repo>` aparece solo en grupo o con `project`.
+
+- **1 — default silencioso por otra vía:** `choose_member(outcomes, default)` (`devctx-mcp/src/state.rs`) chequea
+  `best ≤ 0` antes que cualquier caso de un solo miembro y cuenta TODOS los miembros: la etiqueta dice
+  `k of M members scored; failed: X (motivo); not scored: Y (no running server | different model … | checkout
+  missing)`, también en los errores. Ya no hay `r.ok()` ni `_skipped`/`_missing` descartados. Tests:
+  `group_pick_accounts_for_every_member_and_never_picks_a_zero` (en el padre `[(only,_)]` devolvía el único con
+  score 0 y "among 1"), `pick_group_member_scores_only_warm_members_and_names_the_rest` (e2e con servidores HTTP
+  falsos: uno OK, uno débil, uno que responde 500, uno colgado, uno frío, uno de otro modelo).
+- **2 — escalas:** (a) la selección pide `/search` con `rerank:false` (nunca logits, sin CPU del cross-encoder);
+  (b) `ProjectRow.embed_model` (del registro) y `group_targets` excluye miembros de otro modelo aunque tengan la
+  misma dimensión (`minilm-l6` y `ml-granite` son 384) → "not scored: different model". Test
+  `group_targets_exclude_another_model_of_the_same_width`; (c) decidido y documentado en `group_targets`: misma
+  dimensión + mismo modelo ⇒ cosenos del retriever comparables; logits, scores clampados, BM25 y RRF no. Borrado el
+  doc que afirmaba lo contrario sobre `FANOUT_CONCURRENCY`.
+- **Coordinador (raw_score y penalización entre miembros):** `SearchResult.raw_score: Option<f32>`
+  (`devctx-core/src/types.rs`; `rewrite_score`/`retriever_score`) guarda el score del retriever cuando la
+  penalización lo clampa o el reranker lo reemplaza; los hits JSON lo exponen (`raw_score`, solo si difiere) junto
+  con `kind` y `language`; `devctx_core::hit_raw_score` lo lee. `do_search_group` (fusión por score o RRF) reordena
+  cada miembro por `raw_score`, fusiona y aplica la penalización UNA vez sobre la lista fusionada
+  (`fuse_member_hits` + `devctx_search::demoted_order`; penalty del config del primer miembro). `member_scores`
+  devuelve `(code, all)`: media top-3 de `raw_score` sobre hits no penalizados, y sobre todos; decide `code`
+  salvo que ningún miembro tenga código que matchee (pregunta de docs o `kind` explícito). Se piden 10 hits por
+  miembro (`PICK_FETCH`). Tests: `member_scores_count_code_on_the_raw_score` (docs-site 0.82 vs api 0.75 → api),
+  `group_fusion_demotes_once_over_the_merged_list`.
+- **3 — costo:** la selección solo puntúa miembros con servidor YA vivo: lee su `serve.json` (al lado de la DB,
+  según su config), `/health` con 0.8 s y `/search` por HTTP directo; nunca lanza procesos ni servers. Frío → "not
+  scored (no running server)"; `/health` sin respuesta → failed. **Decisión:** si nadie pudo puntuarse y nada
+  falló (todos fríos/otro modelo/ausentes), responde el miembro default del grupo con la etiqueta "the group's
+  default member" y aviso `not chosen by relevance … pass project`; si hubo fallos, error con la lista. Caché por
+  sesión (`DevctxServer.picks`) con clave query normalizada (minúsculas, espacios colapsados) + `kind` +
+  `include_tests`, TTL 10 min, solo elecciones por relevancia; la etiqueta dice `cached choice`. Identificadores
+  (`identifier_tokens`, 2 primeros): `/symbol/<id>?limit=1` en cada miembro puntuado; quien lo define suma
+  `PICK_MARGIN` (rompe empates, no da vuelta una ventaja clara; la etiqueta dice ``defines `X` ``). Tests:
+  `pick_group_member_with_every_member_cold_uses_the_default` (sin `serve.json` nuevo, < 2 s),
+  `group_pick_falls_back_to_the_default_only_when_nothing_failed`,
+  `group_pick_prefers_the_member_that_defines_the_symbol_on_a_tie`.
+- **4 — usabilidad:** margen < `PICK_MARGIN` → responde igual desde el mejor con `[devctx] ambiguous: also X
+  (0.49), Y (0.48) — within 0.03 of … pass project`; error solo si nada matcheó o nadie respondió. Test
+  `group_pick_answers_a_close_call_with_a_warning`. Calibración del margen: TASK-016.
+- **5:** `compose_context` agrega los `files` de una memoria a `memory_files` solo si la memoria entró. Test
+  `a_memory_that_did_not_fit_does_not_hide_its_files_code` (falla en el padre).
+- **6:** `memory_brief` corta por `char_indices` una primera línea > 500 chars. Test
+  `a_memory_with_a_giant_first_line_keeps_its_start` (en el padre cuerpo vacío + "…").
+- **7:** `cap_lines` corta por chars una línea única > cap (`… (line cut at N of M chars; K more lines)`). Test
+  `a_single_giant_line_is_cut_by_chars`.
+- **8/9:** se borró `is_doc_line`. `trim_leading_doc(text, CommentStyle)` solo recorta hits `kind: code` y solo un
+  bloque que empieza el chunk y es comentario en su lenguaje: `/* … */` (conserva el `*/`, marcador ` * …` dentro
+  del comentario), `//`/`///`/`//!` (marcador con el mismo prefijo), `#` solo en lenguajes de `#`, `--` en SQL/Lua/
+  Haskell; nunca `#if`/`#pragma`/`#import`/`#[attr]`, ni `*p = …`; docstrings de Python se dejan enteros. El
+  marcador de `cap_lines` usa el comentario del lenguaje (`//`, `#`, `--`, o ninguno en Markdown/JSON). Tests:
+  `a_trimmed_doc_stays_well_formed_in_its_language`, `markdown_lists_and_headings_are_not_trimmed`.
+- **10:** `search_items(.., build_fts)`: `build_context` no construye el índice BM25 si falta (hybrid degrada a
+  vector + anclaje); `search` sí, como antes.
+- **11:** en grupo, `group_context_target` rechaza un `project` que no resuelve o que resuelve a un proyecto que no
+  es miembro (antes `resolve_hint` aceptaba cualquiera registrado). Test
+  `group_context_target_rejects_unknown_and_foreign_projects`. `context_backend` delega en esa función pura.
+- Nit: `is_anchored_definition` (extraído de `search_items`) y test
+  `anchored_marks_only_the_identifiers_anchoring_looked_up` (el 4.º identificador no se marca).
+- Algoritmo final de selección (grupo sin `project`): targets = presentes con mismo modelo+dimensión que la
+  mayoría → por cada uno, en lotes de 4: `serve.json` + `/health` (0.8 s) → `/search` vector, sin rerank, 10
+  hits, `kind`/`include_tests` → `(code, all)` sobre `raw_score` → +`PICK_MARGIN` si define un identificador de la
+  query → mejor efectivo; `≤ 0` error; margen < 0.03 aviso; sin puntuados: default (si nada falló) o error.
+- Gate: `cargo fmt --check`; `clippy --workspace --all-targets` con y sin `--features gpu`, 0 warnings;
+  `TMPDIR=/var/tmp DEVCTX_MODEL_CACHE=/var/tmp/devctx-test-model-cache cargo test --workspace` verde (694 tests,
+  sin flakes); sin `target/debug/devctx serve` residuales.
+- **No verificado:** latencia real en revfa (13 miembros) y el margen 0.03 sobre `code` (TASK-016); el caso
+  "serve vivo pero modelo descargado de memoria" (la primera `/search` recarga el modelo, hasta 20 s de timeout).

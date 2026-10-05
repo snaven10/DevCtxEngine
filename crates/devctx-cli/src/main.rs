@@ -3831,12 +3831,18 @@ fn short_commit(commit: &str) -> &str {
 #[derive(Serialize)]
 struct SearchHitOut<'a> {
     score: f32,
+    /// The retriever's score when `score` was rewritten (penalty, rerank).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_score: Option<f32>,
     file: &'a str,
     start_line: i32,
     end_line: i32,
     symbol: &'a str,
     symbol_type: &'a str,
     level: &'a str,
+    language: &'a str,
+    /// `code` / `test` / `doc` / `config`, as the kind penalty judged it.
+    kind: &'static str,
     text: &'a str,
 }
 
@@ -3844,12 +3850,15 @@ fn hit_out(h: &SearchResult) -> SearchHitOut<'_> {
     let m = &h.point.metadata;
     SearchHitOut {
         score: h.score,
+        raw_score: h.raw_score,
         file: &m.file,
         start_line: m.start_line,
         end_line: m.end_line,
         symbol: &m.symbol,
         symbol_type: &m.symbol_type,
         level: &m.chunk_level,
+        language: &m.language,
+        kind: devctx_core::path_kind(&m.file, &m.language).as_str(),
         text: &h.point.text,
     }
 }
@@ -4083,6 +4092,7 @@ mod tests {
     fn hit(file: &str, symbol: &str, score: f32) -> SearchResult {
         SearchResult {
             score,
+            raw_score: None,
             point: VectorPoint {
                 id: "id".into(),
                 vector: vec![],

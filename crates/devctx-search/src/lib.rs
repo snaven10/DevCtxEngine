@@ -166,39 +166,76 @@ const FILTERED_POOL: usize = 400;
 ///
 /// Scores are kept monotone for the caller (anything that reads them as
 /// relevance, e.g. `build_context`'s budget): each hit shows the lower of its
-/// own score and the one above it, so a penalty only ever lowers a score. A
-/// no-op when nothing is penalised.
-fn apply_penalty(hits: Vec<SearchResult>, penalty: &KindPenalty) -> Vec<SearchResult> {
-    let demotions: Vec<Option<usize>> =
-        hits.iter().map(|h| penalty.demotion(hit_kind(h))).collect();
-    if demotions.iter().all(|d| *d == Some(0)) {
-        return hits;
-    }
-    let n = hits.len();
-    // (effective position, penalised?, original position)
-    let mut keyed: Vec<((usize, bool, usize), SearchResult)> = hits
-        .into_iter()
-        .zip(demotions)
-        .enumerate()
-        .map(|(i, (h, d))| {
-            let pos = match d {
-                Some(d) => i.saturating_add(d),
-                None => n.saturating_add(i),
-            };
-            ((pos, d != Some(0), i), h)
-        })
-        .collect();
-    keyed.sort_by_key(|(k, _)| *k);
-    let mut out: Vec<SearchResult> = Vec::with_capacity(n);
-    for (_, mut h) in keyed {
+/// own score and the one above it, so a penalty only ever lowers a score. The
+/// score it had before is kept in `raw_score` (fixup G): a group's fan-out
+/// compares members on the retriever's score, and a clamped one belongs to
+/// whichever hit happened to sit above it. A no-op when nothing is penalised.
+///
+/// The drop is capped at `(limit - 1) / 2` (fixup G, see [`demoted_order`]).
+fn apply_penalty(
+    hits: Vec<SearchResult>,
+    penalty: &KindPenalty,
+    limit: usize,
+) -> Vec<SearchResult> {
+    let kinds: Vec<PathKind> = hits.iter().map(hit_kind).collect();
+    let order = demoted_order(&kinds, penalty, limit);
+    let mut slots: Vec<Option<SearchResult>> = hits.into_iter().map(Some).collect();
+    let mut out: Vec<SearchResult> = Vec::with_capacity(slots.len());
+    for i in order {
+        let Some(mut h) = slots[i].take() else {
+            continue;
+        };
         if let Some(prev) = out.last() {
             if h.score > prev.score {
-                h.score = prev.score;
+                let clamped = prev.score;
+                h.rewrite_score(clamped);
             }
         }
         out.push(h);
     }
     out
+}
+
+/// The order the kind penalty puts a ranked list in: indexes into `kinds`
+/// (which is in rank order), best first. Shared by [`apply_penalty`] and the
+/// group fan-out, which demotes once over the merged list of every member
+/// (fixup G): demoting inside each member is relative to that member's list,
+/// so a member made only of docs came back with its cosines untouched and
+/// outranked the code of every other member.
+///
+/// A hit at 0-based position `i` whose kind demotes by `d`
+/// ([`KindPenalty::demotion`]) is re-ranked at `i + min(d, (limit - 1) / 2)`;
+/// ties go to the unpenalised hit, then to the original order; a kind demoted
+/// by `None` (factor `0.0`) goes after everything else.
+///
+/// Why the cap (fixup G): `limit` is the cut that follows. With a small one a
+/// fixed drop is an exclusion — the 0.6 factor drops 4 places, and the top hit
+/// of a 3-result search, if it is a config file, landed at position 4 and was
+/// cut. Capped at `(limit - 1) / 2` it keeps a place inside the page even
+/// after hybrid anchoring prepends its up-to-`limit / 2` pinned definitions
+/// (`limit / 2 + (limit - 1) / 2 < limit` for every `limit ≥ 2`). With the
+/// usual limits (10+) the cap does not bind. With `limit` 1 or 2 there is no
+/// demotion at all: the page has no room for one that does not exclude.
+pub fn demoted_order(kinds: &[PathKind], penalty: &KindPenalty, limit: usize) -> Vec<usize> {
+    let cap = limit.saturating_sub(1) / 2;
+    let demotions: Vec<Option<usize>> = kinds
+        .iter()
+        .map(|k| penalty.demotion(*k).map(|d| d.min(cap)))
+        .collect();
+    let n = kinds.len();
+    let mut keyed: Vec<(usize, bool, usize)> = demotions
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let pos = match d {
+                Some(d) => i.saturating_add(*d),
+                None => n.saturating_add(i),
+            };
+            (pos, *d != Some(0), i)
+        })
+        .collect();
+    keyed.sort();
+    keyed.into_iter().map(|(_, _, i)| i).collect()
 }
 
 /// Run a search in the requested mode, with the default kind penalty and no
@@ -285,16 +322,26 @@ pub fn search_ranked(
     if opts.filters() {
         candidates.retain(|h| opts.keeps(hit_kind(h)));
     }
-    let mut candidates = dedup_hits(apply_penalty(candidates, &opts.penalty));
+    let mut candidates = dedup_hits(apply_penalty(candidates, &opts.penalty, limit));
     let ranked = match reranker {
         Some(r) => {
             // A cross-encoder costs per candidate. A hard filter widens the
             // fetch to `FILTERED_POOL` per retriever and hybrid fusion can
             // double that, so without this cut the reranker scored 400–800
-            // pairs — tens of seconds — where it asked for `r.pool()`.
-            candidates.truncate(r.pool().max(limit.saturating_mul(2)));
+            // pairs — tens of seconds — where it asked for `r.pool()`. Only
+            // then (fixup G): without a filter the pool already is what the
+            // reranker asked for, and hybrid fusion's extra candidates are the
+            // low-rank ones the reranker is there to rescue (the answer to a
+            // behaviour question sits at rank 27–52, see above).
+            if opts.filters() {
+                candidates.truncate(r.pool().max(limit.saturating_mul(2)));
+            }
             let all = candidates.len();
-            let mut r = apply_penalty(finalize(candidates, query, all, reranker)?, &opts.penalty);
+            let mut r = apply_penalty(
+                finalize(candidates, query, all, reranker)?,
+                &opts.penalty,
+                limit,
+            );
             r.truncate(limit);
             r
         }
@@ -453,6 +500,16 @@ const AMBIGUOUS_EXTENSIONS: &[&str] = &[
     "ini",
 ];
 
+/// Extensions that are everyday *member* names (`process.env`, `this.db`,
+/// `logger.log`, `res.json`, `mutex.lock`): only for these does a known
+/// receiver in front of a one-segment stem make the token an access.
+const MEMBER_EXTENSIONS: &[&str] = &["env", "db", "log", "json", "lock"];
+
+/// Extensions whose files are conventionally PascalCase (`AppDelegate.h`,
+/// `ViewController.m`, `Program.fs`, `Main.hs`): a capital there is a file
+/// name, not a qualified identifier.
+const PASCAL_FILE_EXTENSIONS: &[&str] = &["h", "m", "fs", "hs"];
+
 /// Receivers that make `x.member` an access, whatever `member` is.
 const RECEIVERS: &[&str] = &[
     "this", "self", "super", "cls", "process", "console", "logger", "log", "window", "document",
@@ -472,12 +529,29 @@ const RECEIVERS: &[&str] = &[
 /// the common cases and everything else stays a file name: an identifier left
 /// unanchored is a missed boost, a file name looked up as a symbol costs a
 /// query and pins nothing.
+///
+/// The receiver check only applies when the stem has more than one segment
+/// (`this.state.db`) or the extension is a [`MEMBER_EXTENSIONS`] one
+/// (`process.env`): `client.go`, `state.go`, `log.go`, `client.sh` are file
+/// names (fixup G). For [`PASCAL_FILE_EXTENSIONS`] a PascalCase stem is a file.
 fn looks_like_file_stem(parts: &[&str]) -> bool {
-    let Some((_, stem)) = parts.split_last() else {
+    let Some((ext, stem)) = parts.split_last() else {
         return false;
     };
-    if stem.is_empty() || stem.first().is_some_and(|f| RECEIVERS.contains(f)) {
+    if stem.is_empty() {
         return false;
+    }
+    let ext = ext.to_ascii_lowercase();
+    let receiver_applies = stem.len() > 1 || MEMBER_EXTENSIONS.contains(&ext.as_str());
+    if receiver_applies && stem.first().is_some_and(|f| RECEIVERS.contains(f)) {
+        return false;
+    }
+    let pascal = |p: &str| {
+        p.chars().next().is_some_and(char::is_uppercase)
+            && p.chars().all(|c| c.is_alphanumeric() || c == '_')
+    };
+    if PASCAL_FILE_EXTENSIONS.contains(&ext.as_str()) && stem.len() == 1 && pascal(stem[0]) {
+        return true;
     }
     let all_lower = stem.iter().all(|p| !p.chars().any(char::is_uppercase));
     let all_upper = stem.iter().all(|p| {
@@ -621,7 +695,7 @@ fn anchor_identifiers(
         .max(0.0);
     let mut out: Vec<SearchResult> = pinned
         .into_iter()
-        .map(|point| SearchResult { point, score: top })
+        .map(|point| SearchResult::new(point, top))
         .collect();
     out.extend(ranked);
     let mut out = dedup_hits(out);
@@ -717,8 +791,10 @@ fn finalize(
             Ok(r.rerank(query, &texts, limit)?
                 .into_iter()
                 .map(|ranked| {
+                    // The retriever's score survives in `raw_score`: a logit
+                    // is not comparable across stores, a cosine is.
                     let mut hit = candidates[ranked.index].clone();
-                    hit.score = ranked.score;
+                    hit.rewrite_score(ranked.score);
                     hit
                 })
                 .collect())
@@ -771,6 +847,7 @@ mod tests {
     fn hit(id: &str, score: f32) -> SearchResult {
         SearchResult {
             score,
+            raw_score: None,
             point: VectorPoint {
                 id: id.into(),
                 vector: vec![],
@@ -1034,6 +1111,7 @@ mod tests {
     fn dedup_prefers_the_higher_ranked_of_container_and_contained() {
         let mk = |id: &str, r: (i32, i32)| SearchResult {
             score: 1.0,
+            raw_score: None,
             point: code(id, "main", "b.rs", r, id, id, [0.0; DIM]),
         };
         let small_first = dedup_hits(vec![mk("small", (10, 20)), mk("big", (1, 50))]);
@@ -1409,6 +1487,7 @@ mod tests {
     fn a_summary_chunk_never_swallows_the_code_inside_it() {
         let hit = |p: VectorPoint| SearchResult {
             score: 1.0,
+            raw_score: None,
             point: p,
         };
         let z = [0.0; DIM];
@@ -1854,7 +1933,9 @@ mod tests {
     }
 
     /// I-3, the other side: a README that edges out comparable code by a hair
-    /// still ranks below it.
+    /// still ranks below it. A regression guard, not a test of the change: the
+    /// old `score × 0.6` passed it too (0.48 < 0.79). What tells the two apart
+    /// is the clearly-more-relevant config above.
     #[test]
     fn a_marginally_more_relevant_readme_ranks_below_comparable_code() {
         let store = Store::open_in_memory(DIM).unwrap();
@@ -1890,6 +1971,7 @@ mod tests {
     fn the_penalty_keeps_scores_monotone_and_never_raises_one() {
         let mk = |id: &str, file: &str, score: f32| SearchResult {
             score,
+            raw_score: None,
             point: code(id, "main", file, (1, 9), "", id, [0.0; DIM]),
         };
         let input = vec![
@@ -1897,7 +1979,7 @@ mod tests {
             mk("a", "src/a.rs", 0.8),
             mk("b", "src/b.rs", 0.7),
         ];
-        let out = apply_penalty(input, &KindPenalty::default());
+        let out = apply_penalty(input, &KindPenalty::default(), 100);
         assert_eq!(ids(&out), ["a", "b", "doc"]);
         let scores: Vec<f32> = out.iter().map(|h| h.score).collect();
         assert_eq!(scores, [0.8, 0.7, 0.7]);
@@ -1911,13 +1993,67 @@ mod tests {
             .chain((0..20).map(|i| mk(&format!("c{i}"), &format!("src/{i}.rs"), 0.5)))
             .collect();
         assert_eq!(
-            ids(&apply_penalty(many.clone(), &bury)).last().unwrap(),
+            ids(&apply_penalty(many.clone(), &bury, 100))
+                .last()
+                .unwrap(),
             "doc"
         );
         assert_eq!(
-            ids(&apply_penalty(many.clone(), &KindPenalty::NONE)),
+            ids(&apply_penalty(many.clone(), &KindPenalty::NONE, 100)),
             ids(&many)
         );
+    }
+
+    /// Fixup G (a): the clamp that keeps scores monotone remembers the score
+    /// it replaced, so a cross-store comparison can still read the cosine.
+    #[test]
+    fn the_penalty_keeps_the_retriever_score_in_raw_score() {
+        let mk = |id: &str, file: &str, score: f32| {
+            SearchResult::new(code(id, "main", file, (1, 9), "", id, [0.0; DIM]), score)
+        };
+        let out = apply_penalty(
+            vec![
+                mk("doc", "README.md", 0.9),
+                mk("a", "src/a.rs", 0.8),
+                mk("b", "src/b.rs", 0.7),
+            ],
+            &KindPenalty::default(),
+            100,
+        );
+        let doc = out.iter().find(|h| h.point.id == "doc").unwrap();
+        assert_eq!(doc.score, 0.7);
+        assert_eq!(doc.raw_score, Some(0.9));
+        assert_eq!(doc.retriever_score(), 0.9);
+        // Untouched hits carry no raw score: `score` already is it.
+        assert!(out
+            .iter()
+            .filter(|h| h.point.id != "doc")
+            .all(|h| h.raw_score.is_none()));
+    }
+
+    /// Fixup G (b): with a small `limit` the demotion is capped at `limit / 2`,
+    /// so a penalised hit that ranked first is lowered but not cut.
+    #[test]
+    fn a_small_limit_caps_the_demotion_so_the_top_hit_survives_the_cut() {
+        let mk = |id: &str, file: &str, score: f32| {
+            SearchResult::new(code(id, "main", file, (1, 9), "", id, [0.0; DIM]), score)
+        };
+        let input: Vec<SearchResult> = std::iter::once(mk("cfg", "config.yaml", 0.95))
+            .chain((0..8).map(|i| mk(&format!("c{i}"), &format!("src/{i}.rs"), 0.5)))
+            .collect();
+        for limit in [3usize, 4, 5] {
+            let mut out = apply_penalty(input.clone(), &KindPenalty::default(), limit);
+            out.truncate(limit);
+            assert!(
+                ids(&out).contains(&"cfg".to_string()),
+                "limit {limit}: {:?}",
+                ids(&out)
+            );
+            assert_ne!(ids(&out)[0], "cfg", "still demoted at limit {limit}");
+        }
+        // With a usual limit the full drop applies (4 places for 0.6).
+        let out = apply_penalty(input, &KindPenalty::default(), 10);
+        assert_eq!(ids(&out)[4], "cfg");
     }
 
     /// M-4: a qualified name whose last segment is also an extension is an
@@ -1947,6 +2083,82 @@ mod tests {
         ] {
             assert!(identifier_tokens(q).is_empty(), "{q} is a file name");
         }
+    }
+
+    /// Fixup G (M-4): common file names whose stem is also a receiver, and
+    /// PascalCase files of the languages that name files that way, are not
+    /// identifiers; a receiver still makes a member access of a member-like
+    /// extension or a multi-segment stem.
+    #[test]
+    fn receiver_named_files_and_pascal_case_headers_are_file_names() {
+        for q in [
+            "client.go",
+            "state.go",
+            "request.go",
+            "log.go",
+            "conn.go",
+            "ctx.go",
+            "client.sh",
+            "AppDelegate.h",
+            "ViewController.m",
+            "Program.fs",
+            "Main.hs",
+        ] {
+            assert!(identifier_tokens(q).is_empty(), "{q} is a file name");
+        }
+        // A member-like extension or a longer stem keeps the receiver rule.
+        // (`response.json` stays an access by that rule: `response.json()` is
+        // the everyday call in Python requests and fetch.)
+        for q in [
+            "process.env",
+            "logger.log",
+            "mutex.lock",
+            "this.state.go",
+            "response.json",
+        ] {
+            assert_eq!(identifier_tokens(q), [q], "{q}");
+        }
+    }
+
+    /// Fixup G (2): a config file that is clearly the answer stays inside a
+    /// 3-result page, end to end (store → penalty → cut).
+    #[test]
+    fn a_clearly_relevant_config_survives_a_limit_of_three() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mut pts = vec![code(
+            "cfg",
+            "main",
+            "config/pool.yaml",
+            (1, 9),
+            "",
+            "database pool settings",
+            at_cos(0.85),
+        )];
+        for (i, c) in [0.75, 0.72, 0.70, 0.68, 0.65].iter().enumerate() {
+            pts.push(code(
+                &format!("c{i}"),
+                "main",
+                &format!("src/m{i}.rs"),
+                (1, 9),
+                "f",
+                "database",
+                at_cos(*c),
+            ));
+        }
+        store.upsert(&pts).unwrap();
+        let hits = ids(&search_ranked(
+            &store,
+            "database",
+            &SearchFilter::default(),
+            3,
+            SearchMode::Vector,
+            Some(&KwEmbedder),
+            None,
+            &RankOptions::default(),
+        )
+        .unwrap());
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[1], "cfg", "demoted one place, not cut: {hits:?}");
     }
 
     /// Only the first `ANCHOR_TOKENS` identifiers are looked up; the `anchored`

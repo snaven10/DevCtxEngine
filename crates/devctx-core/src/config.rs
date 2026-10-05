@@ -180,8 +180,10 @@ pub struct Storage {
 /// They are applied *before* the user's `exclude`, which can therefore
 /// re-include with a `!` rule (`!vendor/`, `!/target/`).
 ///
-/// `build/` and `target/` are anchored to the repository root (`/build/`,
-/// `/target/`; PLAN-008 Q-3): nested, both are ordinary names for source —
+/// `build/` and `target/` are anchored to the root of the *git repository*
+/// (`/build/`, `/target/`; PLAN-008 Q-3) — not to the DevCtxEngine project,
+/// which may be a subdirectory of it: the patterns are matched against
+/// repo-relative paths. Nested, both are ordinary names for source —
 /// `src/x/build/Builder.java`, a Java package `com.acme.target` — while the
 /// output of Cargo, Gradle or a root `npm run build` lands at the root. A
 /// multi-module build that tracks per-module output adds `target/` (any depth)
@@ -472,7 +474,11 @@ impl ProjectConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw =
             std::fs::read_to_string(path).map_err(|e| Error::ConfigRead(path.to_path_buf(), e))?;
-        Self::from_yaml(&raw).map_err(|e| Error::ConfigParse(path.to_path_buf(), e))
+        let cfg = Self::from_yaml(&raw).map_err(|e| Error::ConfigParse(path.to_path_buf(), e))?;
+        for w in cfg.search.penalty.warnings() {
+            eprintln!("warning: {}: {w}", path.display());
+        }
+        Ok(cfg)
     }
 
     /// Discover the config by walking up from `start_dir`, then load it.
@@ -680,6 +686,18 @@ mod tests {
 
         let cfg = ProjectConfig::from_yaml("indexing:\n  default_excludes: false\n").unwrap();
         assert!(cfg.indexing.effective_excludes().is_empty());
+    }
+
+    #[test]
+    fn a_penalty_factor_above_one_is_warned_about() {
+        let cfg = ProjectConfig::from_yaml("search:\n  penalty:\n    doc: 1.5\n").unwrap();
+        let w = cfg.search.penalty.warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("search.penalty.doc") && w[0].contains("no"),
+            "{w:?}"
+        );
+        assert!(crate::kind::KindPenalty::default().warnings().is_empty());
     }
 
     #[test]

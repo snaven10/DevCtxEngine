@@ -545,7 +545,7 @@ pub fn do_search(
     rerank: bool,
     sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
-    let (items, fallback) = search_items(state, query, limit, language, mode, rerank, sel)?;
+    let (items, fallback) = search_items(state, query, limit, language, mode, rerank, sel, true)?;
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
@@ -569,6 +569,13 @@ pub fn do_search(
 /// The ranked rows of a search, as JSON, before any output budget touches
 /// them, and the branch fallback when the answer came from another branch.
 /// `do_search` fits them to the tool's budget; `build_context` to its own.
+///
+/// `build_fts`: build the BM25 index when it is missing. `search` does (the
+/// user asked for keyword or hybrid); `build_context` does not — building it
+/// takes as long as the corpus is big, and a brief must not pay that on its
+/// first call. There hybrid without the index degrades to vector search plus
+/// identifier anchoring (`search_ranked` treats a failed keyword leg as empty).
+#[allow(clippy::too_many_arguments)]
 fn search_items(
     state: &AppState,
     query: &str,
@@ -577,6 +584,7 @@ fn search_items(
     mode: SearchMode,
     rerank: bool,
     sel: &devctx_search::KindSel,
+    build_fts: bool,
 ) -> Result<(Vec<Value>, Option<BranchFallback>), String> {
     let opts = sel.options(state.cfg.search.penalty)?;
     let store = state.open_store()?;
@@ -589,7 +597,7 @@ fn search_items(
     // Keyword search needs the BM25 index, which is opt-in and therefore usually
     // absent. Building it here — the user has just asked for the feature — turns
     // a raw `match_bm25 does not exist` catalog error into a one-off wait.
-    if mode != SearchMode::Vector && !store.has_fts() {
+    if build_fts && mode != SearchMode::Vector && !store.has_fts() {
         match store.rebuild_fts() {
             Ok(true) => eprintln!("· built the keyword (BM25) index for this project"),
             Ok(false) if mode == SearchMode::Keyword => {
@@ -641,19 +649,24 @@ fn search_items(
     if mode != SearchMode::Vector {
         let idents = devctx_search::anchor_tokens(query);
         for (item, hit) in items.iter_mut().zip(&hits) {
-            let m = &hit.point.metadata;
-            let is_def = !matches!(m.chunk_level.as_str(), "memory" | "memory_chunk")
-                && idents.iter().any(|t| {
-                    m.symbol == *t
-                        || m.symbol.ends_with(&format!(".{t}"))
-                        || m.symbol.ends_with(&format!("::{t}"))
-                });
-            if is_def {
+            if is_anchored_definition(&hit.point.metadata, &idents) {
                 item["anchored"] = json!(true);
             }
         }
     }
     Ok((items, fallback))
+}
+
+/// Whether a hit is the definition of one of the identifiers anchoring looked
+/// up (`idents` must be `devctx_search::anchor_tokens`, the truncated set: a
+/// fourth identifier is never looked up, so it is never "anchored").
+fn is_anchored_definition(m: &devctx_core::VectorMetadata, idents: &[String]) -> bool {
+    !matches!(m.chunk_level.as_str(), "memory" | "memory_chunk")
+        && idents.iter().any(|t| {
+            m.symbol == *t
+                || m.symbol.ends_with(&format!(".{t}"))
+                || m.symbol.ends_with(&format!("::{t}"))
+        })
 }
 
 /// Drop rows for branches the config no longer lists. Returns rows removed.
@@ -2051,6 +2064,11 @@ pub struct ProjectRow {
     /// Embedding width. Compared before fusing rankings across projects:
     /// vectors of different dimension are not comparable.
     pub embed_dim: i64,
+    /// Embedding model name from the registry (`embed_model`). Width alone does
+    /// not make two stores comparable: two different models of the same width
+    /// (`minilm-l6` and `ml-granite` are both 384) put their cosines in
+    /// different spaces. Empty when unknown (older registry rows, hint lookups).
+    pub embed_model: String,
     /// Unix seconds of the last index run, `0` when never indexed. Used only to
     /// pick a group's default member — the most recently indexed repository is
     /// the one most likely being worked on.
@@ -2135,11 +2153,17 @@ pub fn projects_under(base: &std::path::Path) -> Result<Vec<ProjectRow>, String>
                 .unwrap_or(0);
             let group = group_of(&path);
             let embed_dim = r.get("embed_dim").and_then(|v| v.as_i64()).unwrap_or(0);
+            let embed_model = r
+                .get("embed_model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             Some(ProjectRow {
                 name,
                 path,
                 group,
                 embed_dim,
+                embed_model,
                 last_indexed_at,
             })
         })
@@ -2193,6 +2217,7 @@ pub fn resolve_hint(hint: &str) -> Option<ProjectRow> {
             path,
             group: None,
             embed_dim: 0,
+            embed_model: String::new(),
             last_indexed_at: 0,
         });
     }
@@ -2213,6 +2238,7 @@ pub fn resolve_hint(hint: &str) -> Option<ProjectRow> {
                 path,
                 group: None,
                 embed_dim: 0,
+                embed_model: String::new(),
                 last_indexed_at: 0,
             })
         })
@@ -2349,6 +2375,7 @@ pub fn why_unbound(cwd: &std::path::Path, resolution: &Resolution) -> String {
                                 path: PathBuf::from(r.get("path")?.as_str()?),
                                 group: None,
                                 embed_dim: 0,
+                                embed_model: String::new(),
                                 last_indexed_at: 0,
                             })
                         })
@@ -2480,15 +2507,6 @@ fn search_one(
     Ok(devctx_core::search_hits(&v))
 }
 
-/// Search every member of a group and return one fused ranking.
-///
-/// A session bound to a group is attached to the product, so "search" means the
-/// product. Answering from a single member would answer a question nobody asked
-/// — and would do it invisibly, which is worse than answering nothing.
-///
-/// Fused by reciprocal rank rather than by raw score: two stores embed and score
-/// independently, so their scores are not on one scale even when the model is
-/// identical. Rank survives that; magnitude does not.
 /// How many members to search at once.
 ///
 /// Measured, not guessed: a warm project daemon answers in ~300ms and holds
@@ -2499,19 +2517,32 @@ const FANOUT_CONCURRENCY: usize = 4;
 /// The members of a group a fan-out search can compare, and why the others
 /// were left out: `(targets, skipped, reachable, skipped_missing)`.
 ///
-/// Vectors of different width are not comparable, and a ranking fused across
-/// them looks exactly as plausible as a correct one. The registry has carried
-/// `embed_dim` for this comparison all along.
+/// What is comparable across stores (fixup G, the one rule every fan-out
+/// follows): the *retriever's* cosine, from the same embedding model at the
+/// same width. Same model and width put two stores' vectors in one space, so a
+/// cosine of 0.7 means the same in both — that is what `do_search_group`'s
+/// score fusion and the `build_context` member selection rely on. Not
+/// comparable: a different model (even of the same width — `minilm-l6` and
+/// `ml-granite` are both 384), a cross-encoder logit, a score the kind penalty
+/// clamped, BM25 (each corpus has its own IDF) and RRF. The fan-outs read
+/// `raw_score` for the first two cases and fuse by rank for the last two.
+///
+/// So a member is a target when its width *and* model match the group's
+/// majority; an unknown model (an older registry row) only has to match the
+/// width.
 fn group_targets<'a>(
     members: &'a [ProjectRow],
     only: Option<&[String]>,
 ) -> (Vec<&'a ProjectRow>, Vec<Value>, usize, Vec<Value>) {
-    let dims: Vec<i64> = members.iter().map(|m| m.embed_dim).collect();
-    let majority = dims
+    let keys: Vec<(i64, &str)> = members
+        .iter()
+        .map(|m| (m.embed_dim, m.embed_model.as_str()))
+        .collect();
+    let (majority, majority_model) = keys
         .iter()
         .copied()
-        .max_by_key(|d| dims.iter().filter(|x| *x == d).count())
-        .unwrap_or(0);
+        .max_by_key(|k| keys.iter().filter(|x| *x == k).count())
+        .unwrap_or((0, ""));
 
     let (present, skipped_missing) = split_missing(members);
     let reachable = present.len();
@@ -2529,6 +2560,20 @@ fn group_targets<'a>(
                 "reason": format!(
                     "embedding dimension {} does not match the group's {majority}",
                     m.embed_dim
+                ),
+            }));
+            continue;
+        }
+        if !m.embed_model.is_empty()
+            && !majority_model.is_empty()
+            && m.embed_model != majority_model
+        {
+            skipped.push(json!({
+                "project": m.name,
+                "reason": format!(
+                    "different model: embedding model {} does not match the group's \
+                     {majority_model}, so its scores are in another space",
+                    m.embed_model
                 ),
             }));
             continue;
@@ -2630,28 +2675,17 @@ pub fn do_search_group(
     // construction — no document appears in two repositories — so reciprocal
     // rank never accumulates and degenerates into round-robin: one hit per
     // member, ordered by nothing.
+    //
+    // Either way on the *retriever's* order (fixup G): each member demoted its
+    // own tests/docs/config by position, relative to its own list, and clamped
+    // their scores. A member made only of docs had nothing to demote them
+    // below, so its untouched cosines outranked every other member's code. So
+    // each member's hits are put back in retriever order (`raw_score`), merged,
+    // and the kind penalty is applied once, over the merged list.
     let by_score = mode == "vector" || mode.is_empty();
-    const K: f64 = 60.0;
-    let mut fused: Vec<(f64, Value)> = Vec::new();
-    for (project, hits) in per_member {
-        for (rank, hit) in hits.into_iter().enumerate() {
-            let key = if by_score {
-                hit.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0)
-            } else {
-                1.0 / (K + (rank + 1) as f64)
-            };
-            let mut hit = hit;
-            if let Value::Object(map) = &mut hit {
-                // Without this the result is unusable: two repositories can hold
-                // the same relative path, and the reader cannot tell them apart.
-                map.insert("project".into(), json!(project));
-            }
-            fused.push((key, hit));
-        }
-    }
-    fused.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let fused = fuse_member_hits(per_member, by_score, &group_penalty(&targets), limit);
     let total = fused.len();
-    let hits: Vec<Value> = fused.into_iter().take(limit).map(|(_, h)| h).collect();
+    let hits: Vec<Value> = fused.into_iter().take(limit).collect();
 
     // `results`, like a single project's `search`: one key for the rows
     // whatever the binding (readers go through `devctx_core::search_hits`,
@@ -2680,6 +2714,67 @@ pub fn do_search_group(
         out["warning"] = json!(warning);
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// Merge members' hits into one ranking: by the retriever's score (`by_score`)
+/// or by reciprocal rank, each member's list first restored to retriever order,
+/// then the kind penalty applied once over the merged list. Every hit is
+/// stamped with its `project`.
+fn fuse_member_hits(
+    per_member: Vec<(String, Vec<Value>)>,
+    by_score: bool,
+    penalty: &devctx_core::KindPenalty,
+    limit: usize,
+) -> Vec<Value> {
+    const K: f64 = 60.0;
+    let mut fused: Vec<(f64, Value)> = Vec::new();
+    for (project, mut hits) in per_member {
+        // Stable: hits with equal retriever scores (anchored definitions,
+        // pinned at the top score) keep the member's order.
+        hits.sort_by(|a, b| {
+            devctx_core::hit_raw_score(b)
+                .partial_cmp(&devctx_core::hit_raw_score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (rank, mut hit) in hits.into_iter().enumerate() {
+            let key = if by_score {
+                devctx_core::hit_raw_score(&hit)
+            } else {
+                1.0 / (K + (rank + 1) as f64)
+            };
+            if let Value::Object(map) = &mut hit {
+                // Without this the result is unusable: two repositories can hold
+                // the same relative path, and the reader cannot tell them apart.
+                map.insert("project".into(), json!(project));
+            }
+            fused.push((key, hit));
+        }
+    }
+    fused.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let kinds: Vec<devctx_core::PathKind> = fused.iter().map(|(_, h)| hit_kind(h)).collect();
+    let order = devctx_search::demoted_order(&kinds, penalty, limit);
+    let mut slots: Vec<Option<Value>> = fused.into_iter().map(|(_, h)| Some(h)).collect();
+    order.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// A hit's file kind: the `kind` the member stamped, or worked out from its
+/// path when the member predates the field.
+fn hit_kind(h: &Value) -> devctx_core::PathKind {
+    h.get("kind")
+        .and_then(|k| k.as_str())
+        .and_then(devctx_core::PathKind::parse)
+        .unwrap_or_else(|| devctx_core::path_kind(field(h, "file"), field(h, "language")))
+}
+
+/// The kind penalty a group applies over its merged ranking: the first
+/// target's `search.penalty` (members inherit it from the same machine
+/// defaults), or the default when its config cannot be read.
+fn group_penalty(targets: &[&ProjectRow]) -> devctx_core::KindPenalty {
+    targets
+        .first()
+        .and_then(|m| ProjectConfig::load(&m.path.join(devctx_core::CONFIG_FILE_NAME)).ok())
+        .map(|c| c.search.penalty)
+        .unwrap_or_default()
 }
 
 /// The fan-out had nobody to ask: every member's checkout is missing.
@@ -3982,7 +4077,19 @@ pub fn do_build_context(
     // will fit — the budget, not the limit, decides where to stop — and take
     // the rows before `do_search`'s own fitting, which would truncate each one
     // to a thirtieth of the budget.
-    let (hits, fallback) = search_items(state, query, 30, None, SearchMode::Hybrid, false, sel)?;
+    //
+    // Hybrid without building the BM25 index when it is missing (see
+    // `search_items`): the first brief of a project would otherwise wait for it.
+    let (hits, fallback) = search_items(
+        state,
+        query,
+        30,
+        None,
+        SearchMode::Hybrid,
+        false,
+        sel,
+        false,
+    )?;
     // The branch the answer came from must be named: the code below may differ
     // from what is checked out.
     let fallback_note = fallback
@@ -4053,19 +4160,21 @@ fn compose_context(
         let mut head = "## What is already known\n\n";
         let cap = budget * CTX_MEMORY_SHARE_PCT / 100;
         for m in mems {
+            let piece = format!("{head}{}\n\n", memory_brief(m, "memory"));
+            if out.len() + piece.len() > cap {
+                dropped += 1;
+                continue;
+            }
+            out.push_str(&piece);
+            head = "";
+            // Only a memory that made it in stands for its files: one that
+            // did not fit must not take their code out of the brief too.
             for f in field(m, "files")
                 .split(',')
                 .map(str::trim)
                 .filter(|f| !f.is_empty())
             {
                 memory_files.push(f.to_string());
-            }
-            let piece = format!("{head}{}\n\n", memory_brief(m, "memory"));
-            if out.len() + piece.len() > cap {
-                dropped += 1;
-            } else {
-                out.push_str(&piece);
-                head = "";
             }
         }
     }
@@ -4080,7 +4189,15 @@ fn compose_context(
             continue;
         }
         let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
-        let body = cap_lines(&trim_leading_doc(field(h, "text")), chunk_cap);
+        let style = comment_style(field(h, "language"), file);
+        // Only code has a doc comment to shorten: a Markdown list, a YAML
+        // block or a SQL script is the content itself.
+        let text = if hit_kind(h) == devctx_core::PathKind::Code {
+            trim_leading_doc(field(h, "text"), style)
+        } else {
+            field(h, "text").to_string()
+        };
+        let body = cap_lines(&text, chunk_cap, style);
         let piece = format!("{head}// {file}:{line}\n{body}\n\n");
         if out.len() + piece.len() > budget {
             dropped += 1;
@@ -4138,6 +4255,17 @@ fn memory_brief(m: &Value, tag: &str) -> String {
         .enumerate()
     {
         if i >= CTX_MEMORY_LINES || body.len() + l.len() > CTX_MEMORY_CHARS {
+            // A first line longer than the whole allowance is cut, not
+            // dropped: an empty body under the title says nothing.
+            if body.is_empty() {
+                let end = l
+                    .char_indices()
+                    .take_while(|(b, _)| *b < CTX_MEMORY_CHARS)
+                    .last()
+                    .map(|(b, c)| b + c.len_utf8())
+                    .unwrap_or(0);
+                body.push_str(&l[..end]);
+            }
             cut = true;
             break;
         }
@@ -4152,37 +4280,141 @@ fn memory_brief(m: &Value, tag: &str) -> String {
     format!("[{tag}] {} — {}\n{body}", field(m, "id"), field(m, "title"))
 }
 
-fn is_doc_line(l: &str) -> bool {
-    let t = l.trim_start();
-    t.starts_with("//")
-        || t.starts_with("/*")
-        || t.starts_with('*')
-        || (t.starts_with('#')
-            && !t.starts_with("#[")
-            && !t.starts_with("#!")
-            && !t.starts_with("#include")
-            && !t.starts_with("#define"))
+/// How a chunk's language writes comments, for the doc trimming and the
+/// markers placed inside code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentStyle {
+    /// `//` lines and `/* */` blocks (C, Rust, Java, JS/TS, Go, …).
+    Slash,
+    /// `#` lines (Python, Ruby, shell, Perl, R, Elixir, YAML, TOML, …).
+    Hash,
+    /// `--` lines (SQL, Lua, Haskell, Ada, Elm).
+    Dash,
+    /// No comment syntax worth assuming (Markdown, plain text, JSON).
+    None,
 }
 
-/// A long leading doc comment (javadoc, `///`, `#`) shortened to its first
-/// lines, so the code under it is what the budget pays for.
-fn trim_leading_doc(text: &str) -> String {
+impl CommentStyle {
+    /// The line-comment prefix, if the language has one.
+    fn prefix(self) -> Option<&'static str> {
+        match self {
+            CommentStyle::Slash => Some("//"),
+            CommentStyle::Hash => Some("#"),
+            CommentStyle::Dash => Some("--"),
+            CommentStyle::None => None,
+        }
+    }
+
+    /// `"<prefix> <text>"`, or `text` alone without a comment syntax.
+    fn marker(self, text: &str) -> String {
+        match self.prefix() {
+            Some(p) => format!("{p} {text}"),
+            None => text.to_string(),
+        }
+    }
+}
+
+/// The comment style of a chunk, by its indexed language, else its extension.
+fn comment_style(language: &str, file: &str) -> CommentStyle {
+    let ext = file
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let key = if language.is_empty() {
+        ext.as_str()
+    } else {
+        language
+    };
+    match key.to_ascii_lowercase().as_str() {
+        "python" | "py" | "ruby" | "rb" | "shell" | "sh" | "bash" | "zsh" | "perl" | "pl" | "r"
+        | "elixir" | "ex" | "exs" | "yaml" | "yml" | "toml" | "makefile" | "mk" | "dockerfile"
+        | "powershell" | "ps1" | "julia" | "jl" | "nim" | "crystal" | "cr" | "coffeescript"
+        | "coffee" | "tcl" | "cmake" => CommentStyle::Hash,
+        "sql" | "lua" | "haskell" | "hs" | "ada" | "adb" | "ads" | "elm" => CommentStyle::Dash,
+        "markdown" | "md" | "text" | "txt" | "rst" | "json" | "html" | "xml" | "csv" => {
+            CommentStyle::None
+        }
+        _ => CommentStyle::Slash,
+    }
+}
+
+/// A long leading doc comment shortened to its first lines, so the code under
+/// it is what the budget pays for.
+///
+/// Only a block that *starts* the chunk and is unmistakably a comment in the
+/// chunk's language: `/* … */` (javadoc, `/**`, `/*!`) or `//` lines in the
+/// C family, `#` lines only where `#` is a comment (never `#if`, `#pragma`,
+/// `#import` in C or `#[attr]` in Rust), `--` lines in SQL and kin. A Python
+/// docstring is not trimmed (left whole, never mangled). A trimmed `/* */`
+/// block keeps its closing line and its marker sits inside the comment; a
+/// line-comment marker uses the block's own prefix.
+fn trim_leading_doc(text: &str, style: CommentStyle) -> String {
     let lines: Vec<&str> = text.lines().collect();
-    let doc = lines.iter().take_while(|l| is_doc_line(l)).count();
+    let Some(first) = lines.first() else {
+        return text.to_string();
+    };
+    let indent: String = first.chars().take_while(|c| c.is_whitespace()).collect();
+    let head = first.trim_start();
+    let line_block = |prefix: &str, skip: &dyn Fn(&str) -> bool| {
+        lines
+            .iter()
+            .take_while(|l| {
+                let t = l.trim_start();
+                t.starts_with(prefix) && !skip(t)
+            })
+            .count()
+    };
+    // (lines in the doc block, the closing line to keep, marker prefix)
+    let (doc, closing, marker): (usize, Option<usize>, String) = match style {
+        CommentStyle::Slash if head.starts_with("/*") => {
+            let Some(end) = lines.iter().position(|l| l.contains("*/")) else {
+                return text.to_string();
+            };
+            (end + 1, Some(end), " *".to_string())
+        }
+        CommentStyle::Slash if head.starts_with("//") => {
+            let prefix = if head.starts_with("///") {
+                "///"
+            } else if head.starts_with("//!") {
+                "//!"
+            } else {
+                "//"
+            };
+            (line_block("//", &|_| false), None, prefix.to_string())
+        }
+        CommentStyle::Hash if head.starts_with('#') && !head.starts_with("#!") => (
+            line_block("#", &|t| t.starts_with("#!")),
+            None,
+            "#".to_string(),
+        ),
+        CommentStyle::Dash if head.starts_with("--") => {
+            (line_block("--", &|_| false), None, "--".to_string())
+        }
+        _ => return text.to_string(),
+    };
     if doc <= CTX_DOC_MAX {
         return text.to_string();
     }
+    let kept_tail = usize::from(closing.is_some());
+    let trimmed = doc - CTX_DOC_KEEP - kept_tail;
     let mut out: Vec<String> = lines[..CTX_DOC_KEEP]
         .iter()
         .map(|l| l.to_string())
         .collect();
-    out.push(format!("// … ({} doc lines trimmed)", doc - CTX_DOC_KEEP));
+    out.push(format!("{indent}{marker} … ({trimmed} doc lines trimmed)"));
+    if let Some(c) = closing {
+        out.push(lines[c].to_string());
+    }
     out.extend(lines[doc..].iter().map(|l| l.to_string()));
     out.join("\n")
 }
 
-/// `text` cut at a line boundary to at most `cap` chars, saying how much went.
-fn cap_lines(text: &str, cap: usize) -> String {
+/// `text` cut at a line boundary to at most `cap` chars, saying how much went
+/// in a marker the language reads as a comment. A first line longer than
+/// `cap` on its own (minified JS, a one-line SQL statement) is cut by chars:
+/// a header over nothing but "N more lines" spends budget and shows nothing.
+fn cap_lines(text: &str, cap: usize, style: CommentStyle) -> String {
     if text.len() <= cap {
         return text.to_string();
     }
@@ -4191,79 +4423,506 @@ fn cap_lines(text: &str, cap: usize) -> String {
     let total = text.lines().count();
     for l in text.lines() {
         if out.len() + l.len() + 1 > cap {
+            if kept == 0 {
+                // Room for the marker: ~60 chars.
+                let room = cap.saturating_sub(60);
+                let end = l
+                    .char_indices()
+                    .take_while(|(b, _)| *b < room)
+                    .last()
+                    .map(|(b, c)| b + c.len_utf8())
+                    .unwrap_or(0);
+                out.push_str(&l[..end]);
+                out.push('\n');
+                out.push_str(&style.marker(&format!(
+                    "… (line cut at {end} of {} chars; {} more lines)",
+                    l.len(),
+                    total - 1
+                )));
+                return out;
+            }
             break;
         }
         out.push_str(l);
         out.push('\n');
         kept += 1;
     }
-    out.push_str(&format!("// … ({} more lines)", total - kept));
+    out.push_str(&style.marker(&format!("… ({} more lines)", total - kept)));
     out
 }
 
 /// How many of a member's best hits decide how well it answers a question.
 const PICK_TOP_K: usize = 3;
-/// Mean-score lead the best member needs over the second to be chosen without
-/// being asked. Cosine scores; under this the question is as much about one
-/// repository as the other and a guess would be silent.
+/// Hits fetched per member: more than `PICK_TOP_K`, so a member whose top
+/// hits are docs or tests still shows the code further down (the score counts
+/// code first, see [`member_scores`]).
+const PICK_FETCH: usize = 10;
+/// Mean-score lead the best member needs over the second for the choice not
+/// to be flagged as ambiguous. Cosine scores. Calibration: TASK-016.
 const PICK_MARGIN: f64 = 0.03;
+/// Identifier tokens of the query checked against each member's symbols.
+const PICK_IDENT_TOKENS: usize = 2;
+/// How long the selection waits for a member's `/health`: a warm server
+/// answers in milliseconds; one that does not is busy and is reported, not
+/// waited for.
+const PICK_HEALTH_TIMEOUT: Duration = Duration::from_millis(800);
+/// A warm member's search, model reload included.
+const PICK_SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A member's fitness for a question: the mean of its `PICK_TOP_K` best scores,
-/// counting a missing hit as 0.
-fn member_score(hits: &[Value]) -> f64 {
-    let mut scores: Vec<f64> = hits
-        .iter()
-        .map(|h| h.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0))
-        .collect();
-    scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    scores.truncate(PICK_TOP_K);
-    scores.iter().sum::<f64>() / PICK_TOP_K as f64
+/// A member's fitness for a question: `(code, all)`, each the mean of the
+/// `PICK_TOP_K` best retriever scores (`raw_score`, never a clamped or reranked
+/// one) counting a missing hit as 0 — `code` over the hits the kind penalty
+/// leaves alone, `all` over every hit.
+///
+/// Code first (fixup G): the penalty demotes tests/docs/config by *position*
+/// inside one list, which does nothing between members — a docs-only member
+/// comes back with its cosines intact (0.82 for a README against 0.75 for the
+/// code that answers) and won every "how does auth work". Comparing members on
+/// their code puts that member back where the penalty meant it to be; `all`
+/// decides only when no member has code that matched (a docs question, or an
+/// explicit `kind`).
+fn member_scores(hits: &[Value], penalty: &devctx_core::KindPenalty) -> (f64, f64) {
+    let mean = |keep: &dyn Fn(&Value) -> bool| {
+        let mut scores: Vec<f64> = hits
+            .iter()
+            .filter(|h| keep(h))
+            .map(devctx_core::hit_raw_score)
+            .collect();
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(PICK_TOP_K);
+        scores.iter().sum::<f64>() / PICK_TOP_K as f64
+    };
+    (
+        mean(&|h| penalty.demotion(hit_kind(h)) == Some(0)),
+        mean(&|_| true),
+    )
 }
 
-/// Pick the member to answer from, or refuse and name the candidates.
-/// Never a default: a clear winner is named, anything else asks for `project`.
-fn choose_member(mut scored: Vec<(String, f64)>) -> Result<(String, usize), String> {
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let n = scored.len();
-    let list = |v: &[(String, f64)]| {
+/// How one member fared in a selection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberOutcome {
+    /// Searched. `defines` names the query identifier it has a definition of.
+    Scored {
+        code: f64,
+        all: f64,
+        defines: Option<String>,
+    },
+    /// Asked, and the asking failed (server busy, an error answer).
+    Failed(String),
+    /// Not asked, and why: no running server, another model, checkout missing.
+    NotScored(String),
+}
+
+/// The member a group `build_context` answers from, and how it was chosen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupPick {
+    /// The member's registered name.
+    pub member: String,
+    /// What follows "context from": the member and how it was chosen.
+    pub label: String,
+    /// A close call or a choice not made by relevance, said on its own line.
+    pub warning: Option<String>,
+    /// Chosen by comparing scores (worth caching), not the default fallback.
+    pub by_relevance: bool,
+}
+
+impl GroupPick {
+    /// The label plus the warning line, for the brief's first lines.
+    pub fn header(&self) -> String {
+        match &self.warning {
+            Some(w) => format!("{}\n[devctx] {w}", self.label),
+            None => self.label.clone(),
+        }
+    }
+}
+
+/// At most `max` chars of `s`, cut on a char boundary.
+fn clip(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// "k of M members scored; failed: …; not scored: …".
+fn pick_coverage(
+    total: usize,
+    scored: usize,
+    failed: &[(String, String)],
+    not: &[(String, String)],
+) -> String {
+    let mut t = format!("{scored} of {total} members scored");
+    let list = |v: &[(String, String)]| {
         v.iter()
-            .map(|(m, s)| format!("{m} ({s:.2})"))
+            .map(|(m, why)| format!("{m} ({})", clip(why, 160)))
             .collect::<Vec<_>>()
             .join(", ")
     };
-    match scored.as_slice() {
-        [] => Err("no member of this group could be searched; pass `project` \
-                   (a member name or a path inside it)"
-            .to_string()),
-        [(only, _)] => Ok((only.clone(), 1)),
-        [(_, best), ..] if *best <= 0.0 => Err(format!(
+    if !failed.is_empty() {
+        t.push_str(&format!("; failed: {}", list(failed)));
+    }
+    if !not.is_empty() {
+        t.push_str(&format!("; not scored: {}", list(not)));
+    }
+    t
+}
+
+/// Pick the member to answer from (fixup G).
+///
+/// * Every member's outcome is accounted for in the label: "k of M members
+///   scored", and which failed or were not scored and why — the answer from
+///   the one member that answered is never presented as the best "among 1".
+/// * Nothing matched (best score ≤ 0) is an error, whatever the count.
+/// * A close call (lead < `PICK_MARGIN`) answers from the best member anyway,
+///   with a warning naming the others.
+/// * Nobody scored: when nothing *failed* (every member cold, another model or
+///   missing) the group's `default` member answers, said so in the label and
+///   the warning; when something failed it is an error naming the failures.
+///
+/// A member that defines an identifier of the query gets `PICK_MARGIN` on top
+/// of its score: enough to break a vector tie, not to overturn a clear lead.
+pub fn choose_member(
+    outcomes: Vec<(String, MemberOutcome)>,
+    default: Option<&str>,
+) -> Result<GroupPick, String> {
+    let total = outcomes.len();
+    let mut scored: Vec<(String, f64, f64, Option<String>)> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    let mut not: Vec<(String, String)> = Vec::new();
+    for (name, o) in outcomes {
+        match o {
+            MemberOutcome::Scored { code, all, defines } => scored.push((name, code, all, defines)),
+            MemberOutcome::Failed(e) => failed.push((name, e)),
+            MemberOutcome::NotScored(why) => not.push((name, why)),
+        }
+    }
+    let coverage = pick_coverage(total, scored.len(), &failed, &not);
+    if scored.is_empty() {
+        return match default {
+            Some(d) if failed.is_empty() => Ok(GroupPick {
+                member: d.to_string(),
+                label: format!("{d} (the group's default member; {coverage})"),
+                warning: Some(format!(
+                    "not chosen by relevance: no member could be compared without starting \
+                     its server ({coverage}). Pass `project` to choose, or start the members' \
+                     servers (`devctx serve`) to let this pick by relevance."
+                )),
+                by_relevance: false,
+            }),
+            _ => Err(format!(
+                "no member of this group could be scored, so none can be chosen by relevance; \
+                 pass `project` (a member name or a path inside it). {coverage}"
+            )),
+        };
+    }
+    let use_code = scored.iter().any(|s| s.1 > 0.0);
+    let base = |s: &(String, f64, f64, Option<String>)| if use_code { s.1 } else { s.2 };
+    let eff = |s: &(String, f64, f64, Option<String>)| {
+        base(s) + if s.3.is_some() { PICK_MARGIN } else { 0.0 }
+    };
+    scored.sort_by(|a, b| {
+        eff(b)
+            .partial_cmp(&eff(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let list = |v: &[(String, f64, f64, Option<String>)]| {
+        v.iter()
+            .map(|s| format!("{} ({:.2})", s.0, base(s)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let best = &scored[0];
+    if eff(best) <= 0.0 {
+        return Err(format!(
             "nothing in any member matched this query; pass `project` to choose one. \
-             Members: {}",
+             Scored: {}. {coverage}",
             list(&scored)
-        )),
-        [(top, best), (_, second), ..] if best - second >= PICK_MARGIN => Ok((top.clone(), n)),
-        _ => Err(format!(
-            "this query fits more than one member of the group about equally; pass \
-             `project` to choose. Candidates by relevance: {}",
-            list(&scored)
+        ));
+    }
+    let close: Vec<_> = scored[1..]
+        .iter()
+        .filter(|s| eff(best) - eff(s) < PICK_MARGIN)
+        .cloned()
+        .collect();
+    let warning = (!close.is_empty()).then(|| {
+        format!(
+            "ambiguous: also {} — within {PICK_MARGIN} of {} ({:.2}); pass `project` to choose",
+            list(&close),
+            best.0,
+            base(best)
+        )
+    });
+    let defines = best
+        .3
+        .as_ref()
+        .map(|t| format!(", defines `{t}`"))
+        .unwrap_or_default();
+    Ok(GroupPick {
+        member: best.0.clone(),
+        label: format!(
+            "{} (best match {:.2}{defines}; {coverage})",
+            best.0,
+            base(best)
+        ),
+        warning,
+        by_relevance: true,
+    })
+}
+
+/// A member's running server, as `serve.json` advertises it.
+struct WarmServer {
+    base: String,
+    token: Option<String>,
+}
+
+impl WarmServer {
+    fn agent(timeout: Duration) -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(300))
+            .timeout(timeout)
+            .build()
+    }
+
+    fn auth(&self, req: ureq::Request) -> ureq::Request {
+        match &self.token {
+            Some(t) => req.set("Authorization", &format!("Bearer {t}")),
+            None => req,
+        }
+    }
+
+    /// `/search`, vector mode, never reranked: the selection compares cosines,
+    /// and a cross-encoder would replace them with logits (and cost seconds).
+    fn search(&self, query: &str, sel: &devctx_search::KindSel) -> Result<Vec<Value>, String> {
+        let req =
+            self.auth(Self::agent(PICK_SEARCH_TIMEOUT).post(&format!("{}/search", self.base)));
+        let body = json!({
+            "query": query, "limit": PICK_FETCH, "mode": "vector", "rerank": false,
+            "kind": sel.kind, "include_tests": sel.include_tests,
+        });
+        let raw = match req.send_json(body) {
+            Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+            Err(ureq::Error::Status(code, r)) => {
+                let text = r.into_string().unwrap_or_default();
+                return Err(format!(
+                    "search answered {code}: {}",
+                    text.trim().lines().last().unwrap_or("")
+                ));
+            }
+            Err(e) => return Err(format!("search failed: {e}")),
+        };
+        let v: Value = serde_json::from_str(&raw).map_err(|e| format!("unreadable answer: {e}"))?;
+        Ok(devctx_core::search_hits(&v).hits)
+    }
+
+    /// Whether this member has a definition of `symbol` (`/symbol/<name>`).
+    fn defines(&self, symbol: &str) -> bool {
+        let name: String = symbol
+            .chars()
+            .map(|c| match c {
+                ':' => "%3A".to_string(),
+                c => c.to_string(),
+            })
+            .collect();
+        let req = self.auth(
+            Self::agent(PICK_SEARCH_TIMEOUT).get(&format!("{}/symbol/{name}?limit=1", self.base)),
+        );
+        req.call()
+            .ok()
+            .and_then(|r| r.into_string().ok())
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| {
+                v.get("definitions")
+                    .and_then(|d| d.as_array())
+                    .map(|a| !a.is_empty())
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// The member's server if one is running, found without starting one (fixup
+/// G): a selection must not spawn a server per member — thirteen cold members
+/// were thirteen serves and 12–24 s. `Ok(None)` when nothing runs (no
+/// `serve.json`, or nothing listening on it); `Err` when one is advertised but
+/// does not answer `/health` in time (busy, hung, holding the lock).
+///
+/// `serve.json` sits next to the database (`remote::serve_file` in the CLI),
+/// so the member's config decides where.
+fn warm_server(path: &std::path::Path) -> Result<Option<WarmServer>, String> {
+    let Ok(cfg) = ProjectConfig::load(&path.join(devctx_core::CONFIG_FILE_NAME)) else {
+        return Ok(None);
+    };
+    let mut db = cfg.db_path();
+    if db.is_relative() {
+        db = path.join(db);
+    }
+    let file = db
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("serve.json");
+    let Some(info) = std::fs::read(&file)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(addr) = info.get("addr").and_then(|a| a.as_str()) else {
+        return Ok(None);
+    };
+    let srv = WarmServer {
+        base: format!("http://{addr}"),
+        token: info
+            .get("token")
+            .and_then(|t| t.as_str())
+            .map(str::to_string),
+    };
+    match WarmServer::agent(PICK_HEALTH_TIMEOUT)
+        .get(&format!("{}/health", srv.base))
+        .call()
+    {
+        Ok(_) => Ok(Some(srv)),
+        // Nobody listens: a `serve.json` left behind by a server that is gone.
+        Err(e) if connection_refused(&e) => Ok(None),
+        Err(e) => Err(format!(
+            "its server at {addr} did not answer /health within {:.1}s (busy or hung): {e}",
+            PICK_HEALTH_TIMEOUT.as_secs_f64()
         )),
     }
 }
 
-/// `build_context` in a group, with no `project`: search every member and
-/// choose the one that answers best — `(name, members compared)`.
+/// Whether a request failed because nothing listens on the port.
+fn connection_refused(e: &ureq::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+        {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// Score one member through its running server, if it has one.
+fn score_member(
+    m: &ProjectRow,
+    query: &str,
+    sel: &devctx_search::KindSel,
+    idents: &[String],
+    penalty: &devctx_core::KindPenalty,
+) -> MemberOutcome {
+    let srv = match warm_server(&m.path) {
+        Ok(Some(s)) => s,
+        Ok(None) => return MemberOutcome::NotScored("no running server".into()),
+        Err(e) => return MemberOutcome::Failed(e),
+    };
+    match srv.search(query, sel) {
+        Err(e) => MemberOutcome::Failed(e),
+        Ok(hits) => {
+            let (code, all) = member_scores(&hits, penalty);
+            let defines = idents.iter().find(|t| srv.defines(t)).cloned();
+            MemberOutcome::Scored { code, all, defines }
+        }
+    }
+}
+
+/// `build_context` in a group, with no `project`: compare the members that
+/// can be compared without starting anything, and choose (see
+/// [`choose_member`]). `default` is the group's default member, the answer
+/// when no member could be compared and none failed.
+///
+/// Only members whose server is already running are scored, over HTTP, in
+/// vector mode, without reranking. A cold member is reported "not scored (no
+/// running server)" — never spawned. A member of another embedding model or
+/// width is "not scored" too: its cosines are in another space.
 pub fn pick_group_member(
     members: &[ProjectRow],
     query: &str,
     sel: &devctx_search::KindSel,
-) -> Result<(String, usize), String> {
-    let (targets, _skipped, _reachable, _missing) = group_targets(members, None);
-    let results = fan_out_search(&targets, query, PICK_TOP_K, None, "vector", sel);
-    let scored: Vec<(String, f64)> = results
-        .into_iter()
-        .filter_map(|(name, r)| r.ok().map(|a| (name, member_score(&a.hits))))
-        .collect();
-    choose_member(scored)
+    default: Option<&str>,
+) -> Result<GroupPick, String> {
+    let (targets, skipped, _reachable, missing) = group_targets(members, None);
+    let mut outcomes: Vec<(String, MemberOutcome)> = Vec::new();
+    for v in skipped.iter() {
+        outcomes.push((
+            field(v, "project").to_string(),
+            MemberOutcome::NotScored(field(v, "reason").to_string()),
+        ));
+    }
+    for v in missing.iter() {
+        outcomes.push((
+            field(v, "project").to_string(),
+            MemberOutcome::NotScored("checkout missing".into()),
+        ));
+    }
+    let penalty = group_penalty(&targets);
+    let mut idents = devctx_search::identifier_tokens(query);
+    idents.truncate(PICK_IDENT_TOKENS);
+    for batch in targets.chunks(FANOUT_CONCURRENCY) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|m| {
+                    let (idents, penalty) = (&idents, &penalty);
+                    scope.spawn(move || {
+                        (m.name.clone(), score_member(m, query, sel, idents, penalty))
+                    })
+                })
+                .collect();
+            for (h, m) in handles.into_iter().zip(batch) {
+                outcomes.push(match h.join() {
+                    Ok(r) => r,
+                    Err(_) => (
+                        m.name.clone(),
+                        MemberOutcome::Failed("the scoring thread panicked".into()),
+                    ),
+                });
+            }
+        });
+    }
+    choose_member(outcomes, default)
+}
+
+/// Which member a group `build_context` answers from when the call names a
+/// `project`: `Ok(Some(name))` for a member, `Ok(None)` when no `project` was
+/// given (choose by relevance), and an error for a `project` that is not a
+/// registered project or not a member of this group — never a quiet fallback
+/// to another member (fixup G, item 11).
+pub fn group_context_target(
+    project: Option<&str>,
+    members: &[ProjectRow],
+    resolve: impl Fn(&str) -> Option<ProjectRow>,
+) -> Result<Option<String>, String> {
+    let Some(p) = project else {
+        return Ok(None);
+    };
+    let names = || {
+        members
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let Some(row) = resolve(p) else {
+        return Err(format!(
+            "`project` {p:?} is not a registered project. Members of this group: {}",
+            names()
+        ));
+    };
+    match members
+        .iter()
+        .find(|m| m.path == row.path || (m.name == row.name && row.path.as_os_str().is_empty()))
+    {
+        Some(m) => Ok(Some(m.name.clone())),
+        None => Err(format!(
+            "`project` {p:?} resolves to {} ({}), which is not a member of this group. \
+             Members: {}. Bind it with `use_project` to work in it.",
+            row.name,
+            row.path.display(),
+            names()
+        )),
+    }
 }
 
 /// The tail of a `build_context` answer. The "nothing matched" line goes first:
@@ -4999,7 +5658,7 @@ fn hits_to_json(hits: &[SearchResult]) -> Value {
         hits.iter()
             .map(|h| {
                 let m = &h.point.metadata;
-                json!({
+                let mut row = json!({
                     "score": h.score,
                     "file": m.file,
                     "start_line": m.start_line,
@@ -5007,8 +5666,19 @@ fn hits_to_json(hits: &[SearchResult]) -> Value {
                     "symbol": m.symbol,
                     "symbol_type": m.symbol_type,
                     "level": m.chunk_level,
+                    "language": m.language,
+                    // The file kind the penalty judged it by: a group demotes
+                    // once over every member's hits, and `build_context` trims
+                    // only code (fixup G).
+                    "kind": devctx_core::path_kind(&m.file, &m.language).as_str(),
                     "text": h.point.text,
-                })
+                });
+                // Only when a later stage rewrote `score` (penalty, rerank):
+                // what a group's fan-out compares (`devctx_core::hit_raw_score`).
+                if let Some(raw) = h.raw_score {
+                    row["raw_score"] = json!(raw);
+                }
+                row
             })
             .collect(),
     )
@@ -5292,6 +5962,7 @@ mod tests {
     fn hits_to_json_shape() {
         let hit = SearchResult {
             score: 0.5,
+            raw_score: None,
             point: VectorPoint {
                 id: "x".into(),
                 vector: vec![],
@@ -6395,9 +7066,172 @@ mod tests {
         assert!(!out.contains("documentation line 30"), "{out}");
         // A short doc is left alone.
         let short = "/// one\n/// two\nfn f() {}";
-        assert_eq!(trim_leading_doc(short), short);
+        assert_eq!(trim_leading_doc(short, CommentStyle::Slash), short);
         // Attributes are not documentation.
-        assert!(!is_doc_line("#[derive(Debug)]"));
+        let attrs = format!("{}fn f() {{}}", "#[derive(Debug)]\n".repeat(10));
+        assert_eq!(trim_leading_doc(&attrs, CommentStyle::Slash), attrs);
+    }
+
+    /// Fixup G (9): a trimmed javadoc keeps its `*/` and the marker sits inside
+    /// the comment; line comments get a marker in their own syntax.
+    #[test]
+    fn a_trimmed_doc_stays_well_formed_in_its_language() {
+        let doc = (0..20)
+            .map(|i| format!(" * line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("/**\n{doc}\n */\nvoid f() {{}}");
+        let out = trim_leading_doc(&text, CommentStyle::Slash);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[3], " * … (18 doc lines trimmed)", "{out}");
+        assert_eq!(lines[4], " */", "the block is still closed: {out}");
+        assert_eq!(lines[5], "void f() {}", "{out}");
+
+        let py = format!("{}def f():\n    pass", "# comment\n".repeat(10));
+        let out = trim_leading_doc(&py, CommentStyle::Hash);
+        assert!(out.contains("# … (7 doc lines trimmed)"), "{out}");
+        assert!(!out.contains("//"), "no C marker in Python: {out}");
+
+        let sql = format!("{}SELECT 1;", "-- note\n".repeat(10));
+        assert!(trim_leading_doc(&sql, CommentStyle::Dash).contains("-- … (7 doc lines trimmed)"));
+
+        // `#` is a preprocessor line in C, not a comment.
+        let c = format!(
+            "{}int x;",
+            "#include <a.h>\n#if X\n#pragma once\n".repeat(3)
+        );
+        assert_eq!(trim_leading_doc(&c, CommentStyle::Slash), c);
+        // A line starting with `*` mid-function is not a doc line either.
+        let deref = format!("{}return;", "*p = q;\n".repeat(10));
+        assert_eq!(trim_leading_doc(&deref, CommentStyle::Slash), deref);
+        // Python docstrings are left whole rather than mangled.
+        let doc = format!("\"\"\"\n{}\"\"\"\nx = 1", "text\n".repeat(10));
+        assert_eq!(trim_leading_doc(&doc, CommentStyle::Hash), doc);
+    }
+
+    /// Fixup G (8): Markdown lists and headings are content, not a doc comment
+    /// — a doc/config hit is never trimmed.
+    #[test]
+    fn markdown_lists_and_headings_are_not_trimmed() {
+        let md = format!(
+            "# Install\n{}\n## Usage\nrun it",
+            (0..12)
+                .map(|i| format!("* step {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let out = compose_context(
+            &[],
+            &[json!({"file": "README.md", "start_line": 1, "text": md, "kind": "doc"})],
+            None,
+            2000,
+            false,
+            &no_linked,
+        );
+        assert!(out.contains("* step 11"), "{out}");
+        assert!(!out.contains("trimmed"), "{out}");
+        // Even if a member predates `kind`, the path says it is a doc.
+        let out = compose_context(
+            &[],
+            &[json!({"file": "docs/guide.md", "start_line": 1, "text": md})],
+            None,
+            2000,
+            false,
+            &no_linked,
+        );
+        assert!(
+            out.contains("* step 11") && !out.contains("trimmed"),
+            "{out}"
+        );
+    }
+
+    /// Fixup G (7): one line longer than the cap is cut by chars, not
+    /// replaced by a bare "N more lines"; the marker is a comment of the
+    /// chunk's language.
+    #[test]
+    fn a_single_giant_line_is_cut_by_chars() {
+        let minified = format!("{}\nnext();", "a=b+c;".repeat(500));
+        let out = cap_lines(&minified, 600, CommentStyle::Slash);
+        assert!(out.starts_with("a=b+c;a=b+c;"), "{out}");
+        assert!(out.len() <= 600 + 80, "{}", out.len());
+        assert!(out.contains("// … (line cut at"), "{out}");
+        assert!(out.contains("1 more lines"), "{out}");
+        let sql = format!("SELECT {} FROM t;", "col, ".repeat(400));
+        let out = cap_lines(&sql, 600, CommentStyle::Dash);
+        assert!(out.starts_with("SELECT col, "), "{out}");
+        assert!(out.contains("-- … (line cut at"), "{out}");
+        // A normal multi-line cut uses the language's comment too.
+        let py = "x = 1\n".repeat(400);
+        assert!(cap_lines(&py, 600, CommentStyle::Hash).ends_with("more lines)"));
+        assert!(cap_lines(&py, 600, CommentStyle::Hash).contains("# … ("));
+    }
+
+    /// Fixup G (6): a memory whose first line is longer than the allowance
+    /// still shows the start of it.
+    #[test]
+    fn a_memory_with_a_giant_first_line_keeps_its_start() {
+        let long = format!("ñ{}", "decision text ".repeat(100));
+        let out = memory_brief(&ctx_mem("m1", "t", &long), "memory");
+        let body = out.lines().nth(1).unwrap_or("");
+        assert!(body.starts_with("ñdecision text"), "{out}");
+        assert!(body.ends_with('…'), "{out}");
+        assert!(body.len() <= CTX_MEMORY_CHARS + 4, "{}", body.len());
+    }
+
+    /// Fixup G (5): a memory that did not fit does not take its files' code
+    /// out of the brief.
+    #[test]
+    fn a_memory_that_did_not_fit_does_not_hide_its_files_code() {
+        let big = "a long memory line\n".repeat(5);
+        let mem = json!({"id": "m1", "title": "t".repeat(400), "content": big,
+                         "files": "src/pay.rs"});
+        // 100 tokens = 400 chars; the memory share (35%) is 140 chars.
+        let out = compose_context(
+            std::slice::from_ref(&mem),
+            &[ctx_hit("src/pay.rs", 7, "fn pay() {}")],
+            None,
+            100,
+            true,
+            &no_linked,
+        );
+        assert!(
+            !out.contains("[memory] m1"),
+            "the memory did not fit: {out}"
+        );
+        assert!(out.contains("src/pay.rs:7"), "its file's code stays: {out}");
+        // One that fits still stands for its file.
+        let small = json!({"id": "m2", "title": "t", "content": "short", "files": "src/pay.rs"});
+        let out = compose_context(
+            &[small],
+            &[ctx_hit("src/pay.rs", 7, "fn pay() {}")],
+            None,
+            400,
+            true,
+            &no_linked,
+        );
+        assert!(
+            out.contains("[memory] m2") && !out.contains("src/pay.rs:7"),
+            "{out}"
+        );
+    }
+
+    /// The `anchored` marking uses the truncated identifier set: a fourth
+    /// identifier is never looked up, so its definition is not "anchored".
+    #[test]
+    fn anchored_marks_only_the_identifiers_anchoring_looked_up() {
+        let q = "alpha_one beta_two gamma_three delta_four";
+        let idents = devctx_search::anchor_tokens(q);
+        let meta = |symbol: &str| devctx_core::VectorMetadata {
+            symbol: symbol.into(),
+            chunk_level: "function".into(),
+            ..Default::default()
+        };
+        assert!(is_anchored_definition(&meta("alpha_one"), &idents));
+        assert!(is_anchored_definition(&meta("Mod::gamma_three"), &idents));
+        assert!(!is_anchored_definition(&meta("delta_four"), &idents));
+        let mut mem = meta("alpha_one");
+        mem.chunk_level = "memory".into();
+        assert!(!is_anchored_definition(&mem, &idents));
     }
 
     /// Code is not pushed out by memories: they get a share, the rest is
@@ -6424,44 +7258,503 @@ mod tests {
         assert_eq!(omitted, 1, "one closing count, not one per item: {out}");
     }
 
-    /// Group selection: a query that only matches the non-default member
-    /// chooses it, by name.
-    #[test]
-    fn group_pick_chooses_the_member_that_matches() {
-        let scored = vec![
-            ("tickets-srv".to_string(), 0.12),
-            ("front".to_string(), 0.61),
-        ];
-        assert_eq!(choose_member(scored), Ok(("front".to_string(), 2)));
-        let hits = vec![
-            json!({"score": 0.9}),
-            json!({"score": 0.6}),
-            json!({"score": 0.3}),
-        ];
-        assert!((member_score(&hits) - 0.6).abs() < 1e-9);
-        assert!((member_score(&[json!({"score": 0.9})]) - 0.3).abs() < 1e-9);
+    fn scored(code: f64) -> MemberOutcome {
+        MemberOutcome::Scored {
+            code,
+            all: code,
+            defines: None,
+        }
     }
 
-    /// A close call asks for `project` and lists the candidates; so does a
-    /// group where nothing matched or nobody answered. Never a default.
+    /// Group selection: a query that only matches the non-default member
+    /// chooses it, by name, saying how many members were compared.
     #[test]
-    fn group_pick_refuses_a_close_call_and_names_candidates() {
-        let err = choose_member(vec![("api".into(), 0.50), ("web".into(), 0.49)]).unwrap_err();
-        assert!(err.contains("`project`"), "{err}");
+    fn group_pick_chooses_the_member_that_matches() {
+        let pick = choose_member(
+            vec![
+                ("tickets-srv".into(), scored(0.12)),
+                ("front".into(), scored(0.61)),
+            ],
+            Some("tickets-srv"),
+        )
+        .unwrap();
+        assert_eq!(pick.member, "front");
+        assert!(pick.by_relevance && pick.warning.is_none(), "{pick:?}");
+        assert!(pick.label.contains("best match 0.61"), "{}", pick.label);
         assert!(
-            err.contains("api (0.50)") && err.contains("web (0.49)"),
+            pick.label.contains("2 of 2 members scored"),
+            "{}",
+            pick.label
+        );
+    }
+
+    /// Fixup G (1): one scored member of several is not "the best among 1":
+    /// the label names who failed and who was not scored; and a lone member
+    /// that matched nothing is an error, not a confident pick.
+    #[test]
+    fn group_pick_accounts_for_every_member_and_never_picks_a_zero() {
+        let mut outcomes = vec![("front".to_string(), scored(0.55))];
+        outcomes.push(("api".into(), MemberOutcome::Failed("held by PID 42".into())));
+        for i in 0..11 {
+            outcomes.push((
+                format!("m{i}"),
+                MemberOutcome::NotScored("no running server".into()),
+            ));
+        }
+        let pick = choose_member(outcomes, Some("api")).unwrap();
+        assert_eq!(pick.member, "front");
+        assert!(
+            pick.label.contains("1 of 13 members scored"),
+            "{}",
+            pick.label
+        );
+        assert!(
+            pick.label.contains("failed: api (held by PID 42)"),
+            "{}",
+            pick.label
+        );
+        assert!(
+            pick.label.contains("not scored: m0 (no running server)"),
+            "{}",
+            pick.label
+        );
+
+        // The single-member case no longer skips the "nothing matched" check.
+        let err = choose_member(
+            vec![
+                ("solo".into(), scored(0.0)),
+                ("x".into(), MemberOutcome::Failed("boom".into())),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing in any member matched"), "{err}");
+        assert!(err.contains("failed: x (boom)"), "{err}");
+    }
+
+    /// Fixup G (4): a close call answers from the best member anyway, with a
+    /// warning naming the others; nothing matched or nobody answered is an
+    /// error.
+    #[test]
+    fn group_pick_answers_a_close_call_with_a_warning() {
+        let pick = choose_member(
+            vec![
+                ("api".into(), scored(0.50)),
+                ("web".into(), scored(0.49)),
+                ("ops".into(), scored(0.48)),
+                ("far".into(), scored(0.20)),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(pick.member, "api");
+        let w = pick.warning.clone().expect("a warning");
+        assert!(
+            w.starts_with("ambiguous: also web (0.49), ops (0.48)"),
+            "{w}"
+        );
+        assert!(w.contains("pass `project`") && !w.contains("far"), "{w}");
+        assert!(
+            pick.header().contains("\n[devctx] ambiguous"),
+            "{}",
+            pick.header()
+        );
+        assert!(choose_member(
+            vec![("api".into(), scored(0.0)), ("web".into(), scored(0.0))],
+            None
+        )
+        .unwrap_err()
+        .contains("pass `project`"));
+        assert!(choose_member(vec![], None)
+            .unwrap_err()
+            .contains("`project`"));
+    }
+
+    /// Fixup G (3): nobody warm and nothing failed → the default member, said
+    /// so; nobody answered because they failed → an error.
+    #[test]
+    fn group_pick_falls_back_to_the_default_only_when_nothing_failed() {
+        let cold = || MemberOutcome::NotScored("no running server".into());
+        let pick = choose_member(
+            vec![("api".into(), cold()), ("web".into(), cold())],
+            Some("web"),
+        )
+        .unwrap();
+        assert_eq!(pick.member, "web");
+        assert!(!pick.by_relevance);
+        assert!(pick.label.contains("default member"), "{}", pick.label);
+        assert!(pick.warning.unwrap().contains("not chosen by relevance"));
+        let err = choose_member(
+            vec![
+                ("api".into(), cold()),
+                ("web".into(), MemberOutcome::Failed("busy".into())),
+            ],
+            Some("web"),
+        )
+        .unwrap_err();
+        assert!(err.contains("failed: web (busy)"), "{err}");
+    }
+
+    /// Fixup G (3): a member defining an identifier of the query wins a vector
+    /// tie, not a clear lead.
+    #[test]
+    fn group_pick_prefers_the_member_that_defines_the_symbol_on_a_tie() {
+        let def = |code: f64| MemberOutcome::Scored {
+            code,
+            all: code,
+            defines: Some("PaymentService".into()),
+        };
+        let pick = choose_member(
+            vec![("a".into(), scored(0.51)), ("b".into(), def(0.50))],
+            None,
+        )
+        .unwrap();
+        assert_eq!(pick.member, "b", "{pick:?}");
+        assert!(
+            pick.label.contains("defines `PaymentService`"),
+            "{}",
+            pick.label
+        );
+        let pick = choose_member(
+            vec![("a".into(), scored(0.70)), ("b".into(), def(0.50))],
+            None,
+        )
+        .unwrap();
+        assert_eq!(pick.member, "a");
+    }
+
+    /// Fixup G (coordinator 1): member scores compare code on the retriever's
+    /// score; a docs-only member does not win a code question on its README
+    /// cosines, and decides only when nobody has code that matched.
+    #[test]
+    fn member_scores_count_code_on_the_raw_score() {
+        let pen = devctx_core::KindPenalty::default();
+        let docs = vec![
+            json!({"file": "README.md", "score": 0.82}),
+            json!({"file": "docs/auth.md", "score": 0.81}),
+            json!({"file": "docs/b.md", "score": 0.80}),
+        ];
+        let api = vec![
+            // Clamped by the member's penalty to 0.60, retriever said 0.78.
+            json!({"file": "src/auth.rs", "score": 0.60, "raw_score": 0.78}),
+            json!({"file": "src/session.rs", "score": 0.75}),
+            json!({"file": "README.md", "score": 0.74}),
+            json!({"file": "src/token.rs", "score": 0.72}),
+        ];
+        let (dc, da) = member_scores(&docs, &pen);
+        let (ac, _) = member_scores(&api, &pen);
+        assert_eq!(dc, 0.0);
+        assert!((da - 0.81).abs() < 1e-9);
+        assert!((ac - (0.78 + 0.75 + 0.72) / 3.0).abs() < 1e-9, "{ac}");
+        let pick = choose_member(
+            vec![
+                (
+                    "docs-site".into(),
+                    MemberOutcome::Scored {
+                        code: dc,
+                        all: da,
+                        defines: None,
+                    },
+                ),
+                (
+                    "api".into(),
+                    MemberOutcome::Scored {
+                        code: ac,
+                        all: 0.76,
+                        defines: None,
+                    },
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(pick.member, "api");
+        // With no code anywhere, `all` decides.
+        let pick = choose_member(
+            vec![
+                (
+                    "docs-site".into(),
+                    MemberOutcome::Scored {
+                        code: 0.0,
+                        all: 0.81,
+                        defines: None,
+                    },
+                ),
+                (
+                    "api".into(),
+                    MemberOutcome::Scored {
+                        code: 0.0,
+                        all: 0.60,
+                        defines: None,
+                    },
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(pick.member, "docs-site");
+    }
+
+    /// Fixup G (coordinator 1): a group's score fusion reads the retriever's
+    /// score and applies the kind penalty once over the merged list, so a
+    /// docs-only member's README no longer outranks the other member's code.
+    #[test]
+    fn group_fusion_demotes_once_over_the_merged_list() {
+        let docs = vec![
+            json!({"file": "README.md", "score": 0.82}),
+            json!({"file": "docs/a.md", "score": 0.81}),
+        ];
+        let api = vec![
+            json!({"file": "src/a.rs", "score": 0.75}),
+            json!({"file": "src/b.rs", "score": 0.74}),
+            json!({"file": "src/c.rs", "score": 0.73}),
+            json!({"file": "src/d.rs", "score": 0.72}),
+            json!({"file": "src/e.rs", "score": 0.71}),
+            // The member clamped this one; the retriever said 0.80.
+            json!({"file": "src/f.rs", "score": 0.70, "raw_score": 0.80}),
+        ];
+        let fused = fuse_member_hits(
+            vec![("docs-site".into(), docs), ("api".into(), api)],
+            true,
+            &devctx_core::KindPenalty::default(),
+            10,
+        );
+        let files: Vec<&str> = fused.iter().map(|h| field(h, "file")).collect();
+        assert_eq!(
+            files[0], "src/f.rs",
+            "raw score, not the clamped one: {files:?}"
+        );
+        // Ranked first by its cosine, demoted 4 places over the merged list.
+        assert_eq!(
+            files.iter().position(|f| *f == "README.md"),
+            Some(3),
+            "demoted over the merged list: {files:?}"
+        );
+        assert_eq!(field(&fused[0], "project"), "api");
+    }
+
+    /// Fixup G (2b): a different model of the same width is not comparable.
+    #[test]
+    fn group_targets_exclude_another_model_of_the_same_width() {
+        let row = |name: &str, model: &str| ProjectRow {
+            name: name.into(),
+            path: std::env::temp_dir(),
+            group: Some("g".into()),
+            embed_dim: 384,
+            embed_model: model.into(),
+            last_indexed_at: 0,
+        };
+        let members = vec![
+            row("a", "ml-granite"),
+            row("b", "ml-granite"),
+            row("c", "minilm-l6"),
+        ];
+        let (targets, skipped, _, _) = group_targets(&members, None);
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(skipped[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("different model"));
+        // Unknown model (older registry rows) only has to match the width.
+        let members = vec![row("a", "ml-granite"), row("b", "ml-granite"), row("c", "")];
+        assert_eq!(group_targets(&members, None).0.len(), 3);
+    }
+
+    /// Fixup G (11): in a group a `project` must resolve and be a member.
+    #[test]
+    fn group_context_target_rejects_unknown_and_foreign_projects() {
+        let row = |name: &str, path: &str| ProjectRow {
+            name: name.into(),
+            path: PathBuf::from(path),
+            group: None,
+            embed_dim: 0,
+            embed_model: String::new(),
+            last_indexed_at: 0,
+        };
+        let members = vec![row("api", "/w/api"), row("web", "/w/web")];
+        let resolve = |p: &str| match p {
+            "api" | "/w/api/src" => Some(row("api", "/w/api")),
+            "other" => Some(row("other", "/elsewhere/other")),
+            _ => None,
+        };
+        assert_eq!(group_context_target(None, &members, resolve), Ok(None));
+        assert_eq!(
+            group_context_target(Some("/w/api/src"), &members, resolve),
+            Ok(Some("api".into()))
+        );
+        let err = group_context_target(Some("nope"), &members, resolve).unwrap_err();
+        assert!(
+            err.contains("not a registered project") && err.contains("api, web"),
             "{err}"
         );
+        let err = group_context_target(Some("other"), &members, resolve).unwrap_err();
+        assert!(err.contains("not a member of this group"), "{err}");
+    }
+
+    /// A tiny HTTP server answering `/health`, `/search` and `/symbol/…` the
+    /// way a member's `devctx serve` does. `search` is `(status, body)`; with
+    /// `hang` it accepts and never answers (a busy server).
+    fn fake_serve(search: (u16, String), defines: bool, hang: bool) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                let Ok(mut c) = conn else { continue };
+                if hang {
+                    held.push(c);
+                    continue;
+                }
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = c.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text[..h]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= h + 4 + len {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (code, body) = if path == "/health" {
+                    (200, r#"{"status":"ok"}"#.to_string())
+                } else if path == "/search" {
+                    search.clone()
+                } else if path.starts_with("/symbol/") {
+                    let defs = if defines { r#"[{"symbol":"x"}]"# } else { "[]" };
+                    (200, format!(r#"{{"definitions":{defs}}}"#))
+                } else {
+                    (404, String::new())
+                };
+                let _ = write!(
+                    c,
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        addr
+    }
+
+    /// A member checkout with a config, optionally advertising a server.
+    fn fake_member(
+        root: &std::path::Path,
+        name: &str,
+        model: &str,
+        serve: Option<&str>,
+    ) -> ProjectRow {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join(".devctx/state")).unwrap();
+        std::fs::write(
+            dir.join(".devctx/config.yaml"),
+            format!("project:\n  name: {name}\n  path: {}\n", dir.display()),
+        )
+        .unwrap();
+        if let Some(addr) = serve {
+            std::fs::write(
+                dir.join(".devctx/state/serve.json"),
+                format!(r#"{{"addr":"{addr}","pid":1}}"#),
+            )
+            .unwrap();
+        }
+        ProjectRow {
+            name: name.into(),
+            path: dir,
+            group: Some("g".into()),
+            embed_dim: 384,
+            embed_model: model.into(),
+            last_indexed_at: 0,
+        }
+    }
+
+    /// Fixup G (1, 2, 3) end to end: only warm members are scored, over HTTP;
+    /// a failing member and one of another model are named; a cold member is
+    /// never started (no `serve.json` appears); the best warm member wins.
+    #[test]
+    fn pick_group_member_scores_only_warm_members_and_names_the_rest() {
+        let root = std::env::temp_dir().join(format!("devctx_pick_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let hits = |file: &str, s: f64| {
+            format!(
+                r#"{{"results":[{{"file":"{file}","score":{s}}},{{"file":"{file}","score":{s}}},{{"file":"{file}","score":{s}}}]}}"#
+            )
+        };
+        let good = fake_serve((200, hits("src/pay.rs", 0.7)), false, false);
+        let weak = fake_serve((200, hits("src/ui.rs", 0.3)), false, false);
+        let broken = fake_serve((500, "the index is locked".into()), false, false);
+        let busy = fake_serve((200, String::new()), false, true);
+        let members = vec![
+            fake_member(&root, "pay", "ml-granite", Some(&good)),
+            fake_member(&root, "ui", "ml-granite", Some(&weak)),
+            fake_member(&root, "broken", "ml-granite", Some(&broken)),
+            fake_member(&root, "busy", "ml-granite", Some(&busy)),
+            fake_member(&root, "cold", "ml-granite", None),
+            fake_member(&root, "legacy", "minilm-l6", Some(&good)),
+        ];
+        let pick = pick_group_member(
+            &members,
+            "how is a payment charged",
+            &devctx_search::KindSel::default(),
+            Some("ui"),
+        )
+        .unwrap();
+        assert_eq!(pick.member, "pay", "{pick:?}");
+        let l = &pick.label;
+        assert!(l.contains("2 of 6 members scored"), "{l}");
         assert!(
-            choose_member(vec![("api".into(), 0.0), ("web".into(), 0.0)])
-                .unwrap_err()
-                .contains("pass `project`")
+            l.contains("broken (search answered 500: the index is locked)"),
+            "{l}"
         );
-        assert!(choose_member(vec![]).unwrap_err().contains("`project`"));
-        assert_eq!(
-            choose_member(vec![("solo".into(), 0.2)]),
-            Ok(("solo".into(), 1))
+        assert!(l.contains("busy (its server at"), "{l}");
+        assert!(l.contains("cold (no running server)"), "{l}");
+        assert!(l.contains("legacy (different model"), "{l}");
+        assert!(
+            !root.join("cold/.devctx/state/serve.json").exists(),
+            "a cold member must not be started"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup G (3): with every member cold the default answers, and nothing is
+    /// started to find that out.
+    #[test]
+    fn pick_group_member_with_every_member_cold_uses_the_default() {
+        let root = std::env::temp_dir().join(format!("devctx_pick_cold_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let members = vec![
+            fake_member(&root, "a", "m", None),
+            fake_member(&root, "b", "m", None),
+        ];
+        let started = std::time::Instant::now();
+        let pick = pick_group_member(&members, "q", &devctx_search::KindSel::default(), Some("b"))
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(pick.member, "b");
+        assert!(!pick.by_relevance);
+        for m in ["a", "b"] {
+            assert!(!root.join(m).join(".devctx/state/serve.json").exists());
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

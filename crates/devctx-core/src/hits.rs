@@ -108,6 +108,20 @@ pub fn search_hits(v: &Value) -> SearchHits {
     }
 }
 
+/// The score to compare a hit on across stores: `raw_score` (the retriever's
+/// cosine, or RRF in hybrid, before the kind penalty or a cross-encoder
+/// rewrote it) when the hit carries one, else `score`, else `0.0`.
+///
+/// A group's fan-out ranks members against each other; a clamped or reranked
+/// `score` means something different in each store, the retriever's does not
+/// (same model and width, which the fan-out checks).
+pub fn hit_raw_score(hit: &Value) -> f64 {
+    hit.get("raw_score")
+        .and_then(|v| v.as_f64())
+        .or_else(|| hit.get("score").and_then(|v| v.as_f64()))
+        .unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +145,14 @@ mod tests {
         assert_eq!(h.branch_fallback.as_ref().unwrap()["used"], "a");
         assert!(h.warning.is_none() && h.omitted.is_none());
         assert_eq!(h.notes_json().unwrap()["branch_fallback"]["current"], "b");
+    }
+
+    /// Fixup G: cross-store comparisons read the retriever's score.
+    #[test]
+    fn raw_score_wins_over_a_rewritten_score() {
+        assert_eq!(hit_raw_score(&json!({"score": 0.5, "raw_score": 0.8})), 0.8);
+        assert_eq!(hit_raw_score(&json!({"score": 0.5})), 0.5);
+        assert_eq!(hit_raw_score(&json!({})), 0.0);
     }
 
     #[test]

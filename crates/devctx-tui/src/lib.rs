@@ -389,6 +389,7 @@ fn json_to_hit(v: &Value) -> SearchResult {
     let i = |k: &str| v[k].as_i64().unwrap_or(0) as i32;
     SearchResult {
         score: v["score"].as_f64().unwrap_or(0.0) as f32,
+        raw_score: None,
         point: VectorPoint {
             id: String::new(),
             vector: Vec::new(),
@@ -1227,6 +1228,7 @@ mod tests {
     fn dummy(id: &str) -> SearchResult {
         SearchResult {
             score: 1.0,
+            raw_score: None,
             point: VectorPoint {
                 id: id.into(),
                 vector: vec![],

@@ -63,8 +63,43 @@ pub struct VectorPoint {
 pub struct SearchResult {
     /// The matched point.
     pub point: VectorPoint,
-    /// Cosine similarity in `[-1, 1]` (`1 - cosine_distance`).
+    /// Cosine similarity in `[-1, 1]` (`1 - cosine_distance`) as the store
+    /// returns it; later stages may rewrite it (RRF, the kind penalty, the
+    /// cross-encoder), see `raw_score`.
     pub score: f32,
+    /// The retriever's own score (cosine, or the RRF fusion in hybrid) when a
+    /// later stage rewrote `score`: the kind penalty clamps it to keep scores
+    /// monotone after demoting by position, and a cross-encoder replaces it with
+    /// its logit. `None` when `score` is still the retriever's. Read it through
+    /// [`SearchResult::retriever_score`] — comparing hits from two stores (a
+    /// group's fan-out) is only meaningful on this score, never on a rewritten
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_score: Option<f32>,
+}
+
+impl SearchResult {
+    /// A hit with its retriever score and nothing rewritten yet.
+    pub fn new(point: VectorPoint, score: f32) -> Self {
+        SearchResult {
+            point,
+            score,
+            raw_score: None,
+        }
+    }
+
+    /// The retriever's score: `raw_score` when a later stage rewrote `score`.
+    pub fn retriever_score(&self) -> f32 {
+        self.raw_score.unwrap_or(self.score)
+    }
+
+    /// Replace `score`, remembering the retriever's the first time it changes.
+    pub fn rewrite_score(&mut self, score: f32) {
+        if self.raw_score.is_none() && score != self.score {
+            self.raw_score = Some(self.score);
+        }
+        self.score = score;
+    }
 }
 
 /// Equality filters applied to a vector search (all `Some` fields must match).
