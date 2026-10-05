@@ -45,7 +45,7 @@ boost por identificador y dedup estructural).
 - [x] Test: store con el mismo chunk en dos ramas y un método contenido en su clase → 0 duplicados
       `(file,start,end)` y sin el par contenedor/contenido.
 - [x] Test: `search("do_memories_by_symbol", mode: keyword)` → primer resultado es la definición.
-- [x] Repro de campo re-medido en el Resultado.
+- [ ] Repro de campo re-medido en el Resultado. → sin números todavía; se mide en TASK-016 (verificación de campo).
 
 ## Riesgos
 
@@ -81,3 +81,26 @@ fragmento más chico cuando rankea más alto.
    el anclaje con un índice real multi-rama; `anchored` por el camino CLI `--format json` (solo lo marca `do_search` del MCP).
    El test keyword se salta si la extensión FTS no está disponible.
 8. **Números:** sin medición de campo.
+
+### Fixup E (review)
+
+- **B1 (bloqueante):** la contención del dedup se comía las funciones detrás del chunk `file` (1..N, solo resumen)
+  y los métodos detrás del `class`. Ahora `dedup_hits` (devctx-search/src/lib.rs) solo aplica contención entre
+  chunks de *contenido*: `file`/`class`/`doc` (`is_summary`) nunca contienen ni son contenidos; el mismo rango
+  solo se colapsa si además coincide `chunk_level`. `identifier_tokens` descarta nombres de archivo
+  (`state.rs`, `README.md`: lista `FILE_EXTENSIONS`), versiones (`v0.8.4`) y abreviaturas (`e.g`, `i.e`), así
+  "state.rs plan_status_list" ancla la definición y no el resumen del archivo.
+  Tests (fallan en 409c0d4): `a_summary_chunk_never_swallows_the_code_inside_it`,
+  `naming_the_file_and_the_function_keeps_the_definition_first`, `file_names_and_versions_are_not_identifiers`.
+- **I1:** anclaje acotado: máx. 3 tokens (`ANCHOR_TOKENS`), fijados ≤ `max(1, limit/2)`; `Store::symbol_matches`
+  y `Store::symbol_definitions` usan `ends_with(symbol, '.' || ?)` / `'::' || ?` en vez de `LIKE '%.name'`
+  (`_` era comodín). Tests: `anchoring_is_bounded_in_tokens_and_in_share_of_the_answer`,
+  `the_suffix_match_is_literal` (fallan en el padre). Sin índice sobre `vectors.symbol` (con el tope son ≤ 6 scans).
+- **I2:** pool = `max(2×limit, 20, pool del reranker)`; con filtro duro además `max(400, 4×limit)`.
+  Test `dedup_does_not_shorten_the_answer_below_the_limit` (falla en el padre: devolvía 10 de 20).
+- **I3:** criterio de repro de campo destildado (→ TASK-016). Política FTS decidida: los tests *de keyword*
+  (`keyword_mode_needs_no_embedder`, `..._first_in_keyword`, store `keyword_search_ranks_by_bm25`) pasan por
+  `require_fts`, que **falla** si la extensión FTS no carga; solo con `DEVCTX_TEST_ALLOW_NO_FTS=1` se saltan, y
+  avisan `SKIPPED ...`. Los tests híbridos siguen degradando a vector-only (es el comportamiento de producción).
+- Gate: fmt --check; clippy --workspace --all-targets (con y sin `--features gpu`) 0 warnings;
+  `TMPDIR=/var/tmp DEVCTX_MODEL_CACHE=/var/tmp/devctx-test-model-cache cargo test --workspace` verde.

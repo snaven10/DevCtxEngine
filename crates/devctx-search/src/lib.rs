@@ -216,9 +216,14 @@ pub fn search_ranked(
     // reorders what it is handed and nothing else. Measured here, the chunk
     // answering a behaviour question sits at rank 27–52, so a pool of 20 meant
     // no model, however good, was ever shown it.
-    let mut pool = limit.max(reranker.map_or(POOL, |r| r.pool().max(POOL)));
+    //
+    // Twice `limit` at least: the dedup below drops repeated chunks *before*
+    // the cut, and a pool of exactly `limit` would hand back fewer results than
+    // asked for, silently. The hard filters discard after the fetch too, so
+    // they get the same margin on top of their own floor.
+    let mut pool = (limit.saturating_mul(2)).max(reranker.map_or(POOL, |r| r.pool().max(POOL)));
     if opts.filters() {
-        pool = pool.max(FILTERED_POOL);
+        pool = pool.max(FILTERED_POOL).max(limit.saturating_mul(4));
     }
     let candidates = match mode {
         SearchMode::Keyword => store.keyword_search(query, filter, pool)?,
@@ -272,10 +277,141 @@ pub fn search_ranked(
 /// How many definitions one identifier may pin to the front.
 const ANCHOR_MAX: usize = 3;
 
+/// How many identifier tokens of one query are looked up. Each costs one or
+/// two queries over `vectors`; a pasted stack trace names dozens.
+const ANCHOR_TOKENS: usize = 3;
+
+/// Extensions that make `name.ext` a file name rather than `Type.member`.
+const FILE_EXTENSIONS: &[&str] = &[
+    "rs",
+    "md",
+    "markdown",
+    "txt",
+    "rst",
+    "adoc",
+    "toml",
+    "yaml",
+    "yml",
+    "json",
+    "jsonc",
+    "lock",
+    "xml",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "sass",
+    "less",
+    "js",
+    "mjs",
+    "cjs",
+    "jsx",
+    "ts",
+    "tsx",
+    "vue",
+    "svelte",
+    "py",
+    "pyi",
+    "go",
+    "java",
+    "kt",
+    "kts",
+    "scala",
+    "groovy",
+    "gradle",
+    "c",
+    "h",
+    "cc",
+    "cpp",
+    "cxx",
+    "hpp",
+    "hh",
+    "cs",
+    "fs",
+    "swift",
+    "m",
+    "mm",
+    "rb",
+    "php",
+    "pl",
+    "lua",
+    "sh",
+    "bash",
+    "zsh",
+    "ps1",
+    "bat",
+    "sql",
+    "proto",
+    "graphql",
+    "gql",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "properties",
+    "csv",
+    "tsv",
+    "log",
+    "pdf",
+    "png",
+    "jpg",
+    "jpeg",
+    "svg",
+    "gif",
+    "duckdb",
+    "db",
+    "sqlite",
+    "wasm",
+    "dart",
+    "ex",
+    "exs",
+    "erl",
+    "hs",
+    "ml",
+    "clj",
+    "zig",
+    "nim",
+    "r",
+    "jl",
+    "tf",
+    "hcl",
+    "dockerfile",
+    "mk",
+    "cmake",
+];
+
+/// Is this dotted token a file name (`state.rs`), a version (`v0.8.4`) or an
+/// abbreviation (`e.g`, `i.e`) rather than a qualified identifier?
+fn dotted_non_identifier(tok: &str) -> bool {
+    if !tok.contains('.') || tok.contains("::") {
+        return false;
+    }
+    let parts: Vec<&str> = tok.split('.').filter(|p| !p.is_empty()).collect();
+    let last = parts
+        .last()
+        .map(|p| p.to_ascii_lowercase())
+        .unwrap_or_default();
+    if FILE_EXTENSIONS.contains(&last.as_str()) {
+        return true;
+    }
+    // A version: `v0`, `8`, `4` — a segment that is (v +) digits.
+    let numeric = |p: &str| {
+        let d = p.strip_prefix(['v', 'V']).unwrap_or(p);
+        !d.is_empty() && d.chars().all(|c| c.is_ascii_digit())
+    };
+    if parts.iter().skip(1).any(|p| numeric(p)) || parts.first().is_some_and(|p| numeric(p)) {
+        return true;
+    }
+    // Abbreviations: every segment one letter.
+    parts.iter().all(|p| p.chars().count() == 1)
+}
+
 /// The tokens of `query` shaped like an identifier: `snake_case`, `camelCase`
 /// or `PascalCase` with an inner capital, or qualified (`Class.method`,
 /// `module::item`). Plain words are not — pinning every function called
-/// `search` for the query "search" would drown the ranking.
+/// `search` for the query "search" would drown the ranking. Neither are file
+/// names (`state.rs`, whose `file` chunk carries the basename as its symbol),
+/// versions (`v0.8.4`) or abbreviations (`e.g`).
 pub fn identifier_tokens(query: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in query.split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | ':'))) {
@@ -306,6 +442,9 @@ pub fn identifier_tokens(query: &str) -> Vec<String> {
             }
             prev_lower = c.is_lowercase();
         }
+        if dotted_non_identifier(tok) {
+            continue;
+        }
         if starts_ok && (qualified || ((snake || camel) && !tok.contains(['.', ':']))) {
             let t = tok.to_string();
             if !out.contains(&t) {
@@ -324,6 +463,10 @@ pub fn identifier_tokens(query: &str) -> Vec<String> {
 /// score present so the order they were given is the order shown, and the list
 /// is cut back to `limit` afterwards, so the caller never gets more than asked.
 /// A store without symbols (or an error) leaves the ranking untouched.
+///
+/// Bounded twice: only the first [`ANCHOR_TOKENS`] identifiers are looked up,
+/// and pinned definitions take at most half of `limit` (at least one), so the
+/// retrievers' own ranking always keeps the rest of the answer.
 fn anchor_identifiers(
     store: &Store,
     query: &str,
@@ -332,7 +475,8 @@ fn anchor_identifiers(
     ranked: Vec<SearchResult>,
     opts: &RankOptions,
 ) -> Vec<SearchResult> {
-    let tokens = identifier_tokens(query);
+    let mut tokens = identifier_tokens(query);
+    tokens.truncate(ANCHOR_TOKENS);
     if tokens.is_empty() {
         return ranked;
     }
@@ -350,6 +494,7 @@ fn anchor_identifiers(
     // A definition is never demoted by the penalty — the query named it — but
     // an explicit hard filter still applies to it.
     pinned.retain(|p| opts.keeps(path_kind(&p.metadata.file, &p.metadata.language)));
+    pinned.truncate((limit / 2).max(1));
     if pinned.is_empty() {
         return ranked;
     }
@@ -368,11 +513,26 @@ fn anchor_identifiers(
     out
 }
 
+/// Chunk levels that summarise a range rather than hold its code: the `file`
+/// chunk (imports + symbol list, spanning every line), the `class` chunk
+/// (signature + method names, spanning every method) and the `doc` chunk
+/// (prose above a symbol). Their range says where they point, not what they
+/// contain, so they never stand in for — or swallow — the code inside it.
+fn is_summary(level: &str) -> bool {
+    matches!(level, "file" | "class" | "doc")
+}
+
 /// Collapse repeated chunks, keeping the best-ranked of each (input order is
-/// rank order): the same point id; the same `(repo, file, start, end)` — one
-/// chunk reached through several branches; and a range contained in one
-/// already kept for the same file (a method beside its class), in either
-/// direction, so the smaller fragment wins exactly when it ranked higher.
+/// rank order): the same point id; the same `(repo, file, start, end)` at the
+/// same chunk level — one chunk reached through several branches; and, between
+/// *content* chunks only, a range contained in one already kept for the same
+/// file (a nested function beside its parent), in either direction, so the
+/// smaller fragment wins exactly when it ranked higher.
+///
+/// Summary chunks ([`is_summary`]) take no part in containment: a `file`
+/// chunk spans lines `1..N` and, ranked first, would otherwise drop every
+/// function of the file as "contained" — the reader gets the table of
+/// contents instead of the code. The smaller, real chunk always survives.
 /// Rows without a file (memories) only dedup by id.
 pub fn dedup_hits(hits: Vec<SearchResult>) -> Vec<SearchResult> {
     let mut kept: Vec<SearchResult> = Vec::with_capacity(hits.len());
@@ -387,6 +547,12 @@ pub fn dedup_hits(hits: Vec<SearchResult>) -> Vec<SearchResult> {
                 continue;
             }
             let (a, b) = ((m.start_line, m.end_line), (km.start_line, km.end_line));
+            if a == b && m.chunk_level == km.chunk_level {
+                continue 'next;
+            }
+            if is_summary(&m.chunk_level) || is_summary(&km.chunk_level) {
+                continue;
+            }
             let inside = a.0 >= b.0 && a.1 <= b.1;
             let around = b.0 >= a.0 && b.1 <= a.1;
             if inside || around {
@@ -622,7 +788,7 @@ mod tests {
         store
             .upsert(&[point("a", "database pool", [0.0, 1.0, 0.0, 0.0])])
             .unwrap();
-        if !store.rebuild_fts().unwrap() {
+        if !require_fts(&store, "keyword_mode_needs_no_embedder") {
             return;
         }
         let hits = search(
@@ -815,8 +981,11 @@ mod tests {
     #[test]
     fn an_identifier_query_puts_its_definition_first_in_keyword() {
         let store = anchoring_store();
-        if !store.rebuild_fts().unwrap() {
-            return; // FTS extension unavailable.
+        if !require_fts(
+            &store,
+            "an_identifier_query_puts_its_definition_first_in_keyword",
+        ) {
+            return;
         }
         let hits = search(
             &store,
@@ -1084,6 +1253,275 @@ mod tests {
             ..Default::default()
         };
         assert!(!q(&no_tests).contains(&"def".to_string()));
+    }
+
+    fn leveled(mut p: VectorPoint, level: &str, symbol_type: &str) -> VectorPoint {
+        p.metadata.chunk_level = level.into();
+        p.metadata.symbol_type = symbol_type.into();
+        p
+    }
+
+    /// Every file emits a `file` chunk spanning all its lines (a summary:
+    /// imports and a symbol list), and every class a `class` chunk spanning its
+    /// methods. Ranked first, they used to swallow every real chunk inside them
+    /// as "contained" — the answer became the table of contents.
+    #[test]
+    fn a_summary_chunk_never_swallows_the_code_inside_it() {
+        let hit = |p: VectorPoint| SearchResult {
+            score: 1.0,
+            point: p,
+        };
+        let z = [0.0; DIM];
+        let file = leveled(
+            code(
+                "file",
+                "main",
+                "state.rs",
+                (1, 400),
+                "state.rs",
+                "# File",
+                z,
+            ),
+            "file",
+            "file",
+        );
+        let func = code(
+            "fn",
+            "main",
+            "state.rs",
+            (50, 80),
+            "plan_status_list",
+            "fn",
+            z,
+        );
+        let class = leveled(
+            code("cls", "main", "state.rs", (100, 300), "Store", "struct", z),
+            "class",
+            "struct",
+        );
+        let method = code(
+            "m",
+            "main",
+            "state.rs",
+            (120, 140),
+            "Store.get",
+            "fn get",
+            z,
+        );
+
+        let out = ids(&dedup_hits(vec![
+            hit(file.clone()),
+            hit(class.clone()),
+            hit(func.clone()),
+            hit(method.clone()),
+        ]));
+        assert!(out.contains(&"fn".to_string()), "{out:?}");
+        assert!(out.contains(&"m".to_string()), "{out:?}");
+
+        // Content contained in content is still collapsed.
+        let inner = code(
+            "inner",
+            "main",
+            "state.rs",
+            (55, 60),
+            "inner",
+            "fn inner",
+            z,
+        );
+        let out = ids(&dedup_hits(vec![hit(func), hit(inner)]));
+        assert_eq!(out, ["fn"]);
+    }
+
+    /// A query that names the file and the function used to pin the file
+    /// summary (its symbol is the basename), which then swallowed the very
+    /// definition the query asked for.
+    #[test]
+    fn naming_the_file_and_the_function_keeps_the_definition_first() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let d = [0.0, 1.0, 0.0, 0.0];
+        store
+            .upsert(&[
+                leveled(
+                    code(
+                        "file",
+                        "main",
+                        "src/state.rs",
+                        (1, 400),
+                        "state.rs",
+                        "# File: state.rs plan_status_list plan_status_list",
+                        d,
+                    ),
+                    "file",
+                    "file",
+                ),
+                code(
+                    "def",
+                    "main",
+                    "src/state.rs",
+                    (50, 80),
+                    "plan_status_list",
+                    "fn plan_status_list() {}",
+                    [0.0, 0.0, 1.0, 0.0],
+                ),
+            ])
+            .unwrap();
+        let _ = store.rebuild_fts().unwrap();
+        let hits = ids(&search(
+            &store,
+            "state.rs plan_status_list",
+            &SearchFilter::default(),
+            5,
+            SearchMode::Hybrid,
+            Some(&KwEmbedder),
+            None,
+        )
+        .unwrap());
+        assert_eq!(hits.first().map(String::as_str), Some("def"), "{hits:?}");
+    }
+
+    #[test]
+    fn file_names_and_versions_are_not_identifiers() {
+        assert!(identifier_tokens("state.rs").is_empty());
+        assert!(identifier_tokens("see README.md and plan_status.rs").is_empty());
+        assert!(identifier_tokens("release v0.8.4").is_empty());
+        assert!(identifier_tokens("e.g. this, i.e. that").is_empty());
+        assert_eq!(
+            identifier_tokens("state.rs plan_status_list"),
+            ["plan_status_list"]
+        );
+        assert_eq!(identifier_tokens("Card.charge"), ["Card.charge"]);
+    }
+
+    /// A stack trace names dozens of identifiers; each one costs SQL and
+    /// pinned hits must not replace the whole ranking.
+    #[test]
+    fn anchoring_is_bounded_in_tokens_and_in_share_of_the_answer() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mut pts = Vec::new();
+        for i in 0..10 {
+            pts.push(code(
+                &format!("def{i}"),
+                "main",
+                &format!("src/f{i}.rs"),
+                (1, 9),
+                &format!("handler_{i}"),
+                "fn body",
+                [0.0, 0.0, 1.0, 0.0],
+            ));
+            pts.push(code(
+                &format!("hit{i}"),
+                "main",
+                &format!("src/h{i}.rs"),
+                (1, 9),
+                "other",
+                "database",
+                [0.0, 1.0, 0.0, 0.0],
+            ));
+        }
+        store.upsert(&pts).unwrap();
+        let query = (0..10)
+            .map(|i| format!("handler_{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            + " database";
+        let hits = ids(&search(
+            &store,
+            &query,
+            &SearchFilter::default(),
+            6,
+            SearchMode::Hybrid,
+            Some(&KwEmbedder),
+            None,
+        )
+        .unwrap());
+        let pinned = hits.iter().filter(|h| h.starts_with("def")).count();
+        assert!(pinned <= 3, "at most limit/2 pinned: {hits:?}");
+        assert!(pinned >= 1, "anchoring still happens: {hits:?}");
+    }
+
+    /// `_` is a LIKE wildcard: `get_x` must not anchor `Foo.getAx`.
+    #[test]
+    fn the_suffix_match_is_literal() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        store
+            .upsert(&[code(
+                "wrong",
+                "main",
+                "a.rs",
+                (1, 9),
+                "Foo.getAx",
+                "fn",
+                [0.0, 0.0, 1.0, 0.0],
+            )])
+            .unwrap();
+        let m = store
+            .symbol_matches(&SearchFilter::default(), "get_x", 3)
+            .unwrap();
+        assert!(
+            m.is_empty(),
+            "{:?}",
+            m.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        let m = store
+            .symbol_matches(&SearchFilter::default(), "getAx", 3)
+            .unwrap();
+        assert_eq!(m.len(), 1);
+    }
+
+    /// Without a reranker the pool used to be `max(limit, 20)`: whatever the
+    /// dedup dropped shortened the answer below `limit`, silently.
+    #[test]
+    fn dedup_does_not_shorten_the_answer_below_the_limit() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mut pts = Vec::new();
+        for i in 0..30 {
+            // Each pair shares a vector, so they rank side by side.
+            let e = i as f32 * 0.01;
+            let v = [0.0, 1.0, e, 0.0];
+            for b in ["main", "dev"] {
+                pts.push(code(
+                    &format!("c{i}{b}"),
+                    b,
+                    &format!("src/m{i}.rs"),
+                    (1, 9),
+                    "f",
+                    "database",
+                    v,
+                ));
+            }
+        }
+        store.upsert(&pts).unwrap();
+        let hits = search(
+            &store,
+            "database",
+            &SearchFilter::default(),
+            20,
+            SearchMode::Vector,
+            Some(&KwEmbedder),
+            None,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 20, "{:?}", ids(&hits));
+    }
+
+    /// Build the BM25 index for a test that is *about* keyword search.
+    ///
+    /// The FTS extension is expected (bundled DuckDB installs it on first
+    /// use, and CI has the network for it), so its absence fails the test
+    /// rather than letting it pass with nothing asserted. An environment that
+    /// genuinely cannot load it opts out with `DEVCTX_TEST_ALLOW_NO_FTS=1`,
+    /// and the skip is then announced instead of silent.
+    fn require_fts(store: &Store, test: &str) -> bool {
+        if store.rebuild_fts().unwrap() {
+            return true;
+        }
+        assert!(
+            std::env::var_os("DEVCTX_TEST_ALLOW_NO_FTS").is_some(),
+            "{test}: the DuckDB FTS extension could not be loaded; set \
+             DEVCTX_TEST_ALLOW_NO_FTS=1 to skip keyword tests explicitly"
+        );
+        eprintln!("SKIPPED {test}: FTS unavailable (DEVCTX_TEST_ALLOW_NO_FTS)");
+        false
     }
 
     fn ids(hits: &[SearchResult]) -> Vec<String> {

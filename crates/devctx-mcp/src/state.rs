@@ -1618,16 +1618,25 @@ fn fit_plan_status_budget(mut value: Value, budget_tokens: usize) -> String {
             }
         }
     }
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "omitted".to_string(),
-            json!({
-                "count": omitted_blocked + omitted_warnings,
+    // Only a real cut is recorded, and it is merged into whatever `omitted`
+    // the page already carried (a `limit` cut with its `next_offset`) rather
+    // than replacing it: the budget becomes the reason, the counts add up.
+    let by_budget = omitted_blocked + omitted_warnings;
+    if by_budget > 0 {
+        if let Some(obj) = value.as_object_mut() {
+            let prior = obj.get("omitted").cloned().unwrap_or(Value::Null);
+            let by_limit = prior.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let mut note = json!({
+                "count": by_limit + by_budget,
                 "reason": "budget",
                 "blocked": omitted_blocked,
                 "warnings": omitted_warnings,
-            }),
-        );
+            });
+            if let Some(n) = prior.get("next_offset") {
+                note["next_offset"] = n.clone();
+            }
+            obj.insert("omitted".to_string(), note);
+        }
     }
     value.to_string()
 }
@@ -2606,15 +2615,15 @@ pub fn do_search_group(
     let total = fused.len();
     let hits: Vec<Value> = fused.into_iter().take(limit).map(|(_, h)| h).collect();
 
+    // `results`, like a single project's `search`: one key for the rows
+    // whatever the binding (readers go through `devctx_core::search_hits`,
+    // which still accepts the `hits` older servers sent).
     let mut out = json!({
-        "hits": hits,
+        "results": hits,
         "searched_group": true,
         "fused_by": if by_score { "score" } else { "reciprocal_rank" },
     });
-    if total > limit {
-        out["omitted_for_budget"] = json!({ "count": total - limit });
-        out["omitted"] = json!({ "count": total - limit, "reason": "limit" });
-    }
+    note_limit_cut(&mut out, total, limit);
     if !skipped.is_empty() {
         out["skipped_projects"] = json!(skipped);
     }
@@ -2835,12 +2844,9 @@ pub fn do_recall_group(
     let memories: Vec<Value> = ranked.into_iter().take(limit).map(|(_, m)| m).collect();
 
     let mut out = json!({ "memories": memories, "searched_group": true });
-    if total > limit {
-        // What did not fit has to be visible; silence here reads as "there was
-        // nothing else".
-        out["omitted_for_budget"] = json!({ "count": total - limit });
-        out["omitted"] = json!({ "count": total - limit, "reason": "limit" });
-    }
+    // What did not fit has to be visible; silence here reads as "there was
+    // nothing else".
+    note_limit_cut(&mut out, total, limit);
     if !failed.is_empty() {
         out["failed_projects"] = json!(failed);
     }
@@ -2916,7 +2922,7 @@ pub fn do_search_project(
         let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
         format!("{file}:{line}")
     });
-    let mut out = json!({ "project": project, "path": path, "hits": kept });
+    let mut out = json!({ "project": project, "path": path, "results": kept });
     // The child's `omitted_for_budget` names what it dropped; its `omitted` is
     // only the count, so the legacy note is the one worth merging.
     let child = answer
@@ -3472,6 +3478,16 @@ pub fn omitted_note(
         note["next_offset"] = json!(n);
     }
     Some(note)
+}
+
+/// Record a cut by `limit` of a fused answer (group search, group recall):
+/// `omitted{count, reason: "limit"}` only. `omitted_for_budget` names a cut by
+/// the token budget, and saying it here sent readers to retry narrower when
+/// asking for a larger `limit` was the cure.
+fn note_limit_cut(out: &mut Value, total: usize, limit: usize) {
+    if let Some(note) = omitted_note(total.saturating_sub(limit), 0, None) {
+        out["omitted"] = note;
+    }
 }
 
 /// Record a budget cut on an answer object: the legacy `omitted_for_budget`
@@ -4146,8 +4162,9 @@ fn not_found_hints(
         out["external"] = json!(true);
         out["called_from"] = json!(sites);
         out["next_step"] = json!(format!(
-            "`{name}` is called from {sites} place(s) but defined nowhere in this repository \
-             (a library or runtime function); `get_references` lists the call sites"
+            "`{name}` is called from {sites} place(s) but no indexed definition was found on \
+             this branch — likely a library or runtime function, though it may live in a file \
+             the index excludes or on another branch; `get_references` lists the call sites"
         ));
     }
 }
@@ -4248,11 +4265,21 @@ pub fn do_memories_by_file(
         }
     }
 
-    let mut subjects = vec![file.to_string()];
-    subjects.extend(resolved.clone());
+    let subjects = file_subjects(file, resolved.as_deref());
     let out = linked_response(&store, file, linked, file, &subjects, opts)?;
     let plan_tasks = plan_tasks_for_file(&state.plans_root.root, file, resolved.as_deref());
     Ok(with_plan_tasks_field(out, plan_tasks))
+}
+
+/// The paths a memory's `files` field is compared against to call it
+/// `files-field`. A resolved path, when the index found one, is the only
+/// subject: a bare `mod.rs` would otherwise suffix-match every `*/mod.rs` in
+/// any memory and mark it structural.
+fn file_subjects(file: &str, resolved: Option<&str>) -> Vec<String> {
+    match resolved {
+        Some(r) => vec![r.to_string()],
+        None => vec![file.to_string()],
+    }
 }
 
 /// Plan tasks (across all plans in `plans/`) whose `Archivos`/inline-code file references match
@@ -4341,6 +4368,9 @@ fn linked_response(
     opts: MemoriesOpts,
 ) -> Result<String, String> {
     let mut out: Vec<Value> = Vec::new();
+    // Every lookup below stops at LINKED_SCAN_CAP rows, so a `total` reached
+    // through a full one is a floor, not a count — and says so.
+    let mut capped = linked.len() >= LINKED_SCAN_CAP;
 
     // Resolve locally first; whatever is left is a shared memory, which only
     // the central daemon may read.
@@ -4369,16 +4399,19 @@ fn linked_response(
     let mut fallback_used = false;
     if out.is_empty() {
         let mut seen = std::collections::HashSet::new();
-        for m in text_fallback_local(store, fallback_label, file_subject) {
+        let local = text_fallback_local(store, fallback_label, file_subject);
+        capped |= local.len() >= LINKED_SCAN_CAP;
+        for m in local {
             if seen.insert(m["id"].as_str().unwrap_or_default().to_string()) {
                 out.push(m);
             }
         }
         if let Ok(c) = central() {
-            for v in c
+            let shared = c
                 .memories_mentioning(fallback_label, LINKED_SCAN_CAP)
-                .unwrap_or_default()
-            {
+                .unwrap_or_default();
+            capped |= shared.len() >= LINKED_SCAN_CAP;
+            for v in shared {
                 let id = v.get("id").and_then(|i| i.as_str()).unwrap_or_default();
                 if seen.insert(id.to_string()) {
                     let src = fallback_source(
@@ -4389,11 +4422,7 @@ fn linked_response(
                 }
             }
         }
-        // Words matched, but if every memory also names the file in its `files`
-        // field the answer is structural, not a text guess.
-        fallback_used = out
-            .iter()
-            .any(|m| m["link_sources"].as_str() != Some("files-field"));
+        fallback_used = matched_by_text(&out);
     }
 
     out.sort_by(|a, b| {
@@ -4406,7 +4435,19 @@ fn linked_response(
         key(b).cmp(&key(a))
     });
 
-    Ok(linked_answer(subject, out, fallback_used, opts))
+    Ok(linked_answer(subject, out, fallback_used, capped, opts))
+}
+
+/// Whether a text-fallback answer is a word match (`text-inference`) rather
+/// than structural: words matched, but if every memory also names the file in
+/// its `files` field the answer is structural, not a text guess. An empty
+/// fallback found nothing *by text* — it is never a junction answer, which
+/// would claim the recorded links were looked at and came back empty.
+fn matched_by_text(found: &[Value]) -> bool {
+    found.is_empty()
+        || found
+            .iter()
+            .any(|m| m["link_sources"].as_str() != Some("files-field"))
 }
 
 /// The local memories whose text or `files` mention `label`, each marked by
@@ -4461,6 +4502,7 @@ fn linked_answer(
     subject: &str,
     mut out: Vec<Value>,
     fallback_used: bool,
+    capped: bool,
     opts: MemoriesOpts,
 ) -> String {
     // Page, then shrink what is left: five 600-character memories are the
@@ -4486,6 +4528,10 @@ fn linked_answer(
         // Named so a reader knows the results are word matches, not recorded links.
         "matched_by": if fallback_used { "text-inference" } else { "junction" },
     });
+    if capped {
+        // Each lookup stopped at its cap: `total` is at least this many.
+        resp["total_capped"] = json!(true);
+    }
     if let Some(n) = next_offset {
         resp["next_offset"] = json!(n);
     }
@@ -6322,6 +6368,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// Small functions are indexed together, under a symbol that lists them
+    /// (`a, b, c`, or `a, b, c, d +2` past four). A getter that calls nothing is
+    /// never a graph source, so a lookup that only matched whole symbols called
+    /// it "defined nowhere in this repository" — a library function. It is a
+    /// definition, inside the grouped chunk.
+    #[test]
+    fn a_grouped_small_function_is_found_not_external() {
+        let (state, repo) = subdir_project("rs014g");
+        {
+            let store = state.open_store().unwrap();
+            let git = GitRepo::open(&repo).unwrap();
+            let dim = configured_dimension(&state.cfg);
+            let grouped = |id: &str, symbol: &str, text: &str| VectorPoint {
+                id: id.into(),
+                vector: vec![0.0; dim],
+                text: text.into(),
+                metadata: VectorMetadata {
+                    repo: git.short_name(),
+                    branch: "main".into(),
+                    file: "sub/user.rs".into(),
+                    symbol: symbol.into(),
+                    symbol_type: "grouped".into(),
+                    chunk_level: "function".into(),
+                    language: "rust".into(),
+                    start_line: 1,
+                    end_line: 9,
+                    ..Default::default()
+                },
+            };
+            store
+                .upsert(&[
+                    grouped(
+                        "g1",
+                        "get_name, get_age",
+                        "# user.rs > get_name\nfn get_name() {}\n\n# user.rs > get_age\nfn get_age() {}",
+                    ),
+                    grouped(
+                        "g2",
+                        "a1, a2, a3, a4 +1",
+                        "# user.rs > a1\nfn a1() {}\n\n# user.rs > User > hidden_getter\nfn hidden_getter() {}",
+                    ),
+                ])
+                .unwrap();
+            let edge = |target: &str, line: i32| devctx_store::StoredEdge {
+                source: "T.test".into(),
+                target: target.into(),
+                kind: "calls".into(),
+                source_file: "sub/t.rs".into(),
+                line,
+            };
+            store
+                .replace_file_edges(
+                    &git.short_name(),
+                    "main",
+                    "sub/t.rs",
+                    &[
+                        edge("get_age", 3),
+                        edge("hidden_getter", 4),
+                        edge("get_a", 5),
+                    ],
+                )
+                .unwrap();
+        }
+        for name in ["get_age", "hidden_getter"] {
+            let v: Value = serde_json::from_str(&do_read_symbol(&state, name, 5).unwrap()).unwrap();
+            assert!(v.get("external").is_none(), "{name}: {v}");
+            assert_eq!(v["definitions"].as_array().unwrap().len(), 1, "{name}: {v}");
+        }
+        // Element match, not substring: `get_a` is in no list.
+        let v: Value = serde_json::from_str(&do_read_symbol(&state, "get_a", 5).unwrap()).unwrap();
+        assert!(v["definitions"].as_array().unwrap().is_empty(), "{v}");
+        assert_eq!(v["external"], true, "{v}");
+        let step = v["next_step"].as_str().unwrap();
+        assert!(step.contains("no indexed definition"), "{step}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     fn choice(branch: &str, indexed: bool) -> BranchChoice {
         BranchChoice {
             repo: "r".into(),
@@ -6494,6 +6617,53 @@ mod tests {
         assert_eq!(out["omitted_for_budget"]["items"][1], "b");
     }
 
+    /// The budget pass used to write `omitted` unconditionally: a listing with
+    /// nothing to drop got `{count: 0}`, and a page cut (`reason: limit`,
+    /// `next_offset`) was overwritten and lost.
+    #[test]
+    fn the_plan_budget_pass_keeps_the_limit_note() {
+        let plans: Vec<Value> = (0..30)
+            .map(|i| json!({ "id": format!("PLAN-{i:03}"), "title": "x".repeat(40) }))
+            .collect();
+        let listing = json!({
+            "plans": plans,
+            "total": 45,
+            "next_offset": 30,
+            "omitted": { "count": 15, "reason": "limit", "next_offset": 30 },
+        });
+        let v: Value = serde_json::from_str(&fit_plan_status_budget(listing, 50)).unwrap();
+        assert_eq!(
+            v["omitted"],
+            json!({ "count": 15, "reason": "limit", "next_offset": 30 }),
+            "{v}"
+        );
+
+        // Detail mode: a limit note and a budget cut add up.
+        let detail = json!({
+            "ready": [{ "id": "T1" }],
+            "blocked": (0..40).map(|i| json!({ "id": i, "waiting_on": ["T1"] })).collect::<Vec<_>>(),
+            "warnings": ["w".repeat(400)],
+            "omitted": { "count": 2, "reason": "limit" },
+        });
+        let v: Value = serde_json::from_str(&fit_plan_status_budget(detail, 50)).unwrap();
+        assert_eq!(v["omitted"]["count"], 2 + 40 + 1, "{v}");
+        assert_eq!(v["omitted"]["reason"], "budget", "{v}");
+        assert_eq!(v["omitted"]["blocked"], 40, "{v}");
+    }
+
+    /// M9: a group answer cut by `limit` says `omitted{reason: limit}`, never
+    /// the budget alias.
+    #[test]
+    fn a_limit_cut_is_not_reported_as_a_budget_cut() {
+        let mut out = json!({});
+        note_limit_cut(&mut out, 12, 10);
+        assert_eq!(out["omitted"], json!({ "count": 2, "reason": "limit" }));
+        assert!(out.get("omitted_for_budget").is_none(), "{out}");
+        let mut none = json!({});
+        note_limit_cut(&mut none, 3, 10);
+        assert!(none.get("omitted").is_none());
+    }
+
     #[test]
     fn page_window_clamps() {
         assert_eq!(Page::default().window(20, 45), (0, 20));
@@ -6631,6 +6801,7 @@ mod tests {
             "f.rs",
             linked(12, 2000),
             false,
+            false,
             MemoriesOpts::default(),
         ))
         .unwrap();
@@ -6659,7 +6830,8 @@ mod tests {
             full: true,
         };
         let v: Value =
-            serde_json::from_str(&linked_answer("f.rs", linked(2, 2000), true, opts)).unwrap();
+            serde_json::from_str(&linked_answer("f.rs", linked(2, 2000), true, false, opts))
+                .unwrap();
         assert_eq!(v["memories"][0]["content"].as_str().unwrap().len(), 2000);
         assert!(v["memories"][0].get("content_truncated").is_none());
         assert!(v.get("omitted").is_none() && v.get("next_offset").is_none());
@@ -6669,10 +6841,48 @@ mod tests {
             "f.rs",
             linked(1, 100),
             false,
+            false,
             MemoriesOpts::default(),
         ))
         .unwrap();
         assert!(short["memories"][0].get("content_truncated").is_none());
+    }
+
+    /// M2/M3/M4 of the TASK-014 review: a capped scan says its total is a
+    /// floor; an empty text fallback is not a junction answer; a resolved path
+    /// replaces the bare name as the `files-field` subject.
+    #[test]
+    fn linked_answers_flag_caps_and_name_the_match_honestly() {
+        let capped: Value = serde_json::from_str(&linked_answer(
+            "f.rs",
+            linked(3, 10),
+            false,
+            true,
+            MemoriesOpts::default(),
+        ))
+        .unwrap();
+        assert_eq!(capped["total_capped"], true, "{capped}");
+        let exact: Value = serde_json::from_str(&linked_answer(
+            "f.rs",
+            linked(3, 10),
+            false,
+            false,
+            MemoriesOpts::default(),
+        ))
+        .unwrap();
+        assert!(exact.get("total_capped").is_none(), "{exact}");
+
+        assert!(matched_by_text(&[]), "an empty fallback is text-inference");
+        assert!(!matched_by_text(&linked(2, 1)));
+        let mut mixed = linked(2, 1);
+        mixed[1]["link_sources"] = json!("inference");
+        assert!(matched_by_text(&mixed));
+
+        let subj = file_subjects("mod.rs", Some("src/store/mod.rs"));
+        assert_eq!(subj, ["src/store/mod.rs"]);
+        assert_eq!(fallback_source("src/other/mod.rs", &subj), "inference");
+        assert_eq!(fallback_source("src/store/mod.rs", &subj), "files-field");
+        assert_eq!(file_subjects("mod.rs", None), ["mod.rs"]);
     }
 
     /// Pages of memories join up: offset 5 of 12 continues where 0..5 stopped.
@@ -6680,7 +6890,8 @@ mod tests {
     fn linked_memories_page_without_repeating() {
         let ids = |opts: MemoriesOpts| -> Vec<String> {
             let v: Value =
-                serde_json::from_str(&linked_answer("f.rs", linked(12, 10), false, opts)).unwrap();
+                serde_json::from_str(&linked_answer("f.rs", linked(12, 10), false, false, opts))
+                    .unwrap();
             v["memories"]
                 .as_array()
                 .unwrap()

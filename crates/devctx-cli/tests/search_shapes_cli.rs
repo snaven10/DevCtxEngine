@@ -241,9 +241,14 @@ fn group_search_keeps_the_hits_of_a_member_answered_from_a_fallback_branch() {
         "search",
         serde_json::json!({ "query": "alpha_marker", "limit": 10 }),
     );
-    let hits = out["hits"]
+    // One key for the rows, project or group (PLAN-008 review: UNIFY).
+    assert!(
+        out.get("hits").is_none(),
+        "group search still says `hits`: {out}"
+    );
+    let hits = out["results"]
         .as_array()
-        .unwrap_or_else(|| panic!("no hits: {out}"));
+        .unwrap_or_else(|| panic!("no results: {out}"));
     assert!(!hits.is_empty(), "group search found nothing: {out}");
     for h in hits {
         assert!(

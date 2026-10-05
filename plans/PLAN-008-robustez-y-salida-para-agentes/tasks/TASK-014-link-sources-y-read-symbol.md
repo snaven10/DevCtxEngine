@@ -64,3 +64,20 @@ por prefijo/sufijo en SQL y rankear en memoria.
 6. **Contrato JSON:** `read_symbol` sin definiciones agrega `suggestions: [..]` (hasta 5: formas calificadas del grafo y luego nombres cercanos por prefijo/sufijo/contiene/Levenshtein) y, si el nombre es solo target de llamadas, `external: true`, `called_from: N`, `next_step`. `branch_fallback` intacto. `memories_by_file`: en el fallback, `link_sources: "files-field"` si `files` nombra el archivo (ruta normalizada + sufijo); si todas lo son, `matched_by` pasa a `"junction"`.
 7. **No verificado:** rendimiento de `symbol_suggestions` en repos grandes (tope 2000 candidatos por SQL); no se probó la rama central (daemon) del fallback; `memories_by_symbol` no marca `files-field` (su sujeto no es un archivo).
 8. **Números:** n/a.
+
+### Fixup E (review)
+
+- **I4:** `external: true` falso para funciones chicas agrupadas (símbolo `a, b, c`, `symbol_type: grouped`):
+  `Store::symbol_definitions` tiene un tercer paso que busca el nombre como elemento exacto de la lista
+  (sin el sufijo `+n`) o en el encabezado por función del texto (`# file > name` / `# file > Parent > name`),
+  así `read_symbol` devuelve el chunk agrupado como definición. El `next_step` de `external` se suavizó: "no
+  indexed definition was found on this branch — likely a library or runtime function, though it may live in a
+  file the index excludes or on another branch". Test (falla en el padre):
+  `a_grouped_small_function_is_found_not_external` (incluye que `get_a` no matchee por substring).
+- **M4:** con ruta resuelta, el sujeto `files-field` es solo esa ruta (`file_subjects`): un `mod.rs` pelado ya no
+  marca cualquier `*/mod.rs`.
+- **M5:** `symbol_suggestions` rankea en SQL antes del tope (`levenshtein` sobre el último segmento, luego
+  `jaro_winkler_similarity`, luego el nombre para desempatar; LIMIT 200), "contenido en la consulta" solo para
+  símbolos de ≥ 3 caracteres, y excluye símbolos `grouped`. Test
+  `the_closest_symbol_survives_a_flood_of_candidates` (20k candidatos; falla en el padre). Tarda ~20 s por el
+  upsert de 20k filas.

@@ -836,6 +836,9 @@ impl Store {
     /// copy-pasting from `impact` or `get_references` has in hand. Doing the
     /// exact pass first means the common case never pays for the scan.
     ///
+    /// A third pass, only when both miss, finds a small function inside a
+    /// `grouped` chunk (several small functions indexed together).
+    ///
     /// Definitions only — chunks whose `chunk_level` is not a call site — so the
     /// answer is the code of the symbol rather than every place it appears.
     pub fn symbol_definitions(
@@ -862,16 +865,39 @@ impl Store {
 
         // `Card.charge` and `pay.rs::charge` both end in `charge`; anchoring on
         // the separator keeps `recharge` out.
-        let dot = format!("%.{name}");
-        let colons = format!("%::{name}");
+        // `ends_with` rather than `LIKE '%.name'`: `_` is a LIKE wildcard.
         let sql = format!(
             "SELECT {COLS} FROM vectors
              WHERE repo = ? AND branch = ? AND NOT is_deletion
-               AND (symbol LIKE ? OR symbol LIKE ?)
+               AND (ends_with(symbol, '.' || ?) OR ends_with(symbol, '::' || ?))
              ORDER BY file, start_line LIMIT {limit}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([repo, branch, dot.as_str(), colons.as_str()], row_to_point)?;
+        let rows = stmt.query_map([repo, branch, name, name], row_to_point)?;
+        for r in rows {
+            out.push(r?);
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+
+        // Small functions are chunked together under a symbol that lists them
+        // (`a, b, c`, or `a, b, c, d +2` past four names). An exact element of
+        // the list is a definition; so is a name past the cap, which the chunk
+        // text still carries in its per-function header (`# file > name`, or
+        // `# file > Parent > name`). Without this pass a small getter — which
+        // calls nothing, so is never a graph source either — looked external.
+        let sql = format!(
+            "SELECT {COLS} FROM vectors
+             WHERE repo = ? AND branch = ? AND NOT is_deletion
+               AND symbol_type = 'grouped'
+               AND (list_contains(string_split(regexp_replace(symbol, ' \\+[0-9]+$', ''), ', '), ?)
+                    OR contains(text, ' > ' || ? || chr(10))
+                    OR ends_with(text, ' > ' || ?))
+             ORDER BY file, start_line LIMIT {limit}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([repo, branch, name, name, name], row_to_point)?;
         for r in rows {
             out.push(r?);
         }
@@ -881,10 +907,11 @@ impl Store {
     /// Up to `n` symbol names of this repo/branch that `name` could be a slip for.
     ///
     /// Candidates come from SQL by cheap string tests (shared prefix, shared
-    /// suffix, or containing the name, all case-insensitive; capped), and are ranked
-    /// in memory: same name ignoring case, then prefix/suffix/substring, then
-    /// small edit distance on the last path segment. Edit distance runs only on
-    /// the capped candidate set, never on every symbol of a large repo.
+    /// suffix, or containing the name, all case-insensitive), ordered there by
+    /// DuckDB's `levenshtein` / `jaro_winkler_similarity` on the last path
+    /// segment and capped, so the cap is deterministic and keeps the closest
+    /// names. They are then classed in memory: same name ignoring case, then
+    /// prefix/suffix/substring, then small edit distance.
     pub fn symbol_suggestions(
         &self,
         repo: &str,
@@ -901,18 +928,32 @@ impl Store {
             let c: Vec<char> = lname.chars().collect();
             c[c.len().saturating_sub(3)..].iter().collect()
         };
+        // Ranked in SQL before the cap, so the cap keeps the closest names
+        // rather than whichever the scan met first: edit distance on the last
+        // path segment (`Card.charge` → `charge`), then Jaro-Winkler, then the
+        // name itself as a deterministic tie-break. "Contained in the query"
+        // only counts for names of three letters or more — `a` or `id` are
+        // inside almost anything. Grouped chunks list several names in one
+        // symbol (`a, b, c`) and are not a name to suggest.
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT symbol FROM vectors
-             WHERE repo = ? AND branch = ? AND NOT is_deletion
-               AND chunk_level NOT IN ('memory', 'memory_chunk')
-               AND symbol <> ''
-               AND (starts_with(lower(symbol), ?) OR ends_with(lower(symbol), ?)
-                    OR contains(lower(symbol), ?) OR contains(?, lower(symbol)))
-             LIMIT 2000",
+            "SELECT symbol FROM (
+               SELECT DISTINCT symbol, regexp_extract(lower(symbol), '[^.:]*$') AS last
+                 FROM vectors
+                WHERE repo = ? AND branch = ? AND NOT is_deletion
+                  AND chunk_level NOT IN ('memory', 'memory_chunk')
+                  AND symbol_type <> 'grouped'
+                  AND symbol <> ''
+                  AND (starts_with(lower(symbol), ?) OR ends_with(lower(symbol), ?)
+                       OR contains(lower(symbol), ?)
+                       OR (length(symbol) >= 3 AND contains(?, lower(symbol))))
+             )
+             ORDER BY levenshtein(last, ?), jaro_winkler_similarity(last, ?) DESC, symbol
+             LIMIT 200",
         )?;
-        let rows = stmt.query_map(params![repo, branch, head, tail, lname, lname], |r| {
-            r.get::<_, String>(0)
-        })?;
+        let rows = stmt.query_map(
+            params![repo, branch, head, tail, lname, lname, lname, lname],
+            |r| r.get::<_, String>(0),
+        )?;
         let mut cands = Vec::new();
         for r in rows {
             cands.push(r?);
@@ -957,9 +998,11 @@ impl Store {
         if !exact.is_empty() {
             return Ok(exact);
         }
+        // `ends_with`, not `LIKE '%.name'`: `_` is a LIKE wildcard, so
+        // `get_x` would match `Foo.getAx` (and a leading `%` scans anyway).
         run(
-            "symbol LIKE ? OR symbol LIKE ?",
-            vec![format!("%.{name}"), format!("%::{name}")],
+            "ends_with(symbol, '.' || ?) OR ends_with(symbol, '::' || ?)",
+            vec![name.to_string(), name.to_string()],
         )
     }
 
@@ -1621,6 +1664,50 @@ mod suggestion_tests {
         assert_eq!(r[0], "Card.Charge");
         assert_eq!(r[1], "Card.recharge");
         assert_eq!(rank_suggestions("x1", c(&["x1"]), 5), Vec::<String>::new());
+    }
+
+    fn sym(id: &str, symbol: &str) -> VectorPoint {
+        VectorPoint {
+            id: id.into(),
+            vector: vec![0.0; 3],
+            text: String::new(),
+            metadata: VectorMetadata {
+                repo: "r".into(),
+                branch: "main".into(),
+                file: "a.rs".into(),
+                symbol: symbol.into(),
+                symbol_type: "function".into(),
+                chunk_level: "function".into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The candidate cap used to come without an order: past it, which names
+    /// survived was up to the scan, and one- or two-letter symbols (contained
+    /// in almost any name) filled it. The closest name must always be offered.
+    #[test]
+    fn the_closest_symbol_survives_a_flood_of_candidates() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut pts: Vec<VectorPoint> = (0..20000)
+            .map(|i| sym(&format!("n{i}"), &format!("authz_noise_{i:05}")))
+            .collect();
+        for (i, short) in ["a", "u", "t", "h", "se", "rv"].iter().enumerate() {
+            pts.push(sym(&format!("s{i}"), short));
+        }
+        pts.push(sym("g", "AuthService, other"));
+        pts.push(sym("want", "AuthService"));
+        store.upsert(&pts).unwrap();
+        for _ in 0..3 {
+            let r = store
+                .symbol_suggestions("r", "main", "AuthServce", 5)
+                .unwrap();
+            assert_eq!(r.first().map(String::as_str), Some("AuthService"), "{r:?}");
+            assert!(
+                !r.iter().any(|c| c.len() <= 2),
+                "short noise offered: {r:?}"
+            );
+        }
     }
 
     #[test]

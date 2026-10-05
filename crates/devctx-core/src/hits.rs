@@ -4,8 +4,10 @@
 //! # The contract (PLAN-008 TASK-010)
 //!
 //! Those tools **always** answer with an object. The rows live under `results`
-//! (`search`) or `routes` (`search_routes`, `routes_for_handler`); `search_project`
-//! and the group search keep `hits`. Next to the rows, every one may carry:
+//! (`search` — bound to a project or to a group — and `search_project`) or
+//! `routes` (`search_routes`, `routes_for_handler`). Servers before the
+//! PLAN-008 review answered the group search and `search_project` under `hits`;
+//! [`search_hits`] still reads that key. Next to the rows, every one may carry:
 //!
 //! | field | meaning |
 //! |---|---|
@@ -75,7 +77,8 @@ impl SearchHits {
 }
 
 /// Read the object of the contract above, or the legacy bare array. Rows come
-/// from `results` / `routes` (also `hits`, the key of `search_project`), plus
+/// from `results` / `routes` (also `hits`, the key older servers used for
+/// `search_project` and the group search), plus
 /// the optional notes. Anything else yields no
 /// hits: a wrapper object is never mistaken for a hit.
 pub fn search_hits(v: &Value) -> SearchHits {

@@ -129,3 +129,19 @@ de una línea.
    **Desviaciones:** el cursor es `next_offset` (como pide la task), no `next_cursor`; `search` no pagina (top-k
    por `limit`), solo informa `omitted` por presupuesto; el listado MCP/HTTP de `plan_status` ahora pagina
    (el CLI y el hook, no: `plan_status_value_in` sigue completo).
+
+### Fixup E (review)
+
+- **UNIFY:** `search` en grupo (`do_search_group`) y `search_project` (`do_search_project`) responden `results`
+  (antes `hits`); nunca ambas claves. `devctx_core::search_hits` sigue aceptando `hits` (servers viejos); doc del
+  contrato en `devctx-core/src/hits.rs` actualizado; consumidor e2e `search_shapes_cli` lee `results` y
+  verifica que no exista `hits`.
+- **M1:** `fit_plan_status_budget` solo escribe `omitted` si el presupuesto recortó algo, y lo fusiona con el
+  `omitted` de página (suma `count`, conserva `next_offset`, `reason: budget`). Test
+  `the_plan_budget_pass_keeps_the_limit_note`.
+- **M2:** `memories_by_*` agrega `total_capped: true` cuando algún escaneo (junction, fallback local o central)
+  llegó al tope de 200. **M3:** un fallback de texto vacío es `matched_by: "text-inference"` (no `junction`)
+  — `matched_by_text`. Test `linked_answers_flag_caps_and_name_the_match_honestly`.
+- **M9:** la búsqueda y el recall de grupo ya no emiten `omitted_for_budget` por un corte de `limit`; solo
+  `omitted{count, reason: "limit"}` (`note_limit_cut`). Test `a_limit_cut_is_not_reported_as_a_budget_cut`.
+- **Nits:** el doc de percent-encoding pegado a `query_string` pasó a `urlencode` (documentada) en backend.rs.
