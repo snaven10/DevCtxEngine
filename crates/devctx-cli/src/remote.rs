@@ -559,9 +559,14 @@ impl Spawned {
         f.seek(SeekFrom::Start(self.log_offset)).ok()?;
         let mut raw = String::new();
         f.read_to_string(&mut raw).ok()?;
+        // With `RUST_BACKTRACE` set, the error is followed by its backtrace
+        // (anyhow's "Stack backtrace:", a panic's "stack backtrace:"), and the
+        // last lines were stack frames: the cause — DuckDB naming the lock
+        // holder — never reached the caller. The trace is cut off here.
         let lines: Vec<&str> = raw
             .lines()
             .map(str::trim)
+            .take_while(|l| !l.eq_ignore_ascii_case("stack backtrace:"))
             .filter(|l| !l.is_empty() && !l.starts_with("DevCtxEngine API listening"))
             .collect();
         if lines.is_empty() {
@@ -1322,6 +1327,39 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_failure_hint_skips_a_backtrace_and_keeps_the_cause() {
+        let dir = std::env::temp_dir().join(format!("devctx-hint-bt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("serve.log");
+        let stale = "an older failure\n";
+        std::fs::write(
+            &log,
+            format!(
+                "{stale}Error: duckdb: IO Error: Could not set lock on file \"/x/index.duckdb\": \
+                 Conflicting lock is held in /usr/bin/devctx (PID 4242)\n\nCaused by:\n    \
+                 0: IO Error: Conflicting lock (PID 4242)\n    1: Error code 1\n\n\
+                 Stack backtrace:\n   0: anyhow::error\n  23: main\n  24: <unknown>\n  \
+                 25: __libc_start_main\n  26: _start\n"
+            ),
+        )
+        .unwrap();
+        let spawned = Spawned {
+            pid: 0,
+            exited: Default::default(),
+            log: log.clone(),
+            log_offset: stale.len() as u64,
+        };
+        let hint = spawned.failure_hint().expect("a hint");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(is_lock_error(&hint), "{hint}");
+        assert_eq!(lock_holder_pid(&hint), Some(4242), "{hint}");
+        assert!(
+            !hint.contains("_start") && !hint.contains("older"),
+            "{hint}"
+        );
+    }
+
     #[test]
     fn the_lock_holder_pid_is_read_from_duckdbs_message() {
         let msg = "IO Error: Could not set lock on file \"/x/index.duckdb\": Conflicting lock \
