@@ -398,6 +398,22 @@ Cada TASK llena su `## Resultado` con:
   si el CLI se cuelga, se cuelga la suite.
 - **`init` interactivo con granite + offline** guarda un `model_dir` vacío en la config.
 
+## Pendientes después de 0.9.0 (pasada final de bloqueantes sobre `d60370b`)
+
+Ninguno bloquea; quedan para un plan posterior o para PLAN-010 donde encajen.
+
+1. `split_file_symbol` toma `Foo.Bar::baz` como archivo `Foo.Bar` (con `Bar` como extensión) cuando
+   no hay `/` → exigir una extensión conocida o que el archivo exista en el índice.
+2. Un nombre calificado inexistente (`Foo::new`) puede caer en `external: true` por el fallback del
+   último segmento si el `new` del repositorio es hoja → verificar que el último segmento no exista
+   en `vectors` antes de declararlo externo.
+3. Peor caso teórico de `ensure_checked` con varios clientes en frío: ~6 min (3 × (60 s de spawn +
+   60 s de espera)) → deadline global (~90 s).
+4. `a_central_daemon_that_loses_the_race_exits_quietly` depende de tiempos (1,2 s contra una ventana
+   de 5 s) → margen mayor o espera condicionada.
+5. `a_server_run_from_a_renamed_binary_is_stopped_not_orphaned` fallaría en macOS si los tests
+   corrieran ahí → `cfg(target_os = "linux")`.
+
 ## 13. Cierre
 
 <!-- SE LLENA AL CERRAR EL PLAN -->

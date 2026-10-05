@@ -26,6 +26,9 @@ window, honest ranking, and a project-aware `build_context`.
   Opt out with `indexing.include_build: true` (only `/build/`) or
   `indexing.default_excludes: false` (all of them).
 - Ranking changes results: tests, docs and config files rank below code.
+- **`read_symbol` with `external: true` no longer carries a `suggestions` key**
+  (it used to be `[]`). Suggestions are only given for names that look like a
+  typo of something defined in the repository.
 
 ### Added
 
