@@ -596,10 +596,27 @@ pub fn do_search(
         reranker.as_deref(),
     )
     .map_err(|e| e.to_string())?;
-    let items = match hits_to_json(&hits) {
+    let mut items = match hits_to_json(&hits) {
         Value::Array(a) => a,
         other => return serde_json::to_string_pretty(&other).map_err(|e| e.to_string()),
     };
+    // Hits pinned because the query named their symbol say so, so an agent can
+    // tell "ranked first" from "is the definition of what you typed".
+    if mode != SearchMode::Vector {
+        let idents = devctx_search::identifier_tokens(query);
+        for (item, hit) in items.iter_mut().zip(&hits) {
+            let m = &hit.point.metadata;
+            let is_def = !matches!(m.chunk_level.as_str(), "memory" | "memory_chunk")
+                && idents.iter().any(|t| {
+                    m.symbol == *t
+                        || m.symbol.ends_with(&format!(".{t}"))
+                        || m.symbol.ends_with(&format!("::{t}"))
+                });
+            if is_def {
+                item["anchored"] = json!(true);
+            }
+        }
+    }
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");

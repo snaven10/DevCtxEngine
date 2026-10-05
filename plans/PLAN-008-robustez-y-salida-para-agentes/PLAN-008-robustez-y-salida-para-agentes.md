@@ -242,7 +242,7 @@ binario instalado y sugieren reiniciar la sesión.
 | TASK-009 | Higiene de tests: ningún serve sobrevive a la suite (+ B10 SIGTERM, B11 idle) | P0 | TASK-001 | `done` |
 | TASK-010 | `project`, `limit`, paginación y conteo de omitidos en las tools | P1 | TASK-004 | `done` |
 | TASK-011 | Ranking: penalización de tests/docs, `kind`/`include_tests`, excludes por defecto | P1 | — | `pending` |
-| TASK-012 | Dedup de chunks y anclaje por identificador exacto | P1 | TASK-006 | `pending` |
+| TASK-012 | Dedup de chunks y anclaje por identificador exacto | P1 | TASK-006 | `done` |
 | TASK-013 | `build_context`: `project`, selección en grupo y presupuesto por relevancia | P1 | TASK-010, TASK-011, TASK-012 | `pending` |
 | TASK-014 | `link_sources` correcto y sugerencias en `read_symbol` | P1 | TASK-006 | `pending` |
 | TASK-015 | Docs EN + ES | P1 | TASK-013, TASK-014, TASK-007, TASK-005 | `pending` |

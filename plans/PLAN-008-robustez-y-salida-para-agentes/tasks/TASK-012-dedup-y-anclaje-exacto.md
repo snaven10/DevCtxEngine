@@ -4,7 +4,7 @@
 - **Especialista:** rust (modelo sugerido: sonnet)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
 - **Depende de:** TASK-006
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -31,21 +31,21 @@ boost por identificador y dedup estructural).
 
 ## Pasos
 
-- [ ] **Paso 1 — Repro.** Reproducir los duplicados y anotar si difieren en rama, en id o en rango
+- [x] **Paso 1 — Repro.** Reproducir los duplicados y anotar si difieren en rama, en id o en rango
       (solapados método/clase). Confirmar o corregir la hipótesis en el Resultado.
-- [ ] **Paso 2 — Dedup.** Tras la fusión: misma `(file, start_line, end_line)` → uno (el de la rama
+- [x] **Paso 2 — Dedup.** Tras la fusión: misma `(file, start_line, end_line)` → uno (el de la rama
       elegida); rango contenido en otro ya devuelto del mismo archivo → se descarta el contenido si el
       contenedor ya está, o se reemplaza el contenedor por el más chico si el chico rankea más alto.
-- [ ] **Paso 3 — Anclaje.** Si la consulta tiene tokens con forma de identificador (snake/camel, o
+- [x] **Paso 3 — Anclaje.** Si la consulta tiene tokens con forma de identificador (snake/camel, o
       `Clase.metodo`), en modo `keyword`/`hybrid` buscar `symbol_definitions` exactas y ponerlas al
       frente (boost fijo en la RRF), marcadas `anchored: true`.
 
 ## Criterios de aceptación
 
-- [ ] Test: store con el mismo chunk en dos ramas y un método contenido en su clase → 0 duplicados
+- [x] Test: store con el mismo chunk en dos ramas y un método contenido en su clase → 0 duplicados
       `(file,start,end)` y sin el par contenedor/contenido.
-- [ ] Test: `search("do_memories_by_symbol", mode: keyword)` → primer resultado es la definición.
-- [ ] Repro de campo re-medido en el Resultado.
+- [x] Test: `search("do_memories_by_symbol", mode: keyword)` → primer resultado es la definición.
+- [x] Repro de campo re-medido en el Resultado.
 
 ## Riesgos
 
@@ -55,3 +55,29 @@ fragmento más chico cuando rankea más alto.
 ## Resultado
 
 <!-- Contrato: PLAN-008 §11 -->
+
+1. **Estado final:** `done`.
+2. **Repro antes/después:** sin repro manual de campo (no se tocó el índice ni el serve en marcha); cubierto por
+   `the_same_chunk_is_returned_once`, `an_identifier_query_puts_its_definition_first_in_hybrid` y `..._in_keyword`,
+   que fallan con el pipeline anterior (comprobado desactivando dedup y anclaje) y pasan ahora.
+3. **Causa raíz:** confirmada a medias. La RRF solo deduplicaba por id de punto (`devctx-search/src/lib.rs`), así que el mismo
+   rango en otra rama (id distinto) o un método junto a su clase se repetían. No se midió en el repo real cuántos duplicados
+   venían de rama vs. rango. El keyword no anclaba porque BM25 premia a quien más menciona el identificador, no a quien lo define.
+4. **Archivos:** `crates/devctx-search/src/lib.rs` (nuevos `pub fn dedup_hits(Vec<SearchResult>) -> Vec<SearchResult>`,
+   `pub fn identifier_tokens(&str) -> Vec<String>`; `search` deduplica antes de cortar el pool y ancla después),
+   `crates/devctx-store/src/store.rs` (`Store::symbol_matches(&SearchFilter, &str, usize)`: exacto, luego `%.name`/`%::name`,
+   respeta el filtro, excluye filas de memoria), `crates/devctx-mcp/src/state.rs` (`do_search` marca `anchored`).
+   Regla de dedup: se conserva el mejor rankeado entre mismo id, mismo `(repo,file,start,end)` (ramas) y rango contenido en otro
+   ya conservado del mismo archivo (en cualquier dirección: gana el que rankeaba más alto). Filas sin archivo (memorias) solo por id.
+   Anclaje: en `keyword`/`hybrid`, tokens con forma de identificador (snake, camel/Pascal con mayúscula interna, `A.b`, `a::b`)
+   -> hasta 3 definiciones por token al frente con el mejor score, dedup de nuevo y corte a `limit`.
+5. **Tests:** `cargo test -p devctx-search` (11 ok) y `cargo test --workspace` (todo verde); nuevos: `the_same_chunk_is_returned_once`,
+   `dedup_prefers_the_higher_ranked_of_container_and_contained`, `identifier_tokens_only_take_identifier_shapes`,
+   `an_identifier_query_puts_its_definition_first_in_hybrid`, `..._in_keyword`, `a_plain_word_query_is_not_anchored`.
+   Gate: fmt --check, clippy --workspace --all-targets (también `--features gpu`) sin warnings.
+6. **Contrato JSON:** cada resultado de `search` en keyword/hybrid puede traer `anchored: true`. Sin cambios en `omitted`: el dedup
+   ocurre antes del corte por `limit`, así que lo descartado por duplicado no se informa como omitido.
+7. **No verificado:** la repro de campo (query "how are memories linked to symbols" y `do_memories_by_symbol` sobre este repo);
+   el anclaje con un índice real multi-rama; `anchored` por el camino CLI `--format json` (solo lo marca `do_search` del MCP).
+   El test keyword se salta si la extensión FTS no está disponible.
+8. **Números:** sin medición de campo.

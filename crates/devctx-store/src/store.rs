@@ -878,6 +878,49 @@ impl Store {
         Ok(out)
     }
 
+    /// Definitions of `name` among the rows `filter` admits — the exact symbol
+    /// first, then `Class.name` / `mod::name` — without requiring a repo and
+    /// branch the way [`symbol_definitions`](Self::symbol_definitions) does.
+    ///
+    /// Memory rows are never definitions (their `symbol` is a title). Used to
+    /// anchor an identifier query on the code that defines it.
+    pub fn symbol_matches(
+        &self,
+        filter: &SearchFilter,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<VectorPoint>> {
+        let (where_clause, fparams) = build_where(filter);
+        let base = if where_clause.is_empty() {
+            "WHERE chunk_level NOT IN ('memory', 'memory_chunk')".to_string()
+        } else {
+            format!("{where_clause} AND chunk_level NOT IN ('memory', 'memory_chunk')")
+        };
+        let run = |cond: &str, extra: Vec<String>| -> Result<Vec<VectorPoint>> {
+            let sql = format!(
+                "SELECT {COLS} FROM vectors {base} AND ({cond})
+                 ORDER BY file, start_line LIMIT {limit}"
+            );
+            let mut params = fparams.clone();
+            params.extend(extra);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(params), row_to_point)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        };
+        let exact = run("symbol = ?", vec![name.to_string()])?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        run(
+            "symbol LIKE ? OR symbol LIKE ?",
+            vec![format!("%.{name}"), format!("%::{name}")],
+        )
+    }
+
     /// Render a slice of floats as a DuckDB fixed-size array literal.
     fn vec_literal(&self, v: &[f32]) -> String {
         let mut s = String::with_capacity(v.len() * 8 + 16);
