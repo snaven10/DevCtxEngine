@@ -175,6 +175,12 @@ The hook is the cheapest automation that works. See
 Rust — there is no sidecar holding a second copy of anything, and no
 serialization boundary between stages.
 
+Embedding runs **one batch at a time**, 8 texts per batch by default
+(`DEVCTX_EMBED_BATCH_SIZE`): peak memory scales with the batch, and the old
+parallel split peaked at 6.5 GB at batch 8 and 18.2 GB at batch 32. A model that
+nothing has used for 5 minutes is dropped (`DEVCTX_MODEL_IDLE_SECS`), in project
+servers and in the central daemon alike.
+
 Resident memory is dominated by the loaded model. The ~406 MB figure above is a
 384-dimension embedding model plus the store; enabling a cross-encoder adds
 gigabytes, which is the real reason it defaults off.

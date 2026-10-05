@@ -245,7 +245,7 @@ binario instalado y sugieren reiniciar la sesión.
 | TASK-012 | Dedup de chunks y anclaje por identificador exacto | P1 | TASK-006 | `done` |
 | TASK-013 | `build_context`: `project`, selección en grupo y presupuesto por relevancia | P1 | TASK-010, TASK-011, TASK-012 | `done` |
 | TASK-014 | `link_sources` correcto y sugerencias en `read_symbol` | P1 | TASK-006 | `done` |
-| TASK-015 | Docs EN + ES | P1 | TASK-013, TASK-014, TASK-007, TASK-005 | `pending` |
+| TASK-015 | Docs EN + ES | P1 | TASK-013, TASK-014, TASK-007, TASK-005 | `done` |
 | TASK-016 | Verificación de campo en `~/revfa` y este repo, antes/después | P1 | TASK-015, TASK-017 | `pending` |
 | TASK-017 | Pendientes del review de P0: idle exit, `in_tx`, procown fuera de Linux, transacciones y tests | P1 | — | `done` |
 

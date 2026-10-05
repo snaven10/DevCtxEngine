@@ -116,6 +116,25 @@ The first two mean something connected this memory to this code at write time.
 `inference` means the text happens to line up. A caller weighing whether to
 trust a link should read this field.
 
+`files-field` is also reported by the text fallback of `memories_by_file`: when
+the junction row is missing (the memory was saved before the graph existed, was
+imported or migrated, or the caller spelled the path differently) but the
+memory's `files` names the file — compared after normalising the path, and by
+suffix, so `a.rs` and `src/a.rs` meet. If every result is of that kind,
+`matched_by` is `junction`; a text match with no `files` evidence stays
+`text-inference`. `memories_by_symbol` has no file subject, so it never reports
+`files-field`.
+
+### Paging the by-code tools
+
+`memories_by_symbol` and `memories_by_file` return **5 memories** by default, each
+`content` cut to **600 characters** (`content_truncated: true` and
+`content_chars` say so, and the `id` fetches the rest). They take `limit`,
+`offset`, `full: true` (whole contents) and `project`, and answer
+`{subject, memories, total, matched_by, next_offset?, omitted?, …}`; `total_capped:
+true` means the scan stopped at 200 links. This cuts ~2.5k tokens per memory to
+about 150.
+
 ### Backfilling old memories
 
 Memories written before the junction existed — migrated, imported, or saved by

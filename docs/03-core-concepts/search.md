@@ -175,10 +175,127 @@ models do not live in the same space.
 If your code or comments are not in English, pick a multilingual model. The
 English models will embed Spanish perfectly happily — just badly.
 
+## Ranking: what rises and what sinks
+
+Retrieval finds candidates; four steps decide what the agent sees first.
+
+### File kind and the penalty
+
+Every hit is classified from its path (and language) as one of four **kinds**,
+checked in this order, first match wins:
+
+| Kind | What matches |
+|---|---|
+| `test` | `test/`, `tests/`, `__tests__`, `__mocks__`, `spec/`, `e2e/`, `testdata`, `fixtures`; `*_test.*`, `test_*`, `*.test.*`, `*.spec.*`, `*.cy.*`, `conftest.py`, and `*Test` / `*Tests` / `*IT` in Java/Kotlin/Scala/Groovy/C#/PHP/Swift (`Contest.java` is code) |
+| `doc` | `*.md`, `*.mdx`, `*.rst`, `*.adoc`, `*.txt`, `docs/`, `README*`, `CHANGELOG*`, `LICENSE*`, `CONTRIBUTING*` |
+| `config` | `*.sql`, `*.yaml`, `*.yml`, `*.json`, `*.toml`, `*.xml`, `*.properties`, `*.ini`, `*.cfg`, `*.conf`, `requirements*.txt` |
+| `code` | everything else; memories have no file and count as code |
+
+Tests, docs and config are **demoted, not excluded**. The factor in config
+(`search.penalty.test|doc|config`, default `0.6` each) is turned into a number
+of positions — `round((1 − factor) × 10)`, so `0.6` ranks a hit as if it were
+four places lower — because scores have no common scale across modes (cosines,
+RRF fractions, cross-encoder logits). Ties go to the unpenalised hit, scores
+stay monotone (a demoted hit never shows a higher score than the one above it;
+`raw_score` keeps the retriever's own number), and the demotion is capped at
+`(limit − 1) / 2` positions so a small `limit` cannot push the best hit out of
+the answer. `1.0` turns a kind's penalty off; `0.0` sends it to the end.
+
+```yaml
+# .devctx/config.yaml
+search:
+  penalty:
+    test: 0.6
+    doc: 0.6
+    config: 0.6
+```
+
+### Hard filters: `kind` and `include_tests`
+
+When a demotion is not enough, filter:
+
+```bash
+devctx search "token refresh" --kind code        # only code
+devctx search "token refresh" --kind test        # only tests
+devctx search "token refresh" --no-tests         # everything but tests
+```
+
+On the MCP tool: `kind: "code" | "test" | "doc" | "config"` and
+`include_tests: false`. An explicit `kind` wins over `include_tests`; an invalid
+`kind` fails with ``` `kind` must be one of code, test, doc, config ```. Both
+also apply to `search_project`, to group-wide search and to `build_context`.
+
+### Dedup
+
+The same chunk is returned once. A hit is dropped when another, better-ranked,
+has the same id, the same `(file, start, end)` — the same range indexed on two
+branches — or a range *contained in* a content chunk of the same file. Summary
+chunks (`file`, `class`, `doc`) never swallow the code inside them: a function
+behind its file's summary chunk is still a result. Dedup runs before the cut to
+`limit`, so what it drops is not reported as omitted.
+
+### Identifier anchoring
+
+In `keyword` and `hybrid` mode BM25 rewards whoever *mentions* an identifier
+most, not whoever *defines* it. So a query containing identifier-shaped tokens —
+`snake_case`, `camelCase` / `PascalCase`, `Foo.bar`, `foo::bar` — looks up
+their definitions in the symbol table and puts them first, marked
+`anchored: true`. Bounded on purpose: at most 3 identifiers per query, at most
+half the answer (never fewer than one), and a matching test copy or mock never
+outranks the production definition. File names (`state.rs`, `README.md`),
+versions (`v0.8.4`) and abbreviations (`e.g`) are not identifiers; neither is a
+plain word. Anchored definitions are not demoted, but a hard `kind` filter still
+removes them.
+
+## What the index leaves out
+
+Search can only rank what was indexed. Since 0.9, vendored and generated paths
+are excluded **by default** even when git tracks them — `node_modules/`,
+`dist/`, `vendor/`, `third_party/`, `bower_components/`, `*.min.js`,
+`*.generated.*`, and `/build/` and `/target/` at the repository root. The list,
+the opt-outs and how a change reconciles are in
+[Configuration](../11-configuration.md#default-excludes) and
+[Keeping the index fresh](../13-keeping-the-index-fresh.md#controlling-what-gets-indexed).
+
 ## Branch awareness
 
 Chunks are stored per `(repo, branch)`. A search returns results for the branch
 you are on, so a symbol deleted on your branch does not surface from `main`.
+
+**When your branch has no rows**, the answer does not go quiet. `search` — and
+the graph tools `read_symbol`, `get_references`, `impact_analysis`,
+`search_routes`, `routes_for_handler` — fall back, in this order, to the
+configured default branch, then the most recently indexed branch that has rows,
+and say so:
+
+```json
+"branch_fallback": {
+  "current": "feat/plan-124",
+  "used": "main",
+  "why": "current branch feat/plan-124 is not indexed; answering from branch main"
+}
+```
+
+(`is indexed but empty` when the branch has a record but no rows.) With no
+indexed branch at all the call fails with `<repo> has no index for any branch;
+run devctx index`. `index_status` reports `indexed: false` with
+`indexed_branches` (most recent first) and a hint naming the branch that would be
+used. The fallback is a lie of omission if you ignore it: the symbol you are
+about to edit on your branch may differ from the one the answer describes.
+
+### A stale extractor
+
+The index records which extractor produced it (`index_meta`: a version plus a
+hash of the language definitions). When that differs from the running binary —
+or there is no record, as in any index made by 0.8.2 or earlier —
+`index_status` says `extractor_stale: true` with a hint, and every graph tool
+adds `warning: "index generated by an older extractor …; reindex (devctx index
+--full)"`. Incremental runs never clear it: only `devctx index --full` does, and
+a full run no longer copies rows from a branch that is itself stale. Until then
+a **new** branch re-embeds every file instead of copying from an indexed one.
+`search` itself carries no such warning; it is a retrieval, not an extraction.
+If you change the grammars or `routes.rs`, bump `EXTRACTOR_VERSION` by hand: the
+hash covers only the language JSON files.
 
 Branches you want indexed are declared in config under `indexing.branches`, and
 `devctx index --branch <name>` indexes a named one. Because the copy is driven by
@@ -187,12 +304,19 @@ the two branches share — measured at 95–96% of files on three real
 repositories.
 
 Indexing is worktree-independent: run it from any worktree and it updates the
-one index.
+one index. Which `HEAD` it reads from a linked worktree is covered in
+[Keeping the index fresh](../13-keeping-the-index-fresh.md#from-a-linked-worktree).
 
 ## Filters
 
 `--language <lang>` restricts to one language. `--limit` caps results (default
-10). `--format json` emits a JSON array instead of the table.
+10). `--kind <code|test|doc|config>` and `--no-tests` filter by file kind (see
+above). `--format json` emits an object, `{"results": [...]}`, instead of the
+table; each hit has `score`, `file`, `start_line`, `end_line`, `symbol`,
+`symbol_type`, `level`, `language`, `kind`, `text` and, when relevant,
+`raw_score` and `anchored`. The MCP tool answers the same object, plus
+`branch_fallback`, `omitted` and `warning` when they apply — see
+[MCP integration](mcp-integration.md#return-shapes).
 
 ## Worked example
 

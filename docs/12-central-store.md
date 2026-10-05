@@ -133,8 +133,13 @@ disables that, in which case a lone command opens the store directly — correct
 when nothing else is running, and the reason a single `projects list` still works
 with no daemon at all.
 
-Unlike a project server it loads no model, so startup is a database open and
-nothing more.
+Unlike a project server it loads no model at startup, so startup is a database
+open and nothing more. The first `remember` / `recall` loads the memory embedder;
+after `DEVCTX_MODEL_IDLE_SECS` (300 s by default, `0` = never) without use the
+daemon drops it again and the next call reloads it. While it exits for being idle
+it answers `503` + `X-Devctx-Exiting`, which `CentralClient` retries once against
+the new daemon, and `ensure` waits for an exiting daemon (up to 3 s) rather than
+starting one that would die on the lock.
 
 ## 6. Configuration
 

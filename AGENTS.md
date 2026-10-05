@@ -269,3 +269,38 @@ model makes every search fail with `no output named 'logits'`.
 **Killing processes by matching their command line kills the shell doing the
 matching**, because its own command line contains the pattern. Use
 `devctx serve --stop`.
+
+**An MCP session keeps the code it started with.** After reinstalling the binary,
+restart the AI sessions: `index_status` / `list_projects` report
+`mcp.binary_replaced: true` and a hint when a session is stale. The MCP never
+opens the database — it routes to `devctx serve` — so a stale one no longer locks
+the repository, but it cannot send parameters added since it started.
+
+**A locked database is reported in about two seconds, with the PID.** Read the
+message: it says whether to close an old MCP session or run `devctx serve
+--stop`. When no server will start, the cause is the tail of `serve.log`, next to
+the database. `serve --stop` only signals a process it can verify is this
+project's server; on Windows, and for a PID it cannot verify, it exits non-zero
+and tells you how to release the lock by hand.
+
+**Tool answers are objects.** `search`, `search_routes`, `routes_for_handler`,
+`search_project` and group search return `{results|routes, omitted?,
+branch_fallback?, warning?}`, never a bare array. Check `omitted` and
+`branch_fallback` before trusting an empty or short answer, and `warning` /
+`extractor_stale` before trusting the graph (fix: `devctx index --full`).
+
+**Default excludes change what is indexed.** `node_modules/`, `dist/`, `vendor/`,
+`third_party/`, `bower_components/`, `*.min.js`, `*.generated.*` and the
+repository-root `/build/` and `/target/` are kept out even when tracked. A repo
+whose `build/` is source sets `indexing.include_build: true`; the next
+`devctx index` reconciles incrementally. Running servers hold the config they
+started with, so `devctx serve --stop` after editing it.
+
+**Hooks installed by older versions keep the old block** (no `unset` of `GIT_*`)
+until `devctx hooks install` is run again; devctx strips the git environment
+itself in the meantime.
+
+**Memory knobs.** Embedding is serial, 8 texts per batch (`DEVCTX_EMBED_BATCH_SIZE`);
+unused models are dropped after 300 s (`DEVCTX_MODEL_IDLE_SECS`, also in the
+central daemon). Tests share a model cache in `.devctx-test-models` — see
+`CONTRIBUTING.md`; `cargo run` uses it too unless `DEVCTX_MODEL_CACHE` is set.

@@ -182,11 +182,131 @@ modelos no viven en el mismo espacio.
 Si tu código o tus comentarios no están en inglés, elegí un modelo multilingüe.
 Los modelos en inglés van a embeber español con toda felicidad — solo que mal.
 
+## Ranking: qué sube y qué se hunde
+
+La recuperación encuentra candidatos; cuatro pasos deciden qué ve primero el
+agente.
+
+### Tipo de archivo y penalización
+
+Cada resultado se clasifica por su ruta (y lenguaje) en uno de cuatro **tipos**,
+evaluados en este orden; gana el primero que calza:
+
+| Tipo | Qué calza |
+|---|---|
+| `test` | `test/`, `tests/`, `__tests__`, `__mocks__`, `spec/`, `e2e/`, `testdata`, `fixtures`; `*_test.*`, `test_*`, `*.test.*`, `*.spec.*`, `*.cy.*`, `conftest.py`, y `*Test` / `*Tests` / `*IT` en Java/Kotlin/Scala/Groovy/C#/PHP/Swift (`Contest.java` es código) |
+| `doc` | `*.md`, `*.mdx`, `*.rst`, `*.adoc`, `*.txt`, `docs/`, `README*`, `CHANGELOG*`, `LICENSE*`, `CONTRIBUTING*` |
+| `config` | `*.sql`, `*.yaml`, `*.yml`, `*.json`, `*.toml`, `*.xml`, `*.properties`, `*.ini`, `*.cfg`, `*.conf`, `requirements*.txt` |
+| `code` | todo lo demás; las memorias no tienen archivo y cuentan como código |
+
+Tests, docs y config se **degradan, no se excluyen**. El factor de la config
+(`search.penalty.test|doc|config`, `0.6` cada uno por defecto) se convierte en
+un número de posiciones — `round((1 − factor) × 10)`, así que `0.6` ubica un
+resultado como si estuviera cuatro puestos más abajo — porque los scores no
+tienen una escala común entre modos (cosenos, fracciones RRF, logits del
+cross-encoder). Los empates se los lleva el resultado sin penalizar, los scores
+se mantienen monótonos (un resultado degradado nunca muestra un score mayor que
+el de arriba; `raw_score` conserva el número propio del recuperador) y la
+degradación se topa en `(limit − 1) / 2` posiciones para que un `limit` chico no
+saque de la respuesta al mejor resultado. `1.0` apaga la penalización de un
+tipo; `0.0` lo manda al final.
+
+```yaml
+# .devctx/config.yaml
+search:
+  penalty:
+    test: 0.6
+    doc: 0.6
+    config: 0.6
+```
+
+### Filtros duros: `kind` e `include_tests`
+
+Cuando degradar no alcanza, filtrá:
+
+```bash
+devctx search "token refresh" --kind code        # solo código
+devctx search "token refresh" --kind test        # solo tests
+devctx search "token refresh" --no-tests         # todo menos tests
+```
+
+En la tool MCP: `kind: "code" | "test" | "doc" | "config"` e
+`include_tests: false`. Un `kind` explícito gana sobre `include_tests`; un `kind`
+inválido falla con ``` `kind` must be one of code, test, doc, config ```. Ambos
+aplican también a `search_project`, a la búsqueda de grupo y a `build_context`.
+
+### Deduplicación
+
+El mismo fragmento se devuelve una sola vez. Un resultado se descarta cuando otro,
+mejor rankeado, tiene el mismo id, el mismo `(archivo, inicio, fin)` — el mismo
+rango indexado en dos ramas — o un rango *contenido* en un fragmento de
+contenido del mismo archivo. Los fragmentos resumen (`file`, `class`, `doc`) nunca
+se tragan el código que tienen adentro: una función detrás del fragmento resumen
+de su archivo sigue siendo un resultado. La deduplicación corre antes del corte a
+`limit`, así que lo que descarta no se informa como omitido.
+
+### Anclaje por identificador
+
+En modo `keyword` e `hybrid`, BM25 premia a quien más *menciona* un identificador,
+no a quien lo *define*. Por eso una consulta con tokens con forma de
+identificador — `snake_case`, `camelCase` / `PascalCase`, `Foo.bar`, `foo::bar` —
+busca sus definiciones en la tabla de símbolos y las pone primero, marcadas
+`anchored: true`. Acotado a propósito: como máximo 3 identificadores por consulta,
+como máximo la mitad de la respuesta (nunca menos de uno), y una copia de test o
+un mock que coincida nunca le gana a la definición de producción. Los nombres de
+archivo (`state.rs`, `README.md`), las versiones (`v0.8.4`) y las abreviaturas
+(`e.g`) no son identificadores; una palabra común tampoco. Las definiciones
+ancladas no se degradan, pero un filtro duro de `kind` igual las quita.
+
+## Qué deja afuera el índice
+
+La búsqueda solo puede rankear lo que se indexó. Desde 0.9, las rutas vendorizadas
+y generadas se excluyen **por defecto** aunque git las trackee — `node_modules/`,
+`dist/`, `vendor/`, `third_party/`, `bower_components/`, `*.min.js`,
+`*.generated.*`, y `/build/` y `/target/` en la raíz del repositorio. La lista, los
+opt-outs y cómo se reconcilia un cambio están en
+[Configuración](../11-configuracion.md#excludes-por-defecto) y en
+[Mantener el índice al día](../13-mantener-el-indice-al-dia.md#controlar-qué-se-indexa).
+
 ## Conciencia de ramas
 
 Los fragmentos se guardan por `(repo, rama)`. Una búsqueda devuelve resultados
 de la rama en la que estás, así que un símbolo borrado en tu rama no aparece
 desde `main`.
+
+**Cuando tu rama no tiene filas**, la respuesta no se queda muda. `search` — y las
+tools de grafo `read_symbol`, `get_references`, `impact_analysis`, `search_routes`
+y `routes_for_handler` — caen, en este orden, a la rama por defecto configurada y
+luego a la rama indexada más recientemente que tenga filas, y lo dicen:
+
+```json
+"branch_fallback": {
+  "current": "feat/plan-124",
+  "used": "main",
+  "why": "current branch feat/plan-124 is not indexed; answering from branch main"
+}
+```
+
+(`is indexed but empty` cuando la rama tiene registro pero no filas.) Sin ninguna
+rama indexada la llamada falla con `<repo> has no index for any branch; run devctx
+index`. `index_status` informa `indexed: false` con `indexed_branches` (la más
+reciente primero) y una pista que nombra la rama que se usaría. El fallback es una
+mentira por omisión si lo ignorás: el símbolo que estás por editar en tu rama puede
+ser distinto del que describe la respuesta.
+
+### Un extractor viejo
+
+El índice registra qué extractor lo produjo (`index_meta`: una versión más un hash
+de las definiciones de lenguaje). Cuando eso difiere del binario en ejecución — o
+no hay registro, como en cualquier índice hecho con 0.8.2 o anterior —
+`index_status` dice `extractor_stale: true` con una pista, y cada tool de grafo
+suma `warning: "index generated by an older extractor …; reindex (devctx index
+--full)"`. Las corridas incrementales nunca lo limpian: solo `devctx index --full`,
+y una corrida completa ya no copia filas de una rama que a su vez está vieja.
+Hasta entonces una rama **nueva** re-embebe todos los archivos en vez de copiar de
+una ya indexada. `search` en sí no lleva ese aviso: es una recuperación, no una
+extracción. Si cambiás las gramáticas o `routes.rs`, subí `EXTRACTOR_VERSION` a
+mano: el hash cubre solo los JSON de lenguajes.
 
 Las ramas que querés indexadas se declaran en la configuración bajo
 `indexing.branches`, y `devctx index --branch <nombre>` indexa una en concreto.
@@ -195,12 +315,19 @@ re-embeber todo lo que las dos comparten — medido en 95–96% de los archivos
 sobre tres repositorios reales.
 
 Indexar es independiente del worktree: corrélo desde cualquiera y actualiza el
-mismo índice.
+mismo índice. Qué `HEAD` lee desde un worktree enlazado está en
+[Mantener el índice al día](../13-mantener-el-indice-al-dia.md#desde-un-worktree-enlazado).
 
 ## Filtros
 
 `--language <lang>` restringe a un lenguaje. `--limit` limita resultados
-(default 10). `--format json` emite un arreglo JSON en vez de la tabla.
+(default 10). `--kind <code|test|doc|config>` y `--no-tests` filtran por tipo de
+archivo (ver arriba). `--format json` emite un objeto, `{"results": [...]}`, en
+vez de la tabla; cada resultado tiene `score`, `file`, `start_line`, `end_line`,
+`symbol`, `symbol_type`, `level`, `language`, `kind`, `text` y, cuando
+corresponde, `raw_score` y `anchored`. La tool MCP responde el mismo objeto, más
+`branch_fallback`, `omitted` y `warning` cuando aplican — ver
+[Integración MCP](integracion-mcp.md#formas-de-retorno).
 
 ## Ejemplo trabajado
 

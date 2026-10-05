@@ -136,8 +136,14 @@ levanta uno en segundo plano y se apaga solo tras 15 minutos de inactividad.
 directamente — correcto cuando no hay nada más corriendo, y la razón de que un
 `projects list` solitario siga funcionando sin daemon alguno.
 
-A diferencia del servidor de un proyecto, no carga ningún modelo: arrancar es
-abrir una base de datos y nada más.
+A diferencia del servidor de un proyecto, no carga ningún modelo al arrancar:
+arrancar es abrir una base de datos y nada más. El primer `remember` / `recall`
+carga el embedder de memorias; tras `DEVCTX_MODEL_IDLE_SECS` (300 s por defecto,
+`0` = nunca) sin uso, el daemon lo suelta y la siguiente llamada lo recarga.
+Mientras sale por inactividad responde `503` + `X-Devctx-Exiting`, que
+`CentralClient` reintenta una vez contra el daemon nuevo, y `ensure` espera a un
+daemon que está saliendo (hasta 3 s) en vez de lanzar uno que moriría contra el
+lock.
 
 ## 6. Configuración
 
