@@ -4634,15 +4634,38 @@ pub struct GroupPick {
     /// (another model or width, checkout missing): a cached reuse must not
     /// read as if the whole group had been looked at.
     pub not_comparable: Vec<String>,
+    /// Set when comparable members could not be scored: how far the comparison
+    /// got and which unscored members the question names, so an agent can
+    /// retry with `project` (L, B1). Rendered as a `[devctx] selection: {json}` line.
+    pub selection: Option<Selection>,
+}
+
+/// The machine-readable coverage of a partial group selection.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Selection {
+    /// Members that were scored.
+    pub scored: usize,
+    /// Members of the group.
+    pub total: usize,
+    /// Unscored members whose name or description the question names (shared
+    /// words filtered out), best first: the ones to pass as `project`.
+    pub candidates: Vec<String>,
 }
 
 impl GroupPick {
-    /// The label plus the warning line, for the brief's first lines.
+    /// The label, the warning and, for a partial comparison, the `selection`
+    /// line, for the brief's first lines.
     pub fn header(&self) -> String {
-        match &self.warning {
+        let mut h = match &self.warning {
             Some(w) => format!("{}\n[devctx] {w}", self.label),
             None => self.label.clone(),
+        };
+        if let Some(sel) = &self.selection {
+            if let Ok(json) = serde_json::to_string(sel) {
+                h.push_str(&format!("\n[devctx] selection: {json}"));
+            }
         }
+        h
     }
 
     /// Worth reusing for the same question: every comparable member was
@@ -4830,18 +4853,25 @@ pub fn choose_member(
     }
     let coverage = pick_coverage(total, scored.len(), &failed, &busy, &not);
     let offer: Vec<&String> = named.iter().filter(|n| unscored.contains(n)).collect();
+    let offer_names: Vec<String> = offer.iter().map(|s| s.to_string()).collect();
     let offer = if offer.is_empty() {
         String::new()
     } else {
         format!(
-            " Named by the question (name or description): {}.",
+            " Likely (named by the question): {} — pass `project={}`.",
             offer
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            offer[0]
         )
     };
+    let selection = (!unscored.is_empty()).then(|| Selection {
+        scored: scored.len(),
+        total,
+        candidates: offer_names.clone(),
+    });
     if scored.is_empty() {
         // Nobody scored. Even when members FAILED (an error answer, an
         // unreadable one) the default answers when there is one: the failures
@@ -4860,6 +4890,7 @@ pub fn choose_member(
                 score: 0.0,
                 compared: 0,
                 not_comparable: not_comparable.clone(),
+                selection: selection.clone(),
             }),
             None => Err(format!(
                 "no member of this group could be scored, so none can be chosen by relevance; \
@@ -4926,6 +4957,7 @@ pub fn choose_member(
             score: 0.0,
             compared: scored.len(),
             not_comparable,
+            selection: selection.clone(),
         });
     }
     let mut warnings: Vec<String> = Vec::new();
@@ -4975,6 +5007,7 @@ pub fn choose_member(
         score: base(best),
         compared: scored.len(),
         not_comparable,
+        selection,
     })
 }
 
@@ -5549,6 +5582,7 @@ fn not_found_hints(
     out: &mut Value,
 ) {
     const MAX_SUGGESTIONS: usize = 5;
+    let external = store.external_call_sites(repo, branch, name);
     let mut suggestions: Vec<String> = store
         .resolve_symbol(repo, branch, name)
         .unwrap_or_default()
@@ -5556,16 +5590,23 @@ fn not_found_hints(
         .filter(|q| q != name)
         .take(MAX_SUGGESTIONS)
         .collect();
-    for c in store
-        .symbol_suggestions(repo, branch, name, MAX_SUGGESTIONS)
-        .unwrap_or_default()
-    {
-        if suggestions.len() < MAX_SUGGESTIONS && !suggestions.contains(&c) {
-            suggestions.push(c);
+    // A library function has no near miss in this repo: `with_context` is not a
+    // slip for `build_context`. Only the qualified forms of the same name (above)
+    // are worth offering then.
+    if !matches!(external, Ok(Some(_))) {
+        for c in store
+            .symbol_suggestions(repo, branch, name, MAX_SUGGESTIONS)
+            .unwrap_or_default()
+        {
+            if suggestions.len() < MAX_SUGGESTIONS && !suggestions.contains(&c) {
+                suggestions.push(c);
+            }
         }
+        out["suggestions"] = json!(suggestions);
+    } else if !suggestions.is_empty() {
+        out["suggestions"] = json!(suggestions);
     }
-    out["suggestions"] = json!(suggestions);
-    if let Ok(Some(sites)) = store.external_call_sites(repo, branch, name) {
+    if let Ok(Some(sites)) = external {
         out["external"] = json!(true);
         out["called_from"] = json!(sites);
         out["next_step"] = json!(format!(
@@ -5574,6 +5615,36 @@ fn not_found_hints(
              the index excludes or on another branch; `get_references` lists the call sites"
         ));
     }
+}
+
+/// `file::symbol` split into its two halves when the left one is a file (it has a
+/// `/`, or an extension: `links.rs`), not a module path (`devctx_store::Store`).
+fn split_file_symbol(subject: &str) -> Option<(&str, &str)> {
+    let (file, name) = subject.rsplit_once("::")?;
+    if file.is_empty() || name.is_empty() || file.contains("::") && !file.contains('/') {
+        return None;
+    }
+    let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    let has_ext =
+        !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric());
+    (file.contains('/') || has_ext).then_some((file, name))
+}
+
+/// What a `memories_by_symbol` subject looks up: the name the junction holds and
+/// the files a memory's `files` field is compared against (empty for a bare name).
+fn symbol_query<'a>(store: &devctx_store::Store, subject: &'a str) -> (&'a str, Vec<String>) {
+    let Some((file, name)) = split_file_symbol(subject) else {
+        return (subject, Vec::new());
+    };
+    let resolved = (!file.contains('/'))
+        .then(|| {
+            store
+                .file_index()
+                .ok()
+                .and_then(|index| index.resolve(&[file.to_string()]).into_iter().next())
+        })
+        .flatten();
+    (name, file_subjects(file, resolved.as_deref()))
 }
 
 /// `memories_by_symbol` tool: the decisions recorded about a symbol.
@@ -5596,15 +5667,20 @@ pub fn do_memories_by_symbol(
     // the branch that was indexed, which is not the checked-out one on a branch
     // nobody has indexed yet.
     let (repo, branch, fallback) = symbol_branch(state, &store);
+    // `links.rs::memories_by_symbol` / `crates/x/links.rs::memories_by_symbol`:
+    // the file part is not part of the name the junction holds; it is the file
+    // a memory's `files` field is compared against (otherwise a memory that
+    // names that very file reads as `inference`).
+    let (lookup, file_subject) = symbol_query(&store, symbol);
     let linked = store
-        .memory_ids_for_symbol(symbol, &repo, &branch, LINKED_SCAN_CAP)
+        .memory_ids_for_symbol(lookup, &repo, &branch, LINKED_SCAN_CAP)
         .map_err(|e| e.to_string())?;
     let raw = linked_response(
         &store,
         symbol,
         linked,
-        devctx_store::short_label(symbol),
-        &[],
+        devctx_store::short_label(lookup),
+        &file_subject,
         opts,
     )?;
     let Some(f) = fallback else {
@@ -7853,7 +7929,7 @@ mod tests {
         assert!(w.contains("api, m0, m1"), "{w}");
         assert!(w.contains("Pass `project`"), "{w}");
         assert!(
-            w.contains("Named by the question (name or description): m3."),
+            w.contains("Likely (named by the question): m3 — pass `project=m3`."),
             "{w}"
         );
         assert!(pick.header().contains("\n[devctx] compared only"));
@@ -7992,7 +8068,7 @@ mod tests {
         let w = pick.warning.unwrap();
         assert!(w.contains("not chosen by relevance"), "{w}");
         assert!(
-            w.contains("Named by the question (name or description): api."),
+            w.contains("Likely (named by the question): api — pass `project=api`."),
             "{w}"
         );
     }
@@ -8511,7 +8587,7 @@ mod tests {
         assert!(h.contains("\n[devctx] compared only 1 of 3"), "{h}");
         assert!(h.contains("front, payments could not be scored"), "{h}");
         assert!(
-            h.contains("Named by the question (name or description): payments."),
+            h.contains("Likely (named by the question): payments — pass `project=payments`."),
             "{h}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -8980,6 +9056,52 @@ mod tests {
         assert!(name_candidates(&m, "stat").is_empty());
     }
 
+    /// Fixup L (B1): a partial comparison says which unscored members the
+    /// question names ("likely: X — pass project=X") and carries a
+    /// machine-readable `selection` line an agent can retry from.
+    #[test]
+    fn a_partial_selection_offers_candidates_machine_readably() {
+        let outcomes = vec![
+            ("front".to_string(), scored(0.55)),
+            (
+                "api".into(),
+                MemberOutcome::Cold("no running server".into()),
+            ),
+            (
+                "ops".into(),
+                MemberOutcome::Cold("no running server".into()),
+            ),
+        ];
+        let named = vec!["api".to_string(), "front".to_string()];
+        let pick = choose_member(outcomes, Some("front"), &named).unwrap();
+        let sel = pick.selection.clone().expect("a partial selection");
+        assert_eq!(
+            sel,
+            Selection {
+                scored: 1,
+                total: 3,
+                candidates: vec!["api".into()]
+            },
+            "only unscored members the question names are candidates"
+        );
+        let h = pick.header();
+        assert!(
+            h.contains("Likely (named by the question): api — pass `project=api`."),
+            "{h}"
+        );
+        assert!(
+            h.contains(r#"[devctx] selection: {"scored":1,"total":3,"candidates":["api"]}"#),
+            "{h}"
+        );
+        // Fully compared: nothing partial to report.
+        let all = vec![("a".to_string(), scored(0.6)), ("b".into(), scored(0.1))];
+        assert!(choose_member(all, None, &[]).unwrap().selection.is_none());
+        // Nobody scored, default answers: still reported.
+        let cold = vec![("a".to_string(), MemberOutcome::Cold("x".into()))];
+        let p = choose_member(cold, Some("a"), &[]).unwrap();
+        assert_eq!(p.selection.unwrap().scored, 0);
+    }
+
     /// Fixup I (nit): the penalty reads the member's registered config path.
     #[test]
     fn group_penalty_uses_the_registered_config_path() {
@@ -9013,6 +9135,7 @@ mod tests {
             score: 0.6,
             compared: 2,
             not_comparable: vec!["legacy".into()],
+            selection: None,
         };
         let h = pick.cached_header(Duration::from_secs(5));
         assert!(h.contains("not comparable then: legacy"), "{h}");
@@ -9223,6 +9346,49 @@ mod tests {
         assert_eq!(src("m_text").as_deref(), Some("inference"));
     }
 
+    /// Fixup L (B4): `links.rs::memories_by_symbol` splits into the symbol and
+    /// the file, so a memory naming that file is `files-field` (not `inference`).
+    #[test]
+    fn a_file_qualified_symbol_matches_files_field_against_its_file() {
+        assert_eq!(
+            split_file_symbol("links.rs::memories_by_symbol"),
+            Some(("links.rs", "memories_by_symbol"))
+        );
+        assert_eq!(
+            split_file_symbol("crates/devctx-memory/src/links.rs::memories_by_symbol"),
+            Some(("crates/devctx-memory/src/links.rs", "memories_by_symbol"))
+        );
+        assert_eq!(
+            split_file_symbol("devctx_store::Store"),
+            None,
+            "a module path"
+        );
+        assert_eq!(split_file_symbol("memories_by_symbol"), None);
+        assert_eq!(split_file_symbol("Store.open"), None);
+
+        let store = Store::open_in_memory(GRAPH_DIM).unwrap();
+        store
+            .upsert_memory(&devctx_store::Memory {
+                id: "m1".into(),
+                title: "links".into(),
+                content: "memories_by_symbol falls back to text".into(),
+                files: "crates/devctx-memory/src/links.rs".into(),
+                updated_at: "2026-10-04T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let (name, subject) = symbol_query(&store, "links.rs::memories_by_symbol");
+        assert_eq!(name, "memories_by_symbol");
+        assert_eq!(subject, vec!["links.rs".to_string()]);
+        let hits = text_fallback_local(&store, devctx_store::short_label(name), &subject);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0]["link_sources"], "files-field", "{hits:?}");
+        // Another file's name keeps it an inference.
+        let (n2, other) = symbol_query(&store, "other.rs::memories_by_symbol");
+        let hits = text_fallback_local(&store, devctx_store::short_label(n2), &other);
+        assert_eq!(hits[0]["link_sources"], "inference", "{hits:?}");
+    }
+
     #[test]
     fn fallback_source_compares_normalized_paths_and_suffixes() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -9304,6 +9470,86 @@ mod tests {
         let found: Value =
             serde_json::from_str(&do_read_symbol(&state, "greet", 5).unwrap()).unwrap();
         assert!(found.get("suggestions").is_none() && found.get("external").is_none());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Fixup L (B2/B3): a qualified library call is external too (the edge may
+    /// hold only the bare callee), and an external gets no fuzzy suggestions
+    /// from this repo (`with_context` is not a slip for `build_context`).
+    #[test]
+    fn qualified_externals_are_found_and_get_no_noisy_suggestions() {
+        let (state, repo) = subdir_project("l_b2");
+        {
+            let store = state.open_store().unwrap();
+            let git = GitRepo::open(&repo).unwrap();
+            let dim = configured_dimension(&state.cfg);
+            store
+                .upsert(&[VectorPoint {
+                    id: "bc".into(),
+                    vector: vec![0.0; dim],
+                    text: "fn build_context() {}".into(),
+                    metadata: VectorMetadata {
+                        repo: git.short_name(),
+                        branch: "main".into(),
+                        file: "sub/ctx.rs".into(),
+                        symbol: "build_context".into(),
+                        symbol_type: "function".into(),
+                        language: "rust".into(),
+                        start_line: 1,
+                        end_line: 1,
+                        ..Default::default()
+                    },
+                }])
+                .unwrap();
+            let edge = |target: &str, line: i32| devctx_store::StoredEdge {
+                source: "T.test".into(),
+                target: target.into(),
+                kind: "calls".into(),
+                source_file: "sub/t.rs".into(),
+                line,
+            };
+            store
+                .replace_file_edges(
+                    &git.short_name(),
+                    "main",
+                    "sub/t.rs",
+                    &[
+                        edge("from_str", 1),
+                        edge("tokio::spawn", 2),
+                        edge("withTransaction", 3),
+                        edge("with_context", 4),
+                    ],
+                )
+                .unwrap();
+        }
+        let read = |n: &str| -> Value {
+            serde_json::from_str(&do_read_symbol(&state, n, 5).unwrap()).unwrap()
+        };
+        for q in [
+            "from_str",
+            "serde_json::from_str",
+            "tokio::spawn",
+            "spawn",
+            "Panache.withTransaction",
+        ] {
+            let v = read(q);
+            assert_eq!(v["external"], true, "{q}: {v}");
+            assert!(v["called_from"].as_u64().unwrap() >= 1, "{q}: {v}");
+        }
+        // Not noisy: no near-miss names of this repo for a library function.
+        let v = read("with_context");
+        assert_eq!(v["external"], true, "{v}");
+        assert!(
+            v.get("suggestions").is_none(),
+            "an external must not suggest `build_context`: {v}"
+        );
+        // A name that is nowhere keeps its suggestions and is not external.
+        let v = read("build_contex");
+        assert!(v.get("external").is_none(), "{v}");
+        assert!(
+            v["suggestions"].to_string().contains("build_context"),
+            "{v}"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 

@@ -42,6 +42,13 @@ pub enum Ownership {
 /// subcommand is the first argument that is not a flag, so `devctx search api`
 /// is not a server.
 pub fn is_server_proc(exe: Option<&str>, cmdline: &[u8]) -> bool {
+    is_server_proc_as(exe, cmdline, false)
+}
+
+/// [`is_server_proc`] where `same_exe` says the process runs the very binary
+/// this process runs: such a process is a `devctx` whatever the file was named
+/// (a copy renamed or installed as `new`, `devctx-0.9`, a test harness).
+pub fn is_server_proc_as(exe: Option<&str>, cmdline: &[u8], same_exe: bool) -> bool {
     let mut args = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty());
     let Some(argv0) = args.next() else {
         return false;
@@ -50,10 +57,25 @@ pub fn is_server_proc(exe: Option<&str>, cmdline: &[u8]) -> bool {
     let path = exe.unwrap_or(&argv0);
     let path = path.strip_suffix(" (deleted)").unwrap_or(path);
     let name = path.rsplit('/').next().unwrap_or("");
-    name.starts_with("devctx")
+    (same_exe || name.starts_with("devctx"))
         && args
             .find(|a| !a.starts_with(b"-"))
             .is_some_and(|a| a == b"serve" || a == b"api")
+}
+
+/// Whether `/proc/<pid>/exe` is the same file as this process's own executable
+/// (same device and inode; works after the file was replaced, the old inode
+/// stays reachable through the link).
+#[cfg(target_os = "linux")]
+fn runs_our_binary(pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(theirs), Ok(ours)) = (
+        std::fs::metadata(format!("/proc/{pid}/exe")),
+        std::fs::metadata("/proc/self/exe"),
+    ) else {
+        return false;
+    };
+    theirs.dev() == ours.dev() && theirs.ino() == ours.ino()
 }
 
 /// Field 22 of a `/proc/<pid>/stat` line. The command name (field 2) may hold
@@ -175,7 +197,9 @@ pub fn is_server_pid(pid: u32) -> bool {
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
+        // The name test first: it is the common case and costs no syscall.
         is_server_proc(exe.as_deref(), &cmdline)
+            || is_server_proc_as(exe.as_deref(), &cmdline, runs_our_binary(pid))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -992,6 +1016,22 @@ mod pure_tests {
         ));
         assert!(!is_server_proc(Some("/usr/bin/vim"), cmd));
         assert!(!is_server_proc(None, cmd));
+    }
+
+    /// Fixup L (B5): a renamed binary is a server when it is the binary running
+    /// this check, and only then (a stranger named `new` is not).
+    #[test]
+    fn a_renamed_binary_is_a_server_only_when_it_is_ours() {
+        let cmd = b"/opt/bin/new\0serve\0--central\0";
+        assert!(!is_server_proc(Some("/opt/bin/new"), cmd));
+        assert!(is_server_proc_as(Some("/opt/bin/new"), cmd, true));
+        assert!(!is_server_proc_as(Some("/opt/bin/new"), cmd, false));
+        // Ours, but not a server subcommand: still not a server.
+        assert!(!is_server_proc_as(
+            Some("/opt/bin/new"),
+            b"/opt/bin/new\0search\0serve\0",
+            true
+        ));
     }
 }
 

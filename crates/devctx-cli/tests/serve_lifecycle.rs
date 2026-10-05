@@ -467,10 +467,101 @@ fn two_cold_clients_end_up_on_one_server() {
     }
 }
 
+/// TASK-017 fixup L (K2): THREE cold clients at once. The loser of the second
+/// spawn can die on a lock held by a waiting client (its transient open) or by
+/// the winner's server before it writes `serve.json`; each such failure now
+/// gets its own wait instead of being reported after a single retry.
+#[test]
+fn three_cold_clients_end_up_on_one_server() {
+    let tmp = Tmp::new("cold3");
+    let root = project(&tmp);
+    for round in 0..6 {
+        let clients: Vec<_> = (0..3)
+            .map(|_| {
+                Command::new(env!("CARGO_BIN_EXE_devctx"))
+                    .env("DEVCTX_HOME", tmp.home())
+                    .env("DEVCTX_MODEL_CACHE", tmp.cache())
+                    .current_dir(&root)
+                    .args(["status"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawning a client")
+            })
+            .collect();
+        for (who, c) in clients.into_iter().enumerate() {
+            let out = c.wait_with_output().unwrap();
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success()
+                    && !said.contains("did not start")
+                    && !said.contains("is held by"),
+                "round {round}, client {who} failed: {said}"
+            );
+        }
+        let stop = Command::new(env!("CARGO_BIN_EXE_devctx"))
+            .env("DEVCTX_HOME", tmp.home())
+            .env("DEVCTX_NO_AUTOSERVE", "1")
+            .current_dir(&root)
+            .args(["serve", "--stop"])
+            .output()
+            .unwrap();
+        assert!(stop.status.success());
+    }
+}
+
+/// TASK-017 fixup L (B6): a central daemon that loses the start-up race (the
+/// store is locked by another that has not advertised itself yet) waits for the
+/// winner, says so in one line and exits 0 — no "Error: opening the central store".
+#[test]
+fn a_central_daemon_that_loses_the_race_exits_quietly() {
+    let tmp = Tmp::new("centralrace");
+    let spawn = |log: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_devctx"))
+            .env("DEVCTX_HOME", tmp.home())
+            .env("DEVCTX_NO_AUTOSERVE", "1")
+            .args(["serve", "--central", "--addr"])
+            .arg(format!("127.0.0.1:{}", free_port()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(log).unwrap())
+            .spawn()
+            .expect("spawning a central daemon")
+    };
+    let (log_a, log_b) = (tmp.0.join("a.log"), tmp.0.join("b.log"));
+    let mut winner = spawn(&log_a);
+    let adv = tmp.home().join("serve.json");
+    let t0 = Instant::now();
+    while !adv.exists() {
+        assert!(t0.elapsed() < Duration::from_secs(30), "never advertised");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // The winner is up but has not (yet) advertised: set the file aside.
+    let held = tmp.0.join("serve.json.aside");
+    std::fs::rename(&adv, &held).unwrap();
+    let mut loser = spawn(&log_b);
+    std::thread::sleep(Duration::from_millis(1200));
+    std::fs::rename(&held, &adv).unwrap();
+    let ended = exits_within(&mut loser, Duration::from_secs(20));
+    let status = loser.try_wait().ok().flatten();
+    let said = std::fs::read_to_string(&log_b).unwrap_or_default();
+    let _ = loser.kill();
+    let _ = winner.kill();
+    let _ = winner.wait();
+    assert!(ended.is_some(), "the loser never ended: {said}");
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "{said}");
+    assert!(
+        said.contains("another central daemon is running"),
+        "no explanation: {said}"
+    );
+    assert!(!said.contains("Error"), "noise in the log: {said}");
+}
+
 /// TASK-017 fixup K1: a database held by a process that is NOT a starting
 /// `devctx serve` still fails fast (the 2 s target), naming the holder. The
-/// holder is a hard link of the binary under another name, so it is a server
-/// to the engine but not to the process table: its advertisement is removed.
+/// holder is a hard link of the binary under another name (a server to the
+/// engine since fixup L, B5) that was not spawned by a client and whose
+/// advertisement was withdrawn: it is not "starting", so nobody waits for it.
 #[test]
 fn a_foreign_lock_still_fails_fast() {
     let tmp = Tmp::new("foreignlock");
@@ -521,6 +612,58 @@ fn a_foreign_lock_still_fails_fast() {
         "the holder is not named: {said}"
     );
     assert!(took < Duration::from_secs(2), "took {took:?}");
+}
+
+/// TASK-017 fixup L (B5): a server run from a renamed binary (`new`, say) is
+/// still a server to the binary that asks about it: `serve --stop` stops it
+/// instead of reading "not a devctx" (Gone), deleting its `serve.json` and
+/// leaving it alive and unadvertised, holding the lock.
+#[test]
+fn a_server_run_from_a_renamed_binary_is_stopped_not_orphaned() {
+    let tmp = Tmp::new("renamed");
+    let root = project(&tmp);
+    let bin = tmp.0.join("new");
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_devctx"));
+    // Same inode as the binary that will ask: the "same executable" test.
+    if std::fs::hard_link(&exe, &bin).is_err() {
+        eprintln!("skipped: cannot hard-link the binary on this filesystem");
+        return;
+    }
+    let port = free_port();
+    let mut holder = Command::new(&bin)
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_MODEL_CACHE", tmp.cache())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{port}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the renamed server");
+    let t0 = Instant::now();
+    while http(port, "GET", "/health", "", Duration::from_secs(2)).is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(60), "never came up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(serve_json(&root).exists(), "the server advertises itself");
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .args(["serve", "--stop"])
+        .output()
+        .unwrap();
+    let said =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    let exited = exits_within(&mut holder, Duration::from_secs(10));
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert!(
+        exited.is_some(),
+        "serve --stop left the renamed server running (orphaned): {said}"
+    );
+    assert!(!serve_json(&root).exists(), "{said}");
 }
 
 fn devctx_cli_lock_error(text: &str) -> bool {

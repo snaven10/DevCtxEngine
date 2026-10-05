@@ -215,24 +215,37 @@ pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
     // take the lock a concurrent client's server is about to open. The spawn
     // goes first; only when it dies on a lock (or an exit checkpoint is under
     // way) is the holder waited out and the spawn repeated, once.
-    match spawn_and_wait(cfg) {
-        Err(EnsureError::Failed { cause }) if lock_may_resolve(cfg, cause.as_deref()) => {
-            let cause = cause.unwrap_or_default();
-            match wait_out_lock(
-                cfg,
-                |p| Ok(devctx_store::Store::check_unlocked(p)?),
-                lock_wait_for(cfg, &cause),
-            ) {
-                LockWait::Up(r) => Ok(r),
-                // Still held after the wait: not ours to judge. The failure the
-                // spawn reported already names the holder; reporting it is fast.
-                LockWait::Held => Err(EnsureError::Failed { cause: Some(cause) }),
-                LockWait::Free => spawn_and_wait(cfg),
+    //
+    // Up to [`SPAWN_ATTEMPTS`] spawns: with three or more cold clients the loser
+    // of the second spawn can die on a lock whose holder is another client (a
+    // waiter's transient open, or the winner's server a moment before it writes
+    // `serve.json`), so every failure on a lock gets its own wait first.
+    let mut attempt = 1;
+    loop {
+        match spawn_and_wait(cfg) {
+            Err(EnsureError::Failed { cause }) if lock_may_resolve(cfg, cause.as_deref()) => {
+                let cause = cause.unwrap_or_default();
+                match wait_out_lock(
+                    cfg,
+                    |p| Ok(devctx_store::Store::check_unlocked(p)?),
+                    lock_wait_for(cfg, &cause),
+                ) {
+                    LockWait::Up(r) => return Ok(r),
+                    // Still held after the wait: not ours to judge. The failure
+                    // the spawn reported already names the holder; reporting it
+                    // is fast.
+                    LockWait::Held => return Err(EnsureError::Failed { cause: Some(cause) }),
+                    LockWait::Free if attempt < SPAWN_ATTEMPTS => attempt += 1,
+                    LockWait::Free => return Err(EnsureError::Failed { cause: Some(cause) }),
+                }
             }
+            other => return other,
         }
-        other => other,
     }
 }
+
+/// Spawns [`ensure_checked`] makes before it reports a lock as a failure.
+const SPAWN_ATTEMPTS: usize = 3;
 
 /// Whether a spawn that died is worth repeating after waiting: it hit a held
 /// database, or a server is taking its exit checkpoint right now.
@@ -247,18 +260,37 @@ fn lock_may_resolve(cfg: &ProjectConfig, cause: Option<&str>) -> bool {
 /// by hand and withdrew, an MCP, a TUI — so a foreign holder still fails fast.
 fn lock_wait_for(cfg: &ProjectConfig, cause: &str) -> Duration {
     match lock_holder_pid(cause) {
-        Some(pid)
-            if procown::is_server_pid(pid)
-                && (spawned_by_a_client(pid) || checkpointing(cfg, pid)) =>
-        {
-            HOLDER_WAIT
-        }
+        Some(pid) if procown::is_server_pid(pid) => holder_wait(
+            spawned_by_a_client(pid),
+            procown::age_secs(pid),
+            checkpointing(cfg, pid),
+        ),
+        // The cause names no holder but an exit checkpoint is under way (the
+        // marker exists): wait for it, not for half of it.
+        None if devctx_api::checkpoint_marker(cfg).exists() => CHECKPOINT_WAIT,
         _ => LOCK_WAIT,
     }
 }
 
+/// The wait for a `devctx serve` that holds the file: [`HOLDER_WAIT`] when it
+/// is checkpointing, or when a client spawned it ([`AUTOSPAWN_ENV`]) and it is
+/// still inside its startup window ([`STARTUP_WINDOW`]); [`LOCK_WAIT`]
+/// otherwise. An old autospawned serve whose `serve.json` was lost or withdrawn
+/// (alive until its `--idle` timer, or hung) is not "starting": waiting for it
+/// would turn a fail-fast into half a minute.
+fn holder_wait(autospawned: bool, age_secs: Option<u64>, checkpointing: bool) -> Duration {
+    let starting = autospawned && age_secs.is_some_and(|a| a < STARTUP_WINDOW.as_secs());
+    if starting || checkpointing {
+        HOLDER_WAIT
+    } else {
+        LOCK_WAIT
+    }
+}
+
 /// Whether `pid` was launched by [`spawn_server`] (it carries [`AUTOSPAWN_ENV`]
-/// in its environment). Linux only: elsewhere nobody is known to be starting.
+/// in its environment). Linux only: elsewhere this is always false, nobody is
+/// known to be starting, and a lock race falls back to the [`LOCK_WAIT`] of
+/// 500 ms instead of [`HOLDER_WAIT`].
 fn spawned_by_a_client(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -323,7 +355,16 @@ const LOCK_WAIT: Duration = Duration::from_millis(500);
 /// The same wait when the holder is a `devctx serve` (one another client just
 /// spawned, still loading, or one finishing its exit checkpoint): it is going
 /// to answer or to let go, and both end the wait. It is a ceiling, not a cost.
-const HOLDER_WAIT: Duration = Duration::from_secs(30);
+/// As long as the old 60 s wait for a spawned server (a cold model load on a
+/// loaded machine can pass 30 s).
+const HOLDER_WAIT: Duration = Duration::from_secs(60);
+
+/// A server younger than this is "starting" for the purpose of [`holder_wait`].
+const STARTUP_WINDOW: Duration = Duration::from_secs(60);
+
+/// The wait when an exit checkpoint is under way but the holder's pid is not
+/// known: more than the checkpoint budget (1.5 s) the server gives itself.
+const CHECKPOINT_WAIT: Duration = Duration::from_secs(3);
 
 /// What [`wait_out_lock`] found.
 enum LockWait {
@@ -346,10 +387,17 @@ fn wait_out_lock(
     wait: Duration,
 ) -> LockWait {
     let deadline = Instant::now() + wait;
+    // Looking for a server is cheap (one small file); opening the database is
+    // not (a WAL replay, and a transient lock of our own), so it is done every
+    // `LOCK_CHECK_EVERY` and not on each tick.
+    let mut next_check = Instant::now();
     loop {
-        match check(&cfg.db_path()) {
-            Err(e) if is_lock_error(&format!("{e:#}")) => {}
-            _ => return LockWait::Free,
+        if Instant::now() >= next_check {
+            match check(&cfg.db_path()) {
+                Err(e) if is_lock_error(&format!("{e:#}")) => {}
+                _ => return LockWait::Free,
+            }
+            next_check = Instant::now() + LOCK_CHECK_EVERY;
         }
         if let Discovery::Up(r) = probe(cfg) {
             return LockWait::Up(r);
@@ -360,6 +408,9 @@ fn wait_out_lock(
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// How often [`wait_out_lock`] tries to open the database.
+const LOCK_CHECK_EVERY: Duration = Duration::from_millis(250);
 
 /// [`ensure_checked`] for callers that only need "a server or not" and fall
 /// back to opening the store themselves (the CLI commands, until they stop
@@ -1583,6 +1634,96 @@ mod tests {
             matches!(up, LockWait::Up(_)),
             "the server that appeared is used"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-017 fixup L (K1/K3): only a server that is STARTING is waited for
+    /// the full ceiling; an old autospawned one that lost its advertisement
+    /// (alive till its idle timer, or hung) fails fast like any foreign holder.
+    #[test]
+    fn only_a_starting_or_checkpointing_holder_gets_the_long_wait() {
+        assert_eq!(holder_wait(true, Some(3), false), HOLDER_WAIT);
+        assert_eq!(holder_wait(true, Some(59), false), HOLDER_WAIT);
+        assert_eq!(
+            holder_wait(true, Some(61), false),
+            LOCK_WAIT,
+            "old, not starting"
+        );
+        assert_eq!(holder_wait(true, Some(900), false), LOCK_WAIT);
+        assert_eq!(holder_wait(true, None, false), LOCK_WAIT, "age unknown");
+        assert_eq!(holder_wait(false, Some(3), false), LOCK_WAIT, "run by hand");
+        assert_eq!(
+            holder_wait(false, Some(900), true),
+            HOLDER_WAIT,
+            "checkpointing"
+        );
+        assert!(
+            HOLDER_WAIT >= Duration::from_secs(60),
+            "a model load over 30 s must not make the loser fail"
+        );
+    }
+
+    /// Fixup L: a checkpoint marker whose pid the lock message does not give
+    /// still earns a wait longer than the checkpoint budget (1.5 s).
+    #[test]
+    fn a_checkpoint_without_a_named_holder_is_waited_out() {
+        let dir = std::env::temp_dir().join(format!("devctx_l_ckpt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        assert_eq!(lock_wait_for(&cfg, "Could not set lock"), LOCK_WAIT);
+        std::fs::write(devctx_api::checkpoint_marker(&cfg), "4242").unwrap();
+        let wait = lock_wait_for(&cfg, "Could not set lock");
+        assert!(
+            wait >= Duration::from_millis(1500) + Duration::from_millis(500),
+            "{wait:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fixup L: `spawned_by_a_client` reads the autospawn mark out of the
+    /// process environment (the e2e foreign-lock test never reaches it: its
+    /// holder fails on its name first).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_autospawn_mark_is_read_from_the_environment() {
+        let mark = |on: bool| {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("5");
+            if on {
+                c.env(AUTOSPAWN_ENV, "1");
+            } else {
+                c.env_remove(AUTOSPAWN_ENV);
+            }
+            c.spawn().unwrap()
+        };
+        let (mut yes, mut no) = (mark(true), mark(false));
+        let (a, b) = (spawned_by_a_client(yes.id()), spawned_by_a_client(no.id()));
+        let _ = (yes.kill(), no.kill(), yes.wait(), no.wait());
+        assert!(a, "the marked process is not recognised");
+        assert!(!b, "an unmarked process is taken for a spawned one");
+        assert!(!spawned_by_a_client(u32::MAX - 1), "a pid that is gone");
+    }
+
+    /// Fixup L (K4): the wait looks for a server often but opens the database
+    /// only every `LOCK_CHECK_EVERY` (it was ~600 opens in 30 s).
+    #[test]
+    fn the_wait_does_not_open_the_database_on_every_tick() {
+        let dir = std::env::temp_dir().join(format!("devctx_l_k4_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        let opens = std::sync::atomic::AtomicUsize::new(0);
+        let locked = |_: &Path| -> Result<()> {
+            opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("Could not set lock on file"))
+        };
+        assert!(matches!(
+            wait_out_lock(&cfg, locked, Duration::from_millis(1100)),
+            LockWait::Held
+        ));
+        let n = opens.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((2..=6).contains(&n), "{n} opens in 1.1 s");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

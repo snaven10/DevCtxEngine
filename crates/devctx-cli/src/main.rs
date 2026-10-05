@@ -1408,7 +1408,10 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
         .with_context(|| format!("invalid --addr `{addr}`"))?;
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
 
-    let central = Central::open().context("opening the central store")?;
+    let central = match Central::open() {
+        Ok(c) => c,
+        Err(e) => return central_open_failed(&paths, anyhow::Error::from(e)),
+    };
     println!("DevCtxEngine central store → http://{addr}");
     println!("  Database: {}", paths.db.display());
     println!("  Config:   {}", paths.config.display());
@@ -1437,6 +1440,36 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
     );
     devctx_central::client::remove_own_serve_file(&paths);
     result
+}
+
+/// How long a central daemon that lost the lock waits for the winner to
+/// advertise itself before the lock counts as someone else's problem.
+const CENTRAL_RACE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The central store would not open. When it is the lock and another central
+/// daemon is (or comes up within [`CENTRAL_RACE_WAIT`] as) the advertised one,
+/// this process simply lost a start-up race — several `index` runs on one
+/// `DEVCTX_HOME` spawn several daemons — so it says that in one line and ends
+/// quietly. Anything else is the error it always was.
+fn central_open_failed(paths: &CentralPaths, e: anyhow::Error) -> Result<()> {
+    let text = format!("{e:#}");
+    if remote::is_lock_error(&text) {
+        let deadline = std::time::Instant::now() + CENTRAL_RACE_WAIT;
+        loop {
+            if devctx_central::client::discover(paths).is_some() {
+                eprintln!(
+                    "another central daemon is running for {}; this one exits",
+                    paths.dir.display()
+                );
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    Err(e.context("opening the central store"))
 }
 
 /// `devctx web` — serve the web dashboard (call-graph + memories) locally.
