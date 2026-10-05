@@ -127,12 +127,8 @@ pub async fn serve(
     let app = router(api)
         .layer(middleware::from_fn_with_state(activity.clone(), track))
         .layer(middleware::from_fn_with_state(
-            in_flight.clone(),
+            (in_flight.clone(), exiting.clone()),
             count_requests,
-        ))
-        .layer(middleware::from_fn_with_state(
-            exiting.clone(),
-            refuse_while_exiting,
         ));
     let (listener, addr) = bind_near(addr).await?;
     // Announce only now, and with the port actually bound. Advertising the
@@ -167,7 +163,7 @@ pub async fn serve(
                     continue;
                 }
                 eprintln!("Central store idle for {idle_for:?}; shutting down.");
-                exiting.store(true, Ordering::SeqCst);
+                begin_exit(&exiting, &in_flight);
                 // `exit` runs no destructors, so the connection is never
                 // closed: freeze and fold the WAL first (see
                 // `Store::checkpoint`, `Store::freeze`), on the daemon's own
@@ -220,22 +216,34 @@ pub async fn serve(
 /// waiting for it.
 const STUCK_WINDOWS: u32 = 4;
 
-/// Middleware: once the idle exit has started, answer 503 to everything.
-async fn refuse_while_exiting(
-    State(exiting): State<Arc<AtomicBool>>,
+/// Start the idle exit: raise the flag FIRST (nothing new is admitted from
+/// here on), then give the requests already in a moment to finish before the
+/// store is frozen under them. The other order — wait, then raise — let a
+/// request slip in between and meet the freeze.
+fn begin_exit(exiting: &AtomicBool, in_flight: &AtomicUsize) {
+    exiting.store(true, Ordering::SeqCst);
+    crate::drain_in_flight(in_flight, EXIT_DRAIN);
+}
+
+/// How long the idle exit waits for requests already admitted.
+const EXIT_DRAIN: Duration = Duration::from_millis(300);
+
+/// Middleware: count the non-health requests being answered, and refuse
+/// everything (health included) once the idle exit has started.
+///
+/// Counted before the flag is read, so a request is either refused here or
+/// visible to the exit's drain.
+async fn count_requests(
+    State((n, exiting)): State<(Arc<AtomicUsize>, Arc<AtomicBool>)>,
     req: Request,
     next: Next,
 ) -> Response {
-    if exiting.load(Ordering::SeqCst) {
-        return crate::exiting_response();
-    }
-    next.run(req).await
-}
-
-/// Middleware: count the non-health requests being answered.
-async fn count_requests(State(n): State<Arc<AtomicUsize>>, req: Request, next: Next) -> Response {
     if req.uri().path() == "/health" {
-        return next.run(req).await;
+        return if exiting.load(Ordering::SeqCst) {
+            crate::exiting_response()
+        } else {
+            next.run(req).await
+        };
     }
     struct Guard(Arc<AtomicUsize>);
     impl Drop for Guard {
@@ -245,6 +253,9 @@ async fn count_requests(State(n): State<Arc<AtomicUsize>>, req: Request, next: N
     }
     n.fetch_add(1, Ordering::SeqCst);
     let _guard = Guard(n.clone());
+    if exiting.load(Ordering::SeqCst) {
+        return crate::exiting_response();
+    }
     next.run(req).await
 }
 
@@ -731,16 +742,91 @@ mod tests {
     use tower::ServiceExt;
 
     /// TASK-017 item 1: the central daemon refuses requests once its idle exit
-    /// has started.
+    /// has started, and says (header) that the request was not processed.
     #[tokio::test]
     async fn requests_during_the_idle_exit_get_503() {
         let exiting = Arc::new(AtomicBool::new(false));
+        let n = Arc::new(AtomicUsize::new(0));
         let app = Router::new().route("/x", get(|| async { "ok" })).layer(
-            middleware::from_fn_with_state(exiting.clone(), refuse_while_exiting),
+            middleware::from_fn_with_state((n.clone(), exiting.clone()), count_requests),
         );
         let get = || Request::builder().uri("/x").body(Body::empty()).unwrap();
         assert_eq!(app.clone().oneshot(get()).await.unwrap().status(), 200);
         exiting.store(true, Ordering::SeqCst);
+        let resp = app.oneshot(get()).await.unwrap();
+        assert_eq!(resp.status(), 503);
+        assert!(resp
+            .headers()
+            .contains_key(devctx_core::procown::EXITING_HEADER));
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            0,
+            "a refused request is not left counted"
+        );
+    }
+
+    /// TASK-017 fixup M1: the flag goes up BEFORE the wait for the requests in
+    /// flight, so nothing new can slip in while it waits.
+    #[test]
+    fn the_exit_raises_the_flag_before_it_waits_for_requests() {
+        let exiting = Arc::new(AtomicBool::new(false));
+        let n = Arc::new(AtomicUsize::new(1));
+        let seen_up_while_busy = {
+            let (exiting, n) = (exiting.clone(), n.clone());
+            std::thread::spawn(move || {
+                // The "request": still running when the exit starts; it can
+                // only observe the flag already raised, with itself in flight.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !exiting.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let up = exiting.load(Ordering::SeqCst) && n.load(Ordering::SeqCst) == 1;
+                std::thread::sleep(Duration::from_millis(100));
+                n.fetch_sub(1, Ordering::SeqCst);
+                up
+            })
+        };
+        let started = Instant::now();
+        begin_exit(&exiting, &n);
+        assert_eq!(n.load(Ordering::SeqCst), 0, "waited for the request");
+        assert!(started.elapsed() >= Duration::from_millis(90));
+        assert!(
+            seen_up_while_busy.join().unwrap(),
+            "the flag was raised while the request was still in flight"
+        );
+    }
+
+    /// A request counted before the flag is read is never missed by the
+    /// drain: while it runs the exit waits, and the next one is refused.
+    #[tokio::test]
+    async fn an_admitted_request_is_waited_for_and_a_later_one_refused() {
+        let exiting = Arc::new(AtomicBool::new(false));
+        let n = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    let _ = tokio::task::spawn_blocking(|| {
+                        std::thread::sleep(Duration::from_millis(150))
+                    })
+                    .await;
+                    "ok"
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                (n.clone(), exiting.clone()),
+                count_requests,
+            ));
+        let get = || Request::builder().uri("/slow").body(Body::empty()).unwrap();
+        let slow = tokio::spawn(app.clone().oneshot(get()));
+        while n.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let (e, c) = (exiting.clone(), n.clone());
+        tokio::task::spawn_blocking(move || begin_exit(&e, &c))
+            .await
+            .unwrap();
+        assert_eq!(slow.await.unwrap().unwrap().status(), 200, "it finished");
         assert_eq!(app.oneshot(get()).await.unwrap().status(), 503);
     }
 }

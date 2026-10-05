@@ -3,7 +3,12 @@
 # its models. Pinning the cache here covers every test in the workspace, the
 # `#[ignore]`d ones that download a model included, whichever crate they live
 # in. An explicit `DEVCTX_MODEL_CACHE` in the environment still wins (no
-# `force`). `cargo run` sees it too: point `DEVCTX_MODEL_CACHE` elsewhere to
-# keep a development binary on a different cache.
+# `force`).
+#
+# Outside `target/` on purpose: `[env]` cannot follow `CARGO_TARGET_DIR`, and a
+# cache under `target/` is deleted by `cargo clean`. Note that `cargo run` sees
+# this variable too: a development binary run through cargo uses this cache
+# instead of the user's; set `DEVCTX_MODEL_CACHE` to point it elsewhere. See
+# CONTRIBUTING.md.
 [env]
-DEVCTX_MODEL_CACHE = { value = "target/test-model-cache", relative = true }
+DEVCTX_MODEL_CACHE = { value = ".devctx-test-models", relative = true }

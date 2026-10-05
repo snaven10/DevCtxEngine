@@ -532,42 +532,52 @@ fn a_hung_child_fails_the_wait_instead_of_hanging_the_suite() {
     assert!(out.status.success() && out.stdout == b"ok\n");
 }
 
-/// m-4: the target directory is found whichever way it was configured, and the
-/// workspace's cargo config pins the model cache for every test in the
-/// workspace (the `#[ignore]`d ones in other crates call
-/// `model_cache_dir()` directly, with no helper to go through).
+/// TASK-017 fixup M5: a grandchild that inherited the pipes and outlives the
+/// child must not make `wait_with_timeout` hang past its own deadline.
+#[test]
+fn wait_with_timeout_does_not_wait_for_a_grandchild_holding_the_pipes() {
+    let child = Command::new("sh")
+        // The grandchild keeps stdout/stderr open for 30 s; the child hangs.
+        .args(["-c", "sleep 30 & sleep 30"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    let err = common::wait_with_timeout(child, std::time::Duration::from_secs(1))
+        .expect_err("a hung child must time out");
+    assert!(err.contains("still running"), "{err}");
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(8),
+        "hung on the grandchild's pipe: {:?}",
+        t0.elapsed()
+    );
+}
+
+/// m-4 / TASK-017 fixup M3: under cargo the workspace's `.cargo/config.toml`
+/// puts `DEVCTX_MODEL_CACHE` in the environment of every test process (the
+/// `#[ignore]`d ones in other crates call `model_cache_dir()` directly, with no
+/// helper to go through). Checked on the effective environment, not on the text
+/// of the file, and never the user's real models.
 #[test]
 fn the_test_model_cache_is_pinned_for_the_whole_workspace() {
-    let manifest = Path::new("/ws/crates/devctx-cli");
-    // A relative CARGO_TARGET_DIR is relative to the workspace root.
-    let rel = common::resolve_target_dir(Some("out".into()), None, manifest);
-    assert_eq!(rel, Path::new("/ws/crates/devctx-cli/../../out"));
-    let abs = common::resolve_target_dir(Some("/abs/t".into()), None, manifest);
-    assert_eq!(abs, Path::new("/abs/t"));
-    // `build.target-dir` leaves no variable behind; the test binary's own
-    // location says where the target directory is.
-    let exe = Path::new("/somewhere/else/debug/deps/projects_cli-abc123");
-    assert_eq!(
-        common::resolve_target_dir(None, Some(exe), manifest),
-        Path::new("/somewhere/else")
-    );
-    assert_eq!(
-        common::resolve_target_dir(None, None, manifest),
-        Path::new("/ws/crates/devctx-cli/../../target")
-    );
-    // The cargo config sets `DEVCTX_MODEL_CACHE` for every test process.
-    let config = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".cargo")
-            .join("config.toml"),
-    )
-    .expect("the workspace .cargo/config.toml");
+    let effective = std::env::var_os("DEVCTX_MODEL_CACHE")
+        .filter(|v| !v.is_empty())
+        .expect("cargo must set DEVCTX_MODEL_CACHE for tests (.cargo/config.toml [env])");
+    let effective = PathBuf::from(effective);
+    // An explicit value (CI, a developer) wins; otherwise it is the workspace's
+    // directory outside `target/`, absolute (`relative = true` resolves it).
+    if !effective.starts_with(std::env::temp_dir()) && !effective.starts_with("/var/tmp") {
+        assert!(
+            effective.ends_with(".devctx-test-models") || std::env::var_os("CI").is_some(),
+            "{effective:?}"
+        );
+    }
     assert!(
-        config.contains("[env]") && config.contains("DEVCTX_MODEL_CACHE"),
-        "{config}"
+        !effective.components().any(|c| c.as_os_str() == "target"),
+        "{effective:?} is inside target/: `cargo clean` would delete the models"
     );
+    assert_eq!(common::shared_model_cache(), effective);
 }
 
 /// Test hygiene: a run without `DEVCTX_MODEL_CACHE` must never resolve to the
@@ -575,38 +585,23 @@ fn the_test_model_cache_is_pinned_for_the_whole_workspace() {
 #[test]
 fn without_an_explicit_cache_the_tests_never_use_the_users_real_models() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for target in [None, Some(std::ffi::OsString::from("/tmp/some-target"))] {
-        let got = common::resolve_model_cache(None, target.clone(), manifest);
-        assert!(got.ends_with("test-model-cache"), "{got:?}");
-        for real in [
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/devctx")),
-            std::env::var_os("XDG_DATA_HOME").map(|x| PathBuf::from(x).join("devctx")),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            assert!(!got.starts_with(&real), "{got:?} is under {real:?}");
-        }
+    let got = common::resolve_model_cache(None, manifest);
+    assert!(got.ends_with(".devctx-test-models"), "{got:?}");
+    for real in [
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/devctx")),
+        std::env::var_os("XDG_DATA_HOME").map(|x| PathBuf::from(x).join("devctx")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(!got.starts_with(&real), "{got:?} is under {real:?}");
     }
     // An explicit cache still wins, and an empty one counts as unset.
     assert_eq!(
-        common::resolve_model_cache(Some("/x/cache".into()), None, manifest),
+        common::resolve_model_cache(Some("/x/cache".into()), manifest),
         Path::new("/x/cache")
     );
-    assert!(
-        common::resolve_model_cache(Some("".into()), None, manifest).ends_with("test-model-cache")
-    );
-    // What the suites actually use (with the variable unset in the environment).
-    if std::env::var_os("DEVCTX_MODEL_CACHE").is_none() {
-        let got = common::shared_model_cache();
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        assert!(
-            !got.starts_with(home.join(".local/share/devctx")),
-            "{got:?}"
-        );
-    }
+    assert!(common::resolve_model_cache(Some("".into()), manifest).ends_with(".devctx-test-models"));
 }
 
 /// N4 (field): `init --model ml-granite` on a machine without the model's

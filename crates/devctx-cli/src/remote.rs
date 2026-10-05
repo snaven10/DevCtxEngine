@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use devctx_core::config::ProjectConfig;
@@ -126,6 +126,9 @@ fn announce_spawn(spawned_pid: u32, advertised: Option<u32>) -> bool {
 pub struct Remote {
     base: String,
     token: Option<String>,
+    /// The project this server belongs to: what lets a request refused
+    /// because the server was exiting be repeated against the next one.
+    cfg: Option<Box<ProjectConfig>>,
 }
 
 /// A deterministic loopback address per project, so auto-spawned servers for
@@ -709,6 +712,10 @@ pub enum Discovery {
     Down,
 }
 
+/// How long a request refused by an exiting server waits for the next one:
+/// the exit's freeze and checkpoint are budgeted at 1.5 s, plus margin.
+const EXIT_RETRY_WAIT: Duration = Duration::from_secs(3);
+
 /// Health check for the first look at `serve.json`: short, so a stale file does
 /// not hang the CLI.
 const HEALTH_QUICK: Duration = Duration::from_millis(400);
@@ -777,6 +784,7 @@ pub fn probe(cfg: &ProjectConfig) -> Discovery {
         Discovery::Up(Remote {
             base: base.clone(),
             token,
+            cfg: Some(Box::new(cfg.clone())),
         })
     };
     match health(&base, HEALTH_QUICK) {
@@ -842,15 +850,55 @@ impl Remote {
         }
     }
 
+    /// Send one request; when the server refuses it because it is exiting
+    /// (a 503 from a middleware that runs before any handler, so nothing was
+    /// processed), repeat it against the next server for up to
+    /// [`EXIT_RETRY_WAIT`]. Any other status is final.
+    fn send(
+        &self,
+        build: impl Fn(&Remote) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+    ) -> Result<String> {
+        let first = build(self);
+        let exiting = |r: &std::result::Result<ureq::Response, Box<ureq::Error>>| {
+            matches!(r, Err(e) if matches!(&**e, ureq::Error::Status(503, resp)
+                if resp.header(procown::EXITING_HEADER).is_some()))
+        };
+        let Some(cfg) = self.cfg.as_ref().filter(|_| exiting(&first)) else {
+            return read(first.map_err(|e| *e));
+        };
+        let deadline = Instant::now() + EXIT_RETRY_WAIT;
+        let mut last = first;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            // `ensure_checked` sees the old server busy until it is gone, then
+            // starts the next one.
+            let Ok(next) = ensure_checked(cfg.as_ref()) else {
+                continue;
+            };
+            last = build(&next);
+            if !exiting(&last) {
+                break;
+            }
+        }
+        read(last.map_err(|e| *e))
+    }
+
     fn get(&self, path: &str) -> Result<String> {
-        let req = self.auth(self.agent().get(&format!("{}{path}", self.base)));
-        read(req.call())
+        self.send(|r| {
+            r.auth(r.agent().get(&format!("{}{path}", r.base)))
+                .call()
+                .map_err(Box::new)
+        })
     }
 
     fn post(&self, path: &str, body: Value) -> Result<String> {
-        let req = self.auth(self.agent().post(&format!("{}{path}", self.base)));
         let started = std::time::Instant::now();
-        read(req.send_json(body)).map_err(|e| {
+        self.send(|r| {
+            r.auth(r.agent().post(&format!("{}{path}", r.base)))
+                .send_json(body.clone())
+                .map_err(Box::new)
+        })
+        .map_err(|e| {
             // How long it took is what proves or disproves a timeout claim: an
             // agent that allows an hour cannot time out in four seconds.
             anyhow::anyhow!("{e}\n  after {:.1}s", started.elapsed().as_secs_f64())
@@ -1190,6 +1238,56 @@ mod tests {
         c.project.path = dir.to_string_lossy().to_string();
         c.storage.db_path = dir.join("index.duckdb").to_string_lossy().to_string();
         c
+    }
+
+    fn serve_fixed(reply: &'static str) -> SocketAddr {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        addr
+    }
+
+    const EXITING_503: &str = "HTTP/1.1 503 Service Unavailable\r\nx-devctx-exiting: 1\r\n\
+                               Content-Length: 0\r\nConnection: close\r\n\r\n";
+    const PLAIN_503: &str = "HTTP/1.1 503 Service Unavailable\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n";
+    const OK_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    /// TASK-017 fixup I1 (CLI): a request refused by a server that is exiting
+    /// is repeated against the one `serve.json` now advertises; a 503 that does
+    /// not carry the marker is a final answer.
+    #[test]
+    fn a_command_refused_by_an_exiting_server_reaches_the_next_one() {
+        let dir = std::env::temp_dir().join(format!("devctx-i1-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        let dying = serve_fixed(EXITING_503);
+        let next = serve_fixed(OK_200);
+        write_serve_file(&cfg, next, None).unwrap();
+        let remote = Remote {
+            base: format!("http://{dying}"),
+            token: None,
+            cfg: Some(Box::new(cfg)),
+        };
+        assert_eq!(remote.status().unwrap(), "ok");
+
+        let plain = Remote {
+            base: format!("http://{}", serve_fixed(PLAIN_503)),
+            token: None,
+            cfg: remote.cfg.clone(),
+        };
+        let started = Instant::now();
+        assert!(plain.status().is_err());
+        assert!(started.elapsed() < Duration::from_secs(2), "not retried");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

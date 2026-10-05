@@ -421,11 +421,12 @@ async fn count_in_flight(State(life): State<Arc<Lifecycle>>, req: Request, next:
     // admitted now would land on it half-way. Refuse everything (health too,
     // so nobody reads "healthy" off a server that is leaving) with a 503 a
     // client can retry against the next server.
-    if life.exiting.load(Ordering::SeqCst) {
-        return exiting_response();
-    }
     if req.uri().path() == "/health" {
-        return next.run(req).await;
+        return if life.exiting.load(Ordering::SeqCst) {
+            exiting_response()
+        } else {
+            next.run(req).await
+        };
     }
     struct Guard(Arc<Lifecycle>);
     impl Drop for Guard {
@@ -433,17 +434,51 @@ async fn count_in_flight(State(life): State<Arc<Lifecycle>>, req: Request, next:
             self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
         }
     }
+    // Counted BEFORE the flag is read: the exit raises the flag and then waits
+    // for the count to drain, so a request is either refused here or visible
+    // to that wait. Checking first and counting after left a window in which
+    // one was admitted and not waited for.
     life.in_flight.fetch_add(1, Ordering::SeqCst);
     let _guard = Guard(life.clone());
+    if life.exiting.load(Ordering::SeqCst) {
+        return exiting_response();
+    }
     next.run(req).await
 }
 
 /// The answer to any request that arrives while the process is ending.
+///
+/// Produced by a middleware before any handler: the request was not processed,
+/// so a client may repeat it against the next server. The header says that
+/// this 503 — and no other — is the one to repeat.
 pub(crate) fn exiting_response() -> Response {
-    json_err(
+    let mut resp = json_err(
         StatusCode::SERVICE_UNAVAILABLE,
         "the server is shutting down".into(),
-    )
+    );
+    resp.headers_mut().insert(
+        devctx_core::procown::EXITING_HEADER,
+        header::HeaderValue::from_static("1"),
+    );
+    resp
+}
+
+/// How long an exit waits for the requests already admitted before it freezes
+/// the database. Short: a request that cannot finish in this time is cut by
+/// `FORCE CHECKPOINT` as before; this only spares the ones about to.
+const IN_FLIGHT_DRAIN: Duration = Duration::from_millis(300);
+
+/// Wait (at most `cap`) for `in_flight` to reach zero. Called once the
+/// `exiting` flag is up, so nothing new is admitted while it waits.
+pub(crate) fn drain_in_flight(in_flight: &AtomicUsize, cap: Duration) -> bool {
+    let deadline = Instant::now() + cap;
+    while in_flight.load(Ordering::SeqCst) > 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
 }
 
 fn shutdown_grace() -> Duration {
@@ -515,6 +550,9 @@ fn exit_now(state: &Arc<AppState>, life: &Lifecycle, on_exit: &ExitHook, code: i
         }
     }
     state.cancel_indexing();
+    // The flag is up (nothing new is admitted): let the requests already in
+    // wait their turn before the database is frozen under them.
+    drain_in_flight(&life.in_flight, IN_FLIGHT_DRAIN);
     match life.claim_exit_checkpoint() {
         ExitClaim::Ours => {}
         ExitClaim::OrderlyRunning => {
@@ -1351,6 +1389,10 @@ mod tests {
         life.exiting.store(true, Ordering::SeqCst);
         let resp = app.oneshot(get()).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::SERVICE_UNAVAILABLE);
+        assert!(resp
+            .headers()
+            .contains_key(devctx_core::procown::EXITING_HEADER));
+        assert_eq!(life.in_flight.load(Ordering::SeqCst), 0);
     }
 
     /// D1b item 7: the grace override only shortens the timeline. A larger

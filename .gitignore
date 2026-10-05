@@ -5,6 +5,7 @@
 # the release workflow builds it with --locked so what ships is what was tested.
 
 # DevCtxEngine local state / caches
+.devctx-test-models/
 .devctx/
 .fastembed_cache/
 *.db

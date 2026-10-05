@@ -111,9 +111,24 @@ fn should_retry(err: &ureq::Error) -> bool {
             t.kind(),
             ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns
         ),
-        ureq::Error::Status(..) => false,
+        // The one status that is safe to repeat: see `server_is_exiting`.
+        ureq::Error::Status(..) => server_is_exiting(err),
     }
 }
+
+/// Whether the server refused because it is exiting. That 503 comes from a
+/// middleware that runs BEFORE any handler, so the request was not processed
+/// and repeating it against the next server cannot do anything twice. It is
+/// marked by a header precisely so no other 503 is read this way.
+fn server_is_exiting(err: &ureq::Error) -> bool {
+    matches!(err, ureq::Error::Status(503, r)
+        if r.header(devctx_core::procown::EXITING_HEADER).is_some())
+}
+
+/// How long a request waits for an exiting server to be replaced: its freeze
+/// and checkpoint are budgeted at 1.5 s, plus margin. While the old one lives
+/// the connector sees it busy; once it is gone it starts the next.
+const EXIT_RETRY_WAIT: Duration = Duration::from_secs(3);
 
 impl RemoteClient {
     fn new(connect: Connector) -> Self {
@@ -208,6 +223,9 @@ impl RemoteClient {
     ) -> Result<String, String> {
         let ((base, token), generation) = self.target()?;
         match send(&base, &token) {
+            Err(e) if self.connect.is_some() && server_is_exiting(&e) => {
+                self.retry_after_exit(&send, generation, e.to_string())
+            }
             Err(e) if self.connect.is_some() && should_retry(&e) => {
                 let first = e.to_string();
                 self.invalidate(generation);
@@ -218,6 +236,43 @@ impl RemoteClient {
                     .map_err(|second| format!("{second} (retried once; first attempt: {first})"))
             }
             other => read(other.map_err(|e| *e)),
+        }
+    }
+
+    /// The server answered "shutting down": forget it and keep asking the
+    /// connector for the next one (and sending to it) for up to
+    /// [`EXIT_RETRY_WAIT`].
+    fn retry_after_exit(
+        &self,
+        send: &impl Fn(&str, &Option<String>) -> Result<ureq::Response, Box<ureq::Error>>,
+        mut generation: u64,
+        first: String,
+    ) -> Result<String, String> {
+        let deadline = std::time::Instant::now() + EXIT_RETRY_WAIT;
+        let mut last: String;
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            self.invalidate(generation);
+            // The connector's last "busy" verdict must not be served from the
+            // backoff cache: the whole point is to ask again.
+            self.link.lock().unwrap_or_else(|p| p.into_inner()).failed = None;
+            match self.target() {
+                Ok(((base, token), g)) => {
+                    generation = g;
+                    match send(&base, &token) {
+                        Err(e) if server_is_exiting(&e) => last = e.to_string(),
+                        other => {
+                            return read(other.map_err(|e| *e)).map_err(|second| {
+                                format!("{second} (retried after the server exited; first attempt: {first})")
+                            })
+                        }
+                    }
+                }
+                Err(why) => last = format!("{first}; reconnecting failed: {why}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("{last} (still exiting after {EXIT_RETRY_WAIT:?})"));
+            }
         }
     }
 
@@ -822,6 +877,99 @@ mod tests {
             .send_json(json!({}))
             .unwrap_err();
         assert!(!should_retry(&err), "may have been processed: {err}");
+    }
+
+    /// A tiny HTTP server answering every request with `reply`.
+    fn serve_fixed(reply: &'static str) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        base
+    }
+
+    const EXITING_503: &str = "HTTP/1.1 503 Service Unavailable\r\nx-devctx-exiting: 1\r\n\
+                               Content-Length: 0\r\nConnection: close\r\n\r\n";
+    const PLAIN_503: &str = "HTTP/1.1 503 Service Unavailable\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n";
+    const OK_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    /// TASK-017 fixup I1: the exit's 503 never reached a handler, so it is
+    /// retried against the next server; any other 503 is a final answer.
+    #[test]
+    fn only_the_exiting_503_is_retried() {
+        let marked: ureq::Response = EXITING_503.parse().unwrap();
+        assert!(should_retry(&ureq::Error::Status(503, marked)));
+        let plain: ureq::Response = PLAIN_503.parse().unwrap();
+        assert!(!should_retry(&ureq::Error::Status(503, plain)));
+    }
+
+    #[test]
+    fn a_request_refused_by_an_exiting_server_goes_to_the_next_one() {
+        let dying = serve_fixed(EXITING_503);
+        let next = serve_fixed(OK_200);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let connect: Connector = Arc::new(move || {
+            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ServerConn {
+                base: if n == 0 { dying.clone() } else { next.clone() },
+                token: None,
+            })
+        });
+        let client = RemoteClient::new(connect);
+        assert_eq!(client.get("/status").unwrap(), "ok");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// While the old server lives the connector reports it busy; that is not
+    /// cached as a failure, the client keeps asking until the next one is up.
+    #[test]
+    fn a_busy_connector_during_the_exit_is_asked_again() {
+        let dying = serve_fixed(EXITING_503);
+        let next = serve_fixed(OK_200);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let connect: Connector =
+            Arc::new(
+                move || match c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Ok(ServerConn {
+                        base: dying.clone(),
+                        token: None,
+                    }),
+                    1 | 2 => Err("server busy".to_string()),
+                    _ => Ok(ServerConn {
+                        base: next.clone(),
+                        token: None,
+                    }),
+                },
+            );
+        let client = RemoteClient::new(connect);
+        assert_eq!(client.get("/status").unwrap(), "ok");
+    }
+
+    #[test]
+    fn a_plain_503_is_a_final_answer() {
+        let plain = serve_fixed(PLAIN_503);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let connect: Connector = Arc::new(move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ServerConn {
+                base: plain.clone(),
+                token: None,
+            })
+        });
+        let client = RemoteClient::new(connect);
+        assert!(client.get("/status").is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

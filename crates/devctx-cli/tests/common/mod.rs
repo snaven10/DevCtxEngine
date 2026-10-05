@@ -14,60 +14,31 @@ use std::process::{Child, Command};
 /// half-finished downloads in the way of whoever ran next. The cache is content
 /// addressed and read-only once filled, so sharing it is safe.
 ///
-/// `DEVCTX_MODEL_CACHE` if the caller set it, otherwise a cache of the tests'
-/// own under the cargo target directory (`test-model-cache`): never the user's
-/// real `~/.local/share/devctx/models`, which a test run must not read, fill
-/// or race a running server over. The first run that needs a model downloads
-/// it into the dedicated cache; later runs reuse it.
+/// Under cargo, `.cargo/config.toml` `[env]` sets `DEVCTX_MODEL_CACHE` to
+/// `<workspace>/.devctx-test-models` unless the caller already set it, so that
+/// is what this reads. It sits OUTSIDE `target/` on purpose: `cargo clean` must
+/// not delete ~90 MB of models, and `[env]` cannot follow `CARGO_TARGET_DIR`
+/// anyway. Run directly (no cargo), the same directory is the fallback. Never
+/// the user's real `~/.local/share/devctx/models`, which a test run must not
+/// read, fill or race a running server over.
 pub fn shared_model_cache() -> PathBuf {
     resolve_model_cache(
         std::env::var_os("DEVCTX_MODEL_CACHE"),
-        std::env::var_os("CARGO_TARGET_DIR"),
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
 }
 
-/// The pure part of [`shared_model_cache`].
-pub fn resolve_model_cache(
-    explicit: Option<std::ffi::OsString>,
-    target_dir: Option<std::ffi::OsString>,
-    manifest_dir: &Path,
-) -> PathBuf {
+/// The pure part of [`shared_model_cache`]: an explicit, non-empty value wins;
+/// otherwise the workspace's `.devctx-test-models`.
+pub fn resolve_model_cache(explicit: Option<std::ffi::OsString>, manifest_dir: &Path) -> PathBuf {
     if let Some(explicit) = explicit.filter(|v| !v.is_empty()) {
         return PathBuf::from(explicit);
     }
-    resolve_target_dir(
-        target_dir,
-        std::env::current_exe().ok().as_deref(),
-        manifest_dir,
-    )
-    .join("test-model-cache")
-}
-
-/// The cargo target directory, from whatever says where it is.
-///
-/// `CARGO_TARGET_DIR` when set, and a relative one is relative to the
-/// workspace root (where cargo is run from), not to the crate directory a test
-/// happens to run in. Without it, `build.target-dir` in a `.cargo/config` is
-/// invisible to a test, but the test binary itself sits in
-/// `<target>/<profile>/deps/`, which names the directory whatever set it.
-pub fn resolve_target_dir(
-    env_target: Option<std::ffi::OsString>,
-    exe: Option<&Path>,
-    manifest_dir: &Path,
-) -> PathBuf {
     // crates/<name> -> workspace root
-    let root = manifest_dir.join("..").join("..");
-    if let Some(t) = env_target.filter(|v| !v.is_empty()).map(PathBuf::from) {
-        return if t.is_absolute() { t } else { root.join(t) };
-    }
-    if let Some(deps) = exe.and_then(|e| e.ancestors().find(|a| a.ends_with("deps"))) {
-        // <target>/<profile>/deps
-        if let Some(target) = deps.parent().and_then(Path::parent) {
-            return target.to_path_buf();
-        }
-    }
-    root.join("target")
+    manifest_dir
+        .join("..")
+        .join("..")
+        .join(".devctx-test-models")
 }
 
 /// Make `home/models` (a test's `DEVCTX_HOME`) point at [`shared_model_cache`].
@@ -208,36 +179,50 @@ pub fn wait_with_timeout(
     limit: std::time::Duration,
 ) -> Result<std::process::Output, String> {
     use std::io::Read;
-    fn drain<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    // Each reader reports through a channel and is never joined on the
+    // timeout path: a grandchild (an auto-spawned `serve`) that inherited the
+    // pipe keeps it open after the child is killed, `read_to_end` then never
+    // returns, and joining would hang exactly what this function prevents.
+    fn drain<R: Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut r) = r {
                 let _ = r.read_to_end(&mut buf);
             }
-            buf
-        })
+            let _ = tx.send(buf);
+        });
+        rx
     }
     let out = drain(child.stdout.take());
     let err = drain(child.stderr.take());
-    let deadline = std::time::Instant::now() + limit;
+    let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
             }
             Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let said = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned()
-                    + &String::from_utf8_lossy(&err.join().unwrap_or_default());
+                // What it printed, if the pipes close promptly; not waited for.
+                let grace = Duration::from_millis(500);
+                let said = String::from_utf8_lossy(&out.recv_timeout(grace).unwrap_or_default())
+                    .into_owned()
+                    + &String::from_utf8_lossy(&err.recv_timeout(grace).unwrap_or_default());
                 return Err(format!("still running after {limit:?}:\n{said}"));
             }
         }
     };
+    // The child exited; its output ends with it unless something it started
+    // still holds the pipe: bounded as well, so that cannot hang either.
+    let rest = Duration::from_secs(10);
     Ok(std::process::Output {
         status,
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
+        stdout: out.recv_timeout(rest).unwrap_or_default(),
+        stderr: err.recv_timeout(rest).unwrap_or_default(),
     })
 }

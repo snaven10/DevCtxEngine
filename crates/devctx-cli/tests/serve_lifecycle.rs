@@ -251,6 +251,8 @@ fn sigterm_stops_an_idle_server_within_two_seconds() {
 /// `DEVCTX_TEST_SLOW_CHECKPOINT_MS` stretches the checkpoint to 9 s; the server
 /// holds its checkpoint marker meanwhile, so `--stop` keeps waiting instead of
 /// sending SIGKILL, and the server leaves cleanly (exit 0, WAL folded).
+/// Debug builds only: the seam is compiled out of release binaries.
+#[cfg(debug_assertions)]
 #[test]
 fn serve_stop_waits_for_a_final_checkpoint_longer_than_its_fixed_wait() {
     let tmp = Tmp::new("slowckpt");
