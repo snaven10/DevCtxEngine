@@ -134,3 +134,16 @@ Ver PLAN-008 §7 (excludes y penalización). El factor es configurable para pode
     0.6 es el sugerido por la task, no calibrado contra datos reales; una API HTTP vieja ignora `kind`
     (campo desconocido); `devctx-tui` no usa los filtros; docs EN/ES (TASK-015); Windows.
 13. **Números.** Sobre-fetch de 400 candidatos por recuperador con filtro duro; 9 excludes por defecto.
+
+### Fixup E (review)
+
+- **Efecto colateral corregido:** el hash de excludes en `index_meta` forzaba un reindex **completo** en el
+  primer `index` tras actualizar (o sin hash guardado): ~1 h por 1400 archivos re-embebiendo lo que no cambió.
+  Ahora un set de excludes distinto (o ausente) ya no impide el incremental: la corrida *reconcilia*
+  (`reconcile_excludes` en `devctx-index/src/pipeline.rs`) — borra las filas de los archivos indexados que el
+  set ahora excluye (`files_pruned`), agrega los archivos trackeados que el set ya no excluye y no están en el
+  índice, y estampa el hash nuevo. Una corrida por lista de rutas sigue sin estampar. Test (falla en 409c0d4):
+  `an_index_without_an_exclude_fingerprint_is_reconciled_incrementally` (store sin hash → `full_reindex: false`,
+  4 podados, `files_indexed == 0`, hash estampado); `a_changed_exclude_set_prunes_on_the_next_incremental_run`
+  ahora también exige `!full_reindex` y que al volver a incluir solo se embeben los 4 archivos nuevos.
+- **I2 (de 012, toca el post-filtro de 011):** con filtro duro el pool es `max(400, 4×limit)`.

@@ -1079,7 +1079,8 @@ mod tests {
 
     /// Switching the defaults on over an existing index prunes what they cover
     /// on the next plain (incremental) `index` — the exclude set is
-    /// fingerprinted, so a changed one forces the full run that prunes.
+    /// fingerprinted, and a changed one reconciles the index against it
+    /// (prune the newly excluded, add the newly included) without a full run.
     #[test]
     fn a_changed_exclude_set_prunes_on_the_next_incremental_run() {
         let dir = repo_with_generated_files("defprune");
@@ -1090,16 +1091,67 @@ mod tests {
         let defaults = devctx_core::config::Indexing::default().effective_excludes();
         let res = index_excluding(&store, &dir, &defaults);
         assert_eq!(res.files_pruned, 4, "{res:?}");
+        assert!(!res.full_reindex, "{res:?}");
         assert_eq!(indexed_files(&store), vec!["src/lib.rs".to_string()]);
 
         // Unchanged set again: back to cheap incremental runs, no pruning pass.
         let res = index_excluding(&store, &dir, &defaults);
         assert!(!res.full_reindex);
 
-        // And opting back out brings the files in again, also incrementally.
+        // And opting back out brings the files in again, also incrementally:
+        // only the four newly included files are embedded.
+        let res = index_excluding(&store, &dir, &[]);
+        assert!(!res.full_reindex, "{res:?}");
+        assert_eq!(res.files_indexed, 4, "{res:?}");
+        assert_eq!(indexed_files(&store).len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index from before 0.9 has no exclude fingerprint, so the first
+    /// `index` after upgrading saw a "changed" exclude set and forced a FULL
+    /// run — every file re-embedded, about an hour per 1400 files. It must stay
+    /// incremental: prune what the set now excludes, leave the rest untouched,
+    /// stamp the fingerprint.
+    #[test]
+    fn an_index_without_an_exclude_fingerprint_is_reconciled_incrementally() {
+        let dir = repo_with_generated_files("defupgrade");
+        let store = Store::open_in_memory(DIM).unwrap();
         index_excluding(&store, &dir, &[]);
         assert_eq!(indexed_files(&store).len(), 5);
 
+        // What a store written before the fingerprint existed looks like.
+        let git = crate::git::GitRepo::open(&dir).unwrap();
+        let repo_path = git.root().to_string_lossy().to_string();
+        let branch = git.state().branch;
+        store
+            .delete_index_meta(&repo_path, &branch, crate::pipeline::EXCLUDE_META_KEY)
+            .unwrap();
+
+        let defaults = devctx_core::config::Indexing::default().effective_excludes();
+        let res = index_excluding(&store, &dir, &defaults);
+        assert!(
+            !res.full_reindex,
+            "an exclude change forced a full run: {res:?}"
+        );
+        assert_eq!(res.files_pruned, 4, "{res:?}");
+        assert_eq!(
+            res.files_indexed, 0,
+            "unchanged files were re-embedded: {res:?}"
+        );
+        assert_eq!(indexed_files(&store), vec!["src/lib.rs".to_string()]);
+        assert_eq!(
+            store
+                .get_index_meta(&repo_path, &branch, crate::pipeline::EXCLUDE_META_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(crate::pipeline::exclude_fingerprint(&defaults).as_str()),
+            "the fingerprint is stamped after the reconcile"
+        );
+
+        // Settled: the next run has nothing to reconcile.
+        let res = index_excluding(&store, &dir, &defaults);
+        assert_eq!((res.files_pruned, res.files_indexed), (0, 0), "{res:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
