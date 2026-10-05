@@ -254,6 +254,12 @@ struct ReadSymbolReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct BuildContextReq {
+    /// Build the brief from a different project than the one bound (this call
+    /// only): a registered name or a path inside it. In a group session without
+    /// it, the member that best matches the query is chosen and named — or you
+    /// are asked for `project` when two fit about equally.
+    #[serde(default)]
+    project: Option<String>,
     /// What context is needed, in natural language.
     query: String,
     /// Token budget for the whole brief (default 4096). A hard stop: whatever
@@ -263,6 +269,12 @@ struct BuildContextReq {
     /// Include recalled and linked memories (default true).
     #[serde(default)]
     include_memories: Option<bool>,
+    /// `code` | `test` | `doc` | `config`: keep only that kind of file.
+    #[serde(default)]
+    kind: Option<String>,
+    /// `false` drops test files from the code (default true: tests rank lower).
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 /// Parameters for the `memories_by_symbol` tool.
@@ -571,6 +583,49 @@ impl DevctxServer {
                 None,
             )),
         }
+    }
+
+    /// The backend `build_context` answers from, and the line that names it.
+    ///
+    /// A `project` is honoured as in the other tools — except that in a group an
+    /// unresolvable one is an error, not a quiet fall back to the default
+    /// member. Without `project`, a group session compares its members and
+    /// picks the best match (or asks for `project`); there is no default.
+    async fn context_backend(
+        &self,
+        project: Option<&str>,
+        query: &str,
+        sel: &devctx_search::KindSel,
+    ) -> Result<(Arc<Backend>, Option<String>), ErrorData> {
+        let Binding::Group { members, .. } = self.binding() else {
+            let (b, resolved) = self.backend_for(project)?;
+            return Ok((b, resolved));
+        };
+        if let Some(p) = project {
+            if state::resolve_hint(p).is_none() {
+                let names: Vec<_> = members.iter().map(|m| m.name.as_str()).collect();
+                return Err(ErrorData::invalid_request(
+                    format!(
+                        "`project` {p:?} is not a registered project. Members of this group: {}",
+                        names.join(", ")
+                    ),
+                    None,
+                ));
+            }
+            let (b, resolved) = self.backend_for(Some(p))?;
+            return Ok((b, resolved));
+        }
+        let (q, s) = (query.to_string(), sel.clone());
+        let (name, compared) =
+            tokio::task::spawn_blocking(move || state::pick_group_member(&members, &q, &s))
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("task failed: {e}"), None))?
+                .map_err(|e| ErrorData::invalid_request(e, None))?;
+        let (b, _) = self.backend_for(Some(&name))?;
+        Ok((
+            b,
+            Some(format!("{name} (best match among {compared} members)")),
+        ))
     }
 
     /// The plans root to answer `plan_status` from in this process, when the binding is a
@@ -1097,15 +1152,28 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<BuildContextReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
-        run_blocking(move || {
+        let sel = devctx_search::KindSel {
+            kind: req.kind.clone(),
+            include_tests: req.include_tests,
+        };
+        let (backend, label) = self
+            .context_backend(req.project.as_deref(), &req.query, &sel)
+            .await?;
+        let out = run_blocking(move || {
             backend.build_context(
                 &req.query,
                 req.max_tokens.unwrap_or(4096),
                 req.include_memories.unwrap_or(true),
+                &sel,
             )
         })
-        .await
+        .await?;
+        // Which repository answered is part of the answer: a brief from the
+        // wrong one is otherwise indistinguishable from a right one.
+        Ok(match label {
+            Some(l) => format!("[devctx] context from {l}\n\n{out}"),
+            None => out,
+        })
     }
 
     /// Memories recorded about a symbol.

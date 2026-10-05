@@ -2150,7 +2150,15 @@ fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Resu
              (or run any indexing command, which spawns it)"
         );
     };
-    println!("{}", r.build_context(&query, max_tokens, include_memories)?);
+    println!(
+        "{}",
+        r.build_context(
+            &query,
+            max_tokens,
+            include_memories,
+            &devctx_search::KindSel::default()
+        )?
+    );
     Ok(())
 }
 

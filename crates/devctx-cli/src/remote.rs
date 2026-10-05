@@ -967,11 +967,13 @@ impl Remote {
         query: &str,
         max_tokens: usize,
         include_memories: bool,
+        sel: &devctx_search::KindSel,
     ) -> Result<String> {
         self.post(
             "/context",
             serde_json::json!({ "query": query, "max_tokens": max_tokens,
-                                "include_memories": include_memories }),
+                                "include_memories": include_memories,
+                                "kind": sel.kind, "include_tests": sel.include_tests }),
         )
     }
 

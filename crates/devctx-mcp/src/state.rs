@@ -545,6 +545,39 @@ pub fn do_search(
     rerank: bool,
     sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
+    let (items, fallback) = search_items(state, query, limit, language, mode, rerank, sel)?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
+        let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
+        format!("{file}:{line}")
+    });
+    // Always the object of the output contract, never a bare array.
+    let mut out = json!({ "results": kept });
+    if !dropped.is_empty() {
+        set_budget_omitted(
+            &mut out,
+            json!({ "count": dropped.len(), "items": dropped }),
+        );
+    }
+    if let Some(f) = &fallback {
+        out["branch_fallback"] = f.to_json();
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// The ranked rows of a search, as JSON, before any output budget touches
+/// them, and the branch fallback when the answer came from another branch.
+/// `do_search` fits them to the tool's budget; `build_context` to its own.
+fn search_items(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    language: Option<String>,
+    mode: SearchMode,
+    rerank: bool,
+    sel: &devctx_search::KindSel,
+) -> Result<(Vec<Value>, Option<BranchFallback>), String> {
     let opts = sel.options(state.cfg.search.penalty)?;
     let store = state.open_store()?;
     let (branch_filter, fallback) = search_branch(state, &store);
@@ -601,7 +634,7 @@ pub fn do_search(
     .map_err(|e| e.to_string())?;
     let mut items = match hits_to_json(&hits) {
         Value::Array(a) => a,
-        other => return serde_json::to_string_pretty(&other).map_err(|e| e.to_string()),
+        _ => Vec::new(),
     };
     // Hits pinned because the query named their symbol say so, so an agent can
     // tell "ranked first" from "is the definition of what you typed".
@@ -620,24 +653,7 @@ pub fn do_search(
             }
         }
     }
-    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
-    let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
-        let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
-        let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
-        format!("{file}:{line}")
-    });
-    // Always the object of the output contract, never a bare array.
-    let mut out = json!({ "results": kept });
-    if !dropped.is_empty() {
-        set_budget_omitted(
-            &mut out,
-            json!({ "count": dropped.len(), "items": dropped }),
-        );
-    }
-    if let Some(f) = &fallback {
-        out["branch_fallback"] = f.to_json();
-    }
-    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+    Ok((items, fallback))
 }
 
 /// Drop rows for branches the config no longer lists. Returns rows removed.
@@ -2480,23 +2496,16 @@ fn search_one(
 /// bounded without holding eleven processes open at their peak.
 const FANOUT_CONCURRENCY: usize = 4;
 
-/// Search every member of a group and return one fused ranking.
+/// The members of a group a fan-out search can compare, and why the others
+/// were left out: `(targets, skipped, reachable, skipped_missing)`.
 ///
-/// A session bound to a group is attached to the product, so "search" means the
-/// product. Answering from a single member would answer a question nobody asked
-/// — and would do it invisibly, which is worse than answering nothing.
-pub fn do_search_group(
-    members: &[ProjectRow],
-    query: &str,
-    limit: usize,
-    language: Option<String>,
-    mode: &str,
+/// Vectors of different width are not comparable, and a ranking fused across
+/// them looks exactly as plausible as a correct one. The registry has carried
+/// `embed_dim` for this comparison all along.
+fn group_targets<'a>(
+    members: &'a [ProjectRow],
     only: Option<&[String]>,
-    sel: &devctx_search::KindSel,
-) -> Result<String, String> {
-    // Vectors of different width are not comparable, and a ranking fused across
-    // them looks exactly as plausible as a correct one. The registry has carried
-    // `embed_dim` for this comparison all along.
+) -> (Vec<&'a ProjectRow>, Vec<Value>, usize, Vec<Value>) {
     let dims: Vec<i64> = members.iter().map(|m| m.embed_dim).collect();
     let majority = dims
         .iter()
@@ -2526,20 +2535,30 @@ pub fn do_search_group(
         }
         targets.push(m);
     }
+    (targets, skipped, reachable, skipped_missing)
+}
 
-    // Run in bounded batches. Sequentially this is eleven round trips one after
-    // another; the members are independent, so that latency is pure waste.
-    let mut results: Vec<(String, Result<devctx_core::SearchHits, String>)> = Vec::new();
+/// Run one search per member, in bounded batches. Sequentially this is eleven
+/// round trips one after another; the members are independent, so that latency
+/// is pure waste.
+fn fan_out_search(
+    targets: &[&ProjectRow],
+    query: &str,
+    limit: usize,
+    language: Option<&str>,
+    mode: &str,
+    sel: &devctx_search::KindSel,
+) -> Vec<(String, Result<devctx_core::SearchHits, String>)> {
+    let mut results = Vec::new();
     for batch in targets.chunks(FANOUT_CONCURRENCY) {
         std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()
                 .map(|m| {
-                    let lang = language.clone();
                     scope.spawn(move || {
                         (
                             m.name.clone(),
-                            search_one(&m.name, &m.path, query, limit, lang.as_deref(), mode, sel),
+                            search_one(&m.name, &m.path, query, limit, language, mode, sel),
                         )
                     })
                 })
@@ -2555,6 +2574,25 @@ pub fn do_search_group(
             }
         });
     }
+    results
+}
+
+/// Search every member of a group and return one fused ranking.
+///
+/// A session bound to a group is attached to the product, so "search" means the
+/// product. Answering from a single member would answer a question nobody asked
+/// — and would do it invisibly, which is worse than answering nothing.
+pub fn do_search_group(
+    members: &[ProjectRow],
+    query: &str,
+    limit: usize,
+    language: Option<String>,
+    mode: &str,
+    only: Option<&[String]>,
+    sel: &devctx_search::KindSel,
+) -> Result<String, String> {
+    let (targets, skipped, reachable, skipped_missing) = group_targets(members, only);
+    let results = fan_out_search(&targets, query, limit, language.as_deref(), mode, sel);
 
     let mut failed = Vec::new();
     let mut per_member: Vec<(String, Vec<Value>)> = Vec::new();
@@ -3142,6 +3180,31 @@ pub fn do_recall_scoped(
     scope: &str,
     repo: Option<&str>,
 ) -> Result<String, String> {
+    let fused = recall_fused(state, query, limit, scope, repo)?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    let (fused, dropped) = fit_memories(fused, budget, |content, target| {
+        do_summarize(state, content, Some(query.to_string()), target).ok()
+    });
+    let mut out = json!({
+        "memories": fused,
+        "omitted_for_budget": { "count": dropped.len(), "titles": dropped },
+    });
+    if !dropped.is_empty() {
+        out["omitted"] = json!({ "count": dropped.len(), "reason": "budget" });
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// The memories a scoped recall ranks, fused across tiers and **not** fitted to
+/// any output budget. `do_recall_scoped` budgets them for a tool answer;
+/// `build_context` does its own, per item, against its own `max_tokens`.
+fn recall_fused(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    scope: &str,
+    repo: Option<&str>,
+) -> Result<Vec<Value>, String> {
     // Anything that is not one single tier means "every tier", preserving the
     // permissive default an unset or unknown scope has always had.
     let every = !matches!(scope, "local" | "global" | "group");
@@ -3202,22 +3265,10 @@ pub fn do_recall_scoped(
         Vec::new()
     };
 
-    let fused = fuse_by_rank(
+    Ok(fuse_by_rank(
         vec![(local, "local"), (group, "group"), (global, "global")],
         limit,
-    );
-    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
-    let (fused, dropped) = fit_memories(fused, budget, |content, target| {
-        do_summarize(state, content, Some(query.to_string()), target).ok()
-    });
-    let mut out = json!({
-        "memories": fused,
-        "omitted_for_budget": { "count": dropped.len(), "titles": dropped },
-    });
-    if !dropped.is_empty() {
-        out["omitted"] = json!({ "count": dropped.len(), "reason": "budget" });
-    }
-    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+    ))
 }
 
 /// Recall from the central store alone, for a session with no project bound.
@@ -3916,121 +3967,146 @@ pub fn do_build_context(
     query: &str,
     max_tokens: usize,
     include_memories: bool,
+    sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
-    let mut out = String::new();
-    let mut used = 0usize;
-    let mut dropped = 0usize;
-    let budget_chars = max_tokens * CHARS_PER_TOKEN;
-
-    // Append if it fits, else count it as dropped. Returns whether it fit.
-    let push = |out: &mut String, used: &mut usize, dropped: &mut usize, s: &str| -> bool {
-        if *used + s.len() > budget_chars {
-            *dropped += 1;
-            return false;
-        }
-        out.push_str(s);
-        *used += s.len();
-        true
+    let mems: Vec<Value> = if include_memories {
+        // Unbudgeted on purpose: `do_recall_scoped` would shrink each memory to
+        // its share of the *tool's* output budget and stamp it "truncated";
+        // here the brief's own budget decides, item by item.
+        recall_fused(state, query, 5, "all", None).unwrap_or_default()
+    } else {
+        Vec::new()
     };
-
-    let mut memory_files: Vec<String> = Vec::new();
-    if include_memories {
-        if let Ok(raw) = do_recall_scoped(state, query, 5, "all", None) {
-            let mems = parse_memories(&raw);
-            // The heading rides with the first item that fits. Emitted on its
-            // own it survives a budget the items underneath did not, and an
-            // empty section reads as "nothing here" — the one thing it must
-            // never mean.
-            let mut head = "## What is already known\n\n";
-            for m in &mems {
-                let title = m.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let files = m.get("files").and_then(|v| v.as_str()).unwrap_or("");
-                for f in files.split(',').map(str::trim).filter(|f| !f.is_empty()) {
-                    memory_files.push(f.to_string());
-                }
-                if push(
-                    &mut out,
-                    &mut used,
-                    &mut dropped,
-                    &format!("{head}[memory] {title}\n{content}\n\n"),
-                ) {
-                    head = "";
-                }
-            }
-        }
-    }
-
-    // Fetch more than will fit: the budget, not the limit, decides where to stop.
-    let raw = do_search(
-        state,
-        query,
-        30,
-        None,
-        SearchMode::Vector,
-        false,
-        &devctx_search::KindSel::default(),
-    )?;
-    let hits: Vec<Value> = parse_memories(&raw);
-    // `do_search` says when it answered from another branch; a prose answer
-    // must say so too, since the code below may differ from what is checked out.
-    let fallback_note = fallback_note(&raw);
-    let mut code_files: Vec<String> = Vec::new();
-    let mut head = "## Code\n\n";
-    for h in &hits {
-        let file = h.get("file").and_then(|v| v.as_str()).unwrap_or("");
-        let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
-        let text = h.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        // A file a memory already pulled in is not worth paying for twice.
-        if memory_files.iter().any(|f| f == file) {
-            continue;
-        }
-        if !code_files.iter().any(|f| f == file) {
-            code_files.push(file.to_string());
-        }
-        if !push(
-            &mut out,
-            &mut used,
-            &mut dropped,
-            &format!("{head}// {file}:{line}\n{text}\n\n"),
-        ) {
-            break;
-        }
-        head = "";
-    }
-
-    if include_memories {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut head = "## Recorded against this code\n\n";
-        for file in code_files.iter().take(5) {
-            let Ok(raw) = do_memories_by_file(
+    // Hybrid, so an identifier in the question anchors its definition, with the
+    // file-kind penalty and dedup `search` already applies. Fetch more than
+    // will fit — the budget, not the limit, decides where to stop — and take
+    // the rows before `do_search`'s own fitting, which would truncate each one
+    // to a thirtieth of the budget.
+    let (hits, fallback) = search_items(state, query, 30, None, SearchMode::Hybrid, false, sel)?;
+    // The branch the answer came from must be named: the code below may differ
+    // from what is checked out.
+    let fallback_note = fallback
+        .as_ref()
+        .and_then(|f| fallback_note(&json!({ "branch_fallback": f.to_json() }).to_string()));
+    Ok(compose_context(
+        &mems,
+        &hits,
+        fallback_note,
+        max_tokens,
+        include_memories,
+        &|file| {
+            do_memories_by_file(
                 state,
                 file,
                 MemoriesOpts {
                     page: Page::new(Some(5), None),
-                    full: true,
+                    full: false,
                 },
-            ) else {
-                continue;
-            };
-            for m in parse_memories(&raw) {
-                let id = m
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !seen.insert(id) {
+            )
+            .map(|raw| parse_memories(&raw))
+            .unwrap_or_default()
+        },
+    ))
+}
+
+/// Share of a brief's budget the recalled memories may take, so a long recall
+/// cannot starve the code the question is actually about.
+const CTX_MEMORY_SHARE_PCT: usize = 35;
+/// Lines and characters of a memory a brief keeps; `recall` has the rest, and
+/// the `id` is shown to ask for it.
+const CTX_MEMORY_LINES: usize = 6;
+const CTX_MEMORY_CHARS: usize = 500;
+/// A chunk may take at most `1/CTX_CODE_CAP_DIV` of the budget (never under
+/// `CTX_CODE_CAP_MIN` chars): one huge chunk must not push out the rest.
+const CTX_CODE_CAP_DIV: usize = 3;
+const CTX_CODE_CAP_MIN: usize = 600;
+/// A leading doc comment longer than `CTX_DOC_MAX` lines keeps its first
+/// `CTX_DOC_KEEP`: the code underneath is what the brief is for.
+const CTX_DOC_MAX: usize = 6;
+const CTX_DOC_KEEP: usize = 3;
+
+/// Assemble the brief from what was gathered. Pure — no store, no embedder — so
+/// the budget rules are testable on their own.
+///
+/// Items are taken in relevance order and each is *fitted*: a long leading doc
+/// comment is shortened first, the chunk is capped, and one that still does not
+/// fit is skipped — the next, smaller one may. (Stopping at the first that did
+/// not fit lost every relevant chunk behind one big one.) What did not fit is
+/// counted and named once, at the end.
+fn compose_context(
+    mems: &[Value],
+    hits: &[Value],
+    fallback_note: Option<String>,
+    max_tokens: usize,
+    include_memories: bool,
+    linked: &dyn Fn(&str) -> Vec<Value>,
+) -> String {
+    let mut out = String::new();
+    let mut dropped = 0usize;
+    let budget = max_tokens * CHARS_PER_TOKEN;
+
+    let mut memory_files: Vec<String> = Vec::new();
+    if include_memories {
+        // The heading rides with the first item that fits: emitted alone it
+        // survives a budget the items under it did not, and an empty section
+        // reads as "nothing here" — the one thing it must never mean.
+        let mut head = "## What is already known\n\n";
+        let cap = budget * CTX_MEMORY_SHARE_PCT / 100;
+        for m in mems {
+            for f in field(m, "files")
+                .split(',')
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+            {
+                memory_files.push(f.to_string());
+            }
+            let piece = format!("{head}{}\n\n", memory_brief(m, "memory"));
+            if out.len() + piece.len() > cap {
+                dropped += 1;
+            } else {
+                out.push_str(&piece);
+                head = "";
+            }
+        }
+    }
+
+    let mut code_files: Vec<String> = Vec::new();
+    let mut head = "## Code\n\n";
+    let chunk_cap = (budget / CTX_CODE_CAP_DIV).max(CTX_CODE_CAP_MIN);
+    for h in hits {
+        let file = field(h, "file");
+        // A file a memory already pulled in is not worth paying for twice.
+        if memory_files.iter().any(|f| f == file) {
+            continue;
+        }
+        let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
+        let body = cap_lines(&trim_leading_doc(field(h, "text")), chunk_cap);
+        let piece = format!("{head}// {file}:{line}\n{body}\n\n");
+        if out.len() + piece.len() > budget {
+            dropped += 1;
+            continue;
+        }
+        out.push_str(&piece);
+        head = "";
+        if !code_files.iter().any(|f| f == file) {
+            code_files.push(file.to_string());
+        }
+    }
+
+    if include_memories {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut head = "## Recorded against this code\n\n";
+        for file in code_files.iter().take(5) {
+            for m in linked(file) {
+                if !seen.insert(field(&m, "id").to_string()) {
                     continue;
                 }
-                let title = m.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let src = m.get("link_sources").and_then(|v| v.as_str()).unwrap_or("");
-                if push(
-                    &mut out,
-                    &mut used,
-                    &mut dropped,
-                    &format!("{head}[memory · {src} · about {file}] {title}\n{content}\n\n"),
-                ) {
+                let tag = format!("memory · {} · about {file}", field(&m, "link_sources"));
+                let piece = format!("{head}{}\n\n", memory_brief(&m, &tag));
+                if out.len() + piece.len() > budget {
+                    dropped += 1;
+                } else {
+                    out.push_str(&piece);
                     head = "";
                 }
             }
@@ -4039,12 +4115,155 @@ pub fn do_build_context(
 
     if dropped > 0 {
         out.push_str(&format!(
-            "\n[devctx] {dropped} further item(s) did not fit in {max_tokens} tokens. \
+            "\n[devctx] omitted: {dropped} item(s), reason: budget ({max_tokens} tokens). \
              Raise max_tokens, or narrow the query.\n"
         ));
     }
     close_context(&mut out, fallback_note);
-    Ok(out)
+    out
+}
+
+fn field<'a>(v: &'a Value, key: &str) -> &'a str {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+/// `[tag] id — title` and the first lines of the memory. No per-memory
+/// "truncated" stamp: the `id` is the way to the rest.
+fn memory_brief(m: &Value, tag: &str) -> String {
+    let mut body = String::new();
+    let mut cut = false;
+    for (i, l) in field(m, "content")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+    {
+        if i >= CTX_MEMORY_LINES || body.len() + l.len() > CTX_MEMORY_CHARS {
+            cut = true;
+            break;
+        }
+        body.push_str(l);
+        body.push('\n');
+    }
+    if cut {
+        body.push('…');
+    } else {
+        body.pop();
+    }
+    format!("[{tag}] {} — {}\n{body}", field(m, "id"), field(m, "title"))
+}
+
+fn is_doc_line(l: &str) -> bool {
+    let t = l.trim_start();
+    t.starts_with("//")
+        || t.starts_with("/*")
+        || t.starts_with('*')
+        || (t.starts_with('#')
+            && !t.starts_with("#[")
+            && !t.starts_with("#!")
+            && !t.starts_with("#include")
+            && !t.starts_with("#define"))
+}
+
+/// A long leading doc comment (javadoc, `///`, `#`) shortened to its first
+/// lines, so the code under it is what the budget pays for.
+fn trim_leading_doc(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let doc = lines.iter().take_while(|l| is_doc_line(l)).count();
+    if doc <= CTX_DOC_MAX {
+        return text.to_string();
+    }
+    let mut out: Vec<String> = lines[..CTX_DOC_KEEP]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+    out.push(format!("// … ({} doc lines trimmed)", doc - CTX_DOC_KEEP));
+    out.extend(lines[doc..].iter().map(|l| l.to_string()));
+    out.join("\n")
+}
+
+/// `text` cut at a line boundary to at most `cap` chars, saying how much went.
+fn cap_lines(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut kept = 0usize;
+    let total = text.lines().count();
+    for l in text.lines() {
+        if out.len() + l.len() + 1 > cap {
+            break;
+        }
+        out.push_str(l);
+        out.push('\n');
+        kept += 1;
+    }
+    out.push_str(&format!("// … ({} more lines)", total - kept));
+    out
+}
+
+/// How many of a member's best hits decide how well it answers a question.
+const PICK_TOP_K: usize = 3;
+/// Mean-score lead the best member needs over the second to be chosen without
+/// being asked. Cosine scores; under this the question is as much about one
+/// repository as the other and a guess would be silent.
+const PICK_MARGIN: f64 = 0.03;
+
+/// A member's fitness for a question: the mean of its `PICK_TOP_K` best scores,
+/// counting a missing hit as 0.
+fn member_score(hits: &[Value]) -> f64 {
+    let mut scores: Vec<f64> = hits
+        .iter()
+        .map(|h| h.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0))
+        .collect();
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(PICK_TOP_K);
+    scores.iter().sum::<f64>() / PICK_TOP_K as f64
+}
+
+/// Pick the member to answer from, or refuse and name the candidates.
+/// Never a default: a clear winner is named, anything else asks for `project`.
+fn choose_member(mut scored: Vec<(String, f64)>) -> Result<(String, usize), String> {
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let n = scored.len();
+    let list = |v: &[(String, f64)]| {
+        v.iter()
+            .map(|(m, s)| format!("{m} ({s:.2})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match scored.as_slice() {
+        [] => Err("no member of this group could be searched; pass `project` \
+                   (a member name or a path inside it)"
+            .to_string()),
+        [(only, _)] => Ok((only.clone(), 1)),
+        [(_, best), ..] if *best <= 0.0 => Err(format!(
+            "nothing in any member matched this query; pass `project` to choose one. \
+             Members: {}",
+            list(&scored)
+        )),
+        [(top, best), (_, second), ..] if best - second >= PICK_MARGIN => Ok((top.clone(), n)),
+        _ => Err(format!(
+            "this query fits more than one member of the group about equally; pass \
+             `project` to choose. Candidates by relevance: {}",
+            list(&scored)
+        )),
+    }
+}
+
+/// `build_context` in a group, with no `project`: search every member and
+/// choose the one that answers best — `(name, members compared)`.
+pub fn pick_group_member(
+    members: &[ProjectRow],
+    query: &str,
+    sel: &devctx_search::KindSel,
+) -> Result<(String, usize), String> {
+    let (targets, _skipped, _reachable, _missing) = group_targets(members, None);
+    let results = fan_out_search(&targets, query, PICK_TOP_K, None, "vector", sel);
+    let scored: Vec<(String, f64)> = results
+        .into_iter()
+        .filter_map(|(name, r)| r.ok().map(|a| (name, member_score(&a.hits))))
+        .collect();
+    choose_member(scored)
 }
 
 /// The tail of a `build_context` answer. The "nothing matched" line goes first:
@@ -6117,6 +6336,132 @@ mod tests {
         let f = fallback.expect("the fallback is reported");
         assert_eq!((f.current.as_str(), f.used.as_str()), ("feat/x", "main"));
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn ctx_hit(file: &str, line: i64, text: &str) -> Value {
+        json!({ "file": file, "start_line": line, "text": text })
+    }
+
+    fn ctx_mem(id: &str, title: &str, content: &str) -> Value {
+        json!({ "id": id, "title": title, "content": content })
+    }
+
+    fn no_linked(_: &str) -> Vec<Value> {
+        Vec::new()
+    }
+
+    /// A first hit bigger than the whole budget no longer ends the brief: the
+    /// smaller hits behind it that fit are still delivered, and the one that
+    /// could not be is counted.
+    #[test]
+    fn build_context_skips_a_chunk_that_does_not_fit_and_keeps_going() {
+        let huge = (0..400)
+            .map(|i| format!("let v{i} = compute_something_long({i});"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hits = vec![
+            ctx_hit("big.rs", 1, &huge),
+            ctx_hit("small_a.rs", 3, "fn a() {}"),
+            ctx_hit("small_b.rs", 9, "fn b() {}"),
+        ];
+        // 100 tokens = 400 chars: even the capped huge chunk (600 chars) misses.
+        let out = compose_context(&[], &hits, None, 100, false, &no_linked);
+        assert!(out.contains("small_a.rs:3"), "{out}");
+        assert!(out.contains("small_b.rs:9"), "{out}");
+        assert!(!out.contains("big.rs"), "{out}");
+        assert!(out.contains("omitted: 1 item(s), reason: budget"), "{out}");
+        assert!(out.len() <= 400 + 200, "the budget is a stop: {out}");
+    }
+
+    /// A long javadoc is cut before the code under it: the body survives, the
+    /// doc is shortened and says how much went.
+    #[test]
+    fn build_context_trims_a_long_leading_doc_before_the_body() {
+        let doc = (0..40)
+            .map(|i| format!(" * documentation line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("/**\n{doc}\n */\npublic void charge() {{ run(); }}");
+        let out = compose_context(
+            &[],
+            &[ctx_hit("Pay.java", 10, &text)],
+            None,
+            400,
+            false,
+            &no_linked,
+        );
+        assert!(out.contains("public void charge() { run(); }"), "{out}");
+        assert!(out.contains("doc lines trimmed"), "{out}");
+        assert!(!out.contains("documentation line 30"), "{out}");
+        // A short doc is left alone.
+        let short = "/// one\n/// two\nfn f() {}";
+        assert_eq!(trim_leading_doc(short), short);
+        // Attributes are not documentation.
+        assert!(!is_doc_line("#[derive(Debug)]"));
+    }
+
+    /// Code is not pushed out by memories: they get a share, the rest is
+    /// counted, and no per-item "exceeded its share" stamp appears.
+    #[test]
+    fn build_context_memories_keep_to_a_share_and_never_stamp_truncation() {
+        let long = "line of a long memory\n".repeat(200);
+        let mems: Vec<Value> = (0..6)
+            .map(|i| ctx_mem(&format!("m{i}"), &format!("decision {i}"), &long))
+            .collect();
+        let out = compose_context(
+            &mems,
+            &[ctx_hit("a.rs", 1, "fn a() {}")],
+            None,
+            300,
+            true,
+            &no_linked,
+        );
+        assert!(!out.contains("exceeded its share"), "{out}");
+        assert!(!out.contains("[devctx] truncated"), "{out}");
+        assert!(out.contains("[memory] m0 — decision 0"), "{out}");
+        assert!(out.contains("a.rs:1"), "code still fits: {out}");
+        let omitted = out.matches("omitted:").count();
+        assert_eq!(omitted, 1, "one closing count, not one per item: {out}");
+    }
+
+    /// Group selection: a query that only matches the non-default member
+    /// chooses it, by name.
+    #[test]
+    fn group_pick_chooses_the_member_that_matches() {
+        let scored = vec![
+            ("tickets-srv".to_string(), 0.12),
+            ("front".to_string(), 0.61),
+        ];
+        assert_eq!(choose_member(scored), Ok(("front".to_string(), 2)));
+        let hits = vec![
+            json!({"score": 0.9}),
+            json!({"score": 0.6}),
+            json!({"score": 0.3}),
+        ];
+        assert!((member_score(&hits) - 0.6).abs() < 1e-9);
+        assert!((member_score(&[json!({"score": 0.9})]) - 0.3).abs() < 1e-9);
+    }
+
+    /// A close call asks for `project` and lists the candidates; so does a
+    /// group where nothing matched or nobody answered. Never a default.
+    #[test]
+    fn group_pick_refuses_a_close_call_and_names_candidates() {
+        let err = choose_member(vec![("api".into(), 0.50), ("web".into(), 0.49)]).unwrap_err();
+        assert!(err.contains("`project`"), "{err}");
+        assert!(
+            err.contains("api (0.50)") && err.contains("web (0.49)"),
+            "{err}"
+        );
+        assert!(
+            choose_member(vec![("api".into(), 0.0), ("web".into(), 0.0)])
+                .unwrap_err()
+                .contains("pass `project`")
+        );
+        assert!(choose_member(vec![]).unwrap_err().contains("`project`"));
+        assert_eq!(
+            choose_member(vec![("solo".into(), 0.2)]),
+            Ok(("solo".into(), 1))
+        );
     }
 
     #[test]

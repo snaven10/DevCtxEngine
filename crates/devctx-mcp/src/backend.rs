@@ -589,13 +589,15 @@ impl Backend {
         query: &str,
         max_tokens: usize,
         include_memories: bool,
+        sel: &devctx_search::KindSel,
     ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_build_context(s, query, max_tokens, include_memories),
+            Backend::Local(s) => do_build_context(s, query, max_tokens, include_memories, sel),
             Backend::Remote(r, _) => r.post(
                 "/context",
                 json!({ "query": query, "max_tokens": max_tokens,
-                        "include_memories": include_memories }),
+                        "include_memories": include_memories,
+                        "kind": sel.kind, "include_tests": sel.include_tests }),
             ),
         }
     }

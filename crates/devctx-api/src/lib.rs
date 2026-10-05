@@ -907,6 +907,10 @@ struct ContextBody {
     max_tokens: Option<usize>,
     #[serde(default)]
     include_memories: Option<bool>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1161,6 +1165,10 @@ async fn build_context(State(api): State<Api>, Json(b): Json<ContextBody>) -> Re
             &b.query,
             b.max_tokens.unwrap_or(4096),
             b.include_memories.unwrap_or(true),
+            &devctx_search::KindSel {
+                kind: b.kind,
+                include_tests: b.include_tests,
+            },
         )
     })
     .await

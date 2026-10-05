@@ -4,7 +4,7 @@
 - **Especialista:** rust (modelo sugerido: sonnet; opus si la selección en grupo se complica)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
 - **Depende de:** TASK-010, TASK-011, TASK-012
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -32,28 +32,28 @@ en el primer chunk grande ni traer memorias truncadas (PLAN-008 B7).
 
 ## Pasos
 
-- [ ] **Paso 1 — `project`.** Parámetro `project` como en las demás tools (acepta un repo distinto del
+- [x] **Paso 1 — `project`.** Parámetro `project` como en las demás tools (acepta un repo distinto del
       bindeado en sesiones de grupo).
-- [ ] **Paso 2 — Grupo sin `project`.** Correr la búsqueda en cada miembro (reusar la federación de
+- [x] **Paso 2 — Grupo sin `project`.** Correr la búsqueda en cada miembro (reusar la federación de
       `search` en grupo) y elegir el repo con mejor score top-k; nombrarlo en la salida
       (`[devctx] context from <repo> (best match among N members)`). Si el margen entre el primero y
       el segundo es chico, devolver error pidiendo `project` con los candidatos. Nunca default
       silencioso.
-- [ ] **Paso 3 — Ranking.** Búsqueda `hybrid` con las penalizaciones de TASK-011 y dedup de TASK-012;
+- [x] **Paso 3 — Ranking.** Búsqueda `hybrid` con las penalizaciones de TASK-011 y dedup de TASK-012;
       `kind`/`include_tests` pasan derecho.
-- [ ] **Paso 4 — Presupuesto.** Reemplazar `break` por "saltar y seguir" (un chunk grande no impide
+- [x] **Paso 4 — Presupuesto.** Reemplazar `break` por "saltar y seguir" (un chunk grande no impide
       los siguientes que sí caben); dentro de un chunk de código, recortar comentarios de
       documentación iniciales largos antes que el cuerpo; memorias como título + primeras líneas con
       `id` (sin la marca de truncado por cada una) y una sola línea final con el conteo de omitidos.
 
 ## Criterios de aceptación
 
-- [ ] Test: grupo de 2 miembros, consulta que solo matchea en el no-default → contexto del correcto,
+- [x] Test: grupo de 2 miembros, consulta que solo matchea en el no-default → contexto del correcto,
       nombrado.
-- [ ] Test: consulta ambigua entre miembros → error que lista candidatos y pide `project`.
-- [ ] Test: primer hit más grande que el presupuesto → los siguientes que caben aparecen.
-- [ ] Test: ningún "exceeded its share" en la salida de `build_context`; sí un conteo final.
-- [ ] En el Resultado: la consulta de campo (FrontEnd en revfa) antes/después.
+- [x] Test: consulta ambigua entre miembros → error que lista candidatos y pide `project`.
+- [x] Test: primer hit más grande que el presupuesto → los siguientes que caben aparecen.
+- [x] Test: ningún "exceeded its share" en la salida de `build_context`; sí un conteo final.
+- [ ] En el Resultado: la consulta de campo (FrontEnd en revfa) antes/después. -> diferido a TASK-016 (medición de campo).
 
 ## Riesgos
 
@@ -63,3 +63,12 @@ medirlo y reportarlo.
 ## Resultado
 
 <!-- Contrato: PLAN-008 §11 -->
+
+1. **Estado final:** `done`.
+2. **Repro antes/después:** antes, en sesión de grupo `build_context` usaba `Binding::Group.default` (sin `project`), buscaba en `Vector` con `do_search` (que recorta cada fila a 1/30 del presupuesto con "exceeded its share") y cortaba con `break` en el primer chunk que no cabía. Ahora: ver tests; la consulta de campo FrontEnd/revfa queda para TASK-016.
+3. **Causa raíz:** confirmada. Además: `do_recall_scoped` y `do_search` presupuestaban por su cuenta (marca "truncated" por ítem) antes de que `build_context` viera los datos; ahora `build_context` toma los datos sin presupuestar (`recall_fused`, `search_items`) y reparte su propio `max_tokens`.
+4. **Archivos:** `devctx-mcp/src/{state,lib,backend}.rs`, `devctx-api/src/lib.rs`, `devctx-cli/src/{remote,main}.rs`. Nuevos/cambiados: `do_build_context(state, query, max_tokens, include_memories, &KindSel)`, `Backend::build_context(.., &KindSel)`, `RemoteClient::build_context(.., &KindSel)`, privados `recall_fused`, `search_items`, `group_targets`, `fan_out_search` (extraídos de `do_recall_scoped`/`do_search`/`do_search_group`, sin duplicar), `compose_context`, `memory_brief`, `trim_leading_doc`, `cap_lines`, `member_score`, `choose_member`, pub `pick_group_member(members, query, &KindSel) -> Result<(String, usize), String>`; `DevctxServer::context_backend`.
+5. **Tests** (`cargo test -p devctx-mcp --lib -- build_context group_pick`, 6/6 ok): `build_context_skips_a_chunk_that_does_not_fit_and_keeps_going` (en el padre el `break` perdía los chunks siguientes), `build_context_trims_a_long_leading_doc_before_the_body`, `build_context_memories_keep_to_a_share_and_never_stamp_truncation`, `group_pick_chooses_the_member_that_matches`, `group_pick_refuses_a_close_call_and_names_candidates`. En el padre las funciones no existen (no compilan); la conducta que fijan es la descrita en el punto 2. Gate completo: fmt, clippy (también `--features gpu`) y `cargo test --workspace`.
+6. **Contrato:** `build_context` (MCP) acepta `project`, `kind`, `include_tests`; `POST /context` acepta `kind`, `include_tests`. Salida prosa: primera línea `[devctx] context from <repo>` (con `(best match among N members)` si eligió por score); cierre `[devctx] omitted: N item(s), reason: budget (T tokens)...` (una sola vez); `[devctx] branch_fallback: ...` se mantiene. Memorias: `[memory] <id> — <título>` + primeras líneas (6 líneas / 500 chars), sin marca de truncado por ítem.
+7. **No verificado:** consulta de campo en revfa (TASK-016); el margen de selección `PICK_MARGIN=0.03` sobre media top-3 de coseno es heurístico, sin calibrar en campo; no hay test de integración end-to-end del grupo (la selección se prueba sobre `choose_member`/`member_score`, la fan-out reusa `search_one` ya cubierto).
+8. **Parámetros/números:** búsqueda `hybrid` limit 30, rerank off; memorias ≤35% del presupuesto; un chunk ≤ max(presupuesto/3, 600 chars); doc inicial >6 líneas se deja en 3 + "N doc lines trimmed"; selección: top-3 por miembro (vector), margen 0.03. Costo de selección: N búsquedas (una por miembro, lotes de 4) más la de contexto; igual que `search` en grupo; no medido en tiempo.
