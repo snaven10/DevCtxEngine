@@ -122,8 +122,11 @@ imported or migrated, or the caller spelled the path differently) but the
 memory's `files` names the file — compared after normalising the path, and by
 suffix, so `a.rs` and `src/a.rs` meet. If every result is of that kind,
 `matched_by` is `junction`; a text match with no `files` evidence stays
-`text-inference`. `memories_by_symbol` has no file subject, so it never reports
-`files-field`.
+`text-inference`. `memories_by_symbol` has a file subject only when asked for
+`file::symbol` (`links.rs::memories_by_symbol`, or with a path): the file part is
+split off, the symbol is looked up on its own and a memory whose `files` names
+that file is `files-field`; for a bare symbol it never reports `files-field` from
+the text fallback.
 
 ### Paging the by-code tools
 

@@ -123,6 +123,10 @@ definición, `read_symbol` agrega:
 - `external: true`, `called_from: N` y un `next_step` cuando el nombre solo aparece
   como *destino* de llamadas — lo más probable es una función de librería o del
   runtime, aunque puede vivir en un archivo que el índice excluye o en otra rama.
+  Un nombre calificado (`serde_json::from_str`, `Panache.withTransaction`) se busca
+  tal cual y después por su último segmento, porque el grafo suele guardar solo el
+  callee pelado. Un externo no recibe `suggestions` difusas (`with_context` no es
+  un typo de `build_context`), solo las formas calificadas del mismo nombre.
 
 Las funciones chicas que el chunker agrupó en un solo fragmento (`a, b, c`) se
 encuentran dentro de él, así que no se reportan como externas por error.

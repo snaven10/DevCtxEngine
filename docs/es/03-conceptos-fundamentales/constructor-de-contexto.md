@@ -116,7 +116,12 @@ Cómo se elige un miembro:
 4. Una ventaja menor que 0,03 igual responde desde el mejor miembro, más la línea
    `ambiguous` que nombra a los otros. Si algunos miembros comparables no pudieron
    puntuarse, la respuesta dice `compared only k of N comparable members` y ofrece
-   los que la pregunta nombra. Si nadie pudo puntuarse y nada falló (todos fríos),
+   los que la pregunta nombra (`Likely (named by the question): api — pass
+   `project=api``) y agrega una línea legible por máquina,
+   `[devctx] selection: {"scored":1,"total":3,"candidates":["api"]}`, para que un
+   agente reintente con `project`. La selección nunca levanta un servidor para
+   mejorar su propia elección: los miembros sin puntuar siguen así hasta que su
+   servidor esté arriba. Si nadie pudo puntuarse y nada falló (todos fríos),
    responde desde el miembro por defecto del grupo y dice que *no se eligió por
    relevancia*. Un miembro que responde con un error es un error, listado.
 5. Una elección que comparó **a todos** los miembros comparables con ventaja clara

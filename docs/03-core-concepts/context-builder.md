@@ -111,7 +111,12 @@ How a member is chosen:
 4. A lead under 0.03 still answers from the best member, plus the `ambiguous`
    line naming the others. If some comparable members could not be scored, the
    answer says `compared only k of N comparable members` and offers the ones the
-   question names. If nobody could be scored and nothing failed (all cold), it
+   question names (`Likely (named by the question): api — pass `project=api``)
+   and adds a machine-readable line,
+   `[devctx] selection: {"scored":1,"total":3,"candidates":["api"]}`, so an
+   agent can retry with `project`. Selection never spawns a server to improve
+   its own odds: the unscored members stay unscored until their server is up.
+   If nobody could be scored and nothing failed (all cold), it
    answers from the group's default member and says it was *not chosen by
    relevance*. A member that answers with an error is an error, listed.
 5. A choice that compared **every** comparable member with a clear lead is cached

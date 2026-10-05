@@ -60,6 +60,16 @@ window, honest ranking, and a project-aware `build_context`.
   (`{current, used, why}`). With no index at all they fail with an explicit error.
 - **`read_symbol` not found** returns `suggestions` (up to 5) and, for names that
   are only ever called, `external: true`, `called_from` and a `next_step`.
+  Qualified names (`serde_json::from_str`, `Panache.withTransaction`) are
+  matched as written and by their last segment, and an external no longer gets
+  fuzzy suggestions from this repo.
+- **Group `build_context` selection is actionable.** When comparable members
+  could not be scored, the warning says `Likely (named by the question): X, Y —
+  pass project=X` and the brief carries `[devctx] selection:
+  {"scored","total","candidates"}`. It still never starts a server to select.
+- **`memories_by_symbol("file::symbol")`** splits the file part off: the symbol
+  is looked up alone and a memory whose `files` names that file is
+  `files-field`, not `inference`.
 - **`link_sources: "files-field"`** when a memory's `files` names the file, also
   in the text fallback.
 - **Exclude changes reconcile incrementally.** Changing the effective exclude
@@ -74,6 +84,13 @@ window, honest ranking, and a project-aware `build_context`.
   a spawn that dies on a lock held by a server still starting waits for that
   server and reuses it. The central daemon's idle exit now withdraws its
   `serve.json` too.
+  The wait for a holder that is starting is 60 s, and only for a server a client
+  spawned less than 60 s ago (or one checkpointing): an old server that lost its
+  `serve.json` fails fast with its PID.
+- A server run from a renamed copy of the binary is recognised by the same
+  executable (device and inode), so `serve --stop` stops it instead of deleting
+  its `serve.json` and orphaning it. A central daemon that loses the start-up
+  race logs one line and exits instead of an error.
 - **macOS:** `serve --stop` waits for the real exit with kqueue.
 - `CONTRIBUTING.md`: the test model cache (`.devctx-test-models`).
 

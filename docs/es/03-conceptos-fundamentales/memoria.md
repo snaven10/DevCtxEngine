@@ -125,8 +125,11 @@ importó o migró, o quien llama escribió la ruta distinto) pero los `files` de
 memoria nombran el archivo — comparado tras normalizar la ruta, y por sufijo, así
 `a.rs` y `src/a.rs` se encuentran. Si todos los resultados son de ese tipo,
 `matched_by` es `junction`; una coincidencia de texto sin evidencia en `files`
-sigue siendo `text-inference`. `memories_by_symbol` no tiene un archivo como
-sujeto, así que nunca reporta `files-field`.
+sigue siendo `text-inference`. `memories_by_symbol` tiene un archivo como sujeto
+solo cuando se pide `archivo::símbolo` (`links.rs::memories_by_symbol`, o con
+ruta): se separa la parte del archivo, el símbolo se busca solo y una memoria cuyos
+`files` nombran ese archivo es `files-field`; con un símbolo pelado el fallback de
+texto nunca reporta `files-field`.
 
 ### Paginar las tools por código
 

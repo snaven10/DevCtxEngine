@@ -81,3 +81,17 @@ por prefijo/sufijo en SQL y rankear en memoria.
   símbolos de ≥ 3 caracteres, y excluye símbolos `grouped`. Test
   `the_closest_symbol_survives_a_flood_of_candidates` (20k candidatos; falla en el padre). Tarda ~20 s por el
   upsert de 20k filas.
+
+### Fixup L (campo, B2/B3/B4)
+
+- **B2** `Store::external_call_sites` busca el nombre calificado tal cual y, si falla, por su último segmento (`.` o
+  `::`), y acepta destinos `…::name` además de `….name`; un último segmento definido en el repo no se toma por externo.
+  `serde_json::from_str`, `tokio::spawn`, `Panache.withTransaction` -> `external: true`.
+- **B3** con `external: true` no se ofrecen sugerencias difusas del repo (`with_context` ya no sugiere
+  `build_context`); solo las formas calificadas del mismo nombre, y el campo se omite si no hay. Sin externo todo sigue
+  igual. Test `qualified_externals_are_found_and_get_no_noisy_suggestions` (falla en el padre en el primer
+  calificado).
+- **B4** `memories_by_symbol("links.rs::memories_by_symbol")` parte `archivo::símbolo` (`split_file_symbol`,
+  `symbol_query`): el símbolo se busca solo y el archivo es el sujeto contra el que se compara `files` -> `files-field`
+  en vez de `inference`. Un módulo (`devctx_store::Store`) no se toma por archivo. Test
+  `a_file_qualified_symbol_matches_files_field_against_its_file`.

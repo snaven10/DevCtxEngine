@@ -116,3 +116,38 @@ Los ítems y su evidencia están en "Pendientes para P1" de PLAN-008 (líneas tr
 - **Nit** `Central::embedder()` devuelve `CentralError::Request` ante el lock envenenado en vez de `expect`.
 - **Docs (EN+ES)** `DEVCTX_EMBED_BATCH_SIZE` default 8 (`09-models-and-tuning`, `architecture-spec`, `06-extending-the-system`); CHANGELOG: bullet "Tests no longer leak servers" completado, sin IDs internos en la nota 0.8.3 ni en "Lifecycle"; `12-central-store` documenta el retiro de `serve.json` y el `discover` con validación de pid.
 - **Verificado por:** fmt --check; clippy `--workspace --all-targets` con y sin `--features gpu` (0 warnings); `cargo test` por paquete verde; `serve_lifecycle` 16/16 en 6 corridas completas salvo una en la que `an_idle_server_exits_after_its_window` y `an_idle_server_exits_even_with_an_index_stuck` fallaron por tiempo con la máquina cargada (pre-existentes, ya vistos en J) y pasaron en las 5 siguientes. **No verificado:** release build, macOS/Windows (`spawned_by_a_client` es solo Linux: fuera de Linux el dueño ajeno espera `LOCK_WAIT`).
+
+### Fixup L (review + campo)
+
+Review de K (609f90a) y hallazgos de campo de TASK-016. Cada ítem con su test; los marcados "falla en el padre" se
+verificaron revirtiendo el fix.
+
+- **K1** `lock_wait_for` (`remote.rs`) delega en `holder_wait(autospawned, age_secs, checkpointing)`: el techo largo
+  (`HOLDER_WAIT`) solo para un serve lanzado por un cliente con menos de `STARTUP_WINDOW` (60 s, `procown::age_secs`)
+  o que está checkpointeando; un serve autospawned viejo con `serve.json` perdido (vivo hasta su `--idle`, o colgado)
+  falla rápido nombrando el PID. Test `only_a_starting_or_checkpointing_holder_gets_the_long_wait`.
+- **K2** `ensure_checked` repite el spawn hasta `SPAWN_ATTEMPTS` (3) veces; cada fallo por lock espera antes
+  (`wait_out_lock`) en vez de informarse tras un único reintento. Test e2e `three_cold_clients_end_up_on_one_server`
+  (6 rondas con 3 clientes fríos). **No falla en el padre** en 3 corridas: la carrera no se reproduce a voluntad; es un
+  test de estrés, no una prueba de la causa.
+- **K3** `HOLDER_WAIT` 30 s -> 60 s (igual al `WAIT_TICKS` previo): un serve que tarda >30 s en cargar el modelo ya no
+  hace fallar al perdedor.
+- **K4** `wait_out_lock` mira `serve.json` cada 50 ms pero abre el DuckDB cada `LOCK_CHECK_EVERY` (250 ms). Test
+  `the_wait_does_not_open_the_database_on_every_tick`.
+- **Nits** marker de checkpoint sin pid parseable en el mensaje de lock: espera `CHECKPOINT_WAIT` (3 s > el presupuesto
+  de 1,5 s; test `a_checkpoint_without_a_named_holder_is_waited_out`); la rama del environ `DEVCTX_AUTOSPAWNED` tiene
+  su test (`the_autospawn_mark_is_read_from_the_environment`); `spawned_by_a_client` documenta que fuera de Linux es
+  siempre false (la carrera cae a `LOCK_WAIT` de 500 ms). El comentario del e2e de lock ajeno dice ahora que su
+  "holder" (hard link) es un server para el motor desde B5, no "foreign por nombre".
+- **B5** `procown::is_server_pid` (Linux) acepta además un proceso cuyo `/proc/<pid>/exe` es el mismo archivo
+  (dev+inode) que el ejecutable propio, vía `is_server_proc_as`; un binario renombrado (`new`) deja de leerse como
+  "Gone", así `serve --stop` lo detiene y ya no borra su `serve.json` dejándolo huérfano. `Unverified` nunca borra el
+  archivo (ya era así en `stop_server`/`stop`). Tests: unitario `a_renamed_binary_is_a_server_only_when_it_is_ours` y
+  e2e `a_server_run_from_a_renamed_binary_is_stopped_not_orphaned` (falla en el padre: el server sigue vivo).
+- **B6** `cmd_serve_central`: si `Central::open` falla por lock y otro central se anuncia en <= 5 s
+  (`central_open_failed`), escribe "another central daemon is running…" y sale 0, sin `Error:` en `serve.log`. Test
+  e2e `a_central_daemon_that_loses_the_race_exits_quietly`.
+- **Verificado por:** fmt --check; clippy `--workspace --all-targets` con y sin `--features gpu` (0 warnings);
+  `cargo test` por paquete verde con `TMPDIR=/var/tmp`; `serve_lifecycle` 19/19 en 3 corridas completas; 0 serves
+  sobrantes. **No verificado:** macOS/Windows; K1/K3 en vivo con un serve de >60 s (solo la decisión pura está
+  testeada).

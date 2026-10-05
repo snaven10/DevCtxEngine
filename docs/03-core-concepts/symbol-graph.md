@@ -117,7 +117,11 @@ thing itself; use `search` when you want code *about an idea*. `limit` (default
   prefix, suffix, containment or edit distance (`AuthServce` → `AuthService`);
 - `external: true`, `called_from: N` and a `next_step` when the name is only ever
   a call *target* — most likely a library or runtime function, though it may live
-  in a file the index excludes or on another branch.
+  in a file the index excludes or on another branch. A qualified name
+  (`serde_json::from_str`, `Panache.withTransaction`) is looked up as written and
+  then by its last segment, since the graph often holds only the bare callee. An
+  external gets no fuzzy `suggestions` (`with_context` is not a typo of
+  `build_context`), only the qualified forms of the same name.
 
 Small functions that the chunker grouped into one chunk (`a, b, c`) are found
 inside it, so they are not misreported as external.

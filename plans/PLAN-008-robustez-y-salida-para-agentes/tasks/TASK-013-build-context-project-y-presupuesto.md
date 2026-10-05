@@ -210,3 +210,13 @@ Contrato corregido (punto 6): la línea `[devctx] context from <repo>` aparece s
 - **No verificado:** latencia real en revfa (13 miembros) con el deadline de 2.5 s — un miembro que recarga su
   modelo en la primera `/search` quedará `busy` esa vez (su búsqueda sigue en el server y lo deja caliente para la
   próxima); calibración del margen (TASK-016).
+
+### Fixup L (campo, B1)
+
+En frío el grupo respondía desde el default y, con "1 de 3" puntuados, seguía respondiendo desde el default aunque la
+pregunta fuera de otro miembro. Decisión: se mantiene "nunca levantar un serve para seleccionar". La advertencia ahora
+es accionable: `Likely (named by the question): X, Y — pass project=X` (candidatos de `name_candidates`, ya filtrados
+por IDF, restringidos a los miembros sin puntuar) y el brief lleva la línea legible por máquina
+`[devctx] selection: {"scored":1,"total":3,"candidates":["X","Y"]}` (`GroupPick.selection`, `state::Selection`; ausente
+si se compararon todos los comparables). Test `a_partial_selection_offers_candidates_machine_readably`; los tres tests
+que comprobaban "Named by the question" se actualizaron a la frase nueva.
