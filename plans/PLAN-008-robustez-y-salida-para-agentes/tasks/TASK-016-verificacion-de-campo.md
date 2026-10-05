@@ -3,7 +3,7 @@
 - **Plan:** PLAN-008 — Robustez del ciclo de vida y salida útil para agentes
 - **Especialista:** — (orquestador, con el binario nuevo instalado y aprobación del usuario)
 - **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
-- **Depende de:** TASK-015
+- **Depende de:** TASK-015, TASK-017
 - **Estado:** `pending`
 
 ---

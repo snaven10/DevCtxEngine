@@ -246,7 +246,8 @@ binario instalado y sugieren reiniciar la sesión.
 | TASK-013 | `build_context`: `project`, selección en grupo y presupuesto por relevancia | P1 | TASK-010, TASK-011, TASK-012 | `pending` |
 | TASK-014 | `link_sources` correcto y sugerencias en `read_symbol` | P1 | TASK-006 | `pending` |
 | TASK-015 | Docs EN + ES | P1 | TASK-013, TASK-014, TASK-007, TASK-005 | `pending` |
-| TASK-016 | Verificación de campo en `~/revfa` y este repo, antes/después | P1 | TASK-015 | `pending` |
+| TASK-016 | Verificación de campo en `~/revfa` y este repo, antes/después | P1 | TASK-015, TASK-017 | `pending` |
+| TASK-017 | Pendientes del review de P0: idle exit, `in_tx`, procown fuera de Linux, transacciones y tests | P1 | — | `pending` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
 
@@ -354,12 +355,16 @@ Cada TASK llena su `## Resultado` con:
 - **Q-1 → dos releases.** 0.8.3 = P0 (TASK-001…009); 0.9.0 = P1 (TASK-010…016).
 - **Q-2 → se acepta y se documenta.** Un commit desde un worktree enlazado indexa el `HEAD` del
   worktree principal; el commit del worktree entra al índice cuando llega a una rama trackeada.
-- **Q-3 → PENDIENTE.** `build/` en los excludes por defecto no fue respondida: confirmar con el
-  usuario antes de TASK-011 (P1; no bloquea P0). No asumir.
+- **Q-3 → sí, con opt-out (2026-10-04).** `build/` entra en los excludes por defecto junto con
+  `node_modules`, `target` y `dist`; una opción de config permite volver a indexarlo.
 - **Q-4 → OK.** `search_routes` 20, `plan_status` 25 planes, `memories_by_*` 5 recortadas a 600
   caracteres.
 - Ejecución de P0 en la rama `feat/plan-008-p0`, con compilación y tests autorizados; la sesión
   `debug-devctx-mcp-process` revisa cada lote y hace la verificación de campo antes de 0.8.3.
+- **P0 publicado como 0.8.4 (2026-10-04).** 0.8.3 quedó como tag sin release: el build de Windows
+  falló (`errno_result` de procown sin `cfg(unix)`); se corrigió como fix-forward.
+- **P1 aprobado para ejecución (2026-10-04)** en la rama `feat/plan-008-p1`, con compilación y
+  tests autorizados, release 0.9.0. El usuario sumó **TASK-017** con los pendientes del review de P0.
 
 ## Pendientes para P1 (surgidos en la revisión final de P0)
 
