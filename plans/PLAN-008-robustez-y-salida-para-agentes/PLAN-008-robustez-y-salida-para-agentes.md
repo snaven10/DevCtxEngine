@@ -246,7 +246,7 @@ binario instalado y sugieren reiniciar la sesión.
 | TASK-013 | `build_context`: `project`, selección en grupo y presupuesto por relevancia | P1 | TASK-010, TASK-011, TASK-012 | `done` |
 | TASK-014 | `link_sources` correcto y sugerencias en `read_symbol` | P1 | TASK-006 | `done` |
 | TASK-015 | Docs EN + ES | P1 | TASK-013, TASK-014, TASK-007, TASK-005 | `done` |
-| TASK-016 | Verificación de campo en `~/revfa` y este repo, antes/después | P1 | TASK-015, TASK-017 | `pending` |
+| TASK-016 | Verificación de campo en `~/revfa` y este repo, antes/después | P1 | TASK-015, TASK-017 | `done` |
 | TASK-017 | Pendientes del review de P0: idle exit, `in_tx`, procown fuera de Linux, transacciones y tests | P1 | — | `done` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
@@ -271,11 +271,11 @@ binario instalado y sugieren reiniciar la sesión.
 | `read_symbol`/`get_references`/`search_routes` en rama no indexada | `[]` silencioso | resultados de la rama de fallback + campo `branch_fallback` |
 | `status` sobre un índice de extractor viejo | `up_to_date: true` | `extractor_stale: true` + aviso |
 | `recall scope:all` en revfa desde MCP | falla | devuelve las del CLI (≥ 4 para la consulta del informe) |
-| `search` "how are memories linked to symbols" | mismo chunk 3-5× | 0 duplicados `(file, start, end)` |
-| `search_routes` sin `path` | ~6k tokens | ≤ 1.5k con `limit` default + `omitted` |
-| `plan_status` sin filtro en revfa | ~11k tokens | ≤ 3k con `active_only`/`limit` + `omitted` |
-| `build_context` en grupo sin `project` | default silencioso | repo por mejor score, nombrado, o error que pide `project` |
-| Suite de tests | deja un serve vivo | 0 procesos `devctx serve` con cwd en tmp tras la suite |
+| `search` "how are memories linked to symbols" | mismo chunk 3-5× | 0 duplicados `(file, start, end)` (medido: 0; 0.8.5 ya no duplicaba) |
+| `search_routes` sin `path` | ~6k tokens | ≤ 1.5k con `limit` default + `omitted` (medido: 5041 → 1437 tok, margen estrecho) |
+| `plan_status` sin filtro en revfa | ~11k tokens | ≤ 3k con `active_only`/`limit` + `omitted` (medido: 5820 → 1145 tok) |
+| `build_context` en grupo sin `project` | default silencioso | repo por mejor score, nombrado, o error que pide `project` (medido: 7/7; frío 3,55 s, tibio 0,22-0,34 s) |
+| Suite de tests | deja un serve vivo | 0 procesos `devctx serve` con cwd en tmp tras la suite (medido: 0; `serve_lifecycle` 16/16 en 4 corridas) |
 
 ## 7. Riesgos
 
