@@ -17,6 +17,7 @@ pub mod paths;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use devctx_core::config::{Embeddings, Project, ProjectConfig};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
@@ -64,10 +65,22 @@ pub struct Central {
     paths: CentralPaths,
     config: CentralConfig,
     store: Store,
-    /// Built on first use. The daemon must start without paying a model load —
-    /// registry work needs no embedder at all, and most sessions never touch a
-    /// global memory.
-    embedder: Mutex<Option<Arc<dyn EmbeddingProvider>>>,
+    /// Built on first use and released after an idle window (see
+    /// [`Central::release_idle_embedder`]). The daemon must start without
+    /// paying a model load — registry work needs no embedder at all, and most
+    /// sessions never touch a global memory.
+    embedder: Mutex<Option<CachedEmbedder>>,
+    /// How the embedder is built. `create_provider` outside of tests.
+    factory: EmbedderFactory,
+}
+
+type EmbedderFactory =
+    Box<dyn Fn(&EmbedSettings) -> Result<Arc<dyn EmbeddingProvider>> + Send + Sync>;
+
+/// The loaded embedder and the last time anyone asked for it.
+struct CachedEmbedder {
+    value: Arc<dyn EmbeddingProvider>,
+    last_used: Instant,
 }
 
 impl Central {
@@ -113,7 +126,18 @@ impl Central {
             config,
             store,
             embedder: Mutex::new(None),
+            factory: Box::new(|s| Ok(Arc::from(create_provider(s)?))),
         })
+    }
+
+    /// Replace how the embedder is built (a counting or fake provider in
+    /// tests, so no model has to be downloaded).
+    pub fn with_embedder_factory(
+        mut self,
+        factory: impl Fn(&EmbedSettings) -> Result<Arc<dyn EmbeddingProvider>> + Send + Sync + 'static,
+    ) -> Self {
+        self.factory = Box::new(factory);
+        self
     }
 
     /// Resolved on-disk locations.
@@ -159,16 +183,44 @@ impl Central {
         e.provider == self.config.memory.provider && e.model == self.config.memory.model
     }
 
-    /// The central memory embedder, built (and cached) on first use.
+    /// The central memory embedder, built (and cached) on first use, and again
+    /// after [`Central::release_idle_embedder`] dropped it.
     pub fn embedder(&self) -> Result<Arc<dyn EmbeddingProvider>> {
         let mut guard = self.embedder.lock().expect("central embedder lock");
-        if let Some(e) = guard.as_ref() {
-            return Ok(e.clone());
+        if let Some(c) = guard.as_mut() {
+            c.last_used = Instant::now();
+            return Ok(c.value.clone());
         }
-        let e: Arc<dyn EmbeddingProvider> =
-            Arc::from(create_provider(&self.memory_embed_settings())?);
-        *guard = Some(e.clone());
+        let e = (self.factory)(&self.memory_embed_settings())?;
+        *guard = Some(CachedEmbedder {
+            value: e.clone(),
+            last_used: Instant::now(),
+        });
         Ok(e)
+    }
+
+    /// Whether the embedder is currently loaded.
+    pub fn embedder_loaded(&self) -> bool {
+        self.embedder.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Drop the embedder if nobody asked for it in `max_idle`; true when it
+    /// was dropped. Once loaded it used to live as long as the daemon (1.7 GB
+    /// resident after a day for a handful of memories). The next
+    /// `remember`/`recall` simply loads it again; a caller still holding the
+    /// `Arc` is unaffected.
+    pub fn release_idle_embedder(&self, max_idle: Duration) -> bool {
+        let Ok(mut guard) = self.embedder.lock() else {
+            return false;
+        };
+        if guard
+            .as_ref()
+            .is_some_and(|c| c.last_used.elapsed() >= max_idle)
+        {
+            *guard = None;
+            return true;
+        }
+        false
     }
 
     /// Store a globally-scoped memory, deduplicated across every repository.
@@ -540,6 +592,64 @@ mod tests {
             now: "100".into(),
             ..Default::default()
         }
+    }
+
+    /// A deterministic 384-wide embedder that needs no model files.
+    struct Fake;
+
+    impl EmbeddingProvider for Fake {
+        fn embed(&self, texts: &[String]) -> devctx_embed::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let mut v = vec![0.0f32; 384];
+                    v[t.len() % 384] = 1.0;
+                    v
+                })
+                .collect())
+        }
+        fn dimension(&self) -> usize {
+            384
+        }
+        fn model_name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    #[test]
+    fn the_idle_embedder_is_released_and_the_next_recall_reloads_it() {
+        let tmp = Tmp::new("release_embedder");
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = loads.clone();
+        let central = Central::open_in(&tmp.0)
+            .unwrap()
+            .with_embedder_factory(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Arc::new(Fake))
+            });
+        assert!(!central.embedder_loaded(), "nothing loads at open");
+
+        central.recall("anything", None, 5).unwrap();
+        assert!(central.embedder_loaded());
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Used just now: a long window keeps it.
+        assert!(!central.release_idle_embedder(Duration::from_secs(3600)));
+        assert!(central.embedder_loaded());
+
+        // Past the window it goes.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(central.release_idle_embedder(Duration::from_millis(10)));
+        assert!(!central.embedder_loaded());
+        assert!(
+            !central.release_idle_embedder(Duration::ZERO),
+            "nothing left"
+        );
+
+        // The next recall builds a fresh one.
+        central.recall("anything", None, 5).unwrap();
+        assert!(central.embedder_loaded());
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
