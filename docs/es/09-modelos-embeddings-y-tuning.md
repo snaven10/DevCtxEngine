@@ -97,7 +97,7 @@ Dos variables de entorno, ambas relevantes solo cuando la máquina está justa:
 | Variable | Default | Efecto |
 |---|---|---|
 | `DEVCTX_EMBED_MAX_CHARS` | 4096 | Caracteres por texto que se le pasa al encoder. `0` desactiva el tope. |
-| `DEVCTX_EMBED_BATCH_SIZE` | 32 | Textos por lote del encoder. |
+| `DEVCTX_EMBED_BATCH_SIZE` | 8 | Textos por lote del encoder. |
 
 Estas interactúan. Un solo fragmento muy largo rellena todo el lote hasta su
 longitud, así que un lote grande *y* un tope de caracteres alto es lo que produce

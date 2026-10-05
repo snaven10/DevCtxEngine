@@ -69,7 +69,11 @@ window, honest ranking, and a project-aware `build_context`.
 - **Lifecycle.** `serve` answers `503` + `X-Devctx-Exiting` while it exits, and
   the MCP, CLI and central client retry that one status. `serve.json` stays
   until the final checkpoint is done. Idle exit, `serve --stop` and SIGTERM
-  cancel a running index cleanly (see PLAN-008 TASK-009/017).
+  cancel a running index cleanly. A client that meets a server in its exit
+  window waits for it (up to 3 s) instead of reporting it as busy or hung, and
+  a spawn that dies on a lock held by a server still starting waits for that
+  server and reuses it. The central daemon's idle exit now withdraws its
+  `serve.json` too.
 - **macOS:** `serve --stop` waits for the real exit with kqueue.
 - `CONTRIBUTING.md`: the test model cache (`.devctx-test-models`).
 
@@ -153,4 +157,7 @@ in 0.8.4. This is PLAN-008 P0, robustness.
 - `devctx init` never downloads model files unless asked (`--download`, or an
   interactive terminal) and never writes an empty `model_dir`;
   `devctx models --download <model>` fetches one.
-- **Tests no longer leak servers.**
+- **Tests no longer leak servers.** Every integration test that starts a
+  `devctx serve` stops it when it ends and sweeps any server still running under
+  its temporary directory; a test that leaves one behind fails the run, since
+  stray servers were what made later runs flaky.

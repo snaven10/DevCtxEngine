@@ -143,7 +143,8 @@ carga el embedder de memorias; tras `DEVCTX_MODEL_IDLE_SECS` (300 s por defecto,
 Mientras sale por inactividad responde `503` + `X-Devctx-Exiting`, que
 `CentralClient` reintenta una vez contra el daemon nuevo, y `ensure` espera a un
 daemon que está saliendo (hasta 3 s) en vez de lanzar uno que moriría contra el
-lock.
+lock. La salida por inactividad retira `serve.json` antes de terminar el proceso,
+y `discover` ignora un `serve.json` cuyo pid ya no es un daemon central.
 
 ## 6. Configuración
 

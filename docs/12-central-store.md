@@ -139,7 +139,9 @@ after `DEVCTX_MODEL_IDLE_SECS` (300 s by default, `0` = never) without use the
 daemon drops it again and the next call reloads it. While it exits for being idle
 it answers `503` + `X-Devctx-Exiting`, which `CentralClient` retries once against
 the new daemon, and `ensure` waits for an exiting daemon (up to 3 s) rather than
-starting one that would die on the lock.
+starting one that would die on the lock. The idle exit withdraws `serve.json`
+before it ends the process, and `discover` ignores a `serve.json` whose pid is
+no longer a central daemon.
 
 ## 6. Configuration
 

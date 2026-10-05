@@ -129,7 +129,7 @@ as data.
   ONNX (`model.onnx` + `tokenizer.json`).
 - **API:** OpenAI, Voyage, custom (`POST {endpoint}/embed`).
 - **RAM guards:** `DEVCTX_EMBED_MAX_CHARS` (4096) and `DEVCTX_EMBED_BATCH_SIZE`
-  (32). They interact — one long chunk pads its whole batch.
+  (8). They interact — one long chunk pads its whole batch.
 
 **Dimension change forces a full reindex.** If the active model's width differs
 from `index_state`, the `vector FLOAT[N]` column is recreated and everything is
