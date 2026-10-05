@@ -326,6 +326,150 @@ fn plan_status_lists_plans_and_names_the_active_one() {
     assert_eq!(plan2["active"], true);
 }
 
+/// `plan_status` pages from the newest plan with `limit`/`offset`, and `active_only`
+/// keeps the plans with unresolved tasks (PLAN-008 TASK-010).
+#[test]
+fn plan_status_pages_and_filters_the_listing() {
+    let tmp = Tmp::new("planstatus_paging");
+    let home = tmp.home();
+    let repo = tmp.repo("proj");
+    write_plan_status_fixture(&repo);
+    devctx(&home, &repo, &["projects", "add", ".", "--init"]);
+    let ids = |v: &serde_json::Value| -> Vec<String> {
+        v["plans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let open = call_tool(
+        &home,
+        &repo,
+        "plan_status",
+        serde_json::json!({ "active_only": true }),
+    );
+    assert_eq!(ids(&open), vec!["PLAN-002"], "{open}");
+    assert_eq!(open["total"], 1);
+
+    let first = call_tool(
+        &home,
+        &repo,
+        "plan_status",
+        serde_json::json!({ "limit": 1 }),
+    );
+    assert_eq!(
+        ids(&first),
+        vec!["PLAN-002"],
+        "page one is the newest plan: {first}"
+    );
+    assert_eq!(first["total"], 2);
+    assert_eq!(first["next_offset"], 1);
+    assert_eq!(first["omitted"]["count"], 1);
+    assert_eq!(first["omitted"]["reason"], "limit");
+
+    let second = call_tool(
+        &home,
+        &repo,
+        "plan_status",
+        serde_json::json!({ "limit": 1, "offset": 1 }),
+    );
+    assert_eq!(ids(&second), vec!["PLAN-001"], "{second}");
+    assert!(second.get("next_offset").is_none() && second.get("omitted").is_none());
+}
+
+/// `memories_by_file` answers from another project when told which (`project`),
+/// five memories at most by default, each cut to 600 characters and flagged;
+/// `full` restores the text, `limit`/`offset` page, `omitted` counts the rest.
+#[test]
+fn memories_by_file_takes_project_limit_offset_and_full() {
+    let _serial = EmbedLock::acquire();
+    let tmp = Tmp::new("memfile_project");
+    let home = tmp.home();
+    let here = tmp.repo("here");
+    let there = tmp.repo("there");
+    devctx(&home, &here, &["projects", "add", ".", "--init"]);
+    devctx(&home, &there, &["projects", "add", ".", "--init"]);
+    for i in 0..3 {
+        // Distinct enough not to be collapsed as duplicates.
+        let body = format!(
+            "decision number {i} about the cart: {}",
+            format!("detail{i} ").repeat(200)
+        );
+        devctx(
+            &home,
+            &there,
+            &[
+                "remember",
+                &body,
+                "--title",
+                &format!("cart decision {i}"),
+                "--files",
+                "src/cart.rs",
+                "--scope",
+                "local",
+            ],
+        );
+    }
+    let there_path = there.to_string_lossy().to_string();
+
+    // Bound here, nothing recorded here: the answer must come from `there`.
+    let local = call_tool(
+        &home,
+        &here,
+        "memories_by_file",
+        serde_json::json!({ "file": "src/cart.rs" }),
+    );
+    assert!(local["memories"].as_array().unwrap().is_empty(), "{local}");
+
+    let out = call_tool(
+        &home,
+        &here,
+        "memories_by_file",
+        serde_json::json!({ "file": "src/cart.rs", "project": there_path }),
+    );
+    let mems = out["memories"].as_array().unwrap();
+    assert_eq!(mems.len(), 3, "{out}");
+    assert_eq!(out["total"], 3);
+    for m in mems {
+        assert_eq!(m["content_truncated"], true, "{m}");
+        assert!(m["content"].as_str().unwrap().chars().count() <= 601);
+        assert!(m["id"].as_str().unwrap().starts_with("mem_"));
+    }
+    assert!(out.get("resolved_project").is_some(), "{out}");
+
+    let page = call_tool(
+        &home,
+        &here,
+        "memories_by_file",
+        serde_json::json!({ "file": "src/cart.rs", "project": there_path, "limit": 2 }),
+    );
+    assert_eq!(page["memories"].as_array().unwrap().len(), 2);
+    assert_eq!(page["omitted"]["count"], 1, "{page}");
+    assert_eq!(page["next_offset"], 2);
+
+    let rest = call_tool(
+        &home,
+        &here,
+        "memories_by_file",
+        serde_json::json!({ "file": "src/cart.rs", "project": there_path, "limit": 2, "offset": 2 }),
+    );
+    assert_eq!(rest["memories"].as_array().unwrap().len(), 1, "{rest}");
+    assert!(rest.get("next_offset").is_none());
+
+    let full = call_tool(
+        &home,
+        &here,
+        "memories_by_file",
+        serde_json::json!({ "file": "src/cart.rs", "project": there_path, "full": true }),
+    );
+    for m in full["memories"].as_array().unwrap() {
+        assert!(m.get("content_truncated").is_none(), "{m}");
+        assert!(m["content"].as_str().unwrap().chars().count() > 1000);
+    }
+}
+
 /// `plan_status` with `plan` gives ready/in-progress/blocked detail, including a `waiting_on`
 /// for the task blocked on another, and a warning about the task with a missing dependency.
 #[test]

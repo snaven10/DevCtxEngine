@@ -981,6 +981,9 @@ impl Remote {
         if let Some(p) = path {
             q.push(format!("path={}", urlencode(p)));
         }
+        // The command lists every route, as its local path does; the tool's
+        // default page of 20 is for agents counting tokens.
+        q.push("limit=100000".to_string());
         let qs = if q.is_empty() {
             String::new()
         } else {

@@ -22,7 +22,7 @@ use devctx_mcp::state::{
     do_memories_by_symbol, do_memory_context, do_memory_forget, do_memory_move, do_memory_refs,
     do_memory_stats, do_plan_graph, do_plan_status, do_read_file, do_read_symbol, do_recall_scoped,
     do_references, do_remember, do_remember_shared, do_routes_for_handler, do_search,
-    do_search_routes, do_summarize, parse_mode, AppState,
+    do_search_routes, do_summarize, parse_mode, AppState, MemoriesOpts, Page, PlanListOpts,
 };
 use serde::Deserialize;
 
@@ -849,6 +849,12 @@ struct RoutesQuery {
     method: Option<String>,
     #[serde(default)]
     path: Option<String>,
+    /// Routes per page (default 20).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip this many routes (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -901,12 +907,27 @@ struct ContextBody {
 struct MemoriesQuery {
     #[serde(default)]
     limit: Option<usize>,
+    /// By-symbol / by-file only: skip this many memories.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// By-symbol / by-file only: keep each memory's whole content.
+    #[serde(default)]
+    full: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct PlanStatusQuery {
     #[serde(default)]
     plan: Option<String>,
+    /// Listing only: plans with unresolved tasks.
+    #[serde(default)]
+    active_only: Option<bool>,
+    /// Listing only: plans per page (default 25).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Listing only: skip this many plans.
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 // --- handlers ---
@@ -948,7 +969,14 @@ async fn graph(State(api): State<Api>, Query(q): Query<GraphQuery>) -> Response 
 }
 
 async fn plans_status(State(api): State<Api>, Query(q): Query<PlanStatusQuery>) -> Response {
-    run(api.state, move |s| do_plan_status(s, q.plan.as_deref())).await
+    let opts = PlanListOpts {
+        active_only: q.active_only.unwrap_or(false),
+        page: Page::new(q.limit, q.offset),
+    };
+    run(api.state, move |s| {
+        do_plan_status(s, q.plan.as_deref(), opts)
+    })
+    .await
 }
 
 async fn plans_graph(State(api): State<Api>, Query(q): Query<PlanStatusQuery>) -> Response {
@@ -1128,6 +1156,13 @@ async fn build_context(State(api): State<Api>, Json(b): Json<ContextBody>) -> Re
     .await
 }
 
+fn memories_opts(q: &MemoriesQuery) -> MemoriesOpts {
+    MemoriesOpts {
+        page: Page::new(q.limit, q.offset),
+        full: q.full.unwrap_or(false),
+    }
+}
+
 /// The memories recorded about a symbol — the memory↔graph join.
 async fn memories_by_symbol(
     State(api): State<Api>,
@@ -1135,7 +1170,7 @@ async fn memories_by_symbol(
     Query(q): Query<MemoriesQuery>,
 ) -> Response {
     run(api.state, move |s| {
-        do_memories_by_symbol(s, &symbol, q.limit.unwrap_or(10))
+        do_memories_by_symbol(s, &symbol, memories_opts(&q))
     })
     .await
 }
@@ -1147,7 +1182,7 @@ async fn memories_by_file(
     Query(q): Query<MemoriesQuery>,
 ) -> Response {
     run(api.state, move |s| {
-        do_memories_by_file(s, &file, q.limit.unwrap_or(10))
+        do_memories_by_file(s, &file, memories_opts(&q))
     })
     .await
 }
@@ -1178,7 +1213,11 @@ async fn references(State(api): State<Api>, Path(symbol): Path<String>) -> Respo
 }
 
 async fn routes(State(api): State<Api>, Query(q): Query<RoutesQuery>) -> Response {
-    run(api.state, move |s| do_search_routes(s, q.method, q.path)).await
+    let page = Page::new(q.limit, q.offset);
+    run(api.state, move |s| {
+        do_search_routes(s, q.method, q.path, page)
+    })
+    .await
 }
 
 async fn routes_for_handler(State(api): State<Api>, Path(handler): Path<String>) -> Response {

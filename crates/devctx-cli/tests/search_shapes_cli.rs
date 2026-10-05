@@ -301,3 +301,111 @@ fn table_search_prints_rows_when_the_serve_answers_from_a_fallback_branch() {
     assert!(t.contains("a.rs:"), "no row printed: {t}");
     assert!(t.contains("branch"), "the fallback line is missing: {t}");
 }
+
+/// The contract after PLAN-008 TASK-010: `search` is an object even when there
+/// is nothing to say — current branch indexed, no fallback, nothing omitted.
+/// Through the CLI (`--format json`) and through the MCP tool.
+#[test]
+fn search_is_always_an_object_even_without_notes() {
+    let _embed = EmbedLock::acquire();
+    let mut tmp = Tmp::new("always_object");
+    let ws = tmp.root.clone();
+    make_member(
+        &mut tmp,
+        &ws,
+        "solo",
+        "a.rs",
+        "pub fn alpha_marker() {}\n",
+        false,
+    );
+    let repo = ws.join("solo");
+
+    let json = devctx(
+        &tmp.home(),
+        &repo,
+        &["search", "alpha_marker", "--format", "json"],
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.stdout).unwrap_or_else(|_| panic!("{}", text(&json)));
+    assert!(parsed.is_object(), "the CLI printed a bare array: {parsed}");
+    assert!(
+        parsed["results"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|h| h["file"] == "a.rs")),
+        "{parsed}"
+    );
+    assert!(parsed.get("branch_fallback").is_none(), "{parsed}");
+
+    let tool = call_tool(
+        &tmp.home(),
+        &repo,
+        "search",
+        serde_json::json!({ "query": "alpha_marker", "limit": 5 }),
+    );
+    assert!(tool.is_object(), "the tool answered a bare array: {tool}");
+    assert!(
+        tool["results"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|h| h["file"] == "a.rs")),
+        "{tool}"
+    );
+}
+
+/// `search_routes` end to end (MCP -> serve -> store): 25 routes pages as
+/// 10 + 10 + 5 with `total`, `next_offset` and `omitted.count`; `limit`
+/// defaults to 20; `routes_for_handler` is the same object.
+#[test]
+fn search_routes_pages_through_the_tool() {
+    let _embed = EmbedLock::acquire();
+    let mut tmp = Tmp::new("routes_paging");
+    let ws = tmp.root.clone();
+    let mut body = String::from("from fastapi import FastAPI\napp = FastAPI()\n\n");
+    for i in 0..25 {
+        body.push_str(&format!(
+            "@app.get(\"/items/r{i:02}\")\ndef handler_{i:02}():\n    return {i}\n\n"
+        ));
+    }
+    make_member(&mut tmp, &ws, "solo", "api.py", &body, false);
+    let repo = ws.join("solo");
+    let call = |args: serde_json::Value| call_tool(&tmp.home(), &repo, "search_routes", args);
+    let paths = |v: &serde_json::Value| -> Vec<String> {
+        v["routes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no routes array: {v}"))
+            .iter()
+            .map(|r| r["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let default = call(serde_json::json!({}));
+    assert_eq!(paths(&default).len(), 20, "{default}");
+    assert_eq!(default["total"], 25);
+    assert_eq!(default["omitted"]["count"], 5);
+    assert_eq!(default["next_offset"], 20);
+
+    let p1 = call(serde_json::json!({ "limit": 10 }));
+    let p2 = call(serde_json::json!({ "limit": 10, "offset": 10 }));
+    let p3 = call(serde_json::json!({ "limit": 10, "offset": 20 }));
+    assert_eq!(p1["omitted"]["count"], 15, "{p1}");
+    assert_eq!(p2["next_offset"], 20, "{p2}");
+    assert_eq!(paths(&p3).len(), 5, "{p3}");
+    assert!(
+        p3.get("next_offset").is_none() && p3.get("omitted").is_none(),
+        "{p3}"
+    );
+    let mut all = paths(&p1);
+    all.extend(paths(&p2));
+    all.extend(paths(&p3));
+    let unique: std::collections::HashSet<_> = all.iter().collect();
+    assert_eq!(all.len(), 25);
+    assert_eq!(unique.len(), 25, "a page repeated a route: {all:?}");
+
+    let by_handler = call_tool(
+        &tmp.home(),
+        &repo,
+        "routes_for_handler",
+        serde_json::json!({ "handler": "handler_03" }),
+    );
+    assert_eq!(paths(&by_handler), vec!["/items/r03"], "{by_handler}");
+    assert_eq!(by_handler["total"], 1);
+}

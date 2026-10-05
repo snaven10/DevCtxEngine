@@ -273,9 +273,10 @@ async function doSearch() {
   $('searchList').textContent = 'searching…';
   try {
     const resp = await postJSON('/search', { query: q, limit: 15, mode: 'hybrid' });
-    // A bare array, or {results, branch_fallback, ...} when answered from another branch.
+    // {results, omitted?, branch_fallback?, ...}; a server older than 0.9 sends a bare array.
     const hits = Array.isArray(resp) ? resp : (resp.results || []);
-    $('searchHeader').textContent = `matches (${hits.length})`;
+    const left = (!Array.isArray(resp) && resp.omitted && resp.omitted.count) || 0;
+    $('searchHeader').textContent = `matches (${hits.length}${left ? ` of ${hits.length + left}` : ''})`;
     if (!hits.length) { $('searchList').textContent = 'no matches.'; return; }
     $('searchList').className = '';
     $('searchList').innerHTML = hits.map(h =>

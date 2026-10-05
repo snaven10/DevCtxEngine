@@ -13,6 +13,7 @@ use crate::state::{
     do_memory_move, do_memory_refs, do_memory_stats, do_plan_status, do_read_file, do_read_symbol,
     do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
     do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
+    MemoriesOpts, Page, PlanListOpts,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -316,11 +317,13 @@ impl Backend {
                 parse_mode(mode.as_deref()),
                 rerank,
             ),
-            Backend::Remote(r, _) => r.post(
-                "/search",
-                json!({ "query": query, "limit": limit, "language": language,
-                        "mode": mode.unwrap_or_else(|| "vector".into()), "rerank": rerank }),
-            ),
+            Backend::Remote(r, _) => r
+                .post(
+                    "/search",
+                    json!({ "query": query, "limit": limit, "language": language,
+                            "mode": mode.unwrap_or_else(|| "vector".into()), "rerank": rerank }),
+                )
+                .map(|raw| ensure_object(raw, "results")),
         }
     }
 
@@ -378,16 +381,24 @@ impl Backend {
 
     /// Progress on the plans in `plans/` (see `plans/PLAN-005-plan-status/`): no `plan` lists
     /// them, `plan` gives one plan's ready/in-progress/blocked tasks.
-    pub fn plan_status(&self, plan: Option<&str>) -> Result<String, String> {
+    pub fn plan_status(&self, plan: Option<&str>, opts: PlanListOpts) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_plan_status(s, plan),
+            Backend::Local(s) => do_plan_status(s, plan, opts),
             Backend::Remote(_, id) if id.plans_root.is_some() => {
-                crate::state::plan_status_budgeted(id.plans_root.as_ref().unwrap(), plan)
+                crate::state::plan_status_budgeted(id.plans_root.as_ref().unwrap(), plan, opts)
             }
-            Backend::Remote(r, _) => match plan {
-                Some(p) => r.get(&format!("/plans/status?plan={}", urlencode(p))),
-                None => r.get("/plans/status"),
-            },
+            Backend::Remote(r, _) => {
+                let qs = query_string(&[
+                    ("plan", plan.map(urlencode)),
+                    ("active_only", opts.active_only.then(|| "true".to_string())),
+                    ("limit", opts.page.limit.map(|n| n.to_string())),
+                    (
+                        "offset",
+                        (opts.page.offset > 0).then(|| opts.page.offset.to_string()),
+                    ),
+                ]);
+                r.get(&format!("/plans/status{qs}"))
+            }
         }
     }
 
@@ -585,23 +596,25 @@ impl Backend {
     }
 
     /// Memories recorded about a symbol — the memory↔graph join.
-    pub fn memories_by_symbol(&self, symbol: &str, limit: usize) -> Result<String, String> {
+    pub fn memories_by_symbol(&self, symbol: &str, opts: MemoriesOpts) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_memories_by_symbol(s, symbol, limit),
+            Backend::Local(s) => do_memories_by_symbol(s, symbol, opts),
             Backend::Remote(r, _) => r.get(&format!(
-                "/memories/by-symbol/{}?limit={limit}",
-                urlencode(symbol)
+                "/memories/by-symbol/{}{}",
+                urlencode(symbol),
+                memories_query(opts)
             )),
         }
     }
 
     /// Memories recorded about a file.
-    pub fn memories_by_file(&self, file: &str, limit: usize) -> Result<String, String> {
+    pub fn memories_by_file(&self, file: &str, opts: MemoriesOpts) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_memories_by_file(s, file, limit),
+            Backend::Local(s) => do_memories_by_file(s, file, opts),
             Backend::Remote(r, _) => r.get(&format!(
-                "/memories/by-file/{}?limit={limit}",
-                urlencode(file)
+                "/memories/by-file/{}{}",
+                urlencode(file),
+                memories_query(opts)
             )),
         }
     }
@@ -625,23 +638,19 @@ impl Backend {
         &self,
         method: Option<String>,
         path: Option<String>,
+        page: Page,
     ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_search_routes(s, method, path),
+            Backend::Local(s) => do_search_routes(s, method, path, page),
             Backend::Remote(r, _) => {
-                let mut q = Vec::new();
-                if let Some(m) = &method {
-                    q.push(format!("method={}", urlencode(m)));
-                }
-                if let Some(p) = &path {
-                    q.push(format!("path={}", urlencode(p)));
-                }
-                let qs = if q.is_empty() {
-                    String::new()
-                } else {
-                    format!("?{}", q.join("&"))
-                };
+                let qs = query_string(&[
+                    ("method", method.as_deref().map(urlencode)),
+                    ("path", path.as_deref().map(urlencode)),
+                    ("limit", page.limit.map(|n| n.to_string())),
+                    ("offset", (page.offset > 0).then(|| page.offset.to_string())),
+                ]);
                 r.get(&format!("/routes{qs}"))
+                    .map(|raw| ensure_object(raw, "routes"))
             }
         }
     }
@@ -649,7 +658,9 @@ impl Backend {
     pub fn routes_for_handler(&self, handler: &str) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_routes_for_handler(s, handler),
-            Backend::Remote(r, _) => r.get(&format!("/routes/handler/{}", urlencode(handler))),
+            Backend::Remote(r, _) => r
+                .get(&format!("/routes/handler/{}", urlencode(handler)))
+                .map(|raw| ensure_object(raw, "routes")),
         }
     }
 
@@ -670,6 +681,41 @@ impl Backend {
 }
 
 /// Minimal percent-encoding for a path/query segment.
+/// `?a=1&b=2` from the pairs that have a value (already encoded), or `""`.
+fn query_string(pairs: &[(&str, Option<String>)]) -> String {
+    let parts: Vec<String> = pairs
+        .iter()
+        .filter_map(|(k, v)| v.as_ref().map(|v| format!("{k}={v}")))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
+/// The paging query of the by-symbol / by-file routes.
+fn memories_query(opts: MemoriesOpts) -> String {
+    query_string(&[
+        ("limit", opts.page.limit.map(|n| n.to_string())),
+        (
+            "offset",
+            (opts.page.offset > 0).then(|| opts.page.offset.to_string()),
+        ),
+        ("full", opts.full.then(|| "true".to_string())),
+    ])
+}
+
+/// A server older than 0.9 answers `search` / `search_routes` /
+/// `routes_for_handler` with a bare array when there is nothing to say. The
+/// tools promise an object (`devctx_core::hits`), so wrap it under `key`.
+fn ensure_object(raw: String, key: &str) -> String {
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Array(rows)) => json!({ key: rows }).to_string(),
+        _ => raw,
+    }
+}
+
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

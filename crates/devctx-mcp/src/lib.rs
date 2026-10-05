@@ -196,6 +196,15 @@ struct PlanStatusReq {
     /// Plan id (PLAN-005 or 5). Omit to list plans.
     #[serde(default)]
     plan: Option<String>,
+    /// List only plans with unresolved tasks (default false).
+    #[serde(default)]
+    active_only: Option<bool>,
+    /// Plans per page of the list, newest first (default 25).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip this many plans (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 /// Parameters for the `memory_context` tool.
@@ -250,22 +259,40 @@ struct BuildContextReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct MemoriesBySymbolReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
     /// The symbol name. Bare (`charge`) or qualified (`src/pay.rs::charge`).
     symbol: String,
-    /// Maximum memories to return (default 10).
+    /// Maximum memories to return (default 5).
     #[serde(default)]
     limit: Option<usize>,
+    /// Skip this many memories (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Return each memory's whole content (default: cut to 600 characters).
+    #[serde(default)]
+    full: Option<bool>,
 }
 
 /// Parameters for the `memories_by_file` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct MemoriesByFileReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
     /// Repository-relative path, as reported by `search` or `read_symbol`.
     file: String,
-    /// Maximum memories to return (default 10).
+    /// Maximum memories to return (default 5).
     #[serde(default)]
     limit: Option<usize>,
+    /// Skip this many memories (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Return each memory's whole content (default: cut to 600 characters).
+    #[serde(default)]
+    full: Option<bool>,
 }
 
 /// Parameters for the `memory_forget` tool.
@@ -319,6 +346,12 @@ struct SearchRoutesReq {
     /// Restrict to routes whose path contains this substring, optional.
     #[serde(default)]
     path: Option<String>,
+    /// Routes per page (default 20).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip this many routes (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 /// Parameters for the `routes_for_handler` tool.
@@ -974,12 +1007,16 @@ impl DevctxServer {
         if req.project.is_none() {
             if let Some(root) = self.workspace_plans_root() {
                 let plan = req.plan.clone();
-                return run_blocking(move || state::plan_status_budgeted(&root, plan.as_deref()))
-                    .await;
+                let opts = plan_opts(&req);
+                return run_blocking(move || {
+                    state::plan_status_budgeted(&root, plan.as_deref(), opts)
+                })
+                .await;
             }
         }
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.plan_status(req.plan.as_deref()))
+        let opts = plan_opts(&req);
+        run_blocking(move || backend.plan_status(req.plan.as_deref(), opts))
             .await
             .map(|out| Self::annotate(out, resolved))
     }
@@ -1048,8 +1085,11 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<MemoriesBySymbolReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
-        run_blocking(move || backend.memories_by_symbol(&req.symbol, req.limit.unwrap_or(10))).await
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        let opts = memories_opts(req.limit, req.offset, req.full);
+        run_blocking(move || backend.memories_by_symbol(&req.symbol, opts))
+            .await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// Memories recorded about a file.
@@ -1061,8 +1101,11 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<MemoriesByFileReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
-        run_blocking(move || backend.memories_by_file(&req.file, req.limit.unwrap_or(10))).await
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        let opts = memories_opts(req.limit, req.offset, req.full);
+        run_blocking(move || backend.memories_by_file(&req.file, opts))
+            .await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// Delete one memory for good.
@@ -1128,7 +1171,8 @@ impl DevctxServer {
         Parameters(req): Parameters<SearchRoutesReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.search_routes(req.method, req.path))
+        let page = state::Page::new(req.limit, req.offset);
+        run_blocking(move || backend.search_routes(req.method, req.path, page))
             .await
             .map(|out| Self::annotate(out, resolved))
     }
@@ -1260,6 +1304,24 @@ impl ServerHandler for DevctxServer {
 }
 
 /// Run a blocking tool body on the blocking pool, mapping errors to MCP errors.
+fn plan_opts(req: &PlanStatusReq) -> state::PlanListOpts {
+    state::PlanListOpts {
+        active_only: req.active_only.unwrap_or(false),
+        page: state::Page::new(req.limit, req.offset),
+    }
+}
+
+fn memories_opts(
+    limit: Option<usize>,
+    offset: Option<usize>,
+    full: Option<bool>,
+) -> state::MemoriesOpts {
+    state::MemoriesOpts {
+        page: state::Page::new(limit, offset),
+        full: full.unwrap_or(false),
+    }
+}
+
 async fn run_blocking<F>(f: F) -> Result<String, ErrorData>
 where
     F: FnOnce() -> Result<String, String> + Send + 'static,

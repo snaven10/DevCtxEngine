@@ -528,6 +528,14 @@ fn configured_dimension(cfg: &ProjectConfig) -> usize {
 }
 
 /// `search` tool: vector / keyword / hybrid search, then rerank, return JSON hits.
+///
+/// Output contract (PLAN-008 TASK-010; see `devctx_core::hits`): always an
+/// object `{results: [...], omitted?, omitted_for_budget?, branch_fallback?}`.
+/// `omitted` is `{count, reason: "budget"}` when the token budget cut rows
+/// (`omitted_for_budget` is its legacy alias and names them). `search` takes
+/// the top `limit` and has no pages, so there is no `next_offset`. A bare
+/// array is what servers before 0.9 answered; readers go through
+/// `devctx_core::search_hits`, which takes both.
 pub fn do_search(
     state: &AppState,
     query: &str,
@@ -598,12 +606,13 @@ pub fn do_search(
         let line = v.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0);
         format!("{file}:{line}")
     });
-    if dropped.is_empty() && fallback.is_none() {
-        return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
-    }
+    // Always the object of the output contract, never a bare array.
     let mut out = json!({ "results": kept });
     if !dropped.is_empty() {
-        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+        set_budget_omitted(
+            &mut out,
+            json!({ "count": dropped.len(), "items": dropped }),
+        );
     }
     if let Some(f) = &fallback {
         out["branch_fallback"] = f.to_json();
@@ -1297,14 +1306,33 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
 /// "where am I": the list of plans with no argument, or one plan's ready/in-progress/blocked
 /// tasks with `plan`. Reads markdown from disk on every call — plans are the source of truth,
 /// never copied into the store (PLAN-005 §3).
-pub fn do_plan_status(state: &AppState, plan: Option<&str>) -> Result<String, String> {
-    plan_status_budgeted(&state.plans_root, plan)
+///
+/// The list is paged (PLAN-008 TASK-010): the newest [`DEFAULT_PLANS_LIMIT`] plans per page,
+/// `active_only` keeps the plans with unresolved tasks. See [`plan_status_list`] for the shape.
+pub fn do_plan_status(
+    state: &AppState,
+    plan: Option<&str>,
+    opts: PlanListOpts,
+) -> Result<String, String> {
+    plan_status_budgeted(&state.plans_root, plan, opts)
 }
 
-/// `plan_status_value_in` trimmed to `DEVCTX_MAX_OUTPUT_TOKENS`. The single path behind the
+/// What a `plan_status` listing asks for: only the plans still open, and which page.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlanListOpts {
+    /// Keep only plans with at least one unresolved task.
+    pub active_only: bool,
+    pub page: Page,
+}
+
+/// `plan_status_page_in` trimmed to `DEVCTX_MAX_OUTPUT_TOKENS`. The single path behind the
 /// daemon's `do_plan_status` and the MCP's in-process answer in group mode (PLAN-007 DD-4).
-pub fn plan_status_budgeted(root: &PlansRoot, plan: Option<&str>) -> Result<String, String> {
-    let value = plan_status_value_in(root, plan)?;
+pub fn plan_status_budgeted(
+    root: &PlansRoot,
+    plan: Option<&str>,
+    opts: PlanListOpts,
+) -> Result<String, String> {
+    let value = plan_status_page_in(root, plan, opts)?;
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     Ok(fit_plan_status_budget(value, budget))
 }
@@ -1331,10 +1359,28 @@ pub fn plan_status_value(root: &std::path::Path, plan: Option<&str>) -> Result<V
 
 /// Like [`plan_status_value`], for a root that was resolved: the JSON also says where the plans
 /// came from (`plans_root: {path, source}`), so nobody has to wonder which `plans/` was read.
+/// The listing is complete and in id order — what the CLI and the SessionStart hook want.
 pub fn plan_status_value_in(root: &PlansRoot, plan: Option<&str>) -> Result<Value, String> {
+    plan_status_with(root, plan, None)
+}
+
+/// [`plan_status_value_in`] for the tools: the listing is filtered and paged by `opts`.
+pub fn plan_status_page_in(
+    root: &PlansRoot,
+    plan: Option<&str>,
+    opts: PlanListOpts,
+) -> Result<Value, String> {
+    plan_status_with(root, plan, Some(opts))
+}
+
+fn plan_status_with(
+    root: &PlansRoot,
+    plan: Option<&str>,
+    opts: Option<PlanListOpts>,
+) -> Result<Value, String> {
     let loaded = plans::load_plans(&root.root);
     let mut value = match plan {
-        None => plan_status_list(&loaded),
+        None => plan_status_list(&loaded, opts),
         Some(query) => plan_status_detail(&loaded, query)?,
     };
     value["plans_root"] = json!({
@@ -1365,10 +1411,32 @@ fn plan_number(id: &str) -> u32 {
     id.trim_start_matches("PLAN-").parse().unwrap_or(0)
 }
 
-fn plan_status_list(plans: &[Plan]) -> Value {
+/// The plan listing: `{plans, active, total}`, plus — when paged — `next_offset?` and
+/// `omitted?: {count, reason: "limit", next_offset}`. `total` counts the plans that passed
+/// `active_only`, before paging; `active` is the active plan of the whole set whatever the
+/// filter says. Every page lists its plans by id, as always; what changes is which plans are
+/// on a page: `offset` counts from the newest plan, so page one is the plans somebody is
+/// working on and the old ones (the least useful) are the last pages. Unpaged (`opts` is
+/// `None`) lists every plan.
+fn plan_status_list(plans: &[Plan], opts: Option<PlanListOpts>) -> Value {
     let active = active_plan_id(plans);
-    let items: Vec<Value> = plans
+    let open = |p: &Plan| p.tasks.iter().any(|t| !t.status.is_resolved());
+    let mut chosen: Vec<&Plan> = plans
         .iter()
+        .filter(|p| !opts.is_some_and(|o| o.active_only) || open(p))
+        .collect();
+    let total = chosen.len();
+    let mut next_offset = None;
+    if let Some(o) = opts {
+        chosen.sort_by_key(|p| std::cmp::Reverse(plan_number(&p.id)));
+        let (start, end) = o.page.window(DEFAULT_PLANS_LIMIT, total);
+        chosen = chosen[start..end].to_vec();
+        chosen.reverse();
+        next_offset = (end < total).then_some(end);
+    }
+    let returned = chosen.len();
+    let items: Vec<Value> = chosen
+        .into_iter()
         .map(|p| {
             let done = p.tasks.iter().filter(|t| t.status.is_done()).count();
             let skipped = p
@@ -1388,7 +1456,15 @@ fn plan_status_list(plans: &[Plan]) -> Value {
             })
         })
         .collect();
-    json!({ "plans": items, "active": active })
+    let mut out = json!({ "plans": items, "active": active, "total": total });
+    if let (Some(o), Some(n)) = (opts, next_offset) {
+        let start = o.page.offset.min(total);
+        out["next_offset"] = json!(n);
+        if let Some(note) = omitted_note(total - start - returned, 0, Some(n)) {
+            out["omitted"] = note;
+        }
+    }
+    out
 }
 
 /// Resolves a user-supplied plan identifier (`PLAN-005`, `005`, `5`, or the directory name)
@@ -1525,7 +1601,12 @@ fn fit_plan_status_budget(mut value: Value, budget_tokens: usize) -> String {
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
             "omitted".to_string(),
-            json!({ "blocked": omitted_blocked, "warnings": omitted_warnings }),
+            json!({
+                "count": omitted_blocked + omitted_warnings,
+                "reason": "budget",
+                "blocked": omitted_blocked,
+                "warnings": omitted_warnings,
+            }),
         );
     }
     value.to_string()
@@ -2509,6 +2590,7 @@ pub fn do_search_group(
     });
     if total > limit {
         out["omitted_for_budget"] = json!({ "count": total - limit });
+        out["omitted"] = json!({ "count": total - limit, "reason": "limit" });
     }
     if !skipped.is_empty() {
         out["skipped_projects"] = json!(skipped);
@@ -2734,6 +2816,7 @@ pub fn do_recall_group(
         // What did not fit has to be visible; silence here reads as "there was
         // nothing else".
         out["omitted_for_budget"] = json!({ "count": total - limit });
+        out["omitted"] = json!({ "count": total - limit, "reason": "limit" });
     }
     if !failed.is_empty() {
         out["failed_projects"] = json!(failed);
@@ -2809,8 +2892,14 @@ pub fn do_search_project(
         format!("{file}:{line}")
     });
     let mut out = json!({ "project": project, "path": path, "hits": kept });
-    if let Some(o) = merge_omitted(dropped, answer.omitted.as_ref()) {
-        out["omitted_for_budget"] = o;
+    // The child's `omitted_for_budget` names what it dropped; its `omitted` is
+    // only the count, so the legacy note is the one worth merging.
+    let child = answer
+        .omitted_for_budget
+        .as_ref()
+        .or(answer.omitted.as_ref());
+    if let Some(o) = merge_omitted(dropped, child) {
+        set_budget_omitted(&mut out, o);
     }
     if let Some(f) = &answer.branch_fallback {
         out["branch_fallback"] = f.clone();
@@ -3090,11 +3179,14 @@ pub fn do_recall_scoped(
     let (fused, dropped) = fit_memories(fused, budget, |content, target| {
         do_summarize(state, content, Some(query.to_string()), target).ok()
     });
-    serde_json::to_string_pretty(&json!({
+    let mut out = json!({
         "memories": fused,
         "omitted_for_budget": { "count": dropped.len(), "titles": dropped },
-    }))
-    .map_err(|e| e.to_string())
+    });
+    if !dropped.is_empty() {
+        out["omitted"] = json!({ "count": dropped.len(), "reason": "budget" });
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// Recall from the central store alone, for a session with no project bound.
@@ -3110,11 +3202,14 @@ pub fn do_recall_global(query: &str, limit: usize, repo: Option<&str>) -> Result
     // No project is bound here, so there is no embedder to summarize with: the
     // fallback truncation is the only option, and says so.
     let (tagged, dropped) = fit_memories(tagged, budget, |_, _| None);
-    serde_json::to_string_pretty(&json!({
+    let mut out = json!({
         "memories": tagged,
         "omitted_for_budget": { "count": dropped.len(), "titles": dropped },
-    }))
-    .map_err(|e| e.to_string())
+    });
+    if !dropped.is_empty() {
+        out["omitted"] = json!({ "count": dropped.len(), "reason": "budget" });
+    }
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// Fit ranked memories into the output budget, returning what survived and the
@@ -3291,6 +3386,77 @@ fn fit_json_array(
         kept.push(item);
     }
     (kept, dropped)
+}
+
+/// Default rows per page of `search_routes` (PLAN-008 Q-4).
+pub const DEFAULT_ROUTES_LIMIT: usize = 20;
+/// Default plans per page of a `plan_status` listing (PLAN-008 Q-4).
+pub const DEFAULT_PLANS_LIMIT: usize = 25;
+/// Default memories per answer of `memories_by_symbol` / `memories_by_file`.
+pub const DEFAULT_MEMORIES_LIMIT: usize = 5;
+/// Characters of a memory's `content` kept unless the caller asks for `full`.
+pub const MEMORY_CONTENT_CHARS: usize = 600;
+/// Most junction rows a by-symbol / by-file answer looks at, so it can say how
+/// many it left out without loading an unbounded number of memories.
+const LINKED_SCAN_CAP: usize = 200;
+
+/// Which slice of an ordered list a caller wants: `limit` rows (the tool's own
+/// default when `None`) starting at `offset`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Page {
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
+impl Page {
+    pub fn new(limit: Option<usize>, offset: Option<usize>) -> Self {
+        Self {
+            limit,
+            offset: offset.unwrap_or(0),
+        }
+    }
+
+    /// `(start, end)` of the window inside `total` rows. A `limit` of 0 is
+    /// read as 1: an empty page would say nothing and still claim progress.
+    pub fn window(self, default_limit: usize, total: usize) -> (usize, usize) {
+        let limit = self.limit.unwrap_or(default_limit).max(1);
+        let start = self.offset.min(total);
+        (start, start.saturating_add(limit).min(total))
+    }
+}
+
+/// The `omitted` note of the output contract (see `devctx_core::hits`):
+/// `{count, reason, next_offset?}`, or `None` when nothing was left out.
+/// `by_limit` rows fell past the page, `by_budget` rows did not fit the token
+/// budget; `reason` is `"budget"` when the budget cut anything (the cause that
+/// asking for the next page does not cure), `"limit"` otherwise.
+pub fn omitted_note(
+    by_limit: usize,
+    by_budget: usize,
+    next_offset: Option<usize>,
+) -> Option<Value> {
+    let count = by_limit + by_budget;
+    if count == 0 {
+        return None;
+    }
+    let mut note = json!({
+        "count": count,
+        "reason": if by_budget > 0 { "budget" } else { "limit" },
+    });
+    if let Some(n) = next_offset {
+        note["next_offset"] = json!(n);
+    }
+    Some(note)
+}
+
+/// Record a budget cut on an answer object: the legacy `omitted_for_budget`
+/// (`detail`, which names what was dropped) and the uniform `omitted`.
+fn set_budget_omitted(out: &mut Value, detail: Value) {
+    let count = detail.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
+    out["omitted_for_budget"] = detail;
+    if let Some(note) = omitted_note(0, count, None) {
+        out["omitted"] = note;
+    }
 }
 
 /// Fuse labelled result lists by rank, tagging each survivor with the scope it
@@ -3612,7 +3778,10 @@ pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<
     });
     let mut resp = json!({ "scope": scope, "memories": out });
     if !dropped.is_empty() {
-        resp["omitted_for_budget"] = json!({ "count": dropped.len(), "titles": dropped });
+        set_budget_omitted(
+            &mut resp,
+            json!({ "count": dropped.len(), "titles": dropped }),
+        );
     }
     Ok(resp.to_string())
 }
@@ -3660,11 +3829,14 @@ pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String,
     chosen.annotate(&mut out);
     let dropped_total = up_dropped.len() + down_dropped.len();
     if dropped_total > 0 {
-        out["omitted_for_budget"] = json!({
-            "count": dropped_total,
-            "upstream": up_dropped,
-            "downstream": down_dropped,
-        });
+        set_budget_omitted(
+            &mut out,
+            json!({
+                "count": dropped_total,
+                "upstream": up_dropped,
+                "downstream": down_dropped,
+            }),
+        );
     }
     Ok(out.to_string())
 }
@@ -3782,7 +3954,14 @@ pub fn do_build_context(
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut head = "## Recorded against this code\n\n";
         for file in code_files.iter().take(5) {
-            let Ok(raw) = do_memories_by_file(state, file, 5) else {
+            let Ok(raw) = do_memories_by_file(
+                state,
+                file,
+                MemoriesOpts {
+                    page: Page::new(Some(5), None),
+                    full: true,
+                },
+            ) else {
                 continue;
             };
             for m in parse_memories(&raw) {
@@ -3903,10 +4082,14 @@ pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<Stri
 /// did we decide about this, and why". Reaches both stores because the graph is
 /// per-repository while a global or group memory is not — see
 /// `devctx_memory::links` for why the junction row lives with the graph.
+///
+/// Output: `{subject, memories, total, matched_by, next_offset?, omitted?, ...}`. `memories`
+/// are the newest `page.limit` (default 5), each with its `content` cut to 600 characters
+/// (`content_truncated: true`) unless `full`.
 pub fn do_memories_by_symbol(
     state: &AppState,
     symbol: &str,
-    limit: usize,
+    opts: MemoriesOpts,
 ) -> Result<String, String> {
     let store = state.open_store()?;
     // Same branch rule as the graph tools: the junction rows are filed under
@@ -3914,14 +4097,14 @@ pub fn do_memories_by_symbol(
     // nobody has indexed yet.
     let (repo, branch, fallback) = symbol_branch(state, &store);
     let linked = store
-        .memory_ids_for_symbol(symbol, &repo, &branch, limit)
+        .memory_ids_for_symbol(symbol, &repo, &branch, LINKED_SCAN_CAP)
         .map_err(|e| e.to_string())?;
     let raw = linked_response(
         &store,
         symbol,
         linked,
         devctx_store::short_label(symbol),
-        limit,
+        opts,
     )?;
     let Some(f) = fallback else {
         return Ok(raw);
@@ -3955,10 +4138,16 @@ fn symbol_branch(
 /// `memories_by_file` tool: the decisions recorded about a file, plus the plan tasks that
 /// mention it (`plan_tasks`, PLAN-005 TASK-007) — computed at call time from `plans/`, never
 /// stored, so a parser failure never breaks the memory half of the answer.
-pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result<String, String> {
+///
+/// Same shape and paging as [`do_memories_by_symbol`].
+pub fn do_memories_by_file(
+    state: &AppState,
+    file: &str,
+    opts: MemoriesOpts,
+) -> Result<String, String> {
     let store = state.open_store()?;
     let mut linked = store
-        .memory_ids_for_file(file, limit)
+        .memory_ids_for_file(file, LINKED_SCAN_CAP)
         .map_err(|e| e.to_string())?;
 
     // The junction stores the path the index uses, and a caller who has a bare
@@ -3977,12 +4166,12 @@ pub fn do_memories_by_file(state: &AppState, file: &str, limit: usize) -> Result
     if linked.is_empty() {
         if let Some(r) = &resolved {
             linked = store
-                .memory_ids_for_file(r, limit)
+                .memory_ids_for_file(r, LINKED_SCAN_CAP)
                 .map_err(|e| e.to_string())?;
         }
     }
 
-    let out = linked_response(&store, file, linked, file, limit)?;
+    let out = linked_response(&store, file, linked, file, opts)?;
     let plan_tasks = plan_tasks_for_file(&state.plans_root.root, file, resolved.as_deref());
     Ok(with_plan_tasks_field(out, plan_tasks))
 }
@@ -4069,7 +4258,7 @@ fn linked_response(
     subject: &str,
     linked: Vec<(String, String)>,
     fallback_label: &str,
-    limit: usize,
+    opts: MemoriesOpts,
 ) -> Result<String, String> {
     let mut out: Vec<Value> = Vec::new();
 
@@ -4102,7 +4291,7 @@ fn linked_response(
         fallback_used = true;
         let mut seen = std::collections::HashSet::new();
         for m in store
-            .memories_mentioning(fallback_label, limit)
+            .memories_mentioning(fallback_label, LINKED_SCAN_CAP)
             .unwrap_or_default()
         {
             if seen.insert(m.id.clone()) {
@@ -4111,7 +4300,7 @@ fn linked_response(
         }
         if let Ok(c) = central() {
             for v in c
-                .memories_mentioning(fallback_label, limit)
+                .memories_mentioning(fallback_label, LINKED_SCAN_CAP)
                 .unwrap_or_default()
             {
                 let id = v.get("id").and_then(|i| i.as_str()).unwrap_or_default();
@@ -4131,20 +4320,78 @@ fn linked_response(
         };
         key(b).cmp(&key(a))
     });
-    out.truncate(limit);
+
+    Ok(linked_answer(subject, out, fallback_used, opts))
+}
+
+/// The answer of `memories_by_symbol` / `memories_by_file` from the memories already gathered
+/// (newest first): page them, shrink what is left, and say what was left out. Pure — no store —
+/// so the paging is testable without a central daemon.
+fn linked_answer(
+    subject: &str,
+    mut out: Vec<Value>,
+    fallback_used: bool,
+    opts: MemoriesOpts,
+) -> String {
+    // Page, then shrink what is left: five 600-character memories are the
+    // default answer, the full text is one `recall`/`full: true` away.
+    let total = out.len();
+    let (start, end) = opts.page.window(DEFAULT_MEMORIES_LIMIT, total);
+    let mut out: Vec<Value> = out.drain(start..end).collect();
+    if !opts.full {
+        for m in &mut out {
+            trim_memory_content(m, MEMORY_CONTENT_CHARS);
+        }
+    }
+    let left = total - end;
+    let next_offset = (left > 0).then_some(end);
 
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     let (out, dropped) = fit_memories(out, budget, |_, _| None);
     let mut resp = json!({
         "subject": subject,
         "memories": out,
+        // Linked memories found (looked at up to a cap), before paging.
+        "total": total,
         // Named so a reader knows the results are word matches, not recorded links.
         "matched_by": if fallback_used { "text-inference" } else { "junction" },
     });
+    if let Some(n) = next_offset {
+        resp["next_offset"] = json!(n);
+    }
+    if let Some(note) = omitted_note(left, dropped.len(), next_offset) {
+        resp["omitted"] = note;
+    }
     if !dropped.is_empty() {
         resp["omitted_for_budget"] = json!({ "count": dropped.len(), "titles": dropped });
     }
-    Ok(resp.to_string())
+    resp.to_string()
+}
+
+/// What `memories_by_symbol` / `memories_by_file` ask for: which page (default
+/// [`DEFAULT_MEMORIES_LIMIT`]) and whether to keep each memory's whole content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoriesOpts {
+    pub page: Page,
+    /// Skip the [`MEMORY_CONTENT_CHARS`] cut.
+    pub full: bool,
+}
+
+/// Cut a memory's `content` to `max` characters, flagging it: `content_truncated: true` and
+/// `content_chars` (the real length). The memory keeps its `id`, so the whole text is one
+/// `recall` / `memory_context` away.
+fn trim_memory_content(m: &mut Value, max: usize) {
+    let Some(content) = m.get("content").and_then(|c| c.as_str()) else {
+        return;
+    };
+    let chars = content.chars().count();
+    if chars <= max {
+        return;
+    }
+    let cut: String = content.chars().take(max).collect();
+    m["content"] = json!(format!("{cut}…"));
+    m["content_truncated"] = json!(true);
+    m["content_chars"] = json!(chars);
 }
 
 fn memory_json(m: &devctx_store::Memory, sources: &str) -> Value {
@@ -4207,16 +4454,28 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
     }
     chosen.annotate(&mut out);
     if !dropped.is_empty() {
-        out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
+        set_budget_omitted(
+            &mut out,
+            json!({ "count": dropped.len(), "items": dropped }),
+        );
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 /// `search_routes` tool: find HTTP routes by optional method + path substring.
+///
+/// Output contract (PLAN-008 TASK-010; see `devctx_core::hits`): always an
+/// object `{routes, total, next_offset?, omitted?, omitted_for_budget?,
+/// branch_fallback?, warning?}`. Routes are ordered by path, then method, and
+/// paged: `page.limit` rows (default [`DEFAULT_ROUTES_LIMIT`]) from
+/// `page.offset`. `total` counts every match; `omitted.count` is
+/// `total - offset - returned` (plus rows the token budget cut) and
+/// `next_offset` is where the next page starts, absent on the last one.
 pub fn do_search_routes(
     state: &AppState,
     method: Option<String>,
     path: Option<String>,
+    page: Page,
 ) -> Result<String, String> {
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
@@ -4228,24 +4487,31 @@ pub fn do_search_routes(
             path.as_deref(),
         )
         .map_err(|e| e.to_string())?;
-    routes_to_json(&routes, &chosen)
+    routes_to_json(&routes, &chosen, page, DEFAULT_ROUTES_LIMIT)
 }
 
 /// `routes_for_handler` tool: routes served by a handler symbol.
+///
+/// Same object contract as [`do_search_routes`], unpaged: a handler rarely
+/// serves many routes, and the token budget still applies.
 pub fn do_routes_for_handler(state: &AppState, handler: &str) -> Result<String, String> {
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
     let routes = store
         .routes_for_handler(&chosen.repo, &chosen.branch, handler)
         .map_err(|e| e.to_string())?;
-    routes_to_json(&routes, &chosen)
+    routes_to_json(&routes, &chosen, Page::default(), usize::MAX)
 }
 
 fn routes_to_json(
     routes: &[devctx_store::StoredRoute],
     chosen: &BranchChoice,
+    page: Page,
+    default_limit: usize,
 ) -> Result<String, String> {
-    let arr: Vec<Value> = routes
+    let total = routes.len();
+    let (start, end) = page.window(default_limit, total);
+    let arr: Vec<Value> = routes[start..end]
         .iter()
         .map(|r| {
             json!({
@@ -4264,10 +4530,15 @@ fn routes_to_json(
         let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
         format!("{method} {path}")
     });
-    if dropped.is_empty() && chosen.fallback.is_none() && !chosen.extractor_stale {
-        return serde_json::to_string_pretty(&Value::Array(kept)).map_err(|e| e.to_string());
+    let left = total - end;
+    let next_offset = (left > 0).then_some(end);
+    let mut out = json!({ "routes": kept, "total": total });
+    if let Some(n) = next_offset {
+        out["next_offset"] = json!(n);
     }
-    let mut out = json!({ "routes": kept });
+    if let Some(note) = omitted_note(left, dropped.len(), next_offset) {
+        out["omitted"] = note;
+    }
     if !dropped.is_empty() {
         out["omitted_for_budget"] = json!({ "count": dropped.len(), "items": dropped });
     }
@@ -4444,6 +4715,15 @@ mod tests {
     }
 
     use super::*;
+
+    /// `routes_to_json` as `search_routes` calls it.
+    fn routes_page(
+        routes: &[devctx_store::StoredRoute],
+        chosen: &BranchChoice,
+        page: Page,
+    ) -> Result<String, String> {
+        routes_to_json(routes, chosen, page, DEFAULT_ROUTES_LIMIT)
+    }
     use devctx_core::{VectorMetadata, VectorPoint};
 
     fn mem(id: &str, content_len: usize) -> Value {
@@ -5209,7 +5489,7 @@ mod tests {
             line: 999,
             ..Default::default()
         });
-        let out = routes_to_json(&routes, &on_current_branch()).unwrap();
+        let out = routes_page(&routes, &on_current_branch(), Page::default()).unwrap();
         std::env::remove_var("DEVCTX_MAX_OUTPUT_TOKENS");
         let value: Value = serde_json::from_str(&out).unwrap();
         let omitted = value["omitted_for_budget"]["count"].as_u64().unwrap();
@@ -5220,10 +5500,10 @@ mod tests {
         assert_eq!(value["routes"].as_array().unwrap().len(), 5);
     }
 
-    /// The same call under a generous budget stays the plain array shape the
-    /// tool has always returned — the wrapper only appears when it is needed.
+    /// The same call under a generous budget is still the object of the output
+    /// contract (never the bare array of 0.8), with nothing omitted.
     #[test]
-    fn routes_to_json_stays_a_bare_array_when_everything_fits() {
+    fn routes_to_json_is_an_object_even_when_everything_fits() {
         let routes = vec![devctx_store::StoredRoute {
             framework: "flask".into(),
             http_method: "GET".into(),
@@ -5232,9 +5512,12 @@ mod tests {
             line: 1,
             ..Default::default()
         }];
-        let out = routes_to_json(&routes, &on_current_branch()).unwrap();
+        let out = routes_page(&routes, &on_current_branch(), Page::default()).unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
-        assert!(value.is_array(), "{out}");
+        assert!(value.is_object(), "{out}");
+        assert_eq!(value["routes"].as_array().unwrap().len(), 1);
+        assert_eq!(value["total"], 1);
+        assert!(value.get("omitted").is_none() && value.get("next_offset").is_none());
     }
 
     /// `do_impact`'s upstream/downstream split each get half the budget, so a
@@ -5399,7 +5682,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("feat/x is not indexed"));
-        let routes_out = routes_to_json(&routes, &c).unwrap();
+        let routes_out = routes_page(&routes, &c, Page::default()).unwrap();
         assert!(routes_out.contains("branch_fallback"), "{routes_out}");
     }
 
@@ -5424,13 +5707,10 @@ mod tests {
         c.annotate(&mut out);
         assert!(out.get("branch_fallback").is_none());
         let routes = store.search_routes("demo", "main", None, None).unwrap();
-        assert!(
-            routes_to_json(&routes, &c)
-                .unwrap()
-                .trim_start()
-                .starts_with('['),
-            "shape unchanged when the current branch is indexed"
-        );
+        let routed: Value =
+            serde_json::from_str(&routes_page(&routes, &c, Page::default()).unwrap()).unwrap();
+        assert!(routed["routes"].is_array(), "{routed}");
+        assert!(routed.get("branch_fallback").is_none(), "{routed}");
     }
 
     #[test]
@@ -5452,7 +5732,7 @@ mod tests {
         c.annotate(&mut out);
         assert!(out["warning"].as_str().unwrap().contains("older extractor"));
         let routes = store.search_routes("demo", "main", None, None).unwrap();
-        let routed = routes_to_json(&routes, &c).unwrap();
+        let routed = routes_page(&routes, &c, Page::default()).unwrap();
         assert!(routed.contains("older extractor"), "{routed}");
 
         store
@@ -5835,5 +6115,346 @@ mod tests {
         assert!(hint.contains("records of other branches (dev)"), "{hint}");
         assert!(!hint.contains("nothing indexed"), "{hint}");
         assert!(!hint.contains("answer from branch"), "{hint}");
+    }
+
+    // --- output contract: paging and omitted counts (PLAN-008 TASK-010) ---
+
+    fn numbered_routes(n: usize) -> Vec<devctx_store::StoredRoute> {
+        (0..n)
+            .map(|i| devctx_store::StoredRoute {
+                framework: "fastapi".into(),
+                http_method: "GET".into(),
+                path: format!("/r{i:03}"),
+                file: "app.py".into(),
+                line: i as i32,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn route_paths(v: &Value) -> Vec<String> {
+        v["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// 45 routes with no `limit`: the default page of 20, the total, where the
+    /// next page starts, and exactly how many were left out.
+    #[test]
+    fn search_routes_default_page_says_what_it_left_out() {
+        let routes = numbered_routes(45);
+        let out = routes_to_json(
+            &routes,
+            &on_current_branch(),
+            Page::default(),
+            DEFAULT_ROUTES_LIMIT,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["routes"].as_array().unwrap().len(), 20, "{out}");
+        assert_eq!(v["total"], 45);
+        assert_eq!(v["next_offset"], 20);
+        assert_eq!(v["omitted"]["count"], 25, "total - returned: {out}");
+        assert_eq!(v["omitted"]["reason"], "limit");
+        assert_eq!(v["omitted"]["next_offset"], 20);
+    }
+
+    /// Walking the pages with `next_offset` returns every route once, in order:
+    /// nothing repeated, nothing skipped, and the last page ends the walk.
+    #[test]
+    fn search_routes_pages_without_repeating_or_skipping() {
+        let routes = numbered_routes(45);
+        let c = on_current_branch();
+        let mut seen: Vec<String> = Vec::new();
+        let mut offset = 0usize;
+        let mut pages = 0;
+        loop {
+            let page = Page::new(Some(20), Some(offset));
+            let v: Value = serde_json::from_str(
+                &routes_to_json(&routes, &c, page, DEFAULT_ROUTES_LIMIT).unwrap(),
+            )
+            .unwrap();
+            seen.extend(route_paths(&v));
+            pages += 1;
+            match v["next_offset"].as_u64() {
+                Some(n) => {
+                    assert_eq!(
+                        n as usize,
+                        seen.len(),
+                        "next_offset is where this page ended"
+                    );
+                    offset = n as usize;
+                }
+                None => {
+                    assert!(v.get("omitted").is_none(), "last page omits nothing: {v}");
+                    break;
+                }
+            }
+        }
+        assert_eq!(pages, 3);
+        let expected: Vec<String> = (0..45).map(|i| format!("/r{i:03}")).collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn search_routes_limit_and_an_offset_past_the_end() {
+        let routes = numbered_routes(5);
+        let c = on_current_branch();
+        let v: Value = serde_json::from_str(
+            &routes_to_json(&routes, &c, Page::new(Some(2), None), DEFAULT_ROUTES_LIMIT).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(route_paths(&v), vec!["/r000", "/r001"]);
+        assert_eq!(v["omitted"]["count"], 3);
+        // Past the end: an empty page that says there is nothing more, not an error.
+        let v: Value = serde_json::from_str(
+            &routes_to_json(&routes, &c, Page::new(None, Some(99)), DEFAULT_ROUTES_LIMIT).unwrap(),
+        )
+        .unwrap();
+        assert!(v["routes"].as_array().unwrap().is_empty());
+        assert_eq!(v["total"], 5);
+        assert!(
+            v.get("next_offset").is_none() && v.get("omitted").is_none(),
+            "{v}"
+        );
+    }
+
+    /// `routes_for_handler` is unpaged but is the same object, with `total`.
+    #[test]
+    fn routes_for_handler_shape_has_total_and_no_default_cut() {
+        let routes = numbered_routes(30);
+        let out =
+            routes_to_json(&routes, &on_current_branch(), Page::default(), usize::MAX).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["routes"].as_array().unwrap().len(), 30);
+        assert_eq!(v["total"], 30);
+        assert!(v.get("omitted").is_none());
+    }
+
+    /// A budget cut and a limit cut at once add up under one `omitted`, the
+    /// budget being the reason named; the legacy alias still names the items.
+    #[test]
+    fn omitted_adds_limit_and_budget_cuts() {
+        let n = omitted_note(5, 2, Some(20)).unwrap();
+        assert_eq!(n["count"], 7);
+        assert_eq!(n["reason"], "budget");
+        assert_eq!(n["next_offset"], 20);
+        assert!(omitted_note(0, 0, None).is_none());
+        assert_eq!(omitted_note(3, 0, None).unwrap()["reason"], "limit");
+        let mut out = json!({});
+        set_budget_omitted(&mut out, json!({ "count": 2, "items": ["a", "b"] }));
+        assert_eq!(out["omitted"], json!({ "count": 2, "reason": "budget" }));
+        assert_eq!(out["omitted_for_budget"]["items"][1], "b");
+    }
+
+    #[test]
+    fn page_window_clamps() {
+        assert_eq!(Page::default().window(20, 45), (0, 20));
+        assert_eq!(
+            Page::new(Some(0), None).window(20, 45),
+            (0, 1),
+            "0 reads as 1"
+        );
+        assert_eq!(Page::new(Some(10), Some(40)).window(20, 45), (40, 45));
+        assert_eq!(Page::new(Some(10), Some(99)).window(20, 45), (45, 45));
+        assert_eq!(Page::new(None, None).window(usize::MAX, 3), (0, 3));
+    }
+
+    /// Writes `n` plans: even numbers finished, odd ones with a pending task.
+    fn write_many_plans(root: &std::path::Path, n: usize) {
+        for i in 1..=n {
+            let status = if i % 2 == 0 { "done" } else { "pending" };
+            let dir = root.join(format!("plans/PLAN-{i:03}-p/tasks"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                root.join(format!("plans/PLAN-{i:03}-p/PLAN-{i:03}-p.md")),
+                format!("# PLAN-{i:03} — plan {i}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("TASK-001-x.md"),
+                format!("# TASK-001 — x\n\n- **Estado:** `{status}`\n\n## Objetivo\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    fn plan_ids_of(v: &Value) -> Vec<String> {
+        v["plans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// 130 plans, the field case: the default listing is one page of 25, newest
+    /// first, with the total and the way to the next page; the unpaged value the
+    /// CLI and the hook read still lists all of them.
+    #[test]
+    fn plan_status_list_is_one_page_of_25_with_a_total() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_page_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_many_plans(&root, 130);
+        let plans_root = PlansRoot {
+            root: root.clone(),
+            source: plans::PlansRootSource::Project,
+        };
+
+        let page1 = plan_status_page_in(&plans_root, None, PlanListOpts::default()).unwrap();
+        let ids = plan_ids_of(&page1);
+        assert_eq!(ids.len(), 25);
+        assert_eq!(ids[0], "PLAN-106", "page one is the 25 newest plans, by id");
+        assert_eq!(ids[24], "PLAN-130");
+        assert_eq!(page1["total"], 130);
+        assert_eq!(page1["next_offset"], 25);
+        assert_eq!(page1["omitted"]["count"], 105);
+        assert_eq!(page1["omitted"]["reason"], "limit");
+
+        // Walk to the end: each plan exactly once.
+        let mut all = ids;
+        let mut offset = 25usize;
+        loop {
+            let opts = PlanListOpts {
+                active_only: false,
+                page: Page::new(None, Some(offset)),
+            };
+            let v = plan_status_page_in(&plans_root, None, opts).unwrap();
+            all.extend(plan_ids_of(&v));
+            match v["next_offset"].as_u64() {
+                Some(n) => offset = n as usize,
+                None => break,
+            }
+        }
+        assert_eq!(all.len(), 130);
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), 130, "no repeats");
+
+        // The unpaged value (CLI, SessionStart hook) is untouched: everything, by id.
+        let full = plan_status_value_in(&plans_root, None).unwrap();
+        assert_eq!(plan_ids_of(&full).len(), 130);
+        assert_eq!(plan_ids_of(&full)[0], "PLAN-001");
+        assert!(full.get("next_offset").is_none() && full.get("omitted").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `active_only` keeps the plans with unresolved tasks; `total` counts those,
+    /// and `active` still names the active plan of the whole set.
+    #[test]
+    fn plan_status_active_only_filters_before_paging() {
+        let root = std::env::temp_dir().join(format!("devctx_plan_active_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_many_plans(&root, 10);
+        let plans_root = PlansRoot {
+            root: root.clone(),
+            source: plans::PlansRootSource::Project,
+        };
+        let opts = PlanListOpts {
+            active_only: true,
+            page: Page::new(Some(3), None),
+        };
+        let v = plan_status_page_in(&plans_root, None, opts).unwrap();
+        assert_eq!(v["total"], 5, "plans 1,3,5,7,9 are open");
+        assert_eq!(plan_ids_of(&v), vec!["PLAN-005", "PLAN-007", "PLAN-009"]);
+        assert_eq!(v["next_offset"], 3);
+        assert_eq!(v["omitted"]["count"], 2);
+        assert!(v["active"].is_string());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn linked(n: usize, content_len: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                json!({
+                    "id": format!("m{i}"),
+                    "title": format!("t{i}"),
+                    "content": "y".repeat(content_len),
+                    "link_sources": "files-field",
+                })
+            })
+            .collect()
+    }
+
+    /// 12 linked memories of 2000 characters: the default answer is five, each
+    /// cut to 600 and flagged, with the real length and the count left out.
+    #[test]
+    fn linked_memories_default_to_five_trimmed_to_600() {
+        let v: Value = serde_json::from_str(&linked_answer(
+            "f.rs",
+            linked(12, 2000),
+            false,
+            MemoriesOpts::default(),
+        ))
+        .unwrap();
+        let mems = v["memories"].as_array().unwrap();
+        assert_eq!(mems.len(), 5);
+        assert_eq!(v["total"], 12);
+        assert_eq!(v["omitted"]["count"], 7);
+        assert_eq!(v["omitted"]["reason"], "limit");
+        assert_eq!(v["next_offset"], 5);
+        for m in mems {
+            assert_eq!(m["content_truncated"], true);
+            assert_eq!(m["content_chars"], 2000);
+            assert!(m["content"].as_str().unwrap().chars().count() <= 601);
+            assert!(
+                m["id"].as_str().unwrap().starts_with('m'),
+                "id kept to ask for more"
+            );
+        }
+        assert_eq!(v["matched_by"], "junction");
+    }
+
+    #[test]
+    fn linked_memories_full_keeps_content_and_short_ones_are_not_flagged() {
+        let opts = MemoriesOpts {
+            page: Page::new(Some(2), None),
+            full: true,
+        };
+        let v: Value =
+            serde_json::from_str(&linked_answer("f.rs", linked(2, 2000), true, opts)).unwrap();
+        assert_eq!(v["memories"][0]["content"].as_str().unwrap().len(), 2000);
+        assert!(v["memories"][0].get("content_truncated").is_none());
+        assert!(v.get("omitted").is_none() && v.get("next_offset").is_none());
+        assert_eq!(v["matched_by"], "text-inference");
+
+        let short: Value = serde_json::from_str(&linked_answer(
+            "f.rs",
+            linked(1, 100),
+            false,
+            MemoriesOpts::default(),
+        ))
+        .unwrap();
+        assert!(short["memories"][0].get("content_truncated").is_none());
+    }
+
+    /// Pages of memories join up: offset 5 of 12 continues where 0..5 stopped.
+    #[test]
+    fn linked_memories_page_without_repeating() {
+        let ids = |opts: MemoriesOpts| -> Vec<String> {
+            let v: Value =
+                serde_json::from_str(&linked_answer("f.rs", linked(12, 10), false, opts)).unwrap();
+            v["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let first = ids(MemoriesOpts::default());
+        let second = ids(MemoriesOpts {
+            page: Page::new(None, Some(5)),
+            full: false,
+        });
+        let third = ids(MemoriesOpts {
+            page: Page::new(None, Some(10)),
+            full: false,
+        });
+        assert_eq!(first, ["m0", "m1", "m2", "m3", "m4"]);
+        assert_eq!(second, ["m5", "m6", "m7", "m8", "m9"]);
+        assert_eq!(third, ["m10", "m11"]);
     }
 }

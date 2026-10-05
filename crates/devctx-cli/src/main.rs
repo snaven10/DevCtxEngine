@@ -2419,7 +2419,42 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
 fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
     let cfg = load_project()?;
     if let Some(r) = remote::ensure_cli(&cfg)? {
-        println!("{}", r.routes(method.as_deref(), path.as_deref())?);
+        let raw = r.routes(method.as_deref(), path.as_deref())?;
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        // The object of the output contract, or the bare array of a server
+        // older than 0.9.
+        let answer = devctx_core::search_hits(&value);
+        if let Some(f) = &answer.branch_fallback {
+            let why = f.get("why").and_then(|w| w.as_str()).unwrap_or_default();
+            eprintln!("· branch_fallback: {why}");
+        }
+        if let Some(w) = answer.warning.as_ref().and_then(|w| w.as_str()) {
+            eprintln!("· warning: {w}");
+        }
+        if let Some(line) = omitted_line(answer.omitted.as_ref()) {
+            eprintln!("· {line}");
+        }
+        if answer.hits.is_empty() {
+            println!("No routes.");
+            return Ok(());
+        }
+        for h in &answer.hits {
+            let s = |k| h.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            let handler = if s("handler").is_empty() {
+                "-"
+            } else {
+                s("handler")
+            };
+            println!(
+                "{:6} {}  [{}] {} ({}:{})",
+                s("method"),
+                s("path"),
+                s("framework"),
+                handler,
+                s("file"),
+                h.get("line").and_then(|v| v.as_i64()).unwrap_or(0)
+            );
+        }
         return Ok(());
     }
     let store = open_store(&cfg, configured_dimension(&cfg))?;
@@ -3782,20 +3817,47 @@ fn hit_out(h: &SearchResult) -> SearchHitOut<'_> {
     }
 }
 
+/// The `--format json` answer: the object of the output contract
+/// (`devctx_core::hits`), `{ "results": [...] }`, like the server's `/search`.
 fn render_json(hits: &[SearchResult]) -> Result<String> {
-    let out: Vec<SearchHitOut> = hits.iter().map(hit_out).collect();
-    Ok(serde_json::to_string_pretty(&out)?)
+    let results: Vec<SearchHitOut> = hits.iter().map(hit_out).collect();
+    Ok(serde_json::to_string_pretty(
+        &serde_json::json!({ "results": results }),
+    )?)
+}
+
+/// One line saying what an answer left out, from its `omitted` note
+/// (`{count, reason, next_offset?}`); `None` when nothing was.
+fn omitted_line(omitted: Option<&serde_json::Value>) -> Option<String> {
+    let o = omitted?;
+    let count = o.get("count").and_then(|c| c.as_u64()).filter(|c| *c > 0)?;
+    let reason = o.get("reason").and_then(|r| r.as_str()).unwrap_or("budget");
+    let more = match o.get("next_offset").and_then(|n| n.as_u64()) {
+        Some(n) => format!("; next offset {n}"),
+        None => String::new(),
+    };
+    Some(format!("Note: {count} more left out ({reason}){more}"))
 }
 
 /// Render a server's `/search` JSON response in the requested output format,
 /// matching the local table layout so routing is transparent.
 fn print_remote_search(json: &str, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{json}"),
+        OutputFormat::Json => {
+            // The contract is an object; a server older than 0.9 sends a bare
+            // array when it has nothing to add, so wrap it.
+            match serde_json::from_str::<serde_json::Value>(json) {
+                Ok(serde_json::Value::Array(results)) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "results": results }))?
+                ),
+                _ => println!("{json}"),
+            }
+        }
         OutputFormat::Table => {
             let hits: serde_json::Value = serde_json::from_str(json)?;
-            // Bare array, or `{results, branch_fallback, ...}` when the serve
-            // answered from another branch or truncated to budget.
+            // The object of the output contract, or the bare array of a server
+            // older than 0.9; `search_hits` reads both.
             let answer = devctx_core::search_hits(&hits);
             if let Some(f) = &answer.branch_fallback {
                 println!("Note: answered from another branch: {f}");
@@ -3807,6 +3869,9 @@ fn print_remote_search(json: &str, format: OutputFormat) -> Result<()> {
                         .map(str::to_string)
                         .unwrap_or_else(|| w.to_string())
                 );
+            }
+            if let Some(line) = omitted_line(answer.omitted.as_ref()) {
+                println!("{line}");
             }
             if answer.hits.is_empty() {
                 println!("No results.");
@@ -4018,6 +4083,33 @@ mod tests {
         assert!(out.contains("\"symbol\": \"foo\""));
         assert!(out.contains("\"start_line\": 3"));
         assert!(!out.contains("vector"));
+    }
+
+    /// `--format json` is the object of the output contract, never a bare array.
+    #[test]
+    fn json_is_an_object_with_results() {
+        let out = render_json(&[hit("src/a.rs", "foo", 0.5)]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.is_object(), "{out}");
+        assert_eq!(v["results"].as_array().unwrap().len(), 1);
+        let empty: serde_json::Value = serde_json::from_str(&render_json(&[]).unwrap()).unwrap();
+        assert_eq!(empty["results"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn omitted_line_names_count_reason_and_next_page() {
+        let o = serde_json::json!({"count": 25, "reason": "limit", "next_offset": 20});
+        assert_eq!(
+            omitted_line(Some(&o)).unwrap(),
+            "Note: 25 more left out (limit); next offset 20"
+        );
+        let b = serde_json::json!({"count": 2, "reason": "budget"});
+        assert_eq!(
+            omitted_line(Some(&b)).unwrap(),
+            "Note: 2 more left out (budget)"
+        );
+        assert!(omitted_line(Some(&serde_json::json!({"count": 0}))).is_none());
+        assert!(omitted_line(None).is_none());
     }
 
     #[test]
