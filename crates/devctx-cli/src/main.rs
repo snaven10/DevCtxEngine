@@ -1419,13 +1419,22 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
     // past a taken one, and the file has to name where the daemon actually is.
     let announce_paths = paths.clone();
     let announce_token = token.clone();
-    let result = devctx_api::central::run_blocking(central, socket, token, idle, move |bound| {
-        let _ = devctx_central::client::write_serve_file(
-            &announce_paths,
-            bound,
-            announce_token.as_deref(),
-        );
-    });
+    let exit_paths = paths.clone();
+    let result = devctx_api::central::run_blocking(
+        central,
+        socket,
+        token,
+        idle,
+        move |bound| {
+            let _ = devctx_central::client::write_serve_file(
+                &announce_paths,
+                bound,
+                announce_token.as_deref(),
+            );
+        },
+        // The idle exit ends in `_exit`: the advertisement goes first.
+        move || devctx_central::client::remove_own_serve_file(&exit_paths),
+    );
     devctx_central::client::remove_own_serve_file(&paths);
     result
 }

@@ -150,7 +150,9 @@ pub async fn serve(
     token: Option<String>,
     idle: Option<Duration>,
     announce: impl FnOnce(SocketAddr),
+    on_exit: impl Fn() + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
+    let on_exit: Arc<dyn Fn() + Send + Sync> = Arc::new(on_exit);
     let api = CentralApi {
         central: Arc::new(Mutex::new(central)),
         token,
@@ -192,6 +194,7 @@ pub async fn serve(
         // A plain thread, so the timer does not depend on the runtime's workers.
         let poll = (timeout / 4).clamp(Duration::from_millis(250), Duration::from_secs(30));
         let mut exit_store = Some(folding);
+        let on_exit = on_exit.clone();
         let _ = std::thread::Builder::new()
             .name("idle-watchdog".into())
             .spawn(move || loop {
@@ -222,6 +225,12 @@ pub async fn serve(
                 // does next can write. The helper ends the process itself the
                 // moment the checkpoint returns.
                 let store = exit_store.take();
+                // Withdraw `serve.json` before `_exit` (which runs no
+                // destructors and no caller code): left behind it advertises a
+                // daemon that is gone. Only once the checkpoint is done, as in
+                // the project server: until the lock is released a client must
+                // read this daemon as exiting, not as absent.
+                let hook = on_exit.clone();
                 let _ = std::thread::Builder::new()
                     .name("exit-checkpoint".into())
                     .spawn(move || {
@@ -231,9 +240,11 @@ pub async fn serve(
                                 let _ = store.force_checkpoint();
                             }
                         }
+                        hook();
                         crate::hard_exit(0);
                     });
                 std::thread::sleep(Duration::from_millis(1500));
+                on_exit();
                 crate::hard_exit(0);
             });
     }
@@ -375,11 +386,12 @@ pub fn run_blocking(
     token: Option<String>,
     idle: Option<Duration>,
     announce: impl FnOnce(SocketAddr),
+    on_exit: impl Fn() + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = rt.block_on(serve(central, addr, token, idle, announce));
+    let result = rt.block_on(serve(central, addr, token, idle, announce, on_exit));
     // Bounded: the implicit drop waits for the blocking pool with no limit.
     rt.shutdown_timeout(Duration::from_secs(5));
     result

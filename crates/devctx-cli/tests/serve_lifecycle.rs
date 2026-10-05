@@ -307,7 +307,11 @@ fn a_client_during_the_exit_checkpoint_does_not_spawn_a_second_server() {
         &root,
         Some(1),
         None,
-        &[("DEVCTX_TEST_SLOW_CHECKPOINT_MS", "1200")],
+        // 800 ms against the exit's 1.5 s budget: still a checkpoint that takes
+        // long (clients wait through it), with ~700 ms to spare for the freeze
+        // and the thread spawn. 1200 left ~300 ms and flaked on a loaded
+        // machine, falling into the no-checkpoint path.
+        &[("DEVCTX_TEST_SLOW_CHECKPOINT_MS", "800")],
     );
     let marker = root.join(".devctx/state/serve.checkpointing");
     let t0 = Instant::now();
@@ -324,27 +328,203 @@ fn a_client_during_the_exit_checkpoint_does_not_spawn_a_second_server() {
         "serve.json was withdrawn before the checkpoint finished: a client would read \
          \"nothing running\" while the lock is still held"
     );
-    // A client in the window (autospawn ON): it must not start a server.
+    // A client in the window (autospawn ON): it waits through the exit and
+    // starts the NEXT server only once the first has let go. What must never
+    // happen is a server spawned over the held lock, which dies on it and says
+    // so in `serve.log`.
     let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
         .env("DEVCTX_HOME", tmp.home())
         .env("DEVCTX_MODEL_CACHE", tmp.cache())
         .current_dir(&root)
-        .args(["index"])
+        .args(["status"])
         .output()
         .unwrap();
     let said = String::from_utf8_lossy(&out.stderr);
     let spawn_log = root.join(".devctx/state/serve.log");
+    let logged = std::fs::read_to_string(&spawn_log).unwrap_or_default();
     assert!(
-        !spawn_log.exists(),
-        "a second server was spawned during the exit checkpoint:\n{}\n{said}",
-        std::fs::read_to_string(&spawn_log).unwrap_or_default()
+        !devctx_cli_lock_error(&logged) && !devctx_cli_lock_error(&said),
+        "a server was spawned over the exit checkpoint's lock:\n{logged}\n{said}"
+    );
+    assert!(
+        !said.contains("busy or hung"),
+        "the client reported the exit window as a hung server: {said}"
+    );
+    assert!(
+        out.status.success(),
+        "the client did not get through: {said}"
     );
     let code = exits_within(&mut serve.child, Duration::from_secs(10))
         .and_then(|_| serve.child.try_wait().unwrap())
         .expect("the idle server never exited");
     assert_eq!(code.code(), Some(0));
+    // The client's own server (started after the first let go) is stopped
+    // the way a person would; then nothing is left advertised or unfolded.
+    let stop = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .args(["serve", "--stop"])
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
     assert!(!serve_json(&serve.root).exists(), "serve.json left behind");
     assert!(wal_folded(&root), "the WAL outlived the server");
+}
+
+/// TASK-017 fixup K4: a central daemon that ends on its idle timer withdraws its `serve.json`
+/// (it ends in `_exit`, which runs no cleanup of the caller's).
+#[test]
+fn an_idle_central_daemon_withdraws_its_advertisement() {
+    let tmp = Tmp::new("centralidle");
+    let log = tmp.0.join("central.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .args(["serve", "--central", "--addr"])
+        .arg(format!("127.0.0.1:{}", free_port()))
+        .args(["--idle", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .expect("spawning the central daemon");
+    let adv = tmp.home().join("serve.json");
+    let t0 = Instant::now();
+    while !adv.exists() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "the central daemon never advertised\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let took = exits_within(&mut child, Duration::from_secs(20));
+    let _ = child.kill();
+    took.expect("the central daemon never ended on its idle timer");
+    assert!(
+        !adv.exists(),
+        "serve.json left behind by the idle exit of the central daemon"
+    );
+}
+
+/// TASK-017 fixup K1: two cold clients at once (an MCP and a CLI, say) end up
+/// on ONE server and neither reports the other's lock as a failure. Repeated:
+/// the old pre-spawn probe of the database put a transient lock under the
+/// other client's server, and the loser of the two spawns reported
+/// "did not start" while the winner was still coming up.
+#[test]
+fn two_cold_clients_end_up_on_one_server() {
+    let tmp = Tmp::new("coldrace");
+    let root = project(&tmp);
+    for round in 0..6 {
+        let run = |root: &Path| {
+            Command::new(env!("CARGO_BIN_EXE_devctx"))
+                .env("DEVCTX_HOME", tmp.home())
+                .env("DEVCTX_MODEL_CACHE", tmp.cache())
+                .current_dir(root)
+                .args(["status"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawning a client")
+        };
+        let (a, b) = (run(&root), run(&root));
+        for (who, out) in [("A", a.wait_with_output()), ("B", b.wait_with_output())] {
+            let out = out.unwrap();
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success()
+                    && !said.contains("did not start")
+                    && !said.contains("is held by"),
+                "round {round}, client {who} failed: {said}"
+            );
+        }
+        let info = std::fs::read_to_string(serve_json(&root)).expect("one server is advertised");
+        let pid = info
+            .split("\"pid\"")
+            .nth(1)
+            .and_then(|r| {
+                r.trim_start_matches([':', ' '])
+                    .split([',', '\n', '}'])
+                    .next()
+            })
+            .and_then(|p| p.trim().parse::<u32>().ok())
+            .expect("the advertisement names a pid");
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "the advertised server is gone"
+        );
+        // Next round starts cold.
+        let stop = Command::new(env!("CARGO_BIN_EXE_devctx"))
+            .env("DEVCTX_HOME", tmp.home())
+            .env("DEVCTX_NO_AUTOSERVE", "1")
+            .current_dir(&root)
+            .args(["serve", "--stop"])
+            .output()
+            .unwrap();
+        assert!(stop.status.success());
+    }
+}
+
+/// TASK-017 fixup K1: a database held by a process that is NOT a starting
+/// `devctx serve` still fails fast (the 2 s target), naming the holder. The
+/// holder is a hard link of the binary under another name, so it is a server
+/// to the engine but not to the process table: its advertisement is removed.
+#[test]
+fn a_foreign_lock_still_fails_fast() {
+    let tmp = Tmp::new("foreignlock");
+    let root = project(&tmp);
+    let bin = tmp.0.join("holder");
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_devctx"));
+    if std::fs::hard_link(&exe, &bin).is_err() {
+        std::fs::copy(&exe, &bin).expect("copying the binary");
+    }
+    let port = free_port();
+    let mut holder = Command::new(&bin)
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_MODEL_CACHE", tmp.cache())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{port}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning the holder");
+    let t0 = Instant::now();
+    while http(port, "GET", "/health", "", Duration::from_secs(2)).is_none() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "holder never came up"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::fs::remove_file(serve_json(&root)).expect("withdrawing the holder's advertisement");
+
+    let t0 = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_MODEL_CACHE", tmp.cache())
+        .current_dir(&root)
+        .args(["status"])
+        .output()
+        .unwrap();
+    let took = t0.elapsed();
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    eprintln!("K1 foreign lock fail-fast: {took:?}\n{said}");
+    assert!(!out.status.success(), "it cannot have worked: {said}");
+    assert!(
+        said.contains(&format!("PID {}", holder.id())),
+        "the holder is not named: {said}"
+    );
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+}
+
+fn devctx_cli_lock_error(text: &str) -> bool {
+    text.contains("Could not set lock") || text.contains("Conflicting lock")
 }
 
 /// B10: SIGTERM while a blocking task is stuck in a download that never

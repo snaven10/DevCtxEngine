@@ -147,6 +147,13 @@ const EXIT_WAIT: Duration = Duration::from_secs(3);
 pub fn discover(paths: &CentralPaths) -> Option<CentralClient> {
     let raw = std::fs::read(serve_file(paths)).ok()?;
     let info: ServeInfo = serde_json::from_slice(&raw).ok()?;
+    // A file whose pid is no longer a central daemon is stale (a daemon that
+    // ended without withdrawing it): its port may now answer for something
+    // else. Only a pid that is positively gone distrusts it; one that cannot
+    // be tied to the file (`Unverified`) keeps the old behaviour, health only.
+    if info.pid.is_some() && ownership(&info) == Ownership::Gone {
+        return None;
+    }
     let base = format!("http://{}", info.addr);
     let up = || CentralClient {
         base: base.clone(),
@@ -792,6 +799,7 @@ mod stop_tests {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::process::Command;
     use std::time::Instant;
 
     /// TASK-017 fixup I2: `/health` answering 503 (exiting) is not "down":
@@ -864,6 +872,37 @@ mod tests {
             }
         });
         (addr, hits)
+    }
+
+    /// TASK-017 fixup K4: a `serve.json` whose pid is not a central daemon any
+    /// more is not trusted, even when something answers `/health` on its port.
+    #[test]
+    fn a_stale_advertisement_is_not_trusted() {
+        let dir = std::env::temp_dir().join(format!("devctx-k4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = CentralPaths {
+            dir: dir.clone(),
+            config: dir.join("config.yaml"),
+            db: dir.join("central.duckdb"),
+            serve_file: dir.join("serve.json"),
+        };
+        let (addr, _) =
+            serve_fixed("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
+        // Alive, answers, but is not a daemon: the pid was recycled.
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let info = ServeInfo {
+            addr,
+            token: None,
+            pid: Some(sleeper.id()),
+            start_time: procown::start_time(sleeper.id()),
+        };
+        std::fs::write(&paths.serve_file, serde_json::to_vec(&info).unwrap()).unwrap();
+        let found = discover(&paths);
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        assert!(found.is_none(), "a stale serve.json was trusted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// TASK-017 fixup J3: a request refused with the exiting 503 (an idle exit

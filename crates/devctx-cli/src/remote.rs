@@ -210,19 +210,71 @@ pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
     if std::env::var_os("DEVCTX_NO_AUTOSERVE").is_some() {
         return Err(EnsureError::Disabled);
     }
-    // Nothing advertised, but the file may still be held for an instant: a
-    // server that just withdrew its advertisement and is about to `_exit`, or
-    // one another client spawned a moment ago. Give that a moment to resolve
-    // before spawning — over a held lock the spawn only dies and writes noise
-    // to `serve.log`. A lock that outlasts the wait is not ours to judge: the
-    // spawn below reports it the way it always has (fast, naming the holder).
-    if let Some(r) = wait_out_lock(
-        cfg,
-        |p| Ok(devctx_store::Store::check_unlocked(p)?),
-        LOCK_WAIT,
-    ) {
-        return Ok(r);
+    // No pre-check of the database: opening it here would put a transient
+    // lock on the common cold path (every client, before every spawn) and could
+    // take the lock a concurrent client's server is about to open. The spawn
+    // goes first; only when it dies on a lock (or an exit checkpoint is under
+    // way) is the holder waited out and the spawn repeated, once.
+    match spawn_and_wait(cfg) {
+        Err(EnsureError::Failed { cause }) if lock_may_resolve(cfg, cause.as_deref()) => {
+            let cause = cause.unwrap_or_default();
+            match wait_out_lock(
+                cfg,
+                |p| Ok(devctx_store::Store::check_unlocked(p)?),
+                lock_wait_for(cfg, &cause),
+            ) {
+                LockWait::Up(r) => Ok(r),
+                // Still held after the wait: not ours to judge. The failure the
+                // spawn reported already names the holder; reporting it is fast.
+                LockWait::Held => Err(EnsureError::Failed { cause: Some(cause) }),
+                LockWait::Free => spawn_and_wait(cfg),
+            }
+        }
+        other => other,
     }
+}
+
+/// Whether a spawn that died is worth repeating after waiting: it hit a held
+/// database, or a server is taking its exit checkpoint right now.
+fn lock_may_resolve(cfg: &ProjectConfig, cause: Option<&str>) -> bool {
+    cause.is_some_and(is_lock_error) || devctx_api::checkpoint_marker(cfg).exists()
+}
+
+/// How long to wait out the holder named in `cause`: as long as a `devctx
+/// serve` needs to come up (or to finish its exit) when that is who holds the
+/// file, i.e. one a client spawned ([`AUTOSPAWN_ENV`]) or one that says it is
+/// checkpointing; only [`LOCK_WAIT`] for anyone else — a server somebody ran
+/// by hand and withdrew, an MCP, a TUI — so a foreign holder still fails fast.
+fn lock_wait_for(cfg: &ProjectConfig, cause: &str) -> Duration {
+    match lock_holder_pid(cause) {
+        Some(pid)
+            if procown::is_server_pid(pid)
+                && (spawned_by_a_client(pid) || checkpointing(cfg, pid)) =>
+        {
+            HOLDER_WAIT
+        }
+        _ => LOCK_WAIT,
+    }
+}
+
+/// Whether `pid` was launched by [`spawn_server`] (it carries [`AUTOSPAWN_ENV`]
+/// in its environment). Linux only: elsewhere nobody is known to be starting.
+fn spawned_by_a_client(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let want = format!("{AUTOSPAWN_ENV}=1");
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|raw| raw.split(|b| *b == 0).any(|kv| kv == want.as_bytes()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Spawn one server and wait for it to answer, or to die.
+fn spawn_and_wait(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
     let spawned = spawn_server(cfg).map_err(|e| EnsureError::Spawn(format!("{e:#}")))?;
     // Said only once it is up: when the serve cannot start (the lock is held,
     // the port is taken) "started" would be a lie printed right before the error.
@@ -268,26 +320,42 @@ pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
 /// 2 s target), and the exit window is covered by the advertisement staying up.
 const LOCK_WAIT: Duration = Duration::from_millis(500);
 
+/// The same wait when the holder is a `devctx serve` (one another client just
+/// spawned, still loading, or one finishing its exit checkpoint): it is going
+/// to answer or to let go, and both end the wait. It is a ceiling, not a cost.
+const HOLDER_WAIT: Duration = Duration::from_secs(30);
+
+/// What [`wait_out_lock`] found.
+enum LockWait {
+    /// A server came up while waiting.
+    Up(Remote),
+    /// The file is free (or fails for a reason that is not a lock).
+    Free,
+    /// Still held when the wait ran out.
+    Held,
+}
+
 /// While `check` says the database is held by another process and no server is
 /// advertised, keep looking for one (the holder may be one still starting):
-/// `Some` when one answers; `None` when the file is free, the failure is not a
-/// lock, or the lock is still held after `wait` — the caller spawns then.
+/// [`LockWait::Up`] when one answers; [`LockWait::Free`] when the file is free
+/// or the failure is not a lock; [`LockWait::Held`] when it is still held after
+/// `wait`.
 fn wait_out_lock(
     cfg: &ProjectConfig,
     check: impl Fn(&Path) -> Result<()>,
     wait: Duration,
-) -> Option<Remote> {
+) -> LockWait {
     let deadline = Instant::now() + wait;
     loop {
         match check(&cfg.db_path()) {
             Err(e) if is_lock_error(&format!("{e:#}")) => {}
-            _ => return None,
+            _ => return LockWait::Free,
         }
         if let Discovery::Up(r) = probe(cfg) {
-            return Some(r);
+            return LockWait::Up(r);
         }
         if Instant::now() >= deadline {
-            return None;
+            return LockWait::Held;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -778,6 +846,9 @@ enum Health {
     Ok,
     /// Nothing listens on the port: the server is gone, whatever its pid is now.
     Refused,
+    /// A 503 with the exiting marker: the server is freezing and checkpointing
+    /// before it leaves. It still holds the lock; it is neither busy nor hung.
+    Exiting,
     /// No answer in time, or an error answer: something may be there, busy.
     NoAnswer,
 }
@@ -790,6 +861,9 @@ fn health(base: &str, timeout: Duration) -> Health {
         .call();
     match res {
         Ok(_) => Health::Ok,
+        Err(ureq::Error::Status(503, r)) if r.header(procown::EXITING_HEADER).is_some() => {
+            Health::Exiting
+        }
         Err(e) if connection_refused(&e) => Health::Refused,
         Err(_) => Health::NoAnswer,
     }
@@ -809,57 +883,87 @@ fn connection_refused(e: &ureq::Error) -> bool {
     false
 }
 
-fn healthy(base: &str, timeout: Duration) -> bool {
-    matches!(health(base, timeout), Health::Ok)
+/// One look at `serve.json` and its server.
+enum Look {
+    Found(Discovery),
+    /// The advertised server is leaving (see [`Health::Exiting`]).
+    Exiting {
+        pid: u32,
+        addr: String,
+    },
 }
 
 /// Discover a running server for this project, telling "gone" apart from
-/// "alive but slow".
+/// "alive but slow" and from "leaving".
+///
+/// A server that says it is exiting is waited for, up to [`EXIT_RETRY_WAIT`]
+/// (its freeze and checkpoint are budgeted at 1.5 s): the answer is then Up
+/// (a replacement), Down (it left) or, only if it outlasts the wait, Busy.
+/// Callers used to get Busy at once and report "busy or hung" about a server
+/// that was doing its orderly exit.
 pub fn probe(cfg: &ProjectConfig) -> Discovery {
+    let deadline = Instant::now() + EXIT_RETRY_WAIT;
+    loop {
+        match look(cfg) {
+            Look::Found(d) => return d,
+            Look::Exiting { pid, addr } => {
+                if Instant::now() >= deadline {
+                    return Discovery::Busy { pid, addr };
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn look(cfg: &ProjectConfig) -> Look {
     let Some(info) = std::fs::read(serve_file(cfg))
         .ok()
         .and_then(|raw| serde_json::from_slice::<ServeInfo>(&raw).ok())
     else {
-        return Discovery::Down;
+        return Look::Found(Discovery::Down);
     };
     let base = format!("http://{}", info.addr);
     let up = |token: Option<String>| {
-        Discovery::Up(Remote {
+        Look::Found(Discovery::Up(Remote {
             base: base.clone(),
             token,
             cfg: Some(Box::new(cfg.clone())),
-        })
+        }))
+    };
+    let exiting = |info: ServeInfo| Look::Exiting {
+        pid: info.pid.unwrap_or(0),
+        addr: info.addr,
     };
     match health(&base, HEALTH_QUICK) {
         Health::Ok => return up(info.token),
+        Health::Exiting => return exiting(info),
         // Nobody listens: the server is gone. A live pid on that number is a
         // different process (pids are reused, across repositories too).
         // — unless the process is verifiably OURS: then the listener is closed
         // but the server is not gone (shutting down, wedged), it may still hold
         // the lock, and spawning another would only hit it.
         Health::Refused => {
-            return match info.pid {
+            return Look::Found(match info.pid {
                 Some(pid) if owns_server(cfg, &info) => Discovery::Busy {
                     pid,
                     addr: info.addr,
                 },
                 _ => Discovery::Down,
-            }
+            })
         }
         Health::NoAnswer => {}
     }
     match info.pid {
-        Some(pid) if owns_server(cfg, &info) => {
-            if healthy(&base, HEALTH_PATIENT) {
-                up(info.token)
-            } else {
-                Discovery::Busy {
-                    pid,
-                    addr: info.addr,
-                }
-            }
-        }
-        _ => Discovery::Down,
+        Some(pid) if owns_server(cfg, &info) => match health(&base, HEALTH_PATIENT) {
+            Health::Ok => up(info.token),
+            Health::Exiting => exiting(info),
+            _ => Look::Found(Discovery::Busy {
+                pid,
+                addr: info.addr,
+            }),
+        },
+        _ => Look::Found(Discovery::Down),
     }
 }
 
@@ -1363,6 +1467,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A listener that answers `first` until `flip_at`, `then` after it.
+    fn serve_switching(first: &'static str, then: &'static str, flip_at: Instant) -> SocketAddr {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let reply = if Instant::now() < flip_at {
+                    first
+                } else {
+                    then
+                };
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        addr
+    }
+
+    /// TASK-017 fixup K2: a server that answers `/health` with the marked 503
+    /// is exiting, not "busy or hung": `probe` waits through the exit window
+    /// and reports what is there afterwards (here, its replacement).
+    #[test]
+    fn probe_waits_through_the_exit_window() {
+        let dir = std::env::temp_dir().join(format!("devctx_k2_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        let started = Instant::now();
+        let addr = serve_switching(EXITING_503, OK_200, started + Duration::from_millis(700));
+        write_serve_file(&cfg, addr, None).unwrap();
+        let found = probe(&cfg);
+        assert!(
+            matches!(found, Discovery::Up(_)),
+            "a server in its exit window must be waited for, not reported busy"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(600),
+            "answered before the window closed"
+        );
+
+        // It leaves instead: the advertisement is withdrawn while we wait.
+        let addr = serve_switching(EXITING_503, EXITING_503, started + Duration::from_secs(60));
+        write_serve_file(&cfg, addr, None).unwrap();
+        let remover = {
+            let cfg = cfg.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                remove_serve_file(&cfg);
+            })
+        };
+        let found = probe(&cfg);
+        remover.join().unwrap();
+        assert!(matches!(found, Discovery::Down), "it left: nothing is up");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// TASK-017 fixup J2: a held database with no server advertised gets a
     /// moment to resolve before a spawn; a server that appears meanwhile is
     /// used; a free file (or an error that is not a lock) is not waited on.
@@ -1378,20 +1541,28 @@ mod tests {
             ))
         };
         let started = Instant::now();
-        assert!(wait_out_lock(&cfg, locked, Duration::from_millis(300)).is_none());
+        assert!(matches!(
+            wait_out_lock(&cfg, locked, Duration::from_millis(300)),
+            LockWait::Held
+        ));
         assert!(
             started.elapsed() >= Duration::from_millis(300),
             "did not wait"
         );
 
         let started = Instant::now();
-        assert!(wait_out_lock(&cfg, |_| Ok(()), Duration::from_secs(5)).is_none());
-        assert!(wait_out_lock(
-            &cfg,
-            |_| Err(anyhow::anyhow!("disk full")),
-            Duration::from_secs(5)
-        )
-        .is_none());
+        assert!(matches!(
+            wait_out_lock(&cfg, |_| Ok(()), Duration::from_secs(5)),
+            LockWait::Free
+        ));
+        assert!(matches!(
+            wait_out_lock(
+                &cfg,
+                |_| Err(anyhow::anyhow!("disk full")),
+                Duration::from_secs(5)
+            ),
+            LockWait::Free
+        ));
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "waited on a free file"
@@ -1408,7 +1579,10 @@ mod tests {
         };
         let up = wait_out_lock(&cfg, locked, Duration::from_secs(5));
         writer.join().unwrap();
-        assert!(up.is_some(), "the server that appeared is used");
+        assert!(
+            matches!(up, LockWait::Up(_)),
+            "the server that appeared is used"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
