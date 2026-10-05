@@ -186,7 +186,10 @@ impl Central {
     /// The central memory embedder, built (and cached) on first use, and again
     /// after [`Central::release_idle_embedder`] dropped it.
     pub fn embedder(&self) -> Result<Arc<dyn EmbeddingProvider>> {
-        let mut guard = self.embedder.lock().expect("central embedder lock");
+        let mut guard = self
+            .embedder
+            .lock()
+            .map_err(|_| CentralError::Request("the central embedder lock is poisoned".into()))?;
         if let Some(c) = guard.as_mut() {
             c.last_used = Instant::now();
             return Ok(c.value.clone());

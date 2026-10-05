@@ -43,7 +43,7 @@ const ALWAYS_SKIP: &[&str] = &[
 /// of files at once. Coalescing avoids re-embedding the same file three times a
 /// second.
 pub fn run(cfg: &ProjectConfig, root: &Path, debounce: Duration) -> Result<()> {
-    let ignore = build_ignore(root, &cfg.indexing.exclude);
+    let ignore = build_ignore(root, &cfg.indexing.effective_excludes());
     let (tx, rx) = mpsc::channel();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {

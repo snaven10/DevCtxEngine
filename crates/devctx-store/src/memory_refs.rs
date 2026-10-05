@@ -425,38 +425,42 @@ impl Store {
     /// ever, and — worse than the disk — a branch name reused later inherits
     /// them, so a fresh branch starts out answering with someone else's code.
     pub fn drop_branch(&self, repo: &str, repo_path: &str, branch: &str) -> Result<usize> {
-        let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM vectors WHERE repo = ? AND branch = ?",
-            params![repo, branch],
-            |r| r.get(0),
-        )?;
-        self.w()?.execute(
-            "DELETE FROM vectors WHERE repo = ? AND branch = ?",
-            params![repo, branch],
-        )?;
-        self.w()?.execute(
-            "DELETE FROM graph_edges WHERE repo = ? AND branch = ?",
-            params![repo, branch],
-        )?;
-        self.w()?.execute(
-            "DELETE FROM routes WHERE repo = ? AND branch = ?",
-            params![repo, branch],
-        )?;
-        // Keyed by the absolute path, not the short name, like the rest of
-        // `file_state` and `index_state`.
-        self.w()?.execute(
-            "DELETE FROM file_state WHERE repo_path = ? AND branch = ?",
-            params![repo_path, branch],
-        )?;
-        self.w()?.execute(
-            "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
-            params![repo_path, branch],
-        )?;
-        self.w()?.execute(
-            "DELETE FROM index_meta WHERE repo_path = ? AND branch = ?",
-            params![repo_path, branch],
-        )?;
-        Ok(n as usize)
+        // One transaction: a cut half-way (an error, a process that ends) used
+        // to leave the branch half-deleted, repaired only by the next prune.
+        self.in_transaction(|| {
+            let n: i64 = self.conn.query_row(
+                "SELECT count(*) FROM vectors WHERE repo = ? AND branch = ?",
+                params![repo, branch],
+                |r| r.get(0),
+            )?;
+            self.w()?.execute(
+                "DELETE FROM vectors WHERE repo = ? AND branch = ?",
+                params![repo, branch],
+            )?;
+            self.w()?.execute(
+                "DELETE FROM graph_edges WHERE repo = ? AND branch = ?",
+                params![repo, branch],
+            )?;
+            self.w()?.execute(
+                "DELETE FROM routes WHERE repo = ? AND branch = ?",
+                params![repo, branch],
+            )?;
+            // Keyed by the absolute path, not the short name, like the rest of
+            // `file_state` and `index_state`.
+            self.w()?.execute(
+                "DELETE FROM file_state WHERE repo_path = ? AND branch = ?",
+                params![repo_path, branch],
+            )?;
+            self.w()?.execute(
+                "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
+                params![repo_path, branch],
+            )?;
+            self.w()?.execute(
+                "DELETE FROM index_meta WHERE repo_path = ? AND branch = ?",
+                params![repo_path, branch],
+            )?;
+            Ok(n as usize)
+        })
     }
 
     /// Whether this repository has any rows for `branch` — what search asks
@@ -853,5 +857,19 @@ mod tests {
 
         // Too short to be worth matching: every memory contains "id".
         assert!(store.memories_mentioning("id", 10).unwrap().is_empty());
+    }
+
+    /// TASK-017 item 4: dropping a branch is one transaction. A statement that
+    /// fails half-way (here, `routes` is gone) leaves the branch whole, not
+    /// with its vectors deleted and the rest behind.
+    #[test]
+    fn dropping_a_branch_that_fails_half_way_leaves_it_whole() {
+        let store = seeded_store();
+        store.conn.execute_batch("DROP TABLE routes").unwrap();
+        assert!(store.drop_branch("shop-api", "/x", "main").is_err());
+        assert!(
+            store.has_branch_rows("shop-api", "main").unwrap(),
+            "the vectors deleted before the failure must have been rolled back"
+        );
     }
 }

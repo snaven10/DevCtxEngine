@@ -39,15 +39,23 @@ A `recall` against the question, across all scopes, limit 5.
 because it is small. Code tells you what happens; it does not tell you that the
 obvious alternative was tried and abandoned.
 
-The files these memories name are recorded, and pass 2 uses them.
+Each memory is shown as `[memory] <id> — <title>` plus its first lines (6 lines
+or 500 characters), with no per-item truncation stamp, and the memories as a
+whole may use at most **35%** of the budget so a long recall cannot starve the
+code. A memory is not repeated as code when the brief quotes it literally.
 
 ### 2. Code
 
-A vector search for the question, fetching 30 hits.
+A hybrid search for the question (vector + keyword, no reranker), fetching 30
+hits, with everything [`search`](search.md) does: tests, docs and config rank
+below code, duplicates are collapsed, and an identifier in the question puts its
+definition first. If the BM25 index has not been built, it is not built for the
+brief — hybrid degrades to vector plus anchoring. The `kind` and `include_tests`
+filters apply here too.
 
-**Files a memory already pulled in are skipped** — not worth paying for twice.
 The fetch is deliberately deeper than what will fit: *the budget decides where
-to stop, not the limit*.
+to stop, not the limit*. A hit whose text a memory above already quotes is
+skipped — not worth paying for twice.
 
 ### 3. Recorded against this code
 
@@ -69,7 +77,57 @@ Each is labelled with its link provenance:
 code at write time. `inference` means only that the words match. The label is
 there so the reader can weigh it.
 
-Duplicates across files are dropped by memory id.
+Duplicates across files are dropped by memory id. Only memories that made it
+into the brief contribute their `files`.
+
+## Which repository
+
+`build_context` takes an optional **`project`** — a registered name or any path
+inside one — that builds the brief from that repository for this call only. In a
+group session it must be a *member of the group*; anything else is rejected.
+
+In a **group session without `project`**, the old behaviour (silently use the
+group's default member) is gone. Instead the brief names where it came from:
+
+```
+[devctx] context from acme-api (best match 0.71; 3 of 5 members scored; not scored: acme-web (no running server), acme-docs (different model))
+[devctx] ambiguous: also acme-worker (0.69) — within 0.03 of acme-api (0.71); pass `project` to choose
+```
+
+How a member is chosen:
+
+1. Only members whose server is **already running** are scored: it reads each
+   member's `serve.json`, checks `/health` (0.8 s) and runs a vector search
+   (10 hits, no reranker) over HTTP. **It never starts a process.** A member
+   with no server is `not scored (no running server)`; one on a different
+   embedding model (even of the same width) or whose checkout is gone is
+   `not scored` too, because cosines from two models are not comparable.
+2. The score is the mean of the top 3 raw retriever scores of the member's
+   *code* hits (all hits if the question matches no code, or `kind` is explicit).
+   A member that *defines* an identifier named in the question gets a +0.03 tiebreak,
+   never enough to overturn a clear lead.
+3. The whole selection shares one **2.5 s deadline**; a member that does not
+   answer in time is `busy`, not an error.
+4. A lead under 0.03 still answers from the best member, plus the `ambiguous`
+   line naming the others. If some comparable members could not be scored, the
+   answer says `compared only k of N comparable members` and offers the ones the
+   question names (`Likely (named by the question): api — pass `project=api``)
+   and adds a machine-readable line,
+   `[devctx] selection: {"scored":1,"total":3,"candidates":["api"]}`, so an
+   agent can retry with `project`. Selection never spawns a server to improve
+   its own odds: the unscored members stay unscored until their server is up.
+   If nobody could be scored and nothing failed (all cold), it
+   answers from the group's default member and says it was *not chosen by
+   relevance*. A member that answers with an error is an error, listed.
+5. A choice that compared **every** comparable member with a clear lead is cached
+   for **10 minutes**, per normalised question and `kind` / `include_tests`; its
+   header says `cached choice`. Partial and ambiguous choices are never cached,
+   so a member that has warmed up since gets its turn.
+
+Without a group, a bound project answers as before; the `context from` line
+appears only in a group session or when `project` is passed. `branch_fallback`
+(see [Search](search.md#branch-awareness)) is reported as
+`[devctx] branch_fallback: …`.
 
 ## The budget
 
@@ -80,12 +138,19 @@ against the remaining space before it is appended.
 Two behaviours are worth knowing:
 
 **Nothing is silently dropped.** Whatever did not fit is counted and named at
-the end:
+the end, once:
 
 ```
-[devctx] 7 further item(s) did not fit in 4096 tokens.
-Raise max_tokens, or narrow the query.
+[devctx] omitted: 7 item(s), reason: budget (4096 tokens). Raise max_tokens, or narrow the query.
 ```
+
+**A chunk that does not fit no longer ends the brief.** An item too big for the
+space left is skipped and the next one is tried, so one large function does not
+hide the smaller relevant ones behind it. Each code chunk is capped at the larger
+of a third of the budget and 600 characters; a leading doc comment of more than 6
+lines is cut to 3 plus `N doc lines trimmed`, kept well-formed in its language
+(the `*/` stays); and a single enormous line is cut by characters with a marker
+saying how much was left.
 
 A brief that quietly truncated would read as "this is everything there is",
 which is the one thing it must never mean.
@@ -123,6 +188,9 @@ Sections with no content do not appear at all.
 |---|---|---|
 | `--max-tokens` | 4096 | Hard ceiling for the whole brief |
 | `--no-memories` | off | Code only — skips passes 1 and 3 |
+
+The MCP tool also takes `project`, `kind` and `include_tests` (and
+`include_memories` for `--no-memories`); the CLI does not.
 
 `--no-memories` is for when you want raw retrieval without the opinion layer.
 

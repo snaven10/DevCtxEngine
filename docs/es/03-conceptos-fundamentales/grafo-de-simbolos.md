@@ -110,7 +110,36 @@ la gente olvida que existe y después lamenta no haber corrido.
 ### `read_symbol(nombre)` — la definición
 
 Código, archivo, rango de líneas y tipo. Usalo cuando sabés el nombre y querés
-la cosa misma; usá `search` cuando querés código *sobre una idea*.
+la cosa misma; usá `search` cuando querés código *sobre una idea*. `limit`
+(default 5) acota las definiciones — un nombre puede estar definido muchas veces.
+
+**Un fallo se explica, no solo viene vacío.** Cuando no se encuentra ninguna
+definición, `read_symbol` agrega:
+
+- `suggestions` — hasta 5 nombres para probar: las formas calificadas que el grafo
+  de llamadas conoce de un nombre pelado (`charge` → `Card.charge`), y luego los
+  nombres definidos más cercanos por prefijo, sufijo, contención o distancia de
+  edición (`AuthServce` → `AuthService`);
+- `external: true`, `called_from: N` y un `next_step` cuando el nombre solo aparece
+  como *destino* de llamadas — lo más probable es una función de librería o del
+  runtime, aunque puede vivir en un archivo que el índice excluye o en otra rama.
+  Un nombre calificado (`serde_json::from_str`, `Panache.withTransaction`) se busca
+  tal cual y después por su último segmento, porque el grafo suele guardar solo el
+  callee pelado. Un externo no recibe `suggestions` difusas (`with_context` no es
+  un typo de `build_context`), solo las formas calificadas del mismo nombre.
+
+Las funciones chicas que el chunker agrupó en un solo fragmento (`a, b, c`) se
+encuentran dentro de él, así que no se reportan como externas por error.
+
+## De qué rama responde
+
+El grafo es por rama. Cuando la rama en checkout no tiene filas indexadas,
+`read_symbol`, `get_references`, `impact_analysis`, `search_routes`,
+`routes_for_handler` (y `search`, `build_context`, `memories_by_symbol`) responden
+desde la rama por defecto o la indexada más recientemente y agregan
+`branch_fallback: {current, used, why}`; sin ningún índice fallan con un error
+explícito en vez de `[]`. Ver
+[Búsqueda → Conciencia de ramas](busqueda.md#conciencia-de-ramas).
 
 ## Límites que conviene conocer
 
@@ -132,8 +161,11 @@ la única forma de acotarlo, y por eso un nombre calificado nunca se expande.
 > un llamador y veintitrés llamados: las aristas estuvieron ahí todo el tiempo,
 > bajo una llave con la que nadie preguntaba.
 
-**Un resultado vacío sigue significando "no encontré", nunca "no hay".** Las
-razones de abajo son reales y ninguna se anuncia sola. Ante un vacío, cruzá con
+**Un resultado vacío sigue significando "no encontré", nunca "no hay".** Dos de las
+razones antes eran silenciosas y ya no lo son: una rama sin filas
+(`branch_fallback`) y un índice construido por un extractor más viejo (`warning`
+en cada respuesta de grafo, `extractor_stale` en `index_status` — corré `devctx
+index --full`). Las de abajo siguen sin anunciarse. Ante un vacío, cruzá con
 `search --keyword` antes de renombrar o borrar.
 
 **La resolución de llamadas es por nombre**, informada por imports y ligaduras

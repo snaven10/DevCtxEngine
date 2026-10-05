@@ -180,6 +180,12 @@ opciones.
 proceso — no hay sidecar sosteniendo una segunda copia de nada, ni límite de
 serialización entre etapas.
 
+El embedding corre **un lote a la vez**, de 8 textos por defecto
+(`DEVCTX_EMBED_BATCH_SIZE`): el pico de memoria escala con el lote, y el reparto
+paralelo anterior llegaba a 6,5 GB con lote 8 y a 18,2 GB con lote 32. Un modelo
+que nadie usó en 5 minutos se descarga (`DEVCTX_MODEL_IDLE_SECS`), tanto en los
+servidores de proyecto como en el daemon central.
+
 La memoria residente la domina el modelo cargado. La cifra de ~406 MB de arriba
 es un modelo de embeddings de 384 dimensiones más el store; habilitar un
 cross-encoder agrega gigabytes, que es la razón real de que venga apagado.

@@ -40,6 +40,8 @@ pub struct ServeInfo {
 pub struct CentralClient {
     base: String,
     token: Option<String>,
+    /// Where to look for the next daemon when this one answers "shutting down".
+    paths: Option<CentralPaths>,
 }
 
 /// Path of the discovery file advertising the central daemon.
@@ -105,24 +107,74 @@ pub fn remove_own_serve_file(paths: &CentralPaths) {
     }
 }
 
-/// Discover a running central daemon and confirm it answers.
-pub fn discover(paths: &CentralPaths) -> Option<CentralClient> {
-    let raw = std::fs::read(serve_file(paths)).ok()?;
-    let info: ServeInfo = serde_json::from_slice(&raw).ok()?;
-    let base = format!("http://{}", info.addr);
-    let ok = ureq::AgentBuilder::new()
+/// What the daemon's `/health` said.
+enum Health {
+    Up,
+    /// A 503 with the exiting marker: the daemon is leaving (freezing and
+    /// checkpointing the store). Not "down": it still holds the store's lock.
+    Exiting,
+    /// Refused, unreachable or anything else.
+    Down,
+}
+
+fn health(base: &str) -> Health {
+    let res = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(400))
         .build()
         .get(&format!("{base}/health"))
-        .call()
-        .is_ok();
-    if !ok {
+        .call();
+    match res {
+        Ok(_) => Health::Up,
+        Err(ureq::Error::Status(503, r)) if r.header(procown::EXITING_HEADER).is_some() => {
+            Health::Exiting
+        }
+        Err(_) => Health::Down,
+    }
+}
+
+/// How long to wait for an exiting daemon to be gone. Its freeze and final
+/// checkpoint are budgeted at 1.5 s; this adds margin.
+const EXIT_WAIT: Duration = Duration::from_secs(3);
+
+/// Discover a running central daemon and confirm it answers.
+///
+/// A daemon that answers 503 is exiting, not absent: it still holds the
+/// store's lock for the length of its checkpoint, so a caller that read that
+/// as "down" would launch a daemon that dies on the lock (and then open the
+/// store directly against it). This waits, up to [`EXIT_WAIT`], until the
+/// listener is gone — which is when the process, and its lock, are — and only
+/// then says there is no daemon.
+pub fn discover(paths: &CentralPaths) -> Option<CentralClient> {
+    let raw = std::fs::read(serve_file(paths)).ok()?;
+    let info: ServeInfo = serde_json::from_slice(&raw).ok()?;
+    // A file whose pid is no longer a central daemon is stale (a daemon that
+    // ended without withdrawing it): its port may now answer for something
+    // else. Only a pid that is positively gone distrusts it; one that cannot
+    // be tied to the file (`Unverified`) keeps the old behaviour, health only.
+    if info.pid.is_some() && ownership(&info) == Ownership::Gone {
         return None;
     }
-    Some(CentralClient {
-        base,
-        token: info.token,
-    })
+    let base = format!("http://{}", info.addr);
+    let up = || CentralClient {
+        base: base.clone(),
+        token: info.token.clone(),
+        paths: Some(paths.clone()),
+    };
+    match health(&base) {
+        Health::Up => return Some(up()),
+        Health::Down => return None,
+        Health::Exiting => {}
+    }
+    let deadline = std::time::Instant::now() + EXIT_WAIT;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        match health(&base) {
+            Health::Up => return Some(up()),
+            Health::Down => return None,
+            Health::Exiting => {}
+        }
+    }
+    None
 }
 
 /// Ensure a central daemon is running, spawning one if needed.
@@ -364,19 +416,50 @@ impl CentralClient {
         }
     }
 
+    /// Send one request. A daemon that answers the marked 503 ("shutting
+    /// down", produced before any handler, so nothing was processed) is
+    /// replaced: [`ensure`] waits for it to be gone and returns the next
+    /// daemon, and the request is repeated there, once. Any other status is
+    /// final.
+    fn call(
+        &self,
+        build: impl Fn(&CentralClient) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+    ) -> Result<Value> {
+        let exiting = |r: &std::result::Result<ureq::Response, Box<ureq::Error>>| {
+            matches!(r, Err(e) if matches!(&**e, ureq::Error::Status(503, resp)
+                if resp.header(procown::EXITING_HEADER).is_some()))
+        };
+        let first = build(self);
+        if exiting(&first) {
+            if let Some(next) = self.paths.as_ref().and_then(ensure) {
+                return parse(build(&next).map_err(|e| *e));
+            }
+        }
+        parse(first.map_err(|e| *e))
+    }
+
     fn get(&self, path: &str) -> Result<Value> {
-        let req = self.auth(self.agent().get(&format!("{}{path}", self.base)));
-        parse(req.call())
+        self.call(|c| {
+            c.auth(c.agent().get(&format!("{}{path}", c.base)))
+                .call()
+                .map_err(Box::new)
+        })
     }
 
     fn post(&self, path: &str, body: Value) -> Result<Value> {
-        let req = self.auth(self.agent().post(&format!("{}{path}", self.base)));
-        parse(req.send_json(body))
+        self.call(|c| {
+            c.auth(c.agent().post(&format!("{}{path}", c.base)))
+                .send_json(body.clone())
+                .map_err(Box::new)
+        })
     }
 
     fn delete(&self, path: &str) -> Result<Value> {
-        let req = self.auth(self.agent().delete(&format!("{}{path}", self.base)));
-        parse(req.call())
+        self.call(|c| {
+            c.auth(c.agent().delete(&format!("{}{path}", c.base)))
+                .call()
+                .map_err(Box::new)
+        })
     }
 
     // --- typed endpoints ---
@@ -709,5 +792,178 @@ mod stop_tests {
         let _ = d.wait();
         assert!(!paths.serve_file.exists());
         let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::process::Command;
+    use std::time::Instant;
+
+    /// TASK-017 fixup I2: `/health` answering 503 (exiting) is not "down":
+    /// `discover` waits for the listener to be gone before saying so, so
+    /// `ensure` never launches a daemon beside one that still holds the lock.
+    #[test]
+    fn an_exiting_daemon_is_waited_for_not_replaced() {
+        let dir = std::env::temp_dir().join(format!("devctx-i2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = CentralPaths {
+            dir: dir.clone(),
+            config: dir.join("config.yaml"),
+            db: dir.join("central.duckdb"),
+            serve_file: dir.join("serve.json"),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let info = ServeInfo {
+            addr: listener.local_addr().unwrap().to_string(),
+            token: None,
+            pid: None,
+            start_time: None,
+        };
+        std::fs::write(&paths.serve_file, serde_json::to_vec(&info).unwrap()).unwrap();
+        let leaves_at = Instant::now() + Duration::from_millis(700);
+        let server = std::thread::spawn(move || {
+            while Instant::now() < leaves_at {
+                if let Ok((mut c, _)) = listener.accept() {
+                    c.set_nonblocking(false).ok();
+                    let mut buf = [0u8; 1024];
+                    let _ = c.read(&mut buf);
+                    let _ = c.write_all(
+                        format!(
+                            "HTTP/1.1 503 Service Unavailable\r\n{}: 1\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n",
+                            procown::EXITING_HEADER
+                        )
+                        .as_bytes(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The listener closes here: the daemon is gone.
+            Instant::now()
+        });
+        let found = discover(&paths);
+        let returned = Instant::now();
+        let closed = server.join().unwrap();
+        assert!(found.is_none());
+        assert!(
+            returned >= closed,
+            "discover answered while the exiting daemon was still listening"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listener answering every request with `reply`, counting them.
+    fn serve_fixed(reply: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        (addr, hits)
+    }
+
+    /// TASK-017 fixup K4: a `serve.json` whose pid is not a central daemon any
+    /// more is not trusted, even when something answers `/health` on its port.
+    #[test]
+    fn a_stale_advertisement_is_not_trusted() {
+        let dir = std::env::temp_dir().join(format!("devctx-k4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = CentralPaths {
+            dir: dir.clone(),
+            config: dir.join("config.yaml"),
+            db: dir.join("central.duckdb"),
+            serve_file: dir.join("serve.json"),
+        };
+        let (addr, _) =
+            serve_fixed("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
+        // Alive, answers, but is not a daemon: the pid was recycled.
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let info = ServeInfo {
+            addr,
+            token: None,
+            pid: Some(sleeper.id()),
+            start_time: procown::start_time(sleeper.id()),
+        };
+        std::fs::write(&paths.serve_file, serde_json::to_vec(&info).unwrap()).unwrap();
+        let found = discover(&paths);
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        assert!(found.is_none(), "a stale serve.json was trusted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-017 fixup J3: a request refused with the exiting 503 (an idle exit
+    /// that began right before a `remember`'s POST) is repeated once against
+    /// the daemon `serve.json` now advertises; a 503 without the marker is
+    /// final.
+    #[test]
+    fn a_request_refused_by_an_exiting_daemon_reaches_the_next_one() {
+        use std::sync::atomic::Ordering;
+        let dir = std::env::temp_dir().join(format!("devctx-j3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = CentralPaths {
+            dir: dir.clone(),
+            config: dir.join("config.yaml"),
+            db: dir.join("central.duckdb"),
+            serve_file: dir.join("serve.json"),
+        };
+        let body = r#"{"projects":[{"name":"x"}]}"#;
+        let (dying, dying_hits) = serve_fixed(format!(
+            "HTTP/1.1 503 Service Unavailable\r\n{}: 1\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n",
+            procown::EXITING_HEADER
+        ));
+        let (next, next_hits) = serve_fixed(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        let info = ServeInfo {
+            addr: next,
+            token: None,
+            pid: None,
+            start_time: None,
+        };
+        std::fs::write(&paths.serve_file, serde_json::to_vec(&info).unwrap()).unwrap();
+        let client = CentralClient {
+            base: format!("http://{dying}"),
+            token: None,
+            paths: Some(paths.clone()),
+        };
+        assert_eq!(client.list(false).unwrap().len(), 1);
+        assert_eq!(dying_hits.load(Ordering::SeqCst), 1);
+        assert!(next_hits.load(Ordering::SeqCst) >= 1);
+
+        let (plain, _) = serve_fixed(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        );
+        let before = next_hits.load(Ordering::SeqCst);
+        let client = CentralClient {
+            base: format!("http://{plain}"),
+            token: None,
+            paths: Some(paths),
+        };
+        assert!(client.list(false).is_err());
+        assert_eq!(
+            next_hits.load(Ordering::SeqCst),
+            before,
+            "an unmarked 503 was retried"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

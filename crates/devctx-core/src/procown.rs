@@ -13,6 +13,12 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// Header carried by the 503 a server answers while it is exiting. That answer
+/// is produced by a middleware *before* any handler, so the request was never
+/// processed and is the one status that is safe to repeat against the next
+/// server; any other 503 would not say so.
+pub const EXITING_HEADER: &str = "x-devctx-exiting";
+
 /// What a recorded `pid` turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ownership {
@@ -36,6 +42,13 @@ pub enum Ownership {
 /// subcommand is the first argument that is not a flag, so `devctx search api`
 /// is not a server.
 pub fn is_server_proc(exe: Option<&str>, cmdline: &[u8]) -> bool {
+    is_server_proc_as(exe, cmdline, false)
+}
+
+/// [`is_server_proc`] where `same_exe` says the process runs the very binary
+/// this process runs: such a process is a `devctx` whatever the file was named
+/// (a copy renamed or installed as `new`, `devctx-0.9`, a test harness).
+pub fn is_server_proc_as(exe: Option<&str>, cmdline: &[u8], same_exe: bool) -> bool {
     let mut args = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty());
     let Some(argv0) = args.next() else {
         return false;
@@ -44,10 +57,25 @@ pub fn is_server_proc(exe: Option<&str>, cmdline: &[u8]) -> bool {
     let path = exe.unwrap_or(&argv0);
     let path = path.strip_suffix(" (deleted)").unwrap_or(path);
     let name = path.rsplit('/').next().unwrap_or("");
-    name.starts_with("devctx")
+    (same_exe || name.starts_with("devctx"))
         && args
             .find(|a| !a.starts_with(b"-"))
             .is_some_and(|a| a == b"serve" || a == b"api")
+}
+
+/// Whether `/proc/<pid>/exe` is the same file as this process's own executable
+/// (same device and inode; works after the file was replaced, the old inode
+/// stays reachable through the link).
+#[cfg(target_os = "linux")]
+fn runs_our_binary(pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(theirs), Ok(ours)) = (
+        std::fs::metadata(format!("/proc/{pid}/exe")),
+        std::fs::metadata("/proc/self/exe"),
+    ) else {
+        return false;
+    };
+    theirs.dev() == ours.dev() && theirs.ino() == ours.ino()
 }
 
 /// Field 22 of a `/proc/<pid>/stat` line. The command name (field 2) may hold
@@ -169,7 +197,9 @@ pub fn is_server_pid(pid: u32) -> bool {
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
+        // The name test first: it is the common case and costs no syscall.
         is_server_proc(exe.as_deref(), &cmdline)
+            || is_server_proc_as(exe.as_deref(), &cmdline, runs_our_binary(pid))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -184,16 +214,36 @@ pub fn is_server_pid(pid: u32) -> bool {
 /// path), and the rest is the arguments.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn ps_command_is_server(command: &str) -> bool {
+    ps_command_is_server_with(command, |p| Path::new(p).is_file())
+}
+
+/// [`ps_command_is_server`] with the file check injected. A path split across
+/// spaces (`i > 0`) is only argv[0] if it names a file that exists: otherwise
+/// `/usr/bin/vim x/devctx serve` — a program opening a file called `x/devctx` —
+/// would pass for a server.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn ps_command_is_server_with(command: &str, is_file: impl Fn(&str) -> bool) -> bool {
     let toks: Vec<&str> = command.split_whitespace().collect();
     let Some(first) = toks.first() else {
         return false;
     };
     (0..toks.len()).any(|i| {
         let base = toks[i].rsplit('/').next().unwrap_or("");
-        if !base.starts_with("devctx") || (i > 0 && !first.starts_with('/')) {
+        if !base.starts_with("devctx") {
             return false;
         }
-        let mut cmdline = toks[..=i].join(" ").into_bytes();
+        // Words before the token are part of argv[0]'s path only if they
+        // continue an absolute path with a space in it. A later token that
+        // itself starts with `/` begins a new path: an argument of another
+        // program (`/usr/bin/vim /x/devctx serve`), not a directory name.
+        if i > 0 && (!first.starts_with('/') || toks[1..=i].iter().any(|t| t.starts_with('/'))) {
+            return false;
+        }
+        let argv0 = toks[..=i].join(" ");
+        if i > 0 && !is_file(&argv0) {
+            return false;
+        }
+        let mut cmdline = argv0.into_bytes();
         for a in &toks[i + 1..] {
             cmdline.push(0);
             cmdline.extend_from_slice(a.as_bytes());
@@ -215,7 +265,16 @@ fn ps_command(pid: u32) -> Option<String> {
 /// Whether a `ps` command column carries `flag` as a whole argument.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn ps_command_has(command: &str, flag: &str) -> bool {
-    ps_command_is_server(command) && command.split_whitespace().any(|a| a == flag)
+    ps_command_has_with(command, flag, |p| Path::new(p).is_file())
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn ps_command_has_with(
+    command: &str,
+    flag: &str,
+    is_file: impl Fn(&str) -> bool,
+) -> bool {
+    ps_command_is_server_with(command, is_file) && command.split_whitespace().any(|a| a == flag)
 }
 
 /// The cwd out of `lsof -a -p <pid> -d cwd -Fn` (`p<pid>`, `fcwd`, `n<path>`).
@@ -504,8 +563,86 @@ impl Handle {
         if let Some(t0) = self.start {
             return wait_until(|| exited(self.pid, t0), limit);
         }
+        // macOS: the kernel says when the process exits, as the pidfd does on
+        // Linux. `None` (kqueue unavailable, or it refused the pid) falls
+        // back to polling.
+        //
+        // kqueue watches the *pid*, not the process: a pid recycled between
+        // two slices of a wait would be watched as if it were the server. So
+        // ownership is checked before registering, and once more when the wait
+        // runs out: a number that is no longer ours counts as exited, and a
+        // timeout is only reported for a process that still is.
+        #[cfg(target_os = "macos")]
+        {
+            if !owns() {
+                return true;
+            }
+            if let Some(exited) = kqueue_wait_exit(self.pid, limit) {
+                return exited || !owns();
+            }
+        }
         wait_until(|| !owns(), limit)
     }
+}
+
+/// Wait up to `limit` for `pid` to exit with `EVFILT_PROC` / `NOTE_EXIT`.
+///
+/// `Some(true)` once it exited (or was already gone: `ESRCH` on registration),
+/// `Some(false)` when `limit` ran out, `None` when kqueue cannot be used and
+/// the caller should poll instead.
+#[cfg(target_os = "macos")]
+fn kqueue_wait_exit(pid: u32, limit: Duration) -> Option<bool> {
+    // SAFETY: plain syscall.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return None;
+    }
+    // Not inherited by anything this process spawns meanwhile.
+    // SAFETY: `kq` is the descriptor just opened.
+    unsafe { libc::fcntl(kq, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let outcome = (|| {
+        // SAFETY: an all-zero `kevent` is a valid value; the fields we need
+        // are set below.
+        let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+        change.ident = pid as libc::uintptr_t;
+        change.filter = libc::EVFILT_PROC;
+        change.flags = libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT;
+        change.fflags = libc::NOTE_EXIT;
+        // Register only (no event list): a failure comes back as -1 + errno.
+        // SAFETY: `change` is one valid kevent; no output buffer is passed.
+        let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        if rc < 0 {
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                Some(true)
+            } else {
+                None
+            };
+        }
+        let deadline = Instant::now() + limit;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ts = libc::timespec {
+                tv_sec: left.as_secs() as libc::time_t,
+                tv_nsec: left.subsec_nanos() as libc::c_long,
+            };
+            // SAFETY: as above.
+            let mut out: libc::kevent = unsafe { std::mem::zeroed() };
+            // SAFETY: one valid output slot; `ts` outlives the call.
+            let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, &ts) };
+            if n > 0 {
+                return Some(true);
+            }
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return None;
+            }
+            if n == 0 || left.is_zero() {
+                return Some(false);
+            }
+        }
+    })();
+    // SAFETY: `kq` is the descriptor opened above.
+    unsafe { libc::close(kq) };
+    outcome
 }
 
 /// `Ok` for a successful syscall (or a vanished target), the errno otherwise.
@@ -644,6 +781,10 @@ pub fn terminate_patient(
     )
 }
 
+/// How long a process that was waited on patiently gets to leave once the work
+/// it was waited for is done, before SIGKILL.
+const AFTER_PATIENCE: Duration = Duration::from_secs(2);
+
 /// The body of [`terminate_patient`], with the two OS interactions injected:
 /// `wait` (until exit) and `send` (a signal; `Err(errno)` when refused), so
 /// tests can model a refusal without signalling a real foreign process.
@@ -664,16 +805,43 @@ fn terminate_with(
         if send(handle, libc::SIGTERM) == Err(libc::EPERM) {
             return Termination::NoPermission;
         }
-        if wait(handle, term_wait, &owns) {
-            return Termination::Gone;
+        // The marker is watched through the whole of `term_wait`, not only
+        // after it: a checkpoint that starts late and ends in the last
+        // fraction of the wait would otherwise never have been seen, and the
+        // process leaving because of it would get SIGKILL on the spot.
+        let mut waited = Duration::ZERO;
+        let mut was_patient = false;
+        if patience_cap <= term_wait {
+            // No patience to grant: one wait, as before.
+            if wait(handle, term_wait, &owns) {
+                return Termination::Gone;
+            }
+            waited = term_wait;
+        } else {
+            while waited < term_wait {
+                was_patient |= patient();
+                let slice = Duration::from_millis(250).min(term_wait - waited);
+                if wait(handle, slice, &owns) {
+                    return Termination::Gone;
+                }
+                waited += slice;
+            }
         }
-        let mut waited = term_wait;
         while waited < patience_cap && patient() {
+            was_patient = true;
             let slice = Duration::from_millis(250).min(patience_cap - waited);
             if wait(handle, slice, &owns) {
                 return Termination::Gone;
             }
             waited += slice;
+        }
+        // The patience ended because the work it was waiting for finished
+        // (the checkpoint marker went away), not because it ran out: the
+        // process is on its way out, only the runtime's wind-down is left.
+        // SIGKILL here would land on a server that has done everything it was
+        // asked to and turn a clean exit into status 9.
+        if was_patient && waited < patience_cap && wait(handle, AFTER_PATIENCE, &owns) {
+            return Termination::Gone;
         }
         if send(handle, libc::SIGKILL) == Err(libc::EPERM) {
             return Termination::NoPermission;
@@ -780,7 +948,8 @@ mod pure_tests {
     /// as `devctx serve`, and nothing else may.
     #[test]
     fn a_ps_command_with_spaces_in_the_path_is_still_a_server() {
-        let is = ps_command_is_server;
+        // The paths below are not on this machine: say they exist.
+        let is = |c: &str| ps_command_is_server_with(c, |_| true);
         assert!(is(
             "/Users/John Doe/.local/bin/devctx serve --addr 127.0.0.1:1"
         ));
@@ -790,8 +959,28 @@ mod pure_tests {
         assert!(!is("/Users/John Doe/bin/devctx mcp"));
         assert!(!is("/Users/John Doe/bin/devctx search serve"));
         assert!(!is("vim devctx serve"));
+        // TASK-017 item 3: devctx as an argument of another program.
+        assert!(!is("/usr/bin/vim /x/devctx serve"));
+        assert!(!is("/usr/bin/less /home/u/bin/devctx api"));
         assert!(!is("/usr/bin/vim serve"));
         assert!(!is(""));
+    }
+
+    /// TASK-017 fixup M6: off Linux, `/usr/bin/vim x/devctx serve` (a program
+    /// opening a file called `x/devctx`) is not a server: a word-joined argv[0]
+    /// must be a file that exists.
+    #[test]
+    fn a_joined_argv0_must_exist_as_a_file() {
+        let dir = std::env::temp_dir().join(format!("devctx-m6-{}", std::process::id()));
+        let bin = dir.join("My Tools").join("devctx");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"").unwrap();
+        let real = format!("{} serve --addr 127.0.0.1:1", bin.display());
+        assert!(ps_command_is_server(&real), "{real}");
+        let fake = format!("/usr/bin/vim {}x/devctx serve", dir.display());
+        assert!(!ps_command_is_server(&fake), "{fake}");
+        assert!(!ps_command_is_server("/usr/bin/vim x/devctx serve"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// I-3: the off-Linux fallbacks for a `serve.json` that predates the
@@ -799,10 +988,11 @@ mod pure_tests {
     #[test]
     fn the_off_linux_fallbacks_read_ps_and_lsof_output() {
         let c = "/Users/John Doe/bin/devctx serve --central --addr 127.0.0.1:2";
-        assert!(ps_command_has(c, "--central"));
-        assert!(!ps_command_has("/Users/u/bin/devctx serve", "--central"));
+        let has = |c: &str, f: &str| ps_command_has_with(c, f, |_| true);
+        assert!(has(c, "--central"));
+        assert!(!has("/Users/u/bin/devctx serve", "--central"));
         // The flag of something that is not a devctx server proves nothing.
-        assert!(!ps_command_has("/usr/bin/vim serve --central", "--central"));
+        assert!(!has("/usr/bin/vim serve --central", "--central"));
         assert_eq!(
             parse_lsof_cwd("p123\nfcwd\nn/Users/John Doe/repo\n"),
             Some(std::path::PathBuf::from("/Users/John Doe/repo"))
@@ -810,7 +1000,7 @@ mod pure_tests {
         assert_eq!(parse_lsof_cwd("p123\nfcwd\n"), None);
         assert_eq!(parse_lsof_cwd(""), None);
         // With the fallbacks vouching, an old file's server is Ours.
-        let info = parse_ps_line(&format!("Thu Oct  3 09:15:02 2026 {c}"));
+        let info = parse_ps_line("Thu Oct  3 09:15:02 2026 /usr/bin/devctx serve --central");
         assert_eq!(classify_ps(info, 7, None, |_| true), Ownership::Ours);
     }
 
@@ -826,6 +1016,22 @@ mod pure_tests {
         ));
         assert!(!is_server_proc(Some("/usr/bin/vim"), cmd));
         assert!(!is_server_proc(None, cmd));
+    }
+
+    /// Fixup L (B5): a renamed binary is a server when it is the binary running
+    /// this check, and only then (a stranger named `new` is not).
+    #[test]
+    fn a_renamed_binary_is_a_server_only_when_it_is_ours() {
+        let cmd = b"/opt/bin/new\0serve\0--central\0";
+        assert!(!is_server_proc(Some("/opt/bin/new"), cmd));
+        assert!(is_server_proc_as(Some("/opt/bin/new"), cmd, true));
+        assert!(!is_server_proc_as(Some("/opt/bin/new"), cmd, false));
+        // Ours, but not a server subcommand: still not a server.
+        assert!(!is_server_proc_as(
+            Some("/opt/bin/new"),
+            b"/opt/bin/new\0search\0serve\0",
+            true
+        ));
     }
 }
 
@@ -974,6 +1180,72 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// TASK-017 item 9 (found by its e2e test): the final checkpoint finishes
+    /// and its marker goes away a moment before the process is gone. Patience
+    /// used to end there and SIGKILL the server in its wind-down.
+    #[test]
+    fn a_finished_checkpoint_is_given_a_moment_to_exit_before_sigkill() {
+        let handle = Handle::open(u32::MAX - 1);
+        let left = std::cell::Cell::new(3u32);
+        let patient = || {
+            let n = left.get();
+            left.set(n.saturating_sub(1));
+            n > 0
+        };
+        let sent = std::cell::RefCell::new(Vec::new());
+        let out = terminate_with(
+            &handle,
+            || true,
+            Duration::from_millis(100),
+            (&patient, Duration::from_secs(60)),
+            Duration::from_millis(100),
+            // Gone only when given the post-patience wait.
+            |_, limit, _| limit == AFTER_PATIENCE,
+            |_, sig| {
+                sent.borrow_mut().push(sig);
+                Ok(())
+            },
+        );
+        assert_eq!(out, Termination::Gone);
+        assert_eq!(*sent.borrow(), vec![libc::SIGTERM], "no SIGKILL");
+    }
+
+    /// TASK-017 fixup M2: a checkpoint that starts and ends *inside* the plain
+    /// SIGTERM wait was never seen (the marker was only looked at after it), so
+    /// the process leaving because of it got SIGKILL at once. The marker seen
+    /// at any moment earns the same post-patience margin.
+    #[test]
+    fn a_checkpoint_that_ends_inside_the_term_wait_still_earns_the_margin() {
+        let handle = Handle::open(u32::MAX - 1);
+        let t0 = Instant::now();
+        // Visible from 400 ms to 550 ms, gone before the 600 ms wait ends.
+        let patient = || {
+            let e = t0.elapsed();
+            e >= Duration::from_millis(400) && e < Duration::from_millis(550)
+        };
+        let sent = std::cell::RefCell::new(Vec::new());
+        let out = terminate_with(
+            &handle,
+            || true,
+            Duration::from_millis(600),
+            (&patient, Duration::from_secs(60)),
+            Duration::from_millis(100),
+            |_, limit, _| {
+                if limit == AFTER_PATIENCE {
+                    return true;
+                }
+                std::thread::sleep(limit);
+                false
+            },
+            |_, sig| {
+                sent.borrow_mut().push(sig);
+                Ok(())
+            },
+        );
+        assert_eq!(out, Termination::Gone);
+        assert_eq!(*sent.borrow(), vec![libc::SIGTERM], "no SIGKILL");
     }
 
     #[test]

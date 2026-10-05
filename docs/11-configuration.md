@@ -35,7 +35,15 @@ storage:
 
 indexing:
   exclude: []                  # .gitignore-style patterns; see docs/13
+  default_excludes: true       # vendored / generated / build-output paths; see below
+  include_build: false         # true => index the repository-root /build/ again
   branches: []                 # tracked branches; empty => whatever is checked out
+
+search:
+  penalty:                     # how far each kind of file is demoted; 1.0 = not at all
+    test: 0.6
+    doc: 0.6
+    config: 0.6
 
 reranking:
   enabled: false               # opt-in; see docs/08 ADR-15 for the measurements
@@ -49,6 +57,40 @@ summarization:
   target_tokens: 200
   model: gpt-4o-mini           # for API providers
 ```
+
+### Default excludes
+
+Since 0.9 a built-in list is kept out of the index **even when git tracks
+it** (`indexing.default_excludes: true`):
+
+| Pattern | Where it applies |
+|---|---|
+| `/build/`, `/target/` | the **root of the git repository** only — `src/x/build/Builder.java` or a Java package named `target` is code |
+| `node_modules/`, `dist/`, `vendor/`, `third_party/`, `bower_components/` | any depth (a monorepo emits one `dist/` per package) |
+| `*.min.js`, `*.generated.*` | any depth |
+
+They are `.gitignore` patterns, added **before** `indexing.exclude`, so a line of
+yours can override them. Opt-outs, from narrowest to widest:
+
+```yaml
+indexing:
+  include_build: true            # only /build/ comes back
+  default_excludes: false        # the whole built-in list is off
+  exclude:
+    - "!/target/"                # re-include the root /target/
+    - "target/"                  # or: exclude target/ at ANY depth (multi-module Maven)
+```
+
+Changing any of these (or upgrading to this release) does not force a full
+re-index: the next `devctx index` **reconciles** — it removes the files the set
+now excludes, adds the tracked files it no longer excludes, re-embeds nothing
+else, and logs how many files each pattern excluded (`the exclude set changed:
+N indexed file(s) are now excluded (/build/: 3, …)`). Remember the running
+server holds the config it started with: `devctx serve --stop` first (§6).
+
+`search.penalty` is explained in
+[Search](03-core-concepts/search.md#file-kind-and-the-penalty); a factor above
+`1.0` is warned about when the config loads.
 
 **Where the database ends up.** `storage.db_path` wins; then
 `{state_dir}/index.duckdb`; then `.devctx/state/index.duckdb` under the project
@@ -104,10 +146,14 @@ registry's copy.
 | `DEVCTX_EMBED_ENDPOINT` | Base URL for the `custom` embedding provider. |
 | `DEVCTX_EMBED_DIMENSION` | Vector width for the `custom` provider, which has no registry entry. |
 | `DEVCTX_EMBED_MAX_CHARS` | Characters per text fed to the encoder. Default `4096`; `0` disables. Lower it (e.g. `2048`) on a tight machine — it attacks batch padding, which is where the memory spike comes from. |
-| `DEVCTX_EMBED_BATCH_SIZE` | Texts per encoder batch. Default `32`. |
+| `DEVCTX_EMBED_BATCH_SIZE` | Texts per encoder batch. Default `8` (was `32` before 0.8.5); batches run one after another, so peak memory scales with this. `0` or unparsable falls back to the default. |
 | `DEVCTX_DB_MEMORY_LIMIT` | DuckDB per-process memory budget, any DuckDB size literal. Default `2GB`. |
 | `DEVCTX_DB_THREADS` | DuckDB worker threads. Default `4`. |
-| `DEVCTX_MODEL_IDLE_SECS` | How long an unused model is kept loaded. Default `300`; `0` keeps it for the life of the process. |
+| `DEVCTX_MODEL_IDLE_SECS` | How long an unused model is kept loaded, in project servers and in the central daemon (which drops its embedder and reloads it on the next `remember` / `recall`). Default `300`; `0` keeps it for the life of the process. |
+| `DEVCTX_MODEL_STALL_SECS` | Seconds with no growth of the model cache before a model download is declared stuck and fails (the model is then refused until the server restarts). Default `120`; `0` disables the guard. |
+| `DEVCTX_INDEX_STALL_SECS` | How long an index run may go without reaching a new file and still keep the server from its idle exit. Default `900`. |
+| `DEVCTX_SHUTDOWN_GRACE_SECS` | Grace a stopping server gives itself before the watchdog ends it. Default and maximum `3` — it can only be lowered, so `serve --stop` never SIGKILLs mid-checkpoint. |
+| `DEVCTX_VANISH_POLL_MS` | How often a server checks that its project directory still exists. Default `10000`. |
 | `DEVCTX_MAX_OUTPUT_TOKENS` | Cap on a whole-file `read_file` with no line range. Default `8000`; `0` disables. |
 | `DEVCTX_DAEMON_TIMEOUT_SECS` | How long an MCP session waits for a routed call to the shared daemon before giving up. Default `120`. `index_repo` stays on a fixed 1800s regardless of this, since indexing a large repository can legitimately run for many minutes. |
 | `DEVCTX_NO_UPDATE_CHECK` | Opt out of the background release check. |
@@ -169,14 +215,25 @@ committed before doing so.
 
 DuckDB allows one writing process per database file, so `devctx serve` becomes
 the sole owner of a project's store and every other command routes to it over
-HTTP. It is spawned automatically on first use and idles out after 15 minutes.
+HTTP — the CLI, the TUI, the web dashboard and the MCP (which never opens the
+database itself). It is spawned automatically on first use with `--idle 900`
+(15 minutes), and writes its stderr to `serve.log` next to the database; start
+failures quote the tail of that file.
 
 ```bash
 devctx serve                 # foreground, this project
-devctx serve --stop
+devctx serve --idle 600      # exit after 600 s with no request (0 = never)
+devctx serve --stop          # SIGTERM, waits for the real exit; see below
 devctx serve --central       # the central store instead; see docs/12
 DEVCTX_NO_AUTOSERVE=1 devctx search "…"    # open the store directly instead
 ```
+
+`--stop` only signals a process it can verify is this project's devctx server
+(Linux: pidfd + `/proc`; macOS: `ps` + `lsof`; **Windows: unsupported**), cancels
+a running index, waits for the final checkpoint (up to 65 s while an index winds
+down) and removes `serve.json` only once the process is gone. If another process
+holds the database, commands fail within about two seconds naming its PID. Full
+lifecycle in [MCP integration](03-core-concepts/mcp-integration.md#lifecycle-and-reliability).
 
 Because the server holds the loaded code, **a rebuilt binary does not take effect
 until the running server is restarted** — `devctx serve --stop` before testing a

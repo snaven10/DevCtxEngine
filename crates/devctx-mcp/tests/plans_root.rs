@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use devctx_core::config::{Project, ProjectConfig};
-use devctx_mcp::state::{do_plan_status, AppState};
+use devctx_mcp::state::{do_plan_status, AppState, PlanListOpts};
 
 static ENV: Mutex<()> = Mutex::new(());
 
@@ -82,7 +82,7 @@ fn status_with_home(cfg: ProjectConfig, home: &Path, plan: Option<&str>) -> serd
         None => std::env::remove_var("HOME"),
     }
     let state = state.expect("building AppState");
-    let raw = do_plan_status(&state, plan).expect("do_plan_status");
+    let raw = do_plan_status(&state, plan, PlanListOpts::default()).expect("do_plan_status");
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("not JSON ({e}): {raw}"))
 }
 

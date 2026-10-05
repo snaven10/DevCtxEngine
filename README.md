@@ -196,8 +196,12 @@ server is running, commands open the store directly as usual.
 Every DB command (`search`, `recall`, `remember`, `summarize`, `index`,
 `impact`, `status`, `memory-stats`, `routes`), the TUI, the web dashboard **and
 the MCP server** route through one shared server, **auto-spawning** it on first
-use. The server is the single owner of the DB, so nothing ever fights the lock —
-you can run several Claude Code sessions (each an MCP client), the web dashboard,
+use. The MCP never opens the database itself: it is a lazy client that connects on
+its first call and reconnects (once, and only when the request provably never
+arrived) if the server leaves. The server is the single owner of the DB, so
+nothing ever fights the lock — if something else does hold it, commands fail in
+about two seconds naming the PID. You can run several Claude Code sessions (each
+an MCP client), the web dashboard,
 the TUI and CLI commands against the same project at once, and query while an
 `index` runs (readers see a consistent snapshot). The embedding model stays warm,
 so repeated commands return in milliseconds. The daemon idles out after 15
@@ -214,7 +218,10 @@ memories (with a scope selector) and projects — where you can register and ind
 a repository without leaving the UI.
 
 Because the server holds the loaded code, a rebuilt binary does not take effect
-until the running server is restarted (`devctx serve --stop`).
+until the running server is restarted (`devctx serve --stop`) — and a running
+`devctx mcp` keeps its old code until the AI session is restarted (`index_status`
+reports `mcp.binary_replaced`). Details in
+[MCP integration](docs/03-core-concepts/mcp-integration.md#lifecycle-and-reliability).
 
 ## Crates
 
@@ -242,6 +249,8 @@ until the running server is restarted (`devctx serve --stop`).
 - [The Central Store](docs/12-central-store.md) — registry, global memories, the daemon
 - [Keeping the index fresh](docs/13-keeping-the-index-fresh.md) — hooks, watch, reindex, exclusions
 - [Architecture](docs/02-architecture.md) · [Models & tuning](docs/09-models-and-tuning.md) · [Design decisions](docs/08-design-decisions.md)
+- [Changelog](CHANGELOG.md) — what changed per release, including upgrade notes
+- [Contributing](CONTRIBUTING.md) — running the tests and the test model cache
 
 🇪🇸 [Documentación en español](docs/es/README.md)
 

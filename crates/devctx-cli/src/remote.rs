@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use devctx_core::config::ProjectConfig;
@@ -126,6 +126,9 @@ fn announce_spawn(spawned_pid: u32, advertised: Option<u32>) -> bool {
 pub struct Remote {
     base: String,
     token: Option<String>,
+    /// The project this server belongs to: what lets a request refused
+    /// because the server was exiting be repeated against the next one.
+    cfg: Option<Box<ProjectConfig>>,
 }
 
 /// A deterministic loopback address per project, so auto-spawned servers for
@@ -207,6 +210,103 @@ pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
     if std::env::var_os("DEVCTX_NO_AUTOSERVE").is_some() {
         return Err(EnsureError::Disabled);
     }
+    // No pre-check of the database: opening it here would put a transient
+    // lock on the common cold path (every client, before every spawn) and could
+    // take the lock a concurrent client's server is about to open. The spawn
+    // goes first; only when it dies on a lock (or an exit checkpoint is under
+    // way) is the holder waited out and the spawn repeated, once.
+    //
+    // Up to [`SPAWN_ATTEMPTS`] spawns: with three or more cold clients the loser
+    // of the second spawn can die on a lock whose holder is another client (a
+    // waiter's transient open, or the winner's server a moment before it writes
+    // `serve.json`), so every failure on a lock gets its own wait first.
+    let mut attempt = 1;
+    loop {
+        match spawn_and_wait(cfg) {
+            Err(EnsureError::Failed { cause }) if lock_may_resolve(cfg, cause.as_deref()) => {
+                let cause = cause.unwrap_or_default();
+                match wait_out_lock(
+                    cfg,
+                    |p| Ok(devctx_store::Store::check_unlocked(p)?),
+                    lock_wait_for(cfg, &cause),
+                ) {
+                    LockWait::Up(r) => return Ok(r),
+                    // Still held after the wait: not ours to judge. The failure
+                    // the spawn reported already names the holder; reporting it
+                    // is fast.
+                    LockWait::Held => return Err(EnsureError::Failed { cause: Some(cause) }),
+                    LockWait::Free if attempt < SPAWN_ATTEMPTS => attempt += 1,
+                    LockWait::Free => return Err(EnsureError::Failed { cause: Some(cause) }),
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Spawns [`ensure_checked`] makes before it reports a lock as a failure.
+const SPAWN_ATTEMPTS: usize = 3;
+
+/// Whether a spawn that died is worth repeating after waiting: it hit a held
+/// database, or a server is taking its exit checkpoint right now.
+fn lock_may_resolve(cfg: &ProjectConfig, cause: Option<&str>) -> bool {
+    cause.is_some_and(is_lock_error) || devctx_api::checkpoint_marker(cfg).exists()
+}
+
+/// How long to wait out the holder named in `cause`: as long as a `devctx
+/// serve` needs to come up (or to finish its exit) when that is who holds the
+/// file, i.e. one a client spawned ([`AUTOSPAWN_ENV`]) or one that says it is
+/// checkpointing; only [`LOCK_WAIT`] for anyone else — a server somebody ran
+/// by hand and withdrew, an MCP, a TUI — so a foreign holder still fails fast.
+fn lock_wait_for(cfg: &ProjectConfig, cause: &str) -> Duration {
+    match lock_holder_pid(cause) {
+        Some(pid) if procown::is_server_pid(pid) => holder_wait(
+            spawned_by_a_client(pid),
+            procown::age_secs(pid),
+            checkpointing(cfg, pid),
+        ),
+        // The cause names no holder but an exit checkpoint is under way (the
+        // marker exists): wait for it, not for half of it.
+        None if devctx_api::checkpoint_marker(cfg).exists() => CHECKPOINT_WAIT,
+        _ => LOCK_WAIT,
+    }
+}
+
+/// The wait for a `devctx serve` that holds the file: [`HOLDER_WAIT`] when it
+/// is checkpointing, or when a client spawned it ([`AUTOSPAWN_ENV`]) and it is
+/// still inside its startup window ([`STARTUP_WINDOW`]); [`LOCK_WAIT`]
+/// otherwise. An old autospawned serve whose `serve.json` was lost or withdrawn
+/// (alive until its `--idle` timer, or hung) is not "starting": waiting for it
+/// would turn a fail-fast into half a minute.
+fn holder_wait(autospawned: bool, age_secs: Option<u64>, checkpointing: bool) -> Duration {
+    let starting = autospawned && age_secs.is_some_and(|a| a < STARTUP_WINDOW.as_secs());
+    if starting || checkpointing {
+        HOLDER_WAIT
+    } else {
+        LOCK_WAIT
+    }
+}
+
+/// Whether `pid` was launched by [`spawn_server`] (it carries [`AUTOSPAWN_ENV`]
+/// in its environment). Linux only: elsewhere this is always false, nobody is
+/// known to be starting, and a lock race falls back to the [`LOCK_WAIT`] of
+/// 500 ms instead of [`HOLDER_WAIT`].
+fn spawned_by_a_client(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let want = format!("{AUTOSPAWN_ENV}=1");
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|raw| raw.split(|b| *b == 0).any(|kv| kv == want.as_bytes()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Spawn one server and wait for it to answer, or to die.
+fn spawn_and_wait(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
     let spawned = spawn_server(cfg).map_err(|e| EnsureError::Spawn(format!("{e:#}")))?;
     // Said only once it is up: when the serve cannot start (the lock is held,
     // the port is taken) "started" would be a lie printed right before the error.
@@ -246,6 +346,71 @@ pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
         ),
     })
 }
+
+/// How long [`ensure_checked`] lets a held database resolve before it spawns
+/// anyway. Short on purpose: a foreign holder must still fail fast (the CLI's
+/// 2 s target), and the exit window is covered by the advertisement staying up.
+const LOCK_WAIT: Duration = Duration::from_millis(500);
+
+/// The same wait when the holder is a `devctx serve` (one another client just
+/// spawned, still loading, or one finishing its exit checkpoint): it is going
+/// to answer or to let go, and both end the wait. It is a ceiling, not a cost.
+/// As long as the old 60 s wait for a spawned server (a cold model load on a
+/// loaded machine can pass 30 s).
+const HOLDER_WAIT: Duration = Duration::from_secs(60);
+
+/// A server younger than this is "starting" for the purpose of [`holder_wait`].
+const STARTUP_WINDOW: Duration = Duration::from_secs(60);
+
+/// The wait when an exit checkpoint is under way but the holder's pid is not
+/// known: more than the checkpoint budget (1.5 s) the server gives itself.
+const CHECKPOINT_WAIT: Duration = Duration::from_secs(3);
+
+/// What [`wait_out_lock`] found.
+enum LockWait {
+    /// A server came up while waiting.
+    Up(Remote),
+    /// The file is free (or fails for a reason that is not a lock).
+    Free,
+    /// Still held when the wait ran out.
+    Held,
+}
+
+/// While `check` says the database is held by another process and no server is
+/// advertised, keep looking for one (the holder may be one still starting):
+/// [`LockWait::Up`] when one answers; [`LockWait::Free`] when the file is free
+/// or the failure is not a lock; [`LockWait::Held`] when it is still held after
+/// `wait`.
+fn wait_out_lock(
+    cfg: &ProjectConfig,
+    check: impl Fn(&Path) -> Result<()>,
+    wait: Duration,
+) -> LockWait {
+    let deadline = Instant::now() + wait;
+    // Looking for a server is cheap (one small file); opening the database is
+    // not (a WAL replay, and a transient lock of our own), so it is done every
+    // `LOCK_CHECK_EVERY` and not on each tick.
+    let mut next_check = Instant::now();
+    loop {
+        if Instant::now() >= next_check {
+            match check(&cfg.db_path()) {
+                Err(e) if is_lock_error(&format!("{e:#}")) => {}
+                _ => return LockWait::Free,
+            }
+            next_check = Instant::now() + LOCK_CHECK_EVERY;
+        }
+        if let Discovery::Up(r) = probe(cfg) {
+            return LockWait::Up(r);
+        }
+        if Instant::now() >= deadline {
+            return LockWait::Held;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// How often [`wait_out_lock`] tries to open the database.
+const LOCK_CHECK_EVERY: Duration = Duration::from_millis(250);
 
 /// [`ensure_checked`] for callers that only need "a server or not" and fall
 /// back to opening the store themselves (the CLI commands, until they stop
@@ -394,9 +559,14 @@ impl Spawned {
         f.seek(SeekFrom::Start(self.log_offset)).ok()?;
         let mut raw = String::new();
         f.read_to_string(&mut raw).ok()?;
+        // With `RUST_BACKTRACE` set, the error is followed by its backtrace
+        // (anyhow's "Stack backtrace:", a panic's "stack backtrace:"), and the
+        // last lines were stack frames: the cause — DuckDB naming the lock
+        // holder — never reached the caller. The trace is cut off here.
         let lines: Vec<&str> = raw
             .lines()
             .map(str::trim)
+            .take_while(|l| !l.eq_ignore_ascii_case("stack backtrace:"))
             .filter(|l| !l.is_empty() && !l.starts_with("DevCtxEngine API listening"))
             .collect();
         if lines.is_empty() {
@@ -709,6 +879,10 @@ pub enum Discovery {
     Down,
 }
 
+/// How long a request refused by an exiting server waits for the next one:
+/// the exit's freeze and checkpoint are budgeted at 1.5 s, plus margin.
+const EXIT_RETRY_WAIT: Duration = Duration::from_secs(3);
+
 /// Health check for the first look at `serve.json`: short, so a stale file does
 /// not hang the CLI.
 const HEALTH_QUICK: Duration = Duration::from_millis(400);
@@ -728,6 +902,9 @@ enum Health {
     Ok,
     /// Nothing listens on the port: the server is gone, whatever its pid is now.
     Refused,
+    /// A 503 with the exiting marker: the server is freezing and checkpointing
+    /// before it leaves. It still holds the lock; it is neither busy nor hung.
+    Exiting,
     /// No answer in time, or an error answer: something may be there, busy.
     NoAnswer,
 }
@@ -740,6 +917,9 @@ fn health(base: &str, timeout: Duration) -> Health {
         .call();
     match res {
         Ok(_) => Health::Ok,
+        Err(ureq::Error::Status(503, r)) if r.header(procown::EXITING_HEADER).is_some() => {
+            Health::Exiting
+        }
         Err(e) if connection_refused(&e) => Health::Refused,
         Err(_) => Health::NoAnswer,
     }
@@ -759,56 +939,87 @@ fn connection_refused(e: &ureq::Error) -> bool {
     false
 }
 
-fn healthy(base: &str, timeout: Duration) -> bool {
-    matches!(health(base, timeout), Health::Ok)
+/// One look at `serve.json` and its server.
+enum Look {
+    Found(Discovery),
+    /// The advertised server is leaving (see [`Health::Exiting`]).
+    Exiting {
+        pid: u32,
+        addr: String,
+    },
 }
 
 /// Discover a running server for this project, telling "gone" apart from
-/// "alive but slow".
+/// "alive but slow" and from "leaving".
+///
+/// A server that says it is exiting is waited for, up to [`EXIT_RETRY_WAIT`]
+/// (its freeze and checkpoint are budgeted at 1.5 s): the answer is then Up
+/// (a replacement), Down (it left) or, only if it outlasts the wait, Busy.
+/// Callers used to get Busy at once and report "busy or hung" about a server
+/// that was doing its orderly exit.
 pub fn probe(cfg: &ProjectConfig) -> Discovery {
+    let deadline = Instant::now() + EXIT_RETRY_WAIT;
+    loop {
+        match look(cfg) {
+            Look::Found(d) => return d,
+            Look::Exiting { pid, addr } => {
+                if Instant::now() >= deadline {
+                    return Discovery::Busy { pid, addr };
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn look(cfg: &ProjectConfig) -> Look {
     let Some(info) = std::fs::read(serve_file(cfg))
         .ok()
         .and_then(|raw| serde_json::from_slice::<ServeInfo>(&raw).ok())
     else {
-        return Discovery::Down;
+        return Look::Found(Discovery::Down);
     };
     let base = format!("http://{}", info.addr);
     let up = |token: Option<String>| {
-        Discovery::Up(Remote {
+        Look::Found(Discovery::Up(Remote {
             base: base.clone(),
             token,
-        })
+            cfg: Some(Box::new(cfg.clone())),
+        }))
+    };
+    let exiting = |info: ServeInfo| Look::Exiting {
+        pid: info.pid.unwrap_or(0),
+        addr: info.addr,
     };
     match health(&base, HEALTH_QUICK) {
         Health::Ok => return up(info.token),
+        Health::Exiting => return exiting(info),
         // Nobody listens: the server is gone. A live pid on that number is a
         // different process (pids are reused, across repositories too).
         // — unless the process is verifiably OURS: then the listener is closed
         // but the server is not gone (shutting down, wedged), it may still hold
         // the lock, and spawning another would only hit it.
         Health::Refused => {
-            return match info.pid {
+            return Look::Found(match info.pid {
                 Some(pid) if owns_server(cfg, &info) => Discovery::Busy {
                     pid,
                     addr: info.addr,
                 },
                 _ => Discovery::Down,
-            }
+            })
         }
         Health::NoAnswer => {}
     }
     match info.pid {
-        Some(pid) if owns_server(cfg, &info) => {
-            if healthy(&base, HEALTH_PATIENT) {
-                up(info.token)
-            } else {
-                Discovery::Busy {
-                    pid,
-                    addr: info.addr,
-                }
-            }
-        }
-        _ => Discovery::Down,
+        Some(pid) if owns_server(cfg, &info) => match health(&base, HEALTH_PATIENT) {
+            Health::Ok => up(info.token),
+            Health::Exiting => exiting(info),
+            _ => Look::Found(Discovery::Busy {
+                pid,
+                addr: info.addr,
+            }),
+        },
+        _ => Look::Found(Discovery::Down),
     }
 }
 
@@ -842,15 +1053,55 @@ impl Remote {
         }
     }
 
+    /// Send one request; when the server refuses it because it is exiting
+    /// (a 503 from a middleware that runs before any handler, so nothing was
+    /// processed), repeat it against the next server for up to
+    /// [`EXIT_RETRY_WAIT`]. Any other status is final.
+    fn send(
+        &self,
+        build: impl Fn(&Remote) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+    ) -> Result<String> {
+        let first = build(self);
+        let exiting = |r: &std::result::Result<ureq::Response, Box<ureq::Error>>| {
+            matches!(r, Err(e) if matches!(&**e, ureq::Error::Status(503, resp)
+                if resp.header(procown::EXITING_HEADER).is_some()))
+        };
+        let Some(cfg) = self.cfg.as_ref().filter(|_| exiting(&first)) else {
+            return read(first.map_err(|e| *e));
+        };
+        let deadline = Instant::now() + EXIT_RETRY_WAIT;
+        let mut last = first;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            // `ensure_checked` sees the old server busy until it is gone, then
+            // starts the next one.
+            let Ok(next) = ensure_checked(cfg.as_ref()) else {
+                continue;
+            };
+            last = build(&next);
+            if !exiting(&last) {
+                break;
+            }
+        }
+        read(last.map_err(|e| *e))
+    }
+
     fn get(&self, path: &str) -> Result<String> {
-        let req = self.auth(self.agent().get(&format!("{}{path}", self.base)));
-        read(req.call())
+        self.send(|r| {
+            r.auth(r.agent().get(&format!("{}{path}", r.base)))
+                .call()
+                .map_err(Box::new)
+        })
     }
 
     fn post(&self, path: &str, body: Value) -> Result<String> {
-        let req = self.auth(self.agent().post(&format!("{}{path}", self.base)));
         let started = std::time::Instant::now();
-        read(req.send_json(body)).map_err(|e| {
+        self.send(|r| {
+            r.auth(r.agent().post(&format!("{}{path}", r.base)))
+                .send_json(body.clone())
+                .map_err(Box::new)
+        })
+        .map_err(|e| {
             // How long it took is what proves or disproves a timeout claim: an
             // agent that allows an hour cannot time out in four seconds.
             anyhow::anyhow!("{e}\n  after {:.1}s", started.elapsed().as_secs_f64())
@@ -898,12 +1149,14 @@ impl Remote {
         language: Option<&str>,
         mode: &str,
         rerank: bool,
+        sel: &devctx_search::KindSel,
     ) -> Result<String> {
         self.post(
             "/search",
             serde_json::json!({
                 "query": query, "limit": limit, "language": language,
                 "mode": mode, "rerank": rerank,
+                "kind": sel.kind, "include_tests": sel.include_tests,
             }),
         )
     }
@@ -965,11 +1218,13 @@ impl Remote {
         query: &str,
         max_tokens: usize,
         include_memories: bool,
+        sel: &devctx_search::KindSel,
     ) -> Result<String> {
         self.post(
             "/context",
             serde_json::json!({ "query": query, "max_tokens": max_tokens,
-                                "include_memories": include_memories }),
+                                "include_memories": include_memories,
+                                "kind": sel.kind, "include_tests": sel.include_tests }),
         )
     }
 
@@ -981,6 +1236,9 @@ impl Remote {
         if let Some(p) = path {
             q.push(format!("path={}", urlencode(p)));
         }
+        // The command lists every route, as its local path does; the tool's
+        // default page of 20 is for agents counting tokens.
+        q.push("limit=100000".to_string());
         let qs = if q.is_empty() {
             String::new()
         } else {
@@ -1069,6 +1327,39 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_failure_hint_skips_a_backtrace_and_keeps_the_cause() {
+        let dir = std::env::temp_dir().join(format!("devctx-hint-bt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("serve.log");
+        let stale = "an older failure\n";
+        std::fs::write(
+            &log,
+            format!(
+                "{stale}Error: duckdb: IO Error: Could not set lock on file \"/x/index.duckdb\": \
+                 Conflicting lock is held in /usr/bin/devctx (PID 4242)\n\nCaused by:\n    \
+                 0: IO Error: Conflicting lock (PID 4242)\n    1: Error code 1\n\n\
+                 Stack backtrace:\n   0: anyhow::error\n  23: main\n  24: <unknown>\n  \
+                 25: __libc_start_main\n  26: _start\n"
+            ),
+        )
+        .unwrap();
+        let spawned = Spawned {
+            pid: 0,
+            exited: Default::default(),
+            log: log.clone(),
+            log_offset: stale.len() as u64,
+        };
+        let hint = spawned.failure_hint().expect("a hint");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(is_lock_error(&hint), "{hint}");
+        assert_eq!(lock_holder_pid(&hint), Some(4242), "{hint}");
+        assert!(
+            !hint.contains("_start") && !hint.contains("older"),
+            "{hint}"
+        );
+    }
+
     #[test]
     fn the_lock_holder_pid_is_read_from_duckdbs_message() {
         let msg = "IO Error: Could not set lock on file \"/x/index.duckdb\": Conflicting lock \
@@ -1185,6 +1476,56 @@ mod tests {
         c
     }
 
+    fn serve_fixed(reply: &'static str) -> SocketAddr {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        addr
+    }
+
+    const EXITING_503: &str = "HTTP/1.1 503 Service Unavailable\r\nx-devctx-exiting: 1\r\n\
+                               Content-Length: 0\r\nConnection: close\r\n\r\n";
+    const PLAIN_503: &str = "HTTP/1.1 503 Service Unavailable\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n";
+    const OK_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    /// TASK-017 fixup I1 (CLI): a request refused by a server that is exiting
+    /// is repeated against the one `serve.json` now advertises; a 503 that does
+    /// not carry the marker is a final answer.
+    #[test]
+    fn a_command_refused_by_an_exiting_server_reaches_the_next_one() {
+        let dir = std::env::temp_dir().join(format!("devctx-i1-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        let dying = serve_fixed(EXITING_503);
+        let next = serve_fixed(OK_200);
+        write_serve_file(&cfg, next, None).unwrap();
+        let remote = Remote {
+            base: format!("http://{dying}"),
+            token: None,
+            cfg: Some(Box::new(cfg)),
+        };
+        assert_eq!(remote.status().unwrap(), "ok");
+
+        let plain = Remote {
+            base: format!("http://{}", serve_fixed(PLAIN_503)),
+            token: None,
+            cfg: remote.cfg.clone(),
+        };
+        let started = Instant::now();
+        assert!(plain.status().is_err());
+        assert!(started.elapsed() < Duration::from_secs(2), "not retried");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_cancelled_index_answer_is_recognised() {
         let warn = index_cancelled(r#"{"cancelled":true,"files_indexed":3,"commit":"abc"}"#)
@@ -1212,6 +1553,215 @@ mod tests {
             TERM_WAIT >= devctx_api::STOP_TIMELINE + Duration::from_secs(1),
             "the plain wait must clear the server's own timeline with room to spare"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listener that answers `first` until `flip_at`, `then` after it.
+    fn serve_switching(first: &'static str, then: &'static str, flip_at: Instant) -> SocketAddr {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let reply = if Instant::now() < flip_at {
+                    first
+                } else {
+                    then
+                };
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        addr
+    }
+
+    /// TASK-017 fixup K2: a server that answers `/health` with the marked 503
+    /// is exiting, not "busy or hung": `probe` waits through the exit window
+    /// and reports what is there afterwards (here, its replacement).
+    #[test]
+    fn probe_waits_through_the_exit_window() {
+        let dir = std::env::temp_dir().join(format!("devctx_k2_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        let started = Instant::now();
+        let addr = serve_switching(EXITING_503, OK_200, started + Duration::from_millis(700));
+        write_serve_file(&cfg, addr, None).unwrap();
+        let found = probe(&cfg);
+        assert!(
+            matches!(found, Discovery::Up(_)),
+            "a server in its exit window must be waited for, not reported busy"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(600),
+            "answered before the window closed"
+        );
+
+        // It leaves instead: the advertisement is withdrawn while we wait.
+        let addr = serve_switching(EXITING_503, EXITING_503, started + Duration::from_secs(60));
+        write_serve_file(&cfg, addr, None).unwrap();
+        let remover = {
+            let cfg = cfg.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                remove_serve_file(&cfg);
+            })
+        };
+        let found = probe(&cfg);
+        remover.join().unwrap();
+        assert!(matches!(found, Discovery::Down), "it left: nothing is up");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-017 fixup J2: a held database with no server advertised gets a
+    /// moment to resolve before a spawn; a server that appears meanwhile is
+    /// used; a free file (or an error that is not a lock) is not waited on.
+    #[test]
+    fn a_held_database_gets_a_moment_before_a_spawn() {
+        let dir = std::env::temp_dir().join(format!("devctx_j2_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        let locked = |_: &Path| -> Result<()> {
+            Err(anyhow::anyhow!(
+                "IO Error: Could not set lock on file: Conflicting lock is held in devctx (PID 7)"
+            ))
+        };
+        let started = Instant::now();
+        assert!(matches!(
+            wait_out_lock(&cfg, locked, Duration::from_millis(300)),
+            LockWait::Held
+        ));
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "did not wait"
+        );
+
+        let started = Instant::now();
+        assert!(matches!(
+            wait_out_lock(&cfg, |_| Ok(()), Duration::from_secs(5)),
+            LockWait::Free
+        ));
+        assert!(matches!(
+            wait_out_lock(
+                &cfg,
+                |_| Err(anyhow::anyhow!("disk full")),
+                Duration::from_secs(5)
+            ),
+            LockWait::Free
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited on a free file"
+        );
+
+        // The holder was a server still starting: it shows up while we wait.
+        let next = serve_fixed(OK_200);
+        let writer = {
+            let cfg = cfg.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                write_serve_file(&cfg, next, None).unwrap();
+            })
+        };
+        let up = wait_out_lock(&cfg, locked, Duration::from_secs(5));
+        writer.join().unwrap();
+        assert!(
+            matches!(up, LockWait::Up(_)),
+            "the server that appeared is used"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-017 fixup L (K1/K3): only a server that is STARTING is waited for
+    /// the full ceiling; an old autospawned one that lost its advertisement
+    /// (alive till its idle timer, or hung) fails fast like any foreign holder.
+    #[test]
+    fn only_a_starting_or_checkpointing_holder_gets_the_long_wait() {
+        assert_eq!(holder_wait(true, Some(3), false), HOLDER_WAIT);
+        assert_eq!(holder_wait(true, Some(59), false), HOLDER_WAIT);
+        assert_eq!(
+            holder_wait(true, Some(61), false),
+            LOCK_WAIT,
+            "old, not starting"
+        );
+        assert_eq!(holder_wait(true, Some(900), false), LOCK_WAIT);
+        assert_eq!(holder_wait(true, None, false), LOCK_WAIT, "age unknown");
+        assert_eq!(holder_wait(false, Some(3), false), LOCK_WAIT, "run by hand");
+        assert_eq!(
+            holder_wait(false, Some(900), true),
+            HOLDER_WAIT,
+            "checkpointing"
+        );
+        assert!(
+            HOLDER_WAIT >= Duration::from_secs(60),
+            "a model load over 30 s must not make the loser fail"
+        );
+    }
+
+    /// Fixup L: a checkpoint marker whose pid the lock message does not give
+    /// still earns a wait longer than the checkpoint budget (1.5 s).
+    #[test]
+    fn a_checkpoint_without_a_named_holder_is_waited_out() {
+        let dir = std::env::temp_dir().join(format!("devctx_l_ckpt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        assert_eq!(lock_wait_for(&cfg, "Could not set lock"), LOCK_WAIT);
+        std::fs::write(devctx_api::checkpoint_marker(&cfg), "4242").unwrap();
+        let wait = lock_wait_for(&cfg, "Could not set lock");
+        assert!(
+            wait >= Duration::from_millis(1500) + Duration::from_millis(500),
+            "{wait:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fixup L: `spawned_by_a_client` reads the autospawn mark out of the
+    /// process environment (the e2e foreign-lock test never reaches it: its
+    /// holder fails on its name first).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_autospawn_mark_is_read_from_the_environment() {
+        let mark = |on: bool| {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("5");
+            if on {
+                c.env(AUTOSPAWN_ENV, "1");
+            } else {
+                c.env_remove(AUTOSPAWN_ENV);
+            }
+            c.spawn().unwrap()
+        };
+        let (mut yes, mut no) = (mark(true), mark(false));
+        let (a, b) = (spawned_by_a_client(yes.id()), spawned_by_a_client(no.id()));
+        let _ = (yes.kill(), no.kill(), yes.wait(), no.wait());
+        assert!(a, "the marked process is not recognised");
+        assert!(!b, "an unmarked process is taken for a spawned one");
+        assert!(!spawned_by_a_client(u32::MAX - 1), "a pid that is gone");
+    }
+
+    /// Fixup L (K4): the wait looks for a server often but opens the database
+    /// only every `LOCK_CHECK_EVERY` (it was ~600 opens in 30 s).
+    #[test]
+    fn the_wait_does_not_open_the_database_on_every_tick() {
+        let dir = std::env::temp_dir().join(format!("devctx_l_k4_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        let opens = std::sync::atomic::AtomicUsize::new(0);
+        let locked = |_: &Path| -> Result<()> {
+            opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("Could not set lock on file"))
+        };
+        assert!(matches!(
+            wait_out_lock(&cfg, locked, Duration::from_millis(1100)),
+            LockWait::Held
+        ));
+        let n = opens.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((2..=6).contains(&n), "{n} opens in 1.1 s");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

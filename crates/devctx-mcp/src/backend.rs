@@ -13,6 +13,7 @@ use crate::state::{
     do_memory_move, do_memory_refs, do_memory_stats, do_plan_status, do_read_file, do_read_symbol,
     do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
     do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
+    MemoriesOpts, Page, PlanListOpts,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -110,9 +111,27 @@ fn should_retry(err: &ureq::Error) -> bool {
             t.kind(),
             ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns
         ),
-        ureq::Error::Status(..) => false,
+        // The one status that is safe to repeat: see `server_is_exiting`.
+        ureq::Error::Status(..) => server_is_exiting(err),
     }
 }
+
+/// Whether the server refused because it is exiting. That 503 comes from a
+/// middleware that runs BEFORE any handler, so the request was not processed
+/// and repeating it against the next server cannot do anything twice. It is
+/// marked by a header precisely so no other 503 is read this way.
+fn server_is_exiting(err: &ureq::Error) -> bool {
+    matches!(err, ureq::Error::Status(503, r)
+        if r.header(devctx_core::procown::EXITING_HEADER).is_some())
+}
+
+/// How long a request waits for an exiting server to be replaced: its freeze
+/// and checkpoint are budgeted at 1.5 s, plus margin. While the old one lives
+/// the connector sees it busy: it stays advertised until its checkpoint is
+/// done (the server withdraws `serve.json` after it, not before) and the CLI's
+/// `ensure_checked` does not spawn over a held lock; once it is gone the
+/// connector starts the next.
+const EXIT_RETRY_WAIT: Duration = Duration::from_secs(3);
 
 impl RemoteClient {
     fn new(connect: Connector) -> Self {
@@ -207,6 +226,9 @@ impl RemoteClient {
     ) -> Result<String, String> {
         let ((base, token), generation) = self.target()?;
         match send(&base, &token) {
+            Err(e) if self.connect.is_some() && server_is_exiting(&e) => {
+                self.retry_after_exit(&send, generation, e.to_string())
+            }
             Err(e) if self.connect.is_some() && should_retry(&e) => {
                 let first = e.to_string();
                 self.invalidate(generation);
@@ -217,6 +239,46 @@ impl RemoteClient {
                     .map_err(|second| format!("{second} (retried once; first attempt: {first})"))
             }
             other => read(other.map_err(|e| *e)),
+        }
+    }
+
+    /// The server answered "shutting down": forget it and keep asking the
+    /// connector for the next one (and sending to it) for up to
+    /// [`EXIT_RETRY_WAIT`].
+    fn retry_after_exit(
+        &self,
+        send: &impl Fn(&str, &Option<String>) -> Result<ureq::Response, Box<ureq::Error>>,
+        mut generation: u64,
+        first: String,
+    ) -> Result<String, String> {
+        let deadline = std::time::Instant::now() + EXIT_RETRY_WAIT;
+        let mut last: String;
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            self.invalidate(generation);
+            // The connector's last "busy" verdict must not be served from the
+            // backoff cache: the whole point is to ask again. The `Link` is
+            // shared, so this also cancels the backoff other threads were
+            // honouring; accepted: they would each ask the connector again
+            // (single-flight, so one spawn) at most one verdict sooner.
+            self.link.lock().unwrap_or_else(|p| p.into_inner()).failed = None;
+            match self.target() {
+                Ok(((base, token), g)) => {
+                    generation = g;
+                    match send(&base, &token) {
+                        Err(e) if server_is_exiting(&e) => last = e.to_string(),
+                        other => {
+                            return read(other.map_err(|e| *e)).map_err(|second| {
+                                format!("{second} (retried after the server exited; first attempt: {first})")
+                            })
+                        }
+                    }
+                }
+                Err(why) => last = format!("{first}; reconnecting failed: {why}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("{last} (still exiting after {EXIT_RETRY_WAIT:?})"));
+            }
         }
     }
 
@@ -306,6 +368,7 @@ impl Backend {
         language: Option<String>,
         mode: Option<String>,
         rerank: bool,
+        sel: &devctx_search::KindSel,
     ) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_search(
@@ -315,12 +378,16 @@ impl Backend {
                 language,
                 parse_mode(mode.as_deref()),
                 rerank,
+                sel,
             ),
-            Backend::Remote(r, _) => r.post(
-                "/search",
-                json!({ "query": query, "limit": limit, "language": language,
-                        "mode": mode.unwrap_or_else(|| "vector".into()), "rerank": rerank }),
-            ),
+            Backend::Remote(r, _) => r
+                .post(
+                    "/search",
+                    json!({ "query": query, "limit": limit, "language": language,
+                            "mode": mode.unwrap_or_else(|| "vector".into()), "rerank": rerank,
+                            "kind": sel.kind, "include_tests": sel.include_tests }),
+                )
+                .map(|raw| ensure_object(raw, "results")),
         }
     }
 
@@ -333,6 +400,7 @@ impl Backend {
         limit: usize,
         language: Option<String>,
         mode: Option<String>,
+        sel: &devctx_search::KindSel,
     ) -> Result<String, String> {
         do_search_project(
             project,
@@ -340,6 +408,7 @@ impl Backend {
             limit,
             language,
             mode.as_deref().unwrap_or("vector"),
+            sel,
         )
     }
 
@@ -378,16 +447,24 @@ impl Backend {
 
     /// Progress on the plans in `plans/` (see `plans/PLAN-005-plan-status/`): no `plan` lists
     /// them, `plan` gives one plan's ready/in-progress/blocked tasks.
-    pub fn plan_status(&self, plan: Option<&str>) -> Result<String, String> {
+    pub fn plan_status(&self, plan: Option<&str>, opts: PlanListOpts) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_plan_status(s, plan),
+            Backend::Local(s) => do_plan_status(s, plan, opts),
             Backend::Remote(_, id) if id.plans_root.is_some() => {
-                crate::state::plan_status_budgeted(id.plans_root.as_ref().unwrap(), plan)
+                crate::state::plan_status_budgeted(id.plans_root.as_ref().unwrap(), plan, opts)
             }
-            Backend::Remote(r, _) => match plan {
-                Some(p) => r.get(&format!("/plans/status?plan={}", urlencode(p))),
-                None => r.get("/plans/status"),
-            },
+            Backend::Remote(r, _) => {
+                let qs = query_string(&[
+                    ("plan", plan.map(urlencode)),
+                    ("active_only", opts.active_only.then(|| "true".to_string())),
+                    ("limit", opts.page.limit.map(|n| n.to_string())),
+                    (
+                        "offset",
+                        (opts.page.offset > 0).then(|| opts.page.offset.to_string()),
+                    ),
+                ]);
+                r.get(&format!("/plans/status{qs}"))
+            }
         }
     }
 
@@ -573,35 +650,39 @@ impl Backend {
         query: &str,
         max_tokens: usize,
         include_memories: bool,
+        sel: &devctx_search::KindSel,
     ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_build_context(s, query, max_tokens, include_memories),
+            Backend::Local(s) => do_build_context(s, query, max_tokens, include_memories, sel),
             Backend::Remote(r, _) => r.post(
                 "/context",
                 json!({ "query": query, "max_tokens": max_tokens,
-                        "include_memories": include_memories }),
+                        "include_memories": include_memories,
+                        "kind": sel.kind, "include_tests": sel.include_tests }),
             ),
         }
     }
 
     /// Memories recorded about a symbol — the memory↔graph join.
-    pub fn memories_by_symbol(&self, symbol: &str, limit: usize) -> Result<String, String> {
+    pub fn memories_by_symbol(&self, symbol: &str, opts: MemoriesOpts) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_memories_by_symbol(s, symbol, limit),
+            Backend::Local(s) => do_memories_by_symbol(s, symbol, opts),
             Backend::Remote(r, _) => r.get(&format!(
-                "/memories/by-symbol/{}?limit={limit}",
-                urlencode(symbol)
+                "/memories/by-symbol/{}{}",
+                urlencode(symbol),
+                memories_query(opts)
             )),
         }
     }
 
     /// Memories recorded about a file.
-    pub fn memories_by_file(&self, file: &str, limit: usize) -> Result<String, String> {
+    pub fn memories_by_file(&self, file: &str, opts: MemoriesOpts) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_memories_by_file(s, file, limit),
+            Backend::Local(s) => do_memories_by_file(s, file, opts),
             Backend::Remote(r, _) => r.get(&format!(
-                "/memories/by-file/{}?limit={limit}",
-                urlencode(file)
+                "/memories/by-file/{}{}",
+                urlencode(file),
+                memories_query(opts)
             )),
         }
     }
@@ -625,23 +706,19 @@ impl Backend {
         &self,
         method: Option<String>,
         path: Option<String>,
+        page: Page,
     ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_search_routes(s, method, path),
+            Backend::Local(s) => do_search_routes(s, method, path, page),
             Backend::Remote(r, _) => {
-                let mut q = Vec::new();
-                if let Some(m) = &method {
-                    q.push(format!("method={}", urlencode(m)));
-                }
-                if let Some(p) = &path {
-                    q.push(format!("path={}", urlencode(p)));
-                }
-                let qs = if q.is_empty() {
-                    String::new()
-                } else {
-                    format!("?{}", q.join("&"))
-                };
+                let qs = query_string(&[
+                    ("method", method.as_deref().map(urlencode)),
+                    ("path", path.as_deref().map(urlencode)),
+                    ("limit", page.limit.map(|n| n.to_string())),
+                    ("offset", (page.offset > 0).then(|| page.offset.to_string())),
+                ]);
                 r.get(&format!("/routes{qs}"))
+                    .map(|raw| ensure_object(raw, "routes"))
             }
         }
     }
@@ -649,7 +726,9 @@ impl Backend {
     pub fn routes_for_handler(&self, handler: &str) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_routes_for_handler(s, handler),
-            Backend::Remote(r, _) => r.get(&format!("/routes/handler/{}", urlencode(handler))),
+            Backend::Remote(r, _) => r
+                .get(&format!("/routes/handler/{}", urlencode(handler)))
+                .map(|raw| ensure_object(raw, "routes")),
         }
     }
 
@@ -669,8 +748,45 @@ impl Backend {
     }
 }
 
-/// Minimal percent-encoding for a path/query segment.
-fn urlencode(s: &str) -> String {
+/// `?a=1&b=2` from the pairs that have a value (already encoded), or `""`.
+fn query_string(pairs: &[(&str, Option<String>)]) -> String {
+    let parts: Vec<String> = pairs
+        .iter()
+        .filter_map(|(k, v)| v.as_ref().map(|v| format!("{k}={v}")))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
+/// The paging query of the by-symbol / by-file routes.
+fn memories_query(opts: MemoriesOpts) -> String {
+    query_string(&[
+        ("limit", opts.page.limit.map(|n| n.to_string())),
+        (
+            "offset",
+            (opts.page.offset > 0).then(|| opts.page.offset.to_string()),
+        ),
+        ("full", opts.full.then(|| "true".to_string())),
+    ])
+}
+
+/// A server older than 0.9 answers `search` / `search_routes` /
+/// `routes_for_handler` with a bare array when there is nothing to say. The
+/// tools promise an object (`devctx_core::hits`), so wrap it under `key`.
+fn ensure_object(raw: String, key: &str) -> String {
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Array(rows)) => json!({ key: rows }).to_string(),
+        _ => raw,
+    }
+}
+
+/// Minimal percent-encoding for a path or query segment: RFC 3986 unreserved
+/// characters (`A-Z a-z 0-9 - _ . ~`) pass through, every other byte becomes
+/// `%XX` (UTF-8 bytes one by one), so the value can be spliced into a route.
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -767,6 +883,99 @@ mod tests {
             .send_json(json!({}))
             .unwrap_err();
         assert!(!should_retry(&err), "may have been processed: {err}");
+    }
+
+    /// A tiny HTTP server answering every request with `reply`.
+    fn serve_fixed(reply: &'static str) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        base
+    }
+
+    const EXITING_503: &str = "HTTP/1.1 503 Service Unavailable\r\nx-devctx-exiting: 1\r\n\
+                               Content-Length: 0\r\nConnection: close\r\n\r\n";
+    const PLAIN_503: &str = "HTTP/1.1 503 Service Unavailable\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n";
+    const OK_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    /// TASK-017 fixup I1: the exit's 503 never reached a handler, so it is
+    /// retried against the next server; any other 503 is a final answer.
+    #[test]
+    fn only_the_exiting_503_is_retried() {
+        let marked: ureq::Response = EXITING_503.parse().unwrap();
+        assert!(should_retry(&ureq::Error::Status(503, marked)));
+        let plain: ureq::Response = PLAIN_503.parse().unwrap();
+        assert!(!should_retry(&ureq::Error::Status(503, plain)));
+    }
+
+    #[test]
+    fn a_request_refused_by_an_exiting_server_goes_to_the_next_one() {
+        let dying = serve_fixed(EXITING_503);
+        let next = serve_fixed(OK_200);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let connect: Connector = Arc::new(move || {
+            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ServerConn {
+                base: if n == 0 { dying.clone() } else { next.clone() },
+                token: None,
+            })
+        });
+        let client = RemoteClient::new(connect);
+        assert_eq!(client.get("/status").unwrap(), "ok");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// While the old server lives the connector reports it busy; that is not
+    /// cached as a failure, the client keeps asking until the next one is up.
+    #[test]
+    fn a_busy_connector_during_the_exit_is_asked_again() {
+        let dying = serve_fixed(EXITING_503);
+        let next = serve_fixed(OK_200);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let connect: Connector =
+            Arc::new(
+                move || match c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Ok(ServerConn {
+                        base: dying.clone(),
+                        token: None,
+                    }),
+                    1 | 2 => Err("server busy".to_string()),
+                    _ => Ok(ServerConn {
+                        base: next.clone(),
+                        token: None,
+                    }),
+                },
+            );
+        let client = RemoteClient::new(connect);
+        assert_eq!(client.get("/status").unwrap(), "ok");
+    }
+
+    #[test]
+    fn a_plain_503_is_a_final_answer() {
+        let plain = serve_fixed(PLAIN_503);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let connect: Connector = Arc::new(move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ServerConn {
+                base: plain.clone(),
+                token: None,
+            })
+        });
+        let client = RemoteClient::new(connect);
+        assert!(client.get("/status").is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -102,6 +102,24 @@ impl std::ops::Deref for WriteConn<'_> {
     }
 }
 
+/// Ends the transaction `Store::in_transaction` opened, whichever way `f`
+/// leaves: rolls it back unless it committed, and clears `in_tx`.
+struct TxGuard<'a> {
+    store: &'a Store,
+    finished: bool,
+}
+
+impl Drop for TxGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Never gated: a rollback writes nothing to the WAL, and a frozen
+            // store must still be able to abandon what it started.
+            let _ = self.store.conn.execute_batch("ROLLBACK");
+        }
+        self.store.in_tx.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Store {
     /// Open (creating if needed) a store at `path` with vector dimension `dim`.
     pub fn open(path: &Path, dim: usize) -> Result<Self> {
@@ -535,7 +553,7 @@ impl Store {
         let mut out = Vec::new();
         for r in rows {
             let (point, score) = r?;
-            out.push(SearchResult { point, score });
+            out.push(SearchResult::new(point, score));
         }
         Ok(out)
     }
@@ -578,6 +596,13 @@ impl Store {
         }
         self.w()?.execute_batch("BEGIN TRANSACTION")?;
         self.in_tx.store(true, Ordering::SeqCst);
+        // If `f` panics, unwinding drops this guard: the transaction is rolled
+        // back and `in_tx` cleared, so the next call on this connection opens
+        // its own transaction instead of running bare inside a dead one.
+        let mut guard = TxGuard {
+            store: self,
+            finished: false,
+        };
         let result = f();
         let result = match result {
             Ok(v) => match self.w().and_then(|c| Ok(c.execute_batch("COMMIT")?)) {
@@ -586,12 +611,8 @@ impl Store {
             },
             Err(e) => Err(e),
         };
-        if result.is_err() {
-            // Never gated: a rollback writes nothing to the WAL, and a frozen
-            // store must still be able to abandon what it started.
-            let _ = self.conn.execute_batch("ROLLBACK");
-        }
-        self.in_tx.store(false, Ordering::SeqCst);
+        guard.finished = result.is_ok();
+        drop(guard);
         result
     }
 
@@ -751,10 +772,10 @@ impl Store {
             // Scores stay comparable across metrics: cosine distance is
             // `1 - similarity`, negative inner product is `-similarity`, and on
             // unit-normalized vectors both similarities are the same number.
-            out.push(SearchResult {
+            out.push(SearchResult::new(
                 point,
-                score: if ip { -dist } else { 1.0 - dist },
-            });
+                if ip { -dist } else { 1.0 - dist },
+            ));
         }
         Ok(out)
     }
@@ -836,6 +857,9 @@ impl Store {
     /// copy-pasting from `impact` or `get_references` has in hand. Doing the
     /// exact pass first means the common case never pays for the scan.
     ///
+    /// A third pass, only when both miss, finds a small function inside a
+    /// `grouped` chunk (several small functions indexed together).
+    ///
     /// Definitions only — chunks whose `chunk_level` is not a call site — so the
     /// answer is the code of the symbol rather than every place it appears.
     pub fn symbol_definitions(
@@ -862,20 +886,149 @@ impl Store {
 
         // `Card.charge` and `pay.rs::charge` both end in `charge`; anchoring on
         // the separator keeps `recharge` out.
-        let dot = format!("%.{name}");
-        let colons = format!("%::{name}");
+        // `ends_with` rather than `LIKE '%.name'`: `_` is a LIKE wildcard.
         let sql = format!(
             "SELECT {COLS} FROM vectors
              WHERE repo = ? AND branch = ? AND NOT is_deletion
-               AND (symbol LIKE ? OR symbol LIKE ?)
+               AND (ends_with(symbol, '.' || ?) OR ends_with(symbol, '::' || ?))
              ORDER BY file, start_line LIMIT {limit}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([repo, branch, dot.as_str(), colons.as_str()], row_to_point)?;
+        let rows = stmt.query_map([repo, branch, name, name], row_to_point)?;
+        for r in rows {
+            out.push(r?);
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+
+        // Small functions are chunked together under a symbol that lists them
+        // (`a, b, c`, or `a, b, c, d +2` past four names). An exact element of
+        // the list is a definition; so is a name past the cap, which the chunk
+        // text still carries in its per-function header (`# file > name`, or
+        // `# file > Parent > name`). Without this pass a small getter — which
+        // calls nothing, so is never a graph source either — looked external.
+        //
+        // The header is matched as a whole line that starts with `# `, as
+        // `context_header` in devctx-chunk writes it: a bare `' > name\n'`
+        // also matched code in the group (`return a > limit\n`).
+        let header = format!("(^|\n)# [^\n]* > {}(\n|$)", regex_escape(name));
+        let sql = format!(
+            "SELECT {COLS} FROM vectors
+             WHERE repo = ? AND branch = ? AND NOT is_deletion
+               AND symbol_type = 'grouped'
+               AND (list_contains(string_split(regexp_replace(symbol, ' \\+[0-9]+$', ''), ', '), ?)
+                    OR regexp_matches(text, ?))
+             ORDER BY file, start_line LIMIT {limit}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([repo, branch, name, header.as_str()], row_to_point)?;
         for r in rows {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Up to `n` symbol names of this repo/branch that `name` could be a slip for.
+    ///
+    /// Candidates come from SQL by cheap string tests (shared prefix, shared
+    /// suffix, or containing the name, all case-insensitive), ordered there by
+    /// DuckDB's `levenshtein` / `jaro_winkler_similarity` on the last path
+    /// segment and capped, so the cap is deterministic and keeps the closest
+    /// names. They are then classed in memory: same name ignoring case, then
+    /// prefix/suffix/substring, then small edit distance.
+    pub fn symbol_suggestions(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+        n: usize,
+    ) -> Result<Vec<String>> {
+        let lname = name.to_lowercase();
+        if lname.chars().count() < 2 || n == 0 {
+            return Ok(Vec::new());
+        }
+        let head: String = lname.chars().take(3).collect();
+        let tail: String = {
+            let c: Vec<char> = lname.chars().collect();
+            c[c.len().saturating_sub(3)..].iter().collect()
+        };
+        // Ranked in SQL before the cap, so the cap keeps the closest names
+        // rather than whichever the scan met first: edit distance on the last
+        // path segment (`Card.charge` → `charge`), then Jaro-Winkler, then the
+        // name itself as a deterministic tie-break. "Contained in the query"
+        // only counts for names of three letters or more — `a` or `id` are
+        // inside almost anything. Grouped chunks list several names in one
+        // symbol (`a, b, c`) and are not a name to suggest.
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol FROM (
+               SELECT DISTINCT symbol, regexp_extract(lower(symbol), '[^.:]*$') AS last
+                 FROM vectors
+                WHERE repo = ? AND branch = ? AND NOT is_deletion
+                  AND chunk_level NOT IN ('memory', 'memory_chunk')
+                  AND symbol_type <> 'grouped'
+                  AND symbol <> ''
+                  AND (starts_with(lower(symbol), ?) OR ends_with(lower(symbol), ?)
+                       OR contains(lower(symbol), ?)
+                       OR (length(symbol) >= 3 AND contains(?, lower(symbol))))
+             )
+             ORDER BY levenshtein(last, ?), jaro_winkler_similarity(last, ?) DESC, symbol
+             LIMIT 200",
+        )?;
+        let rows = stmt.query_map(
+            params![repo, branch, head, tail, lname, lname, lname, lname],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut cands = Vec::new();
+        for r in rows {
+            cands.push(r?);
+        }
+        Ok(rank_suggestions(name, cands, n))
+    }
+
+    /// Definitions of `name` among the rows `filter` admits — the exact symbol
+    /// first, then `Class.name` / `mod::name` — without requiring a repo and
+    /// branch the way [`symbol_definitions`](Self::symbol_definitions) does.
+    ///
+    /// Memory rows are never definitions (their `symbol` is a title). Used to
+    /// anchor an identifier query on the code that defines it.
+    pub fn symbol_matches(
+        &self,
+        filter: &SearchFilter,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<VectorPoint>> {
+        let (where_clause, fparams) = build_where(filter);
+        let base = if where_clause.is_empty() {
+            "WHERE chunk_level NOT IN ('memory', 'memory_chunk')".to_string()
+        } else {
+            format!("{where_clause} AND chunk_level NOT IN ('memory', 'memory_chunk')")
+        };
+        let run = |cond: &str, extra: Vec<String>| -> Result<Vec<VectorPoint>> {
+            let sql = format!(
+                "SELECT {COLS} FROM vectors {base} AND ({cond})
+                 ORDER BY file, start_line LIMIT {limit}"
+            );
+            let mut params = fparams.clone();
+            params.extend(extra);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(params), row_to_point)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        };
+        let exact = run("symbol = ?", vec![name.to_string()])?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        // `ends_with`, not `LIKE '%.name'`: `_` is a LIKE wildcard, so
+        // `get_x` would match `Foo.getAx` (and a leading `%` scans anyway).
+        run(
+            "ends_with(symbol, '.' || ?) OR ends_with(symbol, '::' || ?)",
+            vec![name.to_string(), name.to_string()],
+        )
     }
 
     /// Render a slice of floats as a DuckDB fixed-size array literal.
@@ -892,6 +1045,18 @@ impl Store {
         let _ = write!(s, "]::FLOAT[{}]", self.dim);
         s
     }
+}
+
+/// Escape `s` for a literal match inside an RE2 pattern.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Ordered SQL parameters for an INSERT row (vector is inlined separately).
@@ -1140,6 +1305,46 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// The per-function header of a grouped chunk is a whole `# ` line; code
+    /// in the group that merely reads `a > limit` is not a definition of
+    /// `limit`.
+    #[test]
+    fn a_grouped_definition_matches_the_header_line_not_the_code() {
+        let store = Store::open_in_memory(4).unwrap();
+        let grouped = |id: &str, text: &str| {
+            let mut p = point(id, &format!("{id}.js"));
+            p.text = text.into();
+            p.metadata.symbol = "a, b, c, d +2".into();
+            p.metadata.symbol_type = "grouped".into();
+            p.metadata.chunk_level = "function".into();
+            p
+        };
+        store
+            .upsert(&[
+                grouped(
+                    "code",
+                    "# code.js > check\nfunction check(a) {\n  return a > limit\n}",
+                ),
+                grouped(
+                    "def",
+                    "# def.js > other\nfunction other() {}\n\n# def.js > Box > limit\nfunction limit() {}",
+                ),
+                grouped("tail", "# tail.js > a\nfunction a() {}\n\n# tail.js > last"),
+            ])
+            .unwrap();
+        let ids = |name: &str| -> Vec<String> {
+            store
+                .symbol_definitions("demo", "main", name, 10)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect()
+        };
+        assert_eq!(ids("limit"), ["def"]);
+        assert_eq!(ids("last"), ["tail"], "a header on the last line");
+        assert!(ids("lim").is_empty(), "the name is matched whole");
+    }
+
     fn point(id: &str, file: &str) -> VectorPoint {
         VectorPoint {
             id: id.into(),
@@ -1233,6 +1438,38 @@ mod tests {
         drop(running);
         assert!(store.freeze(Duration::from_millis(200)));
         assert!(matches!(other.w().err(), Some(StoreError::Frozen)));
+    }
+
+    /// TASK-017 item 2: a panic inside the transaction used to leave `in_tx`
+    /// true, so the next transaction on the connection ran without its own
+    /// `BEGIN` (and nothing was rolled back).
+    #[test]
+    fn a_panic_inside_a_transaction_rolls_back_and_resets_in_tx() {
+        let store = Store::open_in_memory(4).unwrap();
+        store.upsert(&[point("old", "a.rs")]).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = store.in_transaction(|| {
+                store.delete_by_file("demo", "main", "a.rs")?;
+                panic!("die half-way");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert!(!store.in_tx.load(Ordering::SeqCst), "in_tx must be reset");
+        let ids = |s: &Store| -> Vec<String> {
+            s.scroll_all("demo", "main")
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect()
+        };
+        assert_eq!(ids(&store), vec!["old".to_string()], "rolled back");
+        // The next transaction is a real one again: a failure undoes it.
+        let failed: Result<()> = store.in_transaction(|| {
+            store.delete_by_file("demo", "main", "a.rs")?;
+            Err(StoreError::Decode("again".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(ids(&store), vec!["old".to_string()]);
     }
 
     /// One transaction is all or nothing, and an upsert inside it joins it
@@ -1472,5 +1709,120 @@ mod bench {
             "\nupsert {n} vectors (dim {DIM}):\n  row-wise: {row_wise:?}\n  batched : {batched:?}\n  speedup : {:.1}x\n",
             row_wise.as_secs_f64() / batched.as_secs_f64().max(1e-9)
         );
+    }
+}
+
+/// Rank candidate symbols against a name that matched nothing. Pure.
+fn rank_suggestions(name: &str, cands: Vec<String>, n: usize) -> Vec<String> {
+    let lname = name.to_lowercase();
+    let threshold = (lname.chars().count() / 3).max(2);
+    let mut scored: Vec<(u8, usize, String)> = Vec::new();
+    for c in cands {
+        let last = c.rsplit(['.', ':']).next().unwrap_or(&c).to_lowercase();
+        if last.is_empty() || c == name {
+            continue;
+        }
+        let dist = edit_distance(&lname, &last);
+        let class = if last == lname {
+            0
+        } else if last.starts_with(&lname) || last.ends_with(&lname) || last.contains(&lname) {
+            1
+        } else if dist <= threshold {
+            2
+        } else {
+            continue;
+        };
+        scored.push((class, dist, c));
+    }
+    scored.sort();
+    scored.dedup_by(|a, b| a.2 == b.2);
+    scored.into_iter().take(n).map(|(_, _, c)| c).collect()
+}
+
+/// Levenshtein distance over chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn suggestions_rank_exact_case_then_substring_then_edit_distance() {
+        let c = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let r = rank_suggestions(
+            "AuthServce",
+            c(&["AuthService", "Unrelated", "Other.Zzzz"]),
+            5,
+        );
+        assert_eq!(r[0], "AuthService");
+        assert!(!r.contains(&"Unrelated".to_string()));
+        let r = rank_suggestions("charge", c(&["Card.Charge", "Card.recharge", "zzz"]), 5);
+        assert_eq!(r[0], "Card.Charge");
+        assert_eq!(r[1], "Card.recharge");
+        assert_eq!(rank_suggestions("x1", c(&["x1"]), 5), Vec::<String>::new());
+    }
+
+    fn sym(id: &str, symbol: &str) -> VectorPoint {
+        VectorPoint {
+            id: id.into(),
+            vector: vec![0.0; 3],
+            text: String::new(),
+            metadata: VectorMetadata {
+                repo: "r".into(),
+                branch: "main".into(),
+                file: "a.rs".into(),
+                symbol: symbol.into(),
+                symbol_type: "function".into(),
+                chunk_level: "function".into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The candidate cap used to come without an order: past it, which names
+    /// survived was up to the scan, and one- or two-letter symbols (contained
+    /// in almost any name) filled it. The closest name must always be offered.
+    #[test]
+    fn the_closest_symbol_survives_a_flood_of_candidates() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut pts: Vec<VectorPoint> = (0..20000)
+            .map(|i| sym(&format!("n{i}"), &format!("authz_noise_{i:05}")))
+            .collect();
+        for (i, short) in ["a", "u", "t", "h", "se", "rv"].iter().enumerate() {
+            pts.push(sym(&format!("s{i}"), short));
+        }
+        pts.push(sym("g", "AuthService, other"));
+        pts.push(sym("want", "AuthService"));
+        store.upsert(&pts).unwrap();
+        for _ in 0..3 {
+            let r = store
+                .symbol_suggestions("r", "main", "AuthServce", 5)
+                .unwrap();
+            assert_eq!(r.first().map(String::as_str), Some("AuthService"), "{r:?}");
+            assert!(
+                !r.iter().any(|c| c.len() <= 2),
+                "short noise offered: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_distance_basics() {
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "ab"), 2);
+        assert_eq!(edit_distance("same", "same"), 0);
     }
 }

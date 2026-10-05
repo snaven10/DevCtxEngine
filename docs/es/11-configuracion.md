@@ -36,7 +36,15 @@ storage:
 
 indexing:
   exclude: []                  # patrones estilo .gitignore; ver docs/13
+  default_excludes: true       # rutas vendorizadas / generadas / de build; ver abajo
+  include_build: false         # true => vuelve a indexar el /build/ de la raíz del repo
   branches: []                 # ramas rastreadas; vacío => la que esté en checkout
+
+search:
+  penalty:                     # cuánto se degrada cada tipo de archivo; 1.0 = nada
+    test: 0.6
+    doc: 0.6
+    config: 0.6
 
 reranking:
   enabled: false               # opt-in; ver docs/08 ADR-15 para las mediciones
@@ -56,6 +64,41 @@ summarization:
 proyecto. `devctx init` deja ambos vacíos, así que el índice vive dentro del
 repositorio — y escribe `.devctx/.gitignore` con `state/` para que no se
 commitee. La config que hay al lado sí merece la pena trackearla.
+
+### Excludes por defecto
+
+Desde 0.9, una lista incorporada queda fuera del índice **aunque git la
+trackee** (`indexing.default_excludes: true`):
+
+| Patrón | Dónde aplica |
+|---|---|
+| `/build/`, `/target/` | solo en la **raíz del repositorio git** — `src/x/build/Builder.java` o un paquete Java llamado `target` son código |
+| `node_modules/`, `dist/`, `vendor/`, `third_party/`, `bower_components/` | a cualquier profundidad (un monorepo emite un `dist/` por paquete) |
+| `*.min.js`, `*.generated.*` | a cualquier profundidad |
+
+Son patrones `.gitignore`, y se agregan **antes** de `indexing.exclude`, así que
+una línea tuya puede anularlos. Opt-outs, del más angosto al más amplio:
+
+```yaml
+indexing:
+  include_build: true            # vuelve solo /build/
+  default_excludes: false        # toda la lista incorporada queda apagada
+  exclude:
+    - "!/target/"                # re-incluye el /target/ de la raíz
+    - "target/"                  # o: excluir target/ a CUALQUIER profundidad (Maven multi-módulo)
+```
+
+Cambiar cualquiera de estos (o actualizar a este release) no fuerza un reindexado
+completo: el siguiente `devctx index` **reconcilia** — borra los archivos que el
+conjunto ahora excluye, agrega los trackeados que ya no excluye, no re-embebe nada
+más, y registra cuántos archivos excluyó cada patrón (`the exclude set changed: N
+indexed file(s) are now excluded (/build/: 3, …)`). Recordá que el servidor en
+marcha se queda con la config con la que arrancó: primero `devctx serve --stop`
+(§6).
+
+`search.penalty` se explica en
+[Búsqueda](03-conceptos-fundamentales/busqueda.md#tipo-de-archivo-y-penalización);
+un factor mayor que `1.0` genera un aviso al cargar la config.
 
 **Cambiar el modelo de embedding** cambia el ancho de los vectores, que queda
 fijado al crear la base de datos. El indexado detecta el desajuste y reindexa
@@ -106,11 +149,16 @@ la copia del registro.
 | `DEVCTX_EMBED_ENDPOINT` | URL base para el provider de embeddings `custom`. |
 | `DEVCTX_EMBED_DIMENSION` | Ancho de vector para el provider `custom`, que no está en el registro. |
 | `DEVCTX_EMBED_MAX_CHARS` | Caracteres por texto que se le pasa al encoder. Default `4096`; `0` lo desactiva. Bajalo (ej. `2048`) en una máquina justa — ataca el relleno del lote, que es de donde viene el pico de memoria. |
-| `DEVCTX_EMBED_BATCH_SIZE` | Textos por lote del encoder. Default `32`. |
+| `DEVCTX_EMBED_BATCH_SIZE` | Textos por lote del encoder. Default `8` (era `32` antes de 0.8.5); los lotes corren uno tras otro, así que el pico de memoria escala con este valor. `0` o un valor no numérico vuelve al default. |
 | `DEVCTX_DB_MEMORY_LIMIT` | Presupuesto de memoria de DuckDB por proceso, cualquier literal de tamaño de DuckDB. Default `2GB`. |
 | `DEVCTX_DB_THREADS` | Hilos de trabajo de DuckDB. Default `4`. |
-| `DEVCTX_MODEL_IDLE_SECS` | Cuánto se mantiene cargado un modelo sin uso. Default `300`; `0` lo mantiene mientras viva el proceso. |
+| `DEVCTX_MODEL_IDLE_SECS` | Cuánto se mantiene cargado un modelo sin uso, en los servidores de proyecto y en el daemon central (que suelta su embedder y lo recarga en el siguiente `remember` / `recall`). Default `300`; `0` lo mantiene mientras viva el proceso. |
+| `DEVCTX_MODEL_STALL_SECS` | Segundos sin crecimiento de la caché de modelos antes de dar una descarga por atascada y fallar (el modelo queda rechazado hasta reiniciar el servidor). Default `120`; `0` desactiva la guardia. |
+| `DEVCTX_INDEX_STALL_SECS` | Cuánto puede pasar una corrida de indexado sin llegar a un archivo nuevo y aun así evitar la salida por inactividad del servidor. Default `900`. |
+| `DEVCTX_SHUTDOWN_GRACE_SECS` | Gracia que se da un servidor que se detiene antes de que el watchdog lo termine. Default y máximo `3` — solo se puede bajar, para que `serve --stop` nunca mande SIGKILL en mitad de un checkpoint. |
+| `DEVCTX_VANISH_POLL_MS` | Cada cuánto verifica un servidor que su directorio de proyecto siga existiendo. Default `10000`. |
 | `DEVCTX_MAX_OUTPUT_TOKENS` | Tope de un `read_file` completo sin rango de líneas. Default `8000`; `0` lo desactiva. |
+| `DEVCTX_DAEMON_TIMEOUT_SECS` | Cuánto espera una sesión MCP una llamada ruteada al servidor compartido antes de rendirse. Default `120`. `index_repo` queda en 1800 s fijos, porque indexar un repositorio grande puede tardar muchos minutos. |
 | `DEVCTX_NO_UPDATE_CHECK` | Optar por no hacer la verificación de releases en segundo plano. |
 | `DEVCTX_LANG` | Idioma del resumen agrupado de `--help` (`en` / `es`). |
 | `OPENAI_API_KEY` / `VOYAGE_API_KEY` | Credenciales de los providers de embeddings por API. |
@@ -171,15 +219,26 @@ quieres commitear antes de hacerlo.
 
 DuckDB permite un único proceso escritor por archivo, así que `devctx serve` pasa
 a ser el dueño exclusivo del store de un proyecto y el resto de comandos enrutan
-a él por HTTP. Se levanta solo en el primer uso y se apaga tras 15 minutos de
-inactividad.
+a él por HTTP — el CLI, la TUI, el tablero web y el MCP (que nunca abre la base
+por sí mismo). Se levanta solo en el primer uso con `--idle 900` (15 minutos), y
+escribe su stderr en `serve.log` junto a la base; los fallos de arranque citan el
+final de ese archivo.
 
 ```bash
 devctx serve                 # primer plano, este proyecto
-devctx serve --stop
+devctx serve --idle 600      # sale tras 600 s sin requests (0 = nunca)
+devctx serve --stop          # SIGTERM, espera la salida real; ver abajo
 devctx serve --central       # el store central en su lugar; ver docs/12
 DEVCTX_NO_AUTOSERVE=1 devctx search "…"    # abrir el store directamente
 ```
+
+`--stop` solo señala a un proceso que pueda verificar que es el servidor devctx de
+este proyecto (Linux: pidfd + `/proc`; macOS: `ps` + `lsof`; **Windows: no
+soportado**), cancela un índice en curso, espera el checkpoint final (hasta 65 s
+mientras un índice se desarma) y borra `serve.json` solo cuando el proceso ya no
+está. Si otro proceso retiene la base, los comandos fallan en unos dos segundos
+nombrando su PID. El ciclo de vida completo está en
+[Integración MCP](03-conceptos-fundamentales/integracion-mcp.md#ciclo-de-vida-y-fiabilidad).
 
 Como el servidor tiene el código cargado, **un binario recompilado no surte
 efecto hasta reiniciar el servidor que está corriendo** — haz `devctx serve

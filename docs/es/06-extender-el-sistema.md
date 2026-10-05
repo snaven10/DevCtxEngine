@@ -144,7 +144,7 @@ Tres obligaciones que no están en la firma:
    hace falta un embedder; ese camino perezoso es la razón de que indexar no
    pague por un modelo que nunca usa.
 3. **Agrupá en lotes.** `embed()` recibe muchos textos porque el encoder es
-   mucho más eficiente por texto con lote de 32 que con 1.
+   mucho más eficiente por texto en lote (el default es 8) que de a uno.
 
 Para un modelo local incorporado, agregá un `LocalModelSpec` a `LOCAL_MODELS` en
 `registry.rs` — clave, dimensión, idiomas y la nota que muestra

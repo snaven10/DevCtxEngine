@@ -163,6 +163,11 @@ It returns prose, capped at `max_tokens`, and **names what did not fit** rather
 than dropping it silently. If it says items were dropped, either raise the
 budget or narrow the query — do not assume you saw everything.
 
+In a group session the first line names the repository it answered from (and how
+many members it compared); if a warning says the choice was close or partial,
+pass `project` to choose. `kind` and `include_tests` filter the code like they do
+in `search`.
+
 ---
 
 ## The failure this protocol exists to prevent

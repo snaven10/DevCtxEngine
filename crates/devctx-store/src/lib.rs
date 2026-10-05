@@ -55,6 +55,26 @@ mod tests {
         }
     }
 
+    /// Build the BM25 index for a test that is *about* keyword search.
+    ///
+    /// The FTS extension is expected (bundled DuckDB installs it on first
+    /// use, and CI has the network for it), so its absence fails the test
+    /// rather than letting it pass with nothing asserted. An environment that
+    /// genuinely cannot load it opts out with `DEVCTX_TEST_ALLOW_NO_FTS=1`,
+    /// and the skip is then announced instead of silent.
+    fn require_fts(store: &Store, test: &str) -> bool {
+        if store.rebuild_fts().unwrap() {
+            return true;
+        }
+        assert!(
+            std::env::var_os("DEVCTX_TEST_ALLOW_NO_FTS").is_some(),
+            "{test}: the DuckDB FTS extension could not be loaded; set \
+             DEVCTX_TEST_ALLOW_NO_FTS=1 to skip keyword tests explicitly"
+        );
+        eprintln!("SKIPPED {test}: FTS unavailable (DEVCTX_TEST_ALLOW_NO_FTS)");
+        false
+    }
+
     fn seeded() -> Store {
         let store = Store::open_in_memory(DIM).unwrap();
         store
@@ -168,8 +188,8 @@ mod tests {
                 mk("c", "database connection pool setup"),
             ])
             .unwrap();
-        if !store.rebuild_fts().unwrap() {
-            return; // FTS extension unavailable.
+        if !require_fts(&store, "keyword_search") {
+            return;
         }
         let hits = store
             .keyword_search("database connection", &SearchFilter::default(), 5)

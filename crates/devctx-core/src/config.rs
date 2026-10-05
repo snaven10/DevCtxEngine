@@ -172,9 +172,54 @@ pub struct Storage {
     pub fts: bool,
 }
 
+/// Paths that are somebody else's code or build output, kept out of the index
+/// unless `indexing.default_excludes: false` (all of them) or
+/// `indexing.include_build: true` (just `build/`).
+///
+/// Written as `.gitignore` patterns, so `node_modules/` matches at any depth.
+/// They are applied *before* the user's `exclude`, which can therefore
+/// re-include with a `!` rule (`!vendor/`, `!/target/`).
+///
+/// `build/` and `target/` are anchored to the root of the *git repository*
+/// (`/build/`, `/target/`; PLAN-008 Q-3) — not to the DevCtxEngine project,
+/// which may be a subdirectory of it: the patterns are matched against
+/// repo-relative paths. Nested, both are ordinary names for source —
+/// `src/x/build/Builder.java`, a Java package `com.acme.target` — while the
+/// output of Cargo, Gradle or a root `npm run build` lands at the root. A
+/// multi-module build that tracks per-module output adds `target/` (any depth)
+/// to `exclude`. `dist/` stays at any depth: a monorepo emits one per package,
+/// and it is not a name anyone gives a source directory.
+pub const DEFAULT_EXCLUDES: &[&str] = &[
+    "node_modules/",
+    "/target/",
+    "dist/",
+    "/build/",
+    "vendor/",
+    "third_party/",
+    "bower_components/",
+    "*.min.js",
+    "*.generated.*",
+];
+
 /// `indexing:` section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Indexing {
+    /// Keep vendor / generated / build-output paths ([`DEFAULT_EXCLUDES`]) out
+    /// of the index even when git tracks them. Default `true`; `false` turns
+    /// the whole list off. Changing it (or `include_build`, or `exclude`)
+    /// makes the next `index` *reconcile* the index against the new set —
+    /// prune the files it now excludes, add the tracked files it no longer
+    /// excludes — without re-embedding anything else; the reconcile logs how
+    /// many files each pattern excluded.
+    #[serde(default = "default_true")]
+    pub default_excludes: bool,
+
+    /// Opt the root `/build/` back in while the other defaults stay on. For repositories
+    /// where `build/` is source (Gradle `buildSrc`-style layouts, a Java
+    /// package named `build`) rather than output.
+    #[serde(default)]
+    pub include_build: bool,
+
     /// Paths to keep out of the index, written as `.gitignore` patterns
     /// (`target/`, `*.generated.ts`, `docs/vendor/**`).
     ///
@@ -208,7 +253,35 @@ pub struct Indexing {
     pub branches: Vec<String>,
 }
 
+impl Default for Indexing {
+    fn default() -> Self {
+        Indexing {
+            default_excludes: true,
+            include_build: false,
+            exclude: Vec::new(),
+            branches: Vec::new(),
+        }
+    }
+}
+
 impl Indexing {
+    /// The patterns the index actually applies: the defaults (unless turned
+    /// off, and minus `build/` under `include_build`), then the user's own
+    /// `exclude` so a later `!pattern` can re-include one.
+    pub fn effective_excludes(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if self.default_excludes {
+            out.extend(
+                DEFAULT_EXCLUDES
+                    .iter()
+                    .filter(|p| !(self.include_build && **p == "/build/"))
+                    .map(|p| p.to_string()),
+            );
+        }
+        out.extend(self.exclude.iter().cloned());
+        out
+    }
+
     /// The branch to act on when none was named.
     ///
     /// `None` means "use whatever is checked out" — the behaviour of every
@@ -225,6 +298,20 @@ impl Indexing {
     pub fn tracks(&self, branch: &str) -> bool {
         self.branches.is_empty() || self.branches.iter().any(|b| b == branch)
     }
+}
+
+/// `search:` section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchCfg {
+    /// How far tests / docs / config hits are demoted (`0.6` each by
+    /// default). Not a score multiplier: the factor becomes a number of
+    /// *positions* — `round((1 − f) × 10)`, so `0.6` ranks such a hit as if it
+    /// were 4 places lower — because scores have no common scale across modes
+    /// (cosines cluster around 0.6–0.85, RRF is rank-based, cross-encoder
+    /// logits are unbounded). `1.0` stops demoting a kind; `0.0` sends it to
+    /// the end of the list. See `devctx_core::KindPenalty`.
+    #[serde(default)]
+    pub penalty: crate::kind::KindPenalty,
 }
 
 /// `reranking:` section.
@@ -366,6 +453,9 @@ pub struct ProjectConfig {
     /// `indexing:` section.
     #[serde(default)]
     pub indexing: Indexing,
+    /// `search:` section.
+    #[serde(default)]
+    pub search: SearchCfg,
     /// `reranking:` section.
     #[serde(default)]
     pub reranking: Reranking,
@@ -384,7 +474,13 @@ impl ProjectConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw =
             std::fs::read_to_string(path).map_err(|e| Error::ConfigRead(path.to_path_buf(), e))?;
-        Self::from_yaml(&raw).map_err(|e| Error::ConfigParse(path.to_path_buf(), e))
+        let cfg = Self::from_yaml(&raw).map_err(|e| Error::ConfigParse(path.to_path_buf(), e))?;
+        for w in cfg.search.penalty.warnings() {
+            if first_warning(path, &w) {
+                eprintln!("warning: {}: {w}", path.display());
+            }
+        }
+        Ok(cfg)
     }
 
     /// Discover the config by walking up from `start_dir`, then load it.
@@ -413,6 +509,20 @@ impl ProjectConfig {
         };
         base.join(".devctx").join("state").join("index.duckdb")
     }
+}
+
+/// Whether this `(config, warning)` pair is new to this process (fixup H,
+/// M-5). A long-lived process (the MCP server) loads every group member's
+/// config on each selection, so a config warning printed on every load buried
+/// stderr; it is said once per file and message.
+fn first_warning(path: &Path, warning: &str) -> bool {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((path.to_path_buf(), warning.to_string()))
 }
 
 /// Walk up from `start_dir` looking for `.devctx/config.yaml`.
@@ -501,6 +611,18 @@ pub fn detect_default_branch(repo: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Fixup H (M-5): a config warning is said once per file and message per
+    /// process, however often the config is loaded.
+    #[test]
+    fn a_config_warning_is_said_once_per_file() {
+        let a = Path::new("/nonexistent/fixup-h/a/.devctx/config.yaml");
+        let b = Path::new("/nonexistent/fixup-h/b/.devctx/config.yaml");
+        assert!(first_warning(a, "w1"));
+        assert!(!first_warning(a, "w1"), "the second load must stay quiet");
+        assert!(first_warning(a, "w2"), "another message is news");
+        assert!(first_warning(b, "w1"), "another file is news");
+    }
+
     /// The first entry is the default; an empty list keeps the old behaviour of
     /// following whatever is checked out, so an existing repository does not
     /// change meaning by upgrading.
@@ -567,6 +689,52 @@ mod tests {
                 .unwrap();
         assert_eq!(cfg.embeddings.device, Device::Cuda);
         assert_eq!(cfg.reranking.device, Device::Cuda);
+    }
+
+    #[test]
+    fn default_excludes_are_on_and_include_build_drops_only_build() {
+        let cfg = ProjectConfig::from_yaml("{}").unwrap();
+        assert!(cfg.indexing.default_excludes);
+        let ex = cfg.indexing.effective_excludes();
+        for p in ["node_modules/", "/target/", "dist/", "/build/"] {
+            assert!(ex.iter().any(|e| e == p), "{p} missing from {ex:?}");
+        }
+
+        let cfg =
+            ProjectConfig::from_yaml("indexing:\n  include_build: true\n  exclude: [\"x/\"]\n")
+                .unwrap();
+        let ex = cfg.indexing.effective_excludes();
+        assert!(!ex.iter().any(|e| e.contains("build")));
+        assert!(ex.iter().any(|e| e == "dist/"));
+        assert_eq!(
+            ex.last().map(String::as_str),
+            Some("x/"),
+            "user rules go last"
+        );
+
+        let cfg = ProjectConfig::from_yaml("indexing:\n  default_excludes: false\n").unwrap();
+        assert!(cfg.indexing.effective_excludes().is_empty());
+    }
+
+    #[test]
+    fn a_penalty_factor_above_one_is_warned_about() {
+        let cfg = ProjectConfig::from_yaml("search:\n  penalty:\n    doc: 1.5\n").unwrap();
+        let w = cfg.search.penalty.warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("search.penalty.doc") && w[0].contains("no"),
+            "{w:?}"
+        );
+        assert!(crate::kind::KindPenalty::default().warnings().is_empty());
+    }
+
+    #[test]
+    fn search_penalty_parses_with_per_kind_defaults() {
+        let cfg = ProjectConfig::from_yaml("search:\n  penalty:\n    test: 0.3\n").unwrap();
+        assert_eq!(cfg.search.penalty.test, 0.3);
+        assert_eq!(cfg.search.penalty.doc, 0.6);
+        let cfg = ProjectConfig::from_yaml("{}").unwrap();
+        assert_eq!(cfg.search.penalty.config, 0.6);
     }
 
     #[test]

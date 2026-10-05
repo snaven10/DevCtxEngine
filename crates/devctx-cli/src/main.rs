@@ -125,6 +125,13 @@ enum Command {
         /// Hybrid search: fuse vector + keyword (BM25) via reciprocal rank fusion.
         #[arg(long)]
         hybrid: bool,
+        /// Keep only one kind of file: code, test, doc or config. Without it,
+        /// tests/docs/config are demoted in the ranking, not excluded.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Drop test files from the results (they are only demoted by default).
+        #[arg(long)]
+        no_tests: bool,
     },
     /// Run the MCP server over stdio, or `mcp configure` a client.
     Mcp {
@@ -525,7 +532,21 @@ fn main() -> Result<()> {
             no_rerank,
             keyword,
             hybrid,
-        } => cmd_search(query, limit, language, format, no_rerank, keyword, hybrid),
+            kind,
+            no_tests,
+        } => cmd_search(
+            query,
+            limit,
+            language,
+            format,
+            no_rerank,
+            keyword,
+            hybrid,
+            devctx_search::KindSel {
+                kind,
+                include_tests: no_tests.then_some(false),
+            },
+        ),
         Command::Mcp { project, action } => match action {
             None => cmd_mcp(project),
             Some(McpAction::Configure {
@@ -1019,6 +1040,38 @@ fn choose_model(
     Ok(out)
 }
 
+/// Where a model's files stand when `init` is about to write its config.
+#[derive(Debug, PartialEq, Eq)]
+enum ModelFiles {
+    /// Usable: the directory to record (empty for a built-in model).
+    Ready(String),
+    /// Missing, and `init` may fetch them once the answers are confirmed.
+    Fetch,
+    /// Missing, and nothing may fetch them: not a config to write.
+    Missing,
+}
+
+/// Decide what `init` records as `model_dir`. Pure, so the "never an empty
+/// one for a model that needs files" rule is tested without a terminal.
+fn model_files(
+    builtin: bool,
+    current_dir: &str,
+    on_disk: Option<PathBuf>,
+    will_fetch: bool,
+) -> ModelFiles {
+    if builtin {
+        return ModelFiles::Ready(current_dir.to_string());
+    }
+    if !current_dir.is_empty() {
+        return ModelFiles::Ready(current_dir.to_string());
+    }
+    match on_disk {
+        Some(dir) => ModelFiles::Ready(dir.to_string_lossy().into_owned()),
+        None if will_fetch => ModelFiles::Fetch,
+        None => ModelFiles::Missing,
+    }
+}
+
 /// The sentence for a user-defined ONNX model whose files are not on disk.
 fn missing_files_message(key: &str) -> String {
     format!(
@@ -1355,7 +1408,10 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
         .with_context(|| format!("invalid --addr `{addr}`"))?;
     let token = token.or_else(|| std::env::var("DEVCTX_API_TOKEN").ok());
 
-    let central = Central::open().context("opening the central store")?;
+    let central = match Central::open() {
+        Ok(c) => c,
+        Err(e) => return central_open_failed(&paths, anyhow::Error::from(e)),
+    };
     println!("DevCtxEngine central store → http://{addr}");
     println!("  Database: {}", paths.db.display());
     println!("  Config:   {}", paths.config.display());
@@ -1366,15 +1422,54 @@ fn cmd_serve_central(addr: String, token: Option<String>, idle: u64, stop: bool)
     // past a taken one, and the file has to name where the daemon actually is.
     let announce_paths = paths.clone();
     let announce_token = token.clone();
-    let result = devctx_api::central::run_blocking(central, socket, token, idle, move |bound| {
-        let _ = devctx_central::client::write_serve_file(
-            &announce_paths,
-            bound,
-            announce_token.as_deref(),
-        );
-    });
+    let exit_paths = paths.clone();
+    let result = devctx_api::central::run_blocking(
+        central,
+        socket,
+        token,
+        idle,
+        move |bound| {
+            let _ = devctx_central::client::write_serve_file(
+                &announce_paths,
+                bound,
+                announce_token.as_deref(),
+            );
+        },
+        // The idle exit ends in `_exit`: the advertisement goes first.
+        move || devctx_central::client::remove_own_serve_file(&exit_paths),
+    );
     devctx_central::client::remove_own_serve_file(&paths);
     result
+}
+
+/// How long a central daemon that lost the lock waits for the winner to
+/// advertise itself before the lock counts as someone else's problem.
+const CENTRAL_RACE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The central store would not open. When it is the lock and another central
+/// daemon is (or comes up within [`CENTRAL_RACE_WAIT`] as) the advertised one,
+/// this process simply lost a start-up race — several `index` runs on one
+/// `DEVCTX_HOME` spawn several daemons — so it says that in one line and ends
+/// quietly. Anything else is the error it always was.
+fn central_open_failed(paths: &CentralPaths, e: anyhow::Error) -> Result<()> {
+    let text = format!("{e:#}");
+    if remote::is_lock_error(&text) {
+        let deadline = std::time::Instant::now() + CENTRAL_RACE_WAIT;
+        loop {
+            if devctx_central::client::discover(paths).is_some() {
+                eprintln!(
+                    "another central daemon is running for {}; this one exits",
+                    paths.dir.display()
+                );
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    Err(e.context("opening the central store"))
 }
 
 /// `devctx web` — serve the web dashboard (call-graph + memories) locally.
@@ -2129,7 +2224,15 @@ fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Resu
              (or run any indexing command, which spawns it)"
         );
     };
-    println!("{}", r.build_context(&query, max_tokens, include_memories)?);
+    println!(
+        "{}",
+        r.build_context(
+            &query,
+            max_tokens,
+            include_memories,
+            &devctx_search::KindSel::default()
+        )?
+    );
     Ok(())
 }
 
@@ -2419,7 +2522,42 @@ fn cmd_summarize(path: PathBuf, query: Option<String>, tokens: Option<usize>) ->
 fn cmd_routes(method: Option<String>, path: Option<String>) -> Result<()> {
     let cfg = load_project()?;
     if let Some(r) = remote::ensure_cli(&cfg)? {
-        println!("{}", r.routes(method.as_deref(), path.as_deref())?);
+        let raw = r.routes(method.as_deref(), path.as_deref())?;
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        // The object of the output contract, or the bare array of a server
+        // older than 0.9.
+        let answer = devctx_core::search_hits(&value);
+        if let Some(f) = &answer.branch_fallback {
+            let why = f.get("why").and_then(|w| w.as_str()).unwrap_or_default();
+            eprintln!("· branch_fallback: {why}");
+        }
+        if let Some(w) = answer.warning.as_ref().and_then(|w| w.as_str()) {
+            eprintln!("· warning: {w}");
+        }
+        if let Some(line) = omitted_line(answer.omitted.as_ref()) {
+            eprintln!("· {line}");
+        }
+        if answer.hits.is_empty() {
+            println!("No routes.");
+            return Ok(());
+        }
+        for h in &answer.hits {
+            let s = |k| h.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            let handler = if s("handler").is_empty() {
+                "-"
+            } else {
+                s("handler")
+            };
+            println!(
+                "{:6} {}  [{}] {} ({}:{})",
+                s("method"),
+                s("path"),
+                s("framework"),
+                handler,
+                s("file"),
+                h.get("line").and_then(|v| v.as_i64()).unwrap_or(0)
+            );
+        }
         return Ok(());
     }
     let store = open_store(&cfg, configured_dimension(&cfg))?;
@@ -3057,6 +3195,27 @@ fn cmd_init(
         defaults.reranking = r.clone();
     }
 
+    // Whatever model ends up configured — picked, copied or inherited from the
+    // machine's defaults — a user-defined ONNX one never goes into the config
+    // with an empty `model_dir`: the first index would fail much later, on a
+    // path that names nothing.
+    let mut fetch_key: Option<String> = None;
+    if defaults.embeddings.provider == "local" {
+        let key = defaults.embeddings.model.clone();
+        if let Some(spec) = devctx_embed::registry::find_local(&key) {
+            match model_files(
+                spec.builtin.is_some(),
+                &defaults.embeddings.model_dir,
+                models::local_dir(&key),
+                will_fetch,
+            ) {
+                ModelFiles::Ready(dir) => defaults.embeddings.model_dir = dir,
+                ModelFiles::Fetch => fetch_key = Some(key),
+                ModelFiles::Missing => bail!(missing_files_message(&key)),
+            }
+        }
+    }
+
     if !yes {
         println!(
             "\n{}",
@@ -3073,11 +3232,9 @@ fn cmd_init(
 
     // The files are fetched only now, once the person has confirmed (or there
     // was nobody to ask and `--download` said so): not before the summary.
-    if let Some(key) = &answers.model {
-        if will_fetch && defaults.embeddings.model_dir.is_empty() {
-            let dir = models::download(key)?;
-            defaults.embeddings.model_dir = dir.to_string_lossy().into_owned();
-        }
+    if let Some(key) = &fetch_key {
+        let dir = models::download(key)?;
+        defaults.embeddings.model_dir = dir.to_string_lossy().into_owned();
     }
 
     // Taken before `base` swallows the `None` case: a project that was NOT
@@ -3110,6 +3267,7 @@ fn cmd_init(
             .or(defaults.storage)
             .unwrap_or_default(),
         indexing: answers.indexing.clone().unwrap_or(base.indexing),
+        search: base.search,
         reranking: defaults.reranking,
         summarization: answers.summarization.clone().unwrap_or(base.summarization),
     };
@@ -3420,7 +3578,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         model_name: &cfg.embeddings.model,
         progress: Some(&progress),
         paths: None,
-        exclude: &cfg.indexing.exclude,
+        exclude: &cfg.indexing.effective_excludes(),
         branch: branch.as_deref(),
     })?;
     progress.finish();
@@ -3596,6 +3754,7 @@ fn cmd_repair() -> Result<()> {
 const DEFAULT_DIM: usize = 768;
 
 /// `devctx search` — vector / keyword / hybrid search, then optional rerank.
+#[allow(clippy::too_many_arguments)]
 fn cmd_search(
     query: String,
     limit: usize,
@@ -3604,8 +3763,13 @@ fn cmd_search(
     no_rerank: bool,
     keyword: bool,
     hybrid: bool,
+    sel: devctx_search::KindSel,
 ) -> Result<()> {
     let cfg = load_project()?;
+    // Validate before anything starts a server or loads a model.
+    let rank = sel
+        .options(cfg.search.penalty)
+        .map_err(|e| anyhow::anyhow!(e))?;
     if let Some(r) = remote::ensure_cli(&cfg)? {
         let mode = if hybrid {
             "hybrid"
@@ -3614,7 +3778,7 @@ fn cmd_search(
         } else {
             "vector"
         };
-        let json = r.search(&query, limit, language.as_deref(), mode, !no_rerank)?;
+        let json = r.search(&query, limit, language.as_deref(), mode, !no_rerank, &sel)?;
         print_remote_search(&json, format)?;
         return Ok(());
     }
@@ -3659,7 +3823,7 @@ fn cmd_search(
         None
     };
 
-    let hits = devctx_search::search(
+    let hits = devctx_search::search_ranked(
         &store,
         &query,
         &filter,
@@ -3667,6 +3831,7 @@ fn cmd_search(
         mode,
         embedder.as_deref(),
         reranker.as_deref(),
+        &rank,
     )?;
 
     let out = match format {
@@ -3759,12 +3924,18 @@ fn short_commit(commit: &str) -> &str {
 #[derive(Serialize)]
 struct SearchHitOut<'a> {
     score: f32,
+    /// The retriever's score when `score` was rewritten (penalty, rerank).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_score: Option<f32>,
     file: &'a str,
     start_line: i32,
     end_line: i32,
     symbol: &'a str,
     symbol_type: &'a str,
     level: &'a str,
+    language: &'a str,
+    /// `code` / `test` / `doc` / `config`, as the kind penalty judged it.
+    kind: &'static str,
     text: &'a str,
 }
 
@@ -3772,30 +3943,60 @@ fn hit_out(h: &SearchResult) -> SearchHitOut<'_> {
     let m = &h.point.metadata;
     SearchHitOut {
         score: h.score,
+        raw_score: h.raw_score,
         file: &m.file,
         start_line: m.start_line,
         end_line: m.end_line,
         symbol: &m.symbol,
         symbol_type: &m.symbol_type,
         level: &m.chunk_level,
+        language: &m.language,
+        kind: devctx_core::path_kind(&m.file, &m.language).as_str(),
         text: &h.point.text,
     }
 }
 
+/// The `--format json` answer: the object of the output contract
+/// (`devctx_core::hits`), `{ "results": [...] }`, like the server's `/search`.
 fn render_json(hits: &[SearchResult]) -> Result<String> {
-    let out: Vec<SearchHitOut> = hits.iter().map(hit_out).collect();
-    Ok(serde_json::to_string_pretty(&out)?)
+    let results: Vec<SearchHitOut> = hits.iter().map(hit_out).collect();
+    Ok(serde_json::to_string_pretty(
+        &serde_json::json!({ "results": results }),
+    )?)
+}
+
+/// One line saying what an answer left out, from its `omitted` note
+/// (`{count, reason, next_offset?}`); `None` when nothing was.
+fn omitted_line(omitted: Option<&serde_json::Value>) -> Option<String> {
+    let o = omitted?;
+    let count = o.get("count").and_then(|c| c.as_u64()).filter(|c| *c > 0)?;
+    let reason = o.get("reason").and_then(|r| r.as_str()).unwrap_or("budget");
+    let more = match o.get("next_offset").and_then(|n| n.as_u64()) {
+        Some(n) => format!("; next offset {n}"),
+        None => String::new(),
+    };
+    Some(format!("Note: {count} more left out ({reason}){more}"))
 }
 
 /// Render a server's `/search` JSON response in the requested output format,
 /// matching the local table layout so routing is transparent.
 fn print_remote_search(json: &str, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{json}"),
+        OutputFormat::Json => {
+            // The contract is an object; a server older than 0.9 sends a bare
+            // array when it has nothing to add, so wrap it.
+            match serde_json::from_str::<serde_json::Value>(json) {
+                Ok(serde_json::Value::Array(results)) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "results": results }))?
+                ),
+                _ => println!("{json}"),
+            }
+        }
         OutputFormat::Table => {
             let hits: serde_json::Value = serde_json::from_str(json)?;
-            // Bare array, or `{results, branch_fallback, ...}` when the serve
-            // answered from another branch or truncated to budget.
+            // The object of the output contract, or the bare array of a server
+            // older than 0.9; `search_hits` reads both.
             let answer = devctx_core::search_hits(&hits);
             if let Some(f) = &answer.branch_fallback {
                 println!("Note: answered from another branch: {f}");
@@ -3807,6 +4008,9 @@ fn print_remote_search(json: &str, format: OutputFormat) -> Result<()> {
                         .map(str::to_string)
                         .unwrap_or_else(|| w.to_string())
                 );
+            }
+            if let Some(line) = omitted_line(answer.omitted.as_ref()) {
+                println!("{line}");
             }
             if answer.hits.is_empty() {
                 println!("No results.");
@@ -3854,6 +4058,29 @@ fn render_table(hits: &[SearchResult]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// TASK-017 item 6: the rule for the `model_dir` `init` records.
+    #[test]
+    fn a_model_that_needs_files_never_gets_an_empty_model_dir() {
+        use super::{model_files, ModelFiles};
+        use std::path::PathBuf;
+        let on_disk = || Some(PathBuf::from("/m/ml-granite"));
+        assert_eq!(
+            model_files(true, "", None, false),
+            ModelFiles::Ready("".into())
+        );
+        assert_eq!(
+            model_files(false, "/x", None, false),
+            ModelFiles::Ready("/x".into())
+        );
+        assert_eq!(
+            model_files(false, "", on_disk(), false),
+            ModelFiles::Ready("/m/ml-granite".into())
+        );
+        assert_eq!(model_files(false, "", None, true), ModelFiles::Fetch);
+        // Offline (or no one to ask): no files and no way to get them.
+        assert_eq!(model_files(false, "", None, false), ModelFiles::Missing);
+    }
+
     /// m-5: `init` downloads hundreds of MB only where someone is there to
     /// want it, and never against an offline setting.
     #[test]
@@ -3981,6 +4208,7 @@ mod tests {
     fn hit(file: &str, symbol: &str, score: f32) -> SearchResult {
         SearchResult {
             score,
+            raw_score: None,
             point: VectorPoint {
                 id: "id".into(),
                 vector: vec![],
@@ -4018,6 +4246,33 @@ mod tests {
         assert!(out.contains("\"symbol\": \"foo\""));
         assert!(out.contains("\"start_line\": 3"));
         assert!(!out.contains("vector"));
+    }
+
+    /// `--format json` is the object of the output contract, never a bare array.
+    #[test]
+    fn json_is_an_object_with_results() {
+        let out = render_json(&[hit("src/a.rs", "foo", 0.5)]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.is_object(), "{out}");
+        assert_eq!(v["results"].as_array().unwrap().len(), 1);
+        let empty: serde_json::Value = serde_json::from_str(&render_json(&[]).unwrap()).unwrap();
+        assert_eq!(empty["results"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn omitted_line_names_count_reason_and_next_page() {
+        let o = serde_json::json!({"count": 25, "reason": "limit", "next_offset": 20});
+        assert_eq!(
+            omitted_line(Some(&o)).unwrap(),
+            "Note: 25 more left out (limit); next offset 20"
+        );
+        let b = serde_json::json!({"count": 2, "reason": "budget"});
+        assert_eq!(
+            omitted_line(Some(&b)).unwrap(),
+            "Note: 2 more left out (budget)"
+        );
+        assert!(omitted_line(Some(&serde_json::json!({"count": 0}))).is_none());
+        assert!(omitted_line(None).is_none());
     }
 
     #[test]

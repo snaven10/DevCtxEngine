@@ -14,34 +14,31 @@ use std::process::{Child, Command};
 /// half-finished downloads in the way of whoever ran next. The cache is content
 /// addressed and read-only once filled, so sharing it is safe.
 ///
-/// `DEVCTX_MODEL_CACHE` if the caller set it, otherwise a cache of the tests'
-/// own under the cargo target directory (`test-model-cache`): never the user's
-/// real `~/.local/share/devctx/models`, which a test run must not read, fill
-/// or race a running server over. The first run that needs a model downloads
-/// it into the dedicated cache; later runs reuse it.
+/// Under cargo, `.cargo/config.toml` `[env]` sets `DEVCTX_MODEL_CACHE` to
+/// `<workspace>/.devctx-test-models` unless the caller already set it, so that
+/// is what this reads. It sits OUTSIDE `target/` on purpose: `cargo clean` must
+/// not delete ~90 MB of models, and `[env]` cannot follow `CARGO_TARGET_DIR`
+/// anyway. Run directly (no cargo), the same directory is the fallback. Never
+/// the user's real `~/.local/share/devctx/models`, which a test run must not
+/// read, fill or race a running server over.
 pub fn shared_model_cache() -> PathBuf {
     resolve_model_cache(
         std::env::var_os("DEVCTX_MODEL_CACHE"),
-        std::env::var_os("CARGO_TARGET_DIR"),
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
 }
 
-/// The pure part of [`shared_model_cache`].
-pub fn resolve_model_cache(
-    explicit: Option<std::ffi::OsString>,
-    target_dir: Option<std::ffi::OsString>,
-    manifest_dir: &Path,
-) -> PathBuf {
+/// The pure part of [`shared_model_cache`]: an explicit, non-empty value wins;
+/// otherwise the workspace's `.devctx-test-models`.
+pub fn resolve_model_cache(explicit: Option<std::ffi::OsString>, manifest_dir: &Path) -> PathBuf {
     if let Some(explicit) = explicit.filter(|v| !v.is_empty()) {
         return PathBuf::from(explicit);
     }
-    let target = target_dir
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        // crates/<name> -> workspace root -> target
-        .unwrap_or_else(|| manifest_dir.join("..").join("..").join("target"));
-    target.join("test-model-cache")
+    // crates/<name> -> workspace root
+    manifest_dir
+        .join("..")
+        .join("..")
+        .join(".devctx-test-models")
 }
 
 /// Make `home/models` (a test's `DEVCTX_HOME`) point at [`shared_model_cache`].
@@ -169,4 +166,87 @@ pub fn reap_servers_under(root: &Path) {
     if !left.is_empty() && !std::thread::panicking() {
         panic!("devctx serve process(es) {left:?} outlived the test under {root:?}");
     }
+}
+
+/// `Child::wait_with_output` with a deadline: a CLI that hangs fails the test
+/// that started it instead of hanging the whole suite.
+///
+/// The child's piped stdout and stderr are drained on their own threads (a
+/// full pipe would otherwise block it for good). On timeout the child is
+/// killed and `Err` carries what it had printed so far.
+pub fn wait_with_timeout(
+    mut child: Child,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    // Each reader reports through a channel and is never joined on the
+    // timeout path: a grandchild (an auto-spawned `serve`) that inherited the
+    // pipe keeps it open after the child is killed, the read then never sees
+    // EOF, and joining would hang exactly what this function prevents.
+    //
+    // It forwards every chunk as it arrives instead of one buffer at EOF: with
+    // the pipe held by a grandchild there is no EOF, and whatever the child
+    // had printed was lost with it. That is not only an auto-spawned server:
+    // `sh -c "echo started; sleep 60"` under dash (Ubuntu's `sh`, CI's)
+    // forks `sleep` instead of exec'ing it, and killing the shell leaves the
+    // sleep holding the pipe — under bash the same line passed by accident.
+    fn drain<R: Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let Some(mut r) = r else { return };
+            let mut chunk = [0u8; 8192];
+            loop {
+                match r.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        rx
+    }
+    // What a reader delivered until its pipe closed or `until` passed; chunks
+    // already received are kept even when the deadline is already gone.
+    fn collect(rx: &mpsc::Receiver<Vec<u8>>, until: Instant) -> Vec<u8> {
+        let mut buf = Vec::new();
+        while let Ok(c) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            buf.extend_from_slice(&c);
+        }
+        buf
+    }
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // What it printed, if the pipes close promptly; not waited for.
+                let grace = Instant::now() + Duration::from_millis(500);
+                let said = String::from_utf8_lossy(&collect(&out, grace)).into_owned()
+                    + &String::from_utf8_lossy(&collect(&err, grace));
+                return Err(format!("still running after {limit:?}:\n{said}"));
+            }
+        }
+    };
+    // The child exited; its output ends with it unless something it started
+    // still holds the pipe: bounded as well, so that cannot hang either.
+    let rest = Instant::now() + Duration::from_secs(10);
+    Ok(std::process::Output {
+        status,
+        stdout: collect(&out, rest),
+        stderr: collect(&err, rest),
+    })
 }

@@ -95,7 +95,7 @@ Two environment variables, both mattering only when the machine is tight:
 | Variable | Default | Effect |
 |---|---|---|
 | `DEVCTX_EMBED_MAX_CHARS` | 4096 | Characters per text fed to the encoder. `0` disables the cap. |
-| `DEVCTX_EMBED_BATCH_SIZE` | 32 | Texts per encoder batch. |
+| `DEVCTX_EMBED_BATCH_SIZE` | 8 | Texts per encoder batch. |
 
 These interact. A single very long chunk pads the entire batch to its length, so
 a large batch *and* a high character cap is what produces the memory spike — not

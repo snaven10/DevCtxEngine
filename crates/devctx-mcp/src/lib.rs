@@ -54,6 +54,15 @@ struct SearchReq {
     /// more than the exact ordering.
     #[serde(default)]
     rerank: Option<bool>,
+    /// Keep only one kind of file: "code", "test", "doc" or "config". Without
+    /// it tests, docs, READMEs and SQL/YAML/JSON still appear but rank below
+    /// code (a ranking penalty, not an exclusion).
+    #[serde(default)]
+    kind: Option<String>,
+    /// `false` drops test files from the results (default true: they are only
+    /// demoted). An explicit `kind` wins over this.
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 /// Parameters for the `read_file` tool.
@@ -153,6 +162,12 @@ struct SearchProjectReq {
     /// "vector" (default), "keyword", or "hybrid".
     #[serde(default)]
     mode: Option<String>,
+    /// Keep only one kind of file: "code", "test", "doc" or "config".
+    #[serde(default)]
+    kind: Option<String>,
+    /// `false` drops test files (default true: they are only demoted).
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 /// Parameters for the `list_projects` tool.
@@ -196,6 +211,15 @@ struct PlanStatusReq {
     /// Plan id (PLAN-005 or 5). Omit to list plans.
     #[serde(default)]
     plan: Option<String>,
+    /// List only plans with unresolved tasks (default false).
+    #[serde(default)]
+    active_only: Option<bool>,
+    /// Plans per page of the list, newest first (default 25).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip this many plans (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 /// Parameters for the `memory_context` tool.
@@ -230,6 +254,14 @@ struct ReadSymbolReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct BuildContextReq {
+    /// Build the brief from a different project than the one bound (this call
+    /// only): a registered name or a path inside it — in a group session, a
+    /// member of the group. In a group session without it, the members whose
+    /// servers are running are compared and the best match answers, named with
+    /// how many members were scored; a close call adds an "ambiguous" warning
+    /// naming the others. Pass it to choose.
+    #[serde(default)]
+    project: Option<String>,
     /// What context is needed, in natural language.
     query: String,
     /// Token budget for the whole brief (default 4096). A hard stop: whatever
@@ -239,6 +271,12 @@ struct BuildContextReq {
     /// Include recalled and linked memories (default true).
     #[serde(default)]
     include_memories: Option<bool>,
+    /// `code` | `test` | `doc` | `config`: keep only that kind of file.
+    #[serde(default)]
+    kind: Option<String>,
+    /// `false` drops test files from the code (default true: tests rank lower).
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 /// Parameters for the `memories_by_symbol` tool.
@@ -250,22 +288,40 @@ struct BuildContextReq {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct MemoriesBySymbolReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
     /// The symbol name. Bare (`charge`) or qualified (`src/pay.rs::charge`).
     symbol: String,
-    /// Maximum memories to return (default 10).
+    /// Maximum memories to return (default 5).
     #[serde(default)]
     limit: Option<usize>,
+    /// Skip this many memories (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Return each memory's whole content (default: cut to 600 characters).
+    #[serde(default)]
+    full: Option<bool>,
 }
 
 /// Parameters for the `memories_by_file` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct MemoriesByFileReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
     /// Repository-relative path, as reported by `search` or `read_symbol`.
     file: String,
-    /// Maximum memories to return (default 10).
+    /// Maximum memories to return (default 5).
     #[serde(default)]
     limit: Option<usize>,
+    /// Skip this many memories (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Return each memory's whole content (default: cut to 600 characters).
+    #[serde(default)]
+    full: Option<bool>,
 }
 
 /// Parameters for the `memory_forget` tool.
@@ -319,6 +375,12 @@ struct SearchRoutesReq {
     /// Restrict to routes whose path contains this substring, optional.
     #[serde(default)]
     path: Option<String>,
+    /// Routes per page (default 20).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip this many routes (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 /// Parameters for the `routes_for_handler` tool.
@@ -408,7 +470,62 @@ pub struct DevctxServer {
     /// does not reopen a store on every call. Capped: a long session that walks
     /// a large workspace would otherwise hold a handle per repository forever.
     hinted: Arc<Mutex<HashMap<std::path::PathBuf, Arc<Backend>>>>,
+    /// `build_context`'s group member choices, per [`pick_cache_key`], for
+    /// [`PICK_CACHE_TTL`]: the same question asked again in a session is not
+    /// worth another fan-out.
+    picks: Arc<Mutex<PickCache>>,
     tool_router: ToolRouter<Self>,
+}
+
+/// How long a group member choice is reused for the same question.
+const PICK_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The cache key of a group member choice: the query lowercased with its
+/// whitespace collapsed, and the kind selection (it changes what is compared).
+fn pick_cache_key(query: &str, sel: &devctx_search::KindSel) -> String {
+    let q = query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    format!(
+        "{q}\u{1f}{}\u{1f}{:?}",
+        sel.kind.as_deref().unwrap_or("").trim().to_lowercase(),
+        sel.include_tests
+    )
+}
+
+/// Group member choices worth reusing, by [`pick_cache_key`], for
+/// [`PICK_CACHE_TTL`]. Only a [`state::GroupPick::cacheable`] choice goes in:
+/// one made with every comparable member compared and a clear lead. A choice
+/// among the members that happened to be warm is decided again next time, when
+/// the member that answers may have warmed up (fixup H, I-1).
+#[derive(Default)]
+struct PickCache {
+    picks: HashMap<String, (std::time::Instant, state::GroupPick)>,
+}
+
+impl PickCache {
+    /// The cached choice for `key` as of `now`, with its age; `None` when
+    /// absent or older than [`PICK_CACHE_TTL`].
+    fn get(
+        &self,
+        key: &str,
+        now: std::time::Instant,
+    ) -> Option<(state::GroupPick, std::time::Duration)> {
+        let (at, pick) = self.picks.get(key)?;
+        let age = now.saturating_duration_since(*at);
+        (age < PICK_CACHE_TTL).then(|| (pick.clone(), age))
+    }
+
+    /// Remember `pick` for `key` if it is worth reusing; expired entries go.
+    fn put(&mut self, key: String, pick: &state::GroupPick, now: std::time::Instant) {
+        self.picks
+            .retain(|_, (at, _)| now.saturating_duration_since(*at) < PICK_CACHE_TTL);
+        if pick.cacheable() {
+            self.picks.insert(key, (now, pick.clone()));
+        }
+    }
 }
 
 /// How many hint-resolved backends to keep open at once.
@@ -447,6 +564,7 @@ impl DevctxServer {
             connect,
             cwd: std::env::current_dir().unwrap_or_default(),
             hinted: Arc::new(Mutex::new(HashMap::new())),
+            picks: Arc::new(Mutex::new(PickCache::default())),
             tool_router: Self::tool_router(),
         }
     }
@@ -491,22 +609,7 @@ impl DevctxServer {
     /// into a dead end. It falls back to the binding and says so.
     fn backend_for(&self, hint: Option<&str>) -> Result<(Arc<Backend>, Option<String>), ErrorData> {
         if let Some(row) = hint.and_then(state::resolve_hint) {
-            if let Ok(cache) = self.hinted.lock() {
-                if let Some(b) = cache.get(&row.path) {
-                    return Ok((b.clone(), Some(row.name)));
-                }
-            }
-            let backend =
-                (self.connect)(&row.path).map_err(|e| ErrorData::invalid_request(e, None))?;
-            let backend = Arc::new(backend);
-            if let Ok(mut cache) = self.hinted.lock() {
-                // A session that walks a large workspace would otherwise hold a
-                // database handle per repository for its whole life.
-                if cache.len() >= HINT_CACHE_CAP {
-                    cache.clear();
-                }
-                cache.insert(row.path.clone(), backend.clone());
-            }
+            let backend = self.open_path(&row.path)?;
             return Ok((backend, Some(row.name)));
         }
         match self.binding() {
@@ -523,6 +626,106 @@ impl DevctxServer {
                 None,
             )),
         }
+    }
+
+    /// The backend for a project root, from the hint cache or newly connected.
+    fn open_path(&self, path: &std::path::Path) -> Result<Arc<Backend>, ErrorData> {
+        if let Ok(cache) = self.hinted.lock() {
+            if let Some(b) = cache.get(path) {
+                return Ok(b.clone());
+            }
+        }
+        let backend =
+            Arc::new((self.connect)(path).map_err(|e| ErrorData::invalid_request(e, None))?);
+        if let Ok(mut cache) = self.hinted.lock() {
+            // A session that walks a large workspace would otherwise hold a
+            // database handle per repository for its whole life.
+            if cache.len() >= HINT_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(path.to_path_buf(), backend.clone());
+        }
+        Ok(backend)
+    }
+
+    /// The backend of the group member `name`, opened by the path the binding
+    /// already holds (fixup H, M-1). Resolving the name again against the
+    /// registry could fail (central down or slow) and fall back to the
+    /// default member, while the header named another.
+    fn member_backend(
+        &self,
+        members: &[state::ProjectRow],
+        name: &str,
+    ) -> Result<Arc<Backend>, ErrorData> {
+        let m = members.iter().find(|m| m.name == name).ok_or_else(|| {
+            ErrorData::internal_error(format!("{name} is not a member of this group"), None)
+        })?;
+        self.open_path(&m.path)
+    }
+
+    /// The backend `build_context` answers from, and the line that names it.
+    ///
+    /// Outside a group this is `backend_for` (a `project` hint names the
+    /// project it resolved to; no hint, no line). In a group a `project` must
+    /// be a registered *member* — an unresolvable one or a project of another
+    /// group is an error, never a quiet fall back to the default member.
+    /// Without `project` the members whose servers are running are compared
+    /// and the best match answers, named, with how many were scored; see
+    /// [`state::pick_group_member`]. Only a choice that compared every
+    /// comparable member with a clear lead is cached, per (query, kind,
+    /// include_tests) for [`PICK_CACHE_TTL`], and a reused one says so with
+    /// its age instead of the old call's coverage. The member is opened by
+    /// the path the binding holds, never re-resolved by name.
+    async fn context_backend(
+        &self,
+        project: Option<&str>,
+        query: &str,
+        sel: &devctx_search::KindSel,
+    ) -> Result<(Arc<Backend>, Option<String>), ErrorData> {
+        let Binding::Group {
+            members,
+            default_name,
+            ..
+        } = self.binding()
+        else {
+            let (b, resolved) = self.backend_for(project)?;
+            return Ok((b, resolved));
+        };
+        if let Some(name) = state::group_context_target(project, &members, state::resolve_hint)
+            .map_err(|e| ErrorData::invalid_request(e, None))?
+        {
+            let b = self.member_backend(&members, &name)?;
+            return Ok((b, Some(name)));
+        }
+        let key = pick_cache_key(query, sel);
+        let cached = self
+            .picks
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&key, std::time::Instant::now()));
+        let (pick, header) = match cached {
+            Some((p, age)) => {
+                let header = p.cached_header(age);
+                (p, header)
+            }
+            None => {
+                let (q, s, d) = (query.to_string(), sel.clone(), default_name.clone());
+                let ms = members.clone();
+                let p = tokio::task::spawn_blocking(move || {
+                    state::pick_group_member(&ms, &q, &s, Some(&d))
+                })
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("task failed: {e}"), None))?
+                .map_err(|e| ErrorData::invalid_request(e, None))?;
+                if let Ok(mut c) = self.picks.lock() {
+                    c.put(key, &p, std::time::Instant::now());
+                }
+                let header = p.header();
+                (p, header)
+            }
+        };
+        let b = self.member_backend(&members, &pick.member)?;
+        Ok((b, Some(header)))
     }
 
     /// The plans root to answer `plan_status` from in this process, when the binding is a
@@ -609,6 +812,10 @@ impl DevctxServer {
                 let (query, limit) = (req.query.clone(), req.limit.unwrap_or(10));
                 let (language, mode) = (req.language.clone(), req.mode.clone());
                 let only = req.projects.clone();
+                let sel = devctx_search::KindSel {
+                    kind: req.kind.clone(),
+                    include_tests: req.include_tests,
+                };
                 return run_blocking(move || {
                     state::do_search_group(
                         &members,
@@ -617,12 +824,17 @@ impl DevctxServer {
                         language,
                         mode.as_deref().unwrap_or("vector"),
                         only.as_deref(),
+                        &sel,
                     )
                 })
                 .await;
             }
         }
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        let sel = devctx_search::KindSel {
+            kind: req.kind.clone(),
+            include_tests: req.include_tests,
+        };
         run_blocking(move || {
             backend.search(
                 &req.query,
@@ -630,6 +842,7 @@ impl DevctxServer {
                 req.language,
                 req.mode,
                 req.rerank.unwrap_or(true),
+                &sel,
             )
         })
         .await
@@ -856,6 +1069,10 @@ impl DevctxServer {
         // Naming another project is enough to answer: this needs the registry,
         // not a project of our own. It therefore works while unbound, which is
         // exactly when an agent reaches for it.
+        let sel = devctx_search::KindSel {
+            kind: req.kind.clone(),
+            include_tests: req.include_tests,
+        };
         let Some(backend) = self.maybe_bound() else {
             return run_blocking(move || {
                 state::do_search_project(
@@ -864,6 +1081,7 @@ impl DevctxServer {
                     req.limit.unwrap_or(10),
                     req.language,
                     req.mode.as_deref().unwrap_or("vector"),
+                    &sel,
                 )
             })
             .await;
@@ -875,6 +1093,7 @@ impl DevctxServer {
                 req.limit.unwrap_or(10),
                 req.language,
                 req.mode,
+                &sel,
             )
         })
         .await
@@ -974,12 +1193,16 @@ impl DevctxServer {
         if req.project.is_none() {
             if let Some(root) = self.workspace_plans_root() {
                 let plan = req.plan.clone();
-                return run_blocking(move || state::plan_status_budgeted(&root, plan.as_deref()))
-                    .await;
+                let opts = plan_opts(&req);
+                return run_blocking(move || {
+                    state::plan_status_budgeted(&root, plan.as_deref(), opts)
+                })
+                .await;
             }
         }
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.plan_status(req.plan.as_deref()))
+        let opts = plan_opts(&req);
+        run_blocking(move || backend.plan_status(req.plan.as_deref(), opts))
             .await
             .map(|out| Self::annotate(out, resolved))
     }
@@ -1029,15 +1252,28 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<BuildContextReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
-        run_blocking(move || {
+        let sel = devctx_search::KindSel {
+            kind: req.kind.clone(),
+            include_tests: req.include_tests,
+        };
+        let (backend, label) = self
+            .context_backend(req.project.as_deref(), &req.query, &sel)
+            .await?;
+        let out = run_blocking(move || {
             backend.build_context(
                 &req.query,
                 req.max_tokens.unwrap_or(4096),
                 req.include_memories.unwrap_or(true),
+                &sel,
             )
         })
-        .await
+        .await?;
+        // Which repository answered is part of the answer: a brief from the
+        // wrong one is otherwise indistinguishable from a right one.
+        Ok(match label {
+            Some(l) => format!("[devctx] context from {l}\n\n{out}"),
+            None => out,
+        })
     }
 
     /// Memories recorded about a symbol.
@@ -1048,8 +1284,11 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<MemoriesBySymbolReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
-        run_blocking(move || backend.memories_by_symbol(&req.symbol, req.limit.unwrap_or(10))).await
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        let opts = memories_opts(req.limit, req.offset, req.full);
+        run_blocking(move || backend.memories_by_symbol(&req.symbol, opts))
+            .await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// Memories recorded about a file.
@@ -1061,8 +1300,11 @@ impl DevctxServer {
         &self,
         Parameters(req): Parameters<MemoriesByFileReq>,
     ) -> Result<String, ErrorData> {
-        let backend = self.bound()?;
-        run_blocking(move || backend.memories_by_file(&req.file, req.limit.unwrap_or(10))).await
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        let opts = memories_opts(req.limit, req.offset, req.full);
+        run_blocking(move || backend.memories_by_file(&req.file, opts))
+            .await
+            .map(|out| Self::annotate(out, resolved))
     }
 
     /// Delete one memory for good.
@@ -1128,7 +1370,8 @@ impl DevctxServer {
         Parameters(req): Parameters<SearchRoutesReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.search_routes(req.method, req.path))
+        let page = state::Page::new(req.limit, req.offset);
+        run_blocking(move || backend.search_routes(req.method, req.path, page))
             .await
             .map(|out| Self::annotate(out, resolved))
     }
@@ -1260,6 +1503,24 @@ impl ServerHandler for DevctxServer {
 }
 
 /// Run a blocking tool body on the blocking pool, mapping errors to MCP errors.
+fn plan_opts(req: &PlanStatusReq) -> state::PlanListOpts {
+    state::PlanListOpts {
+        active_only: req.active_only.unwrap_or(false),
+        page: state::Page::new(req.limit, req.offset),
+    }
+}
+
+fn memories_opts(
+    limit: Option<usize>,
+    offset: Option<usize>,
+    full: Option<bool>,
+) -> state::MemoriesOpts {
+    state::MemoriesOpts {
+        page: state::Page::new(limit, offset),
+        full: full.unwrap_or(false),
+    }
+}
+
 async fn run_blocking<F>(f: F) -> Result<String, ErrorData>
 where
     F: FnOnce() -> Result<String, String> + Send + 'static,
@@ -1354,3 +1615,122 @@ pub fn run_stdio_bound(binding: Binding, connect: Connect) -> anyhow::Result<()>
 
 /// How long in-flight blocking tool calls may delay the exit once the service loop ended.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn pick(by_relevance: bool, warning: Option<&str>) -> state::GroupPick {
+        state::GroupPick {
+            member: "front".into(),
+            label: "front (best match 0.61; 2 of 3 members scored; not scored: x (cold))".into(),
+            warning: warning.map(str::to_string),
+            by_relevance,
+            score: 0.61,
+            compared: 2,
+            not_comparable: vec!["x".into()],
+            selection: None,
+        }
+    }
+
+    /// Fixup H (M-6): the key folds case and whitespace, and the kind
+    /// selection is part of it.
+    #[test]
+    fn pick_cache_key_folds_the_query_and_keeps_the_selection() {
+        let none = devctx_search::KindSel::default();
+        let code = devctx_search::KindSel {
+            kind: Some(" Code ".into()),
+            include_tests: None,
+        };
+        let no_tests = devctx_search::KindSel {
+            kind: None,
+            include_tests: Some(false),
+        };
+        assert_eq!(
+            pick_cache_key("How  is a\tPayment charged", &none),
+            pick_cache_key("how is a payment charged", &none)
+        );
+        assert_ne!(pick_cache_key("q", &none), pick_cache_key("q", &code));
+        assert_ne!(pick_cache_key("q", &none), pick_cache_key("q", &no_tests));
+        assert_eq!(
+            pick_cache_key("q", &code),
+            pick_cache_key(
+                "q",
+                &devctx_search::KindSel {
+                    kind: Some("code".into()),
+                    include_tests: None,
+                }
+            )
+        );
+    }
+
+    /// Fixup H (I-1, M-6): only a choice that compared every comparable member
+    /// with a clear lead is cached; it expires after the TTL; and reused, it is
+    /// said to be cached without the old call's coverage or warnings.
+    #[test]
+    fn pick_cache_keeps_only_full_choices_for_the_ttl() {
+        let t0 = Instant::now();
+        let mut c = PickCache::default();
+        c.put(
+            "partial".into(),
+            &pick(false, Some("compared only 2 of 3")),
+            t0,
+        );
+        c.put("close".into(), &pick(true, Some("ambiguous: also x")), t0);
+        c.put("full".into(), &pick(true, None), t0);
+        assert!(
+            c.get("partial", t0).is_none(),
+            "a partial pick is not reused"
+        );
+        assert!(c.get("close", t0).is_none(), "a close call is not reused");
+        let (p, age) = c.get("full", t0 + Duration::from_secs(30)).expect("cached");
+        assert_eq!(age, Duration::from_secs(30));
+        let h = p.cached_header(age);
+        assert!(h.starts_with("front (cached choice from 30s ago"), "{h}");
+        assert!(!h.contains("not scored") && !h.contains("ambiguous"), "{h}");
+        assert!(
+            c.get("full", t0 + PICK_CACHE_TTL).is_none(),
+            "expired at the TTL"
+        );
+        // An insert sweeps what expired.
+        c.put("other".into(), &pick(true, None), t0 + PICK_CACHE_TTL);
+        assert_eq!(c.picks.len(), 1);
+    }
+
+    /// Fixup H (M-1): the chosen member is opened by the path the binding
+    /// holds, never re-resolved by name (which could fall back to the default
+    /// while the header names another).
+    #[test]
+    fn a_group_member_is_opened_by_its_path() {
+        let connect: Connect =
+            Arc::new(|p: &std::path::Path| Err(format!("connect:{}", p.display())));
+        let server = DevctxServer::with_binding(Binding::None, connect);
+        let members = vec![
+            state::ProjectRow {
+                name: "a".into(),
+                path: "/nonexistent/fixup-h/a".into(),
+                ..Default::default()
+            },
+            state::ProjectRow {
+                name: "b".into(),
+                path: "/nonexistent/fixup-h/b".into(),
+                ..Default::default()
+            },
+        ];
+        let err = server
+            .member_backend(&members, "b")
+            .err()
+            .expect("connect fails");
+        assert!(
+            err.message.contains("connect:/nonexistent/fixup-h/b"),
+            "{}",
+            err.message
+        );
+        let err = server
+            .member_backend(&members, "zz")
+            .err()
+            .expect("unknown");
+        assert!(err.message.contains("not a member"), "{}", err.message);
+    }
+}

@@ -140,7 +140,7 @@ Three obligations that are not in the signature:
    `dimension_for(provider, model)` to decide whether an embedder is even needed;
    that lazy path is why indexing does not pay for a model it never uses.
 3. **Batch.** `embed()` receives many texts because the encoder is far more
-   efficient per text at batch size 32 than at 1.
+   efficient per text in a batch (the default is 8) than one at a time.
 
 For a built-in local model, add a `LocalModelSpec` to `LOCAL_MODELS` in
 `registry.rs` — key, dimension, languages, and the note shown by

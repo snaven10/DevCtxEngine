@@ -300,6 +300,21 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let prev_extractor_stale =
         req.store
             .extractor_stale(&repo_path, &branch, &devctx_parse::extractor_fingerprint())?;
+    // The exclude set decides what belongs in the index, and an incremental run
+    // only looks at what changed since the last commit, so a rule added since
+    // would leave what it now covers behind forever. A different fingerprint
+    // (or none recorded: an index from before defaults existed) makes the run
+    // *reconcile* the index against the set — prune the files it now
+    // excludes, add the tracked files it no longer excludes — and nothing
+    // else. It used to force a full run instead, which re-embeds every file:
+    // on the first `index` after upgrading, an hour per ~1400 files spent
+    // re-deriving vectors that had not changed.
+    let exclude_fp = exclude_fingerprint(req.exclude);
+    let exclude_stale = req
+        .store
+        .get_index_meta(&repo_path, &branch, EXCLUDE_META_KEY)?
+        .as_deref()
+        != Some(exclude_fp.as_str());
     let last_commit = prev.as_ref().map(|p| p.last_commit.clone());
     let can_incremental = req.incremental
         && !model_changed
@@ -312,6 +327,9 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // An explicit path list is never a full reindex, whatever the commit state:
     // it says exactly which files to look at.
     let full_reindex = from.is_none() && explicit_paths.is_none();
+    // A full run applies the exclude set by itself (it prunes everything it
+    // did not re-index); a path-list run looks at too little to settle it.
+    let reconcile_excludes = exclude_stale && !full_reindex && explicit_paths.is_none();
 
     // Snapshot the previously-indexed files so a full reindex can prune any that
     // vanished (git diff can't detect them when we list all tracked files).
@@ -344,7 +362,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         ..Default::default()
     };
 
-    let changes = match explicit_paths {
+    let mut changes: Vec<Change> = match explicit_paths {
         // A path that no longer exists on disk was deleted; everything else is
         // re-read and dropped by the content-hash check if it did not change.
         Some(paths) => paths
@@ -362,6 +380,49 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
             None => git.changes(from)?,
         },
     };
+    // Reconciling a changed exclude set: the indexed files it now covers are
+    // pruned below; the tracked files it no longer covers, absent from the
+    // index, join this run as additions. Everything else is left alone — the
+    // content-hash check would skip it anyway, but listing it at all is what a
+    // full run costs.
+    let mut now_excluded: Vec<String> = Vec::new();
+    if reconcile_excludes {
+        let indexed: HashSet<String> = req
+            .store
+            .list_file_states(&repo_path, &branch)?
+            .into_iter()
+            .collect();
+        now_excluded = indexed
+            .iter()
+            .filter(|f| ctx.is_excluded(f))
+            .cloned()
+            .collect();
+        now_excluded.sort();
+        let counts = exclude_counts(&ctx.excluded, &now_excluded);
+        if !counts.is_empty() {
+            let per = counts
+                .iter()
+                .map(|(p, n)| format!("{p}: {n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "· the exclude set changed: {} indexed file(s) are now excluded ({per})",
+                now_excluded.len()
+            );
+        }
+        let listed: HashSet<String> = changes.iter().map(|c| change_path(c).to_string()).collect();
+        let tracked = match &read_from {
+            Some(b) => git.changes_at(b, None)?,
+            None => git.changes(None)?,
+        };
+        for c in tracked {
+            let f = change_path(&c);
+            if !indexed.contains(f) && !listed.contains(f) && !ctx.is_excluded(f) {
+                changes.push(Change::Added(f.to_string()));
+            }
+        }
+    }
+
     if let Some(p) = req.progress {
         p.start(changes.len());
     }
@@ -388,6 +449,29 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
             Change::Added(file) | Change::Modified(file) => {
                 ctx.index_file(&file, &mut result)?;
             }
+        }
+    }
+
+    // Prune what a changed exclude set now covers (reconcile, see above).
+    if !result.cancelled && !now_excluded.is_empty() {
+        if let Some(p) = req.progress {
+            p.phase("prune");
+        }
+        for file in &now_excluded {
+            if cancelled() {
+                result.cancelled = true;
+                break;
+            }
+            // Already gone (deleted in git and dropped by the loop above).
+            if req
+                .store
+                .get_file_hash(&repo_path, &branch, file)?
+                .is_none()
+            {
+                continue;
+            }
+            ctx.delete_file(file)?;
+            result.files_pruned += 1;
         }
     }
 
@@ -460,6 +544,13 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // incremental run over an older index re-parses just the changed files, so
     // stamping it would hide the rest — the very thing this record is for.
     let current_extractor = devctx_parse::extractor_fingerprint();
+    // Same rule for the exclude set: stamped when a full run applied it, a
+    // reconcile settled it, or nothing changed — never by a path-list run,
+    // which looked at too little to prune.
+    if full_reindex || reconcile_excludes || !exclude_stale {
+        req.store
+            .set_index_meta(&repo_path, &branch, EXCLUDE_META_KEY, &exclude_fp)?;
+    }
     if full_reindex || !prev_extractor_stale {
         req.store
             .set_index_meta(&repo_path, &branch, EXTRACTOR_META_KEY, &current_extractor)?;
@@ -564,6 +655,23 @@ const BLOAT_WARN_RATIO: f64 = 3.0;
 /// [`devctx_core::dirs::model_cache_dir`], but older checkouts still carry one.
 const OWN_ARTIFACTS: &[&str] = &[".devctx", ".fastembed_cache", ".git"];
 
+/// `index_meta` key holding the fingerprint of the exclude set the index was
+/// last built or reconciled with.
+pub const EXCLUDE_META_KEY: &str = "excludes";
+
+/// A stable fingerprint of an exclude list (FNV-1a over the patterns in order;
+/// order matters because a later `!rule` overrides an earlier one).
+pub fn exclude_fingerprint(patterns: &[String]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in patterns {
+        for b in p.bytes().chain(std::iter::once(0u8)) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
 /// Compile `indexing.exclude` into a matcher.
 ///
 /// Reusing the gitignore engine rather than a plain glob is deliberate: a rule
@@ -571,7 +679,7 @@ const OWN_ARTIFACTS: &[&str] = &[".devctx", ".fastembed_cache", ".git"];
 /// depth — which is what anyone writing these patterns expects. An unparseable
 /// pattern is dropped rather than failing the run; refusing to index because one
 /// line of config is malformed helps nobody.
-fn build_exclude(patterns: &[String]) -> Gitignore {
+pub(crate) fn build_exclude(patterns: &[String]) -> Gitignore {
     if patterns.is_empty() {
         return Gitignore::empty();
     }
@@ -582,15 +690,29 @@ fn build_exclude(patterns: &[String]) -> Gitignore {
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
-/// Directories whose contents are somebody else's code, checked in for
-/// convenience. Nobody asks a question whose answer is in `node_modules`.
-const VENDOR_DIRS: &[&str] = &[
-    "node_modules",
-    "vendor",
-    "third_party",
-    "dist",
-    "bower_components",
-];
+/// How many of `files` each exclude pattern covers, in first-seen order of
+/// the patterns (the one that decided each file: for a gitignore set, the last
+/// matching rule). Files under one of devctx's own directories, which no
+/// pattern decides, are counted under `(devctx artifacts)`.
+///
+/// Logged by the reconcile so a changed default — `/build/` anchored to the
+/// root, a new `*.generated.*` — says what it removed instead of just how many.
+pub(crate) fn exclude_counts(excluded: &Gitignore, files: &[String]) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for f in files {
+        let path = Path::new(f);
+        let key = match excluded.matched_path_or_any_parents(path, false) {
+            ignore::Match::Ignore(g) => g.original().to_string(),
+            _ if is_own_artifact(path) => "(devctx artifacts)".to_string(),
+            _ => continue,
+        };
+        match out.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => out.push((key, 1)),
+        }
+    }
+    out
+}
 
 /// A minified line is longer than any line a person writes. 1,000 characters is
 /// far past the widest hand-written line and far below a bundle's single line,
@@ -610,13 +732,10 @@ const MINIFIED_LINE: usize = 1_000;
 /// a single 200,000-character line is the fact, and it catches generated JSON,
 /// bundled CSS and vendored blobs that follow no naming convention at all.
 fn is_generated(path: &Path, content: &str) -> bool {
-    if path
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .any(|c| VENDOR_DIRS.contains(&c))
-    {
-        return true;
-    }
+    // Vendored directories (`node_modules/`, `vendor/`, `dist/`...) are not
+    // decided here any more: they are `devctx_core::config::DEFAULT_EXCLUDES`,
+    // applied through `indexing.exclude`, so that `default_excludes: false`
+    // really does bring them back.
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -678,6 +797,16 @@ fn stall_inside_write(nth: usize) {
 }
 
 impl Ctx<'_> {
+    /// Does the exclude set (or our own artifacts rule) keep `file` out?
+    fn is_excluded(&self, file: &str) -> bool {
+        let path = Path::new(file);
+        is_own_artifact(path)
+            || self
+                .excluded
+                .matched_path_or_any_parents(path, false)
+                .is_ignore()
+    }
+
     /// Forget a file: its vectors, edges, routes and state, as one
     /// transaction (see `index_file` for why one).
     fn delete_file(&self, file: &str) -> Result<()> {
@@ -696,12 +825,7 @@ impl Ctx<'_> {
 
     fn index_file(&mut self, file: &str, result: &mut IndexResult) -> Result<()> {
         let path = Path::new(file);
-        if is_own_artifact(path)
-            || self
-                .excluded
-                .matched_path_or_any_parents(path, false)
-                .is_ignore()
-        {
+        if self.is_excluded(file) {
             result.files_skipped += 1;
             return Ok(());
         }
@@ -966,10 +1090,6 @@ mod tests {
         let long = "a".repeat(MINIFIED_LINE + 1);
         assert!(is_generated(Path::new("assets/cytoscape.min.js"), "x"));
         assert!(is_generated(Path::new("web/app.bundle.js"), "x"));
-        assert!(is_generated(
-            Path::new("node_modules/left-pad/index.js"),
-            "x"
-        ));
         assert!(is_generated(Path::new("package-lock.json"), "x"));
         assert!(
             is_generated(Path::new("src/data.json"), &long),

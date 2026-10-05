@@ -106,7 +106,35 @@ exists and then regret not running.
 ### `read_symbol(name)` — the definition
 
 Code, file, line range and kind. Use this when you know the name and want the
-thing itself; use `search` when you want code *about an idea*.
+thing itself; use `search` when you want code *about an idea*. `limit` (default
+5) caps the definitions — a name can be defined many times.
+
+**A miss is explained, not just empty.** When no definition is found,
+`read_symbol` adds:
+
+- `suggestions` — up to 5 names to try: the qualified forms the call graph knows
+  for a bare name (`charge` → `Card.charge`), then the closest defined names by
+  prefix, suffix, containment or edit distance (`AuthServce` → `AuthService`);
+- `external: true`, `called_from: N` and a `next_step` when the name is only ever
+  a call *target* — most likely a library or runtime function, though it may live
+  in a file the index excludes or on another branch. A qualified name
+  (`serde_json::from_str`, `Panache.withTransaction`) is looked up as written and
+  then by its last segment, since the graph often holds only the bare callee. An
+  external gets no fuzzy `suggestions` (`with_context` is not a typo of
+  `build_context`), only the qualified forms of the same name.
+
+Small functions that the chunker grouped into one chunk (`a, b, c`) are found
+inside it, so they are not misreported as external.
+
+## Which branch it answers from
+
+The graph is per branch. When the checked-out branch has no indexed rows,
+`read_symbol`, `get_references`, `impact_analysis`, `search_routes`,
+`routes_for_handler` (and `search`, `build_context`, `memories_by_symbol`) answer
+from the default or most recently indexed branch and add
+`branch_fallback: {current, used, why}`; with no index at all they fail with an
+explicit error instead of `[]`. See
+[Search → Branch awareness](search.md#branch-awareness).
 
 ## Limits worth knowing
 
@@ -128,9 +156,12 @@ way to narrow it, and it is why qualified names are never expanded.
 > caller and twenty-three callees: the edges were there the whole time, under a
 > key nobody was asking with.
 
-**An empty result still means "nothing found", never "nothing there".** The
-reasons below are real and none of them announce themselves. Cross-check an
-empty result with `search --keyword` before renaming or deleting.
+**An empty result still means "nothing found", never "nothing there".** Two of
+the reasons used to be silent and no longer are: a branch with no rows
+(`branch_fallback`) and an index built by an older extractor (`warning` on every
+graph answer, `extractor_stale` on `index_status` — run `devctx index --full`).
+The ones below still announce nothing. Cross-check an empty result with
+`search --keyword` before renaming or deleting.
 
 **Call resolution is name-based**, informed by imports and type bindings where
 the grammar supports it.

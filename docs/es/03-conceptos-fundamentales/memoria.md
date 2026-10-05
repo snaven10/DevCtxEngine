@@ -119,6 +119,28 @@ Los dos primeros significan que algo conectó esta memoria con este código al
 momento de escribirla. `inference` significa solo que el texto casualmente
 calza. Quien evalúe si confiar en un vínculo debería leer este campo.
 
+`files-field` también lo reporta el fallback de texto de `memories_by_file`: cuando
+falta la fila de unión (la memoria se guardó antes de que existiera el grafo, se
+importó o migró, o quien llama escribió la ruta distinto) pero los `files` de la
+memoria nombran el archivo — comparado tras normalizar la ruta, y por sufijo, así
+`a.rs` y `src/a.rs` se encuentran. Si todos los resultados son de ese tipo,
+`matched_by` es `junction`; una coincidencia de texto sin evidencia en `files`
+sigue siendo `text-inference`. `memories_by_symbol` tiene un archivo como sujeto
+solo cuando se pide `archivo::símbolo` (`links.rs::memories_by_symbol`, o con
+ruta): se separa la parte del archivo, el símbolo se busca solo y una memoria cuyos
+`files` nombran ese archivo es `files-field`; con un símbolo pelado el fallback de
+texto nunca reporta `files-field`.
+
+### Paginar las tools por código
+
+`memories_by_symbol` y `memories_by_file` devuelven **5 memorias** por defecto,
+cada `content` recortado a **600 caracteres** (`content_truncated: true` y
+`content_chars` lo dicen, y el `id` trae el resto). Aceptan `limit`, `offset`,
+`full: true` (contenido completo) y `project`, y responden `{subject, memories,
+total, matched_by, next_offset?, omitted?, …}`; `total_capped: true` significa que
+el escaneo se detuvo en 200 vínculos. Esto baja ~2,5k tokens por memoria a unos
+150.
+
 ### Barrido de memorias viejas
 
 Las memorias escritas antes de que existiera la unión — migradas, importadas o

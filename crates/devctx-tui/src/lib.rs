@@ -22,7 +22,7 @@ use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult, VectorMetadata, VectorPoint};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::GitRepo;
-use devctx_search::{search as run_search, SearchMode};
+use devctx_search::{search_ranked, RankOptions, SearchMode};
 use devctx_store::Store;
 use serde_json::Value;
 
@@ -100,6 +100,16 @@ impl MemScope {
     }
 }
 
+/// Ranking options for the local engine: the project's configured
+/// `search.penalty`, no hard filters. The default penalty used to apply here
+/// whatever the config said.
+fn rank_options(cfg: &ProjectConfig) -> RankOptions {
+    RankOptions {
+        penalty: cfg.search.penalty,
+        ..Default::default()
+    }
+}
+
 /// Connection to a running server the TUI routes through, so it never opens the
 /// DuckDB file itself (no lock fights with other `devctx` processes).
 pub struct ServerConn {
@@ -118,6 +128,8 @@ enum Engine {
         store: Store,
         embedder: Box<dyn EmbeddingProvider>,
         filter: SearchFilter,
+        /// The project's `search.penalty`, as the CLI and MCP apply it.
+        rank: RankOptions,
         repo: String,
         branch: String,
         project: String,
@@ -153,6 +165,7 @@ impl Engine {
                 exclude_deletions: true,
                 ..Default::default()
             },
+            rank: rank_options(cfg),
             repo,
             branch,
             project,
@@ -165,6 +178,7 @@ impl Engine {
                 store,
                 embedder,
                 filter,
+                rank,
                 ..
             } => {
                 let emb = if mode == SearchMode::Keyword {
@@ -172,7 +186,9 @@ impl Engine {
                 } else {
                     Some(embedder.as_ref())
                 };
-                Ok(run_search(store, query, filter, LIMIT, mode, emb, None)?)
+                Ok(search_ranked(
+                    store, query, filter, LIMIT, mode, emb, None, rank,
+                )?)
             }
             Engine::Remote { base, token } => {
                 let m = match mode {
@@ -373,6 +389,7 @@ fn json_to_hit(v: &Value) -> SearchResult {
     let i = |k: &str| v[k].as_i64().unwrap_or(0) as i32;
     SearchResult {
         score: v["score"].as_f64().unwrap_or(0.0) as f32,
+        raw_score: None,
         point: VectorPoint {
             id: String::new(),
             vector: Vec::new(),
@@ -1198,9 +1215,20 @@ mod tests {
     use super::*;
     use devctx_core::{VectorMetadata, VectorPoint};
 
+    #[test]
+    fn the_local_engine_ranks_with_the_configured_penalty() {
+        let cfg =
+            ProjectConfig::from_yaml("search:\n  penalty:\n    doc: 1.0\n    test: 0.2\n").unwrap();
+        let r = rank_options(&cfg);
+        assert_eq!(r.penalty, cfg.search.penalty);
+        assert_eq!(r.penalty.doc, 1.0);
+        assert!(r.kind.is_none() && r.include_tests);
+    }
+
     fn dummy(id: &str) -> SearchResult {
         SearchResult {
             score: 1.0,
+            raw_score: None,
             point: VectorPoint {
                 id: id.into(),
                 vector: vec![],

@@ -95,7 +95,7 @@ impl Store {
             binds.push(format!("%{p}%"));
         }
         let sql = format!(
-            "SELECT {ROUTE_COLS} FROM routes WHERE {} ORDER BY path, http_method",
+            "SELECT {ROUTE_COLS} FROM routes WHERE {} ORDER BY path, http_method, file, line",
             clauses.join(" AND ")
         );
         self.query_routes(&sql, binds)
@@ -111,7 +111,7 @@ impl Store {
         let sql = format!(
             "SELECT {ROUTE_COLS} FROM routes
              WHERE repo = ? AND branch = ? AND (handler_symbol = ? OR handler_method = ?)
-             ORDER BY path"
+             ORDER BY path, http_method, file, line"
         );
         self.query_routes(
             &sql,

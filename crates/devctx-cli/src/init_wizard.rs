@@ -253,7 +253,11 @@ pub fn ask(
             metric,
             fts,
         }),
-        indexing: Some(Indexing { exclude, branches }),
+        indexing: Some(Indexing {
+            exclude,
+            branches,
+            ..Indexing::default()
+        }),
         reranking: Some(Reranking {
             enabled: rerank_enabled,
             model: rerank_model,

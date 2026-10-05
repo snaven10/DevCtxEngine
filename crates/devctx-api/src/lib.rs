@@ -22,7 +22,7 @@ use devctx_mcp::state::{
     do_memories_by_symbol, do_memory_context, do_memory_forget, do_memory_move, do_memory_refs,
     do_memory_stats, do_plan_graph, do_plan_status, do_read_file, do_read_symbol, do_recall_scoped,
     do_references, do_remember, do_remember_shared, do_routes_for_handler, do_search,
-    do_search_routes, do_summarize, parse_mode, AppState,
+    do_search_routes, do_summarize, parse_mode, AppState, MemoriesOpts, Page, PlanListOpts,
 };
 use serde::Deserialize;
 
@@ -417,8 +417,16 @@ enum ExitClaim {
 /// Middleware: count the non-health requests in flight (the vanished-project
 /// check does not end a server that is answering someone).
 async fn count_in_flight(State(life): State<Arc<Lifecycle>>, req: Request, next: Next) -> Response {
+    // Once an exit has started the database is about to be frozen: a request
+    // admitted now would land on it half-way. Refuse everything (health too,
+    // so nobody reads "healthy" off a server that is leaving) with a 503 a
+    // client can retry against the next server.
     if req.uri().path() == "/health" {
-        return next.run(req).await;
+        return if life.exiting.load(Ordering::SeqCst) {
+            exiting_response()
+        } else {
+            next.run(req).await
+        };
     }
     struct Guard(Arc<Lifecycle>);
     impl Drop for Guard {
@@ -426,9 +434,51 @@ async fn count_in_flight(State(life): State<Arc<Lifecycle>>, req: Request, next:
             self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
         }
     }
+    // Counted BEFORE the flag is read: the exit raises the flag and then waits
+    // for the count to drain, so a request is either refused here or visible
+    // to that wait. Checking first and counting after left a window in which
+    // one was admitted and not waited for.
     life.in_flight.fetch_add(1, Ordering::SeqCst);
     let _guard = Guard(life.clone());
+    if life.exiting.load(Ordering::SeqCst) {
+        return exiting_response();
+    }
     next.run(req).await
+}
+
+/// The answer to any request that arrives while the process is ending.
+///
+/// Produced by a middleware before any handler: the request was not processed,
+/// so a client may repeat it against the next server. The header says that
+/// this 503 — and no other — is the one to repeat.
+pub(crate) fn exiting_response() -> Response {
+    let mut resp = json_err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the server is shutting down".into(),
+    );
+    resp.headers_mut().insert(
+        devctx_core::procown::EXITING_HEADER,
+        header::HeaderValue::from_static("1"),
+    );
+    resp
+}
+
+/// How long an exit waits for the requests already admitted before it freezes
+/// the database. Short: a request that cannot finish in this time is cut by
+/// `FORCE CHECKPOINT` as before; this only spares the ones about to.
+const IN_FLIGHT_DRAIN: Duration = Duration::from_millis(300);
+
+/// Wait (at most `cap`) for `in_flight` to reach zero. Called once the
+/// `exiting` flag is up, so nothing new is admitted while it waits.
+pub(crate) fn drain_in_flight(in_flight: &AtomicUsize, cap: Duration) -> bool {
+    let deadline = Instant::now() + cap;
+    while in_flight.load(Ordering::SeqCst) > 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
 }
 
 fn shutdown_grace() -> Duration {
@@ -483,10 +533,12 @@ fn hard_exit(code: i32) -> ! {
 /// leaves. Otherwise this claims it, atomically, so the orderly path cannot
 /// start one behind it.
 ///
-/// The advertisement goes first (`on_exit`), then the database is frozen and
-/// checkpointed on a helper thread that `_exit`s itself the moment the
-/// checkpoint returns: frozen, no write can land after the checkpoint, and
-/// ending on that same thread leaves no window for one either. The calling
+/// The database is frozen and checkpointed on a helper thread that withdraws
+/// the advertisement (`on_exit`) and `_exit`s itself the moment the checkpoint
+/// returns: frozen, no write can land after the checkpoint, and ending on that
+/// same thread leaves no window for one either. The advertisement stays up
+/// during the checkpoint on purpose: a client then finds a busy server rather
+/// than none, and does not spawn one that dies on the lock we still hold. The calling
 /// thread is the budget: a checkpoint that blocks (a stuck connection, a
 /// poisoned lock) must not turn a watchdog into one more thing that hangs, so
 /// after [`CHECKPOINT_BUDGET`] it leaves without it. The checkpoint escalates
@@ -500,6 +552,9 @@ fn exit_now(state: &Arc<AppState>, life: &Lifecycle, on_exit: &ExitHook, code: i
         }
     }
     state.cancel_indexing();
+    // The flag is up (nothing new is admitted): let the requests already in
+    // wait their turn before the database is frozen under them.
+    drain_in_flight(&life.in_flight, IN_FLIGHT_DRAIN);
     match life.claim_exit_checkpoint() {
         ExitClaim::Ours => {}
         ExitClaim::OrderlyRunning => {
@@ -512,14 +567,19 @@ fn exit_now(state: &Arc<AppState>, life: &Lifecycle, on_exit: &ExitHook, code: i
             hard_exit(code)
         }
     }
-    on_exit();
     life.begin_checkpoint_marker();
     let s = state.clone();
     let marker = life.marker.clone();
+    let hook = on_exit.clone();
     let _ = std::thread::Builder::new()
         .name("exit-checkpoint".into())
         .spawn(move || {
             s.checkpoint_for_exit(EXIT_FREEZE_WAIT);
+            // Withdrawn only now: the database is frozen, so nothing can be
+            // written after the checkpoint, and until the lock is released a
+            // client must still read this server as alive-but-busy — with the
+            // advertisement gone it spawns a second server that dies on our lock.
+            hook();
             if let Some(m) = &marker {
                 let _ = std::fs::remove_file(m);
             }
@@ -530,6 +590,7 @@ fn exit_now(state: &Arc<AppState>, life: &Lifecycle, on_exit: &ExitHook, code: i
         "DevCtxEngine: the exit checkpoint did not finish within {CHECKPOINT_BUDGET:?}; \
          leaving without it"
     );
+    on_exit();
     life.end_checkpoint_marker();
     hard_exit(code)
 }
@@ -754,6 +815,12 @@ struct SearchBody {
     /// interactive callers turn it off because it dominates latency.
     #[serde(default)]
     rerank: Option<bool>,
+    /// `code` | `test` | `doc` | `config`: keep only that kind of file.
+    #[serde(default)]
+    kind: Option<String>,
+    /// `false` drops test files.
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -849,6 +916,12 @@ struct RoutesQuery {
     method: Option<String>,
     #[serde(default)]
     path: Option<String>,
+    /// Routes per page (default 20).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip this many routes (the `next_offset` of the previous page).
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -895,24 +968,51 @@ struct ContextBody {
     max_tokens: Option<usize>,
     #[serde(default)]
     include_memories: Option<bool>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct MemoriesQuery {
     #[serde(default)]
     limit: Option<usize>,
+    /// By-symbol / by-file only: skip this many memories.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// By-symbol / by-file only: keep each memory's whole content.
+    #[serde(default)]
+    full: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct PlanStatusQuery {
     #[serde(default)]
     plan: Option<String>,
+    /// Listing only: plans with unresolved tasks.
+    #[serde(default)]
+    active_only: Option<bool>,
+    /// Listing only: plans per page (default 25).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Listing only: skip this many plans.
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 // --- handlers ---
 
-async fn health() -> Response {
-    json_ok(r#"{"status":"ok"}"#.to_string())
+/// `{"status":"ok","root":…}`: `root` lets a client that found this server
+/// through a `serve.json` check it serves the repository it asked about — a
+/// stale file whose port another project's server reused would otherwise send
+/// that repository's answers (the group selection scored the wrong member).
+/// Nothing is locked: the root is fixed at start.
+async fn health(State(api): State<Api>) -> Response {
+    json_ok(
+        serde_json::json!({ "status": "ok", "root": api.state.root().to_string_lossy() })
+            .to_string(),
+    )
 }
 
 /// The web dashboard shell (call-graph + memories).
@@ -948,7 +1048,14 @@ async fn graph(State(api): State<Api>, Query(q): Query<GraphQuery>) -> Response 
 }
 
 async fn plans_status(State(api): State<Api>, Query(q): Query<PlanStatusQuery>) -> Response {
-    run(api.state, move |s| do_plan_status(s, q.plan.as_deref())).await
+    let opts = PlanListOpts {
+        active_only: q.active_only.unwrap_or(false),
+        page: Page::new(q.limit, q.offset),
+    };
+    run(api.state, move |s| {
+        do_plan_status(s, q.plan.as_deref(), opts)
+    })
+    .await
 }
 
 async fn plans_graph(State(api): State<Api>, Query(q): Query<PlanStatusQuery>) -> Response {
@@ -973,6 +1080,10 @@ async fn search(State(api): State<Api>, Json(b): Json<SearchBody>) -> Response {
             b.language,
             parse_mode(b.mode.as_deref()),
             b.rerank.unwrap_or(true),
+            &devctx_search::KindSel {
+                kind: b.kind,
+                include_tests: b.include_tests,
+            },
         )
     })
     .await
@@ -1123,9 +1234,20 @@ async fn build_context(State(api): State<Api>, Json(b): Json<ContextBody>) -> Re
             &b.query,
             b.max_tokens.unwrap_or(4096),
             b.include_memories.unwrap_or(true),
+            &devctx_search::KindSel {
+                kind: b.kind,
+                include_tests: b.include_tests,
+            },
         )
     })
     .await
+}
+
+fn memories_opts(q: &MemoriesQuery) -> MemoriesOpts {
+    MemoriesOpts {
+        page: Page::new(q.limit, q.offset),
+        full: q.full.unwrap_or(false),
+    }
 }
 
 /// The memories recorded about a symbol — the memory↔graph join.
@@ -1135,7 +1257,7 @@ async fn memories_by_symbol(
     Query(q): Query<MemoriesQuery>,
 ) -> Response {
     run(api.state, move |s| {
-        do_memories_by_symbol(s, &symbol, q.limit.unwrap_or(10))
+        do_memories_by_symbol(s, &symbol, memories_opts(&q))
     })
     .await
 }
@@ -1147,7 +1269,7 @@ async fn memories_by_file(
     Query(q): Query<MemoriesQuery>,
 ) -> Response {
     run(api.state, move |s| {
-        do_memories_by_file(s, &file, q.limit.unwrap_or(10))
+        do_memories_by_file(s, &file, memories_opts(&q))
     })
     .await
 }
@@ -1178,7 +1300,11 @@ async fn references(State(api): State<Api>, Path(symbol): Path<String>) -> Respo
 }
 
 async fn routes(State(api): State<Api>, Query(q): Query<RoutesQuery>) -> Response {
-    run(api.state, move |s| do_search_routes(s, q.method, q.path)).await
+    let page = Page::new(q.limit, q.offset);
+    run(api.state, move |s| {
+        do_search_routes(s, q.method, q.path, page)
+    })
+    .await
 }
 
 async fn routes_for_handler(State(api): State<Api>, Path(handler): Path<String>) -> Response {
@@ -1253,6 +1379,29 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode as HttpStatus};
     use tower::ServiceExt;
+
+    /// TASK-017 item 1: a request that arrives once an exit has started gets a
+    /// 503, not an answer from a store that is being frozen.
+    #[tokio::test]
+    async fn requests_during_an_exit_get_503() {
+        let life = Arc::new(Lifecycle::default());
+        let app = Router::new()
+            .route("/x", axum::routing::get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                life.clone(),
+                count_in_flight,
+            ));
+        let get = || Request::builder().uri("/x").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(get()).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        life.exiting.store(true, Ordering::SeqCst);
+        let resp = app.oneshot(get()).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::SERVICE_UNAVAILABLE);
+        assert!(resp
+            .headers()
+            .contains_key(devctx_core::procown::EXITING_HEADER));
+        assert_eq!(life.in_flight.load(Ordering::SeqCst), 0);
+    }
 
     /// D1b item 7: the grace override only shortens the timeline. A larger
     /// value used to push "grace + checkpoint budget" past the 5 s the client
@@ -1383,6 +1532,38 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["forgotten"], serde_json::json!(true), "{v}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fixup H (M-2): `/health` says which project root this server serves,
+    /// so a client holding a stale `serve.json` can tell another repository's
+    /// server on a reused port from this one's.
+    #[tokio::test]
+    async fn health_reports_the_project_root() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_health_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "ok", "{v}");
+        let root = std::path::PathBuf::from(v["root"].as_str().expect("a root"));
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            dir.canonicalize().unwrap(),
+            "{v}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

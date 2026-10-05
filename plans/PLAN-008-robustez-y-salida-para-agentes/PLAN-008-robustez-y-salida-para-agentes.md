@@ -240,13 +240,14 @@ binario instalado y sugieren reiniciar la sesión.
 | TASK-007 | Versión del extractor en `index_meta` y aviso de índice viejo | P0 | — | `done` |
 | TASK-008 | `recall` federado: exe propio robusto y errores con ruta | P0 | TASK-001 | `done` |
 | TASK-009 | Higiene de tests: ningún serve sobrevive a la suite (+ B10 SIGTERM, B11 idle) | P0 | TASK-001 | `done` |
-| TASK-010 | `project`, `limit`, paginación y conteo de omitidos en las tools | P1 | TASK-004 | `pending` |
-| TASK-011 | Ranking: penalización de tests/docs, `kind`/`include_tests`, excludes por defecto | P1 | — | `pending` |
-| TASK-012 | Dedup de chunks y anclaje por identificador exacto | P1 | TASK-006 | `pending` |
-| TASK-013 | `build_context`: `project`, selección en grupo y presupuesto por relevancia | P1 | TASK-010, TASK-011, TASK-012 | `pending` |
-| TASK-014 | `link_sources` correcto y sugerencias en `read_symbol` | P1 | TASK-006 | `pending` |
-| TASK-015 | Docs EN + ES | P1 | TASK-013, TASK-014, TASK-007, TASK-005 | `pending` |
-| TASK-016 | Verificación de campo en `~/revfa` y este repo, antes/después | P1 | TASK-015 | `pending` |
+| TASK-010 | `project`, `limit`, paginación y conteo de omitidos en las tools | P1 | TASK-004 | `done` |
+| TASK-011 | Ranking: penalización de tests/docs, `kind`/`include_tests`, excludes por defecto | P1 | — | `done` |
+| TASK-012 | Dedup de chunks y anclaje por identificador exacto | P1 | TASK-006 | `done` |
+| TASK-013 | `build_context`: `project`, selección en grupo y presupuesto por relevancia | P1 | TASK-010, TASK-011, TASK-012 | `done` |
+| TASK-014 | `link_sources` correcto y sugerencias en `read_symbol` | P1 | TASK-006 | `done` |
+| TASK-015 | Docs EN + ES | P1 | TASK-013, TASK-014, TASK-007, TASK-005 | `done` |
+| TASK-016 | Verificación de campo en `~/revfa` y este repo, antes/después | P1 | TASK-015, TASK-017 | `done` |
+| TASK-017 | Pendientes del review de P0: idle exit, `in_tx`, procown fuera de Linux, transacciones y tests | P1 | — | `done` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
 
@@ -270,11 +271,11 @@ binario instalado y sugieren reiniciar la sesión.
 | `read_symbol`/`get_references`/`search_routes` en rama no indexada | `[]` silencioso | resultados de la rama de fallback + campo `branch_fallback` |
 | `status` sobre un índice de extractor viejo | `up_to_date: true` | `extractor_stale: true` + aviso |
 | `recall scope:all` en revfa desde MCP | falla | devuelve las del CLI (≥ 4 para la consulta del informe) |
-| `search` "how are memories linked to symbols" | mismo chunk 3-5× | 0 duplicados `(file, start, end)` |
-| `search_routes` sin `path` | ~6k tokens | ≤ 1.5k con `limit` default + `omitted` |
-| `plan_status` sin filtro en revfa | ~11k tokens | ≤ 3k con `active_only`/`limit` + `omitted` |
-| `build_context` en grupo sin `project` | default silencioso | repo por mejor score, nombrado, o error que pide `project` |
-| Suite de tests | deja un serve vivo | 0 procesos `devctx serve` con cwd en tmp tras la suite |
+| `search` "how are memories linked to symbols" | mismo chunk 3-5× | 0 duplicados `(file, start, end)` (medido: 0; 0.8.5 ya no duplicaba) |
+| `search_routes` sin `path` | ~6k tokens | ≤ 1.5k con `limit` default + `omitted` (medido: 5041 → 1437 tok, margen estrecho) |
+| `plan_status` sin filtro en revfa | ~11k tokens | ≤ 3k con `active_only`/`limit` + `omitted` (medido: 5820 → 1145 tok) |
+| `build_context` en grupo sin `project` | default silencioso | repo por mejor score, nombrado, o error que pide `project` (medido: 7/7; frío 3,55 s, tibio 0,22-0,34 s) |
+| Suite de tests | deja un serve vivo | 0 procesos `devctx serve` con cwd en tmp tras la suite (medido: 0; `serve_lifecycle` 16/16 en 4 corridas) |
 
 ## 7. Riesgos
 
@@ -354,12 +355,24 @@ Cada TASK llena su `## Resultado` con:
 - **Q-1 → dos releases.** 0.8.3 = P0 (TASK-001…009); 0.9.0 = P1 (TASK-010…016).
 - **Q-2 → se acepta y se documenta.** Un commit desde un worktree enlazado indexa el `HEAD` del
   worktree principal; el commit del worktree entra al índice cuando llega a una rama trackeada.
-- **Q-3 → PENDIENTE.** `build/` en los excludes por defecto no fue respondida: confirmar con el
-  usuario antes de TASK-011 (P1; no bloquea P0). No asumir.
+- **Q-3 → sí, con opt-out (2026-10-04).** `build/` entra en los excludes por defecto junto con
+  `node_modules`, `target` y `dist`; una opción de config permite volver a indexarlo.
+  - **Precisión de Q-3 (2026-10-05).** `build/` y `target/` se anclan a la **raíz del repo**
+    (`/build/`, `/target/`), no a cualquier profundidad: `src/x/build/Builder.java` o un paquete
+    Java `target` son código. El primer reconcile registra cuántos archivos excluye cada patrón.
+    `node_modules/`, `dist/`, `vendor/`, `third_party/`, `bower_components/` siguen a cualquier
+    profundidad: en monorepos cada paquete emite su `dist/` y nadie llama `dist` a un directorio
+    de fuentes. Quien quiera `target/` a cualquier profundidad (Maven multi-módulo con `target/`
+    trackeado) lo añade en `indexing.exclude: ["target/"]`; quien quiera indexar el `/target/`
+    raíz lo reincluye con `indexing.exclude: ["!/target/"]`.
 - **Q-4 → OK.** `search_routes` 20, `plan_status` 25 planes, `memories_by_*` 5 recortadas a 600
   caracteres.
 - Ejecución de P0 en la rama `feat/plan-008-p0`, con compilación y tests autorizados; la sesión
   `debug-devctx-mcp-process` revisa cada lote y hace la verificación de campo antes de 0.8.3.
+- **P0 publicado como 0.8.4 (2026-10-04).** 0.8.3 quedó como tag sin release: el build de Windows
+  falló (`errno_result` de procown sin `cfg(unix)`); se corrigió como fix-forward.
+- **P1 aprobado para ejecución (2026-10-04)** en la rama `feat/plan-008-p1`, con compilación y
+  tests autorizados, release 0.9.0. El usuario sumó **TASK-017** con los pendientes del review de P0.
 
 ## Pendientes para P1 (surgidos en la revisión final de P0)
 
@@ -384,6 +397,22 @@ Cada TASK llena su `## Resultado` con:
 - **Test `devctx_index_fails_when_the_server_cancels_its_run`** usa `wait_with_output()` sin timeout:
   si el CLI se cuelga, se cuelga la suite.
 - **`init` interactivo con granite + offline** guarda un `model_dir` vacío en la config.
+
+## Pendientes después de 0.9.0 (pasada final de bloqueantes sobre `d60370b`)
+
+Ninguno bloquea; quedan para un plan posterior o para PLAN-010 donde encajen.
+
+1. `split_file_symbol` toma `Foo.Bar::baz` como archivo `Foo.Bar` (con `Bar` como extensión) cuando
+   no hay `/` → exigir una extensión conocida o que el archivo exista en el índice.
+2. Un nombre calificado inexistente (`Foo::new`) puede caer en `external: true` por el fallback del
+   último segmento si el `new` del repositorio es hoja → verificar que el último segmento no exista
+   en `vectors` antes de declararlo externo.
+3. Peor caso teórico de `ensure_checked` con varios clientes en frío: ~6 min (3 × (60 s de spawn +
+   60 s de espera)) → deadline global (~90 s).
+4. `a_central_daemon_that_loses_the_race_exits_quietly` depende de tiempos (1,2 s contra una ventana
+   de 5 s) → margen mayor o espera condicionada.
+5. `a_server_run_from_a_renamed_binary_is_stopped_not_orphaned` fallaría en macOS si los tests
+   corrieran ahí → `cfg(target_os = "linux")`.
 
 ## 13. Cierre
 
