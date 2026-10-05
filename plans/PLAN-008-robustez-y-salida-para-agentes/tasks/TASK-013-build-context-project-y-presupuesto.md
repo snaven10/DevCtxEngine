@@ -151,3 +151,62 @@ Contrato corregido (punto 6): la línea `[devctx] context from <repo>` aparece s
   sin flakes); sin `target/debug/devctx serve` residuales.
 - **No verificado:** latencia real en revfa (13 miembros) y el margen 0.03 sobre `code` (TASK-016); el caso
   "serve vivo pero modelo descargado de memoria" (la primera `/search` recarga el modelo, hasta 20 s de timeout).
+
+### Fixup H (review)
+
+- **I-1 — siempre el default, presentado "por relevancia" y cacheado:** `MemberOutcome` separa `Cold` (comparable
+  sin servidor / `serve.json` rancio), `Busy` (no respondió a tiempo), `Failed` (respondió error) y `NotScored`
+  (no comparable: otro modelo/dimensión, checkout ausente). Si quedan miembros comparables sin puntuar,
+  `choose_member` responde desde el mejor puntuado con etiqueta `best match X among the k members that could be
+  scored` y una línea `[devctx] compared only k of N comparable members: … could not be scored … Pass project`,
+  ofreciendo los que la pregunta nombra por nombre o `description` del registro (`name_candidates`;
+  `ProjectRow.description`). `by_relevance` = todos los comparables puntuados; `GroupPick::cacheable()` =
+  `by_relevance && warning.is_none()` (ni parciales ni empates se cachean). Tests:
+  `group_pick_accounts_for_every_member_and_never_picks_a_zero`, `a_pick_among_the_warm_few_warns_and_is_not_cached`
+  (la sesión del review: solo el default caliente), `name_candidates_match_name_and_description_words`.
+- **I-2 — latencia:** un deadline total de 2.5 s (`PICK_DEADLINE`) para toda la selección; un hilo por miembro
+  (sin lotes en lockstep), resultados por canal con `recv_timeout(deadline + 150 ms)`; quien no respondió es `Busy`
+  y su hilo termina solo (todos sus timeouts están acotados al mismo deadline). `/health` ≤ 0.8 s, `/symbol` ≤ 1 s
+  y en paralelo con `/search`. Si nadie puntuó y solo hubo fríos/ocupados → default con aviso (antes error); un
+  error real (500) sigue siendo error. Tests con servidores HTTP falsos (uno por conexión, con demoras):
+  `a_slow_or_hung_member_costs_the_budget_once` (search de 10 s ×2, colgado, `/symbol` de 10 s → < 2.5 s con
+  presupuesto 1.5 s), `a_busy_only_warm_member_falls_back_to_the_default`,
+  `group_pick_falls_back_to_the_default_only_when_nothing_failed`.
+- **M-1:** `context_backend` abre el miembro elegido (y el `project` explícito) por la ruta que ya tiene el binding
+  (`member_backend` → `open_path`, compartido con `backend_for`), sin re-resolver el nombre contra el central.
+  Test `a_group_member_is_opened_by_its_path` (`devctx-mcp/src/lib.rs`).
+- **M-2:** `/health` devuelve `{"status":"ok","root":…}` (`AppState::root`; test
+  `health_reports_the_project_root` en devctx-api). `warm_server` compara ese root con la ruta del miembro; uno
+  distinto → `Cold("stale serve.json …")`; un servidor viejo sin `root` solo vale si `procown::classify(pid,
+  start_time, cwd_is(root))` es `Ours` (la regla de `remote::discover`). Test
+  `a_stale_serve_json_does_not_score_another_repository`.
+- **M-3:** `member_serve_file` usa el `config_path` del registro (o el convencional) y, si no se puede leer, el
+  `db_path` del registro (`ProjectRow.config_path`/`db_path`). No existe un override por entorno del `db_path` en
+  `ProjectConfig` (el único `with_env_override` es de `Device`), así que no hay nada más que aplicar. Test
+  `warm_server_follows_the_registered_config_and_db_paths`.
+- **M-4:** `keep_selected` filtra en el cliente por `path_kind` de cada hit según `kind`/`include_tests` (un
+  servidor 0.8.4 ignora esos campos del body); idempotente con servidores nuevos. Test
+  `an_unfiltered_answer_is_filtered_by_kind_here` (pedido `doc`: el código del viejo ya no gana).
+- **M-5:** `ProjectConfig::load` avisa una sola vez por proceso por (archivo, mensaje) (`first_warning`, OnceLock +
+  HashSet). Test `a_config_warning_is_said_once_per_file`.
+- **M-6:** caché extraída a `PickCache` (`get(key, now)` con edad, `put` solo si `cacheable`, barre vencidos). Un
+  acierto arma un encabezado nuevo `X (cached choice from Ns ago: best match … of all N comparable members compared
+  then; pass project …)` sin la cobertura ni avisos viejos. Tests `pick_cache_key_folds_the_query_and_keeps_the_selection`,
+  `pick_cache_keeps_only_full_choices_for_the_ttl`.
+- **M-7:** `compose_context` ya no quita del brief el código de los archivos que una memoria nombra en `files`;
+  solo omite un hit cuyo texto la memoria incluida ya cita literal. Test
+  `a_memory_naming_a_file_does_not_drop_its_code`; `a_memory_that_did_not_fit_does_not_hide_its_files_code`
+  actualizado (una memoria que entra tampoco esconde el código).
+- **Nits:** `defines` usa `backend::urlencode` (ahora `pub(crate)`), test `defines_percent_encodes_the_symbol`; el
+  bono de identificador solo suma a un score base > 0 y "nada matcheó" mira el base, test
+  `group_pick_bonus_never_lifts_a_zero`; empate de mayoría en `group_targets` se desempata por modelo y dimensión,
+  no por orden de filas, test `group_targets_break_a_majority_tie_by_name`. Resultados de los hilos se ordenan por
+  nombre antes de elegir (determinismo).
+- Cada test nuevo se verificó fallando con la mutación que revierte su fix (I-1, I-2 tiempo y busy, M-2, M-3, M-4,
+  M-7, encoding, bono, empate).
+- Gate: `cargo fmt --check`; `clippy --workspace --all-targets` con y sin `--features gpu`, `-D warnings`;
+  `cargo test --workspace` verde (corrido por paquetes/binarios, cada uno < 10 min); tests de devctx-mcp repetidos
+  3× sin flakes; sin `target/debug/devctx serve` residuales.
+- **No verificado:** latencia real en revfa (13 miembros) con el deadline de 2.5 s — un miembro que recarga su
+  modelo en la primera `/search` quedará `busy` esa vez (su búsqueda sigue en el server y lo deja caliente para la
+  próxima); calibración del margen (TASK-016).

@@ -957,8 +957,16 @@ struct PlanStatusQuery {
 
 // --- handlers ---
 
-async fn health() -> Response {
-    json_ok(r#"{"status":"ok"}"#.to_string())
+/// `{"status":"ok","root":…}`: `root` lets a client that found this server
+/// through a `serve.json` check it serves the repository it asked about — a
+/// stale file whose port another project's server reused would otherwise send
+/// that repository's answers (the group selection scored the wrong member).
+/// Nothing is locked: the root is fixed at start.
+async fn health(State(api): State<Api>) -> Response {
+    json_ok(
+        serde_json::json!({ "status": "ok", "root": api.state.root().to_string_lossy() })
+            .to_string(),
+    )
 }
 
 /// The web dashboard shell (call-graph + memories).
@@ -1474,6 +1482,38 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["forgotten"], serde_json::json!(true), "{v}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fixup H (M-2): `/health` says which project root this server serves,
+    /// so a client holding a stale `serve.json` can tell another repository's
+    /// server on a reused port from this one's.
+    #[tokio::test]
+    async fn health_reports_the_project_root() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_health_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "ok", "{v}");
+        let root = std::path::PathBuf::from(v["root"].as_str().expect("a root"));
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            dir.canonicalize().unwrap(),
+            "{v}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

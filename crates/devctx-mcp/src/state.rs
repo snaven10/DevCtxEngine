@@ -1139,6 +1139,13 @@ fn do_index_inner(
 /// would queue behind the very work it reports on and arrive too late to be
 /// worth reporting.
 impl AppState {
+    /// The project root this server serves. `/health` reports it so a client
+    /// that found the server through a `serve.json` can tell a stale file whose
+    /// port another repository's server now holds (fixup H, M-2).
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Whether the project this server owns has been deleted from under it (its
     /// directory or its `.devctx/`). Such a server serves nothing anyone can
     /// reach again, and the test-suite leak of PLAN-008 B9 was exactly one.
@@ -2066,7 +2073,7 @@ fn shellexpand(path: &str) -> String {
 }
 
 /// A registered project, as the descent needs it: enough to bind, name and rank.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProjectRow {
     pub name: String,
     pub path: PathBuf,
@@ -2083,6 +2090,15 @@ pub struct ProjectRow {
     /// pick a group's default member — the most recently indexed repository is
     /// the one most likely being worked on.
     pub last_indexed_at: i64,
+    /// The registry's `config_path` (empty when unknown): where this member's
+    /// config lives, which decides where its `serve.json` is (fixup H, M-3).
+    pub config_path: PathBuf,
+    /// The registry's `db_path` (empty when unknown), the fallback for
+    /// finding `serve.json` when the config cannot be read.
+    pub db_path: PathBuf,
+    /// The registry's `description`, offered when a member must be named by
+    /// hand because it could not be compared (fixup H, I-1).
+    pub description: String,
 }
 
 /// What the registry can say about the directory the server was started in.
@@ -2168,6 +2184,7 @@ pub fn projects_under(base: &std::path::Path) -> Result<Vec<ProjectRow>, String>
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let text = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
             Some(ProjectRow {
                 name,
                 path,
@@ -2175,6 +2192,9 @@ pub fn projects_under(base: &std::path::Path) -> Result<Vec<ProjectRow>, String>
                 embed_dim,
                 embed_model,
                 last_indexed_at,
+                config_path: PathBuf::from(text("config_path")),
+                db_path: PathBuf::from(text("db_path")),
+                description: text("description"),
             })
         })
         .collect();
@@ -2229,6 +2249,7 @@ pub fn resolve_hint(hint: &str) -> Option<ProjectRow> {
             embed_dim: 0,
             embed_model: String::new(),
             last_indexed_at: 0,
+            ..Default::default()
         });
     }
     let expanded = shellexpand(hint);
@@ -2250,6 +2271,7 @@ pub fn resolve_hint(hint: &str) -> Option<ProjectRow> {
                 embed_dim: 0,
                 embed_model: String::new(),
                 last_indexed_at: 0,
+                ..Default::default()
             })
         })
         .collect();
@@ -2387,6 +2409,7 @@ pub fn why_unbound(cwd: &std::path::Path, resolution: &Resolution) -> String {
                                 embed_dim: 0,
                                 embed_model: String::new(),
                                 last_indexed_at: 0,
+                                ..Default::default()
                             })
                         })
                         .collect();
@@ -2548,10 +2571,19 @@ fn group_targets<'a>(
         .iter()
         .map(|m| (m.embed_dim, m.embed_model.as_str()))
         .collect();
+    // A tie between two keys is broken by the key itself (model name, then
+    // width), not by which member the registry listed last: the same group
+    // must compare the same members whatever order its rows come back in.
     let (majority, majority_model) = keys
         .iter()
         .copied()
-        .max_by_key(|k| keys.iter().filter(|x| *x == k).count())
+        .max_by(|a, b| {
+            let count = |k: &(i64, &str)| keys.iter().filter(|x| *x == k).count();
+            count(a)
+                .cmp(&count(b))
+                .then_with(|| b.1.cmp(a.1))
+                .then_with(|| b.0.cmp(&a.0))
+        })
         .unwrap_or((0, ""));
 
     let (present, skipped_missing) = split_missing(members);
@@ -4162,7 +4194,11 @@ fn compose_context(
     let mut dropped = 0usize;
     let budget = max_tokens * CHARS_PER_TOKEN;
 
-    let mut memory_files: Vec<String> = Vec::new();
+    // What the memories put in the brief actually say: a code hit is left
+    // out only when this already carries its text (fixup H, M-7). A memory
+    // naming a file in its `files` carries no code — dropping that file's code
+    // because of it left a brief with the decision and none of the code.
+    let mut memory_text = String::new();
     if include_memories {
         // The heading rides with the first item that fits: emitted alone it
         // survives a budget the items under it did not, and an empty section
@@ -4177,15 +4213,7 @@ fn compose_context(
             }
             out.push_str(&piece);
             head = "";
-            // Only a memory that made it in stands for its files: one that
-            // did not fit must not take their code out of the brief too.
-            for f in field(m, "files")
-                .split(',')
-                .map(str::trim)
-                .filter(|f| !f.is_empty())
-            {
-                memory_files.push(f.to_string());
-            }
+            memory_text.push_str(&piece);
         }
     }
 
@@ -4194,8 +4222,10 @@ fn compose_context(
     let chunk_cap = (budget / CTX_CODE_CAP_DIV).max(CTX_CODE_CAP_MIN);
     for h in hits {
         let file = field(h, "file");
-        // A file a memory already pulled in is not worth paying for twice.
-        if memory_files.iter().any(|f| f == file) {
+        // Code a memory in the brief already quotes is not worth paying for
+        // twice.
+        let quoted = field(h, "text").trim();
+        if !quoted.is_empty() && memory_text.contains(quoted) {
             continue;
         }
         let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -4472,12 +4502,23 @@ const PICK_FETCH: usize = 10;
 const PICK_MARGIN: f64 = 0.03;
 /// Identifier tokens of the query checked against each member's symbols.
 const PICK_IDENT_TOKENS: usize = 2;
-/// How long the selection waits for a member's `/health`: a warm server
-/// answers in milliseconds; one that does not is busy and is reported, not
-/// waited for.
+/// The whole selection's budget, every member at once (fixup H, I-2). A warm
+/// member answers a vector search in well under a second; one that does not is
+/// busy (indexing, reloading its model, holding a lock) and is reported, not
+/// waited for — the brief must not cost 20 s per busy member.
+const PICK_DEADLINE: Duration = Duration::from_millis(2500);
+/// How long the selection waits for a member's `/health`, inside the budget:
+/// a running server answers it in milliseconds even while it indexes.
 const PICK_HEALTH_TIMEOUT: Duration = Duration::from_millis(800);
-/// A warm member's search, model reload included.
-const PICK_SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long one `/symbol` lookup may take, inside the budget. It only breaks
+/// ties, so it never holds the selection up.
+const PICK_SYMBOL_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long past the deadline the selection listens for members to report
+/// their own reason (their requests time out at the deadline), before calling
+/// them busy itself.
+const PICK_GRACE: Duration = Duration::from_millis(150);
+/// Below this much budget left a request is not worth sending.
+const PICK_MIN_REQUEST: Duration = Duration::from_millis(50);
 
 /// A member's fitness for a question: `(code, all)`, each the mean of the
 /// `PICK_TOP_K` best retriever scores (`raw_score`, never a clamped or reranked
@@ -4508,6 +4549,27 @@ fn member_scores(hits: &[Value], penalty: &devctx_core::KindPenalty) -> (f64, f6
     )
 }
 
+/// The hits a kind selection keeps, decided here from each hit's path kind
+/// (fixup H, M-4). A member running an older server (0.8.4) ignores `kind` and
+/// `include_tests` in the search body and answers unfiltered; scoring that
+/// list against filtered ones compared a member's docs with the others' code.
+/// On a server that did filter this keeps every hit, so it is applied always.
+fn keep_selected(hits: Vec<Value>, sel: &devctx_search::KindSel) -> Vec<Value> {
+    let kind = sel
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .and_then(devctx_core::PathKind::parse);
+    let no_tests = sel.include_tests == Some(false);
+    hits.into_iter()
+        .filter(|h| {
+            let k = hit_kind(h);
+            kind.is_none_or(|want| k == want) && !(no_tests && k == devctx_core::PathKind::Test)
+        })
+        .collect()
+}
+
 /// How one member fared in a selection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemberOutcome {
@@ -4517,9 +4579,14 @@ pub enum MemberOutcome {
         all: f64,
         defines: Option<String>,
     },
-    /// Asked, and the asking failed (server busy, an error answer).
+    /// Asked, and it answered with an error.
     Failed(String),
-    /// Not asked, and why: no running server, another model, checkout missing.
+    /// Asked, and it did not answer within the selection's budget: indexing,
+    /// reloading its model, holding a lock. Not an error of the selection.
+    Busy(String),
+    /// Comparable, but nothing runs to ask (no server, a stale `serve.json`).
+    Cold(String),
+    /// Not comparable at all: another model or width, checkout missing.
     NotScored(String),
 }
 
@@ -4530,10 +4597,17 @@ pub struct GroupPick {
     pub member: String,
     /// What follows "context from": the member and how it was chosen.
     pub label: String,
-    /// A close call or a choice not made by relevance, said on its own line.
+    /// What the reader must not miss (a close call, members that could not be
+    /// compared, a choice not made by relevance), on its own `[devctx]` line.
     pub warning: Option<String>,
-    /// Chosen by comparing scores (worth caching), not the default fallback.
+    /// Chosen by comparing *every* comparable member's scores (fixup H, I-1).
+    /// A pick among the members that happened to be warm is not: the one cold
+    /// member that answers the question was never looked at.
     pub by_relevance: bool,
+    /// The winning score (0 when not chosen by score).
+    pub score: f64,
+    /// How many members were compared.
+    pub compared: usize,
 }
 
 impl GroupPick {
@@ -4543,6 +4617,27 @@ impl GroupPick {
             Some(w) => format!("{}\n[devctx] {w}", self.label),
             None => self.label.clone(),
         }
+    }
+
+    /// Worth reusing for the same question: every comparable member was
+    /// compared and the lead was clear. Anything else is re-decided, so a
+    /// member that has warmed up since gets its turn (fixup H, I-1).
+    pub fn cacheable(&self) -> bool {
+        self.by_relevance && self.warning.is_none()
+    }
+
+    /// The header of this pick reused `age` later: said to be a cached choice,
+    /// without the coverage of the call that made it, which may no longer hold
+    /// (fixup H, M-6).
+    pub fn cached_header(&self, age: Duration) -> String {
+        format!(
+            "{} (cached choice from {}s ago: best match {:.2} of all {} comparable members \
+             compared then; pass `project` to choose another)",
+            self.member,
+            age.as_secs(),
+            self.score,
+            self.compared
+        )
     }
 }
 
@@ -4554,11 +4649,12 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// "k of M members scored; failed: …; not scored: …".
+/// "k of M members scored; failed: …; busy: …; not scored: …".
 fn pick_coverage(
     total: usize,
     scored: usize,
     failed: &[(String, String)],
+    busy: &[(String, String)],
     not: &[(String, String)],
 ) -> String {
     let mut t = format!("{scored} of {total} members scored");
@@ -4571,64 +4667,135 @@ fn pick_coverage(
     if !failed.is_empty() {
         t.push_str(&format!("; failed: {}", list(failed)));
     }
+    if !busy.is_empty() {
+        t.push_str(&format!("; busy: {}", list(busy)));
+    }
     if !not.is_empty() {
         t.push_str(&format!("; not scored: {}", list(not)));
     }
     t
 }
 
-/// Pick the member to answer from (fixup G).
+/// The members a question names, by their registered name or description:
+/// the candidates to offer when the selection could not compare them (fixup
+/// H, I-1). Ordered by how many of the query's words they share, then name.
+pub fn name_candidates(members: &[ProjectRow], query: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "from", "that", "this", "how", "what", "where", "does",
+        "into", "are", "was", "una", "los", "las", "del", "para", "con", "que", "como", "por",
+    ];
+    let words = |s: &str| -> HashSet<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .map(|w| w.to_lowercase())
+            .map(|w| w.strip_suffix('s').map(str::to_string).unwrap_or(w))
+            .filter(|w| w.chars().count() >= 3 && !STOP.contains(&w.as_str()))
+            .collect()
+    };
+    let q = words(query);
+    let mut hits: Vec<(usize, String)> = members
+        .iter()
+        .filter_map(|m| {
+            let mine = words(&format!("{} {}", m.name, m.description));
+            let n = q.intersection(&mine).count();
+            (n > 0).then(|| (n, m.name.clone()))
+        })
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, n)| n).collect()
+}
+
+/// Pick the member to answer from (fixups G and H).
 ///
 /// * Every member's outcome is accounted for in the label: "k of M members
-///   scored", and which failed or were not scored and why — the answer from
-///   the one member that answered is never presented as the best "among 1".
-/// * Nothing matched (best score ≤ 0) is an error, whatever the count.
+///   scored", and which failed, were busy or were not scored and why.
+/// * Comparable members that could not be scored (cold, busy, failed) make the
+///   pick partial: it answers from the best of those that were scored, says so
+///   on a `[devctx]` line naming the others (and `named`, the members the
+///   question names), and is not `by_relevance` — so it is not cached.
+/// * Nothing matched (best base score ≤ 0) is an error, whatever the count.
 /// * A close call (lead < `PICK_MARGIN`) answers from the best member anyway,
 ///   with a warning naming the others.
-/// * Nobody scored: when nothing *failed* (every member cold, another model or
-///   missing) the group's `default` member answers, said so in the label and
-///   the warning; when something failed it is an error naming the failures.
+/// * Nobody scored: when nothing *failed* with an error (every member cold,
+///   busy, another model or missing) the group's `default` member answers,
+///   said so in the label and the warning; an error answer makes it an error.
 ///
 /// A member that defines an identifier of the query gets `PICK_MARGIN` on top
-/// of its score: enough to break a vector tie, not to overturn a clear lead.
+/// of a positive score: enough to break a vector tie, not to overturn a clear
+/// lead, and never enough to make a member that matched nothing win.
 pub fn choose_member(
-    outcomes: Vec<(String, MemberOutcome)>,
+    mut outcomes: Vec<(String, MemberOutcome)>,
     default: Option<&str>,
+    named: &[String],
 ) -> Result<GroupPick, String> {
+    // Arrival order is thread timing; the answer must not depend on it.
+    outcomes.sort_by(|a, b| a.0.cmp(&b.0));
     let total = outcomes.len();
     let mut scored: Vec<(String, f64, f64, Option<String>)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
+    let mut busy: Vec<(String, String)> = Vec::new();
     let mut not: Vec<(String, String)> = Vec::new();
+    let mut unscored: Vec<String> = Vec::new();
     for (name, o) in outcomes {
         match o {
             MemberOutcome::Scored { code, all, defines } => scored.push((name, code, all, defines)),
-            MemberOutcome::Failed(e) => failed.push((name, e)),
+            MemberOutcome::Failed(e) => {
+                unscored.push(name.clone());
+                failed.push((name, e));
+            }
+            MemberOutcome::Busy(e) => {
+                unscored.push(name.clone());
+                busy.push((name, e));
+            }
+            MemberOutcome::Cold(why) => {
+                unscored.push(name.clone());
+                not.push((name, why));
+            }
             MemberOutcome::NotScored(why) => not.push((name, why)),
         }
     }
-    let coverage = pick_coverage(total, scored.len(), &failed, &not);
+    let coverage = pick_coverage(total, scored.len(), &failed, &busy, &not);
+    let offer: Vec<&String> = named.iter().filter(|n| unscored.contains(n)).collect();
+    let offer = if offer.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Named by the question (name or description): {}.",
+            offer
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     if scored.is_empty() {
         return match default {
             Some(d) if failed.is_empty() => Ok(GroupPick {
                 member: d.to_string(),
                 label: format!("{d} (the group's default member; {coverage})"),
                 warning: Some(format!(
-                    "not chosen by relevance: no member could be compared without starting \
-                     its server ({coverage}). Pass `project` to choose, or start the members' \
-                     servers (`devctx serve`) to let this pick by relevance."
+                    "not chosen by relevance: no member could be compared in time without \
+                     starting its server ({coverage}). Pass `project` (a member name) to \
+                     choose.{offer}"
                 )),
                 by_relevance: false,
+                score: 0.0,
+                compared: 0,
             }),
             _ => Err(format!(
                 "no member of this group could be scored, so none can be chosen by relevance; \
-                 pass `project` (a member name or a path inside it). {coverage}"
+                 pass `project` (a member name or a path inside it).{offer} {coverage}"
             )),
         };
     }
     let use_code = scored.iter().any(|s| s.1 > 0.0);
     let base = |s: &(String, f64, f64, Option<String>)| if use_code { s.1 } else { s.2 };
     let eff = |s: &(String, f64, f64, Option<String>)| {
-        base(s) + if s.3.is_some() { PICK_MARGIN } else { 0.0 }
+        let b = base(s);
+        b + if b > 0.0 && s.3.is_some() {
+            PICK_MARGIN
+        } else {
+            0.0
+        }
     };
     scored.sort_by(|a, b| {
         eff(b)
@@ -4642,11 +4809,23 @@ pub fn choose_member(
             .join(", ")
     };
     let best = &scored[0];
-    if eff(best) <= 0.0 {
+    if base(best) <= 0.0 {
         return Err(format!(
-            "nothing in any member matched this query; pass `project` to choose one. \
-             Scored: {}. {coverage}",
+            "nothing in any member that could be scored matched this query; pass `project` to \
+             choose one.{offer} Scored: {}. {coverage}",
             list(&scored)
+        ));
+    }
+    let mut warnings: Vec<String> = Vec::new();
+    if !unscored.is_empty() {
+        warnings.push(format!(
+            "compared only {} of {} comparable members: {} could not be scored (see above), so \
+             {} is the best of those that could, not necessarily of the group. Pass `project` \
+             to choose.{offer}",
+            scored.len(),
+            scored.len() + unscored.len(),
+            unscored.join(", "),
+            best.0
         ));
     }
     let close: Vec<_> = scored[1..]
@@ -4654,28 +4833,35 @@ pub fn choose_member(
         .filter(|s| eff(best) - eff(s) < PICK_MARGIN)
         .cloned()
         .collect();
-    let warning = (!close.is_empty()).then(|| {
-        format!(
+    if !close.is_empty() {
+        warnings.push(format!(
             "ambiguous: also {} — within {PICK_MARGIN} of {} ({:.2}); pass `project` to choose",
             list(&close),
             best.0,
             base(best)
-        )
-    });
+        ));
+    }
     let defines = best
         .3
         .as_ref()
         .map(|t| format!(", defines `{t}`"))
         .unwrap_or_default();
+    let among = if unscored.is_empty() {
+        String::new()
+    } else {
+        format!(" among the {} members that could be scored", scored.len())
+    };
     Ok(GroupPick {
         member: best.0.clone(),
         label: format!(
-            "{} (best match {:.2}{defines}; {coverage})",
+            "{} (best match {:.2}{among}{defines}; {coverage})",
             best.0,
             base(best)
         ),
-        warning,
-        by_relevance: true,
+        warning: (!warnings.is_empty()).then(|| warnings.join("\n[devctx] ")),
+        by_relevance: unscored.is_empty(),
+        score: base(best),
+        compared: scored.len(),
     })
 }
 
@@ -4685,10 +4871,28 @@ struct WarmServer {
     token: Option<String>,
 }
 
+/// Whether a request failed for lack of time (a read or connect timeout), as
+/// opposed to an answer: the member is busy, not broken.
+fn timed_out(e: &ureq::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if err.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        }) {
+            return true;
+        }
+        cur = err.source();
+    }
+    e.to_string().contains("timed out")
+}
+
 impl WarmServer {
     fn agent(timeout: Duration) -> ureq::Agent {
         ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_millis(300))
+            .timeout_connect(Duration::from_millis(300).min(timeout))
             .timeout(timeout)
             .build()
     }
@@ -4702,40 +4906,66 @@ impl WarmServer {
 
     /// `/search`, vector mode, never reranked: the selection compares cosines,
     /// and a cross-encoder would replace them with logits (and cost seconds).
-    fn search(&self, query: &str, sel: &devctx_search::KindSel) -> Result<Vec<Value>, String> {
-        let req =
-            self.auth(Self::agent(PICK_SEARCH_TIMEOUT).post(&format!("{}/search", self.base)));
+    /// A timeout is [`MemberOutcome::Busy`], an error answer `Failed`.
+    fn search(
+        &self,
+        query: &str,
+        sel: &devctx_search::KindSel,
+        timeout: Duration,
+    ) -> Result<Vec<Value>, MemberOutcome> {
+        if timeout < PICK_MIN_REQUEST {
+            return Err(MemberOutcome::Busy(
+                "the selection's budget ran out before its search".into(),
+            ));
+        }
+        let req = self.auth(Self::agent(timeout).post(&format!("{}/search", self.base)));
         let body = json!({
             "query": query, "limit": PICK_FETCH, "mode": "vector", "rerank": false,
             "kind": sel.kind, "include_tests": sel.include_tests,
         });
         let raw = match req.send_json(body) {
-            Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+            Ok(r) => r.into_string().map_err(|e| {
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    MemberOutcome::Busy(format!(
+                        "its search did not finish within {:.1}s",
+                        timeout.as_secs_f64()
+                    ))
+                } else {
+                    MemberOutcome::Failed(e.to_string())
+                }
+            })?,
             Err(ureq::Error::Status(code, r)) => {
                 let text = r.into_string().unwrap_or_default();
-                return Err(format!(
+                return Err(MemberOutcome::Failed(format!(
                     "search answered {code}: {}",
                     text.trim().lines().last().unwrap_or("")
-                ));
+                )));
             }
-            Err(e) => return Err(format!("search failed: {e}")),
+            Err(e) if timed_out(&e) => {
+                return Err(MemberOutcome::Busy(format!(
+                    "its search did not answer within {:.1}s (indexing or loading its model?)",
+                    timeout.as_secs_f64()
+                )))
+            }
+            Err(e) => return Err(MemberOutcome::Failed(format!("search failed: {e}"))),
         };
-        let v: Value = serde_json::from_str(&raw).map_err(|e| format!("unreadable answer: {e}"))?;
-        Ok(devctx_core::search_hits(&v).hits)
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| MemberOutcome::Failed(format!("unreadable answer: {e}")))?;
+        Ok(keep_selected(devctx_core::search_hits(&v).hits, sel))
     }
 
-    /// Whether this member has a definition of `symbol` (`/symbol/<name>`).
-    fn defines(&self, symbol: &str) -> bool {
-        let name: String = symbol
-            .chars()
-            .map(|c| match c {
-                ':' => "%3A".to_string(),
-                c => c.to_string(),
-            })
-            .collect();
-        let req = self.auth(
-            Self::agent(PICK_SEARCH_TIMEOUT).get(&format!("{}/symbol/{name}?limit=1", self.base)),
-        );
+    /// Whether this member has a definition of `symbol` (`/symbol/<name>`),
+    /// the name percent-encoded (`#`, `?` and `/` would otherwise end the
+    /// path). No answer within `timeout` is "no".
+    fn defines(&self, symbol: &str, timeout: Duration) -> bool {
+        if timeout < PICK_MIN_REQUEST {
+            return false;
+        }
+        let name = crate::backend::urlencode(symbol);
+        let req =
+            self.auth(Self::agent(timeout).get(&format!("{}/symbol/{name}?limit=1", self.base)));
         req.call()
             .ok()
             .and_then(|r| r.into_string().ok())
@@ -4749,35 +4979,66 @@ impl WarmServer {
     }
 }
 
+/// Where a member's `serve.json` is: next to its database, as the member's
+/// own config decides (`remote::serve_file` in the CLI). The config is the
+/// registry's `config_path` and, failing that, the conventional one; when it
+/// cannot be read, the registry's `db_path` stands in (fixup H, M-3).
+fn member_serve_file(m: &ProjectRow) -> Option<PathBuf> {
+    let config = if m.config_path.as_os_str().is_empty() {
+        m.path.join(devctx_core::CONFIG_FILE_NAME)
+    } else {
+        m.config_path.clone()
+    };
+    let mut db = match ProjectConfig::load(&config) {
+        Ok(cfg) => cfg.db_path(),
+        Err(_) if !m.db_path.as_os_str().is_empty() => m.db_path.clone(),
+        Err(_) => return None,
+    };
+    if db.is_relative() {
+        db = m.path.join(db);
+    }
+    Some(
+        db.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("serve.json"),
+    )
+}
+
+/// Whether two paths name the same directory (canonicalized when they exist).
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
 /// The member's server if one is running, found without starting one (fixup
 /// G): a selection must not spawn a server per member — thirteen cold members
-/// were thirteen serves and 12–24 s. `Ok(None)` when nothing runs (no
-/// `serve.json`, or nothing listening on it); `Err` when one is advertised but
-/// does not answer `/health` in time (busy, hung, holding the lock).
+/// were thirteen serves and 12–24 s.
 ///
-/// `serve.json` sits next to the database (`remote::serve_file` in the CLI),
-/// so the member's config decides where.
-fn warm_server(path: &std::path::Path) -> Result<Option<WarmServer>, String> {
-    let Ok(cfg) = ProjectConfig::load(&path.join(devctx_core::CONFIG_FILE_NAME)) else {
-        return Ok(None);
-    };
-    let mut db = cfg.db_path();
-    if db.is_relative() {
-        db = path.join(db);
-    }
-    let file = db
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("serve.json");
-    let Some(info) = std::fs::read(&file)
+/// `Err(Cold)` when nothing runs: no `serve.json`, nothing listening on it, or
+/// a `serve.json` that is not this repository's server any more (fixup H,
+/// M-2: a stale file whose port another project's server reused scored *that*
+/// repository under this one's name). The server says which root it serves on
+/// `/health`; one too old to say is accepted only when its advertised pid is
+/// verifiably the process that wrote the file and runs from this root (the
+/// CLI's `remote::discover` rule). `Err(Busy)` when one is advertised but does
+/// not answer `/health` in time.
+fn warm_server(m: &ProjectRow, timeout: Duration) -> Result<WarmServer, MemberOutcome> {
+    let cold = || MemberOutcome::Cold("no running server".into());
+    let file = member_serve_file(m).ok_or_else(cold)?;
+    let info = std::fs::read(&file)
         .ok()
         .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-    else {
-        return Ok(None);
-    };
-    let Some(addr) = info.get("addr").and_then(|a| a.as_str()) else {
-        return Ok(None);
-    };
+        .ok_or_else(cold)?;
+    let addr = info
+        .get("addr")
+        .and_then(|a| a.as_str())
+        .ok_or_else(cold)?
+        .to_string();
+    if timeout < PICK_MIN_REQUEST {
+        return Err(MemberOutcome::Busy(
+            "the selection's budget ran out before its /health".into(),
+        ));
+    }
     let srv = WarmServer {
         base: format!("http://{addr}"),
         token: info
@@ -4785,17 +5046,48 @@ fn warm_server(path: &std::path::Path) -> Result<Option<WarmServer>, String> {
             .and_then(|t| t.as_str())
             .map(str::to_string),
     };
-    match WarmServer::agent(PICK_HEALTH_TIMEOUT)
+    let health = match WarmServer::agent(timeout)
         .get(&format!("{}/health", srv.base))
         .call()
     {
-        Ok(_) => Ok(Some(srv)),
+        Ok(r) => r
+            .into_string()
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .unwrap_or(Value::Null),
         // Nobody listens: a `serve.json` left behind by a server that is gone.
-        Err(e) if connection_refused(&e) => Ok(None),
-        Err(e) => Err(format!(
-            "its server at {addr} did not answer /health within {:.1}s (busy or hung): {e}",
-            PICK_HEALTH_TIMEOUT.as_secs_f64()
-        )),
+        Err(e) if connection_refused(&e) => return Err(cold()),
+        Err(e) => {
+            return Err(MemberOutcome::Busy(format!(
+                "its server at {addr} did not answer /health within {:.1}s (busy or hung): {e}",
+                timeout.as_secs_f64()
+            )))
+        }
+    };
+    match health.get("root").and_then(|r| r.as_str()) {
+        Some(root) if same_dir(std::path::Path::new(root), &m.path) => Ok(srv),
+        Some(root) => Err(MemberOutcome::Cold(format!(
+            "stale serve.json: the server at {addr} serves {root}, not this repository"
+        ))),
+        None => {
+            let pid = info.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32);
+            let start = info.get("start_time").and_then(|t| t.as_u64());
+            let ours = pid.is_some_and(|pid| {
+                devctx_core::procown::classify(pid, start, |p| {
+                    devctx_core::procown::cwd_is(p, &m.path)
+                }) == devctx_core::procown::Ownership::Ours
+            });
+            if ours {
+                Ok(srv)
+            } else {
+                Err(MemberOutcome::Cold(format!(
+                    "its serve.json could not be tied to a server of this repository (the \
+                     server at {addr} does not report its root and pid {} is not verifiably \
+                     the one that wrote the file)",
+                    pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                )))
+            }
+        }
     }
 }
 
@@ -4814,24 +5106,43 @@ fn connection_refused(e: &ureq::Error) -> bool {
     false
 }
 
-/// Score one member through its running server, if it has one.
+/// Score one member through its running server, if it has one, by
+/// `deadline`. The search and the `/symbol` lookups run side by side.
 fn score_member(
     m: &ProjectRow,
     query: &str,
     sel: &devctx_search::KindSel,
     idents: &[String],
     penalty: &devctx_core::KindPenalty,
+    deadline: Instant,
 ) -> MemberOutcome {
-    let srv = match warm_server(&m.path) {
-        Ok(Some(s)) => s,
-        Ok(None) => return MemberOutcome::NotScored("no running server".into()),
-        Err(e) => return MemberOutcome::Failed(e),
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let srv = match warm_server(m, left().min(PICK_HEALTH_TIMEOUT)) {
+        Ok(s) => s,
+        Err(o) => return o,
     };
-    match srv.search(query, sel) {
-        Err(e) => MemberOutcome::Failed(e),
+    let (hits, defined) = std::thread::scope(|scope| {
+        let srv = &srv;
+        let lookups: Vec<_> = idents
+            .iter()
+            .map(|t| scope.spawn(move || srv.defines(t, left().min(PICK_SYMBOL_TIMEOUT))))
+            .collect();
+        let hits = srv.search(query, sel, left());
+        let defined: Vec<bool> = lookups
+            .into_iter()
+            .map(|h| h.join().unwrap_or(false))
+            .collect();
+        (hits, defined)
+    });
+    match hits {
+        Err(o) => o,
         Ok(hits) => {
             let (code, all) = member_scores(&hits, penalty);
-            let defines = idents.iter().find(|t| srv.defines(t)).cloned();
+            let defines = idents
+                .iter()
+                .zip(defined)
+                .find(|(_, d)| *d)
+                .map(|(t, _)| t.clone());
             MemberOutcome::Scored { code, all, defines }
         }
     }
@@ -4840,18 +5151,35 @@ fn score_member(
 /// `build_context` in a group, with no `project`: compare the members that
 /// can be compared without starting anything, and choose (see
 /// [`choose_member`]). `default` is the group's default member, the answer
-/// when no member could be compared and none failed.
+/// when no member could be compared and none failed with an error.
 ///
 /// Only members whose server is already running are scored, over HTTP, in
 /// vector mode, without reranking. A cold member is reported "not scored (no
 /// running server)" — never spawned. A member of another embedding model or
 /// width is "not scored" too: its cosines are in another space.
+///
+/// Timing (fixup H, I-2): every member is asked at once, each on its own
+/// thread, against one shared deadline of [`PICK_DEADLINE`] for the whole
+/// selection — no batches in lockstep, so one slow member holds up nobody.
+/// Whoever has not answered by then is `Busy`; its thread is left to finish
+/// against its own request timeouts (all bounded by the same deadline).
 pub fn pick_group_member(
     members: &[ProjectRow],
     query: &str,
     sel: &devctx_search::KindSel,
     default: Option<&str>,
 ) -> Result<GroupPick, String> {
+    pick_group_member_within(members, query, sel, default, PICK_DEADLINE)
+}
+
+fn pick_group_member_within(
+    members: &[ProjectRow],
+    query: &str,
+    sel: &devctx_search::KindSel,
+    default: Option<&str>,
+    budget: Duration,
+) -> Result<GroupPick, String> {
+    let deadline = Instant::now() + budget;
     let (targets, skipped, _reachable, missing) = group_targets(members, None);
     let mut outcomes: Vec<(String, MemberOutcome)> = Vec::new();
     for v in skipped.iter() {
@@ -4866,32 +5194,50 @@ pub fn pick_group_member(
             MemberOutcome::NotScored("checkout missing".into()),
         ));
     }
-    let penalty = group_penalty(&targets);
+    let penalty = Arc::new(group_penalty(&targets));
     let mut idents = devctx_search::identifier_tokens(query);
     idents.truncate(PICK_IDENT_TOKENS);
-    for batch in targets.chunks(FANOUT_CONCURRENCY) {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = batch
-                .iter()
-                .map(|m| {
-                    let (idents, penalty) = (&idents, &penalty);
-                    scope.spawn(move || {
-                        (m.name.clone(), score_member(m, query, sel, idents, penalty))
-                    })
-                })
-                .collect();
-            for (h, m) in handles.into_iter().zip(batch) {
-                outcomes.push(match h.join() {
-                    Ok(r) => r,
-                    Err(_) => (
-                        m.name.clone(),
-                        MemberOutcome::Failed("the scoring thread panicked".into()),
-                    ),
-                });
-            }
+    let idents = Arc::new(idents);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut pending: Vec<String> = Vec::new();
+    for m in targets {
+        let (tx, m, q, s) = (tx.clone(), m.clone(), query.to_string(), sel.clone());
+        let (idents, penalty) = (idents.clone(), penalty.clone());
+        pending.push(m.name.clone());
+        std::thread::spawn(move || {
+            let o = score_member(&m, &q, &s, &idents, &penalty, deadline);
+            let _ = tx.send((m.name, o));
         });
     }
-    choose_member(outcomes, default)
+    drop(tx);
+    let mut all_done = false;
+    while !pending.is_empty() {
+        match rx.recv_timeout((deadline + PICK_GRACE).saturating_duration_since(Instant::now())) {
+            Ok((name, o)) => {
+                pending.retain(|n| n != &name);
+                outcomes.push((name, o));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                all_done = true;
+                break;
+            }
+        }
+    }
+    for name in pending {
+        outcomes.push((
+            name,
+            if all_done {
+                MemberOutcome::Failed("the scoring thread panicked".into())
+            } else {
+                MemberOutcome::Busy(format!(
+                    "no answer within the selection's {:.1}s budget",
+                    budget.as_secs_f64()
+                ))
+            },
+        ));
+    }
+    choose_member(outcomes, default, &name_candidates(members, query))
 }
 
 /// Which member a group `build_context` answers from when the call names a
@@ -7209,7 +7555,8 @@ mod tests {
             "the memory did not fit: {out}"
         );
         assert!(out.contains("src/pay.rs:7"), "its file's code stays: {out}");
-        // One that fits still stands for its file.
+        // Fixup H (M-7): one that fits no longer stands for its file either —
+        // it carries the decision, not the code.
         let small = json!({"id": "m2", "title": "t", "content": "short", "files": "src/pay.rs"});
         let out = compose_context(
             &[small],
@@ -7220,7 +7567,7 @@ mod tests {
             &no_linked,
         );
         assert!(
-            out.contains("[memory] m2") && !out.contains("src/pay.rs:7"),
+            out.contains("[memory] m2") && out.contains("src/pay.rs:7"),
             "{out}"
         );
     }
@@ -7286,6 +7633,7 @@ mod tests {
                 ("front".into(), scored(0.61)),
             ],
             Some("tickets-srv"),
+            &[],
         )
         .unwrap();
         assert_eq!(pick.member, "front");
@@ -7301,6 +7649,10 @@ mod tests {
     /// Fixup G (1): one scored member of several is not "the best among 1":
     /// the label names who failed and who was not scored; and a lone member
     /// that matched nothing is an error, not a confident pick.
+    ///
+    /// Fixup H (I-1): and that pick is partial — a `[devctx]` line names the
+    /// comparable members that were not scored, offers those the question
+    /// names, and the pick is not `by_relevance` (so it is not cached).
     #[test]
     fn group_pick_accounts_for_every_member_and_never_picks_a_zero() {
         let mut outcomes = vec![("front".to_string(), scored(0.55))];
@@ -7308,11 +7660,30 @@ mod tests {
         for i in 0..11 {
             outcomes.push((
                 format!("m{i}"),
-                MemberOutcome::NotScored("no running server".into()),
+                MemberOutcome::Cold("no running server".into()),
             ));
         }
-        let pick = choose_member(outcomes, Some("api")).unwrap();
+        let pick = choose_member(outcomes, Some("api"), &["m3".to_string()]).unwrap();
         assert_eq!(pick.member, "front");
+        assert!(!pick.by_relevance && !pick.cacheable(), "{pick:?}");
+        assert!(
+            pick.label
+                .contains("among the 1 members that could be scored"),
+            "{}",
+            pick.label
+        );
+        let w = pick.warning.clone().expect("a warning");
+        assert!(
+            w.starts_with("compared only 1 of 13 comparable members"),
+            "{w}"
+        );
+        assert!(w.contains("api, m0, m1"), "{w}");
+        assert!(w.contains("Pass `project`"), "{w}");
+        assert!(
+            w.contains("Named by the question (name or description): m3."),
+            "{w}"
+        );
+        assert!(pick.header().contains("\n[devctx] compared only"));
         assert!(
             pick.label.contains("1 of 13 members scored"),
             "{}",
@@ -7336,9 +7707,10 @@ mod tests {
                 ("x".into(), MemberOutcome::Failed("boom".into())),
             ],
             None,
+            &[],
         )
         .unwrap_err();
-        assert!(err.contains("nothing in any member matched"), "{err}");
+        assert!(err.contains("nothing in any member"), "{err}");
         assert!(err.contains("failed: x (boom)"), "{err}");
     }
 
@@ -7355,6 +7727,7 @@ mod tests {
                 ("far".into(), scored(0.20)),
             ],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(pick.member, "api");
@@ -7371,23 +7744,26 @@ mod tests {
         );
         assert!(choose_member(
             vec![("api".into(), scored(0.0)), ("web".into(), scored(0.0))],
-            None
+            None,
+            &[]
         )
         .unwrap_err()
         .contains("pass `project`"));
-        assert!(choose_member(vec![], None)
+        assert!(choose_member(vec![], None, &[])
             .unwrap_err()
             .contains("`project`"));
     }
 
     /// Fixup G (3): nobody warm and nothing failed → the default member, said
-    /// so; nobody answered because they failed → an error.
+    /// so; nobody answered because they failed → an error. Fixup H (I-2): a
+    /// member that was only *busy* is not a failure — the default answers.
     #[test]
     fn group_pick_falls_back_to_the_default_only_when_nothing_failed() {
-        let cold = || MemberOutcome::NotScored("no running server".into());
+        let cold = || MemberOutcome::Cold("no running server".into());
         let pick = choose_member(
             vec![("api".into(), cold()), ("web".into(), cold())],
             Some("web"),
+            &[],
         )
         .unwrap();
         assert_eq!(pick.member, "web");
@@ -7400,9 +7776,77 @@ mod tests {
                 ("web".into(), MemberOutcome::Failed("busy".into())),
             ],
             Some("web"),
+            &[],
         )
         .unwrap_err();
         assert!(err.contains("failed: web (busy)"), "{err}");
+        let pick = choose_member(
+            vec![
+                ("api".into(), cold()),
+                (
+                    "web".into(),
+                    MemberOutcome::Busy("its search did not answer within 2.5s".into()),
+                ),
+            ],
+            Some("web"),
+            &["api".to_string()],
+        )
+        .unwrap();
+        assert_eq!(pick.member, "web");
+        assert!(!pick.by_relevance);
+        assert!(
+            pick.label.contains("busy: web (its search"),
+            "{}",
+            pick.label
+        );
+        let w = pick.warning.unwrap();
+        assert!(w.contains("not chosen by relevance"), "{w}");
+        assert!(
+            w.contains("Named by the question (name or description): api."),
+            "{w}"
+        );
+    }
+
+    /// Fixup H (nit): the identifier bonus breaks a tie between members that
+    /// matched; it does not make a member that matched nothing a pick.
+    #[test]
+    fn group_pick_bonus_never_lifts_a_zero() {
+        let def = MemberOutcome::Scored {
+            code: 0.0,
+            all: 0.0,
+            defines: Some("PaymentService".into()),
+        };
+        let err = choose_member(
+            vec![("a".into(), def), ("b".into(), scored(0.0))],
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing in any member"), "{err}");
+    }
+
+    /// Fixup H (I-1): the members a question names, by name or description.
+    #[test]
+    fn name_candidates_match_name_and_description_words() {
+        let row = |name: &str, desc: &str| ProjectRow {
+            name: name.into(),
+            description: desc.into(),
+            ..Default::default()
+        };
+        let members = vec![
+            row("tickets-srv", "ticket sales backend"),
+            row("front", "the web UI"),
+            row("payments-api", "charges and refunds"),
+        ];
+        assert_eq!(
+            name_candidates(&members, "how are payments refunded? refunds flow"),
+            vec!["payments-api".to_string()]
+        );
+        assert_eq!(
+            name_candidates(&members, "where does the ticket web page live"),
+            vec!["front".to_string(), "tickets-srv".to_string()]
+        );
+        assert!(name_candidates(&members, "the and for").is_empty());
     }
 
     /// Fixup G (3): a member defining an identifier of the query wins a vector
@@ -7417,6 +7861,7 @@ mod tests {
         let pick = choose_member(
             vec![("a".into(), scored(0.51)), ("b".into(), def(0.50))],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(pick.member, "b", "{pick:?}");
@@ -7428,6 +7873,7 @@ mod tests {
         let pick = choose_member(
             vec![("a".into(), scored(0.70)), ("b".into(), def(0.50))],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(pick.member, "a");
@@ -7476,6 +7922,7 @@ mod tests {
                 ),
             ],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(pick.member, "api");
@@ -7500,6 +7947,7 @@ mod tests {
                 ),
             ],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(pick.member, "docs-site");
@@ -7553,6 +8001,7 @@ mod tests {
             embed_dim: 384,
             embed_model: model.into(),
             last_indexed_at: 0,
+            ..Default::default()
         };
         let members = vec![
             row("a", "ml-granite"),
@@ -7581,6 +8030,7 @@ mod tests {
             embed_dim: 0,
             embed_model: String::new(),
             last_indexed_at: 0,
+            ..Default::default()
         };
         let members = vec![row("api", "/w/api"), row("web", "/w/web")];
         let resolve = |p: &str| match p {
@@ -7603,63 +8053,115 @@ mod tests {
     }
 
     /// A tiny HTTP server answering `/health`, `/search` and `/symbol/…` the
-    /// way a member's `devctx serve` does. `search` is `(status, body)`; with
-    /// `hang` it accepts and never answers (a busy server).
-    fn fake_serve(search: (u16, String), defines: bool, hang: bool) -> String {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        std::thread::spawn(move || {
-            let mut held = Vec::new();
-            for conn in listener.incoming() {
-                let Ok(mut c) = conn else { continue };
-                if hang {
-                    held.push(c);
-                    continue;
-                }
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                loop {
-                    let n = c.read(&mut chunk).unwrap_or(0);
-                    buf.extend_from_slice(&chunk[..n]);
-                    let text = String::from_utf8_lossy(&buf).to_string();
-                    if let Some(h) = text.find("\r\n\r\n") {
-                        let len = text[..h]
-                            .lines()
-                            .find_map(|l| {
-                                l.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                            })
-                            .unwrap_or(0);
-                        if buf.len() >= h + 4 + len {
-                            break;
+    /// way a member's `devctx serve` does, one thread per connection.
+    #[derive(Clone, Default)]
+    struct Fake {
+        /// `/search`'s `(status, body)`.
+        search: (u16, String),
+        /// Whether `/symbol/…` finds a definition.
+        defines: bool,
+        /// Accept and never answer anything (a hung server).
+        hang: bool,
+        /// The root `/health` reports; `None` answers like an older server.
+        root: Option<PathBuf>,
+        search_delay: Duration,
+        symbol_delay: Duration,
+        /// Request lines seen, when set.
+        seen: Option<Arc<Mutex<Vec<String>>>>,
+    }
+
+    impl Fake {
+        fn start(self) -> String {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            std::thread::spawn(move || {
+                let mut held = Vec::new();
+                for conn in listener.incoming() {
+                    let Ok(mut c) = conn else { continue };
+                    if self.hang {
+                        held.push(c);
+                        continue;
+                    }
+                    let me = self.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            let n = c.read(&mut chunk).unwrap_or(0);
+                            buf.extend_from_slice(&chunk[..n]);
+                            let text = String::from_utf8_lossy(&buf).to_string();
+                            if let Some(h) = text.find("\r\n\r\n") {
+                                let len = text[..h]
+                                    .lines()
+                                    .find_map(|l| {
+                                        l.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() >= h + 4 + len {
+                                    break;
+                                }
+                            }
+                            if n == 0 {
+                                break;
+                            }
                         }
-                    }
-                    if n == 0 {
-                        break;
-                    }
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                        if let Some(seen) = &me.seen {
+                            seen.lock().unwrap().push(path.clone());
+                        }
+                        let (code, body) = if path == "/health" {
+                            match &me.root {
+                                Some(r) => (
+                                    200,
+                                    json!({"status": "ok", "root": r.to_string_lossy()})
+                                        .to_string(),
+                                ),
+                                None => (200, r#"{"status":"ok"}"#.to_string()),
+                            }
+                        } else if path == "/search" {
+                            std::thread::sleep(me.search_delay);
+                            me.search.clone()
+                        } else if path.starts_with("/symbol/") {
+                            std::thread::sleep(me.symbol_delay);
+                            let defs = if me.defines {
+                                r#"[{"symbol":"x"}]"#
+                            } else {
+                                "[]"
+                            };
+                            (200, format!(r#"{{"definitions":{defs}}}"#))
+                        } else {
+                            (404, String::new())
+                        };
+                        let _ = write!(
+                            c,
+                            "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    });
                 }
-                let text = String::from_utf8_lossy(&buf).to_string();
-                let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
-                let (code, body) = if path == "/health" {
-                    (200, r#"{"status":"ok"}"#.to_string())
-                } else if path == "/search" {
-                    search.clone()
-                } else if path.starts_with("/symbol/") {
-                    let defs = if defines { r#"[{"symbol":"x"}]"# } else { "[]" };
-                    (200, format!(r#"{{"definitions":{defs}}}"#))
-                } else {
-                    (404, String::new())
-                };
-                let _ = write!(
-                    c,
-                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
-        addr
+            });
+            addr
+        }
+    }
+
+    /// A server for member `name` under `root`, reporting that root.
+    fn serve_for(root: &std::path::Path, name: &str, search: (u16, String)) -> Fake {
+        Fake {
+            search,
+            root: Some(root.join(name)),
+            ..Default::default()
+        }
+    }
+
+    /// Three hits of `file` at score `s`.
+    fn three_hits(file: &str, s: f64) -> String {
+        format!(
+            r#"{{"results":[{{"file":"{file}","score":{s}}},{{"file":"{file}","score":{s}}},{{"file":"{file}","score":{s}}}]}}"#
+        )
     }
 
     /// A member checkout with a config, optionally advertising a server.
@@ -7690,7 +8192,14 @@ mod tests {
             embed_dim: 384,
             embed_model: model.into(),
             last_indexed_at: 0,
+            ..Default::default()
         }
+    }
+
+    fn pick_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("devctx_pick_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
     }
 
     /// Fixup G (1, 2, 3) end to end: only warm members are scored, over HTTP;
@@ -7698,16 +8207,10 @@ mod tests {
     /// never started (no `serve.json` appears); the best warm member wins.
     #[test]
     fn pick_group_member_scores_only_warm_members_and_names_the_rest() {
-        let root = std::env::temp_dir().join(format!("devctx_pick_e2e_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let hits = |file: &str, s: f64| {
-            format!(
-                r#"{{"results":[{{"file":"{file}","score":{s}}},{{"file":"{file}","score":{s}}},{{"file":"{file}","score":{s}}}]}}"#
-            )
-        };
-        let good = fake_serve((200, hits("src/pay.rs", 0.7)), false, false);
-        let weak = fake_serve((200, hits("src/ui.rs", 0.3)), false, false);
-        let broken = fake_serve((500, "the index is locked".into()), false, false);
+        let root = pick_root("e2e");
+        let good = serve_for(&root, "pay", (200, three_hits("src/pay.rs", 0.7))).start();
+        let weak = serve_for(&root, "ui", (200, three_hits("src/ui.rs", 0.3))).start();
+        let broken = serve_for(&root, "broken", (500, "the index is locked".into())).start();
         let busy = fake_serve((200, String::new()), false, true);
         let members = vec![
             fake_member(&root, "pay", "ml-granite", Some(&good)),
@@ -7734,6 +8237,13 @@ mod tests {
         assert!(l.contains("busy (its server at"), "{l}");
         assert!(l.contains("cold (no running server)"), "{l}");
         assert!(l.contains("legacy (different model"), "{l}");
+        // Three comparable members were not scored: a partial pick.
+        assert!(!pick.by_relevance, "{pick:?}");
+        let w = pick.warning.clone().unwrap_or_default();
+        assert!(
+            w.contains("compared only 2 of 5 comparable members: broken, busy, cold"),
+            "{w}"
+        );
         assert!(
             !root.join("cold/.devctx/state/serve.json").exists(),
             "a cold member must not be started"
@@ -7745,8 +8255,7 @@ mod tests {
     /// started to find that out.
     #[test]
     fn pick_group_member_with_every_member_cold_uses_the_default() {
-        let root = std::env::temp_dir().join(format!("devctx_pick_cold_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = pick_root("cold");
         let members = vec![
             fake_member(&root, "a", "m", None),
             fake_member(&root, "b", "m", None),
@@ -7765,6 +8274,316 @@ mod tests {
             assert!(!root.join(m).join(".devctx/state/serve.json").exists());
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup H (I-1), the session the review traced: the MCP has started the
+    /// default member's server, so it is the only warm one. Picking it "by
+    /// relevance" among one and caching that for 10 minutes meant the cold
+    /// member that answers was never compared. Now: a warning names the cold
+    /// members, offers the one the question names, and nothing is cached.
+    #[test]
+    fn a_pick_among_the_warm_few_warns_and_is_not_cached() {
+        let root = pick_root("lazy");
+        let dflt = serve_for(&root, "tickets-srv", (200, three_hits("src/a.rs", 0.41))).start();
+        let mut members = vec![
+            fake_member(&root, "tickets-srv", "m", Some(&dflt)),
+            fake_member(&root, "front", "m", None),
+            fake_member(&root, "payments", "m", None),
+        ];
+        members[2].description = "charges and refunds".into();
+        let pick = pick_group_member(
+            &members,
+            "how is a refund issued",
+            &devctx_search::KindSel::default(),
+            Some("tickets-srv"),
+        )
+        .unwrap();
+        assert_eq!(pick.member, "tickets-srv");
+        assert!(!pick.by_relevance && !pick.cacheable(), "{pick:?}");
+        let h = pick.header();
+        assert!(h.contains("\n[devctx] compared only 1 of 3"), "{h}");
+        assert!(h.contains("front, payments could not be scored"), "{h}");
+        assert!(
+            h.contains("Named by the question (name or description): payments."),
+            "{h}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup H (I-2): one shared deadline for the whole selection. A member
+    /// whose search is stuck behind an index run, a hung server and a slow
+    /// `/symbol` cost the budget once, not 20 s each; the stuck ones are
+    /// `busy`, and the member that answered wins.
+    #[test]
+    fn a_slow_or_hung_member_costs_the_budget_once() {
+        let root = pick_root("slow");
+        let good = Fake {
+            symbol_delay: Duration::from_secs(10),
+            ..serve_for(&root, "good", (200, three_hits("src/a.rs", 0.6)))
+        }
+        .start();
+        let slow = Fake {
+            search_delay: Duration::from_secs(10),
+            ..serve_for(&root, "slow", (200, three_hits("src/b.rs", 0.9)))
+        }
+        .start();
+        let slow2 = Fake {
+            search_delay: Duration::from_secs(10),
+            ..serve_for(&root, "slow2", (200, three_hits("src/c.rs", 0.9)))
+        }
+        .start();
+        let hung = fake_serve((200, String::new()), false, true);
+        let members = vec![
+            fake_member(&root, "good", "m", Some(&good)),
+            fake_member(&root, "slow", "m", Some(&slow)),
+            fake_member(&root, "slow2", "m", Some(&slow2)),
+            fake_member(&root, "hung", "m", Some(&hung)),
+        ];
+        let started = Instant::now();
+        let pick = pick_group_member_within(
+            &members,
+            "how does PaymentService charge",
+            &devctx_search::KindSel::default(),
+            Some("slow"),
+            Duration::from_millis(1500),
+        )
+        .unwrap();
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(2500), "{took:?}");
+        assert_eq!(pick.member, "good", "{pick:?}");
+        let l = &pick.label;
+        let busy = &l[l.find("busy: ").expect("a busy list")..];
+        for m in ["hung (", "slow (", "slow2 ("] {
+            assert!(busy.contains(m), "{m}: {l}");
+        }
+        assert!(!pick.by_relevance);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup H (I-2): when the only warm member is busy (indexing), the
+    /// selection answers from the default with a warning — it used to be an
+    /// error where the plain default had answered before.
+    #[test]
+    fn a_busy_only_warm_member_falls_back_to_the_default() {
+        let root = pick_root("busyonly");
+        let slow = Fake {
+            search_delay: Duration::from_secs(10),
+            ..serve_for(&root, "api", (200, three_hits("src/b.rs", 0.9)))
+        }
+        .start();
+        let members = vec![
+            fake_member(&root, "api", "m", Some(&slow)),
+            fake_member(&root, "web", "m", None),
+        ];
+        let started = Instant::now();
+        let pick = pick_group_member_within(
+            &members,
+            "q",
+            &devctx_search::KindSel::default(),
+            Some("api"),
+            Duration::from_millis(800),
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(1800));
+        assert_eq!(pick.member, "api");
+        assert!(!pick.by_relevance);
+        assert!(
+            pick.warning.unwrap().contains("not chosen by relevance"),
+            "{}",
+            pick.label
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup H (M-2): a `serve.json` whose port now belongs to another
+    /// repository's server is not this member's server — and one whose server
+    /// does not say its root counts only when its pid is verifiably ours (pid
+    /// 1 is not).
+    #[test]
+    fn a_stale_serve_json_does_not_score_another_repository() {
+        let root = pick_root("stale");
+        let other = Fake {
+            root: Some(root.join("elsewhere")),
+            search: (200, three_hits("src/x.rs", 0.9)),
+            ..Default::default()
+        }
+        .start();
+        let older = fake_serve((200, three_hits("src/y.rs", 0.9)), false, false);
+        let members = vec![
+            fake_member(&root, "a", "m", Some(&other)),
+            fake_member(&root, "b", "m", Some(&older)),
+        ];
+        let pick = pick_group_member(&members, "q", &devctx_search::KindSel::default(), Some("a"))
+            .unwrap();
+        let l = &pick.label;
+        assert!(l.contains("0 of 2 members scored"), "{l}");
+        assert!(l.contains("a (stale serve.json: the server at"), "{l}");
+        assert!(l.contains("b (its serve.json could not be tied"), "{l}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup H (M-3): `serve.json` is found where the member's registered
+    /// config puts the database, not assumed under `<root>/.devctx`.
+    #[test]
+    fn warm_server_follows_the_registered_config_and_db_paths() {
+        let root = pick_root("cfgpath");
+        let srv = serve_for(&root, "a", (200, three_hits("src/a.rs", 0.5))).start();
+        let state = root.join("state-elsewhere");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("serve.json"),
+            format!(r#"{{"addr":"{srv}","pid":1}}"#),
+        )
+        .unwrap();
+        // The config lives outside the checkout and moves the state dir.
+        let cfg = root.join("configs/a.yaml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cfg,
+            format!("project:\n  name: a\nstate_dir: {}\n", state.display()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        let mut m = ProjectRow {
+            name: "a".into(),
+            path: root.join("a"),
+            config_path: cfg.clone(),
+            ..Default::default()
+        };
+        assert!(warm_server(&m, Duration::from_secs(2)).is_ok());
+        // No readable config: the registry's db_path stands in.
+        m.config_path = root.join("configs/missing.yaml");
+        m.db_path = state.join("index.duckdb");
+        assert!(warm_server(&m, Duration::from_secs(2)).is_ok());
+        m.db_path = PathBuf::new();
+        assert_eq!(
+            warm_server(&m, Duration::from_secs(2)).err(),
+            Some(MemberOutcome::Cold("no running server".into()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup H (M-4): an older member ignores `kind` in the search body and
+    /// answers unfiltered; the selection filters its hits by path kind, so its
+    /// docs are not compared against the others' code.
+    #[test]
+    fn an_unfiltered_answer_is_filtered_by_kind_here() {
+        let root = pick_root("kind");
+        // Asked for docs, the older member also sends its code: compared as
+        // is, its code (0.9) beat the other member's docs on the code score.
+        let mixed = r#"{"results":[
+            {"file":"src/a.rs","score":0.9},{"file":"src/b.rs","score":0.9},
+            {"file":"src/c.rs","score":0.9},{"file":"README.md","score":0.2}]}"#;
+        let docs_only = r#"{"results":[{"file":"docs/x.md","score":0.6},{"file":"docs/y.md","score":0.6},{"file":"docs/z.md","score":0.6}]}"#;
+        let old = serve_for(&root, "old", (200, mixed.into())).start();
+        let new = serve_for(&root, "new", (200, docs_only.into())).start();
+        let members = vec![
+            fake_member(&root, "old", "m", Some(&old)),
+            fake_member(&root, "new", "m", Some(&new)),
+        ];
+        let sel = devctx_search::KindSel {
+            kind: Some("doc".into()),
+            include_tests: None,
+        };
+        let pick = pick_group_member(&members, "q", &sel, None).unwrap();
+        assert_eq!(pick.member, "new", "{pick:?}");
+        let docs = keep_selected(
+            serde_json::from_str::<Value>(mixed).unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .clone(),
+            &devctx_search::KindSel {
+                kind: Some("doc".into()),
+                include_tests: None,
+            },
+        );
+        assert_eq!(docs.len(), 1);
+        let no_tests = keep_selected(
+            vec![json!({"file": "tests/a.rs"}), json!({"file": "src/a.rs"})],
+            &devctx_search::KindSel {
+                kind: None,
+                include_tests: Some(false),
+            },
+        );
+        assert_eq!(no_tests, vec![json!({"file": "src/a.rs"})]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup H (nit): a symbol name is percent-encoded into the `/symbol`
+    /// path: `#`, `?` and `/` used to cut it short.
+    #[test]
+    fn defines_percent_encodes_the_symbol() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let addr = Fake {
+            defines: true,
+            seen: Some(seen.clone()),
+            ..Default::default()
+        }
+        .start();
+        let srv = WarmServer {
+            base: format!("http://{addr}"),
+            token: None,
+        };
+        assert!(srv.defines("a#b?c/d::e", Duration::from_secs(2)));
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["/symbol/a%23b%3Fc%2Fd%3A%3Ae?limit=1"]
+        );
+    }
+
+    /// Fixup H (nit): which model is the group's majority on a tie does not
+    /// depend on the registry's row order.
+    #[test]
+    fn group_targets_break_a_majority_tie_by_name() {
+        let root = pick_root("tie");
+        let a = fake_member(&root, "a", "zeta", None);
+        let b = fake_member(&root, "b", "alpha", None);
+        let pick = |ms: Vec<ProjectRow>| {
+            let (t, _, _, _) = group_targets(&ms, None);
+            t.iter().map(|m| m.name.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(pick(vec![a.clone(), b.clone()]), vec!["b".to_string()]);
+        assert_eq!(pick(vec![b, a]), vec!["b".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup H (M-7): a memory that names a file in `files` carries no code,
+    /// so that file's code stays in the brief; code a memory quotes verbatim
+    /// is not paid for twice.
+    #[test]
+    fn a_memory_naming_a_file_does_not_drop_its_code() {
+        let mut mem = ctx_mem("m1", "auth decision", "we validate tokens in auth.rs");
+        mem["files"] = json!("src/auth.rs");
+        let out = compose_context(
+            &[mem],
+            &[ctx_hit("src/auth.rs", 1, "fn validate_token() {}")],
+            None,
+            2000,
+            true,
+            &no_linked,
+        );
+        assert!(out.contains("// src/auth.rs:1"), "{out}");
+        let quoting = ctx_mem("m2", "snippet", "fn validate_token() {}");
+        let out = compose_context(
+            &[quoting],
+            &[ctx_hit("src/auth.rs", 1, "fn validate_token() {}")],
+            None,
+            2000,
+            true,
+            &no_linked,
+        );
+        assert!(!out.contains("// src/auth.rs:1"), "{out}");
+    }
+
+    /// The legacy three-argument form, for servers too old to report a root.
+    fn fake_serve(search: (u16, String), defines: bool, hang: bool) -> String {
+        Fake {
+            search,
+            defines,
+            hang,
+            ..Default::default()
+        }
+        .start()
     }
 
     #[test]

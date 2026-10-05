@@ -476,7 +476,9 @@ impl ProjectConfig {
             std::fs::read_to_string(path).map_err(|e| Error::ConfigRead(path.to_path_buf(), e))?;
         let cfg = Self::from_yaml(&raw).map_err(|e| Error::ConfigParse(path.to_path_buf(), e))?;
         for w in cfg.search.penalty.warnings() {
-            eprintln!("warning: {}: {w}", path.display());
+            if first_warning(path, &w) {
+                eprintln!("warning: {}: {w}", path.display());
+            }
         }
         Ok(cfg)
     }
@@ -507,6 +509,20 @@ impl ProjectConfig {
         };
         base.join(".devctx").join("state").join("index.duckdb")
     }
+}
+
+/// Whether this `(config, warning)` pair is new to this process (fixup H,
+/// M-5). A long-lived process (the MCP server) loads every group member's
+/// config on each selection, so a config warning printed on every load buried
+/// stderr; it is said once per file and message.
+fn first_warning(path: &Path, warning: &str) -> bool {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((path.to_path_buf(), warning.to_string()))
 }
 
 /// Walk up from `start_dir` looking for `.devctx/config.yaml`.
@@ -594,6 +610,18 @@ pub fn detect_default_branch(repo: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixup H (M-5): a config warning is said once per file and message per
+    /// process, however often the config is loaded.
+    #[test]
+    fn a_config_warning_is_said_once_per_file() {
+        let a = Path::new("/nonexistent/fixup-h/a/.devctx/config.yaml");
+        let b = Path::new("/nonexistent/fixup-h/b/.devctx/config.yaml");
+        assert!(first_warning(a, "w1"));
+        assert!(!first_warning(a, "w1"), "the second load must stay quiet");
+        assert!(first_warning(a, "w2"), "another message is news");
+        assert!(first_warning(b, "w1"), "another file is news");
+    }
 
     /// The first entry is the default; an empty list keeps the old behaviour of
     /// following whatever is checked out, so an existing repository does not

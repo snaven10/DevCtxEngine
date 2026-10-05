@@ -473,7 +473,7 @@ pub struct DevctxServer {
     /// `build_context`'s group member choices, per [`pick_cache_key`], for
     /// [`PICK_CACHE_TTL`]: the same question asked again in a session is not
     /// worth another fan-out.
-    picks: Arc<Mutex<HashMap<String, (std::time::Instant, state::GroupPick)>>>,
+    picks: Arc<Mutex<PickCache>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -493,6 +493,39 @@ fn pick_cache_key(query: &str, sel: &devctx_search::KindSel) -> String {
         sel.kind.as_deref().unwrap_or("").trim().to_lowercase(),
         sel.include_tests
     )
+}
+
+/// Group member choices worth reusing, by [`pick_cache_key`], for
+/// [`PICK_CACHE_TTL`]. Only a [`state::GroupPick::cacheable`] choice goes in:
+/// one made with every comparable member compared and a clear lead. A choice
+/// among the members that happened to be warm is decided again next time, when
+/// the member that answers may have warmed up (fixup H, I-1).
+#[derive(Default)]
+struct PickCache {
+    picks: HashMap<String, (std::time::Instant, state::GroupPick)>,
+}
+
+impl PickCache {
+    /// The cached choice for `key` as of `now`, with its age; `None` when
+    /// absent or older than [`PICK_CACHE_TTL`].
+    fn get(
+        &self,
+        key: &str,
+        now: std::time::Instant,
+    ) -> Option<(state::GroupPick, std::time::Duration)> {
+        let (at, pick) = self.picks.get(key)?;
+        let age = now.saturating_duration_since(*at);
+        (age < PICK_CACHE_TTL).then(|| (pick.clone(), age))
+    }
+
+    /// Remember `pick` for `key` if it is worth reusing; expired entries go.
+    fn put(&mut self, key: String, pick: &state::GroupPick, now: std::time::Instant) {
+        self.picks
+            .retain(|_, (at, _)| now.saturating_duration_since(*at) < PICK_CACHE_TTL);
+        if pick.cacheable() {
+            self.picks.insert(key, (now, pick.clone()));
+        }
+    }
 }
 
 /// How many hint-resolved backends to keep open at once.
@@ -531,7 +564,7 @@ impl DevctxServer {
             connect,
             cwd: std::env::current_dir().unwrap_or_default(),
             hinted: Arc::new(Mutex::new(HashMap::new())),
-            picks: Arc::new(Mutex::new(HashMap::new())),
+            picks: Arc::new(Mutex::new(PickCache::default())),
             tool_router: Self::tool_router(),
         }
     }
@@ -576,22 +609,7 @@ impl DevctxServer {
     /// into a dead end. It falls back to the binding and says so.
     fn backend_for(&self, hint: Option<&str>) -> Result<(Arc<Backend>, Option<String>), ErrorData> {
         if let Some(row) = hint.and_then(state::resolve_hint) {
-            if let Ok(cache) = self.hinted.lock() {
-                if let Some(b) = cache.get(&row.path) {
-                    return Ok((b.clone(), Some(row.name)));
-                }
-            }
-            let backend =
-                (self.connect)(&row.path).map_err(|e| ErrorData::invalid_request(e, None))?;
-            let backend = Arc::new(backend);
-            if let Ok(mut cache) = self.hinted.lock() {
-                // A session that walks a large workspace would otherwise hold a
-                // database handle per repository for its whole life.
-                if cache.len() >= HINT_CACHE_CAP {
-                    cache.clear();
-                }
-                cache.insert(row.path.clone(), backend.clone());
-            }
+            let backend = self.open_path(&row.path)?;
             return Ok((backend, Some(row.name)));
         }
         match self.binding() {
@@ -610,6 +628,41 @@ impl DevctxServer {
         }
     }
 
+    /// The backend for a project root, from the hint cache or newly connected.
+    fn open_path(&self, path: &std::path::Path) -> Result<Arc<Backend>, ErrorData> {
+        if let Ok(cache) = self.hinted.lock() {
+            if let Some(b) = cache.get(path) {
+                return Ok(b.clone());
+            }
+        }
+        let backend =
+            Arc::new((self.connect)(path).map_err(|e| ErrorData::invalid_request(e, None))?);
+        if let Ok(mut cache) = self.hinted.lock() {
+            // A session that walks a large workspace would otherwise hold a
+            // database handle per repository for its whole life.
+            if cache.len() >= HINT_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(path.to_path_buf(), backend.clone());
+        }
+        Ok(backend)
+    }
+
+    /// The backend of the group member `name`, opened by the path the binding
+    /// already holds (fixup H, M-1). Resolving the name again against the
+    /// registry could fail (central down or slow) and fall back to the
+    /// default member, while the header named another.
+    fn member_backend(
+        &self,
+        members: &[state::ProjectRow],
+        name: &str,
+    ) -> Result<Arc<Backend>, ErrorData> {
+        let m = members.iter().find(|m| m.name == name).ok_or_else(|| {
+            ErrorData::internal_error(format!("{name} is not a member of this group"), None)
+        })?;
+        self.open_path(&m.path)
+    }
+
     /// The backend `build_context` answers from, and the line that names it.
     ///
     /// Outside a group this is `backend_for` (a `project` hint names the
@@ -618,8 +671,11 @@ impl DevctxServer {
     /// group is an error, never a quiet fall back to the default member.
     /// Without `project` the members whose servers are running are compared
     /// and the best match answers, named, with how many were scored; see
-    /// [`state::pick_group_member`]. The choice is cached per (query, kind,
-    /// include_tests) for [`PICK_CACHE_TTL`].
+    /// [`state::pick_group_member`]. Only a choice that compared every
+    /// comparable member with a clear lead is cached, per (query, kind,
+    /// include_tests) for [`PICK_CACHE_TTL`], and a reused one says so with
+    /// its age instead of the old call's coverage. The member is opened by
+    /// the path the binding holds, never re-resolved by name.
     async fn context_backend(
         &self,
         project: Option<&str>,
@@ -638,39 +694,37 @@ impl DevctxServer {
         if let Some(name) = state::group_context_target(project, &members, state::resolve_hint)
             .map_err(|e| ErrorData::invalid_request(e, None))?
         {
-            let (b, _) = self.backend_for(Some(&name))?;
+            let b = self.member_backend(&members, &name)?;
             return Ok((b, Some(name)));
         }
         let key = pick_cache_key(query, sel);
-        let cached = self.picks.lock().ok().and_then(|c| {
-            c.get(&key)
-                .filter(|(at, _)| at.elapsed() < PICK_CACHE_TTL)
-                .map(|(_, p)| p.clone())
-        });
-        let (pick, from_cache) = match cached {
-            Some(p) => (p, true),
+        let cached = self
+            .picks
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&key, std::time::Instant::now()));
+        let (pick, header) = match cached {
+            Some((p, age)) => {
+                let header = p.cached_header(age);
+                (p, header)
+            }
             None => {
                 let (q, s, d) = (query.to_string(), sel.clone(), default_name.clone());
+                let ms = members.clone();
                 let p = tokio::task::spawn_blocking(move || {
-                    state::pick_group_member(&members, &q, &s, Some(&d))
+                    state::pick_group_member(&ms, &q, &s, Some(&d))
                 })
                 .await
                 .map_err(|e| ErrorData::internal_error(format!("task failed: {e}"), None))?
                 .map_err(|e| ErrorData::invalid_request(e, None))?;
-                (p, false)
+                if let Ok(mut c) = self.picks.lock() {
+                    c.put(key, &p, std::time::Instant::now());
+                }
+                let header = p.header();
+                (p, header)
             }
         };
-        if !from_cache && pick.by_relevance {
-            if let Ok(mut c) = self.picks.lock() {
-                c.retain(|_, (at, _)| at.elapsed() < PICK_CACHE_TTL);
-                c.insert(key, (std::time::Instant::now(), pick.clone()));
-            }
-        }
-        let (b, _) = self.backend_for(Some(&pick.member))?;
-        let mut header = pick.header();
-        if from_cache {
-            header = header.replacen(" (", " (cached choice; ", 1);
-        }
+        let b = self.member_backend(&members, &pick.member)?;
         Ok((b, Some(header)))
     }
 
@@ -1561,3 +1615,120 @@ pub fn run_stdio_bound(binding: Binding, connect: Connect) -> anyhow::Result<()>
 
 /// How long in-flight blocking tool calls may delay the exit once the service loop ended.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn pick(by_relevance: bool, warning: Option<&str>) -> state::GroupPick {
+        state::GroupPick {
+            member: "front".into(),
+            label: "front (best match 0.61; 2 of 3 members scored; not scored: x (cold))".into(),
+            warning: warning.map(str::to_string),
+            by_relevance,
+            score: 0.61,
+            compared: 2,
+        }
+    }
+
+    /// Fixup H (M-6): the key folds case and whitespace, and the kind
+    /// selection is part of it.
+    #[test]
+    fn pick_cache_key_folds_the_query_and_keeps_the_selection() {
+        let none = devctx_search::KindSel::default();
+        let code = devctx_search::KindSel {
+            kind: Some(" Code ".into()),
+            include_tests: None,
+        };
+        let no_tests = devctx_search::KindSel {
+            kind: None,
+            include_tests: Some(false),
+        };
+        assert_eq!(
+            pick_cache_key("How  is a\tPayment charged", &none),
+            pick_cache_key("how is a payment charged", &none)
+        );
+        assert_ne!(pick_cache_key("q", &none), pick_cache_key("q", &code));
+        assert_ne!(pick_cache_key("q", &none), pick_cache_key("q", &no_tests));
+        assert_eq!(
+            pick_cache_key("q", &code),
+            pick_cache_key(
+                "q",
+                &devctx_search::KindSel {
+                    kind: Some("code".into()),
+                    include_tests: None,
+                }
+            )
+        );
+    }
+
+    /// Fixup H (I-1, M-6): only a choice that compared every comparable member
+    /// with a clear lead is cached; it expires after the TTL; and reused, it is
+    /// said to be cached without the old call's coverage or warnings.
+    #[test]
+    fn pick_cache_keeps_only_full_choices_for_the_ttl() {
+        let t0 = Instant::now();
+        let mut c = PickCache::default();
+        c.put(
+            "partial".into(),
+            &pick(false, Some("compared only 2 of 3")),
+            t0,
+        );
+        c.put("close".into(), &pick(true, Some("ambiguous: also x")), t0);
+        c.put("full".into(), &pick(true, None), t0);
+        assert!(
+            c.get("partial", t0).is_none(),
+            "a partial pick is not reused"
+        );
+        assert!(c.get("close", t0).is_none(), "a close call is not reused");
+        let (p, age) = c.get("full", t0 + Duration::from_secs(30)).expect("cached");
+        assert_eq!(age, Duration::from_secs(30));
+        let h = p.cached_header(age);
+        assert!(h.starts_with("front (cached choice from 30s ago"), "{h}");
+        assert!(!h.contains("not scored") && !h.contains("ambiguous"), "{h}");
+        assert!(
+            c.get("full", t0 + PICK_CACHE_TTL).is_none(),
+            "expired at the TTL"
+        );
+        // An insert sweeps what expired.
+        c.put("other".into(), &pick(true, None), t0 + PICK_CACHE_TTL);
+        assert_eq!(c.picks.len(), 1);
+    }
+
+    /// Fixup H (M-1): the chosen member is opened by the path the binding
+    /// holds, never re-resolved by name (which could fall back to the default
+    /// while the header names another).
+    #[test]
+    fn a_group_member_is_opened_by_its_path() {
+        let connect: Connect =
+            Arc::new(|p: &std::path::Path| Err(format!("connect:{}", p.display())));
+        let server = DevctxServer::with_binding(Binding::None, connect);
+        let members = vec![
+            state::ProjectRow {
+                name: "a".into(),
+                path: "/nonexistent/fixup-h/a".into(),
+                ..Default::default()
+            },
+            state::ProjectRow {
+                name: "b".into(),
+                path: "/nonexistent/fixup-h/b".into(),
+                ..Default::default()
+            },
+        ];
+        let err = server
+            .member_backend(&members, "b")
+            .err()
+            .expect("connect fails");
+        assert!(
+            err.message.contains("connect:/nonexistent/fixup-h/b"),
+            "{}",
+            err.message
+        );
+        let err = server
+            .member_backend(&members, "zz")
+            .err()
+            .expect("unknown");
+        assert!(err.message.contains("not a member"), "{}", err.message);
+    }
+}

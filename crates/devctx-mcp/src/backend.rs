@@ -725,7 +725,7 @@ fn ensure_object(raw: String, key: &str) -> String {
 /// Minimal percent-encoding for a path or query segment: RFC 3986 unreserved
 /// characters (`A-Z a-z 0-9 - _ . ~`) pass through, every other byte becomes
 /// `%XX` (UTF-8 bytes one by one), so the value can be spliced into a route.
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
