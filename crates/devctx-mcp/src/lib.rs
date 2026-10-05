@@ -1629,6 +1629,7 @@ mod tests {
             by_relevance,
             score: 0.61,
             compared: 2,
+            not_comparable: vec!["x".into()],
         }
     }
 

@@ -2814,9 +2814,19 @@ fn hit_kind(h: &Value) -> devctx_core::PathKind {
 fn group_penalty(targets: &[&ProjectRow]) -> devctx_core::KindPenalty {
     targets
         .first()
-        .and_then(|m| ProjectConfig::load(&m.path.join(devctx_core::CONFIG_FILE_NAME)).ok())
+        .and_then(|m| ProjectConfig::load(&member_config_path(m)).ok())
         .map(|c| c.search.penalty)
         .unwrap_or_default()
+}
+
+/// The member's config file: the registry's `config_path`, and failing that
+/// the conventional one under its checkout.
+fn member_config_path(m: &ProjectRow) -> PathBuf {
+    if m.config_path.as_os_str().is_empty() {
+        m.path.join(devctx_core::CONFIG_FILE_NAME)
+    } else {
+        m.config_path.clone()
+    }
 }
 
 /// The fan-out had nobody to ask: every member's checkout is missing.
@@ -4174,6 +4184,14 @@ const CTX_CODE_CAP_MIN: usize = 600;
 const CTX_DOC_MAX: usize = 6;
 const CTX_DOC_KEEP: usize = 3;
 
+/// Whether a code hit is long enough for "a memory already quotes it" to mean
+/// anything: at least [`QUOTE_MIN_CHARS`] characters or two lines.
+fn is_quotable(text: &str) -> bool {
+    text.chars().count() >= QUOTE_MIN_CHARS || text.lines().count() >= 2
+}
+
+const QUOTE_MIN_CHARS: usize = 40;
+
 /// Assemble the brief from what was gathered. Pure — no store, no embedder — so
 /// the budget rules are testable on their own.
 ///
@@ -4225,7 +4243,9 @@ fn compose_context(
         // Code a memory in the brief already quotes is not worth paying for
         // twice.
         let quoted = field(h, "text").trim();
-        if !quoted.is_empty() && memory_text.contains(quoted) {
+        // A short hit (`}`, `use super::*;`) is "contained" in nearly any
+        // memory: only text long enough to be a quotation may suppress code.
+        if is_quotable(quoted) && memory_text.contains(quoted) {
             continue;
         }
         let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -4608,6 +4628,10 @@ pub struct GroupPick {
     pub score: f64,
     /// How many members were compared.
     pub compared: usize,
+    /// Members that could not be compared at all in the original choice
+    /// (another model or width, checkout missing): a cached reuse must not
+    /// read as if the whole group had been looked at.
+    pub not_comparable: Vec<String>,
 }
 
 impl GroupPick {
@@ -4631,12 +4655,17 @@ impl GroupPick {
     /// (fixup H, M-6).
     pub fn cached_header(&self, age: Duration) -> String {
         format!(
-            "{} (cached choice from {}s ago: best match {:.2} of all {} comparable members \
-             compared then; pass `project` to choose another)",
+            "{} (cached choice from {}s ago: best match {:.2} of {} comparable members \
+             compared then{}; pass `project` to choose another)",
             self.member,
             age.as_secs(),
             self.score,
-            self.compared
+            self.compared,
+            if self.not_comparable.is_empty() {
+                String::new()
+            } else {
+                format!("; not comparable then: {}", self.not_comparable.join(", "))
+            }
         )
     }
 }
@@ -4679,24 +4708,62 @@ fn pick_coverage(
 /// The members a question names, by their registered name or description:
 /// the candidates to offer when the selection could not compare them (fixup
 /// H, I-1). Ordered by how many of the query's words they share, then name.
+/// Two words naming the same thing: equal, or one the other plus a plural
+/// `s`. Compared pairwise rather than by stripping the `s` from every word,
+/// which made `status` and `statu` the same word.
+fn same_word(a: &str, b: &str) -> bool {
+    a == b || a.strip_suffix('s') == Some(b) || b.strip_suffix('s') == Some(a)
+}
+
 pub fn name_candidates(members: &[ProjectRow], query: &str) -> Vec<String> {
     const STOP: &[&str] = &[
         "the", "and", "for", "with", "from", "that", "this", "how", "what", "where", "does",
         "into", "are", "was", "una", "los", "las", "del", "para", "con", "que", "como", "por",
     ];
-    let words = |s: &str| -> HashSet<String> {
+    let tokens = |s: &str, min: usize| -> HashSet<String> {
         s.split(|c: char| !c.is_alphanumeric())
             .map(|w| w.to_lowercase())
-            .map(|w| w.strip_suffix('s').map(str::to_string).unwrap_or(w))
-            .filter(|w| w.chars().count() >= 3 && !STOP.contains(&w.as_str()))
+            .filter(|w| w.chars().count() >= min && !STOP.contains(&w.as_str()))
             .collect()
     };
-    let q = words(query);
+    // A member's words: those of its name and description, plus its WHOLE name
+    // when that is short (`ui`, `db`), which the length floor would drop. No
+    // stemming: stripping an `s` turned `status` into `statu`.
+    let mine: Vec<HashSet<String>> = members
+        .iter()
+        .map(|m| {
+            let mut w = tokens(&format!("{} {}", m.name, m.description), 3);
+            let name = m.name.to_lowercase();
+            if name.chars().count() < 3 && !name.is_empty() {
+                w.insert(name);
+            }
+            w
+        })
+        .collect();
+    // Words most members share say nothing about WHICH one the question means
+    // (in a group every repository may carry `revfa` and `backend`): like an
+    // inverse document frequency of zero, they are dropped.
+    let mut freq: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for w in mine.iter().flatten() {
+        *freq.entry(w.as_str()).or_default() += 1;
+    }
+    let common: HashSet<&str> = freq
+        .into_iter()
+        .filter(|(_, n)| n * 2 > members.len())
+        .map(|(w, _)| w)
+        .collect();
+    let q = tokens(query, 2);
     let mut hits: Vec<(usize, String)> = members
         .iter()
-        .filter_map(|m| {
-            let mine = words(&format!("{} {}", m.name, m.description));
-            let n = q.intersection(&mine).count();
+        .zip(&mine)
+        .filter_map(|(m, mine)| {
+            let n = q
+                .iter()
+                .filter(|w| {
+                    mine.iter()
+                        .any(|x| same_word(w, x) && !common.contains(x.as_str()))
+                })
+                .count();
             (n > 0).then(|| (n, m.name.clone()))
         })
         .collect();
@@ -4735,6 +4802,7 @@ pub fn choose_member(
     let mut busy: Vec<(String, String)> = Vec::new();
     let mut not: Vec<(String, String)> = Vec::new();
     let mut unscored: Vec<String> = Vec::new();
+    let mut not_comparable: Vec<String> = Vec::new();
     for (name, o) in outcomes {
         match o {
             MemberOutcome::Scored { code, all, defines } => scored.push((name, code, all, defines)),
@@ -4750,7 +4818,10 @@ pub fn choose_member(
                 unscored.push(name.clone());
                 not.push((name, why));
             }
-            MemberOutcome::NotScored(why) => not.push((name, why)),
+            MemberOutcome::NotScored(why) => {
+                not_comparable.push(name.clone());
+                not.push((name, why));
+            }
         }
     }
     let coverage = pick_coverage(total, scored.len(), &failed, &busy, &not);
@@ -4768,8 +4839,12 @@ pub fn choose_member(
         )
     };
     if scored.is_empty() {
+        // Nobody scored. Even when members FAILED (an error answer, an
+        // unreadable one) the default answers when there is one: the failures
+        // are in the label and the warning, so they are not hidden, and a
+        // question is not refused over a member that could not be asked.
         return match default {
-            Some(d) if failed.is_empty() => Ok(GroupPick {
+            Some(d) => Ok(GroupPick {
                 member: d.to_string(),
                 label: format!("{d} (the group's default member; {coverage})"),
                 warning: Some(format!(
@@ -4780,8 +4855,9 @@ pub fn choose_member(
                 by_relevance: false,
                 score: 0.0,
                 compared: 0,
+                not_comparable: not_comparable.clone(),
             }),
-            _ => Err(format!(
+            None => Err(format!(
                 "no member of this group could be scored, so none can be chosen by relevance; \
                  pass `project` (a member name or a path inside it).{offer} {coverage}"
             )),
@@ -4810,11 +4886,43 @@ pub fn choose_member(
     };
     let best = &scored[0];
     if base(best) <= 0.0 {
-        return Err(format!(
-            "nothing in any member that could be scored matched this query; pass `project` to \
-             choose one.{offer} Scored: {}. {coverage}",
-            list(&scored)
-        ));
+        if unscored.is_empty() {
+            return Err(format!(
+                "nothing in any member that could be scored matched this query; pass `project` \
+                 to choose one.{offer} Scored: {}. {coverage}",
+                list(&scored)
+            ));
+        }
+        // Nothing matched among those that could be scored, but others could
+        // not be asked: "nothing matched" is not known for the group, so it is
+        // not an error. Answer from the default (or the best of the scored),
+        // and say the comparison was partial.
+        let member = default.unwrap_or(best.0.as_str()).to_string();
+        return Ok(GroupPick {
+            label: format!(
+                "{member} (nothing matched among the {} members that could be scored{}; \
+                 {coverage})",
+                scored.len(),
+                if default.is_some() {
+                    "; the group's default member"
+                } else {
+                    ""
+                }
+            ),
+            warning: Some(format!(
+                "compared only {} of {} comparable members and none of them matched: {} could \
+                 not be scored (see above), so the match may be there. Answering from {member}. \
+                 Pass `project` to choose.{offer}",
+                scored.len(),
+                scored.len() + unscored.len(),
+                unscored.join(", "),
+            )),
+            member,
+            by_relevance: false,
+            score: 0.0,
+            compared: scored.len(),
+            not_comparable,
+        });
     }
     let mut warnings: Vec<String> = Vec::new();
     if !unscored.is_empty() {
@@ -4862,6 +4970,7 @@ pub fn choose_member(
         by_relevance: unscored.is_empty(),
         score: base(best),
         compared: scored.len(),
+        not_comparable,
     })
 }
 
@@ -4936,6 +5045,15 @@ impl WarmServer {
                     MemberOutcome::Failed(e.to_string())
                 }
             })?,
+            // The member is leaving (its idle exit): busy, not broken. Only the
+            // marked 503 is read this way.
+            Err(ureq::Error::Status(503, r))
+                if r.header(devctx_core::procown::EXITING_HEADER).is_some() =>
+            {
+                return Err(MemberOutcome::Busy(
+                    "its server is shutting down (idle exit)".into(),
+                ))
+            }
             Err(ureq::Error::Status(code, r)) => {
                 let text = r.into_string().unwrap_or_default();
                 return Err(MemberOutcome::Failed(format!(
@@ -4949,7 +5067,12 @@ impl WarmServer {
                     timeout.as_secs_f64()
                 )))
             }
-            Err(e) => return Err(MemberOutcome::Failed(format!("search failed: {e}"))),
+            // A transport failure that is neither a timeout nor a refusal (a
+            // connection reset by a server on its way out, say) says nothing
+            // about the member's answer: busy, not an error answer.
+            Err(e @ ureq::Error::Transport(_)) => {
+                return Err(MemberOutcome::Busy(format!("its search was cut off: {e}")))
+            }
         };
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| MemberOutcome::Failed(format!("unreadable answer: {e}")))?;
@@ -4984,11 +5107,7 @@ impl WarmServer {
 /// registry's `config_path` and, failing that, the conventional one; when it
 /// cannot be read, the registry's `db_path` stands in (fixup H, M-3).
 fn member_serve_file(m: &ProjectRow) -> Option<PathBuf> {
-    let config = if m.config_path.as_os_str().is_empty() {
-        m.path.join(devctx_core::CONFIG_FILE_NAME)
-    } else {
-        m.config_path.clone()
-    };
+    let config = member_config_path(m);
     let mut db = match ProjectConfig::load(&config) {
         Ok(cfg) => cfg.db_path(),
         Err(_) if !m.db_path.as_os_str().is_empty() => m.db_path.clone(),
@@ -5023,6 +5142,7 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// CLI's `remote::discover` rule). `Err(Busy)` when one is advertised but does
 /// not answer `/health` in time.
 fn warm_server(m: &ProjectRow, timeout: Duration) -> Result<WarmServer, MemberOutcome> {
+    let started = Instant::now();
     let cold = || MemberOutcome::Cold("no running server".into());
     let file = member_serve_file(m).ok_or_else(cold)?;
     let info = std::fs::read(&file)
@@ -5057,6 +5177,23 @@ fn warm_server(m: &ProjectRow, timeout: Duration) -> Result<WarmServer, MemberOu
             .unwrap_or(Value::Null),
         // Nobody listens: a `serve.json` left behind by a server that is gone.
         Err(e) if connection_refused(&e) => return Err(cold()),
+        // A leaving devctx server answers /health 503 with its marker: busy.
+        Err(ureq::Error::Status(503, r))
+            if r.header(devctx_core::procown::EXITING_HEADER).is_some() =>
+        {
+            return Err(MemberOutcome::Busy(format!(
+                "its server at {addr} is shutting down (idle exit)"
+            )))
+        }
+        // Any other HTTP error status came from something that is not this
+        // member's devctx server (a stale `serve.json` whose port another
+        // program reused): nothing runs for this member.
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(MemberOutcome::Cold(format!(
+                "stale serve.json: what answers at {addr} replied HTTP {code} to /health, \
+                 not a devctx server"
+            )))
+        }
         Err(e) => {
             return Err(MemberOutcome::Busy(format!(
                 "its server at {addr} did not answer /health within {:.1}s (busy or hung): {e}",
@@ -5072,11 +5209,21 @@ fn warm_server(m: &ProjectRow, timeout: Duration) -> Result<WarmServer, MemberOu
         None => {
             let pid = info.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32);
             let start = info.get("start_time").and_then(|t| t.as_u64());
-            let ours = pid.is_some_and(|pid| {
-                devctx_core::procown::classify(pid, start, |p| {
-                    devctx_core::procown::cwd_is(p, &m.path)
-                }) == devctx_core::procown::Ownership::Ours
-            });
+            // Off Linux the ownership check runs `ps` and `lsof`, which the
+            // selection's deadline must cover like any other wait.
+            let root = m.path.clone();
+            let left = timeout.saturating_sub(started.elapsed());
+            let Some(ours) = within(left, move || {
+                pid.is_some_and(|pid| {
+                    devctx_core::procown::classify(pid, start, |p| {
+                        devctx_core::procown::cwd_is(p, &root)
+                    }) == devctx_core::procown::Ownership::Ours
+                })
+            }) else {
+                return Err(MemberOutcome::Busy(
+                    "the selection's budget ran out checking who owns its serve.json".into(),
+                ));
+            };
             if ours {
                 Ok(srv)
             } else {
@@ -5089,6 +5236,16 @@ fn warm_server(m: &ProjectRow, timeout: Duration) -> Result<WarmServer, MemberOu
             }
         }
     }
+}
+
+/// Run `f` on its own thread and wait at most `limit` for its answer; `None`
+/// when it did not come in time (the thread is left to finish by itself).
+fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(limit).ok()
 }
 
 /// Whether a request failed because nothing listens on the port.
@@ -7700,18 +7857,19 @@ mod tests {
             pick.label
         );
 
-        // The single-member case no longer skips the "nothing matched" check.
+        // The single-member case no longer skips the "nothing matched" check
+        // (every member compared: the other one is not comparable at all).
         let err = choose_member(
             vec![
                 ("solo".into(), scored(0.0)),
-                ("x".into(), MemberOutcome::Failed("boom".into())),
+                ("x".into(), MemberOutcome::NotScored("boom".into())),
             ],
             None,
             &[],
         )
         .unwrap_err();
         assert!(err.contains("nothing in any member"), "{err}");
-        assert!(err.contains("failed: x (boom)"), "{err}");
+        assert!(err.contains("not scored: x (boom)"), "{err}");
     }
 
     /// Fixup G (4): a close call answers from the best member anyway, with a
@@ -7770,12 +7928,28 @@ mod tests {
         assert!(!pick.by_relevance);
         assert!(pick.label.contains("default member"), "{}", pick.label);
         assert!(pick.warning.unwrap().contains("not chosen by relevance"));
+        // Fixup I (H re-review 1): an error answer does not refuse the
+        // question while a default exists: it answers from it and shows the
+        // error. Without a default it is still an error.
+        let pick = choose_member(
+            vec![
+                ("api".into(), cold()),
+                ("web".into(), MemberOutcome::Failed("boom".into())),
+            ],
+            Some("web"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pick.member, "web");
+        assert!(!pick.by_relevance && !pick.cacheable());
+        assert!(pick.label.contains("failed: web (boom)"), "{}", pick.label);
+        assert!(pick.warning.unwrap().contains("failed: web (boom)"));
         let err = choose_member(
             vec![
                 ("api".into(), cold()),
                 ("web".into(), MemberOutcome::Failed("busy".into())),
             ],
-            Some("web"),
+            None,
             &[],
         )
         .unwrap_err();
@@ -8068,6 +8242,12 @@ mod tests {
         symbol_delay: Duration,
         /// Request lines seen, when set.
         seen: Option<Arc<Mutex<Vec<String>>>>,
+        /// Answer `/health` with this status and a body that is not devctx's.
+        health_status: Option<u16>,
+        /// Mark 503s as the idle exit's (`x-devctx-exiting`).
+        exiting: bool,
+        /// Cut the connection on `/search` without answering.
+        reset_search: bool,
     }
 
     impl Fake {
@@ -8113,32 +8293,43 @@ mod tests {
                         if let Some(seen) = &me.seen {
                             seen.lock().unwrap().push(path.clone());
                         }
-                        let (code, body) = if path == "/health" {
-                            match &me.root {
-                                Some(r) => (
-                                    200,
-                                    json!({"status": "ok", "root": r.to_string_lossy()})
-                                        .to_string(),
-                                ),
-                                None => (200, r#"{"status":"ok"}"#.to_string()),
-                            }
-                        } else if path == "/search" {
-                            std::thread::sleep(me.search_delay);
-                            me.search.clone()
-                        } else if path.starts_with("/symbol/") {
-                            std::thread::sleep(me.symbol_delay);
-                            let defs = if me.defines {
-                                r#"[{"symbol":"x"}]"#
+                        if path == "/search" && me.reset_search {
+                            return;
+                        }
+                        let (code, body) =
+                            if let (true, Some(code)) = (path == "/health", me.health_status) {
+                                (code, "not devctx".to_string())
+                            } else if path == "/health" {
+                                match &me.root {
+                                    Some(r) => (
+                                        200,
+                                        json!({"status": "ok", "root": r.to_string_lossy()})
+                                            .to_string(),
+                                    ),
+                                    None => (200, r#"{"status":"ok"}"#.to_string()),
+                                }
+                            } else if path == "/search" {
+                                std::thread::sleep(me.search_delay);
+                                me.search.clone()
+                            } else if path.starts_with("/symbol/") {
+                                std::thread::sleep(me.symbol_delay);
+                                let defs = if me.defines {
+                                    r#"[{"symbol":"x"}]"#
+                                } else {
+                                    "[]"
+                                };
+                                (200, format!(r#"{{"definitions":{defs}}}"#))
                             } else {
-                                "[]"
+                                (404, String::new())
                             };
-                            (200, format!(r#"{{"definitions":{defs}}}"#))
+                        let extra = if code == 503 && me.exiting {
+                            "x-devctx-exiting: 1\r\n"
                         } else {
-                            (404, String::new())
+                            ""
                         };
                         let _ = write!(
                             c,
-                            "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         );
                     });
@@ -8547,6 +8738,212 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Fixup I (H re-review 1, 2): a member that failed, and a question
+    /// nothing matched among the scored members while others were not asked,
+    /// are answered from the default (or the best), with the partial
+    /// comparison said; with every member compared, "nothing matched" is
+    /// still an error.
+    #[test]
+    fn nothing_scored_or_matched_is_not_an_error_while_members_were_not_asked() {
+        let cold = || MemberOutcome::Cold("no running server".into());
+        // kind=doc in a repo without docs: the warm member scores 0, the rest
+        // are cold.
+        let pick = choose_member(
+            vec![("api".into(), scored(0.0)), ("web".into(), cold())],
+            Some("web"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pick.member, "web");
+        assert!(!pick.by_relevance && !pick.cacheable());
+        let w = pick.warning.clone().unwrap();
+        assert!(
+            w.starts_with("compared only 1 of 2 comparable members"),
+            "{w}"
+        );
+        assert!(w.contains("none of them matched"), "{w}");
+        // No default: the best of the scored answers, same warning.
+        let pick = choose_member(
+            vec![("api".into(), scored(0.0)), ("web".into(), cold())],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pick.member, "api");
+        assert!(pick.warning.unwrap().contains("none of them matched"));
+        // Everyone was compared: nothing matched stays an error.
+        assert!(choose_member(
+            vec![("api".into(), scored(0.0)), ("web".into(), scored(0.0))],
+            Some("web"),
+            &[]
+        )
+        .is_err());
+    }
+
+    /// Fixup I (H re-review 1, 5): a member leaving (the exit's marked 503),
+    /// a connection cut mid-answer, and a stale `serve.json` whose port answers
+    /// something that is not devctx, are Busy, Busy and Cold; an error answer
+    /// is Failed, and the default still answers.
+    #[test]
+    fn leaving_cut_and_foreign_servers_are_not_errors_of_the_selection() {
+        let root = pick_root("i_kinds");
+        let leaving = Fake {
+            search: (503, String::new()),
+            exiting: true,
+            root: Some(root.join("leaving")),
+            ..Default::default()
+        }
+        .start();
+        let cut = Fake {
+            reset_search: true,
+            root: Some(root.join("cut")),
+            ..Default::default()
+        }
+        .start();
+        let foreign = Fake {
+            health_status: Some(500),
+            ..Default::default()
+        }
+        .start();
+        let plain503 = Fake {
+            search: (503, "no".into()),
+            root: Some(root.join("plain")),
+            ..Default::default()
+        }
+        .start();
+        let members = vec![
+            fake_member(&root, "leaving", "ml-granite", Some(&leaving)),
+            fake_member(&root, "cut", "ml-granite", Some(&cut)),
+            fake_member(&root, "foreign", "ml-granite", Some(&foreign)),
+            fake_member(&root, "plain", "ml-granite", Some(&plain503)),
+        ];
+        let pick = pick_group_member(
+            &members,
+            "how is a payment charged",
+            &devctx_search::KindSel::default(),
+            Some("cut"),
+        )
+        .unwrap();
+        assert_eq!(pick.member, "cut");
+        let l = &pick.label;
+        assert!(
+            l.contains("busy: cut (") && l.contains("leaving (its server is shutting down"),
+            "{l}"
+        );
+        assert!(l.contains("not scored: foreign (stale serve.json"), "{l}");
+        // An unmarked 503 is an error answer, not the exit.
+        assert!(l.contains("failed: plain (search answered 503"), "{l}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup I (H re-review 3): a short code hit is not suppressed by a memory
+    /// that happens to contain it; a long one is.
+    #[test]
+    fn short_hits_are_never_suppressed_by_a_quoting_memory() {
+        assert!(!is_quotable("}"));
+        assert!(!is_quotable("use super::*;"));
+        assert!(is_quotable(
+            "fn validate_token(token: &str) -> bool { true }"
+        ));
+        assert!(is_quotable("let a = 1;\nlet b = 2;"));
+        let mem = ctx_mem("m", "note", "closing brace } and use super::*; are common");
+        for tiny in ["}", "use super::*;"] {
+            let out = compose_context(
+                std::slice::from_ref(&mem),
+                &[ctx_hit("src/a.rs", 3, tiny)],
+                None,
+                2000,
+                true,
+                &no_linked,
+            );
+            assert!(out.contains("// src/a.rs:3"), "{tiny}: {out}");
+        }
+    }
+
+    /// Fixup I (H re-review 4): words most members share name no member, a
+    /// short whole name counts, and plurals are not stemmed.
+    #[test]
+    fn name_candidates_ignore_shared_words_and_keep_short_names() {
+        let row = |name: &str, desc: &str| ProjectRow {
+            name: name.into(),
+            description: desc.into(),
+            ..Default::default()
+        };
+        let members = vec![
+            row("revfa-backend", "revfa backend service"),
+            row("revfa-front", "revfa backend web client"),
+            row("revfa-docs", "revfa backend documents"),
+            row("ui", "components"),
+            row("db", "schemas"),
+        ];
+        // "revfa" and "backend" are in most members: they point at nobody.
+        assert!(name_candidates(&members, "revfa backend").is_empty());
+        assert_eq!(
+            name_candidates(&members, "revfa backend service flow"),
+            vec!["revfa-backend".to_string()]
+        );
+        // Short whole names.
+        assert_eq!(
+            name_candidates(&members, "where is the ui"),
+            vec!["ui".to_string()]
+        );
+        assert_eq!(
+            name_candidates(&members, "db migration"),
+            vec!["db".to_string()]
+        );
+        // A plural matches its singular both ways, without stripping every
+        // `s`: `status` stays `status`, it is not turned into `statu`.
+        assert!(same_word("refunds", "refund") && same_word("refund", "refunds"));
+        assert!(same_word("status", "status") && !same_word("status", "statu1"));
+        assert!(!same_word("stat", "status") && !same_word("statu", "stat"));
+        let m = vec![
+            row("a", "refunds"),
+            row("b", "status page"),
+            row("c", "other"),
+        ];
+        assert_eq!(name_candidates(&m, "a refund"), vec!["a".to_string()]);
+        assert_eq!(name_candidates(&m, "status"), vec!["b".to_string()]);
+        assert!(name_candidates(&m, "stat").is_empty());
+    }
+
+    /// Fixup I (nit): the penalty reads the member's registered config path.
+    #[test]
+    fn group_penalty_uses_the_registered_config_path() {
+        let root = pick_root("penalty");
+        let m = fake_member(&root, "m", "ml-granite", None);
+        let mut moved = m.clone();
+        moved.config_path = m.path.join(".devctx/config.yaml");
+        assert_eq!(
+            member_config_path(&moved),
+            m.path.join(".devctx/config.yaml")
+        );
+        let mut other = m.clone();
+        other.config_path = root.join("elsewhere.yaml");
+        assert_eq!(member_config_path(&other), root.join("elsewhere.yaml"));
+        assert_eq!(
+            member_config_path(&m),
+            m.path.join(devctx_core::CONFIG_FILE_NAME)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixup I (nit): a cached pick still names the members that could not be
+    /// compared at all.
+    #[test]
+    fn a_cached_header_keeps_the_members_that_were_not_comparable() {
+        let pick = GroupPick {
+            member: "api".into(),
+            label: "api".into(),
+            warning: None,
+            by_relevance: true,
+            score: 0.6,
+            compared: 2,
+            not_comparable: vec!["legacy".into()],
+        };
+        let h = pick.cached_header(Duration::from_secs(5));
+        assert!(h.contains("not comparable then: legacy"), "{h}");
+    }
+
     /// Fixup H (M-7): a memory that names a file in `files` carries no code,
     /// so that file's code stays in the brief; code a memory quotes verbatim
     /// is not paid for twice.
@@ -8563,10 +8960,11 @@ mod tests {
             &no_linked,
         );
         assert!(out.contains("// src/auth.rs:1"), "{out}");
-        let quoting = ctx_mem("m2", "snippet", "fn validate_token() {}");
+        let long = "fn validate_token(token: &str) -> bool { token.len() > 8 }";
+        let quoting = ctx_mem("m2", "snippet", long);
         let out = compose_context(
             &[quoting],
-            &[ctx_hit("src/auth.rs", 1, "fn validate_token() {}")],
+            &[ctx_hit("src/auth.rs", 1, long)],
             None,
             2000,
             true,
