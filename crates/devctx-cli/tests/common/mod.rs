@@ -183,18 +183,43 @@ pub fn wait_with_timeout(
     use std::time::{Duration, Instant};
     // Each reader reports through a channel and is never joined on the
     // timeout path: a grandchild (an auto-spawned `serve`) that inherited the
-    // pipe keeps it open after the child is killed, `read_to_end` then never
-    // returns, and joining would hang exactly what this function prevents.
+    // pipe keeps it open after the child is killed, the read then never sees
+    // EOF, and joining would hang exactly what this function prevents.
+    //
+    // It forwards every chunk as it arrives instead of one buffer at EOF: with
+    // the pipe held by a grandchild there is no EOF, and whatever the child
+    // had printed was lost with it. That is not only an auto-spawned server:
+    // `sh -c "echo started; sleep 60"` under dash (Ubuntu's `sh`, CI's)
+    // forks `sleep` instead of exec'ing it, and killing the shell leaves the
+    // sleep holding the pipe — under bash the same line passed by accident.
     fn drain<R: Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Vec<u8>> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut r) = r {
-                let _ = r.read_to_end(&mut buf);
+            let Some(mut r) = r else { return };
+            let mut chunk = [0u8; 8192];
+            loop {
+                match r.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
             }
-            let _ = tx.send(buf);
         });
         rx
+    }
+    // What a reader delivered until its pipe closed or `until` passed; chunks
+    // already received are kept even when the deadline is already gone.
+    fn collect(rx: &mpsc::Receiver<Vec<u8>>, until: Instant) -> Vec<u8> {
+        let mut buf = Vec::new();
+        while let Ok(c) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            buf.extend_from_slice(&c);
+        }
+        buf
     }
     let out = drain(child.stdout.take());
     let err = drain(child.stderr.take());
@@ -209,20 +234,19 @@ pub fn wait_with_timeout(
                 let _ = child.kill();
                 let _ = child.wait();
                 // What it printed, if the pipes close promptly; not waited for.
-                let grace = Duration::from_millis(500);
-                let said = String::from_utf8_lossy(&out.recv_timeout(grace).unwrap_or_default())
-                    .into_owned()
-                    + &String::from_utf8_lossy(&err.recv_timeout(grace).unwrap_or_default());
+                let grace = Instant::now() + Duration::from_millis(500);
+                let said = String::from_utf8_lossy(&collect(&out, grace)).into_owned()
+                    + &String::from_utf8_lossy(&collect(&err, grace));
                 return Err(format!("still running after {limit:?}:\n{said}"));
             }
         }
     };
     // The child exited; its output ends with it unless something it started
     // still holds the pipe: bounded as well, so that cannot hang either.
-    let rest = Duration::from_secs(10);
+    let rest = Instant::now() + Duration::from_secs(10);
     Ok(std::process::Output {
         status,
-        stdout: out.recv_timeout(rest).unwrap_or_default(),
-        stderr: err.recv_timeout(rest).unwrap_or_default(),
+        stdout: collect(&out, rest),
+        stderr: collect(&err, rest),
     })
 }

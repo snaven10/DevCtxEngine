@@ -511,8 +511,12 @@ fn routed_and_direct_agree_on_shape_not_just_content() {
 /// deadline, with what it printed, instead of hanging the caller.
 #[test]
 fn a_hung_child_fails_the_wait_instead_of_hanging_the_suite() {
+    // The trailing `:` keeps `sleep` a forked child under every `sh`: bash
+    // exec'd a final `sleep` in place of the shell and dash does not, so the
+    // orphaned sleep holding the pipe after the kill happened only on CI's
+    // dash and the output printed before it was lost there.
     let child = Command::new("sh")
-        .args(["-c", "echo started; sleep 60"])
+        .args(["-c", "echo started; sleep 60; :"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
