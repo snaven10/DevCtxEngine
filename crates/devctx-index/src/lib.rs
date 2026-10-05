@@ -1005,6 +1005,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A repository with tracked build output and vendored code, as git sees it.
+    fn repo_with_generated_files(tag: &str) -> PathBuf {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_index_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        write(&dir, "src/lib.rs", "pub fn kept() -> i32 { 1 }\n");
+        write(
+            &dir,
+            "dist/app.js",
+            "export function bundled() { return 1 }\n",
+        );
+        write(&dir, "build/gen.rs", "pub fn built() -> i32 { 2 }\n");
+        write(&dir, "target/out.rs", "pub fn compiled() -> i32 { 3 }\n");
+        write(
+            &dir,
+            "node_modules/dep/index.js",
+            "export function dep() { return 4 }\n",
+        );
+        commit_all(&dir, "initial");
+        dir
+    }
+
+    /// Vendor / generated / build output that git *tracks* stays out of the
+    /// index by default, and `default_excludes: false` brings it all back.
+    #[test]
+    fn default_excludes_keep_tracked_build_output_out_and_can_be_turned_off() {
+        let dir = repo_with_generated_files("defex");
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        let cfg = devctx_core::config::Indexing::default();
+        index_excluding(&store, &dir, &cfg.effective_excludes());
+        assert_eq!(indexed_files(&store), vec!["src/lib.rs".to_string()]);
+
+        let store = Store::open_in_memory(DIM).unwrap();
+        let off = devctx_core::config::Indexing {
+            default_excludes: false,
+            ..Default::default()
+        };
+        index_excluding(&store, &dir, &off.effective_excludes());
+        assert_eq!(
+            indexed_files(&store),
+            vec![
+                "build/gen.rs".to_string(),
+                "dist/app.js".to_string(),
+                "node_modules/dep/index.js".to_string(),
+                "src/lib.rs".to_string(),
+                "target/out.rs".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `include_build: true` opts `build/` back in and nothing else.
+    #[test]
+    fn include_build_reindexes_build_but_not_the_other_defaults() {
+        let dir = repo_with_generated_files("incbuild");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let cfg = devctx_core::config::Indexing {
+            include_build: true,
+            ..Default::default()
+        };
+        index_excluding(&store, &dir, &cfg.effective_excludes());
+        assert_eq!(
+            indexed_files(&store),
+            vec!["build/gen.rs".to_string(), "src/lib.rs".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Switching the defaults on over an existing index prunes what they cover
+    /// on the next plain (incremental) `index` — the exclude set is
+    /// fingerprinted, so a changed one forces the full run that prunes.
+    #[test]
+    fn a_changed_exclude_set_prunes_on_the_next_incremental_run() {
+        let dir = repo_with_generated_files("defprune");
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_excluding(&store, &dir, &[]);
+        assert_eq!(indexed_files(&store).len(), 5);
+
+        let defaults = devctx_core::config::Indexing::default().effective_excludes();
+        let res = index_excluding(&store, &dir, &defaults);
+        assert_eq!(res.files_pruned, 4, "{res:?}");
+        assert_eq!(indexed_files(&store), vec!["src/lib.rs".to_string()]);
+
+        // Unchanged set again: back to cheap incremental runs, no pruning pass.
+        let res = index_excluding(&store, &dir, &defaults);
+        assert!(!res.full_reindex);
+
+        // And opting back out brings the files in again, also incrementally.
+        index_excluding(&store, &dir, &[]);
+        assert_eq!(indexed_files(&store).len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A malformed pattern must not take the whole index down with it.
     #[test]
     fn a_broken_pattern_is_dropped_not_fatal() {

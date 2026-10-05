@@ -125,6 +125,13 @@ enum Command {
         /// Hybrid search: fuse vector + keyword (BM25) via reciprocal rank fusion.
         #[arg(long)]
         hybrid: bool,
+        /// Keep only one kind of file: code, test, doc or config. Without it,
+        /// tests/docs/config are demoted in the ranking, not excluded.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Drop test files from the results (they are only demoted by default).
+        #[arg(long)]
+        no_tests: bool,
     },
     /// Run the MCP server over stdio, or `mcp configure` a client.
     Mcp {
@@ -525,7 +532,21 @@ fn main() -> Result<()> {
             no_rerank,
             keyword,
             hybrid,
-        } => cmd_search(query, limit, language, format, no_rerank, keyword, hybrid),
+            kind,
+            no_tests,
+        } => cmd_search(
+            query,
+            limit,
+            language,
+            format,
+            no_rerank,
+            keyword,
+            hybrid,
+            devctx_search::KindSel {
+                kind,
+                include_tests: no_tests.then_some(false),
+            },
+        ),
         Command::Mcp { project, action } => match action {
             None => cmd_mcp(project),
             Some(McpAction::Configure {
@@ -3145,6 +3166,7 @@ fn cmd_init(
             .or(defaults.storage)
             .unwrap_or_default(),
         indexing: answers.indexing.clone().unwrap_or(base.indexing),
+        search: base.search,
         reranking: defaults.reranking,
         summarization: answers.summarization.clone().unwrap_or(base.summarization),
     };
@@ -3455,7 +3477,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         model_name: &cfg.embeddings.model,
         progress: Some(&progress),
         paths: None,
-        exclude: &cfg.indexing.exclude,
+        exclude: &cfg.indexing.effective_excludes(),
         branch: branch.as_deref(),
     })?;
     progress.finish();
@@ -3631,6 +3653,7 @@ fn cmd_repair() -> Result<()> {
 const DEFAULT_DIM: usize = 768;
 
 /// `devctx search` — vector / keyword / hybrid search, then optional rerank.
+#[allow(clippy::too_many_arguments)]
 fn cmd_search(
     query: String,
     limit: usize,
@@ -3639,8 +3662,13 @@ fn cmd_search(
     no_rerank: bool,
     keyword: bool,
     hybrid: bool,
+    sel: devctx_search::KindSel,
 ) -> Result<()> {
     let cfg = load_project()?;
+    // Validate before anything starts a server or loads a model.
+    let rank = sel
+        .options(cfg.search.penalty)
+        .map_err(|e| anyhow::anyhow!(e))?;
     if let Some(r) = remote::ensure_cli(&cfg)? {
         let mode = if hybrid {
             "hybrid"
@@ -3649,7 +3677,7 @@ fn cmd_search(
         } else {
             "vector"
         };
-        let json = r.search(&query, limit, language.as_deref(), mode, !no_rerank)?;
+        let json = r.search(&query, limit, language.as_deref(), mode, !no_rerank, &sel)?;
         print_remote_search(&json, format)?;
         return Ok(());
     }
@@ -3694,7 +3722,7 @@ fn cmd_search(
         None
     };
 
-    let hits = devctx_search::search(
+    let hits = devctx_search::search_ranked(
         &store,
         &query,
         &filter,
@@ -3702,6 +3730,7 @@ fn cmd_search(
         mode,
         embedder.as_deref(),
         reranker.as_deref(),
+        &rank,
     )?;
 
     let out = match format {

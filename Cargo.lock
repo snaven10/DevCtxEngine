@@ -1051,6 +1051,7 @@ dependencies = [
  "devctx-embed",
  "devctx-mcp",
  "devctx-memory",
+ "devctx-search",
  "devctx-store",
  "libc",
  "serde",

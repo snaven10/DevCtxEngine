@@ -543,7 +543,9 @@ pub fn do_search(
     language: Option<String>,
     mode: SearchMode,
     rerank: bool,
+    sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
+    let opts = sel.options(state.cfg.search.penalty)?;
     let store = state.open_store()?;
     let (branch_filter, fallback) = search_branch(state, &store);
     let filter = SearchFilter {
@@ -586,7 +588,7 @@ pub fn do_search(
     } else {
         None
     };
-    let hits = devctx_search::search(
+    let hits = devctx_search::search_ranked(
         &store,
         query,
         &filter,
@@ -594,6 +596,7 @@ pub fn do_search(
         mode,
         embedder.as_deref(),
         reranker.as_deref(),
+        &opts,
     )
     .map_err(|e| e.to_string())?;
     let mut items = match hits_to_json(&hits) {
@@ -1040,7 +1043,7 @@ fn do_index_inner(
         model_name: &state.cfg.embeddings.model,
         progress: Some(&sink),
         paths,
-        exclude: &state.cfg.indexing.exclude,
+        exclude: &state.cfg.indexing.effective_excludes(),
         branch: target_branch.as_deref(),
     });
     let res = run.map_err(|e| e.to_string())?;
@@ -2419,6 +2422,7 @@ fn search_one(
     limit: usize,
     language: Option<&str>,
     mode: &str,
+    sel: &devctx_search::KindSel,
 ) -> Result<devctx_core::SearchHits, String> {
     // Not opening the store directly: DuckDB allows one writing process per
     // file, and a running `devctx serve` for that project owns it. Re-entering
@@ -2440,6 +2444,7 @@ fn search_one(
         "hybrid" => args.push("--hybrid".into()),
         _ => {}
     }
+    args.extend(sel.cli_args());
     let out = run_in_member(member, path, &args)?;
     if !out.status.success() {
         return Err(child_failure(member, path, &out, "search failed"));
@@ -2478,6 +2483,7 @@ pub fn do_search_group(
     language: Option<String>,
     mode: &str,
     only: Option<&[String]>,
+    sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
     // Vectors of different width are not comparable, and a ranking fused across
     // them looks exactly as plausible as a correct one. The registry has carried
@@ -2524,7 +2530,7 @@ pub fn do_search_group(
                     scope.spawn(move || {
                         (
                             m.name.clone(),
-                            search_one(&m.name, &m.path, query, limit, lang.as_deref(), mode),
+                            search_one(&m.name, &m.path, query, limit, lang.as_deref(), mode, sel),
                         )
                     })
                 })
@@ -2865,6 +2871,7 @@ pub fn do_search_project(
     limit: usize,
     language: Option<String>,
     mode: &str,
+    sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
     let row = central()?
         .show(project)
@@ -2890,6 +2897,7 @@ pub fn do_search_project(
         "hybrid" => args.push("--hybrid".into()),
         _ => {}
     }
+    args.extend(sel.cli_args());
     let out = run_in_member(project, std::path::Path::new(path), &args)?;
     if !out.status.success() {
         return Err(child_failure(
@@ -3938,7 +3946,15 @@ pub fn do_build_context(
     }
 
     // Fetch more than will fit: the budget, not the limit, decides where to stop.
-    let raw = do_search(state, query, 30, None, SearchMode::Vector, false)?;
+    let raw = do_search(
+        state,
+        query,
+        30,
+        None,
+        SearchMode::Vector,
+        false,
+        &devctx_search::KindSel::default(),
+    )?;
     let hits: Vec<Value> = parse_memories(&raw);
     // `do_search` says when it answered from another branch; a prose answer
     // must say so too, since the code below may differ from what is checked out.

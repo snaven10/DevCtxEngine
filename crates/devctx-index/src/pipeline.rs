@@ -300,9 +300,21 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let prev_extractor_stale =
         req.store
             .extractor_stale(&repo_path, &branch, &devctx_parse::extractor_fingerprint())?;
+    // The exclude set decides what belongs in the index, and an incremental run
+    // only looks at what changed since the last commit, so a rule added since
+    // would leave what it now covers behind forever. A different fingerprint
+    // (or none recorded: an index from before defaults existed) makes this a
+    // full run, which is the one that prunes.
+    let exclude_fp = exclude_fingerprint(req.exclude);
+    let exclude_stale = req
+        .store
+        .get_index_meta(&repo_path, &branch, EXCLUDE_META_KEY)?
+        .as_deref()
+        != Some(exclude_fp.as_str());
     let last_commit = prev.as_ref().map(|p| p.last_commit.clone());
     let can_incremental = req.incremental
         && !model_changed
+        && !exclude_stale
         && last_commit.as_deref().is_some_and(|c| git.commit_exists(c));
     let from = if can_incremental {
         last_commit.as_deref()
@@ -460,6 +472,12 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // incremental run over an older index re-parses just the changed files, so
     // stamping it would hide the rest — the very thing this record is for.
     let current_extractor = devctx_parse::extractor_fingerprint();
+    // Same rule for the exclude set: stamped only when a full run applied it (or
+    // nothing changed), never by a path-list run that never pruned.
+    if full_reindex || !exclude_stale {
+        req.store
+            .set_index_meta(&repo_path, &branch, EXCLUDE_META_KEY, &exclude_fp)?;
+    }
     if full_reindex || !prev_extractor_stale {
         req.store
             .set_index_meta(&repo_path, &branch, EXTRACTOR_META_KEY, &current_extractor)?;
@@ -564,6 +582,23 @@ const BLOAT_WARN_RATIO: f64 = 3.0;
 /// [`devctx_core::dirs::model_cache_dir`], but older checkouts still carry one.
 const OWN_ARTIFACTS: &[&str] = &[".devctx", ".fastembed_cache", ".git"];
 
+/// `index_meta` key holding the fingerprint of the exclude set the index was
+/// last fully built with.
+pub const EXCLUDE_META_KEY: &str = "excludes";
+
+/// A stable fingerprint of an exclude list (FNV-1a over the patterns in order;
+/// order matters because a later `!rule` overrides an earlier one).
+pub fn exclude_fingerprint(patterns: &[String]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in patterns {
+        for b in p.bytes().chain(std::iter::once(0u8)) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
 /// Compile `indexing.exclude` into a matcher.
 ///
 /// Reusing the gitignore engine rather than a plain glob is deliberate: a rule
@@ -581,16 +616,6 @@ fn build_exclude(patterns: &[String]) -> Gitignore {
     }
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
-
-/// Directories whose contents are somebody else's code, checked in for
-/// convenience. Nobody asks a question whose answer is in `node_modules`.
-const VENDOR_DIRS: &[&str] = &[
-    "node_modules",
-    "vendor",
-    "third_party",
-    "dist",
-    "bower_components",
-];
 
 /// A minified line is longer than any line a person writes. 1,000 characters is
 /// far past the widest hand-written line and far below a bundle's single line,
@@ -610,13 +635,10 @@ const MINIFIED_LINE: usize = 1_000;
 /// a single 200,000-character line is the fact, and it catches generated JSON,
 /// bundled CSS and vendored blobs that follow no naming convention at all.
 fn is_generated(path: &Path, content: &str) -> bool {
-    if path
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .any(|c| VENDOR_DIRS.contains(&c))
-    {
-        return true;
-    }
+    // Vendored directories (`node_modules/`, `vendor/`, `dist/`...) are not
+    // decided here any more: they are `devctx_core::config::DEFAULT_EXCLUDES`,
+    // applied through `indexing.exclude`, so that `default_excludes: false`
+    // really does bring them back.
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -966,10 +988,6 @@ mod tests {
         let long = "a".repeat(MINIFIED_LINE + 1);
         assert!(is_generated(Path::new("assets/cytoscape.min.js"), "x"));
         assert!(is_generated(Path::new("web/app.bundle.js"), "x"));
-        assert!(is_generated(
-            Path::new("node_modules/left-pad/index.js"),
-            "x"
-        ));
         assert!(is_generated(Path::new("package-lock.json"), "x"));
         assert!(
             is_generated(Path::new("src/data.json"), &long),

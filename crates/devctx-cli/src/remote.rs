@@ -898,12 +898,14 @@ impl Remote {
         language: Option<&str>,
         mode: &str,
         rerank: bool,
+        sel: &devctx_search::KindSel,
     ) -> Result<String> {
         self.post(
             "/search",
             serde_json::json!({
                 "query": query, "limit": limit, "language": language,
                 "mode": mode, "rerank": rerank,
+                "kind": sel.kind, "include_tests": sel.include_tests,
             }),
         )
     }

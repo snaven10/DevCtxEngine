@@ -307,6 +307,7 @@ impl Backend {
         language: Option<String>,
         mode: Option<String>,
         rerank: bool,
+        sel: &devctx_search::KindSel,
     ) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_search(
@@ -316,12 +317,14 @@ impl Backend {
                 language,
                 parse_mode(mode.as_deref()),
                 rerank,
+                sel,
             ),
             Backend::Remote(r, _) => r
                 .post(
                     "/search",
                     json!({ "query": query, "limit": limit, "language": language,
-                            "mode": mode.unwrap_or_else(|| "vector".into()), "rerank": rerank }),
+                            "mode": mode.unwrap_or_else(|| "vector".into()), "rerank": rerank,
+                            "kind": sel.kind, "include_tests": sel.include_tests }),
                 )
                 .map(|raw| ensure_object(raw, "results")),
         }
@@ -336,6 +339,7 @@ impl Backend {
         limit: usize,
         language: Option<String>,
         mode: Option<String>,
+        sel: &devctx_search::KindSel,
     ) -> Result<String, String> {
         do_search_project(
             project,
@@ -343,6 +347,7 @@ impl Backend {
             limit,
             language,
             mode.as_deref().unwrap_or("vector"),
+            sel,
         )
     }
 

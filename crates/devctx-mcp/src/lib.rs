@@ -54,6 +54,15 @@ struct SearchReq {
     /// more than the exact ordering.
     #[serde(default)]
     rerank: Option<bool>,
+    /// Keep only one kind of file: "code", "test", "doc" or "config". Without
+    /// it tests, docs, READMEs and SQL/YAML/JSON still appear but rank below
+    /// code (a ranking penalty, not an exclusion).
+    #[serde(default)]
+    kind: Option<String>,
+    /// `false` drops test files from the results (default true: they are only
+    /// demoted). An explicit `kind` wins over this.
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 /// Parameters for the `read_file` tool.
@@ -153,6 +162,12 @@ struct SearchProjectReq {
     /// "vector" (default), "keyword", or "hybrid".
     #[serde(default)]
     mode: Option<String>,
+    /// Keep only one kind of file: "code", "test", "doc" or "config".
+    #[serde(default)]
+    kind: Option<String>,
+    /// `false` drops test files (default true: they are only demoted).
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 /// Parameters for the `list_projects` tool.
@@ -642,6 +657,10 @@ impl DevctxServer {
                 let (query, limit) = (req.query.clone(), req.limit.unwrap_or(10));
                 let (language, mode) = (req.language.clone(), req.mode.clone());
                 let only = req.projects.clone();
+                let sel = devctx_search::KindSel {
+                    kind: req.kind.clone(),
+                    include_tests: req.include_tests,
+                };
                 return run_blocking(move || {
                     state::do_search_group(
                         &members,
@@ -650,12 +669,17 @@ impl DevctxServer {
                         language,
                         mode.as_deref().unwrap_or("vector"),
                         only.as_deref(),
+                        &sel,
                     )
                 })
                 .await;
             }
         }
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        let sel = devctx_search::KindSel {
+            kind: req.kind.clone(),
+            include_tests: req.include_tests,
+        };
         run_blocking(move || {
             backend.search(
                 &req.query,
@@ -663,6 +687,7 @@ impl DevctxServer {
                 req.language,
                 req.mode,
                 req.rerank.unwrap_or(true),
+                &sel,
             )
         })
         .await
@@ -889,6 +914,10 @@ impl DevctxServer {
         // Naming another project is enough to answer: this needs the registry,
         // not a project of our own. It therefore works while unbound, which is
         // exactly when an agent reaches for it.
+        let sel = devctx_search::KindSel {
+            kind: req.kind.clone(),
+            include_tests: req.include_tests,
+        };
         let Some(backend) = self.maybe_bound() else {
             return run_blocking(move || {
                 state::do_search_project(
@@ -897,6 +926,7 @@ impl DevctxServer {
                     req.limit.unwrap_or(10),
                     req.language,
                     req.mode.as_deref().unwrap_or("vector"),
+                    &sel,
                 )
             })
             .await;
@@ -908,6 +938,7 @@ impl DevctxServer {
                 req.limit.unwrap_or(10),
                 req.language,
                 req.mode,
+                &sel,
             )
         })
         .await

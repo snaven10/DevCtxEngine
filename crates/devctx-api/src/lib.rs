@@ -754,6 +754,12 @@ struct SearchBody {
     /// interactive callers turn it off because it dominates latency.
     #[serde(default)]
     rerank: Option<bool>,
+    /// `code` | `test` | `doc` | `config`: keep only that kind of file.
+    #[serde(default)]
+    kind: Option<String>,
+    /// `false` drops test files.
+    #[serde(default)]
+    include_tests: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1001,6 +1007,10 @@ async fn search(State(api): State<Api>, Json(b): Json<SearchBody>) -> Response {
             b.language,
             parse_mode(b.mode.as_deref()),
             b.rerank.unwrap_or(true),
+            &devctx_search::KindSel {
+                kind: b.kind,
+                include_tests: b.include_tests,
+            },
         )
     })
     .await

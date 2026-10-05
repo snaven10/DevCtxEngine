@@ -351,6 +351,103 @@ fn search_is_always_an_object_even_without_notes() {
     );
 }
 
+/// PLAN-008 D3 end to end: `kind` / `--no-tests` filter hard, vendor/build
+/// output that git tracks never reaches the index, and a bad `kind` is refused
+/// before anything loads a model.
+#[test]
+fn kind_filters_and_default_excludes_work_through_the_cli_and_the_tool() {
+    let _embed = EmbedLock::acquire();
+    let mut tmp = Tmp::new("kind_filters");
+    let ws = tmp.root.clone();
+    make_member(
+        &mut tmp,
+        &ws,
+        "solo",
+        "pool.rs",
+        "pub fn pool_marker() {}\n",
+        false,
+    );
+    let repo = ws.join("solo");
+    for (path, body) in [
+        ("tests/pool_test.rs", "pub fn pool_marker_test() {}\n"),
+        ("README.md", "# Pool\n\npool_marker is documented here.\n"),
+        ("build/gen.rs", "pub fn pool_marker_built() {}\n"),
+    ] {
+        let full = repo.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "more"]);
+    let out = devctx(&tmp.home(), &repo, &["index"]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    let files = |args: &[&str]| -> Vec<String> {
+        let mut a = vec!["search", "pool_marker", "--format", "json", "--limit", "20"];
+        a.extend_from_slice(args);
+        let out = devctx(&tmp.home(), &repo, &a);
+        let v: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", text(&out)));
+        v["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no results: {v}"))
+            .iter()
+            .map(|h| h["file"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let all = files(&[]);
+    for f in ["pool.rs", "tests/pool_test.rs", "README.md"] {
+        assert!(
+            all.iter().any(|x| x == f),
+            "{f} must be demoted, not dropped: {all:?}"
+        );
+    }
+    assert!(
+        !all.iter().any(|f| f.starts_with("build/")),
+        "tracked build output must not be indexed by default: {all:?}"
+    );
+    assert!(
+        files(&["--kind", "test"])
+            .iter()
+            .all(|f| f == "tests/pool_test.rs"),
+        "--kind test leaked other files"
+    );
+    assert!(!files(&["--kind", "test"]).is_empty());
+    let no_tests = files(&["--no-tests"]);
+    assert!(
+        !no_tests.iter().any(|f| f.starts_with("tests/")),
+        "{no_tests:?}"
+    );
+    assert!(no_tests.iter().any(|f| f == "pool.rs"), "{no_tests:?}");
+
+    let bad = devctx(
+        &tmp.home(),
+        &repo,
+        &["search", "pool_marker", "--kind", "banana"],
+    );
+    assert!(!bad.status.success());
+    assert!(
+        text(&bad).contains("`kind` must be one of"),
+        "{}",
+        text(&bad)
+    );
+
+    let tool = call_tool(
+        &tmp.home(),
+        &repo,
+        "search",
+        serde_json::json!({ "query": "pool_marker", "kind": "doc", "limit": 20 }),
+    );
+    let docs: Vec<&str> = tool["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{tool}"))
+        .iter()
+        .map(|h| h["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(docs, vec!["README.md"], "{tool}");
+}
+
 /// `search_routes` end to end (MCP -> serve -> store): 25 routes pages as
 /// 10 + 10 + 5 with `total`, `next_offset` and `omitted.count`; `limit`
 /// defaults to 20; `routes_for_handler` is the same object.

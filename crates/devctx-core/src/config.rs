@@ -172,9 +172,42 @@ pub struct Storage {
     pub fts: bool,
 }
 
+/// Paths that are somebody else's code or build output, kept out of the index
+/// unless `indexing.default_excludes: false` (all of them) or
+/// `indexing.include_build: true` (just `build/`).
+///
+/// Written as `.gitignore` patterns, so `node_modules/` matches at any depth.
+/// They are applied *before* the user's `exclude`, which can therefore
+/// re-include with a `!` rule (`!vendor/`).
+pub const DEFAULT_EXCLUDES: &[&str] = &[
+    "node_modules/",
+    "target/",
+    "dist/",
+    "build/",
+    "vendor/",
+    "third_party/",
+    "bower_components/",
+    "*.min.js",
+    "*.generated.*",
+];
+
 /// `indexing:` section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Indexing {
+    /// Keep vendor / generated / build-output paths ([`DEFAULT_EXCLUDES`]) out
+    /// of the index even when git tracks them. Default `true`; `false` turns
+    /// the whole list off. Changing it (or `include_build`, or `exclude`)
+    /// makes the next `index` a full run, which prunes what no longer
+    /// qualifies.
+    #[serde(default = "default_true")]
+    pub default_excludes: bool,
+
+    /// Opt `build/` back in while the other defaults stay on. For repositories
+    /// where `build/` is source (Gradle `buildSrc`-style layouts, a Java
+    /// package named `build`) rather than output.
+    #[serde(default)]
+    pub include_build: bool,
+
     /// Paths to keep out of the index, written as `.gitignore` patterns
     /// (`target/`, `*.generated.ts`, `docs/vendor/**`).
     ///
@@ -208,7 +241,35 @@ pub struct Indexing {
     pub branches: Vec<String>,
 }
 
+impl Default for Indexing {
+    fn default() -> Self {
+        Indexing {
+            default_excludes: true,
+            include_build: false,
+            exclude: Vec::new(),
+            branches: Vec::new(),
+        }
+    }
+}
+
 impl Indexing {
+    /// The patterns the index actually applies: the defaults (unless turned
+    /// off, and minus `build/` under `include_build`), then the user's own
+    /// `exclude` so a later `!pattern` can re-include one.
+    pub fn effective_excludes(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if self.default_excludes {
+            out.extend(
+                DEFAULT_EXCLUDES
+                    .iter()
+                    .filter(|p| !(self.include_build && **p == "build/"))
+                    .map(|p| p.to_string()),
+            );
+        }
+        out.extend(self.exclude.iter().cloned());
+        out
+    }
+
     /// The branch to act on when none was named.
     ///
     /// `None` means "use whatever is checked out" — the behaviour of every
@@ -225,6 +286,15 @@ impl Indexing {
     pub fn tracks(&self, branch: &str) -> bool {
         self.branches.is_empty() || self.branches.iter().any(|b| b == branch)
     }
+}
+
+/// `search:` section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchCfg {
+    /// Score multipliers for tests / docs / config hits (`0.6` each by
+    /// default). Set a kind to `1.0` to stop demoting it.
+    #[serde(default)]
+    pub penalty: crate::kind::KindPenalty,
 }
 
 /// `reranking:` section.
@@ -366,6 +436,9 @@ pub struct ProjectConfig {
     /// `indexing:` section.
     #[serde(default)]
     pub indexing: Indexing,
+    /// `search:` section.
+    #[serde(default)]
+    pub search: SearchCfg,
     /// `reranking:` section.
     #[serde(default)]
     pub reranking: Reranking,
@@ -567,6 +640,40 @@ mod tests {
                 .unwrap();
         assert_eq!(cfg.embeddings.device, Device::Cuda);
         assert_eq!(cfg.reranking.device, Device::Cuda);
+    }
+
+    #[test]
+    fn default_excludes_are_on_and_include_build_drops_only_build() {
+        let cfg = ProjectConfig::from_yaml("{}").unwrap();
+        assert!(cfg.indexing.default_excludes);
+        let ex = cfg.indexing.effective_excludes();
+        for p in ["node_modules/", "target/", "dist/", "build/"] {
+            assert!(ex.iter().any(|e| e == p), "{p} missing from {ex:?}");
+        }
+
+        let cfg =
+            ProjectConfig::from_yaml("indexing:\n  include_build: true\n  exclude: [\"x/\"]\n")
+                .unwrap();
+        let ex = cfg.indexing.effective_excludes();
+        assert!(!ex.iter().any(|e| e == "build/"));
+        assert!(ex.iter().any(|e| e == "dist/"));
+        assert_eq!(
+            ex.last().map(String::as_str),
+            Some("x/"),
+            "user rules go last"
+        );
+
+        let cfg = ProjectConfig::from_yaml("indexing:\n  default_excludes: false\n").unwrap();
+        assert!(cfg.indexing.effective_excludes().is_empty());
+    }
+
+    #[test]
+    fn search_penalty_parses_with_per_kind_defaults() {
+        let cfg = ProjectConfig::from_yaml("search:\n  penalty:\n    test: 0.3\n").unwrap();
+        assert_eq!(cfg.search.penalty.test, 0.3);
+        assert_eq!(cfg.search.penalty.doc, 0.6);
+        let cfg = ProjectConfig::from_yaml("{}").unwrap();
+        assert_eq!(cfg.search.penalty.config, 0.6);
     }
 
     #[test]
