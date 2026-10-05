@@ -40,6 +40,8 @@ pub struct ServeInfo {
 pub struct CentralClient {
     base: String,
     token: Option<String>,
+    /// Where to look for the next daemon when this one answers "shutting down".
+    paths: Option<CentralPaths>,
 }
 
 /// Path of the discovery file advertising the central daemon.
@@ -149,6 +151,7 @@ pub fn discover(paths: &CentralPaths) -> Option<CentralClient> {
     let up = || CentralClient {
         base: base.clone(),
         token: info.token.clone(),
+        paths: Some(paths.clone()),
     };
     match health(&base) {
         Health::Up => return Some(up()),
@@ -406,19 +409,50 @@ impl CentralClient {
         }
     }
 
+    /// Send one request. A daemon that answers the marked 503 ("shutting
+    /// down", produced before any handler, so nothing was processed) is
+    /// replaced: [`ensure`] waits for it to be gone and returns the next
+    /// daemon, and the request is repeated there, once. Any other status is
+    /// final.
+    fn call(
+        &self,
+        build: impl Fn(&CentralClient) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+    ) -> Result<Value> {
+        let exiting = |r: &std::result::Result<ureq::Response, Box<ureq::Error>>| {
+            matches!(r, Err(e) if matches!(&**e, ureq::Error::Status(503, resp)
+                if resp.header(procown::EXITING_HEADER).is_some()))
+        };
+        let first = build(self);
+        if exiting(&first) {
+            if let Some(next) = self.paths.as_ref().and_then(ensure) {
+                return parse(build(&next).map_err(|e| *e));
+            }
+        }
+        parse(first.map_err(|e| *e))
+    }
+
     fn get(&self, path: &str) -> Result<Value> {
-        let req = self.auth(self.agent().get(&format!("{}{path}", self.base)));
-        parse(req.call())
+        self.call(|c| {
+            c.auth(c.agent().get(&format!("{}{path}", c.base)))
+                .call()
+                .map_err(Box::new)
+        })
     }
 
     fn post(&self, path: &str, body: Value) -> Result<Value> {
-        let req = self.auth(self.agent().post(&format!("{}{path}", self.base)));
-        parse(req.send_json(body))
+        self.call(|c| {
+            c.auth(c.agent().post(&format!("{}{path}", c.base)))
+                .send_json(body.clone())
+                .map_err(Box::new)
+        })
     }
 
     fn delete(&self, path: &str) -> Result<Value> {
-        let req = self.auth(self.agent().delete(&format!("{}{path}", self.base)));
-        parse(req.call())
+        self.call(|c| {
+            c.auth(c.agent().delete(&format!("{}{path}", c.base)))
+                .call()
+                .map_err(Box::new)
+        })
     }
 
     // --- typed endpoints ---
@@ -810,6 +844,86 @@ mod tests {
         assert!(
             returned >= closed,
             "discover answered while the exiting daemon was still listening"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listener answering every request with `reply`, counting them.
+    fn serve_fixed(reply: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        (addr, hits)
+    }
+
+    /// TASK-017 fixup J3: a request refused with the exiting 503 (an idle exit
+    /// that began right before a `remember`'s POST) is repeated once against
+    /// the daemon `serve.json` now advertises; a 503 without the marker is
+    /// final.
+    #[test]
+    fn a_request_refused_by_an_exiting_daemon_reaches_the_next_one() {
+        use std::sync::atomic::Ordering;
+        let dir = std::env::temp_dir().join(format!("devctx-j3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = CentralPaths {
+            dir: dir.clone(),
+            config: dir.join("config.yaml"),
+            db: dir.join("central.duckdb"),
+            serve_file: dir.join("serve.json"),
+        };
+        let body = r#"{"projects":[{"name":"x"}]}"#;
+        let (dying, dying_hits) = serve_fixed(format!(
+            "HTTP/1.1 503 Service Unavailable\r\n{}: 1\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n",
+            procown::EXITING_HEADER
+        ));
+        let (next, next_hits) = serve_fixed(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        let info = ServeInfo {
+            addr: next,
+            token: None,
+            pid: None,
+            start_time: None,
+        };
+        std::fs::write(&paths.serve_file, serde_json::to_vec(&info).unwrap()).unwrap();
+        let client = CentralClient {
+            base: format!("http://{dying}"),
+            token: None,
+            paths: Some(paths.clone()),
+        };
+        assert_eq!(client.list(false).unwrap().len(), 1);
+        assert_eq!(dying_hits.load(Ordering::SeqCst), 1);
+        assert!(next_hits.load(Ordering::SeqCst) >= 1);
+
+        let (plain, _) = serve_fixed(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        );
+        let before = next_hits.load(Ordering::SeqCst);
+        let client = CentralClient {
+            base: format!("http://{plain}"),
+            token: None,
+            paths: Some(paths),
+        };
+        assert!(client.list(false).is_err());
+        assert_eq!(
+            next_hits.load(Ordering::SeqCst),
+            before,
+            "an unmarked 503 was retried"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

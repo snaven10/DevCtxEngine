@@ -251,7 +251,8 @@ fn sigterm_stops_an_idle_server_within_two_seconds() {
 /// `DEVCTX_TEST_SLOW_CHECKPOINT_MS` stretches the checkpoint to 9 s; the server
 /// holds its checkpoint marker meanwhile, so `--stop` keeps waiting instead of
 /// sending SIGKILL, and the server leaves cleanly (exit 0, WAL folded).
-/// Debug builds only: the seam is compiled out of release binaries.
+/// Debug builds only: the seam is `#[cfg(debug_assertions)]` in the server, so
+/// release binaries do not contain it.
 #[cfg(debug_assertions)]
 #[test]
 fn serve_stop_waits_for_a_final_checkpoint_longer_than_its_fixed_wait() {
@@ -287,6 +288,61 @@ fn serve_stop_waits_for_a_final_checkpoint_longer_than_its_fixed_wait() {
         Some(0),
         "the server must finish its checkpoint and exit 0, not die by SIGKILL: {code:?}"
     );
+    assert!(!serve_json(&serve.root).exists(), "serve.json left behind");
+    assert!(wal_folded(&root), "the WAL outlived the server");
+}
+
+/// TASK-017 fixup J2: while an idle exit takes its final checkpoint the server
+/// is still advertised, so a client that arrives in that window sees a busy
+/// server (and waits) instead of "nothing running" — which used to spawn a
+/// second server that died on the first one's lock and wrote to `serve.log`.
+/// Debug builds only: it relies on the `DEVCTX_TEST_SLOW_CHECKPOINT_MS` seam.
+#[cfg(debug_assertions)]
+#[test]
+fn a_client_during_the_exit_checkpoint_does_not_spawn_a_second_server() {
+    let tmp = Tmp::new("exitwin");
+    let root = project(&tmp);
+    let mut serve = start_serve_env(
+        &tmp,
+        &root,
+        Some(1),
+        None,
+        &[("DEVCTX_TEST_SLOW_CHECKPOINT_MS", "1200")],
+    );
+    let marker = root.join(".devctx/state/serve.checkpointing");
+    let t0 = Instant::now();
+    while !marker.exists() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "the idle exit never started its checkpoint\n{}",
+            serve.log()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        serve_json(&serve.root).exists(),
+        "serve.json was withdrawn before the checkpoint finished: a client would read \
+         \"nothing running\" while the lock is still held"
+    );
+    // A client in the window (autospawn ON): it must not start a server.
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_MODEL_CACHE", tmp.cache())
+        .current_dir(&root)
+        .args(["index"])
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    let spawn_log = root.join(".devctx/state/serve.log");
+    assert!(
+        !spawn_log.exists(),
+        "a second server was spawned during the exit checkpoint:\n{}\n{said}",
+        std::fs::read_to_string(&spawn_log).unwrap_or_default()
+    );
+    let code = exits_within(&mut serve.child, Duration::from_secs(10))
+        .and_then(|_| serve.child.try_wait().unwrap())
+        .expect("the idle server never exited");
+    assert_eq!(code.code(), Some(0));
     assert!(!serve_json(&serve.root).exists(), "serve.json left behind");
     assert!(wal_folded(&root), "the WAL outlived the server");
 }

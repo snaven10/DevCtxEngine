@@ -210,6 +210,19 @@ pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
     if std::env::var_os("DEVCTX_NO_AUTOSERVE").is_some() {
         return Err(EnsureError::Disabled);
     }
+    // Nothing advertised, but the file may still be held for an instant: a
+    // server that just withdrew its advertisement and is about to `_exit`, or
+    // one another client spawned a moment ago. Give that a moment to resolve
+    // before spawning — over a held lock the spawn only dies and writes noise
+    // to `serve.log`. A lock that outlasts the wait is not ours to judge: the
+    // spawn below reports it the way it always has (fast, naming the holder).
+    if let Some(r) = wait_out_lock(
+        cfg,
+        |p| Ok(devctx_store::Store::check_unlocked(p)?),
+        LOCK_WAIT,
+    ) {
+        return Ok(r);
+    }
     let spawned = spawn_server(cfg).map_err(|e| EnsureError::Spawn(format!("{e:#}")))?;
     // Said only once it is up: when the serve cannot start (the lock is held,
     // the port is taken) "started" would be a lie printed right before the error.
@@ -248,6 +261,36 @@ pub fn ensure_checked(cfg: &ProjectConfig) -> Result<Remote, EnsureError> {
                 .unwrap_or_else(|| format!("no answer after {}s", WAIT_TICKS / 10)),
         ),
     })
+}
+
+/// How long [`ensure_checked`] lets a held database resolve before it spawns
+/// anyway. Short on purpose: a foreign holder must still fail fast (the CLI's
+/// 2 s target), and the exit window is covered by the advertisement staying up.
+const LOCK_WAIT: Duration = Duration::from_millis(500);
+
+/// While `check` says the database is held by another process and no server is
+/// advertised, keep looking for one (the holder may be one still starting):
+/// `Some` when one answers; `None` when the file is free, the failure is not a
+/// lock, or the lock is still held after `wait` — the caller spawns then.
+fn wait_out_lock(
+    cfg: &ProjectConfig,
+    check: impl Fn(&Path) -> Result<()>,
+    wait: Duration,
+) -> Option<Remote> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match check(&cfg.db_path()) {
+            Err(e) if is_lock_error(&format!("{e:#}")) => {}
+            _ => return None,
+        }
+        if let Discovery::Up(r) = probe(cfg) {
+            return Some(r);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// [`ensure_checked`] for callers that only need "a server or not" and fall
@@ -1317,6 +1360,55 @@ mod tests {
             TERM_WAIT >= devctx_api::STOP_TIMELINE + Duration::from_secs(1),
             "the plain wait must clear the server's own timeline with room to spare"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-017 fixup J2: a held database with no server advertised gets a
+    /// moment to resolve before a spawn; a server that appears meanwhile is
+    /// used; a free file (or an error that is not a lock) is not waited on.
+    #[test]
+    fn a_held_database_gets_a_moment_before_a_spawn() {
+        let dir = std::env::temp_dir().join(format!("devctx_j2_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cfg_at(&dir);
+        let locked = |_: &Path| -> Result<()> {
+            Err(anyhow::anyhow!(
+                "IO Error: Could not set lock on file: Conflicting lock is held in devctx (PID 7)"
+            ))
+        };
+        let started = Instant::now();
+        assert!(wait_out_lock(&cfg, locked, Duration::from_millis(300)).is_none());
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "did not wait"
+        );
+
+        let started = Instant::now();
+        assert!(wait_out_lock(&cfg, |_| Ok(()), Duration::from_secs(5)).is_none());
+        assert!(wait_out_lock(
+            &cfg,
+            |_| Err(anyhow::anyhow!("disk full")),
+            Duration::from_secs(5)
+        )
+        .is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited on a free file"
+        );
+
+        // The holder was a server still starting: it shows up while we wait.
+        let next = serve_fixed(OK_200);
+        let writer = {
+            let cfg = cfg.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                write_serve_file(&cfg, next, None).unwrap();
+            })
+        };
+        let up = wait_out_lock(&cfg, locked, Duration::from_secs(5));
+        writer.join().unwrap();
+        assert!(up.is_some(), "the server that appeared is used");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

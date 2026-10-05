@@ -413,8 +413,10 @@ impl AppState {
         }
         // Test seam: `DEVCTX_TEST_SLOW_CHECKPOINT_MS=<n>` makes the final
         // checkpoint take n ms longer, so the e2e suite can prove that
-        // `serve --stop` waits for one that outlasts its fixed wait. Unset
-        // (always, outside those tests) it costs one environment lookup.
+        // `serve --stop` waits for one that outlasts its fixed wait. Compiled
+        // only into debug builds (the ones the tests run): a release binary
+        // does not read it.
+        #[cfg(debug_assertions)]
         if let Some(ms) = std::env::var("DEVCTX_TEST_SLOW_CHECKPOINT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -4749,7 +4751,9 @@ pub fn name_candidates(members: &[ProjectRow], query: &str) -> Vec<String> {
     }
     let common: HashSet<&str> = freq
         .into_iter()
-        .filter(|(_, n)| n * 2 > members.len())
+        // A word is "shared" only among several: in a group of one every
+        // word would be, and no question could ever name the member.
+        .filter(|(_, n)| members.len() > 1 && n * 2 > members.len())
         .map(|(w, _)| w)
         .collect();
     let q = tokens(query, 2);
@@ -5192,6 +5196,18 @@ fn warm_server(m: &ProjectRow, timeout: Duration) -> Result<WarmServer, MemberOu
             return Err(MemberOutcome::Cold(format!(
                 "stale serve.json: what answers at {addr} replied HTTP {code} to /health, \
                  not a devctx server"
+            )))
+        }
+        // The address itself is unusable (a corrupt `serve.json`): no server
+        // can be behind it, and "busy" would have the selection wait for one.
+        Err(ureq::Error::Transport(t))
+            if matches!(
+                t.kind(),
+                ureq::ErrorKind::InvalidUrl | ureq::ErrorKind::UnknownScheme | ureq::ErrorKind::Dns
+            ) =>
+        {
+            return Err(MemberOutcome::Cold(format!(
+                "unusable serve.json: the address `{addr}` is not reachable ({t})"
             )))
         }
         Err(e) => {
@@ -8778,6 +8794,64 @@ mod tests {
             &[]
         )
         .is_err());
+    }
+
+    /// Fixup J (nit): a member that FAILED (not just cold) while the scored
+    /// ones matched nothing is the partial branch too: the default answers
+    /// (or the best scored), the failure is in the label, and it is not an error.
+    #[test]
+    fn a_failed_member_in_the_nothing_matched_partial_branch_is_not_an_error() {
+        let failed = || MemberOutcome::Failed("search answered 500: boom".into());
+        let pick = choose_member(
+            vec![("api".into(), scored(0.0)), ("web".into(), failed())],
+            Some("web"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pick.member, "web");
+        assert!(!pick.by_relevance && !pick.cacheable());
+        assert!(pick.label.contains("boom"), "{}", pick.label);
+        let w = pick.warning.unwrap();
+        assert!(
+            w.contains("none of them matched") && w.contains("web"),
+            "{w}"
+        );
+        let pick = choose_member(
+            vec![("api".into(), scored(0.0)), ("web".into(), failed())],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pick.member, "api");
+    }
+
+    /// Fixup J (nit): a group of one member can still be named by the question
+    /// (every word was "shared" by the only member, so the list was always empty).
+    #[test]
+    fn name_candidates_work_for_a_group_of_one() {
+        let one = vec![ProjectRow {
+            name: "payments-api".into(),
+            description: "charges and refunds".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            name_candidates(&one, "how are refunds issued"),
+            vec!["payments-api".to_string()]
+        );
+        assert!(name_candidates(&one, "something unrelated").is_empty());
+    }
+
+    /// Fixup J (nit): a `serve.json` whose address is not even a URL is not a
+    /// busy server to wait for: it is cold.
+    #[test]
+    fn a_corrupt_serve_json_address_is_cold_not_busy() {
+        let root = pick_root("badaddr");
+        let m = fake_member(&root, "a", "m", Some("not a valid address"));
+        match warm_server(&m, Duration::from_secs(2)) {
+            Err(MemberOutcome::Cold(why)) => assert!(why.contains("unusable serve.json"), "{why}"),
+            other => panic!("expected Cold, got {:?}", other.err()),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Fixup I (H re-review 1, 5): a member leaving (the exit's marked 503),

@@ -127,7 +127,10 @@ fn server_is_exiting(err: &ureq::Error) -> bool {
 
 /// How long a request waits for an exiting server to be replaced: its freeze
 /// and checkpoint are budgeted at 1.5 s, plus margin. While the old one lives
-/// the connector sees it busy; once it is gone it starts the next.
+/// the connector sees it busy: it stays advertised until its checkpoint is
+/// done (the server withdraws `serve.json` after it, not before) and the CLI's
+/// `ensure_checked` does not spawn over a held lock; once it is gone the
+/// connector starts the next.
 const EXIT_RETRY_WAIT: Duration = Duration::from_secs(3);
 
 impl RemoteClient {
@@ -254,7 +257,10 @@ impl RemoteClient {
             std::thread::sleep(Duration::from_millis(200));
             self.invalidate(generation);
             // The connector's last "busy" verdict must not be served from the
-            // backoff cache: the whole point is to ask again.
+            // backoff cache: the whole point is to ask again. The `Link` is
+            // shared, so this also cancels the backoff other threads were
+            // honouring; accepted: they would each ask the connector again
+            // (single-flight, so one spawn) at most one verdict sooner.
             self.link.lock().unwrap_or_else(|p| p.into_inner()).failed = None;
             match self.target() {
                 Ok(((base, token), g)) => {

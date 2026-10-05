@@ -533,10 +533,12 @@ fn hard_exit(code: i32) -> ! {
 /// leaves. Otherwise this claims it, atomically, so the orderly path cannot
 /// start one behind it.
 ///
-/// The advertisement goes first (`on_exit`), then the database is frozen and
-/// checkpointed on a helper thread that `_exit`s itself the moment the
-/// checkpoint returns: frozen, no write can land after the checkpoint, and
-/// ending on that same thread leaves no window for one either. The calling
+/// The database is frozen and checkpointed on a helper thread that withdraws
+/// the advertisement (`on_exit`) and `_exit`s itself the moment the checkpoint
+/// returns: frozen, no write can land after the checkpoint, and ending on that
+/// same thread leaves no window for one either. The advertisement stays up
+/// during the checkpoint on purpose: a client then finds a busy server rather
+/// than none, and does not spawn one that dies on the lock we still hold. The calling
 /// thread is the budget: a checkpoint that blocks (a stuck connection, a
 /// poisoned lock) must not turn a watchdog into one more thing that hangs, so
 /// after [`CHECKPOINT_BUDGET`] it leaves without it. The checkpoint escalates
@@ -565,14 +567,19 @@ fn exit_now(state: &Arc<AppState>, life: &Lifecycle, on_exit: &ExitHook, code: i
             hard_exit(code)
         }
     }
-    on_exit();
     life.begin_checkpoint_marker();
     let s = state.clone();
     let marker = life.marker.clone();
+    let hook = on_exit.clone();
     let _ = std::thread::Builder::new()
         .name("exit-checkpoint".into())
         .spawn(move || {
             s.checkpoint_for_exit(EXIT_FREEZE_WAIT);
+            // Withdrawn only now: the database is frozen, so nothing can be
+            // written after the checkpoint, and until the lock is released a
+            // client must still read this server as alive-but-busy — with the
+            // advertisement gone it spawns a second server that dies on our lock.
+            hook();
             if let Some(m) = &marker {
                 let _ = std::fs::remove_file(m);
             }
@@ -583,6 +590,7 @@ fn exit_now(state: &Arc<AppState>, life: &Lifecycle, on_exit: &ExitHook, code: i
         "DevCtxEngine: the exit checkpoint did not finish within {CHECKPOINT_BUDGET:?}; \
          leaving without it"
     );
+    on_exit();
     life.end_checkpoint_marker();
     hard_exit(code)
 }
