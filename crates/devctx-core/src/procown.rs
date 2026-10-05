@@ -412,6 +412,7 @@ pub(crate) fn classify_ps(
 /// the number between the check and the `kill`. Elsewhere it is the plain pid
 /// (the window is documented, not closed).
 struct Handle {
+    #[cfg_attr(not(unix), allow(dead_code))]
     pid: u32,
     #[cfg(target_os = "linux")]
     fd: Option<i32>,
@@ -508,6 +509,8 @@ impl Handle {
 }
 
 /// `Ok` for a successful syscall (or a vanished target), the errno otherwise.
+/// Unix only: `libc` is not a dependency on Windows, and nothing there signals.
+#[cfg(unix)]
 fn errno_result(rc: libc::c_long) -> Result<(), i32> {
     if rc == 0 {
         return Ok(());
@@ -569,6 +572,10 @@ pub enum Termination {
     /// The kernel refused the signal (`EPERM`): another user's or a `sudo`
     /// process. Waiting would only repeat the refusal.
     NoPermission,
+    /// This platform cannot signal a process (Windows: there is no SIGTERM, and
+    /// this module does not call `TerminateProcess`). Nothing was done, and the
+    /// process is not assumed gone: the caller keeps the discovery file.
+    Unsupported,
 }
 
 impl Termination {
@@ -583,6 +590,10 @@ impl Termination {
             Termination::Survived => Some(format!("{what} {pid} survived SIGTERM and SIGKILL")),
             Termination::NoPermission => Some(format!(
                 "no permission to signal PID {pid} (it belongs to another user, or runs as root)"
+            )),
+            Termination::Unsupported => Some(format!(
+                "cannot stop {what} {pid} from here: this platform has no signal support in devctx; \
+                 end the process yourself (Task Manager, or `taskkill /PID {pid}`) and retry"
             )),
         }
     }
@@ -668,12 +679,29 @@ fn terminate_with(
             return Termination::NoPermission;
         }
     }
+    #[cfg(unix)]
+    {
+        if wait(handle, kill_wait, &owns) {
+            Termination::Gone
+        } else {
+            Termination::Survived
+        }
+    }
+    // Windows: no signals, and ownership is never verifiable there (`classify`
+    // answers `Unverified`), so nothing is stopped and nothing is declared
+    // gone. The caller reports the message of `Termination::failure`.
     #[cfg(not(unix))]
-    let _ = (handle, term_wait, patient, patience_cap, &send);
-    if wait(handle, kill_wait, &owns) {
-        Termination::Gone
-    } else {
-        Termination::Survived
+    {
+        let _ = (
+            handle,
+            term_wait,
+            patient,
+            patience_cap,
+            &send,
+            wait,
+            kill_wait,
+        );
+        Termination::Unsupported
     }
 }
 

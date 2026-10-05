@@ -4,9 +4,14 @@ name: ci
 # commit — once for the push and once for the pull request — doing the same
 # work in both. The pull request is the one that gates a merge; on `main` the
 # push is all there is.
+#
+# `fix/**` is the exception: a release builds Windows (and macOS) only when a
+# tag is pushed, so a platform-specific break would otherwise surface at the
+# one build nobody can retry without cutting another tag. Running on pushes to
+# `fix/**` lets such a fix be verified by `cross-check` before it is tagged.
 on:
   push:
-    branches: [main]
+    branches: [main, "fix/**"]
   pull_request:
 
 # Only the tip of a branch is worth checking. Without this, pushing three
@@ -35,3 +40,22 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: test
         run: cargo test --all --locked
+
+  # The release builds for Windows and macOS, but only at tag time, and `check`
+  # above runs on Linux alone: code that needs `libc` or `std::os::unix`
+  # compiles here and fails only on the tag. `cargo check` type-checks every
+  # target (tests and integration tests included) without paying for a link or
+  # for compiling DuckDB's C++, so it is cheap enough to run on every push.
+  cross-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--locked` for the same reason as in `check`.
+      - name: check
+        run: cargo check --workspace --all-targets --locked
