@@ -1,7 +1,7 @@
 # PLAN-010 — Memoria de procesos: modelo, ONNX Runtime y DuckDB acotados y medidos
 
 **Fecha:** 2026-10-05
-**Fase:** 1 (Planificación) — aprobado por el usuario 2026-10-05; la ejecución arranca tras publicar el hotfix 0.8.5
+**Fase:** 2 (Ejecución) — aprobado 2026-10-05; TASK-001 hecha (línea base en 0.9.0); el resto (TASK-002…011) se ejecuta después de PLAN-009 (decisión 2026-10-06)
 **Diseño:** [`PLAN-010-design.md`](./PLAN-010-design.md)
 **Fase anterior:** hotfix 0.8.5 (D1 lotes de embeddings en serie + batch 8 por defecto; D2 liberación
 por inactividad del embedder del central + corrección del comentario falso). Lo ejecuta otra sesión
@@ -11,7 +11,7 @@ publicado 0.8.5 (y de lo que haya en `main` de PLAN-008 P1 en ese momento). Rama
 `feat/plan-010-memoria`.
 **Origen:** investigación verificada de consumo de memoria del 2026-10-05 (devctx 0.8.4, máquina
 con `nproc=20`, WSL2), medida con `/proc/<pid>/status` sobre el central y 14 serves vivos.
-**Release:** a decidir (Q-4): `0.10.0`, o `0.9.x` si sale después de P1.
+**Release:** `0.11.0` (Q-4, decidido 2026-10-06): se ejecuta completo DESPUÉS de PLAN-009 (`0.10.0`).
 
 Todas las referencias `archivo:línea` son contra `main` = v0.8.4 (`47eea79`). El hotfix 0.8.5 mueve
 líneas de `devctx-embed/src/local.rs`, `devctx-central/src/lib.rs` y `devctx-api/src/central.rs`:
@@ -296,6 +296,10 @@ Recomendación: un `0.9.x`/`0.10.0-rc` intermedio tras TASK-007 (motor nuevo con
 red de seguridad) no aporta: el usuario no puede elegir motor. Se sugiere **un solo `0.10.0`** al
 cerrar TASK-011, con TASK-009 incluida pero apagada.
 
+**Decidido (2026-10-06):** como PLAN-009 sale primero como `0.10.0`, este plan sale como **`0.11.0`**
+(un solo release al cerrar TASK-011). TASK-001 (instrumentación) se mergea antes a `main` sin release
+y viaja con `0.10.0`.
+
 ## 11. Contrato de resultado (lo que cada task reporta al cerrar)
 
 Cada TASK llena su `## Resultado` con:
@@ -319,7 +323,22 @@ Cada TASK llena su `## Resultado` con:
   dejarlo configurable y en 512.
 - **Q-3 — `provider: central` como default.** ¿Queda siempre opt-in, o se re-evalúa hacerlo default
   si TASK-009 muestra latencia aceptable y el central estable?
-- **Q-4 — Número de release.** `0.10.0` vs `0.9.x` (§10).
+- **Q-4 — Número de release.** `0.10.0` vs `0.9.x` (§10). → **Resuelta: `0.11.0`** (ver abajo).
+
+### Decisiones del usuario (2026-10-06), con la línea base de TASK-001 en mano
+
+- **Ejecutar el plan completo** (TASK-002…011), **después de PLAN-009**. Orden general: TASK-001 se
+  mergea a `main` sin release → PLAN-009 → `0.10.0` → resto de PLAN-010 → `0.11.0`.
+- **Lo que la línea base cambia del foco:** tres metas de §6 **ya se cumplen en 0.9.0** gracias al
+  hotfix 0.8.5 — pico de `index --full` (897 MiB), pico incremental (753 MiB) y central en reposo
+  (105 MiB). El foco real del resto del plan es:
+  - el **costo por serve con el modelo cargado**: 300-315 MiB, de los que ~225 MiB son modelo + ORT
+    (meta 250 MiB), que con tres serves suma 679 MiB de `RssAnon` (pesos anónimos, no compartidos);
+  - el **transitorio de carga del modelo**: pico ~710 MiB en la primera búsqueda de un serve fresco
+    contra ~300 MiB estables.
+  TASK-006 (pesos compartidos vía mmap) y TASK-009 (`provider: central`) son las que actúan sobre lo
+  primero; TASK-004/007 (motor ort propio y perillas) sobre lo segundo.
+- Q-1, Q-2 y Q-3 siguen abiertas y se deciden con los números de sus tasks.
 
 ## 13. Cierre
 
