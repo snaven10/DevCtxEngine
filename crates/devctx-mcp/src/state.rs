@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use devctx_core::config::ProjectConfig;
 use devctx_core::plans::{self, Analysis, Plan, PlansRoot};
+use devctx_core::procmem;
 use devctx_core::{SearchFilter, SearchResult};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
 use devctx_index::{run as index_run, GitRepo, IndexRequest, ProgressSink};
@@ -176,6 +177,19 @@ impl ProgressSink for SharedProgress {
     }
 }
 
+/// One line on stderr (`serve.log`) when a model is loaded or let go: key, how
+/// long it took, and the resident set before and after, so "why is it big now"
+/// has an answer in the log (PLAN-010 DD-1).
+fn log_model_event(what: &str, key: &str, took: Option<Duration>, rss_before: Option<u64>) {
+    let mb = |b: Option<u64>| b.map_or("n/a".to_string(), |b| format!("{} MB", b / (1024 * 1024)));
+    let took = took.map_or(String::new(), |d| format!(" in {} ms", d.as_millis()));
+    eprintln!(
+        "memory: {what} {key}{took}; rss {} -> {}",
+        mb(rss_before),
+        mb(procmem::rss_bytes())
+    );
+}
+
 /// Hand freed pages back to the kernel after a model is dropped.
 ///
 /// Dropping the model frees its allocations, but glibc keeps the pages on its
@@ -207,6 +221,10 @@ fn trim_allocator() {}
 struct Cached<T> {
     value: T,
     last_used: Instant,
+    /// Which model this is (`provider/model`), for `status.memory.models`.
+    key: String,
+    /// Wall-clock load time, seconds since the Unix epoch.
+    loaded_at: u64,
 }
 
 impl<T: Clone> Cached<T> {
@@ -308,11 +326,19 @@ impl AppState {
         if let Some(c) = guard.as_mut() {
             return Ok(c.touch());
         }
+        let key = format!(
+            "{}/{}",
+            self.embed_settings.provider, self.embed_settings.model
+        );
+        let (rss_before, started) = (procmem::rss_bytes(), Instant::now());
         let e: Arc<dyn EmbeddingProvider> =
             Arc::from(create_provider(&self.embed_settings).map_err(|e| e.to_string())?);
+        log_model_event("loaded embedder", &key, Some(started.elapsed()), rss_before);
         *guard = Some(Cached {
             value: e.clone(),
             last_used: Instant::now(),
+            key,
+            loaded_at: procmem::unix_now(),
         });
         Ok(e)
     }
@@ -323,11 +349,16 @@ impl AppState {
         if let Some(c) = guard.as_mut() {
             return Ok(c.touch());
         }
+        let key = self.rerank_settings.model.clone();
+        let (rss_before, started) = (procmem::rss_bytes(), Instant::now());
         let r: Arc<dyn Reranker> =
             Arc::from(create_reranker(&self.rerank_settings).map_err(|e| e.to_string())?);
+        log_model_event("loaded reranker", &key, Some(started.elapsed()), rss_before);
         *guard = Some(Cached {
             value: r.clone(),
             last_used: Instant::now(),
+            key,
+            loaded_at: procmem::unix_now(),
         });
         Ok(r)
     }
@@ -349,12 +380,14 @@ impl AppState {
     /// means the *next* caller builds a fresh one.
     pub fn release_idle_models(&self, max_idle: Duration) -> Vec<&'static str> {
         let mut released = Vec::new();
+        let mut keys = Vec::new();
+        let rss_before = procmem::rss_bytes();
         if let Ok(mut guard) = self.embedder.lock() {
             if guard
                 .as_ref()
                 .is_some_and(|c| c.last_used.elapsed() >= max_idle)
             {
-                *guard = None;
+                keys.push(guard.take().map(|c| c.key).unwrap_or_default());
                 released.push("embedding model");
             }
         }
@@ -363,14 +396,77 @@ impl AppState {
                 .as_ref()
                 .is_some_and(|c| c.last_used.elapsed() >= max_idle)
             {
-                *guard = None;
+                keys.push(guard.take().map(|c| c.key).unwrap_or_default());
                 released.push("reranker");
             }
         }
         if !released.is_empty() {
             trim_allocator();
+            log_model_event("released", &keys.join(", "), None, rss_before);
         }
         released
+    }
+
+    /// The `memory` block of `status` (PLAN-010 DD-1): process RSS, which models
+    /// are held, and what the database accounts for.
+    ///
+    /// Reads the two model slots without building anything: a `status` poll must
+    /// never be the thing that loads a model.
+    pub fn memory_json(&self, store: &Store) -> serde_json::Value {
+        let report = store.memory_report();
+        let slot = |key: &str, loaded: Option<(String, u64, u64)>, engine: &str| match loaded {
+            Some((k, at, idle)) => json!({
+                "loaded": true, "key": k, "loaded_at": at,
+                "age_secs": procmem::unix_now().saturating_sub(at),
+                "idle_secs": idle, "engine": engine,
+            }),
+            None => json!({ "loaded": false, "configured": key }),
+        };
+        let emb = self.embedder.lock().ok().and_then(|g| {
+            g.as_ref()
+                .map(|c| (c.key.clone(), c.loaded_at, c.last_used.elapsed().as_secs()))
+        });
+        let rer = self.reranker.lock().ok().and_then(|g| {
+            g.as_ref()
+                .map(|c| (c.key.clone(), c.loaded_at, c.last_used.elapsed().as_secs()))
+        });
+        let emb_engine = if self.embed_settings.provider == "local" {
+            "fastembed"
+        } else {
+            "remote"
+        };
+        json!({
+            "process": procmem::process_json(procmem::ProcMemory::read()),
+            "models": {
+                "embedder": slot(
+                    &format!("{}/{}", self.embed_settings.provider, self.embed_settings.model),
+                    emb,
+                    emb_engine,
+                ),
+                "reranker": if self.rerank_enabled {
+                    slot(&self.rerank_settings.model, rer, "fastembed")
+                } else {
+                    json!({ "loaded": false, "enabled": false })
+                },
+            },
+            "duckdb": {
+                "memory_limit": report.memory_limit,
+                "threads": report.threads,
+                "memory_usage_bytes": report.memory_usage_bytes,
+                "temp_files_bytes": report.temp_files_bytes,
+                "database_size": report.database_size,
+                "notes": report.notes,
+            },
+            "hnsw": {
+                "present": report.hnsw_present,
+                "metric": report.hnsw_metric,
+                "vectors": report.vectors,
+                "dimension": report.dimension,
+                "reported_bytes": report.hnsw_reported_bytes,
+                "estimated_bytes": report.hnsw_estimated_bytes(),
+                "estimate_note": "vectors x dimension x 4 B, without graph links: a floor, not a measurement",
+            },
+        })
     }
 
     /// Fold the write-ahead log into the database file before the process goes
@@ -1298,7 +1394,7 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
     let record = store
         .get_index_record(&repo_path, &state_git.branch)
         .map_err(|e| e.to_string())?;
-    let value = match record {
+    let mut value = match record {
         None => {
             let indexed_branches = store.branches_by_recency(&repo_path).unwrap_or_default();
             let chosen = pick_graph_branch(
@@ -1367,6 +1463,8 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
             v
         }
     };
+    // Aditive (PLAN-010 DD-1); reads state, loads nothing.
+    value["memory"] = state.memory_json(&store);
     Ok(value.to_string())
 }
 
@@ -6531,6 +6629,8 @@ mod tests {
             last_used: Instant::now()
                 .checked_sub(Duration::from_secs(600))
                 .expect("an instant ten minutes ago"),
+            key: "test".into(),
+            loaded_at: 0,
         };
         assert!(cached.last_used.elapsed() >= Duration::from_secs(600));
 
@@ -6655,6 +6755,32 @@ mod tests {
         cfg.project.path = root.to_string_lossy().into_owned();
         cfg.state_dir = root.join(".devctx/state").to_string_lossy().into_owned();
         (AppState::build(cfg).unwrap(), root)
+    }
+
+    /// PLAN-010 TASK-001: `memory` has its four blocks, and asking for it loads
+    /// no model (a `status` poll must not be what makes a serve big).
+    #[test]
+    fn memory_json_has_four_blocks_and_loads_nothing() {
+        let (state, root) = lifecycle_state("memjson");
+        let store = state.open_store().unwrap();
+        let v = state.memory_json(&store);
+        for k in ["process", "models", "duckdb", "hnsw"] {
+            assert!(v.get(k).is_some(), "missing {k}: {v}");
+        }
+        assert!(v["process"]["source"].is_string());
+        assert_eq!(v["models"]["embedder"]["loaded"], false, "{v}");
+        assert_eq!(v["models"]["reranker"]["loaded"], false, "{v}");
+        assert!(v["duckdb"]["memory_limit"].is_string(), "{v}");
+        assert!(v["duckdb"]["threads"].is_u64(), "{v}");
+        assert!(v["hnsw"]["present"].is_boolean());
+        assert!(v["hnsw"]["vectors"].is_u64(), "{v}");
+        assert!(
+            state.embedder.lock().unwrap().is_none(),
+            "status loaded the embedder"
+        );
+        assert!(state.reranker.lock().unwrap().is_none());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn set_progress(state: &AppState, running: bool, advanced_ago: Duration) {

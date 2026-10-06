@@ -13,6 +13,7 @@ pub mod hits;
 pub mod kind;
 pub mod modelload;
 pub mod plans;
+pub mod procmem;
 pub mod procown;
 pub mod rank;
 pub mod types;

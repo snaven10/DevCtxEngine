@@ -24,7 +24,7 @@ pub use projects::{ProjectIndexStats, ProjectRecord};
 pub use routes::StoredRoute;
 pub use schema::init_schema;
 pub use state::{FileState, IndexRecord, EXTRACTOR_META_KEY};
-pub use store::Store;
+pub use store::{MemoryReport, Store};
 
 #[cfg(test)]
 mod tests {
@@ -125,6 +125,21 @@ mod tests {
         let got = store.vector_by_id("mem_a").unwrap().expect("stored");
         assert_eq!(got, vec![0.5, 0.25, 0.125]);
         assert!(store.vector_by_id("mem_missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn memory_report_reads_settings_and_counts_without_failing() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        store
+            .upsert(&[point("mem_a", [0.5, 0.25, 0.125], "a.rs", "rust")])
+            .unwrap();
+        let r = store.memory_report();
+        assert!(r.memory_limit.is_some(), "{r:?}");
+        assert!(r.threads.is_some(), "{r:?}");
+        assert_eq!(r.vectors, Some(1));
+        assert_eq!(r.dimension, DIM);
+        assert_eq!(r.hnsw_estimated_bytes(), Some(DIM as u64 * 4));
+        assert!(!r.hnsw_present);
     }
 
     #[test]

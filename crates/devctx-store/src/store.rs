@@ -17,6 +17,43 @@ use crate::schema;
 /// Comfortably above the memory chunker's default cap so lowering it still cleans up.
 const DELETE_CHUNK_SWEEP: usize = 256;
 
+/// What a database holds in memory (see [`Store::memory_report`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryReport {
+    /// Effective `memory_limit`, as DuckDB spells it (`"2.0 GiB"`).
+    pub memory_limit: Option<String>,
+    /// Effective `threads`.
+    pub threads: Option<u64>,
+    /// Sum of `duckdb_memory()`'s `memory_usage_bytes`; `None` when unavailable.
+    pub memory_usage_bytes: Option<u64>,
+    /// Sum of `duckdb_memory()`'s `temporary_storage_bytes` (spill).
+    pub temp_files_bytes: Option<u64>,
+    /// `pragma_database_size()`'s `database_size` (the file on disk).
+    pub database_size: Option<String>,
+    /// Rows in `vectors`.
+    pub vectors: Option<u64>,
+    /// Width of one vector.
+    pub dimension: usize,
+    /// Whether an HNSW index exists on `vectors`.
+    pub hnsw_present: bool,
+    /// Its metric (`cosine` | `ip`).
+    pub hnsw_metric: Option<String>,
+    /// What the VSS extension itself says the index takes, when it says.
+    pub hnsw_reported_bytes: Option<u64>,
+    /// Probes that failed, with their error, so a `null` above has a reason.
+    pub notes: Vec<String>,
+}
+
+impl MemoryReport {
+    /// A rough floor for the HNSW payload: `vectors x dimension x 4` bytes of
+    /// f32, ignoring the graph links. An estimate to size an index by, never a
+    /// measurement: the RSS before and after the first vector search is.
+    pub fn hnsw_estimated_bytes(&self) -> Option<u64> {
+        self.vectors
+            .map(|v| v.saturating_mul(self.dimension as u64).saturating_mul(4))
+    }
+}
+
 /// The 19 `vectors` columns, in the canonical order used by every query.
 pub(crate) const COLS: &str = r#"id, text, vector, repo, branch, "commit", file, symbol,
     symbol_type, language, start_line, end_line, chunk_level, content_hash,
@@ -313,6 +350,67 @@ impl Store {
             return fresh;
         }
         self.read_hnsw_metric()
+    }
+
+    /// What this database holds in memory and why (PLAN-010 DD-1), for `status`.
+    ///
+    /// Every probe is best-effort and independent: a DuckDB build without
+    /// `duckdb_memory()`, or without the VSS extension's `pragma_hnsw_index_info`,
+    /// leaves that field `None` with the reason in `notes` instead of failing the
+    /// whole report. Reads the catalog and counts rows; nothing is loaded.
+    pub fn memory_report(&self) -> MemoryReport {
+        let mut r = MemoryReport::default();
+        let mut notes = Vec::new();
+        r.memory_limit =
+            self.one_string("SELECT value FROM duckdb_settings() WHERE name = 'memory_limit'");
+        r.threads = self
+            .one_string("SELECT value FROM duckdb_settings() WHERE name = 'threads'")
+            .and_then(|v| v.parse().ok());
+        match self.conn.prepare(
+            "SELECT CAST(coalesce(sum(memory_usage_bytes), 0) AS BIGINT), \
+             CAST(coalesce(sum(temporary_storage_bytes), 0) AS BIGINT) FROM duckdb_memory()",
+        ) {
+            Ok(mut st) => {
+                match st.query_row([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))) {
+                    Ok((used, temp)) => {
+                        r.memory_usage_bytes = Some(used.max(0) as u64);
+                        r.temp_files_bytes = Some(temp.max(0) as u64);
+                    }
+                    Err(e) => notes.push(format!("duckdb_memory() failed: {e}")),
+                }
+            }
+            Err(e) => notes.push(format!("duckdb_memory() unavailable: {e}")),
+        }
+        r.database_size = self.one_string("SELECT database_size FROM pragma_database_size()");
+        r.vectors = self
+            .one_string("SELECT CAST(count(*) AS VARCHAR) FROM vectors")
+            .and_then(|v| v.parse().ok());
+        r.hnsw_metric = self.hnsw_metric();
+        r.hnsw_present = r.hnsw_metric.is_some();
+        if r.hnsw_present {
+            // The extension's own accounting, when it offers one.
+            match self.conn.prepare(
+                "SELECT CAST(coalesce(sum(approx_memory_usage), 0) AS BIGINT) \
+                 FROM pragma_hnsw_index_info()",
+            ) {
+                Ok(mut st) => {
+                    r.hnsw_reported_bytes = st
+                        .query_row([], |row| row.get::<_, i64>(0))
+                        .ok()
+                        .map(|v| v.max(0) as u64);
+                }
+                Err(e) => notes.push(format!("pragma_hnsw_index_info() unavailable: {e}")),
+            }
+        }
+        r.dimension = self.dim;
+        r.notes = notes;
+        r
+    }
+
+    /// First column of the first row as text, `None` on any error or no row.
+    fn one_string(&self, sql: &str) -> Option<String> {
+        let mut st = self.conn.prepare(sql).ok()?;
+        st.query_row([], |row| row.get::<_, String>(0)).ok()
     }
 
     /// Uncached catalog read behind [`hnsw_metric`](Self::hnsw_metric).

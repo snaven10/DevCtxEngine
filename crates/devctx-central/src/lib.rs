@@ -81,6 +81,8 @@ type EmbedderFactory =
 struct CachedEmbedder {
     value: Arc<dyn EmbeddingProvider>,
     last_used: Instant,
+    /// Wall-clock load time, seconds since the Unix epoch.
+    loaded_at: u64,
 }
 
 impl Central {
@@ -194,10 +196,22 @@ impl Central {
             c.last_used = Instant::now();
             return Ok(c.value.clone());
         }
+        let (rss_before, started) = (devctx_core::procmem::rss_bytes(), Instant::now());
         let e = (self.factory)(&self.memory_embed_settings())?;
+        let mb =
+            |b: Option<u64>| b.map_or("n/a".to_string(), |b| format!("{} MB", b / (1024 * 1024)));
+        eprintln!(
+            "memory: loaded central embedder {}/{} in {} ms; rss {} -> {}",
+            self.config.memory.provider,
+            self.config.memory.model,
+            started.elapsed().as_millis(),
+            mb(rss_before),
+            mb(devctx_core::procmem::rss_bytes()),
+        );
         *guard = Some(CachedEmbedder {
             value: e.clone(),
             last_used: Instant::now(),
+            loaded_at: devctx_core::procmem::unix_now(),
         });
         Ok(e)
     }
@@ -205,6 +219,23 @@ impl Central {
     /// Whether the embedder is currently loaded.
     pub fn embedder_loaded(&self) -> bool {
         self.embedder.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// The embedder slot for `status`, without loading it: `(key, loaded_at,
+    /// idle_secs)` when held, `None` when not.
+    pub fn embedder_state(&self) -> Option<(String, u64, u64)> {
+        let key = format!(
+            "{}/{}",
+            self.config.memory.provider, self.config.memory.model
+        );
+        let g = self.embedder.lock().ok()?;
+        g.as_ref()
+            .map(|c| (key, c.loaded_at, c.last_used.elapsed().as_secs()))
+    }
+
+    /// What the central database holds in memory (see [`Store::memory_report`]).
+    pub fn db_memory_report(&self) -> devctx_store::MemoryReport {
+        self.store.memory_report()
     }
 
     /// Drop the embedder if nobody asked for it in `max_idle`; true when it

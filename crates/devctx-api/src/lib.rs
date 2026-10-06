@@ -1566,4 +1566,42 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// PLAN-010 TASK-001: `GET /status` carries the `memory` block, with its
+    /// four sub-blocks, and answering it does not load the embedder.
+    #[tokio::test]
+    async fn status_reports_a_memory_block_without_loading_a_model() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_status_mem_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .uri("/status")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let m = &v["memory"];
+        assert!(m.is_object(), "{v}");
+        for k in ["process", "models", "duckdb", "hnsw"] {
+            assert!(m.get(k).is_some(), "missing {k}: {v}");
+        }
+        assert_eq!(m["models"]["embedder"]["loaded"], false, "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
