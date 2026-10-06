@@ -3580,6 +3580,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         paths: None,
         exclude: &cfg.indexing.effective_excludes(),
         branch: branch.as_deref(),
+        hnsw: cfg.storage.hnsw.then_some(cfg.storage.metric.as_str()),
     })?;
     progress.finish();
     devctx_mcp::state::report_index(&store, &root, &res);
@@ -3610,6 +3611,12 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         println!(
             "  {} of those were copied from another branch, not embedded",
             res.files_copied
+        );
+    }
+    if res.chunks_reused > 0 {
+        println!(
+            "  {} chunks reused without re-embedding (same text, same model)",
+            res.chunks_reused
         );
     }
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);

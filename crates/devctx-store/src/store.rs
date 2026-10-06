@@ -894,6 +894,38 @@ impl Store {
         }
     }
 
+    /// The embeddings a file already has on a branch, keyed by the chunk's
+    /// `content_hash` (one query for the whole file).
+    ///
+    /// What lets a reindex skip the embedder for every chunk whose text did not
+    /// change. Deletion tombstones are left out, and so is anything whose width
+    /// is not this store's. When two chunks share a hash they share a text, so
+    /// either vector serves.
+    pub fn vectors_by_hash(
+        &self,
+        repo: &str,
+        branch: &str,
+        file: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content_hash, vector FROM vectors \
+             WHERE repo = ? AND branch = ? AND file = ? \
+               AND COALESCE(is_deletion, false) = false AND content_hash IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![repo, branch, file], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Value>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (hash, v) = row?;
+            let v = value_to_f32_vec(v);
+            if v.len() == self.dim {
+                out.entry(hash).or_insert(v);
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete every vector for a given file.
     pub fn delete_by_file(&self, repo: &str, branch: &str, file: &str) -> Result<usize> {
         let n = self.w()?.execute(

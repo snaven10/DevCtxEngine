@@ -158,6 +158,12 @@ pub struct IndexRequest<'a> {
     /// `.gitignore`-style patterns for paths to keep out of the index
     /// (`indexing.exclude` in the project config).
     pub exclude: &'a [String],
+    /// Metric of the HNSW index this run should leave behind (`storage.hnsw`
+    /// on, `storage.metric`), or `None` when the config does not want one.
+    ///
+    /// Without it a database that never had the index never got one from a run
+    /// through the server: the pipeline only rebuilds what it took down.
+    pub hnsw: Option<&'a str>,
 }
 
 /// Summary of an indexing run.
@@ -186,6 +192,9 @@ pub struct IndexResult {
     /// branches indexed, and an argument nobody can see the effect of is one
     /// nobody can tell has stopped working.
     pub files_copied: usize,
+    /// Chunks whose vector was reused from the file's previous rows (same
+    /// `content_hash`, same model) instead of being embedded again.
+    pub chunks_reused: usize,
     /// Total symbols across indexed files.
     pub symbols: usize,
     /// Total chunks stored.
@@ -353,6 +362,9 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         indexed: HashSet::new(),
         excluded,
         written: 0,
+        // Vectors are only comparable within the model that made them: the
+        // branch's last completed run must have used this one, at this width.
+        reuse_vectors: prev.is_some() && !model_changed,
     };
 
     let mut result = IndexResult {
@@ -580,12 +592,21 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // the notes keep them owed to the next run. Checked before each, since
     // the first can be long enough for the request to arrive during it.
     if in_flight.alone() {
-        let hnsw = had_hnsw.or_else(|| {
-            req.store
-                .get_index_meta("", "", PENDING_HNSW_META_KEY)
-                .ok()
-                .flatten()
-        });
+        let hnsw = had_hnsw
+            .or_else(|| {
+                req.store
+                    .get_index_meta("", "", PENDING_HNSW_META_KEY)
+                    .ok()
+                    .flatten()
+            })
+            // Nothing took it down and nothing is owed: a database that never
+            // had one. Only the direct CLI path used to create it, so an index
+            // built through the server searched by full scan for good.
+            .or_else(|| {
+                req.hnsw
+                    .filter(|_| req.store.hnsw_metric().is_none())
+                    .map(str::to_string)
+            });
         if let Some(metric) = &hnsw {
             if cancelled() {
                 eprintln!("· the server is stopping; the HNSW index is left for the next run");
@@ -771,6 +792,9 @@ struct Ctx<'a> {
     excluded: Gitignore,
     /// Files that reached the write step this run (for [`stall_inside_write`]).
     written: usize,
+    /// The index record names this run's model and dimension, so a chunk whose
+    /// text is unchanged can keep its stored vector.
+    reuse_vectors: bool,
 }
 
 /// Test seam: `DEVCTX_TEST_STALL_IN_WRITE=<n>` stalls the run for good inside
@@ -947,7 +971,7 @@ impl Ctx<'_> {
                 )
             }
         };
-        let points = self.embed(file, &language, &chunks)?;
+        let (points, reused) = self.embed(file, &language, &chunks)?;
         let symbol_count = parsed.as_ref().map_or(0, |p| p.symbols.len());
         let chunk_count = chunks.len();
 
@@ -980,17 +1004,56 @@ impl Ctx<'_> {
         result.files_indexed += 1;
         result.symbols += symbol_count;
         result.chunks += chunk_count;
+        result.chunks_reused += reused;
         Ok(())
     }
 
-    /// Embed `chunks` into the points to store for `file` under `language`.
+    /// Embed `chunks` into the points to store for `file` under `language`,
+    /// returning how many reused a stored vector instead.
     /// Writes nothing: the caller stores them inside the file's transaction.
-    fn embed(&self, file: &str, language: &str, chunks: &[Chunk]) -> Result<Vec<VectorPoint>> {
+    ///
+    /// A chunk whose `content_hash` the file already holds (same model, see
+    /// `reuse_vectors`) keeps that vector; only the rest go to the embedder, in
+    /// order. This is sound because what is embedded is exactly `chunk.text`,
+    /// which the hash covers: if the embedding input ever grows (metadata,
+    /// path, a prefix), the hash must grow with it or reuse becomes wrong.
+    fn embed(
+        &self,
+        file: &str,
+        language: &str,
+        chunks: &[Chunk],
+    ) -> Result<(Vec<VectorPoint>, usize)> {
         if chunks.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
-        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-        let vectors = self.embedder.embed(&texts)?;
+        let old = if self.reuse_vectors {
+            self.store
+                .vectors_by_hash(self.repo_short, self.branch, file)?
+        } else {
+            Default::default()
+        };
+        let missing: Vec<usize> = (0..chunks.len())
+            .filter(|&i| !old.contains_key(&chunks[i].content_hash))
+            .collect();
+        let texts: Vec<String> = missing.iter().map(|&i| chunks[i].text.clone()).collect();
+        let mut fresh = if texts.is_empty() {
+            Vec::new()
+        } else {
+            self.embedder.embed(&texts)?
+        }
+        .into_iter();
+        let reused = chunks.len() - missing.len();
+        let mut vectors = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            vectors.push(match old.get(&c.content_hash) {
+                Some(v) => v.clone(),
+                None => fresh.next().ok_or_else(|| {
+                    devctx_embed::EmbedError::BadResponse(
+                        "the embedder returned fewer vectors than texts".into(),
+                    )
+                })?,
+            });
+        }
         let mut points = Vec::with_capacity(chunks.len());
         for (ordinal, (chunk, vector)) in chunks.iter().zip(vectors).enumerate() {
             points.push(VectorPoint {
@@ -1021,7 +1084,7 @@ impl Ctx<'_> {
                 },
             });
         }
-        Ok(points)
+        Ok((points, reused))
     }
 
     fn store_edges(

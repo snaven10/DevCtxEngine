@@ -1178,6 +1178,11 @@ fn do_index_inner(
         paths,
         exclude: &state.cfg.indexing.effective_excludes(),
         branch: target_branch.as_deref(),
+        hnsw: state
+            .cfg
+            .storage
+            .hnsw
+            .then_some(state.cfg.storage.metric.as_str()),
     });
     let res = run.map_err(|e| e.to_string())?;
     if res.cancelled {
@@ -1213,6 +1218,7 @@ fn do_index_inner(
         "files_pruned": res.files_pruned,
         "files_renamed": res.files_renamed,
         "files_copied": res.files_copied,
+        "chunks_reused": res.chunks_reused,
         "symbols": res.symbols,
         "chunks": res.chunks,
     });
@@ -10218,5 +10224,64 @@ mod tests {
         assert_eq!(first, ["m0", "m1", "m2", "m3", "m4"]);
         assert_eq!(second, ["m5", "m6", "m7", "m8", "m9"]);
         assert_eq!(third, ["m10", "m11"]);
+    }
+    /// PLAN-009 TASK-002 Paso 7: an index built through the serve path
+    /// (`do_index`) ends with the HNSW index when `storage.hnsw` is on. Before,
+    /// only the direct CLI created it, so autoserve searched by full scan.
+    #[test]
+    fn do_index_leaves_an_hnsw_index_when_the_config_wants_one() {
+        struct Fake(usize);
+        impl EmbeddingProvider for Fake {
+            fn embed(&self, texts: &[String]) -> devctx_embed::Result<Vec<Vec<f32>>> {
+                Ok(texts
+                    .iter()
+                    .map(|t| {
+                        (0..self.0)
+                            .map(|j| ((t.len() + j) % 10) as f32 / 10.0)
+                            .collect()
+                    })
+                    .collect())
+            }
+            fn dimension(&self) -> usize {
+                self.0
+            }
+            fn model_name(&self) -> &str {
+                "fake"
+            }
+        }
+        // VSS unavailable (offline): nothing to assert.
+        if !Store::open_in_memory(3)
+            .unwrap()
+            .enable_hnsw("cosine")
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let repo = std::env::temp_dir().join(format!("devctx_mcp_hnsw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.rs"), "pub fn greet() {}\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-q", "-m", "init"]);
+
+        let mut cfg = ProjectConfig::default();
+        cfg.project.path = repo.to_string_lossy().into_owned();
+        cfg.state_dir = repo.join("state").to_string_lossy().into_owned();
+        assert!(cfg.storage.hnsw, "HNSW is on by default");
+        let state = AppState::build(cfg).unwrap();
+        let dim = configured_dimension(&state.cfg);
+        *state.embedder.lock().unwrap() = Some(Cached {
+            value: Arc::new(Fake(dim)),
+            last_used: Instant::now(),
+            key: "fake/fake".into(),
+            loaded_at: procmem::unix_now(),
+        });
+
+        do_index(&state, false).unwrap();
+        let store = state.open_store().unwrap();
+        let v = state.memory_json(&store);
+        assert_eq!(v["hnsw"]["present"], true, "{v}");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

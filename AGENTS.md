@@ -196,18 +196,24 @@ Both commands open the databases directly, so stop the servers first:
 ```bash
 cd ~/code/api
 devctx serve --stop
-DEVCTX_NO_AUTOSERVE=1 devctx index          # see below for why
+devctx index
 devctx status                               # "indexed": true, "up_to_date": true
 ```
 
-Reckon **an hour per ~1400 files** on 8 cores. Two things to know:
+Reckon **an hour per ~1400 files** on 8 cores. Things to know:
 
 - The work happens inside the server, and the client's HTTP read times out at
   about an hour. **The error is the client giving up, not the index failing** —
   poll `devctx status` instead of believing it.
-- Building the HNSW index only happens on the direct path, hence
-  `DEVCTX_NO_AUTOSERVE=1`. Without it the index is never created and searches
-  fall back to a full scan (~5× slower).
+- With `storage.hnsw: true` the run itself leaves the HNSW index behind, through
+  the server or directly. Before 0.10 only the direct path
+  (`DEVCTX_NO_AUTOSERVE=1`) created it, and a server-built index searched by
+  full scan (~5× slower); to repair one built that way, run `devctx index`
+  again.
+- A reindex reuses the stored vector of every chunk whose text is unchanged
+  (same `content_hash`, same model), so `index --full` after an extractor
+  upgrade pays for parsing and the changed chunks, not for the embedder again.
+  A different model embeds everything.
 
 Enable HNSW first, in `.devctx/config.yaml`:
 

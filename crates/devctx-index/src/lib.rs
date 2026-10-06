@@ -97,6 +97,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: None,
         })
         .unwrap()
@@ -112,6 +113,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: Some(branch),
         })
         .unwrap()
@@ -236,6 +238,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: Some("main"),
         })
         .unwrap();
@@ -253,6 +256,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: Some("feature"),
         })
         .unwrap();
@@ -456,6 +460,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: Some("no-such-branch"),
         })
         .unwrap_err();
@@ -557,6 +562,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: None,
         })
         .unwrap();
@@ -622,6 +628,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: None,
         })
         .unwrap();
@@ -717,6 +724,7 @@ mod tests {
             progress: None,
             paths: Some(paths),
             exclude: &[],
+            hnsw: None,
             branch: None,
         })
         .unwrap()
@@ -839,6 +847,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: None,
         })
         .unwrap();
@@ -921,6 +930,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude,
+            hnsw: None,
             branch: None,
         })
         .unwrap()
@@ -996,6 +1006,7 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &["legacy/".to_string()],
+            hnsw: None,
             branch: None,
         })
         .unwrap();
@@ -1217,6 +1228,7 @@ mod tests {
             progress: Some(sink),
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: None,
         })
         .unwrap()
@@ -1556,6 +1568,7 @@ mod tests {
             progress: Some(&sink),
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: None,
         })
         .expect_err("the first write after the freeze must fail the run");
@@ -1741,6 +1754,7 @@ mod tests {
             progress: Some(&sink),
             paths: None,
             exclude: &[],
+            hnsw: None,
             branch: None,
         })
         .unwrap();
@@ -1762,6 +1776,155 @@ mod tests {
         let res = index_excluding(&store, &dir, &[]);
         assert!(!res.cancelled && !res.full_reindex, "{res:?}");
         assert_eq!(indexed_files(&store).len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ---- vector reuse by content hash (PLAN-009 TASK-002) -------------------
+
+    /// One run with the counting embedder, `full` or incremental, under `model`.
+    fn run_counting(store: &Store, root: &Path, full: bool, model: &str) -> (IndexResult, usize) {
+        let emb = CountingEmbedder(std::sync::atomic::AtomicUsize::new(0));
+        let res = run(IndexRequest {
+            store,
+            embedder: &emb,
+            repo_root: root,
+            incremental: !full,
+            model_name: model,
+            progress: None,
+            paths: None,
+            exclude: &[],
+            hnsw: None,
+            branch: None,
+        })
+        .unwrap();
+        (res, emb.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Three functions, each far above the minimum chunk size so none merges
+    /// into its neighbour; `beta_ret` is what the middle one returns.
+    fn three_functions(beta_ret: &str) -> String {
+        let body = |name: &str, ret: &str| {
+            let pad: String = (0..12)
+                .map(|i| format!("    step_{i} = compute_value_{name}({i}) + {i}\n"))
+                .collect();
+            format!("def {name}():\n{pad}    return {ret}\n")
+        };
+        format!(
+            "{}\n\n{}\n\n{}",
+            body("alpha", "1"),
+            body("beta", beta_ret),
+            body("gamma", "3")
+        )
+    }
+
+    fn reuse_repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("devctx_reuse_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write(&dir, "m.py", &three_functions("2"));
+        commit_all(&dir, "init");
+        dir
+    }
+
+    /// Every vector of `file`, keyed by chunk hash.
+    fn vectors_of(
+        store: &Store,
+        root: &Path,
+        file: &str,
+    ) -> std::collections::HashMap<String, Vec<f32>> {
+        let git = crate::git::GitRepo::open(root).unwrap();
+        store
+            .vectors_by_hash(&git.short_name(), &git.state().branch, file)
+            .unwrap()
+    }
+
+    /// `--full` over identical source (the rollout `EXTRACTOR_VERSION` forces)
+    /// must not pay for the embedder again, and must keep the same vectors.
+    #[test]
+    fn a_full_reindex_of_unchanged_source_embeds_nothing() {
+        let dir = reuse_repo("full");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, n1) = run_counting(&store, &dir, true, "minilm-l6");
+        assert!(n1 > 0 && first.chunks_reused == 0, "{first:?} {n1}");
+        let before = vectors_of(&store, &dir, "m.py");
+        assert!(!before.is_empty());
+
+        let (second, n2) = run_counting(&store, &dir, true, "minilm-l6");
+        assert!(second.full_reindex, "{second:?}");
+        assert_eq!(n2, 0, "unchanged chunks went to the embedder again");
+        assert_eq!(second.chunks_reused, second.chunks, "{second:?}");
+        assert_eq!(vectors_of(&store, &dir, "m.py"), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Editing one function embeds that function's chunk(s), not the file's.
+    #[test]
+    fn editing_one_function_embeds_only_its_chunks() {
+        let dir = reuse_repo("edit");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, n1) = run_counting(&store, &dir, false, "minilm-l6");
+        assert!(first.chunks >= 3 && n1 == first.chunks, "{first:?} {n1}");
+
+        write(&dir, "m.py", &three_functions("22222"));
+        commit_all(&dir, "edit beta");
+        let (second, n2) = run_counting(&store, &dir, false, "minilm-l6");
+        assert_eq!(second.files_indexed, 1, "{second:?}");
+        assert!(
+            n2 >= 1 && n2 < first.chunks,
+            "embedded {n2} of {}",
+            first.chunks
+        );
+        assert_eq!(second.chunks_reused, second.chunks - n2, "{second:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Vectors are only comparable within the model that made them.
+    #[test]
+    fn a_different_model_embeds_everything_again() {
+        let dir = reuse_repo("model");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, _) = run_counting(&store, &dir, true, "minilm-l6");
+        let (second, n2) = run_counting(&store, &dir, true, "bge-small");
+        assert_eq!(second.chunks_reused, 0, "{second:?}");
+        assert_eq!(
+            n2, first.chunks,
+            "every chunk must be embedded under a new model"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pipeline creates the HNSW index when the config wants one and the
+    /// database never had it (the server path used to leave it out for good).
+    #[test]
+    fn a_new_index_gets_hnsw_when_the_config_asks_for_it() {
+        // VSS unavailable (offline): nothing to assert.
+        if !Store::open_in_memory(DIM)
+            .unwrap()
+            .enable_hnsw("cosine")
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let dir = reuse_repo("hnsw");
+        let store = Store::open_in_memory(DIM).unwrap();
+        run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: true,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+            exclude: &[],
+            hnsw: Some("cosine"),
+            branch: None,
+        })
+        .unwrap();
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert!(store
+            .get_index_meta("", "", PENDING_HNSW_META_KEY)
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
