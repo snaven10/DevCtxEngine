@@ -15,7 +15,12 @@
 #
 # Summary (MiB): max and final RSS/anon/file/Pss, the kernel's VmHWM at the end,
 # and RSS at each --at second. A PID that is not yours to read (or gone) is an
-# error, never a row of zeros.
+# error, never a row of zeros. A Pss that cannot be read is reported as n/a.
+#
+# In `-- COMMAND` mode sampling stops when COMMAND exits or --duration elapses.
+# If --duration cuts in first, the summary is printed and COMMAND is LEFT
+# RUNNING (it is the child this script started; stop it yourself). Exit status:
+# COMMAND's own when it exited, 0 otherwise (--pid mode, or cut by --duration).
 set -u
 
 interval=0.2; duration=0; at=""; out=""; pid=""; until_pid=""
@@ -28,7 +33,7 @@ while [ $# -gt 0 ]; do
     --out) out="$2"; shift 2;;
     --until-exit) until_pid="$2"; shift 2;;
     --) shift; break;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0;;
     *) echo "memprobe: unknown option $1" >&2; exit 2;;
   esac
 done
@@ -51,6 +56,8 @@ if [ ! -r "/proc/$pid/status" ]; then
 fi
 
 raw=$(mktemp -p "${TMPDIR:-/var/tmp}" memprobe.XXXXXX)
+trap 'rm -f "$raw"' EXIT
+trap 'exit 130' INT TERM
 # Monotonic seconds: /proc/uptime does not jump when the wall clock is stepped.
 mono() { read -r up _ </proc/uptime; echo "$up"; }
 start=$(mono)
@@ -59,36 +66,41 @@ sample() {
   st=$(awk '/^VmRSS:/{r=$2} /^RssAnon:/{a=$2} /^RssFile:/{f=$2} /^VmHWM:/{h=$2} END{if(r=="")exit 1; print r"\t"a"\t"f"\t"h}' "/proc/$pid/status" 2>/dev/null) || return 1
   sm=$(awk '/^Pss:/{print $2; exit}' "/proc/$pid/smaps_rollup" 2>/dev/null)
   now=$(mono)
-  printf '%s\t%s\t%s\n' "$(awk -v n="$now" -v s="$start" 'BEGIN{printf "%.2f", n-s}')" "$st" "${sm:-0}" >>"$raw"
+  printf '%s\t%s\t%s\n' "$(awk -v n="$now" -v s="$start" 'BEGIN{printf "%.2f", n-s}')" "$st" "${sm:-NA}" >>"$raw"
 }
 
+cut=0
 while sample; do
-  if [ -n "$until_pid" ] && [ ! -d "/proc/$until_pid" ]; then break; fi
+  if [ -n "$until_pid" ] && [ ! -d "/proc/$until_pid" ]; then cut=1; break; fi
   if [ "$duration" != "0" ] && awk -v n="$(mono)" -v s="$start" -v d="$duration" 'BEGIN{exit !(n-s>=d)}'; then
-    break
+    cut=1; break
   fi
   sleep "$interval"
 done
-[ -n "$child" ] && wait "$child" 2>/dev/null
-status=$?
+status=0
+if [ -n "$child" ] && [ "$cut" = 0 ]; then
+  # Sampling ended because the child is gone: collect its exit status.
+  wait "$child" 2>/dev/null; status=$?
+fi
 
 if [ ! -s "$raw" ]; then
   echo "memprobe: no samples (process gone before the first read?)" >&2
-  rm -f "$raw"; exit 1
+  exit 1
 fi
 
 # columns: t  rss_kb  anon_kb  file_kb  hwm_kb  pss_kb
 awk -F'\t' -v at="$at" '
   BEGIN { n = split(at, A, ","); }
-  { t[NR]=$1; rss[NR]=$2; an[NR]=$3; fi[NR]=$4; if ($5>hwm) hwm=$5; pss[NR]=$6 }
-  { if ($2>mr) mr=$2; if ($3>ma) ma=$3; if ($4>mf) mf=$4; if ($6>mp) mp=$6 }
+  { t[NR]=$1; rss[NR]=$2; an[NR]=$3; fi[NR]=$4; if ($5>hwm) hwm=$5; pss[NR]=$6; if ($6=="NA") nopss++ }
+  { if ($2>mr) mr=$2; if ($3>ma) ma=$3; if ($4>mf) mf=$4; if ($6!="NA" && $6>mp) mp=$6 }
   END {
     m = 1024
     printf "samples        %d over %.1f s\n", NR, t[NR]
     printf "RSS   max/final  %.0f / %.0f MiB\n", mr/m, rss[NR]/m
     printf "anon  max/final  %.0f / %.0f MiB\n", ma/m, an[NR]/m
     printf "file  max/final  %.0f / %.0f MiB\n", mf/m, fi[NR]/m
-    printf "Pss   max/final  %.0f / %.0f MiB\n", mp/m, pss[NR]/m
+    if (nopss == NR || pss[NR] == "NA") printf "Pss   max/final  n/a (smaps_rollup unreadable)\n"
+    else printf "Pss   max/final  %.0f / %.0f MiB\n", mp/m, pss[NR]/m
     printf "VmHWM (kernel)   %.0f MiB\n", hwm/m
     for (i = 1; i <= n; i++) {
       want = A[i] + 0; best = 0
@@ -99,5 +111,5 @@ awk -F'\t' -v at="$at" '
     }
   }' "$raw"
 
-if [ -n "$out" ]; then mv "$raw" "$out"; else rm -f "$raw"; fi
+if [ -n "$out" ]; then mv "$raw" "$out"; fi
 exit "$status"

@@ -13,11 +13,12 @@ pub struct ProcMemory {
     /// `VmRSS`: everything resident.
     pub rss: u64,
     /// `RssAnon`: private heap, model weights, ORT arenas, DuckDB buffers.
-    pub rss_anon: u64,
-    /// `RssFile`: mapped files (the binary, its libraries).
-    pub rss_file: u64,
-    /// `RssShmem`: shared memory.
-    pub rss_shmem: u64,
+    /// `None` on kernels < 4.5, which do not report it (never a fake zero).
+    pub rss_anon: Option<u64>,
+    /// `RssFile`: mapped files (the binary, its libraries). `None` if absent.
+    pub rss_file: Option<u64>,
+    /// `RssShmem`: shared memory. `None` if absent.
+    pub rss_shmem: Option<u64>,
     /// `VmHWM`: peak `VmRSS` since the process started.
     pub hwm: u64,
 }
@@ -29,24 +30,32 @@ impl ProcMemory {
     pub fn parse_status(text: &str) -> Option<Self> {
         let mut m = Self::default();
         let mut seen_rss = false;
+        let mut hwm_seen = false;
         for line in text.lines() {
             let Some((key, rest)) = line.split_once(':') else {
                 continue;
             };
-            let slot = match key {
+            let Some(bytes) = parse_kb(rest) else {
+                continue;
+            };
+            match key {
                 "VmRSS" => {
                     seen_rss = true;
-                    &mut m.rss
+                    m.rss = bytes;
                 }
-                "RssAnon" => &mut m.rss_anon,
-                "RssFile" => &mut m.rss_file,
-                "RssShmem" => &mut m.rss_shmem,
-                "VmHWM" => &mut m.hwm,
-                _ => continue,
-            };
-            if let Some(bytes) = parse_kb(rest) {
-                *slot = bytes;
+                "RssAnon" => m.rss_anon = Some(bytes),
+                "RssFile" => m.rss_file = Some(bytes),
+                "RssShmem" => m.rss_shmem = Some(bytes),
+                "VmHWM" => {
+                    hwm_seen = true;
+                    m.hwm = bytes;
+                }
+                _ => {}
             }
+        }
+        // Without VmHWM the peak is unknown; the current RSS is its lower bound.
+        if !hwm_seen {
+            m.hwm = m.rss;
         }
         seen_rss.then_some(m)
     }
@@ -74,12 +83,26 @@ fn parse_kb(rest: &str) -> Option<u64> {
     (unit.eq_ignore_ascii_case("kB")).then(|| n.saturating_mul(1024))
 }
 
+/// Name of the engine that runs an embedder/reranker for `provider`: the
+/// in-process one for `local`, otherwise `remote`. One place to change when the
+/// local engine does.
+pub fn engine_for(provider: &str) -> &'static str {
+    if provider == "local" {
+        LOCAL_ENGINE
+    } else {
+        "remote"
+    }
+}
+
+/// The in-process inference engine behind `provider: local`.
+pub const LOCAL_ENGINE: &str = "fastembed";
+
 /// The `memory.process` block of `status`.
 pub fn process_json(mem: Option<ProcMemory>) -> Value {
     match mem {
         Some(m) => json!({
             "rss_bytes": m.rss,
-            "rss_anon_bytes": m.rss_anon,
+            "rss_anon_bytes": m.rss_anon,   // null when the kernel omits it
             "rss_file_bytes": m.rss_file,
             "rss_shmem_bytes": m.rss_shmem,
             "hwm_bytes": m.hwm,
@@ -122,9 +145,9 @@ RssAnon:\t  400000 kB\nRssFile:\t  100000 kB\nRssShmem:\t   12000 kB\nThreads:\t
     fn parses_a_status_file_into_bytes() {
         let m = ProcMemory::parse_status(SAMPLE).unwrap();
         assert_eq!(m.rss, 512_000 * 1024);
-        assert_eq!(m.rss_anon, 400_000 * 1024);
-        assert_eq!(m.rss_file, 100_000 * 1024);
-        assert_eq!(m.rss_shmem, 12_000 * 1024);
+        assert_eq!(m.rss_anon, Some(400_000 * 1024));
+        assert_eq!(m.rss_file, Some(100_000 * 1024));
+        assert_eq!(m.rss_shmem, Some(12_000 * 1024));
         assert_eq!(m.hwm, 600_000 * 1024);
     }
 
@@ -132,6 +155,18 @@ RssAnon:\t  400000 kB\nRssFile:\t  100000 kB\nRssShmem:\t   12000 kB\nThreads:\t
     fn text_without_vmrss_is_not_a_status_file() {
         assert_eq!(ProcMemory::parse_status("Name:\tkthreadd\n"), None);
         assert_eq!(ProcMemory::parse_status(""), None);
+    }
+
+    #[test]
+    fn old_kernel_without_rss_breakdown_gives_none_not_zero() {
+        let m = ProcMemory::parse_status("VmHWM:\t 2000 kB\nVmRSS:\t 1000 kB\n").unwrap();
+        assert_eq!(m.rss_anon, None);
+        assert_eq!(m.rss_file, None);
+        assert_eq!(m.rss_shmem, None);
+        let v = process_json(Some(m));
+        assert_eq!(v["source"], "proc");
+        assert!(v["rss_anon_bytes"].is_null());
+        assert!(v["rss_bytes"].is_u64());
     }
 
     #[test]

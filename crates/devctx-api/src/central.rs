@@ -522,7 +522,7 @@ fn central_status_json(c: &Central) -> serde_json::Value {
         Some((key, at, idle)) => json!({
             "loaded": true, "key": key, "loaded_at": at,
             "age_secs": procmem::unix_now().saturating_sub(at),
-            "idle_secs": idle, "engine": "fastembed",
+            "idle_secs": idle, "engine": procmem::engine_for(key.split('/').next().unwrap_or("")),
         }),
         None => json!({ "loaded": false }),
     };

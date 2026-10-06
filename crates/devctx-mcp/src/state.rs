@@ -430,11 +430,7 @@ impl AppState {
             g.as_ref()
                 .map(|c| (c.key.clone(), c.loaded_at, c.last_used.elapsed().as_secs()))
         });
-        let emb_engine = if self.embed_settings.provider == "local" {
-            "fastembed"
-        } else {
-            "remote"
-        };
+        let emb_engine = procmem::engine_for(&self.embed_settings.provider);
         json!({
             "process": procmem::process_json(procmem::ProcMemory::read()),
             "models": {
@@ -444,7 +440,7 @@ impl AppState {
                     emb_engine,
                 ),
                 "reranker": if self.rerank_enabled {
-                    slot(&self.rerank_settings.model, rer, "fastembed")
+                    slot(&self.rerank_settings.model, rer, procmem::LOCAL_ENGINE)
                 } else {
                     json!({ "loaded": false, "enabled": false })
                 },
