@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-009 — Grafo estático preciso y contexto por grafo
 - **Especialista:** rust (a definir al detallar)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 - **Depende de:** —
 - **Estado:** `pending`
 

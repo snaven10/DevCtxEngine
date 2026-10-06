@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-007 — Planes en la raíz del workspace
 - **Especialista:** rust (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
 - **Depende de:** TASK-003
 - **Estado:** `done`
 
@@ -10,8 +10,8 @@
 
 ## Objetivo
 
-Que una sesión MCP lanzada desde `~/revfa` (binding de grupo) reciba los planes de
-`~/revfa/plans` sin depender del miembro default ni de la versión de su daemon (PLAN-007 DD-4).
+Que una sesión MCP lanzada desde `~/acme` (binding de grupo) reciba los planes de
+`~/acme/plans` sin depender del miembro default ni de la versión de su daemon (PLAN-007 DD-4).
 
 ## Contexto verificado
 

@@ -300,7 +300,7 @@ mod tests {
             content: "línea uno\nlínea dos".into(),
             memory_type: "decision".into(),
             scope: "group".into(),
-            project: "@group:REVFA".into(),
+            project: "@group:ACME".into(),
             topic_key: "auth".into(),
             tags: "a,b".into(),
             repo: "api".into(),
@@ -488,7 +488,7 @@ mod tests {
             content: content.into(),
             topic_key: topic.into(),
             normalized_hash: hash.into(),
-            project: "@group:REVFA".into(),
+            project: "@group:ACME".into(),
             ..Default::default()
         }
     }
@@ -925,15 +925,15 @@ Expected: no output. Fix anything reported before continuing — in particular c
 ```bash
 devctx serve --stop; devctx serve --central --stop
 install -m755 target/release/devctx ~/.local/bin/devctx
-cd ~/revfa/REVFA_BackEnd
+cd ~/acme/backend-a
 
 # Export the group and count it against what the store holds.
-devctx memories export --scope group > /tmp/revfa.jsonl
-wc -l /tmp/revfa.jsonl                 # expect 2090
-head -1 /tmp/revfa.jsonl | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["title"], "| embedding:", d.get("embedding",{}).get("model"))'
+devctx memories export --scope group > /tmp/acme.jsonl
+wc -l /tmp/acme.jsonl                 # expect 2090
+head -1 /tmp/acme.jsonl | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["title"], "| embedding:", d.get("embedding",{}).get("model"))'
 
 # Importing what is already there must change nothing.
-devctx memories import /tmp/revfa.jsonl --dry-run
+devctx memories import /tmp/acme.jsonl --dry-run
 ```
 
 Expected: `wc -l` reports 2090; the first line shows a title and `ml-granite`; the dry run reports **0 added, 2090 already present**. Anything else means `decide` is not recognising the store's own rows and must be fixed before committing.
@@ -941,14 +941,14 @@ Expected: `wc -l` reports 2090; the first line shows a title and `ml-granite`; t
 - [ ] **Step 6: Verify the additive rule with a real collision**
 
 ```bash
-cd ~/revfa/REVFA_BackEnd
+cd ~/acme/backend-a
 devctx remember "local version of a shared topic" --title "COLLISION LOCAL" --topic collision-test --scope group
 devctx memories export --scope group | grep -c COLLISION      # expect 1
 
 python3 - <<'EOF'
 import json
 line = None
-for l in open('/tmp/revfa.jsonl'):
+for l in open('/tmp/acme.jsonl'):
     d = json.loads(l)
     if d['topic_key']:
         d.update(id='mem_collision_probe', title='COLLISION INCOMING',
@@ -1229,10 +1229,10 @@ mod tests {
         let a = Answers {
             model: Some("ml-granite".into()),
             state_dir: None,
-            group: Some("REVFA".into()),
+            group: Some("ACME".into()),
         };
         let s = summary("demo", &a, "ml-granite");
-        assert!(s.contains("REVFA"), "{s}");
+        assert!(s.contains("ACME"), "{s}");
         assert!(s.contains("local"), "the tiers must be named: {s}");
         assert!(s.contains("group"), "{s}");
         assert!(s.contains("global"), "{s}");
@@ -1256,8 +1256,8 @@ mod tests {
     /// list rather than a name that has to be remembered exactly.
     #[test]
     fn known_groups_are_offered() {
-        let s = groups_line(&[("REVFA".to_string(), 4)]);
-        assert!(s.contains("REVFA"), "{s}");
+        let s = groups_line(&[("ACME".to_string(), 4)]);
+        assert!(s.contains("ACME"), "{s}");
         assert!(s.contains('4'), "{s}");
         assert!(groups_line(&[]).is_empty(), "nothing to offer on a fresh machine");
     }

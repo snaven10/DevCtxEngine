@@ -152,7 +152,7 @@ way to narrow it, and it is why qualified names are never expanded.
 
 > This is the correction to an earlier claim in these pages that coverage was
 > "binary per symbol, with nothing to tell the cases apart". It was not. A bare
-> `actualizar` returned nothing while `OficinaService.actualizar` returned one
+> `actualizar` returned nothing while `OfficeService.actualizar` returned one
 > caller and twenty-three callees: the edges were there the whole time, under a
 > key nobody was asking with.
 

@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-008 — Robustez del ciclo de vida y salida útil para agentes
 - **Especialista:** rust (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 - **Depende de:** —
 - **Estado:** `done`
 

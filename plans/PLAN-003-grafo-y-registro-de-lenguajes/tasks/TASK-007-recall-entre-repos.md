@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-003 — Grafo y registro de lenguajes
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
 - **Depende de:** —
 - **Estado:** `done`
 
@@ -16,7 +16,7 @@ repositorio, y las de los repositorios hermanos del grupo.
 ## Contexto verificado (2026-08-23)
 
 Apareció buscando si alguna memoria vieja repetía la afirmación falsa de
-TASK-005. El `recall` devolvió los 11 proyectos REVFA en `failed_projects`.
+TASK-005. El `recall` devolvió los 11 proyectos ACME en `failed_projects`.
 
 **Son dos bugs encadenados, ninguno de PLAN-003.**
 
@@ -54,7 +54,7 @@ pero `POST /recall` → `do_recall_scoped` responde
 es `None`, así que **devolvía vacío siempre que hubiera un servidor corriendo**,
 que es el caso normal.
 
-Medido en REVFA_BackEnd: `memory-stats` reporta **16 memorias**, y
+Medido en backend-a: `memory-stats` reporta **16 memorias**, y
 `recall "solicitud" --scope local` respondía `No memories.`
 
 Y de paso, `remote::recall` no mandaba `scope`; el endpoint asume `all`. Aunque
@@ -82,7 +82,7 @@ los habría fusionado por segunda vez con los suyos.
 
 ## Criterios de aceptación
 
-- [x] `devctx recall "solicitud" --scope local` en REVFA_BackEnd devuelve
+- [x] `devctx recall "solicitud" --scope local` en backend-a devuelve
       memorias en vez de `No memories.`
 - [x] `--format json` imprime un objeto válido, también sin resultados.
 - [x] Un `recall` de grupo devuelve `failed_projects` vacío y trae memorias de
@@ -118,10 +118,10 @@ devolver un resultado parcial que se ve normal.
 
   | Comprobación | Antes | Después |
   |---|---|---|
-  | `recall "solicitud" --scope local` en REVFA_BackEnd (16 memorias) | `No memories.` | 3 memorias, con título y tipo |
+  | `recall "solicitud" --scope local` en backend-a (16 memorias) | `No memories.` | 3 memorias, con título y tipo |
   | `recall ... --format json` | `error: unexpected argument '--format'` | `{"memories":[...]}` |
   | `--format json` sin resultados | (no existía) | `{"memories":[]}` — JSON válido |
-  | Fan-out de grupo, proceso `devctx mcp` recién arrancado desde `~/revfa` | 11 proyectos en `failed_projects`, 0 locales | **`failed_projects` vacío**, 8 memorias de 3 repos |
+  | Fan-out de grupo, proceso `devctx mcp` recién arrancado desde `~/acme` | 11 proyectos en `failed_projects`, 0 locales | **`failed_projects` vacío**, 8 memorias de 3 repos |
 
   El fan-out se probó contra un proceso MCP **nuevo**, no contra los que ya
   estaban corriendo: `recall_one_local` lanza `current_exe()`, así que un

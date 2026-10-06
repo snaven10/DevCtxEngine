@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-003 — Grafo y registro de lenguajes
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
 - **Depende de:** —
 - **Estado:** `done`
 
@@ -25,8 +25,8 @@ esquema.
   una clase, así que `get_callees` por nombre pelado no puede coincidir nunca.
 - `crates/devctx-parse/src/parser.rs:312` — `qualified_target` califica solo si
   resuelve el receptor; si no, deja el nombre pelado.
-- Medido contra REVFA_BackEnd/`development`: `actualizar` → 0/0;
-  `OficinaService.actualizar` → 1 caller y 23 callees.
+- Medido contra backend-a/`development`: `actualizar` → 0/0;
+  `OfficeService.actualizar` → 1 caller y 23 callees.
 - El esquema (`crates/devctx-store/src/schema.rs:94`) tiene
   `idx_edges_source` e `idx_edges_target` sobre `(repo, branch, <col>)`.
   **Un `LIKE '%.' || ?` no usa esos índices** — ver Riesgos.
@@ -61,10 +61,10 @@ esquema.
 
 ## Criterios de aceptación
 
-- [x] Con el índice **actual** de REVFA_BackEnd/`development`, sin reindexar:
+- [x] Con el índice **actual** de backend-a/`development`, sin reindexar:
       `devctx impact actualizar` devuelve callers y callees no vacíos.
 - [x] Esa misma salida nombra a cuántas declaraciones expandió `actualizar`.
-- [x] `devctx impact OficinaService.actualizar` devuelve **lo mismo que hoy**
+- [x] `devctx impact OfficeService.actualizar` devuelve **lo mismo que hoy**
       (1 caller, 23 callees): un nombre calificado no expande.
 - [x] `devctx impact crearNotificacion` sigue devolviendo sus 8 callers directos.
 - [x] Los tests de `graph.rs` pasan, incluido el de no-regresión del Paso 5.
@@ -75,10 +75,10 @@ esquema.
 el comodín va al principio. Es un scan del subconjunto `(repo, branch)`. Para los
 tamaños actuales (un repo, una rama) es aceptable; si `graph_edges` creciera a
 millones de filas habría que materializar una columna `target_bare`. **Medir el
-tiempo de `impact` sobre REVFA_BackEnd antes y después y anotarlo en `## Resultado`.**
+tiempo de `impact` sobre backend-a antes y después y anotarlo en `## Resultado`.**
 
 **Colapso de homónimos.** `actualizar` tiene muchas declaraciones distintas en
-REVFA_BackEnd. Expandir las funde en un solo reporte. Por eso el Paso 4 no es
+backend-a. Expandir las funde en un solo reporte. Por eso el Paso 4 no es
 cosmético: sin él, el usuario lee un radio de impacto que mezcla siete servicios
 y no tiene forma de saberlo.
 
@@ -97,12 +97,12 @@ y no tiene forma de saberlo.
 
 - **Verificado por:**
   - `cargo test --offline -p devctx-store --lib` → **52 pasan, 0 fallan**.
-  - Binario release instalado en `~/.local/bin/devctx` (respaldo en `devctx.bak-pre-plan003`), servidor de REVFA_BackEnd reiniciado, **sin reindexar**:
+  - Binario release instalado en `~/.local/bin/devctx` (respaldo en `devctx.bak-pre-plan003`), servidor de backend-a reiniciado, **sin reindexar**:
 
     | Consulta | Antes | Después |
     |---|---|---|
     | `impact actualizar` | 0 callers, 0 callees | **21 declaraciones**, callers y callees poblados |
-    | `impact OficinaService.actualizar` | 1 caller, 23 callees | **idéntico** — un nombre calificado no expande |
+    | `impact OfficeService.actualizar` | 1 caller, 23 callees | **idéntico** — un nombre calificado no expande |
     | `impact crearNotificacion` | 8 callers | 2 declaraciones, más callers |
     | `get_references crearNotificacion` | (array pelado) | 12 referencias + `resolved_symbols` |
 
@@ -134,7 +134,7 @@ y no tiene forma de saberlo.
   3. **Semillas reportables.** El plan decía "el interior de `bfs` no se expande",
      y así quedó; pero la primera versión metía las semillas en `visited` antes
      de arrancar, y eso **borraba la arista por la que existe el fix**:
-     en `OficinaResource.actualizar → OficinaService.actualizar` los dos extremos
+     en `OfficeResource.actualizar → OfficeService.actualizar` los dos extremos
      responden a `actualizar`, así que el caller quedaba suprimido por ser
      semilla. Se separó en dos conjuntos: `walked` (no recorrer dos veces) y
      `reported` (no reportar la pregunta misma). Lo atrapó el test
@@ -146,5 +146,5 @@ y no tiene forma de saberlo.
     respuesta que hay que leer con criterio.
   - Los targets basura de cadena fluida siguen ahí (`getNombre` pelado y
     calificado a la vez) — es TASK-002, y exige reindexar.
-  - Se detuvo y relanzó el servidor de REVFA_BackEnd (pid 493405). Otra sesión
+  - Se detuvo y relanzó el servidor de backend-a (pid 493405). Otra sesión
     con binding a ese proyecto puede haber quedado desconectada.

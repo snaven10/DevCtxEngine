@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-010 — Memoria de procesos
 - **Especialista:** general-purpose (Rust)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feat/plan-010-medicion`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-010-medicion`
 - **Depende de:** — (primera del plan; requiere 0.8.5 publicado en `main`)
 - **Estado:** `done`
 
@@ -114,7 +114,7 @@ las tasks siguientes. Confirmar o refutar HM-1…HM-4 del diseño (§1).
   7. Hallazgo de camino: con el serve (autoserve) **el índice HNSW no se crea** aunque `storage.hnsw: true`;
      sólo lo crea el camino directo `DEVCTX_NO_AUTOSERVE=1 devctx index` (ya lo dice AGENTS.md §6).
      `status.memory.hnsw.present` lo hace visible.
-- **Riesgos abiertos / siguiente:** ver "Insumos para decidir". No se midió REVFA_FrontEnd completo en
+- **Riesgos abiertos / siguiente:** ver "Insumos para decidir". No se midió frontend completo en
   su tamaño real de usuario (18 GB en disco incluye no-git); el clon git (2135 archivos) es el medido.
 
 ### Método y máquina
@@ -122,8 +122,8 @@ las tasks siguientes. Confirmar o refutar HM-1…HM-4 del diseño (§1).
 Intel Core Ultra 7 255HX, 20 hilos, 76 GiB RAM (otros procesos del usuario vivos: ~25 GiB usados),
 WSL2 Linux 6.18. Release sin `gpu`, modelo `ml-granite` (CPU, `local`, 384 dim) descargado en una caché
 de sandbox; `DuckDB memory_limit` efectivo 1.8 GiB, 4 hilos. Repos: DevCtxEngine (clon, 300 archivos
-git, 270 indexados, 4 677 chunks); REVFA_FrontEnd (clon git, 2 135 archivos, 1 644 indexados, 14 365
-chunks); REVFA_EUI_Microservice (81 archivos, 383 chunks). Muestreo con `scripts/memprobe.sh` cada
+git, 270 indexados, 4 677 chunks); frontend (clon git, 2 135 archivos, 1 644 indexados, 14 365
+chunks); service-d (81 archivos, 383 chunks). Muestreo con `scripts/memprobe.sh` cada
 0.2 s sobre el PID del serve (E2/E3) o 0.5 s (E1); `VmHWM` del kernel como pico real. Una caída del reloj
 de pared de WSL durante E3 inflaba los tiempos: se descontó; `memprobe.sh` quedó con reloj monotónico
 (`/proc/uptime`). Cifras en MiB. Todos los procesos de la medición se pararon con `serve --stop`.
@@ -134,7 +134,7 @@ de pared de WSL durante E3 inflaba los tiempos: se descontó; `memprobe.sh` qued
 |---|---|---|
 | E1 | Central en reposo | arranque 82-101; con embedder cargado (tras `remember --scope global`) 303 estable, pico RSS 623, `VmHWM` 724; **tras 300 s de inactividad 105** (anon 28, file 77) |
 | E2 | Serve DevCtxEngine `index --full` (4 677 chunks) | 528 s = **8.9 chunks/s**; `VmHWM` **897**; RSS final tras el índice 276, y 159 tras soltar el modelo |
-| E3 | Serve REVFA_FrontEnd | completo: 14 365 chunks en 1 821 s = **7.9 chunks/s**, `VmHWM` **786**. Incremental (149 archivos editados, 1 201 chunks): 155 s = 7.7 chunks/s, `VmHWM` **753** |
+| E3 | Serve frontend | completo: 14 365 chunks en 1 821 s = **7.9 chunks/s**, `VmHWM` **786**. Incremental (149 archivos editados, 1 201 chunks): 155 s = 7.7 chunks/s, `VmHWM` **753** |
 | E4 | 3 serves con modelo cargado | RSS 315 / 322 / 284 (suma 921); **Pss** 256 / 262 / 224 (suma 742); `RssAnon` 233 / 241 / 205 (suma 679), `RssFile` ~80 c/u (sólo binario); `VmHWM` ~710-730 c/u. Tras soltar (300 s): 84 / 91 / 56 (Pss 55 / 62 / 28) |
 | E5 | 20 `search` seguidos (serve caliente; tiempo de pared del CLI, incluye spawn) | 3 corridas: p50 35 / 30 / 37 ms, p95 70 / 40 / 43 ms (la última con HNSW). Primer `search` (carga del modelo): 1.09 s |
 | E6 | Serve recién abierto -> primer `search` vectorial | **Sin HNSW** (DevCtxEngine, 4 677 vec): abre en 82 (anon 9) -> 439 tras el search (`VmHWM` 712) -> 299-308 al segundo. **Con HNSW** (mismo DB): abre en **97 (anon 26)** -> 445 (`VmHWM` 725) -> 308. Front (14 365 vec): abre en 128 (anon 57) con HNSW vs ~85 sin él |
@@ -162,7 +162,7 @@ Crear el HNSW por el camino directo: 1.7 s (4.7 k vec) y ~6 s (14 k vec), pico `
 ### Insumos para decidir (sin decidirlo)
 
 - Metas de PLAN-010 §6 **ya cumplidas en 0.9.0**: pico de indexación completa (897 vs <= 1.5 GB), pico
-  incremental en REVFA_FrontEnd (753 vs <= 1.5 GB), central en reposo tras el idle (105 vs <= 150).
+  incremental en frontend (753 vs <= 1.5 GB), central en reposo tras el idle (105 vs <= 150).
   El motivo "controlar el pico por lote" de TASK-004 ya no tiene síntoma en 0.9.0.
 - Lo que queda por encima de las metas: serve con modelo cargado 300-315 vs <= 250 (faltan 50-65 MiB), y el
   **transitorio de carga ~710 `VmHWM`** (400 por encima del estable) que se paga en cada recarga tras el

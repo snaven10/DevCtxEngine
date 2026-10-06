@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-008 — Robustez del ciclo de vida y salida útil para agentes
 - **Especialista:** rust (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 - **Depende de:** TASK-004
 - **Estado:** `done`
 
@@ -21,7 +21,7 @@ recorta diga cuánto dejó afuera y cómo pedir más, y que las tools de memoria
   `project`), `SearchRoutesReq` (`:312`, tiene `project`, sin `limit`), `BuildContextReq` (`:232`,
   lo cubre TASK-013).
 - Medido en campo: `search_routes` sin `path` → 50 rutas ~6k tokens; `plan_status` sin filtro en
-  revfa → 130 planes ~11k tokens; `memories_by_*` ~2.5k tokens/memoria.
+  acme → 130 planes ~11k tokens; `memories_by_*` ~2.5k tokens/memoria.
 - Recortes existentes que ya informan: `omitted_for_budget` en `do_search` (`state.rs:430-439`),
   `do_references` (`state.rs:3417-3420`), `linked_response` (`state.rs:3355-3357`).
   `routes_to_json` (`state.rs:3449`) no recorta ni informa.
@@ -118,13 +118,13 @@ de una línea.
    `get_references`, `search_project`, búsqueda de grupo, `recall*` y `memory_context` (solo cuando recortan).
    Lectores: `search_hits` acepta arreglo pelado y objeto (`results`/`routes`/`hits`), y expone `total`,
    `next_offset`, `omitted`, `omitted_for_budget`.
-7. **No verificado.** Contra `~/revfa` real (TASK-016); un serve < 0.9 con MCP nuevo solo por el envoltorio
+7. **No verificado.** Contra `~/acme` real (TASK-016); un serve < 0.9 con MCP nuevo solo por el envoltorio
    `ensure_object` (sin test e2e); TUI sin cambios de código (ya leía por `search_hits`); `total` de memorias
    cuenta hasta 200 vínculos (tope de escaneo). La búsqueda de grupo y `search_project` siguen usando la clave
    `hits` (no `results`). Docs EN/ES = TASK-015.
-8. **Números** (tokens = bytes/4, JSON con sangría; fixture sintético, no revfa): `search_routes` sin `path`
+8. **Números** (tokens = bytes/4, JSON con sangría; fixture sintético, no acme): `search_routes` sin `path`
    sobre 50 rutas: 3553 → 1449 tokens (20 rutas + `omitted`). `plan_status` sin filtro sobre 130 planes
-   (títulos cortos): 3901 → 796 tokens (25 planes); con los títulos reales de revfa (~11k medido en campo)
+   (títulos cortos): 3901 → 796 tokens (25 planes); con los títulos reales de acme (~11k medido en campo)
    la proporción es ~80% menos. `memories_by_*`: de ~2.5k tokens/memoria a ≤ ~150 (600 caracteres).
    **Desviaciones:** el cursor es `next_offset` (como pide la task), no `next_cursor`; `search` no pagina (top-k
    por `limit`), solo informa `omitted` por presupuesto; el listado MCP/HTTP de `plan_status` ahora pagina

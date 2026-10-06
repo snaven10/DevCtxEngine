@@ -1288,7 +1288,7 @@ mod tests {
 
 - **Plan:** PLAN-002 — MCP resuelve el proyecto por ruta
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
 - **Depende de:** — (paralela a TASK-001)
 - **Estado:** `done`
 
@@ -1598,7 +1598,7 @@ Referencia pelada: `lib.rs` y relativa `../VERIFICACION.md` (excluida) y `state.
         );
     }
 
-    // --- PLAN-007 TASK-001: tolerant `Estado` (fixtures copied from real revfa plans) ---
+    // --- PLAN-007 TASK-001: tolerant `Estado` (fixtures copied from real acme plans) ---
 
     /// Status and warnings of a task whose header carries `line`.
     fn status_of(line: &str) -> (Status, Vec<String>) {

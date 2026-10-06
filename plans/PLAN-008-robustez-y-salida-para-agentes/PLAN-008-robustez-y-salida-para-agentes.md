@@ -2,8 +2,8 @@
 
 **Fecha:** 2026-10-03
 **Fase:** 2 (Ejecución) — aprobado por el usuario el 2026-10-03. P0 en `feat/plan-008-p0`.
-**Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), sale de `main` (v0.8.2 + `3069e51`)
-**Origen:** prueba de campo de devctx 0.8.2 en el workspace REVFA (13 repos, `group: revfa`) y en
+**Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), sale de `main` (v0.8.2 + `3069e51`)
+**Origen:** prueba de campo de devctx 0.8.2 en el workspace ACME (13 repos, `group: acme`) y en
 este mismo repo. Dos sesiones evaluaron la herramienta y llegaron a consenso sobre los bugs, sus
 causas y el orden. Insumos: `research-state-of-art.md` y `devctx-graph-inventory.md` (scratchpad de
 la sesión 695c60fd…, 2026-10-03).
@@ -31,17 +31,17 @@ PLAN-009, que arranca después de este.
 
 | Síntoma | Medido |
 |---|---|
-| Procesos `devctx mcp` viejos (binario `(deleted)`) reteniendo el DuckDB de un proyecto | 3, sobre `REVFA_BackEnd`, `REVFA_Calidad_MicroService`, `revfa_plantillas` → `search`, `read_symbol`, `get_references`, `impact_analysis`, `search_routes`, `remember` fallan en los tres |
+| Procesos `devctx mcp` viejos (binario `(deleted)`) reteniendo el DuckDB de un proyecto | 3, sobre `backend-a`, `service-e`, `templates-repo` → `search`, `read_symbol`, `get_references`, `impact_analysis`, `search_routes`, `remember` fallan en los tres |
 | Espera de `remote::ensure` antes de rendirse | 60 s fijos (200 × 300 ms), aunque el hijo murió en el primer segundo |
 | `devctx search` CLI contra un DB bloqueado | 63 s hasta fallar, sin decir qué PID lo tiene |
-| `read_symbol("AuthService")`, `get_references("authHttpInterceptor")`, `search_routes` en REVFA_FrontEnd sobre `feat/plan-124-…` | `[]` sin aviso, mientras `search` sí devuelve resultados |
-| `recall` MCP con `scope: all`/`local` en el grupo revfa | falla: `None of the 13 repositories … First failure: No such file or directory (os error 2)`, sin ruta. CLI desde el repo devuelve 4 memorias; MCP global/group, 1 |
+| `read_symbol("AuthService")`, `get_references("tokenInterceptor")`, `search_routes` en frontend sobre `feat/plan-124-…` | `[]` sin aviso, mientras `search` sí devuelve resultados |
+| `recall` MCP con `scope: all`/`local` en el grupo acme | falla: `None of the 13 repositories … First failure: No such file or directory (os error 2)`, sin ruta. CLI desde el repo devuelve 4 memorias; MCP global/group, 1 |
 | `search` "how are memories linked to symbols" (DevCtxEngine) | el mismo chunk 3-5 veces |
-| `build_context` en sesión de grupo para una tarea de FrontEnd | usa el repo default (`tickets-srv`), trunca 5 memorias ("exceeded its share of the output budget"), prioriza javadocs largos |
+| `build_context` en sesión de grupo para una tarea de FrontEnd | usa el repo default (`orders-srv`), trunca 5 memorias ("exceeded its share of the output budget"), prioriza javadocs largos |
 | `search_routes` sin `path` | 50 rutas, ~6k tokens |
-| `plan_status` sin filtro en `~/revfa` | 130 planes, ~11k tokens |
+| `plan_status` sin filtro en `~/acme` | 130 planes, ~11k tokens |
 | `memories_by_symbol`/`memories_by_file` | ~2.5k tokens por memoria (contenido completo) |
-| `REVFA_REGISTRO_EXTERIOR` indexado 2026-08-19, antes del normalizador de receptores (`9ef3f4d`, 2026-08-24) | `devctx status` dice `up_to_date: true` y el índice tiene nodos basura de Mutiny |
+| `backend-b` indexado 2026-08-19, antes del normalizador de receptores (`9ef3f4d`, 2026-08-24) | `devctx status` dice `up_to_date: true` y el índice tiene nodos basura de Mutiny |
 | Suite de tests | deja vivo un `target/debug/devctx serve --idle 900` con cwd en un tmp borrado |
 
 ## 2. Bugs: reproducción y causa raíz (verificado en `main`, 2026-10-03)
@@ -116,7 +116,7 @@ los archivos del principal.
 
 ### B4 (alta, silencioso) — el grafo filtra por la rama actual sin fallback
 
-**Repro.** REVFA_FrontEnd en `feat/plan-124-…` (no está en `indexing.branches`, sin filas):
+**Repro.** frontend en `feat/plan-124-…` (no está en `indexing.branches`, sin filas):
 `read_symbol`, `get_references`, `search_routes` → `[]`; `search` → resultados.
 
 **Causa.** `search` usa `search_branch` (`state.rs:485-506`): rama actual si tiene filas, si no la
@@ -224,8 +224,8 @@ binario instalado y sugieren reiniciar la sesión.
 - Reindexar automáticamente un índice viejo en segundo plano (B8: se avisa; `index` lo hace si se
   pide).
 - Cambiar el modelo de embeddings o el reranker.
-- Tocar archivos de `/home/snaven10/revfa` (la verificación es solo lectura, salvo reindexar
-  `REVFA_REGISTRO_EXTERIOR` con aprobación).
+- Tocar archivos de `/home/you/acme` (la verificación es solo lectura, salvo reindexar
+  `backend-b` con aprobación).
 
 ## 5. Tasks y orden
 
@@ -246,7 +246,7 @@ binario instalado y sugieren reiniciar la sesión.
 | TASK-013 | `build_context`: `project`, selección en grupo y presupuesto por relevancia | P1 | TASK-010, TASK-011, TASK-012 | `done` |
 | TASK-014 | `link_sources` correcto y sugerencias en `read_symbol` | P1 | TASK-006 | `done` |
 | TASK-015 | Docs EN + ES | P1 | TASK-013, TASK-014, TASK-007, TASK-005 | `done` |
-| TASK-016 | Verificación de campo en `~/revfa` y este repo, antes/después | P1 | TASK-015, TASK-017 | `done` |
+| TASK-016 | Verificación de campo en `~/acme` y este repo, antes/después | P1 | TASK-015, TASK-017 | `done` |
 | TASK-017 | Pendientes del review de P0: idle exit, `in_tx`, procown fuera de Linux, transacciones y tests | P1 | — | `done` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
@@ -270,10 +270,10 @@ binario instalado y sugieren reiniciar la sesión.
 | Serve hijo de un hook con `GIT_DIR` de un worktree borrado | rompe git en el repo | no hereda `GIT_*` |
 | `read_symbol`/`get_references`/`search_routes` en rama no indexada | `[]` silencioso | resultados de la rama de fallback + campo `branch_fallback` |
 | `status` sobre un índice de extractor viejo | `up_to_date: true` | `extractor_stale: true` + aviso |
-| `recall scope:all` en revfa desde MCP | falla | devuelve las del CLI (≥ 4 para la consulta del informe) |
+| `recall scope:all` en acme desde MCP | falla | devuelve las del CLI (≥ 4 para la consulta del informe) |
 | `search` "how are memories linked to symbols" | mismo chunk 3-5× | 0 duplicados `(file, start, end)` (medido: 0; 0.8.5 ya no duplicaba) |
 | `search_routes` sin `path` | ~6k tokens | ≤ 1.5k con `limit` default + `omitted` (medido: 5041 → 1437 tok, margen estrecho) |
-| `plan_status` sin filtro en revfa | ~11k tokens | ≤ 3k con `active_only`/`limit` + `omitted` (medido: 5820 → 1145 tok) |
+| `plan_status` sin filtro en acme | ~11k tokens | ≤ 3k con `active_only`/`limit` + `omitted` (medido: 5820 → 1145 tok) |
 | `build_context` en grupo sin `project` | default silencioso | repo por mejor score, nombrado, o error que pide `project` (medido: 7/7; frío 3,55 s, tibio 0,22-0,34 s) |
 | Suite de tests | deja un serve vivo | 0 procesos `devctx serve` con cwd en tmp tras la suite (medido: 0; `serve_lifecycle` 16/16 en 4 corridas) |
 
@@ -330,7 +330,7 @@ vuelve a incluir lo excluido. Ninguna task migra ni reescribe datos existentes.
 
 **Recomendación: dos releases.**
 - `0.8.3` = P0 (TASK-001…009). Son arreglos; lo único "nuevo" es la tabla aditiva `index_meta` y
-  campos JSON aditivos. Urge: hoy tres repos de revfa tienen todas las tools de índice caídas.
+  campos JSON aditivos. Urge: hoy tres repos de acme tienen todas las tools de índice caídas.
 - `0.9.0` = P1 (TASK-010…016). Parámetros nuevos en tools, cambios de ranking que alteran
   resultados y excludes por defecto que cambian el set indexado: en 0.x eso es minor.
 

@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-003 — Grafo y registro de lenguajes
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
 - **Depende de:** —
 - **Estado:** `done`
 
@@ -19,20 +19,20 @@ respuesta honesta cuando el receptor no se puede nombrar.
 `crates/devctx-parse/src/parser.rs:339` — `receiver_of` toma
 `parent.child_by_field_name(field)` y devuelve su `utf8_text` **crudo**. En una
 cadena fluida el nodo `object` es toda la expresión previa. Targets reales que
-devolvió `devctx impact OficinaService.actualizar` sobre REVFA_BackEnd:
+devolvió `devctx impact OfficeService.actualizar` sobre backend-a:
 
 ```
-Oficina.findByCodigo(codigo).flatMap
-Oficina.<Oficina>findById(idOficina).flatMap
-Oficina
-        .persist(oficina).replaceWith(
-            () -> OficinaDTO.from(oficina)).invoke
+Office.findByCodigo(codigo).flatMap
+Office.<Office>findById(idOffice).flatMap
+Office
+        .persist(office).replaceWith(
+            () -> OfficeDTO.from(office)).invoke
 ```
 
 En Quarkus reactivo la cadena fluida es la norma, no el borde.
 
 Segundo efecto, en la misma salida: `getNombre` aparece como nodo pelado **y**
-como `OficinaRequestDTO.getNombre`. El mismo método son dos nodos.
+como `OfficeRequestDTO.getNombre`. El mismo método son dos nodos.
 
 `qualified_target` (`parser.rs:312`) ya tiene la rama correcta para caerse al
 nombre pelado — solo hay que llegar a ella.
@@ -45,8 +45,8 @@ nombre pelado — solo hay que llegar a ella.
 
 - [x] **Paso 1 — Escribir los tests que fallan.** En `crates/devctx-parse/src/lib.rs`,
       con fuente Java:
-      `Oficina.findByCodigo(c).flatMap(x -> y)` → el target de `flatMap` es
-      `flatMap`, **no** `Oficina.findByCodigo(c).flatMap`.
+      `Office.findByCodigo(c).flatMap(x -> y)` → el target de `flatMap` es
+      `flatMap`, **no** `Office.findByCodigo(c).flatMap`.
       Y `this.repo.save(x)` → sigue resolviendo por `type_map` como hoy.
 - [x] **Paso 2 — Añadir `fn clean_receiver(text: &str) -> Option<&str>`.**
       Devuelve `Some` solo si el texto completo es un identificador o una cadena
@@ -64,7 +64,7 @@ nombre pelado — solo hay que llegar a ella.
 
 - [x] Ningún target contiene `(`, `)`, `<`, un espacio o un salto de línea.
 - [x] Los tests existentes de `devctx-parse` siguen verdes.
-- [x] Tras reindexar REVFA_BackEnd, `devctx impact OficinaService.actualizar`
+- [x] Tras reindexar backend-a, `devctx impact OfficeService.actualizar`
       ya no lista ningún callee con paréntesis o multilínea.
 - [x] `getNombre` deja de aparecer duplicado como pelado y calificado en esa
       misma salida. *(Si sigue duplicado, decirlo en `## Resultado` con el porqué —
@@ -82,4 +82,4 @@ pero es **cierto**, y con TASK-001 el nombre pelado ya encuentra sus aristas.
 ## Resultado
 
 - **Estado final:** `done` (2026-08-24)
-- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre REVFA_BackEnd, con lo que NO se verificó declarado.
+- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre backend-a, con lo que NO se verificó declarado.

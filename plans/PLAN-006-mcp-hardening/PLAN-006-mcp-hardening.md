@@ -3,7 +3,7 @@
 **Fecha:** 2026-09-12
 **Fase:** 2 (Ejecución) — implementado en la misma sesión que este plan. Rama `fix/mcp-hardening`
 (sale de `feature/plan-status`, verde: 377 tests, clippy limpio).
-**Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+**Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 **Origen:** Cuatro hallazgos puntuales pedidos por el usuario, sin relación entre sí salvo que
 todos tocan la superficie MCP/API: presupuesto de salida incompleto, un chequeo de red bloqueando
 el handshake, un 404 reportado en `memory_forget`, y verificar en caliente los endpoints de

@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-007 — Planes en la raíz del workspace
 - **Especialista:** rust-testing (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
 - **Depende de:** TASK-002, TASK-004, TASK-005
 - **Estado:** `done`
 
@@ -11,7 +11,7 @@
 ## Objetivo
 
 Cubrir los bordes que en este repo históricamente no tienen tests (CLI ↔ daemon, MCP ↔ subproceso —
-ver PLAN-005/PLAN-006) para la raíz del workspace, y fijar el parser contra texto real de revfa para
+ver PLAN-005/PLAN-006) para la raíz del workspace, y fijar el parser contra texto real de acme para
 que una regresión de tolerancia se vea en `cargo test`, no en el dashboard.
 
 ## Contexto verificado
@@ -36,7 +36,7 @@ que una regresión de tolerancia se vea en `cargo test`, no en el dashboard.
 ## Pasos
 
 - [x] **Paso 1 — Corpus.** Un mini-workspace de fixtures con ~10 tasks y 2 planes copiados (texto
-      real, recortado) de revfa: `**Status:** done`, front matter, `## Estado`, línea con ` · `,
+      real, recortado) de acme: `**Status:** done`, front matter, `## Estado`, línea con ` · `,
       `✅ **\`done\`** — ejecutada…`, `Depende de` con prosa, `TASK-001b`, `TASK-R01`, un `TASK-001-DESIGN.md`
       compañero, una tabla de rollback y una de estado. El test afirma el conteo **exacto** de warnings
       y cuáles son (los legítimos de PLAN-007 §6).
@@ -58,7 +58,7 @@ que una regresión de tolerancia se vea en `cargo test`, no en el dashboard.
 
 - [ ] Todos los tests nuevos fallan contra `main` (v0.7.0) y pasan en la rama — anotar en Resultado
       cuáles se verificaron fallando primero.
-- [x] Ningún test lee `/home/snaven10/revfa` (los fixtures son copias dentro del repo).
+- [x] Ningún test lee `/home/you/acme` (los fixtures son copias dentro del repo).
 - [x] Sin puertos fijos (el dashboard usa un puerto efímero: bind a `:0`, leer, soltar).
 
 ## Resultado

@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-002 — MCP resuelve el proyecto por ruta
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
 - **Depende de:** TASK-002
 - **Estado:** `pending`
 
@@ -20,7 +20,7 @@ cada proyecto son dueños de sus stores. Por eso `do_search_project` (`state.rs`
 ajeno: lanza el propio binario con `current_dir(path)` y `--format json`. El fan-out es N de esos.
 
 El registry ya guarda `embed_dim` por proyecto, documentado como *"compared before any cross-project
-vector work"* — la comparación que esta task por fin usa. Los 11 repos REVFA son `ml-granite`/384d.
+vector work"* — la comparación que esta task por fin usa. Los 11 repos ACME son `ml-granite`/384d.
 
 El modo `hybrid` de `search` ya fusiona por **RRF**; hay precedente de la técnica en el repo.
 

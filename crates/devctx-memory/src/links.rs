@@ -32,7 +32,7 @@ pub fn link_memory(graph_store: &Store, m: &Memory) -> usize {
 /// This is a *candidate* list and nothing more. It over-matches by design and
 /// is safe only because the caller checks every candidate against the index
 /// before linking: measured on a real corpus, the pattern that finds
-/// `apps/registry/src/app/components/firmar-registro.ts` also finds
+/// `apps/portal/src/app/components/sign-form.ts` also finds
 /// `Shepherd.js`, which is a library nobody indexed, and `CLAUDE.md`, which is
 /// not code. The index is what tells them apart, never the pattern.
 pub fn paths_in_text(text: &str) -> Vec<String> {
@@ -511,9 +511,9 @@ mod tests {
     #[test]
     fn paths_are_recovered_from_prose_and_junk_comes_with_them() {
         let found = paths_in_text(
-            "el control vive en apps/registry/src/app/firmar-registro.ts y usamos              Shepherd.js para el tour; ver CLAUDE.md. Roto en NombreUtil.java.",
+            "el control vive en apps/portal/src/app/sign-form.ts y usamos              Shepherd.js para el tour; ver CLAUDE.md. Roto en NombreUtil.java.",
         );
-        assert!(found.contains(&"apps/registry/src/app/firmar-registro.ts".to_string()));
+        assert!(found.contains(&"apps/portal/src/app/sign-form.ts".to_string()));
         assert!(found.contains(&"NombreUtil.java".to_string()), "{found:?}");
         // Deliberately still here: the pattern cannot tell a library from a
         // file, so it must not try. The index rejects it, and the next test

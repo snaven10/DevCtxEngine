@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-002 — MCP resuelve el proyecto por ruta
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
 - **Depende de:** TASK-003, TASK-005, TASK-006
 - **Estado:** `done`
 
@@ -37,8 +37,8 @@ el molde a reusar; no hace falta inventar andamiaje.
 - [x] **Paso 6 — Escenario E**: `--project` gana sobre el descenso.
 - [x] **Paso 7 — Escenario F (hint)**: en modo grupo, una tool de código con `path` apuntando al
       miembro B responde desde B aunque el `default` sea A; y la salida nombra el proyecto resuelto.
-- [x] **Paso 8 — Escenario G (prefijo)**: `/tmp/x/revfa` no captura los proyectos de
-      `/tmp/x/revfa-otro`.
+- [x] **Paso 8 — Escenario G (prefijo)**: `/tmp/x/acme` no captura los proyectos de
+      `/tmp/x/acme-otro`.
 - [x] **Paso 9 — Escenario H (default de scope)**: en modo grupo, `remember` sin `scope` cae en
       `group`; en modo proyecto sigue en `local`.
 

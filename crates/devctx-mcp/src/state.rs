@@ -2223,7 +2223,7 @@ pub enum Resolution {
 /// Is `candidate` strictly below `base`?
 ///
 /// Compared component by component rather than with `starts_with` on the
-/// rendered string, because `/a/revfa` is a string prefix of `/a/revfa-otro`
+/// rendered string, because `/a/acme` is a string prefix of `/a/acme-otro`
 /// while being no ancestor of it at all — and binding a sibling workspace by
 /// accident is exactly the failure this descent exists to avoid. Equality is
 /// not descent: a directory that *is* a project is already handled by the walk
@@ -4860,7 +4860,7 @@ pub fn name_candidates(members: &[ProjectRow], query: &str) -> Vec<String> {
         })
         .collect();
     // Words most members share say nothing about WHICH one the question means
-    // (in a group every repository may carry `revfa` and `backend`): like an
+    // (in a group every repository may carry `acme` and `backend`): like an
     // inverse document frequency of zero, they are dropped.
     let mut freq: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for w in mine.iter().flatten() {
@@ -8000,10 +8000,10 @@ mod tests {
     fn group_pick_chooses_the_member_that_matches() {
         let pick = choose_member(
             vec![
-                ("tickets-srv".into(), scored(0.12)),
+                ("orders-srv".into(), scored(0.12)),
                 ("front".into(), scored(0.61)),
             ],
-            Some("tickets-srv"),
+            Some("orders-srv"),
             &[],
         )
         .unwrap();
@@ -8222,7 +8222,7 @@ mod tests {
             ..Default::default()
         };
         let members = vec![
-            row("tickets-srv", "ticket sales backend"),
+            row("orders-srv", "order sales backend"),
             row("front", "the web UI"),
             row("payments-api", "charges and refunds"),
         ];
@@ -8231,8 +8231,8 @@ mod tests {
             vec!["payments-api".to_string()]
         );
         assert_eq!(
-            name_candidates(&members, "where does the ticket web page live"),
-            vec!["front".to_string(), "tickets-srv".to_string()]
+            name_candidates(&members, "where does the order web page live"),
+            vec!["front".to_string(), "orders-srv".to_string()]
         );
         assert!(name_candidates(&members, "the and for").is_empty());
     }
@@ -8689,9 +8689,9 @@ mod tests {
     #[test]
     fn a_pick_among_the_warm_few_warns_and_is_not_cached() {
         let root = pick_root("lazy");
-        let dflt = serve_for(&root, "tickets-srv", (200, three_hits("src/a.rs", 0.41))).start();
+        let dflt = serve_for(&root, "orders-srv", (200, three_hits("src/a.rs", 0.41))).start();
         let mut members = vec![
-            fake_member(&root, "tickets-srv", "m", Some(&dflt)),
+            fake_member(&root, "orders-srv", "m", Some(&dflt)),
             fake_member(&root, "front", "m", None),
             fake_member(&root, "payments", "m", None),
         ];
@@ -8700,10 +8700,10 @@ mod tests {
             &members,
             "how is a refund issued",
             &devctx_search::KindSel::default(),
-            Some("tickets-srv"),
+            Some("orders-srv"),
         )
         .unwrap();
-        assert_eq!(pick.member, "tickets-srv");
+        assert_eq!(pick.member, "orders-srv");
         assert!(!pick.by_relevance && !pick.cacheable(), "{pick:?}");
         let h = pick.header();
         assert!(h.contains("\n[devctx] compared only 1 of 3"), "{h}");
@@ -9142,17 +9142,17 @@ mod tests {
             ..Default::default()
         };
         let members = vec![
-            row("revfa-backend", "revfa backend service"),
-            row("revfa-front", "revfa backend web client"),
-            row("revfa-docs", "revfa backend documents"),
+            row("acme-backend", "acme backend service"),
+            row("acme-front", "acme backend web client"),
+            row("acme-docs", "acme backend documents"),
             row("ui", "components"),
             row("db", "schemas"),
         ];
-        // "revfa" and "backend" are in most members: they point at nobody.
-        assert!(name_candidates(&members, "revfa backend").is_empty());
+        // "acme" and "backend" are in most members: they point at nobody.
+        assert!(name_candidates(&members, "acme backend").is_empty());
         assert_eq!(
-            name_candidates(&members, "revfa backend service flow"),
-            vec!["revfa-backend".to_string()]
+            name_candidates(&members, "acme backend service flow"),
+            vec!["acme-backend".to_string()]
         );
         // Short whole names.
         assert_eq!(

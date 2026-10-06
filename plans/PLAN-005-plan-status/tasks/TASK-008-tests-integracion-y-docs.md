@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-005 — `plan_status`
 - **Especialista:** — (modelo sugerido: sonnet para tests; haiku para docs)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plan-status`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/plan-status`
 - **Depende de:** TASK-003, TASK-004, TASK-006, TASK-007
 - **Estado:** `done`
 

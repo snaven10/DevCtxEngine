@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-006 — Endurecimiento del MCP
 - **Especialista:** — (sonnet, en la misma sesión)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `fix/mcp-hardening`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `fix/mcp-hardening`
 - **Depende de:** — (independiente)
 - **Estado:** `done`
 
@@ -24,7 +24,7 @@ JSON que devuelven es el que la pestaña "Plans" del dashboard espera.
 
 ## Verificación
 
-Corrido en el propio repo (`/home/snaven10/personal/DevCtxEngine`, rama `fix/mcp-hardening`), en
+Corrido en el propio repo (`/home/you/personal/DevCtxEngine`, rama `fix/mcp-hardening`), en
 primer plano con `timeout` (nunca en background):
 
 ```

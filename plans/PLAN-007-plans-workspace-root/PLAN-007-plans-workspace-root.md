@@ -3,8 +3,8 @@
 **Fecha:** 2026-10-01
 **Fase:** 2 (Ejecución) — aprobado por el usuario el 2026-10-01. Rama `feature/plans-workspace-root` (sale de
 `main` = v0.7.0, `f979582`, árbol limpio)
-**Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
-**Origen:** En el setup real del usuario (`/home/snaven10/revfa`), `plan_status` por MCP y la pestaña
+**Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
+**Origen:** En el setup real del usuario (`/home/you/acme`), `plan_status` por MCP y la pestaña
 "Plans" del dashboard no ven los planes, y aunque los vieran mostrarían basura: 1592 warnings.
 
 ---
@@ -17,16 +17,16 @@ información.
 
 ### 1.1 Problema 1 — la raíz equivocada
 
-`/home/snaven10/revfa` es un **workspace**: no es proyecto devctx (no tiene `.devctx/`), contiene
-13 repos registrados con `group: revfa`, y los planes viven en la raíz del workspace:
-`/home/snaven10/revfa/plans` (136 entradas; 128 directorios `PLAN-<n>*`, 1174 archivos de task).
+`/home/you/acme` es un **workspace**: no es proyecto devctx (no tiene `.devctx/`), contiene
+13 repos registrados con `group: acme`, y los planes viven en la raíz del workspace:
+`/home/you/acme/plans` (136 entradas; 128 directorios `PLAN-<n>*`, 1174 archivos de task).
 **Ningún sub-repo tiene `plans/`.**
 
-| Superficie | Raíz que usa hoy | Resultado en `~/revfa` |
+| Superficie | Raíz que usa hoy | Resultado en `~/acme` |
 |---|---|---|
-| CLI `devctx plan-status` | `plan_status_root()` (`crates/devctx-cli/src/main.rs:2013`): raíz del proyecto si el cwd está en uno, si no el cwd | Funciona desde `~/revfa`. **Falla desde dentro de un miembro** (`~/revfa/REVFA_BackEnd`): lee `REVFA_BackEnd/plans`, que no existe |
+| CLI `devctx plan-status` | `plan_status_root()` (`crates/devctx-cli/src/main.rs:2013`): raíz del proyecto si el cwd está en uno, si no el cwd | Funciona desde `~/acme`. **Falla desde dentro de un miembro** (`~/acme/backend-a`): lee `backend-a/plans`, que no existe |
 | Tool MCP `plan_status` | `backend_for` (`crates/devctx-mcp/src/lib.rs:492`) → en `Binding::Group` (`lib.rs:371`) cae al miembro `default` (`lib.rs:516-521`) → `Backend::plan_status` (`crates/devctx-mcp/src/backend.rs:227`) → `do_plan_status(state)` usa `state.root` (`crates/devctx-mcp/src/state.rs:720-721`) o, en `Remote`, `GET /plans/status` al daemon del miembro, cuya raíz también es la del miembro | `{"plans":[]}` — lee `<miembro>/plans` |
-| Dashboard `devctx web` | `cmd_web` (`main.rs:1318`) llama `load_project()` (`main.rs:3429`), que exige `.devctx/` | **Ni arranca** en `~/revfa` ("No DevCtxEngine project found") |
+| Dashboard `devctx web` | `cmd_web` (`main.rs:1318`) llama `load_project()` (`main.rs:3429`), que exige `.devctx/` | **Ni arranca** en `~/acme` ("No DevCtxEngine project found") |
 | Rutas `/plans/status`, `/plans/graph` | `crates/devctx-api/src/lib.rs:59-60` → `do_plan_status`/`do_plan_graph` (`state.rs:720`, `state.rs:905`) sobre `state.root` | La raíz del miembro |
 | `memories_by_file` → `plan_tasks` | `plan_tasks_for_file(&state.root, …)` (`state.rs:3126`, def. `state.rs:3134`) | Siempre vacío en un miembro del workspace |
 | `serve --central` | `crates/devctx-api/src/central.rs:40-54`: no sirve dashboard ni rutas `/plans/*` | No aplica |
@@ -38,7 +38,7 @@ raíz pasarles. `AppState.root` es privado (`state.rs:163`, calculado en `state.
 ### 1.2 Problema 2 — el parser se ahoga con planes reales
 
 Medido el 2026-10-01 con `devctx 0.7.0` (`~/.local/bin/devctx`), `devctx plan-status --format json`
-desde `~/revfa`, más `plan-status PLAN-N --format json` por cada plan para clasificar warnings:
+desde `~/acme`, más `plan-status PLAN-N --format json` por cada plan para clasificar warnings:
 
 | Métrica (baseline) | Valor |
 |---|---|
@@ -70,7 +70,7 @@ Nota: PLAN-129 **no** necesita renombre. Su directorio es `PLAN-129-tickets-micr
 ### 1.3 Proyección medida del parser tolerante
 
 Antes de escribir este plan se prototipó la regla de DD-4…DD-7 en un script desechable (fuera del
-repo) y se corrió contra el corpus de `~/revfa/plans`:
+repo) y se corrió contra el corpus de `~/acme/plans`:
 
 | Métrica | Baseline | Prototipo |
 |---|---|---|
@@ -92,7 +92,7 @@ Todas las referencias `archivo:línea` de §1 se re-verificaron en esta rama (HE
   (`state.rs:1342`, `state.rs:1462`) sí la reciben.
 - `fit_plan_status_budget` (`state.rs:866`) es privada: el MCP no puede hoy calcular un
   `plan_status` en proceso con presupuesto sin pasar por un backend.
-- El registry de esta máquina: los 13 miembros de `revfa` son hijos directos de `/home/snaven10/revfa`.
+- El registry de esta máquina: los 13 miembros de `acme` son hijos directos de `/home/you/acme`.
 - Test que este plan puede romper sin querer: `table_output_on_the_real_repo_plans_fits_the_hook_budget`
   (`crates/devctx-cli/tests/plan_status_cli.rs:124`) exige que `devctx plan-status` sobre los planes
   **de este repo** quepa en 600 bytes. **Medido: sin PLAN-007 son 485 bytes; con PLAN-007 (que pasa
@@ -128,7 +128,7 @@ group_declared: bool) -> PlansRoot { root, source }`, sin I/O más allá de `is_
 | Override por env (`DEVCTX_PLANS_ROOT`) | Hay que fijarlo en el proceso del daemon, no del cliente (misma trampa que `DEVCTX_MAX_OUTPUT_TOKENS`). Fuera de alcance hasta que haga falta |
 
 Tradeoff aceptado: el paso 3 hace que un proyecto del grupo bindeado **solo** (no en modo grupo)
-también vea los planes del workspace. Es lo que se quiere en revfa (ningún miembro tiene `plans/`
+también vea los planes del workspace. Es lo que se quiere en acme (ningún miembro tiene `plans/`
 propio); si un miembro tuviera los suyos, el paso 2 gana.
 
 ### DD-3 — `AppState` guarda `plans_root`; el daemon resuelve solo
@@ -136,7 +136,7 @@ propio); si un miembro tuviera los suyos, el paso 2 gana.
 `AppState` calcula `plans_root` al construirse (`state.rs:196`) con DD-2 (`workspace = None`,
 `group_declared = !cfg.project.group.is_empty()`). `do_plan_status`, `do_plan_graph` y
 `plan_tasks_for_file` usan `plans_root`, no `root`. Consecuencia: el daemon de cualquier miembro de
-revfa ya sirve los planes del workspace, y **`Backend::Remote` no necesita cambios**.
+acme ya sirve los planes del workspace, y **`Backend::Remote` no necesita cambios**.
 
 ### DD-4 — El MCP en modo grupo o sin binding lee en proceso
 
@@ -208,8 +208,8 @@ PLAN-005 §2.3: nada de `regex`).
 
 ## 4. Fuera de alcance
 
-- Escribir estados desde devctx, o "arreglar" los markdown de revfa: este plan **no toca
-  `/home/snaven10/revfa`**.
+- Escribir estados desde devctx, o "arreglar" los markdown de acme: este plan **no toca
+  `/home/you/acme`**.
 - Resolver dependencias entre planes (`external_deps` solo se reporta).
 - Planes cuyo directorio no tiene número (`plans/PLAN-CALIDAD-cierre`): siguen ignorados, como hoy.
 - Override de raíz por variable de entorno o flag (`DEVCTX_PLANS_ROOT`, `--plans-root`).
@@ -227,7 +227,7 @@ PLAN-005 §2.3: nada de `regex`).
 | TASK-005 | `devctx web` desde un workspace (descenso compartido con `devctx mcp`) | TASK-003 | `done` |
 | TASK-006 | Tests de integración: workspace sin init + corpus de fixtures reales | TASK-002, TASK-004, TASK-005 | `done` |
 | TASK-007 | Docs EN + ES: formato tolerante y raíz de planes | TASK-002, TASK-005 | `done` |
-| TASK-008 | Verificación final contra `~/revfa` con antes/después medido | TASK-006, TASK-007 | `done` |
+| TASK-008 | Verificación final contra `~/acme` con antes/después medido | TASK-006, TASK-007 | `done` |
 
 (La columna `Estado` va última a propósito: el parser actual lee la última celda de la fila como
 estado, y este documento tiene que parsear sin warnings **antes** de TASK-002.)
@@ -239,7 +239,7 @@ TASK-005 y TASK-004 no lo necesita).
 
 ## 6. Criterios de aceptación globales (medidos en TASK-008)
 
-Sobre `~/revfa/plans`, comparados con el baseline de §1.2:
+Sobre `~/acme/plans`, comparados con el baseline de §1.2:
 
 | Métrica | Baseline | Meta |
 |---|---|---|
@@ -267,11 +267,11 @@ Sobre `~/revfa/plans`, comparados con el baseline de §1.2:
 
 Y en el workspace:
 
-- `plan_status` vía MCP lanzado desde `~/revfa` (binding de grupo) lista los 128 planes, con
+- `plan_status` vía MCP lanzado desde `~/acme` (binding de grupo) lista los 128 planes, con
   `plans_root.source = "workspace"`.
-- `devctx plan-status` desde `~/revfa/REVFA_BackEnd` devuelve lo mismo que desde `~/revfa`
+- `devctx plan-status` desde `~/acme/backend-a` devuelve lo mismo que desde `~/acme`
   (`source = "ancestor"`).
-- `devctx web` arranca desde `~/revfa` y `GET /plans/status` lista los 128 planes.
+- `devctx web` arranca desde `~/acme` y `GET /plans/status` lista los 128 planes.
 - Este repo (`DevCtxEngine`) sigue leyendo **sus** planes (`source = "project"`), sin cambios.
 
 ## 7. Riesgos
@@ -313,7 +313,7 @@ Y en el workspace:
 - `cargo test -p devctx-core plans` — fixtures por cada variante de §1.2 (TASK-001, TASK-002).
 - `cargo test -p devctx-mcp` y `-p devctx-cli --test plan_status_cli --test mcp_tools --test
   mcp_binding` — workspace sin init (TASK-006).
-- Corpus: `devctx plan-status --format json` desde `~/revfa` antes y después, con los mismos `jq` de
+- Corpus: `devctx plan-status --format json` desde `~/acme` antes y después, con los mismos `jq` de
   §1.2 (TASK-008).
 - `devctx plan-status PLAN-007 --format json` desde la raíz de este repo: 0 warnings (ya verificado
   al escribir este plan con el binario 0.7.0).

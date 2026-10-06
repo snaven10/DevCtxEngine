@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-002 — MCP resuelve el proyecto por ruta
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
 - **Depende de:** TASK-002
 - **Estado:** `done`
 
@@ -50,7 +50,7 @@ trabajo cross-repo.
 
 ## Criterios de aceptación
 
-- [ ] En modo grupo, `search(query, path: "<...>/REVFA_FrontEnd/src/x.ts")` busca en FrontEnd aunque
+- [ ] En modo grupo, `search(query, path: "<...>/frontend/src/x.ts")` busca en FrontEnd aunque
       el `default` del grupo sea BackEnd.
 - [ ] Dos llamadas seguidas con el mismo hint abren el backend UNA vez (verificable por instrumentación
       o por tiempo).

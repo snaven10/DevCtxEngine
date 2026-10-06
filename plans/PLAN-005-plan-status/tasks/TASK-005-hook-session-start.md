@@ -42,10 +42,10 @@ sigue, sin tener que acordarse de preguntar. Es el cierre del problema del PLAN 
 
 ## Criterios de aceptación
 
-- [ ] `echo '{"source":"compact","cwd":"/home/snaven10/personal/DevCtxEngine"}' | ~/.claude/hooks/devctx-session-start.sh`
+- [ ] `echo '{"source":"compact","cwd":"/home/you/personal/DevCtxEngine"}' | ~/.claude/hooks/devctx-session-start.sh`
       muestra la sección "Plan activo" con ≤ 600 chars.
 - [ ] Con un binario viejo sin `plan-status`: la sección no aparece y el hook sale 0.
-- [ ] En `/home/snaven10/revfa` (sin `plans/`): sin sección, sin error.
+- [ ] En `/home/you/acme` (sin `plans/`): sin sección, sin error.
 
 ## Riesgos
 

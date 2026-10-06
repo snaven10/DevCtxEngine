@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-006 — Endurecimiento del MCP
 - **Especialista:** — (sonnet, en la misma sesión)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `fix/mcp-hardening`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `fix/mcp-hardening`
 - **Depende de:** — (independiente; nace de la nota de infraestructura de TASK-004)
 - **Estado:** `done`
 

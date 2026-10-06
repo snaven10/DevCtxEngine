@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-003 — Grafo y registro de lenguajes
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine + configuración global + `~/revfa/.claude/agents/`
+- **Proyecto:** DevCtxEngine + configuración global + `~/acme/.claude/agents/`
 - **Depende de:** TASK-001
 - **Estado:** `done`
 
@@ -24,13 +24,13 @@ which group your symbol is in."*
 tenía un receptor con tipo resoluble. La consulta era por igualdad exacta. Por eso
 `crearNotificacion` (llamado intra-clase, sin `this.`) devolvía sus 8 aristas y
 `actualizar` (llamado vía campo tipado) devolvía cero. **Las aristas de
-`actualizar` siempre existieron** — bajo la llave `OficinaService.actualizar`.
+`actualizar` siempre existieron** — bajo la llave `OfficeService.actualizar`.
 
 Medición que hay que reemplazar, no borrar:
 
 ```
 devctx impact actualizar                 → 0 callers, 0 callees
-devctx impact OficinaService.actualizar  → 1 caller, 23 callees
+devctx impact OfficeService.actualizar  → 1 caller, 23 callees
 devctx impact crearNotificacion          → 8 callers directos
 ```
 
@@ -48,12 +48,12 @@ devctx impact crearNotificacion          → 8 callers directos
 **Configuración global — 2 archivos:**
 `~/.claude/CLAUDE.md:94` · `~/.claude/protocols/devctx-memory.md`
 
-**Agentes REVFA — 10 archivos** (bloque "Code Intelligence"):
+**Agentes ACME — 10 archivos** (bloque "Code Intelligence"):
 `java-backend-specialist`, `devctx-specialist`, `frontend-ui-debugger`,
 `code-reviewer`, `external-api-integration-specialist`,
 `angular-frontend-architect`, `oracle-database-specialist`,
-`authentication-specialist`, `legacy-data-analyst`, `openkm-documents-specialist`
-— todos en `~/revfa/.claude/agents/`.
+`authentication-specialist`, `legacy-data-analyst`, `dms-documents-specialist`
+— todos en `~/acme/.claude/agents/`.
 
 ## Archivos
 
@@ -76,7 +76,7 @@ devctx impact crearNotificacion          → 8 callers directos
       El §4 de CLAUDE.md dice "el grafo es BINARIO por símbolo"; se reemplaza por
       la guía operativa corta: *buscá por nombre pelado, mirá cuántas
       declaraciones reporta, y si te importa una sola, calificala*.
-- [x] **Paso 6 — Los 10 agentes REVFA.** Mismo bloque, mismo texto. Es
+- [x] **Paso 6 — Los 10 agentes ACME.** Mismo bloque, mismo texto. Es
       sustitución mecánica: **un solo párrafo canónico, no 10 redacciones**.
 - [x] **Paso 7 — Commit** (dos: uno en DevCtxEngine, otro donde vivan los agentes).
       `docs: retract the "binary coverage" claim — the cause was the lookup key`
@@ -99,7 +99,7 @@ nada, cruzá con `search --keyword`"— **sigue siendo buena**. Lo que estaba ma
 era la explicación, no el consejo. Si esta task termina diciendo "ya podés
 confiar en el vacío", está mal hecha.
 
-**Los agentes REVFA viven en otro repo.** No mezclar los commits.
+**Los agentes ACME viven en otro repo.** No mezclar los commits.
 
 ## Resultado
 
@@ -117,7 +117,7 @@ confiar en el vacío", está mal hecha.
     `05-examples/debugging.md` y sus pares en `docs/es/`.
   - **Config global, 2:** `~/.claude/CLAUDE.md` §4 y
     `~/.claude/protocols/devctx-memory.md`.
-  - **Agentes REVFA, 10:** todos los de `~/revfa/.claude/agents/` que llevaban
+  - **Agentes ACME, 10:** todos los de `~/acme/.claude/agents/` que llevaban
     el bloque.
 
 - **Verificado por:**
@@ -130,7 +130,7 @@ confiar en el vacío", está mal hecha.
 
 - **Desviaciones:**
   1. **Un solo commit, no dos.** El Paso 7 asumía commits separados, pero ni
-     `~/revfa` ni `~/.claude` son repositorios git — verificado con
+     `~/acme` ni `~/.claude` son repositorios git — verificado con
      `git rev-parse`. Los 12 archivos de configuración y agentes **quedan fuera
      de todo control de versiones**; solo se commitearon los 8 docs. Vale la
      pena decidir aparte si esa configuración debería versionarse.

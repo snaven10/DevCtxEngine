@@ -2,7 +2,7 @@
 
 **Fecha:** 2026-09-11
 **Fase:** Cerrado
-**Proyectos:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `fix/mcp-integration`
+**Proyectos:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `fix/mcp-integration`
 **Origen:** Auditoría del servidor MCP (`crates/devctx-mcp`) antes de que un agente externo dependa de él a diario.
 
 ## 1. Qué resuelve

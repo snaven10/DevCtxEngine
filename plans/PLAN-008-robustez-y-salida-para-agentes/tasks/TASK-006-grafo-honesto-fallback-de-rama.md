@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-008 — Robustez del ciclo de vida y salida útil para agentes
 - **Especialista:** rust (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 - **Depende de:** —
 - **Estado:** `done`
 
@@ -25,7 +25,7 @@ actual o que no hay índice, en vez de `[]` silencioso (PLAN-008 B4).
 - Store: `symbol_definitions(repo, branch, …)` (`crates/devctx-store/src/store.rs:658`),
   `resolve_symbol`/`find_references`/`impact_analysis` en `graph.rs`, `search_routes`/
   `routes_for_handler` en `routes.rs` — todas exigen una rama concreta.
-- Campo: REVFA_FrontEnd en `feat/plan-124-…` (fuera de `indexing.branches`).
+- Campo: frontend en `feat/plan-124-…` (fuera de `indexing.branches`).
 
 ## Archivos
 
@@ -65,7 +65,7 @@ obligatorio cuando hay fallback.
 2. **Repro antes/después.** Antes: repo indexado en `trunk`, checkout en `feat/not-indexed` ->
    `read_symbol` devolvía `definitions: []` sin aviso. Después (`mcp_binding::graph_tools_fall_back_to_the_indexed_branch_and_say_so`):
    `definitions` con resultado y `branch_fallback {current: "feat/not-indexed", used: "trunk", why}`;
-   sin índice alguno: error `<repo> has no index for any branch; run devctx index`. Sin repro manual en REVFA_FrontEnd.
+   sin índice alguno: error `<repo> has no index for any branch; run devctx index`. Sin repro manual en frontend.
 3. **Causa raíz:** confirmada (§2 B4): `search_branch` caía a la rama por defecto/sin filtro; las 5 tools de grafo
    usaban `repo_branch()` a secas.
 4. **Archivos y símbolos.** `crates/devctx-mcp/src/state.rs`: `search_branch` ahora devuelve `(SearchFilter,
@@ -93,7 +93,7 @@ obligatorio cuando hay fallback.
    rama actual indexada y sin recorte el array queda idéntico. Error nuevo de las 5 tools de grafo con repo sin
    índice. `index_status` con `indexed: false` agrega `indexed_branches: [...]` (más reciente primero) y `hint`.
    `search` solo reporta fallback cuando cae a la rama por defecto (no cuando va sin filtro).
-7. **No verificado:** REVFA_FrontEnd real; el cambio de forma de `search`/rutas en clientes externos; `graph_edges`.
+7. **No verificado:** frontend real; el cambio de forma de `search`/rutas en clientes externos; `graph_edges`.
 8. **Números:** sin medición de tiempo; `mcp_binding` completo ~200 s.
 
 ### Fixup (review)

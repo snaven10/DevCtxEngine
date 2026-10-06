@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-003 — Grafo y registro de lenguajes
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
 - **Depende de:** TASK-003
 - **Estado:** `done`
 
@@ -60,7 +60,7 @@ ese impedimento.
 ## Criterios de aceptación
 
 - [x] El test del Paso 1 falla antes del Paso 2 y pasa después.
-- [x] Tras reindexar REVFA_BackEnd, un constructor con inyección que llama a algo
+- [x] Tras reindexar backend-a, un constructor con inyección que llama a algo
       aparece como `source` en `graph_edges`. Nombrar el archivo concreto en
       `## Resultado`.
 - [x] Python, Go y Rust no cambian su conteo de aristas.
@@ -73,4 +73,4 @@ conteos de TASK-006. Medir Java **antes y después** por separado.
 ## Resultado
 
 - **Estado final:** `done` (2026-08-24)
-- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre REVFA_BackEnd, con lo que NO se verificó declarado.
+- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre backend-a, con lo que NO se verificó declarado.
