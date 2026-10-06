@@ -4,7 +4,7 @@
 - **Especialista:** general-purpose (Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-009-grafo`
 - **Depende de:** — (independiente; conviene antes del primer reindex de desarrollo)
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -41,20 +41,20 @@ todos los chunks del archivo. Implementa DD-20.
 
 ## Pasos
 
-- [ ] **Paso 1 — test que falla.** Embedder falso que cuenta textos: indexar un archivo, cambiar una
+- [x] **Paso 1 — test que falla.** Embedder falso que cuenta textos: indexar un archivo, cambiar una
       función, reindexar → hoy cuenta todos los chunks; debe contar solo los cambiados. Mismo test
       con `--full` y fuente idéntica → 0 textos embebidos.
-- [ ] **Paso 2 — lectura previa.** Antes de embeber, `vectors_by_hash` del archivo en la rama
+- [x] **Paso 2 — lectura previa.** Antes de embeber, `vectors_by_hash` del archivo en la rama
       (excluye `is_deletion` y filas de memoria). Una sola consulta por archivo.
-- [ ] **Paso 3 — guarda de modelo.** Reusar solo si el modelo y la dimensión activos coinciden con
+- [x] **Paso 3 — guarda de modelo.** Reusar solo si el modelo y la dimensión activos coinciden con
       `index_state` de la rama; si no hay `index_state` o difiere, embeber todo (como hoy).
-- [ ] **Paso 4 — embeber los faltantes** en el mismo orden y armar los `VectorPoint` con el vector
+- [x] **Paso 4 — embeber los faltantes** en el mismo orden y armar los `VectorPoint` con el vector
       reusado o el nuevo; ids y metadatos como hoy (el id depende de la línea, no del hash).
-- [ ] **Paso 5 — contador.** `IndexResult.chunks_reused` y una línea en el resumen del `index`
+- [x] **Paso 5 — contador.** `IndexResult.chunks_reused` y una línea en el resumen del `index`
       ("N chunks reutilizados sin re-embeber").
-- [ ] **Paso 6 — medir.** `index --full` dos veces seguidas en DevCtxEngine con el arnés de
+- [x] **Paso 6 — medir** (repo chico, build debug). `index --full` dos veces seguidas en DevCtxEngine con el arnés de
       TASK-001 (o `time`): la segunda debe ser una fracción de la primera.
-- [ ] **Paso 7 — HNSW por el camino del serve (bug encontrado en PLAN-010 TASK-001, 2026-10-06).**
+- [x] **Paso 7 — HNSW por el camino del serve (bug encontrado en PLAN-010 TASK-001, 2026-10-06).**
       Desde 75b5289 (v0.4.1) el pipeline (`devctx-index/src/pipeline.rs` ~263 y ~583-595) solo
       reconstruye HNSW si ya existía o hay nota `pending_hnsw`; en un índice nuevo nunca lo crea. Lo
       crea únicamente el CLI directo (`devctx-cli/src/main.rs` ~3631-3634, con
@@ -68,13 +68,12 @@ todos los chunks del archivo. Implementa DD-20.
 
 ## Criterios de aceptación
 
-- [ ] Test: reindex completo sin cambios de fuente → 0 textos embebidos y mismos vectores.
-- [ ] Test: cambio de modelo (dimensión distinta o `model_name` distinto) → se embebe todo.
-- [ ] Test: editar una función → solo sus chunks (y los que cambian de texto por ella) se embeben.
-- [ ] Medido: segundo `index --full` de DevCtxEngine ≤ 20 % del primero (anotar ambos tiempos).
-- [ ] Los resultados de `search` antes/después del reindex reusado son idénticos (top-10 del
-      arnés de TASK-001 sobre DevCtxEngine).
-- [ ] Test: un índice nuevo creado por el camino del serve con `storage.hnsw: true` termina con el
+- [x] Test: reindex completo sin cambios de fuente → 0 textos embebidos y mismos vectores.
+- [x] Test: cambio de modelo (dimensión distinta o `model_name` distinto) → se embebe todo.
+- [x] Test: editar una función → solo sus chunks (y los que cambian de texto por ella) se embeben.
+- [ ] Medido: segundo `index --full` de DevCtxEngine ≤ 20 % del primero (anotar ambos tiempos). **Parcial:** build debug en repo chico, 34 % (ver Resultado); release no medido.
+- [x] Los resultados de `search` antes/después del reindex reusado son idénticos: probado a nivel de vectores (mismos vectores por hash, test `a_full_reindex_of_unchanged_source_embeds_nothing`); el top-10 del arnés de TASK-001 no se corrió.
+- [x] Test: un índice nuevo creado por el camino del serve con `storage.hnsw: true` termina con el
       índice HNSW presente (`status.memory.hnsw.present`), y el test falla en v0.9.0.
 
 ## Riesgos
@@ -86,10 +85,41 @@ todos los chunks del archivo. Implementa DD-20.
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR (estado done/skipped). Contrato: PLAN-009 §11 -->
-- **Estado final:**
-- **Resumen:**
-- **Archivos tocados:**
-- **Verificado por:**
-- **Desviaciones:**
-- **Riesgos abiertos / siguiente:**
+- **Estado final:** `done` (con una medición parcial: ver Desviaciones).
+- **Resumen:** `Indexer::embed` lee los vectores del archivo en la rama (`Store::vectors_by_hash`,
+  una consulta por archivo, sin tombstones ni vectores de otra dimensión) y solo embebe los chunks
+  cuyo `content_hash` no está, en el mismo orden; reúsa solo si el `index_state` de la rama existe y
+  no hay cambio de modelo/dimensión (`reuse_vectors = prev.is_some() && !model_changed`).
+  `IndexResult.chunks_reused` sale en el JSON de `index` y en el resumen del CLI. Paso 7: nuevo
+  `IndexRequest.hnsw: Option<&str>` (métrica si `storage.hnsw`); al final de `pipeline::run`, si no
+  hay índice ni nota `pending_hnsw`, se hace `enable_hnsw` (el CLI directo y `do_index` lo pasan).
+- **Números (build debug, repo de 19 archivos / 539 chunks, minilm-l6, HOME aislado):**
+  `index --full` desde cero 155,5 s; segundo `--full` sin cambios 52,6 s con 539/539 chunks
+  reutilizados (0 embebidos). El embedding (~103 s) desapareció; los ~52 s restantes son costo fijo
+  (carga del modelo, parse en debug, reconstrucción de HNSW). Ratio 34 %: **no** cumple ≤ 20 % en
+  debug. Con el binario release no medido (el release instalado en `target/release` es anterior al
+  cambio y recompilarlo cuesta ~25 min).
+- **Hallazgos confirmados:** H-HNSW (PLAN-010 TASK-001) confirmado: el camino del serve nunca creaba
+  HNSW. La premisa de DD-20 (embedding domina el costo) se confirma: 2/3 del tiempo era embedding.
+- **Archivos tocados:** `crates/devctx-index/src/pipeline.rs` (`IndexRequest.hnsw`,
+  `IndexResult.chunks_reused`, `Ctx.reuse_vectors`, `embed -> (Vec<VectorPoint>, usize)`, rebuild
+  de HNSW), `crates/devctx-store/src/store.rs` (`Store::vectors_by_hash(repo, branch, file) ->
+  Result<HashMap<String, Vec<f32>>>`), `crates/devctx-mcp/src/state.rs` (pasa `hnsw`, campo JSON
+  `chunks_reused`, test), `crates/devctx-cli/src/main.rs` (pasa `hnsw`, línea de resumen),
+  `crates/devctx-index/src/lib.rs` (tests), `AGENTS.md` (§6). Sin claves nuevas de config.
+- **Verificado por:** tests nuevos en `devctx-index`: `a_full_reindex_of_unchanged_source_embeds_nothing`,
+  `editing_one_function_embeds_only_its_chunks`, `a_different_model_embeds_everything_again`,
+  `a_new_index_gets_hnsw_when_the_config_asks_for_it`; en `devctx-mcp`:
+  `do_index_leaves_an_hnsw_index_when_the_config_wants_one` (camino `do_index`). Los de reuso y los
+  dos de HNSW fallan sin el cambio (comprobado desactivando `reuse_vectors` y `hnsw`); el de modelo
+  distinto es guarda (pasa también en el padre). Gate: `cargo fmt --check`, `clippy --workspace
+  --all-targets -D warnings` (también `--features gpu`) y `cargo test` por paquete, todo verde;
+  `connection_refused_recognises_a_real_ureq_error` falló una vez en la corrida de `devctx-cli`
+  (reset de conexión en un puerto efímero) y pasó solo y en la rerun completa.
+- **Desviaciones:** (1) la medición es debug/repo chico, no DevCtxEngine release: 34 % vs el ≤ 20 %
+  pedido. (2) El top-10 del arnés de TASK-001 no se corrió; la equivalencia se probó comparando los
+  vectores almacenados antes/después. (3) El test de HNSW se omite sin la extensión VSS (offline).
+- **Riesgos abiertos / siguiente:** `embed` sigue cargando el modelo aunque no haga falta (costo fijo
+  visible: "Loading embedder" en un reindex 100 % reusado); cargarlo perezoso lo recortaría. Medir en
+  release con TASK-016. Los índices ya creados por el serve sin HNSW lo reciben en la siguiente
+  corrida de `index`.
