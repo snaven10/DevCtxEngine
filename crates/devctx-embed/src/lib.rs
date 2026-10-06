@@ -128,17 +128,37 @@ pub fn embedding_fingerprint(s: &EmbedSettings, dimension: usize) -> String {
         // (The device — CPU or CUDA — stays out: it moves vectors only at the
         // rounding level.) Credentials and query strings are not recorded.
         other => {
-            let endpoint = s.endpoint.as_deref().unwrap_or("");
-            let endpoint = endpoint.split('?').next().unwrap_or("");
-            let endpoint = match endpoint.split_once("://") {
-                Some((scheme, rest)) => {
-                    format!("{scheme}://{}", rest.rsplit('@').next().unwrap_or(rest))
-                }
-                None => endpoint.to_string(),
-            };
+            let endpoint = endpoint_identity(s.endpoint.as_deref().unwrap_or(""));
             format!("{other}|{model}|{dimension}|http|{endpoint}|l2")
         }
     }
+}
+
+/// What of an endpoint goes on disk: `scheme://host[:port]` plus a short hash
+/// of the path. Userinfo, query, fragment and the raw path (tokens live there
+/// too) are never recorded; the hash still tells two paths apart.
+fn endpoint_identity(raw: &str) -> String {
+    let (scheme, rest) = match raw.split_once("://") {
+        Some((sch, rest)) => (Some(sch), rest),
+        None => (None, raw),
+    };
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(auth_end);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let path = tail.split(['?', '#']).next().unwrap_or("");
+    let path = path.trim_end_matches('/');
+    let mut out = match scheme {
+        Some(sch) => format!("{sch}://{host}"),
+        None => host.to_string(),
+    };
+    if !path.is_empty() {
+        // FNV-1a: stable across Rust versions, unlike `DefaultHasher`.
+        let h = path.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        out.push_str(&format!("#{:08x}", h as u32));
+    }
+    out
 }
 
 /// Construct an embedding provider from resolved settings.
@@ -195,6 +215,10 @@ fn create_local(_s: &EmbedSettings) -> Result<Box<dyn EmbeddingProvider>> {
 }
 
 #[cfg(test)]
+#[path = "../build/lock.rs"]
+mod lock_parser;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -240,20 +264,53 @@ mod tests {
     /// lock holds (a stale or unreadable lock would leave "unlocked").
     #[test]
     fn the_local_engine_is_the_locked_one() {
-        let lock = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
-        )
-        .unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock = std::fs::read_to_string(root.join("../../Cargo.lock")).unwrap();
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
         let ver = |p: &str| {
-            let at = lock.find(&format!("name = \"{p}\"\nversion = \"")).unwrap();
-            let rest = &lock[at..];
-            let v = rest.split('"').nth(3).unwrap();
-            v.to_string()
+            lock_parser::locked_version(&lock, &manifest, p)
+                .unwrap()
+                .unwrap()
         };
         assert_eq!(
             LOCAL_ENGINE,
             format!("fastembed-{}/ort-{}", ver("fastembed"), ver("ort"))
         );
+    }
+
+    #[test]
+    fn the_endpoint_identity_keeps_no_secrets_and_tells_hosts_apart() {
+        let base = EmbedSettings {
+            provider: "custom".into(),
+            model: "m".into(),
+            ..Default::default()
+        };
+        let fp = |url: &str| {
+            embedding_fingerprint(
+                &EmbedSettings {
+                    endpoint: Some(url.into()),
+                    ..base.clone()
+                },
+                8,
+            )
+        };
+        for (url, secret) in [
+            ("http://h/users/a@b/v1", "a@b"),
+            ("http://h/v1/tok3n-SECRET", "SECRET"),
+            ("user:pw@host:8080", "pw"),
+            ("http://u:pw@h/v1", "pw"),
+            ("http://h/v1#frag-SECRET", "SECRET"),
+            ("http://h/v1?key=SECRET", "SECRET"),
+        ] {
+            let f = fp(url);
+            assert!(!f.contains(secret), "{url} leaked {secret}: {f}");
+            assert!(!f.contains("/v1") && !f.contains("users"), "raw path: {f}");
+        }
+        assert!(fp("user:pw@host:8080").contains("host:8080"));
+        assert_ne!(fp("http://h1/users/a@b/v1"), fp("http://h2/users/a@b/v1"));
+        assert_ne!(fp("http://h/v1"), fp("http://h/v2"), "path is hashed in");
+        assert_eq!(fp("http://h/v1"), fp("http://h/v1/"));
+        assert_eq!(fp("http://u:p@h/v1?k=1#f"), fp("http://h/v1"));
     }
 
     #[test]

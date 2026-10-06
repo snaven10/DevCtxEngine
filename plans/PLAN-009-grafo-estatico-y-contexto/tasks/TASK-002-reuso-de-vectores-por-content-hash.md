@@ -207,3 +207,16 @@ todos los chunks del archivo. Implementa DD-20.
 - **Medición multi-rama:** no hecha (los tests con dos ramas lo cubren: 0 archivos copiados, 0
   embebidos, sin fase hnsw/fts).
 
+
+### Fixup 3
+
+- **build.rs:** el parser del lock (`crates/devctx-embed/build/lock.rs`, compartido con los tests)
+  lee bloques `[[package]]` (LF o CRLF); con varias versiones elige la que exige el manifiesto de
+  devctx-embed y, si no decide, el build falla. Sin lock el fallback es
+  `unlocked(<spec del manifiesto>@<versión del crate>)`, no un literal común; límite documentado en
+  AGENTS.md.
+- **Endpoint:** `endpoint_identity` aísla la autoridad (corta en `/ ? #`), `rsplit_once('@')` solo
+  ahí, descarta query y fragmento y guarda `scheme://host[:port]` + hash FNV del path (nunca el path
+  crudo). Test `the_endpoint_identity_keeps_no_secrets_and_tells_hosts_apart`.
+- **Test del motor:** usa el mismo parser (sin `\n` literal), válido con CRLF.
+- **Menor:** el recorte del prefijo "local embedding backend:" del serve ignora mayúsculas.

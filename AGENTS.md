@@ -219,8 +219,10 @@ Reckon **an hour per ~1400 files** on 8 cores. Things to know:
   different setup embeds everything, and an interrupted run under another setup
   leaves the branch marked "transition" so it is never reused by mistake.
   The engine part is read from `Cargo.lock` at build time (`fastembed-<v>/ort-<v>`),
-  so a `cargo update` of either one makes every index re-embed once; for an
-  HTTP provider the endpoint (without credentials) is part of it. The device
+  so a `cargo update` of either one makes every index re-embed once (a build outside the
+  workspace has no lock: it uses the crate version and the manifest's pinned specs, which
+  cannot see a different resolved engine); for an
+  HTTP provider the endpoint (`scheme://host` and a hash of the path, no credentials) is part of it. The device
   (CPU or CUDA) is not: it moves vectors only at the rounding level.
   An index **from before fingerprints** is reused only if its recorded model
   *and* width equal the active ones and no run left it in "transition"; the run

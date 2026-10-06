@@ -1152,7 +1152,12 @@ fn do_index_inner(
             sink.phase(LOADING_MODEL);
             let loaded = embedder_reporting(state, &sink).map_err(|e| {
                 // `Backend` prints its own prefix; do not stack a second one.
-                let e = e.strip_prefix("local embedding backend: ").unwrap_or(&e);
+                const PREFIX: &str = "local embedding backend: ";
+                let head = e.get(..PREFIX.len());
+                let e = match head {
+                    Some(h) if h.eq_ignore_ascii_case(PREFIX) => &e[PREFIX.len()..],
+                    _ => e.as_str(),
+                };
                 devctx_embed::EmbedError::Backend(e.to_string())
             });
             sink.phase("files");
