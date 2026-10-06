@@ -43,6 +43,7 @@ struct CentralApi {
 fn router(api: CentralApi) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/projects", get(list_projects).post(add_project))
         .route("/projects/:name", get(show_project))
         .route("/projects/:name", delete(remove_project))
@@ -507,6 +508,51 @@ async fn health() -> Response {
     json_ok(json!({ "status": "ok", "role": "central" }).to_string())
 }
 
+/// `GET /status`: the central's `memory` block (PLAN-010 DD-1). `/health` stays
+/// a bare liveness probe; this one takes the central lock and reads the store.
+async fn status(State(api): State<CentralApi>) -> Response {
+    run(api, |c| Ok(central_status_json(c).to_string())).await
+}
+
+/// Shape of the central's `/status`. Reads the embedder slot without loading it.
+fn central_status_json(c: &Central) -> serde_json::Value {
+    use devctx_core::procmem;
+    let r = c.db_memory_report();
+    let embedder = match c.embedder_state() {
+        Some((key, at, idle)) => json!({
+            "loaded": true, "key": key, "loaded_at": at,
+            "age_secs": procmem::unix_now().saturating_sub(at),
+            "idle_secs": idle, "engine": procmem::engine_for(key.split('/').next().unwrap_or("")),
+        }),
+        None => json!({ "loaded": false }),
+    };
+    json!({
+        "status": "ok",
+        "role": "central",
+        "memory": {
+            "process": procmem::process_json(procmem::ProcMemory::read()),
+            "models": { "embedder": embedder },
+            "duckdb": {
+                "memory_limit": r.memory_limit,
+                "threads": r.threads,
+                "memory_usage_bytes": r.memory_usage_bytes,
+                "temp_files_bytes": r.temp_files_bytes,
+                "database_size": r.database_size,
+                "notes": r.notes,
+            },
+            "hnsw": {
+                "present": r.hnsw_present,
+                "metric": r.hnsw_metric,
+                "vectors": r.vectors,
+                "dimension": r.dimension,
+                "reported_bytes": r.hnsw_reported_bytes,
+                "estimated_bytes": r.hnsw_estimated_bytes(),
+                "estimate_note": "vectors x dimension x 4 B, without graph links: a floor, not a measurement",
+            },
+        },
+    })
+}
+
 async fn list_projects(State(api): State<CentralApi>, Query(q): Query<ListQuery>) -> Response {
     run(api, move |c| {
         let projects = c.list(q.all).map_err(|e| e.to_string())?;
@@ -919,6 +965,29 @@ mod sweeper_tests {
         fn model_name(&self) -> &str {
             "fake"
         }
+    }
+
+    /// PLAN-010 TASK-001: the central's status has the four `memory` blocks and
+    /// reading it does not load the embedder.
+    #[test]
+    fn central_status_reports_memory_without_loading_the_embedder() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_central_status_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let central = Central::open_in(&dir)
+            .unwrap()
+            .with_embedder_factory(|_| Ok(Arc::new(Fake)));
+        let v = central_status_json(&central);
+        for k in ["process", "models", "duckdb", "hnsw"] {
+            assert!(v["memory"].get(k).is_some(), "missing {k}: {v}");
+        }
+        assert_eq!(v["memory"]["models"]["embedder"]["loaded"], false);
+        assert!(!central.embedder_loaded());
+        central.recall("q", None, 3).unwrap();
+        let v = central_status_json(&central);
+        assert_eq!(v["memory"]["models"]["embedder"]["loaded"], true, "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
