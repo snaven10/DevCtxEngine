@@ -207,18 +207,18 @@ de comparación (la columna se completa ahí).
 
 | Criterio | Antes (0.8.4) | Meta |
 |---|---|---|
-| RSS del central en reposo tras el idle de modelos | 1.8 GB | ≤ 150 MB (sin modelo) |
-| RSS de un serve con modelo cargado, en reposo (DevCtxEngine) | 508 MB | ≤ 250 MB, con el reparto modelo/ORT/DuckDB/HNSW explicado por `status.memory` |
-| Pico de indexación completa de DevCtxEngine (`VmHWM` del serve) | 18.2 GB | ≤ 1.5 GB |
-| Pico de indexación incremental en REVFA_FrontEnd | 6.5 GB | ≤ 1.5 GB |
-| 3 serves con modelo cargado: páginas de pesos compartidas | 0 (todo `RssAnon`) | pesos en `RssFile`/`Pss` repartido; `RssAnon` por serve baja ≥ el tamaño del modelo (~98 MB) |
+| RSS del central en reposo tras el idle de modelos | 1.8 GB; **0.9.0: 105 MB** (303 MB cargado) | ≤ 150 MB (sin modelo) |
+| RSS de un serve con modelo cargado, en reposo (DevCtxEngine) | 508 MB; **0.9.0: 300-315 MB** (pico de carga `VmHWM` ~710) | ≤ 250 MB, con el reparto modelo/ORT/DuckDB/HNSW explicado por `status.memory` |
+| Pico de indexación completa de DevCtxEngine (`VmHWM` del serve) | 18.2 GB; **0.9.0: 897 MiB** | ≤ 1.5 GB |
+| Pico de indexación incremental en REVFA_FrontEnd | 6.5 GB; **0.9.0: 753 MiB** (clon git, 149 archivos) | ≤ 1.5 GB |
+| 3 serves con modelo cargado: páginas de pesos compartidas | 0 (todo `RssAnon`); **0.9.0: 3 serves = 679 MiB anon, Pss 742** | pesos en `RssFile`/`Pss` repartido; `RssAnon` por serve baja ≥ el tamaño del modelo (~98 MB) |
 | Embeddings motor nuevo vs fastembed, sobre el set de fixtures | — | coseno ≥ 0.9999 por vector; top-10 de `search` idéntico en el set de consultas |
 | Scores del reranker vs fastembed | — | `|Δ| ≤ 1e-3` y mismo orden en el set de fixtures |
 | Reindex requerido tras actualizar | — | **ninguno** (`extractor_stale`/aviso de modelo en `false`) |
-| Latencia de `search` (p50 y p95, 20 consultas, serve caliente) | medir en TASK-001 | ≤ +10 % |
-| Throughput de indexación (chunks/s, DevCtxEngine completo) | medir en TASK-001 | ≥ −15 % (se acepta algo más lento a cambio del pico) |
+| Latencia de `search` (p50 y p95, 20 consultas, serve caliente) | **0.9.0: p50 30-37 ms, p95 40-70 ms** (CLI, serve caliente) | ≤ +10 % |
+| Throughput de indexación (chunks/s, DevCtxEngine completo) | **0.9.0: 8.9 chunks/s** (DevCtxEngine, 4 677 chunks; 7.9 en REVFA_FrontEnd) | ≥ −15 % (se acepta algo más lento a cambio del pico) |
 | DuckDB acotado y HNSW creado en REVFA_FrontEnd (2.3 GB) con el default elegido | 2 GB, sin medir | `CREATE INDEX … USING HNSW` termina sin OOM; `memory_limit` efectivo visible en `status` |
-| `status` informa memoria | no | bloque `memory`: modelo cargado sí/no, RSS anon/file, DuckDB usado/límite, vectores HNSW |
+| `status` informa memoria | no; **TASK-001: sí** (`status.memory`) | bloque `memory`: modelo cargado sí/no, RSS anon/file, DuckDB usado/límite, vectores HNSW |
 | `provider: central` (si se activa) | — | serve con `provider: central` en reposo ≤ 60 MB; `search` OK; error explícito con central caído |
 
 ## 7. Riesgos
