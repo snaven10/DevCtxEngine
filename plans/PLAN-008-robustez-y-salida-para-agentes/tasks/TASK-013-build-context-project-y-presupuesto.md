@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-008 — Robustez del ciclo de vida y salida útil para agentes
 - **Especialista:** rust (modelo sugerido: sonnet; opus si la selección en grupo se complica)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 - **Depende de:** TASK-010, TASK-011, TASK-012
 - **Estado:** `done`
 
@@ -23,7 +23,7 @@ en el primer chunk grande ni traer memorias truncadas (PLAN-008 B7).
 - Truncados: `do_recall_scoped` recorta memorias con "exceeded its share of the output budget"
   (`state.rs:2493`, `:2506`, `:2564`) antes de que `build_context` las vea.
 - Grupo: `DevctxServer::backend_for` (`lib.rs:492-512`) devuelve `Binding::Group.default` sin hint.
-- Campo: sesión de grupo revfa → tarea de FrontEnd respondida desde `tickets-srv`.
+- Campo: sesión de grupo acme → tarea de FrontEnd respondida desde `orders-srv`.
 
 ## Archivos
 
@@ -53,7 +53,7 @@ en el primer chunk grande ni traer memorias truncadas (PLAN-008 B7).
 - [x] Test: consulta ambigua entre miembros → error que lista candidatos y pide `project`.
 - [x] Test: primer hit más grande que el presupuesto → los siguientes que caben aparecen.
 - [x] Test: ningún "exceeded its share" en la salida de `build_context`; sí un conteo final.
-- [ ] En el Resultado: la consulta de campo (FrontEnd en revfa) antes/después. -> diferido a TASK-016 (medición de campo).
+- [ ] En el Resultado: la consulta de campo (FrontEnd en acme) antes/después. -> diferido a TASK-016 (medición de campo).
 
 ## Riesgos
 
@@ -65,12 +65,12 @@ medirlo y reportarlo.
 <!-- Contrato: PLAN-008 §11 -->
 
 1. **Estado final:** `done`.
-2. **Repro antes/después:** antes, en sesión de grupo `build_context` usaba `Binding::Group.default` (sin `project`), buscaba en `Vector` con `do_search` (que recorta cada fila a 1/30 del presupuesto con "exceeded its share") y cortaba con `break` en el primer chunk que no cabía. Ahora: ver tests; la consulta de campo FrontEnd/revfa queda para TASK-016.
+2. **Repro antes/después:** antes, en sesión de grupo `build_context` usaba `Binding::Group.default` (sin `project`), buscaba en `Vector` con `do_search` (que recorta cada fila a 1/30 del presupuesto con "exceeded its share") y cortaba con `break` en el primer chunk que no cabía. Ahora: ver tests; la consulta de campo FrontEnd/acme queda para TASK-016.
 3. **Causa raíz:** confirmada. Además: `do_recall_scoped` y `do_search` presupuestaban por su cuenta (marca "truncated" por ítem) antes de que `build_context` viera los datos; ahora `build_context` toma los datos sin presupuestar (`recall_fused`, `search_items`) y reparte su propio `max_tokens`.
 4. **Archivos:** `devctx-mcp/src/{state,lib,backend}.rs`, `devctx-api/src/lib.rs`, `devctx-cli/src/{remote,main}.rs`. Nuevos/cambiados: `do_build_context(state, query, max_tokens, include_memories, &KindSel)`, `Backend::build_context(.., &KindSel)`, `RemoteClient::build_context(.., &KindSel)`, privados `recall_fused`, `search_items`, `group_targets`, `fan_out_search` (extraídos de `do_recall_scoped`/`do_search`/`do_search_group`, sin duplicar), `compose_context`, `memory_brief`, `trim_leading_doc`, `cap_lines`, `member_score`, `choose_member`, pub `pick_group_member(members, query, &KindSel) -> Result<(String, usize), String>`; `DevctxServer::context_backend`.
 5. **Tests** (`cargo test -p devctx-mcp --lib -- build_context group_pick`, 6/6 ok): `build_context_skips_a_chunk_that_does_not_fit_and_keeps_going` (en el padre el `break` perdía los chunks siguientes), `build_context_trims_a_long_leading_doc_before_the_body`, `build_context_memories_keep_to_a_share_and_never_stamp_truncation`, `group_pick_chooses_the_member_that_matches`, `group_pick_refuses_a_close_call_and_names_candidates`. En el padre las funciones no existen (no compilan); la conducta que fijan es la descrita en el punto 2. Gate completo: fmt, clippy (también `--features gpu`) y `cargo test --workspace`.
 6. **Contrato:** `build_context` (MCP) acepta `project`, `kind`, `include_tests`; `POST /context` acepta `kind`, `include_tests`. Salida prosa: primera línea `[devctx] context from <repo>` **solo en sesión de grupo o cuando la llamada trae `project`** (en un proyecto bindeado sin `project` no hay línea; corregido en Fixup G); en grupo sin `project`, `<repo> (best match S; k of M members scored[; failed: …][; not scored: …])` y, si fue reñido, una segunda línea `[devctx] ambiguous: also …`; cierre `[devctx] omitted: N item(s), reason: budget (T tokens)...` (una sola vez); `[devctx] branch_fallback: ...` se mantiene. Memorias: `[memory] <id> — <título>` + primeras líneas (6 líneas / 500 chars), sin marca de truncado por ítem.
-7. **No verificado:** consulta de campo en revfa (TASK-016); el margen de selección `PICK_MARGIN=0.03` sobre media top-3 de coseno es heurístico, sin calibrar en campo; no hay test de integración end-to-end del grupo (la selección se prueba sobre `choose_member`/`member_score`, la fan-out reusa `search_one` ya cubierto).
+7. **No verificado:** consulta de campo en acme (TASK-016); el margen de selección `PICK_MARGIN=0.03` sobre media top-3 de coseno es heurístico, sin calibrar en campo; no hay test de integración end-to-end del grupo (la selección se prueba sobre `choose_member`/`member_score`, la fan-out reusa `search_one` ya cubierto).
 8. **Parámetros/números:** búsqueda `hybrid` limit 30, rerank off; memorias ≤35% del presupuesto; un chunk ≤ max(presupuesto/3, 600 chars); doc inicial >6 líneas se deja en 3 + "N doc lines trimmed"; selección: top-3 por miembro (vector), margen 0.03. Costo de selección: N búsquedas (una por miembro, lotes de 4) más la de contexto; igual que `search` en grupo; no medido en tiempo.
 
 ### Fixup F (review)
@@ -149,7 +149,7 @@ Contrato corregido (punto 6): la línea `[devctx] context from <repo>` aparece s
 - Gate: `cargo fmt --check`; `clippy --workspace --all-targets` con y sin `--features gpu`, 0 warnings;
   `TMPDIR=/var/tmp DEVCTX_MODEL_CACHE=/var/tmp/devctx-test-model-cache cargo test --workspace` verde (694 tests,
   sin flakes); sin `target/debug/devctx serve` residuales.
-- **No verificado:** latencia real en revfa (13 miembros) y el margen 0.03 sobre `code` (TASK-016); el caso
+- **No verificado:** latencia real en acme (13 miembros) y el margen 0.03 sobre `code` (TASK-016); el caso
   "serve vivo pero modelo descargado de memoria" (la primera `/search` recarga el modelo, hasta 20 s de timeout).
 
 ### Fixup H (review)
@@ -207,7 +207,7 @@ Contrato corregido (punto 6): la línea `[devctx] context from <repo>` aparece s
 - Gate: `cargo fmt --check`; `clippy --workspace --all-targets` con y sin `--features gpu`, `-D warnings`;
   `cargo test --workspace` verde (corrido por paquetes/binarios, cada uno < 10 min); tests de devctx-mcp repetidos
   3× sin flakes; sin `target/debug/devctx serve` residuales.
-- **No verificado:** latencia real en revfa (13 miembros) con el deadline de 2.5 s — un miembro que recarga su
+- **No verificado:** latencia real en acme (13 miembros) con el deadline de 2.5 s — un miembro que recarga su
   modelo en la primera `/search` quedará `busy` esa vez (su búsqueda sigue en el server y lo deja caliente para la
   próxima); calibración del margen (TASK-016).
 

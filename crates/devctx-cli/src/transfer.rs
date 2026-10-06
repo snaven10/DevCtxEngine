@@ -63,7 +63,7 @@ mod tests {
             content: "línea uno\nlínea dos".into(),
             memory_type: "decision".into(),
             scope: "group".into(),
-            project: "@group:REVFA".into(),
+            project: "@group:ACME".into(),
             topic_key: "auth".into(),
             tags: "a,b".into(),
             repo: "api".into(),

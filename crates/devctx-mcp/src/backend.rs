@@ -812,13 +812,13 @@ mod tests {
     #[test]
     fn an_ignored_provenance_is_reported_not_assumed() {
         let answer = json!({ "id": "mem_1", "repo": "api" }).to_string();
-        let out = Backend::warn_if_provenance_was_ignored(answer, Some("REVFA"));
+        let out = Backend::warn_if_provenance_was_ignored(answer, Some("ACME"));
         let v: Value = serde_json::from_str(&out).unwrap();
         let warning = v["warning"]
             .as_str()
             .expect("a mismatch has to be reported");
         assert!(warning.contains("api"), "name what it stored: {warning}");
-        assert!(warning.contains("REVFA"), "and what was asked: {warning}");
+        assert!(warning.contains("ACME"), "and what was asked: {warning}");
         assert_eq!(v["id"], "mem_1", "the answer itself survives");
     }
 
@@ -826,8 +826,8 @@ mod tests {
     /// grow a warning nobody needs.
     #[test]
     fn an_honoured_provenance_is_left_alone() {
-        let answer = json!({ "id": "mem_1", "repo": "REVFA" }).to_string();
-        let out = Backend::warn_if_provenance_was_ignored(answer.clone(), Some("REVFA"));
+        let answer = json!({ "id": "mem_1", "repo": "ACME" }).to_string();
+        let out = Backend::warn_if_provenance_was_ignored(answer.clone(), Some("ACME"));
         assert_eq!(out, answer);
     }
 
@@ -852,7 +852,7 @@ mod tests {
     fn a_non_json_answer_passes_through() {
         let answer = "saved".to_string();
         assert_eq!(
-            Backend::warn_if_provenance_was_ignored(answer.clone(), Some("REVFA")),
+            Backend::warn_if_provenance_was_ignored(answer.clone(), Some("ACME")),
             answer
         );
     }

@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-007 — Planes en la raíz del workspace
 - **Especialista:** rust (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
 - **Depende de:** —
 - **Estado:** `done`
 
@@ -20,11 +20,11 @@ le pase la ruta (PLAN-007 DD-2, DD-3).
   desde `cfg.project.path` o el cwd.
 - `state.rs:720-721` — `do_plan_status` usa `state.root`; `state.rs:905-906` — `do_plan_graph` igual.
 - `state.rs:3126` — `memories_by_file` llama `plan_tasks_for_file(&state.root, …)` (def. `state.rs:3134`):
-  **también afectado**, en un miembro de revfa siempre devuelve `plan_tasks: []`.
+  **también afectado**, en un miembro de acme siempre devuelve `plan_tasks: []`.
 - `state.rs:729` / `state.rs:911` — `plan_status_value(root, plan)` / `plan_graph_value(root, plan)`
   ya reciben la raíz: no cambian de firma.
 - `crates/devctx-cli/src/main.rs:2013` — `plan_status_root()`: raíz del proyecto si el cwd está en uno,
-  si no el cwd. Desde `~/revfa/REVFA_BackEnd` lee `REVFA_BackEnd/plans` (no existe).
+  si no el cwd. Desde `~/acme/backend-a` lee `backend-a/plans` (no existe).
 - `crates/devctx-core/src/config.rs:80` — `project.group: String` (vacío si no declara grupo).
 - `crates/devctx-mcp/src/state.rs:1329` — `group_of(root)` ya lee el grupo desde el config.
 

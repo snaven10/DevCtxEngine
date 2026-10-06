@@ -157,7 +157,7 @@ la única forma de acotarlo, y por eso un nombre calificado nunca se expande.
 
 > Esto corrige una afirmación anterior de estas páginas: que la cobertura era
 > "binaria por símbolo, sin nada que distinguiera los casos". No lo era. Un
-> `actualizar` pelado devolvía cero mientras `OficinaService.actualizar` devolvía
+> `actualizar` pelado devolvía cero mientras `OfficeService.actualizar` devolvía
 > un llamador y veintitrés llamados: las aristas estuvieron ahí todo el tiempo,
 > bajo una llave con la que nadie preguntaba.
 

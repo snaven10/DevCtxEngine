@@ -154,7 +154,7 @@ devctx memories backfill-links
 Hay una pasada derivada del texto para memorias sin `files` del todo, que es
 como la mitad de un corpus real. Arma una lista de *candidatos* con las rutas de
 archivo nombradas en la prosa y sobre-empareja a propósito: el mismo patrón que
-encuentra `apps/registry/src/app/components/firmar-registro.ts` también
+encuentra `apps/portal/src/app/components/sign-form.ts` también
 encuentra `Shepherd.js`, que es una librería que nadie indexó, y `CLAUDE.md`,
 que no es código. Cada candidato se verifica contra el índice antes de escribir
 un vínculo. **El índice es lo que los distingue, nunca el patrón.**

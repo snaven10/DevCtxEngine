@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-007 — Planes en la raíz del workspace
 - **Especialista:** rust (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
 - **Depende de:** TASK-001
 - **Estado:** `done`
 
@@ -17,7 +17,7 @@ realmente lleva el estado.
 ## Contexto verificado
 
 - `crates/devctx-core/src/plans.rs:225` — `parse_depends_on`: warning por cada token no reconocido
-  (153 en revfa: `'el'`, `'A)**'`, `'**DD-T9**'`); `normalize_task_id` (`plans.rs:283`) convierte
+  (153 en acme: `'el'`, `'A)**'`, `'**DD-T9**'`); `normalize_task_id` (`plans.rs:283`) convierte
   un `0` pelado en `TASK-000` (`Fase 0`) y `digits_of` (`plans.rs:273`) concatena
   `TASK-033/034/035` en `TASK-33034035`.
 - `plans.rs:673` — `extract_task_id_from_filename` descarta el sufijo de letra: 22 archivos
@@ -26,7 +26,7 @@ realmente lleva el estado.
   (PLAN-078, 10 archivos), `TASK-DB-001-…` (PLAN-051).
 - Duplicados reales: `PLAN-047-firma-async-cert-pipeline/tasks/` tiene `TASK-001-DESIGN.md` y
   `TASK-001-verify-….md` (y lo mismo para 002, 011, 015). Hoy entran las dos como tasks.
-- Claves de dependencia en revfa: `Dependencies:` 634, `Depende de:` 413, `Depends on:` 20,
+- Claves de dependencia en acme: `Dependencies:` 634, `Depende de:` 413, `Depends on:` 20,
   `Bloqueada por:` 7, `Dependencias:` 6; en front matter `depends_on: [TASK-002]` y `Dependencies: none`.
 - Formas reales del valor: `` TASK-001 (`done`), Paso 0b … `` · `TASK-009, TASK-012 … TASK-018` ·
   `` `PLAN-120` TASK-031 (pares duplicados…) `` · `Fase 0 (y coordinar orden con TASK-006, ver Riesgos)` ·

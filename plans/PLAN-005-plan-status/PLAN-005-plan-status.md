@@ -2,7 +2,7 @@
 
 **Fecha:** 2026-09-11
 **Fase:** 1 (Planificación) — pendiente de aprobación. Rama `feature/plan-status` (sale de `fix/mcp-integration`, 2 commits sin compilar)
-**Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+**Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 **Origen:** Tras una compactación o un reinicio, el modelo pierde el hilo de qué task del plan activo sigue.
 
 ---
@@ -161,7 +161,7 @@ Nada de esto se corrió: es un plan. **No se compiló ni se testeó.**
 ## 7. Fuera de alcance / fase 2
 
 - **`memories_by_symbol` → tasks.** Las tasks mencionan archivos, no símbolos. Pasar de símbolo a
-  archivo exige `symbol_definitions` y, con nombre pelado, la expansión de PLAN-003 (en REVFA_BackEnd
+  archivo exige `symbol_definitions` y, con nombre pelado, la expansión de PLAN-003 (en backend-a
   `actualizar` son 21 declaraciones): el link resultante sería inferencia disfrazada de estructura.
   Fase 2, si hace falta, con `link_source: "inference"` explícito.
 - **Escribir estados desde devctx** (`plan_set_status`). La edición sigue siendo del agente sobre el

@@ -47,7 +47,7 @@ the others".
 
 ```
 This machine already uses:
-  ml-granite  (384d, multilingual)   REVFA_BackEnd, REVFA_FrontEnd, +2 others
+  ml-granite  (384d, multilingual)   backend-a, frontend, +2 others
                                      and the shared memory space
 
 MODEL            DIMS  LANGUAGES      FILES      NOTES
@@ -90,12 +90,12 @@ Per-repository indexes are the reason a re-index never blocks another project.
 
 ```
 Memories can be shared between the repositories of one product.
-Groups on this machine: REVFA (4 repositories)
+Groups on this machine: ACME (4 repositories)
 
 Group for this repository [none]:
 ```
 
-Answering `REVFA` puts it in the existing group. Answering a new name creates
+Answering `ACME` puts it in the existing group. Answering a new name creates
 one — which costs nothing, because a group is a key in the central store, not a
 database.
 
@@ -108,7 +108,7 @@ per group was asked for; it should not be built:
 - Recall fuses local + group + global in one call. Splitting the group into its
   own file means opening two databases per recall instead of one.
 - Isolation is what a group is *for*, and the key already gives it: a
-  `@group:REVFA` memory is invisible to any repository outside the group. A
+  `@group:ACME` memory is invisible to any repository outside the group. A
   separate file adds no isolation that the key does not already provide.
 
 What a separate file would genuinely buy is *portability* — handing one group's
@@ -119,7 +119,7 @@ layout, and it is specified in §5.
 
 ```
   project     demo
-  group       REVFA          → memories shared with 4 repositories
+  group       ACME          → memories shared with 4 repositories
   model       ml-granite     → 384d, same space as the shared memories
   index       ./.devctx/state/index.duckdb   (HNSW on)
   memories    local → here · group → central store · global → central store
@@ -139,13 +139,13 @@ splitting where they live.
 
 ```bash
 devctx memories export --scope local            > project.jsonl
-devctx memories export --scope group            > revfa.jsonl
+devctx memories export --scope group            > acme.jsonl
 devctx memories export --scope global           > global.jsonl
-devctx memories export --scope group --repo REVFA_BackEnd   # only what one repo contributed
+devctx memories export --scope group --repo backend-a   # only what one repo contributed
 
-devctx memories import revfa.jsonl              # into the scope each memory declares
-devctx memories import revfa.jsonl --scope local   # override: land them all here
-devctx memories import revfa.jsonl --dry-run
+devctx memories import acme.jsonl              # into the scope each memory declares
+devctx memories import acme.jsonl --scope local   # override: land them all here
+devctx memories import acme.jsonl --dry-run
 ```
 
 **Format: JSONL, one memory per line.** Not a DuckDB file, and the reason is
@@ -159,7 +159,7 @@ Each line carries the memory's fields plus its embedding:
 
 ```json
 {"id":"mem_…","title":"…","content":"…","type":"decision","scope":"group",
- "project":"@group:REVFA","tags":"…","repo":"REVFA_BackEnd","created_at":"…",
+ "project":"@group:ACME","tags":"…","repo":"backend-a","created_at":"…",
  "embedding":{"model":"ml-granite","dim":384,"vector":[…]}}
 ```
 
@@ -210,7 +210,7 @@ worth reading, not resolving automatically.
 imported 41 memories · 12 already present · 3 topic collisions kept separately:
     · "auth approach"        (topic: auth-approach)
     · "PDF template lookup"  (topic: pdf-templates)
-    · "NUI format"           (topic: nui-format)
+    · "ID format"            (topic: id-format)
 ```
 
 `--dry-run` prints exactly that table without writing, so the outcome is

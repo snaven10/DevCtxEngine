@@ -1,8 +1,8 @@
-# TASK-006 — Verificación con datos reales sobre REVFA_BackEnd
+# TASK-006 — Verificación con datos reales sobre backend-a
 
 - **Plan:** PLAN-003 — Grafo y registro de lenguajes
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (medición sobre `~/revfa/REVFA_BackEnd`, rama `development`)
+- **Proyecto:** DevCtxEngine (medición sobre `~/acme/backend-a`, rama `development`)
 - **Depende de:** TASK-001, TASK-002, TASK-003, TASK-004
 - **Estado:** `done`
 
@@ -16,15 +16,15 @@ nada de lo que ya funcionaba se rompió. Sin esto el PLAN no cierra.
 ## Contexto verificado (2026-08-23)
 
 Línea base tomada **antes** de tocar nada, con el binario instalado
-(`~/.local/bin/devctx`), sobre REVFA_BackEnd rama `development`:
+(`~/.local/bin/devctx`), sobre backend-a rama `development`:
 
 | Consulta | callers | callees |
 |---|---|---|
 | `actualizar` | 0 | 0 |
-| `OficinaService.actualizar` | 1 | 23 |
+| `OfficeService.actualizar` | 1 | 23 |
 | `crearNotificacion` | 8 | — |
 
-En los 23 callees de `OficinaService.actualizar` hay al menos 4 targets basura
+En los 23 callees de `OfficeService.actualizar` hay al menos 4 targets basura
 (con paréntesis o multilínea) y `getNombre`/`getTelefono`/`getCodigo` duplicados
 en forma pelada y calificada.
 
@@ -46,13 +46,13 @@ en forma pelada y calificada.
       declaraciones expandió.
 - [x] **Paso 2 — Tiempo de `impact`** antes y después del `LIKE`, sobre el mismo
       símbolo. Es el riesgo declarado en TASK-001.
-- [x] **Paso 3 — Reindexar** REVFA_BackEnd/`development` con TASK-002+003+004
+- [x] **Paso 3 — Reindexar** backend-a/`development` con TASK-002+003+004
       dentro. Anotar conteo total de aristas antes y después.
 - [x] **Paso 4 — Basura y duplicados.** Confirmar que ningún callee de
-      `OficinaService.actualizar` tiene `(`, `)`, `<`, espacio o salto de línea,
+      `OfficeService.actualizar` tiene `(`, `)`, `<`, espacio o salto de línea,
       y ver si `getNombre` sigue duplicado.
 - [x] **Paso 5 — Constructores.** Nombrar un constructor Java concreto de
-      REVFA_BackEnd que ahora aparezca como `source`.
+      backend-a que ahora aparezca como `source`.
 - [x] **Paso 6 — Muestra ciega.** Elegir **10 métodos Java al azar** —no los tres
       de la línea base— y para cada uno comparar el conteo de `get_references`
       contra un `grep -c` de sus sitios de llamada. Reportar la tabla **completa,
@@ -79,10 +79,10 @@ falso. El Paso 6 se hace con un patrón que **acepte** la llamada sin receptor, 
 si el conteo no cuadra se reporta el desacuerdo en vez de ajustar el patrón hasta
 que cuadre.
 
-**El índice de REVFA_BackEnd es el que usa el usuario a diario.** Reindexar es
+**El índice de backend-a es el que usa el usuario a diario.** Reindexar es
 seguro, pero avisar antes.
 
 ## Resultado
 
 - **Estado final:** `done` (2026-08-24)
-- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre REVFA_BackEnd, con lo que NO se verificó declarado.
+- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre backend-a, con lo que NO se verificó declarado.

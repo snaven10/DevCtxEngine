@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-004 — MCP integration hardening
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `fix/mcp-integration`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `fix/mcp-integration`
 - **Depende de:** — (primera del plan)
 - **Estado:** `done`
 

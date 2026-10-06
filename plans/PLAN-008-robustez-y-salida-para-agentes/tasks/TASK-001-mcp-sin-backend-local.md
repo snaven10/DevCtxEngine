@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-008 — Robustez del ciclo de vida y salida útil para agentes
 - **Especialista:** rust (modelo sugerido: opus para el diseño del backend perezoso, sonnet para el resto)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 - **Depende de:** —
 - **Estado:** `done`
 

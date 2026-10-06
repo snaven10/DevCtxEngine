@@ -3,7 +3,7 @@
 **Fecha:** 2026-08-23
 **Fase:** Cerrado
 **Diseño:** [`PLAN-003-design.md`](./PLAN-003-design.md)
-**Proyectos:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama propuesta `feature/grafo-y-registro-de-lenguajes`
+**Proyectos:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama propuesta `feature/grafo-y-registro-de-lenguajes`
 **Origen:** Reporte del usuario — "el grafo no une bien los símbolos, ¿es el soporte de Java el que está mal?"
 
 ## 1. Qué resuelve
@@ -28,18 +28,18 @@ hay que retractar.
 
 ## 2. Hallazgos que reorientan el plan
 
-Verificado 2026-08-23 contra REVFA_BackEnd, rama `development`, con el binario instalado:
+Verificado 2026-08-23 contra backend-a, rama `development`, con el binario instalado:
 
 | Consulta | Resultado |
 |---|---|
 | `devctx impact actualizar` | **0** callers, **0** callees |
-| `devctx impact OficinaService.actualizar` | **1** caller, **23** callees |
+| `devctx impact OfficeService.actualizar` | **1** caller, **23** callees |
 | `devctx impact crearNotificacion` | **8** callers directos |
 
 **Java no está mal. El grafo no está roto.** Las aristas existen; la llave de
 búsqueda no coincide. `crearNotificacion` funcionaba porque Java no exige `this.`
 en llamadas intra-clase, así que su target quedó pelado. `actualizar` fallaba
-porque se llama vía campo tipado (`oficinaService.actualizar`), así que su target
+porque se llama vía campo tipado (`officeService.actualizar`), así que su target
 quedó calificado.
 
 Esto **retracta** lo que se documentó en 6 páginas, en `~/.claude/protocols/devctx-memory.md`
@@ -48,7 +48,7 @@ distingue de antemano"*. Sí hay algo que los distingue y es determinista.
 
 Dos defectos secundarios salieron en la misma corrida:
 
-- **Receptores basura.** Targets reales medidos: `Oficina.findByCodigo(codigo).flatMap`
+- **Receptores basura.** Targets reales medidos: `Office.findByCodigo(codigo).flatMap`
   y una expresión de 3 líneas con un lambda adentro. `receiver_of` toma el texto
   crudo del nodo `object`, que en una cadena fluida es toda la expresión previa.
 - **Constructores Java invisibles.** `constructor_declaration` no está en
@@ -64,7 +64,7 @@ Dos defectos secundarios salieron en la misma corrida:
 | TASK-003 | `lang.rs` → registro JSON embebido, con kinds por lenguaje | — | TASK-002 | `done` |
 | TASK-004 | `constructor_declaration` y kinds Java completos | — | TASK-003 | `done` |
 | TASK-005 | Retractar la afirmación falsa en docs, protocolos y CLAUDE.md | — | TASK-001 | `pending` |
-| TASK-006 | Verificación con datos reales sobre REVFA_BackEnd | — | TASK-001..004 | `done` |
+| TASK-006 | Verificación con datos reales sobre backend-a | — | TASK-001..004 | `done` |
 | TASK-007 | El recall entre repositorios devolvía cero, en dos capas | — | — | `done` |
 | TASK-008 | El test flaky era el daemon central perdiendo una carrera de 4 s | — | — | `done` |
 
@@ -99,7 +99,7 @@ se escribe en el índice y exigen un reindexado antes de TASK-006.
   sin release**.
 
 - **Verificación:** [`VERIFICACION.md`](./VERIFICACION.md). En resumen: sobre
-  REVFA_BackEnd reindexado, los 5 nombres de nodo que eran expresiones bajaron a
+  backend-a reindexado, los 5 nombres de nodo que eran expresiones bajaron a
   **0**, y una muestra ciega de 10 métodos elegidos por hash dio **0 grafos
   vacíos con llamadas reales** — que era el defecto que abrió el plan.
   `cargo test --all`: 322 passed, 0 failed.

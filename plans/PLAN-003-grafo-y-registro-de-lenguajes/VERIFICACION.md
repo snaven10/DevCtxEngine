@@ -1,7 +1,7 @@
 # PLAN-003 — Verificación con datos reales
 
 **Fecha:** 2026-08-24
-**Sujeto:** REVFA_BackEnd, rama `development`, 1,500 archivos
+**Sujeto:** backend-a, rama `development`, 1,500 archivos
 **Binario:** compilado de `c36a87e`, verificado por **md5** (`5a5f1ede…`) contra
 el proceso vivo — no por `--version`, que dice `0.5.0` tanto en el release
 publicado como en este build.
@@ -10,7 +10,7 @@ publicado como en este build.
 
 ## 1. Nodos del grafo que eran expresiones
 
-`devctx impact OficinaService.actualizar`, mismo símbolo antes y después:
+`devctx impact OfficeService.actualizar`, mismo símbolo antes y después:
 
 | | Callees | Nombres malformados |
 |---|---|---|
@@ -20,11 +20,11 @@ publicado como en este build.
 Los cinco que desaparecieron:
 
 ```
-Oficina.findByCodigo(codigo).flatMap
-.persist(oficina).replaceWith
-Oficina.<Oficina>findById(idOficina).flatMap
-.persist(oficina).replaceWith(
-() -> OficinaDTO.from(oficina)).invoke
+Office.findByCodigo(codigo).flatMap
+.persist(office).replaceWith
+Office.<Office>findById(idOffice).flatMap
+.persist(office).replaceWith(
+() -> OfficeDTO.from(office)).invoke
 ```
 
 En su lugar quedaron `flatMap`, `replaceWith` e `invoke` — el nombre pelado, que
@@ -32,7 +32,7 @@ es la respuesta honesta cuando el receptor no se puede nombrar, y que desde
 TASK-001 encuentra sus propias aristas.
 
 La caída de 45 a 39 es la consolidación esperada: cuatro expresiones distintas
-sobre `Oficina` colapsan en los nombres reales.
+sobre `Office` colapsan en los nombres reales.
 
 ## 2. Muestra ciega — 10 métodos Java
 
@@ -47,11 +47,11 @@ las llamadas intra-clase y produjo un "160% de cobertura" que era falso.
 | findAllActiveWithJoins | 2 | 2 | ok |
 | getNombreRegimenMatrimonial | 2 | 2 | ok |
 | CamposNormalizadosDTO | 0 | 1 | ambos ~cero |
-| searchAndMapForAdminNui | 39 | 4 | ok |
+| searchAndMapForAdminItem | 39 | 4 | ok |
 | setConfiguracionDependencia | 1 | 2 | ok |
-| leerNuiIns | 1 | 1 | ok |
-| seccionesSinSolicitud | 3 | 2 | ok |
-| getTipoCertificacion | 3 | 2 | ok |
+| leerItemIns | 1 | 1 | ok |
+| seccionesSinItem | 3 | 2 | ok |
+| getTipoDocumento | 3 | 2 | ok |
 
 **Grafos vacíos con llamadas reales: 0 de 10.** Ese era el defecto.
 
@@ -78,7 +78,7 @@ final corrió: la base abre limpia.
 - ~~**Rust y Python sin reindexar.**~~ **HECHO el 2026-08-26** — ver §7.
 - **Ningún constructor Java concreto identificado en el índice.** El test
   unitario prueba que ahora produce arista —fallaba con `edges: []` antes del
-  cambio— pero no se nombró un constructor real de REVFA_BackEnd en el grafo.
+  cambio— pero no se nombró un constructor real de backend-a en el grafo.
 - **El tiempo de `impact` no se volvió a medir** tras el reindexado.
 - **El archivo creció de 90 MB a 1.23 GB** y no volvió a bajar con los
   checkpoints. Sin explicar. Ver riesgos.
@@ -128,7 +128,7 @@ pequeños; que el comportamiento sobre código real no cambiara era otra cosa.
 
 ### Python — la comparación que vale
 
-`REVFAConversorPlantilla` tenía su índice de hacía días, construido con el parser
+`template-converter` tenía su índice de hacía días, construido con el parser
 **anterior**. Un `--full` lo rehizo entero con el nuevo:
 
 | | Archivos | Chunks | Símbolos |

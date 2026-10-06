@@ -26,6 +26,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The repository is public and field measurements are taken on private
+      # codebases. Their identifiers go through aliases; this fails if a real
+      # one slips into a tracked file. The pattern is assembled from pieces so
+      # this file does not match itself.
+      - name: private identifiers
+        run: |
+          pattern="re""vfa|rn""pn|registro""exterior|tickets""-srv|/home/""snaven10|prepar""tida|oficina""service"
+          if git grep -n -i -E "$pattern" -- .; then
+            echo "::error::private identifiers found in tracked files (see above)"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

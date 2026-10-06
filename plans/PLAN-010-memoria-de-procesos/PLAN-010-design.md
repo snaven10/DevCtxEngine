@@ -29,7 +29,7 @@ Un serve con modelo cargado tiene, a grandes rasgos:
 - **HM-1**: de los ~500 MB de un serve en reposo con modelo, ≥ 250 MB son modelo + ORT (pesos +
   prepacking + arena retenida) y el resto DuckDB + HNSW.
 - **HM-2**: el HNSW de DevCtxEngine (~N vectores × 384 × 4 B + grafo) cuesta decenas de MB, y el de
-  REVFA_FrontEnd cientos. Se cuenta con `SELECT count(*) FROM vectors` y se compara RSS antes/después
+  frontend cientos. Se cuenta con `SELECT count(*) FROM vectors` y se compara RSS antes/después
   del primer `search` vectorial tras abrir el DB.
 - **HM-3**: con el modelo liberado, el serve vuelve a < 60 MB (los 12-43 MB medidos + DuckDB/HNSW).
   Si no vuelve, la arena de ORT o el heap fragmentado retienen memoria aunque se suelte la sesión.
@@ -70,7 +70,7 @@ Contrato propuesto (aditivo):
 **Metodología de medición** (la usan todas las tasks): script `scripts/memprobe.sh` que, dado un PID,
 muestrea `/proc/<pid>/status` + `/proc/<pid>/smaps_rollup` (`Pss`, `Shared_Clean`, `Private_Dirty`)
 cada 200 ms durante un comando y reporta máximo y reposo. Escenarios fijos:
-(E1) central en reposo tras idle; (E2) serve DevCtxEngine `index --full`; (E3) serve REVFA_FrontEnd
+(E1) central en reposo tras idle; (E2) serve DevCtxEngine `index --full`; (E3) serve frontend
 indexación incremental; (E4) 3 serves con modelo cargado simultáneamente; (E5) 20 `search`
 consecutivos para p50/p95; (E6) serve recién abierto antes/después del primer `search` vectorial
 (costo HNSW).
@@ -209,7 +209,7 @@ YAML. El central usa los de `defaults.embeddings` de su config.
   falló, `eprintln!` con el motivo y el valor efectivo se reporta en `status.memory.duckdb`.
 - `temp_directory` explícito junto al DB (`<db>.tmp`, que ya es el default de DuckDB) y
   `max_temp_directory_size` acotado, para que un spill no llene el disco en silencio.
-- Defaults: se fijan con la matriz de TASK-002 (HNSW sobre copia de REVFA_FrontEnd con 512 MB /
+- Defaults: se fijan con la matriz de TASK-002 (HNSW sobre copia de frontend con 512 MB /
   1 GB / 2 GB × threads 2/4: ¿termina?, tiempo, `VmHWM`, spill). Propuesta en Q-1.
 
 ## DD-8 — `embeddings.provider: central` (opcional)

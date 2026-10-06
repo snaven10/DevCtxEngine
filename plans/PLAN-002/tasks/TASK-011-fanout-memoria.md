@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-002 — MCP resuelve el proyecto por ruta
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
 - **Depende de:** TASK-002
 - **Estado:** `pending`
 

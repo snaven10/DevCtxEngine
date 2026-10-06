@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-002 — MCP resuelve el proyecto por ruta
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
 - **Depende de:** — (primera del plan)
 - **Estado:** `done`
 
@@ -20,7 +20,7 @@ varios, si comparten grupo. Es la consulta que hoy no existe y por la que el ser
 (`crates/devctx-cli/src/main.rs:1099`). El `path` de cada fila es absoluto.
 
 El `group` NO viene en las filas de `list`: vive en `project.group` del `config.yaml` de cada repo
-(verificado: los 11 repos REVFA tienen `group: REVFA`). Hay que leerlo por `config_path`, o
+(verificado: los 11 repos ACME tienen `group: ACME`). Hay que leerlo por `config_path`, o
 extender la fila del registry. **Preferir leer el config**: no cambia el esquema (PLAN §4).
 
 ## Archivos
@@ -31,7 +31,7 @@ extender la fila del registry. **Preferir leer el config**: no cambia el esquema
 
 - [ ] **Paso 1 — `projects_under(cwd) -> Vec<ProjectRow>`.** Filtrar `client.list(false)` por filas
       cuyo `path` sea descendiente de `cwd`. Comparar por componentes de ruta canonizada, NO por
-      `starts_with` de string: `/a/revfa` no debe matchear `/a/revfa-otro`.
+      `starts_with` de string: `/a/acme` no debe matchear `/a/acme-otro`.
 - [ ] **Paso 2 — Excluir el caso exacto.** Si `path == cwd` no es "descendiente": ese caso ya lo
       resuelve `load_project()` hacia arriba y no debe entrar acá.
 - [ ] **Paso 3 — `group_of(row) -> Option<String>`.** Leer `project.group` del `config_path` de la
@@ -50,7 +50,7 @@ extender la fila del registry. **Preferir leer el config**: no cambia el esquema
 - [ ] Con cwd = raíz con un solo repo registrado adentro → `Single`.
 - [ ] Con repos de grupos distintos (o alguno sin grupo) → `Ambiguous`, nunca `Group`.
 - [ ] Sin nada registrado adentro → `Empty`.
-- [ ] `/tmp/revfa` NO devuelve los proyectos de `/tmp/revfa-otro` (prueba explícita del prefijo).
+- [ ] `/tmp/acme` NO devuelve los proyectos de `/tmp/acme-otro` (prueba explícita del prefijo).
 - [ ] La función no abre ningún store de proyecto: solo registry + lectura de `config.yaml`.
 
 ## Riesgos

@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-007 — Planes en la raíz del workspace
 - **Especialista:** rust (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
 - **Depende de:** TASK-003
 - **Estado:** `done`
 
@@ -10,13 +10,13 @@
 
 ## Objetivo
 
-Que `devctx web` arranque desde `~/revfa` (sin `.devctx/`) y que su pestaña "Plans" muestre
-`~/revfa/plans` (PLAN-007 DD-5). Sin flag nuevo.
+Que `devctx web` arranque desde `~/acme` (sin `.devctx/`) y que su pestaña "Plans" muestre
+`~/acme/plans` (PLAN-007 DD-5). Sin flag nuevo.
 
 ## Contexto verificado
 
 - `crates/devctx-cli/src/main.rs:1318` — `cmd_web` empieza con `load_project()?` (`main.rs:3429`), que
-  exige `.devctx/config.yaml` subiendo por los padres: en `~/revfa` falla con "No DevCtxEngine project
+  exige `.devctx/config.yaml` subiendo por los padres: en `~/acme` falla con "No DevCtxEngine project
   found (run `devctx init` first)".
 - `cmd_web` reusa un daemon que ya corre para ese proyecto (`remote::running_server_url`) o levanta
   `devctx_api::run_blocking(cfg, …)` con el `AppState` del proyecto.

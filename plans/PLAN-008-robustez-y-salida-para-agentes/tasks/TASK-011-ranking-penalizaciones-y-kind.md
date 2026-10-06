@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-008 — Robustez del ciclo de vida y salida útil para agentes
 - **Especialista:** rust (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 - **Depende de:** —
 - **Estado:** `done`
 
@@ -20,7 +20,7 @@ puede filtrar duro con `kind`/`include_tests`; vendor/generado no entra al índi
 - `crates/devctx-core/src/config.rs:176-187` — `Indexing.exclude: Vec<String>`, vacío por defecto.
 - `crates/devctx-index/src/git.rs:85-99` — archivos = `git ls-files` + no trackeados no ignorados;
   `crates/devctx-index/src/pipeline.rs:329-340` — `build_exclude` (motor gitignore).
-- Inventario: en REVFA_BackEnd el 57 % de las aristas sale de `/test/`; en búsquedas de campo los
+- Inventario: en backend-a el 57 % de las aristas sale de `/test/`; en búsquedas de campo los
   javadocs largos y specs desplazan al código.
 
 ## Archivos
@@ -51,7 +51,7 @@ puede filtrar duro con `kind`/`include_tests`; vendor/generado no entra al índi
       `src/` primero; con `kind: "test"` solo vuelve el test.
 - [x] Test de indexado: un `dist/app.js` versionado no entra con defaults; entra con
       `default_excludes: false`.
-- [ ] En el Resultado: 3 consultas de campo (REVFA_BackEnd) con el top-5 antes/después.
+- [ ] En el Resultado: 3 consultas de campo (backend-a) con el top-5 antes/después.
 
 ## Riesgos
 
@@ -61,7 +61,7 @@ Ver PLAN-008 §7 (excludes y penalización). El factor es configurable para pode
 
 <!-- Contrato: PLAN-008 §11 -->
 
-1. **Estado final:** `done` (el criterio de las 3 consultas de campo en REVFA_BackEnd queda para TASK-016: no se tocó `~/revfa`).
+1. **Estado final:** `done` (el criterio de las 3 consultas de campo en backend-a queda para TASK-016: no se tocó `~/acme`).
 2. **Repro antes/después.** Antes: en una búsqueda sin filtro, un spec/README/SQL con similitud igual o mayor
    quedaba por encima del código; `build/`, `target/` y todo lo versionado generado entraba al índice (solo
    había un salto interno de `node_modules`/`vendor`/`third_party`/`dist`/`bower_components` en `is_generated`,
@@ -130,7 +130,7 @@ Ver PLAN-008 §7 (excludes y penalización). El factor es configurable para pode
 11. **Contrato JSON.** `search` (MCP/HTTP): entrada `kind?`, `include_tests?`; la salida no cambia. `search_project`:
     entrada `kind?`, `include_tests?`. Config nueva: `indexing.default_excludes`, `indexing.include_build`,
     `search.penalty.{test,doc,config}`.
-12. **No verificado.** Las 3 consultas de campo en REVFA_BackEnd con top-5 antes/después (TASK-016); el valor
+12. **No verificado.** Las 3 consultas de campo en backend-a con top-5 antes/después (TASK-016); el valor
     0.6 es el sugerido por la task, no calibrado contra datos reales; una API HTTP vieja ignora `kind`
     (campo desconocido); `devctx-tui` no usa los filtros; docs EN/ES (TASK-015); Windows.
 13. **Números.** Sobre-fetch de 400 candidatos por recuperador con filtro duro; 9 excludes por defecto.

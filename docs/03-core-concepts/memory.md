@@ -151,7 +151,7 @@ devctx memories backfill-links
 There is a text-derived pass for memories with no `files` at all, which is
 roughly half of a real corpus. It builds a *candidate* list from file paths
 named in the prose and over-matches by design: the same pattern that finds
-`apps/registry/src/app/components/firmar-registro.ts` also finds `Shepherd.js`,
+`apps/portal/src/app/components/sign-form.ts` also finds `Shepherd.js`,
 which is a library nobody indexed, and `CLAUDE.md`, which is not code. Every
 candidate is checked against the index before a link is written. **The index is
 what tells them apart, never the pattern.**

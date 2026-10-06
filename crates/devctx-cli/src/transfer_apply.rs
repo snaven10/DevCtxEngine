@@ -96,7 +96,7 @@ mod tests {
             content: content.into(),
             topic_key: topic.into(),
             normalized_hash: hash.into(),
-            project: "@group:REVFA".into(),
+            project: "@group:ACME".into(),
             ..Default::default()
         }
     }

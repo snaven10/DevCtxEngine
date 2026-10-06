@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-003 — Grafo y registro de lenguajes
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
 - **Depende de:** —
 - **Estado:** `done`
 

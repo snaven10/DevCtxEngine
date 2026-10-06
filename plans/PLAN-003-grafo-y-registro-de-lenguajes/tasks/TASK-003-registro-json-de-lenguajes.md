@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-003 — Grafo y registro de lenguajes
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/grafo-y-registro-de-lenguajes`
 - **Depende de:** TASK-002
 - **Estado:** `done`
 
@@ -96,4 +96,4 @@ la red — no los modifiques para que pasen.
 ## Resultado
 
 - **Estado final:** `done` (2026-08-24)
-- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre REVFA_BackEnd, con lo que NO se verificó declarado.
+- **Verificado por:** ver [`../VERIFICACION.md`](../VERIFICACION.md) — medición completa sobre backend-a, con lo que NO se verificó declarado.

@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-002 — MCP resuelve el proyecto por ruta
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
 - **Depende de:** — (paralela a TASK-001)
 - **Estado:** `done`
 
@@ -27,7 +27,7 @@ fn bound(&self)       -> Result<Arc<Backend>, ErrorData>  // error = unbound_hel
 fn maybe_bound(&self) -> Option<Arc<Backend>>             // para tools de registry
 ```
 
-`Option<Arc<Backend>>` no puede expresar "estoy en el grupo REVFA, con 11 miembros, ninguno elegido".
+`Option<Arc<Backend>>` no puede expresar "estoy en el grupo ACME, con 11 miembros, ninguno elegido".
 Ese es el estado nuevo.
 
 ## Archivos

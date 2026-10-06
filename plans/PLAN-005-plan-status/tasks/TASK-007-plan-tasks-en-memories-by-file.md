@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-005 — `plan_status`
 - **Especialista:** — (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plan-status`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/plan-status`
 - **Depende de:** TASK-001
 - **Estado:** `done`
 
@@ -56,7 +56,7 @@ task de qué plan lo va a tocar o lo tocó?" cuesta una lectura de `plans/` y **
 
 - Costo: una lectura de `plans/` por llamada. Mismo orden que TASK-002.
 - **`memories_by_symbol` queda fuera** (PLAN §7): símbolo → archivo exige resolver definiciones, y con
-  nombre pelado es inferencia (21 declaraciones de `actualizar` en REVFA_BackEnd, PLAN-003).
+  nombre pelado es inferencia (21 declaraciones de `actualizar` en backend-a, PLAN-003).
 
 ## Resultado
 

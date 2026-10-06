@@ -368,7 +368,7 @@ mod tests {
     fn the_summary_shows_every_section() {
         let a = Answers {
             model: Some("ml-granite".into()),
-            group: Some("REVFA".into()),
+            group: Some("ACME".into()),
             ..Default::default()
         };
         let s = summary("demo", &a, "ml-granite");
@@ -384,11 +384,11 @@ mod tests {
     #[test]
     fn the_summary_explains_where_each_kind_of_memory_will_live() {
         let a = Answers {
-            group: Some("REVFA".into()),
+            group: Some("ACME".into()),
             ..Default::default()
         };
         let s = summary("demo", &a, "ml-granite");
-        assert!(s.contains("REVFA"), "{s}");
+        assert!(s.contains("ACME"), "{s}");
         assert!(s.contains("local"), "{s}");
         assert!(s.contains("group"), "{s}");
         assert!(s.contains("global"), "{s}");
@@ -410,11 +410,11 @@ mod tests {
     #[test]
     fn copying_a_configuration_is_summarised_as_exactly_that() {
         let a = Answers {
-            copy_from: Some("REVFA_BackEnd".into()),
+            copy_from: Some("backend-a".into()),
             ..Default::default()
         };
         let s = summary("demo", &a, "ml-granite");
-        assert!(s.contains("copied from `REVFA_BackEnd`"), "{s}");
+        assert!(s.contains("copied from `backend-a`"), "{s}");
         assert!(!s.contains("rerank"), "nothing here was chosen: {s}");
     }
 
@@ -425,7 +425,7 @@ mod tests {
     fn the_summary_is_written_in_the_chosen_language() {
         let a = Answers {
             language: Some(Language::Es),
-            group: Some("REVFA".into()),
+            group: Some("ACME".into()),
             ..Default::default()
         };
         let s = summary("demo", &a, "ml-granite");

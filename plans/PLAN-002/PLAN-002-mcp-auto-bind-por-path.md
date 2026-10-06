@@ -3,7 +3,7 @@
 **Fecha:** 2026-08-19
 **Fase:** 2 (Ejecución) — aprobado 2026-08-19. Rama `feature/mcp-auto-bind-por-path`
 **Proyecto:** DevCtxEngine
-**Origen:** Falla reproducida en un workspace real (`/home/snaven10/revfa`, 11 repos registrados):
+**Origen:** Falla reproducida en un workspace real (`/home/you/acme`, 11 repos registrados):
 `remember` aborta con "not bound to a project" en el 100% de las sesiones.
 
 ---
@@ -33,7 +33,7 @@ workspace no hay nada arriba, y **nunca mira hacia abajo**, donde están los 11 
 
 ### 2.2 El `group` ya está poblado
 
-Los 11 repos REVFA tienen `project.group: REVFA` en su `config.yaml`. La materia prima para resolver
+Los 11 repos ACME tienen `project.group: ACME` en su `config.yaml`. La materia prima para resolver
 por grupo **ya existe**; no hay que pedirle nada nuevo al usuario.
 
 ### 2.3 La maquinaria de rebind ya está construida

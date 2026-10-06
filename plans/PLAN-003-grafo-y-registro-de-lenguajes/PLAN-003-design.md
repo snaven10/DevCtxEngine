@@ -32,15 +32,15 @@ por construcción.
 Del lado de `get_callers` depende del sitio de llamada:
 
 ```java
-oficinaService.actualizar(id, request, usuario)  // campo tipado → "OficinaService.actualizar"
+officeService.actualizar(id, request, usuario)  // campo tipado → "OfficeService.actualizar"
 return crearNotificacion(dto);                   // intra-clase, sin this. → "crearNotificacion"
 ```
 
-### Medición (2026-08-23, REVFA_BackEnd, rama `development`)
+### Medición (2026-08-23, backend-a, rama `development`)
 
 ```
 devctx impact actualizar                 → 0 callers, 0 callees
-devctx impact OficinaService.actualizar  → 1 caller, 23 callees
+devctx impact OfficeService.actualizar  → 1 caller, 23 callees
 devctx impact crearNotificacion          → 8 callers directos (todas llamadas intra-clase sin receptor)
 ```
 
@@ -78,7 +78,7 @@ SELECT DISTINCT source FROM graph_edges
 
 **Regla de desempate:** si el usuario pasa un nombre **ya calificado**
 (contiene `.`), se busca exacto y no se expande. La expansión aplica solo al
-nombre pelado. Así `OficinaService.actualizar` sigue significando una cosa sola.
+nombre pelado. Así `OfficeService.actualizar` sigue significando una cosa sola.
 
 **El colapso de homónimos se reporta, no se esconde.** Si `actualizar` expande
 a 7 declaraciones, la salida lo dice. Un grafo que fusiona 7 métodos distintos
@@ -91,10 +91,10 @@ cadena fluida —que en Quarkus reactivo es la norma— eso es **toda la expresi
 anterior, saltos de línea incluidos**. Targets reales medidos hoy:
 
 ```
-Oficina.findByCodigo(codigo).flatMap
-Oficina
-        .persist(oficina).replaceWith(
-            () -> OficinaDTO.from(oficina)).invoke
+Office.findByCodigo(codigo).flatMap
+Office
+        .persist(office).replaceWith(
+            () -> OfficeDTO.from(office)).invoke
 ```
 
 Regla: el receptor se acepta como calificador **solo** si su texto es un
@@ -103,7 +103,7 @@ identificador simple o una cadena punteada de identificadores (`self.campo`,
 respuesta honesta.
 
 Efecto colateral bueno: hoy `getNombre` existe como nodo pelado **y** como
-`OficinaRequestDTO.getNombre`. Esto reduce la duplicación de nodos.
+`OfficeRequestDTO.getNombre`. Esto reduce la duplicación de nodos.
 
 **Requiere reindexar** — cambia lo que se escribe en `graph_edges`.
 

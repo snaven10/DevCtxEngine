@@ -2,8 +2,8 @@
 
 - **Plan:** PLAN-010 — Memoria de procesos
 - **Especialista:** — (orquestador, con el binario nuevo instalado y aprobación del usuario)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`) + lectura/medición en
-  `/home/snaven10/revfa`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`) + lectura/medición en
+  `/home/you/acme`
 - **Depende de:** TASK-010
 - **Estado:** `pending`
 
@@ -21,16 +21,16 @@ fase de verify del plan.
 - "A rebuilt binary does not take effect until the server restarts" (`AGENTS.md`):
   `devctx serve --stop` en cada repo y del central antes de medir; las sesiones MCP viejas siguen
   vivas hasta cerrarse.
-- Sin reindex: el criterio es que los índices existentes (DevCtxEngine, REVFA_FrontEnd y el resto
-  del grupo `revfa`) sigan sirviendo sin `index --full`.
+- Sin reindex: el criterio es que los índices existentes (DevCtxEngine, frontend y el resto
+  del grupo `acme`) sigan sirviendo sin `index --full`.
 
 ## Pasos
 
 - [ ] **E1.** Central en reposo tras el idle de modelos → RSS (meta ≤ 150 MB).
 - [ ] **E2.** DevCtxEngine `index --full` → `VmHWM` del serve (meta ≤ 1.5 GB) y chunks/s
       (≥ −15 %). **Nota:** `--full` re-embebe DevCtxEngine; es el único reindex permitido y es de
-      este repo, no de revfa.
-- [ ] **E3.** REVFA_FrontEnd indexación incremental (un commit trivial en una copia/worktree de
+      este repo, no de acme.
+- [ ] **E3.** frontend indexación incremental (un commit trivial en una copia/worktree de
       prueba, o la próxima indexación real con aprobación) → `VmHWM` (meta ≤ 1.5 GB).
 - [ ] **E4.** 3 serves con modelo cargado → `Pss`/`RssAnon`/`RssFile` (meta: pesos compartidos,
       si TASK-006 quedó `done`).
@@ -38,9 +38,9 @@ fase de verify del plan.
       contra índices reales.
 - [ ] **E6.** `status.memory` en serve y central: los cuatro bloques con números coherentes con
       `/proc`.
-- [ ] **Sin reindex.** `status` en los repos de revfa: sin aviso de reindex nuevo; `search`/`recall`
+- [ ] **Sin reindex.** `status` en los repos de acme: sin aviso de reindex nuevo; `search`/`recall`
       responden.
-- [ ] **DuckDB.** HNSW de REVFA_FrontEnd sigue presente y usable con el `memory_limit` nuevo
+- [ ] **DuckDB.** HNSW de frontend sigue presente y usable con el `memory_limit` nuevo
       (`status.memory.duckdb` y `hnsw`).
 - [ ] **`provider: central`** (si TASK-009 `done`): un repo de prueba con el modo activo, RSS en
       reposo y `search` OK; central detenido → error explícito.
@@ -49,7 +49,7 @@ fase de verify del plan.
 ## Criterios de aceptación
 
 - [ ] Cada fila de PLAN-010 §6 con su número real y veredicto; desviaciones explicadas.
-- [ ] `git status` limpio en los repos de revfa (solo lectura).
+- [ ] `git status` limpio en los repos de acme (solo lectura).
 - [ ] `## 13. Cierre` del master redactado con lo verificado **y lo no verificado** (CUDA, macOS en
       runtime, Windows en runtime).
 

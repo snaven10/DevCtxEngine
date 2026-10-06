@@ -361,7 +361,7 @@ fn receiver_of(callee: Node<'_>, bytes: &[u8]) -> Option<String> {
 ///
 /// The receiver node of a chained call is the entire expression before the dot.
 /// In reactive Java that is routine, and it put graph nodes like
-/// `Oficina.findByCodigo(codigo).flatMap` — and three-line ones with a lambda
+/// `Office.findByCodigo(codigo).flatMap` — and three-line ones with a lambda
 /// inside — into the call graph, where they match nothing and are searchable by
 /// nobody.
 ///

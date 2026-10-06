@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-010 — Memoria de procesos
 - **Especialista:** general-purpose (Rust)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
 - **Depende de:** — (arranca en paralelo con TASK-001; **debe** cerrarse con fastembed aún en el árbol)
 - **Estado:** `pending`
 

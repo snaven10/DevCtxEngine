@@ -168,11 +168,11 @@ impl Store {
     /// bare name unable to match any `source` at all, and able to match a
     /// `target` only by luck of how the call happened to be written. Measured
     /// on a Java/Quarkus repository: `actualizar` returned nothing while
-    /// `OficinaService.actualizar` returned one caller and twenty-three
+    /// `OfficeService.actualizar` returned one caller and twenty-three
     /// callees. The edges were never missing — the key was.
     ///
     /// So a bare name expands to every qualified form carrying it. A name that
-    /// is already qualified is returned untouched: `OficinaService.actualizar`
+    /// is already qualified is returned untouched: `OfficeService.actualizar`
     /// has to keep meaning exactly one thing. A name nothing matches returns as
     /// itself, so an absent symbol still yields an empty result rather than an
     /// error.
@@ -358,7 +358,7 @@ impl Store {
         let seeds = self.resolve_symbol(repo, branch, start)?;
 
         // Two sets, because a seed is both a starting point and a reachable
-        // node. In `OficinaResource.actualizar -> OficinaService.actualizar`
+        // node. In `OfficeResource.actualizar -> OfficeService.actualizar`
         // — the dominant shape in a Quarkus codebase — both ends answer to the
         // bare name `actualizar`, so both are seeds *and* one is genuinely the
         // caller of the other. Suppressing a seed from the output would drop
@@ -455,11 +455,11 @@ mod tests {
             .replace_file_edges(
                 "repo",
                 "main",
-                "OficinaResource.java",
+                "OfficeResource.java",
                 &[edge(
-                    "OficinaResource.actualizar",
-                    "OficinaService.actualizar",
-                    "OficinaResource.java",
+                    "OfficeResource.actualizar",
+                    "OfficeService.actualizar",
+                    "OfficeResource.java",
                     129,
                 )],
             )
@@ -481,11 +481,11 @@ mod tests {
             .replace_file_edges(
                 "repo",
                 "main",
-                "OficinaService.java",
+                "OfficeService.java",
                 &[edge(
-                    "OficinaService.actualizar",
-                    "Oficina.persist",
-                    "OficinaService.java",
+                    "OfficeService.actualizar",
+                    "Office.persist",
+                    "OfficeService.java",
                     121,
                 )],
             )
@@ -502,11 +502,11 @@ mod tests {
         let store = java_like();
 
         let callers = store.get_callers("repo", "main", "actualizar").unwrap();
-        assert!(callers.contains(&"OficinaResource.actualizar".to_string()));
+        assert!(callers.contains(&"OfficeResource.actualizar".to_string()));
         assert!(callers.contains(&"TicketResource.actualizar".to_string()));
 
         let callees = store.get_callees("repo", "main", "actualizar").unwrap();
-        assert!(callees.contains(&"Oficina.persist".to_string()));
+        assert!(callees.contains(&"Office.persist".to_string()));
 
         let refs = store.find_references("repo", "main", "actualizar").unwrap();
         assert_eq!(refs.len(), 2, "both call sites, not zero");
@@ -522,8 +522,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "OficinaResource.actualizar",
-                "OficinaService.actualizar",
+                "OfficeResource.actualizar",
+                "OfficeService.actualizar",
                 "TicketResource.actualizar",
                 "TicketService.actualizar",
             ]
@@ -538,15 +538,15 @@ mod tests {
         let store = java_like();
         assert_eq!(
             store
-                .resolve_symbol("repo", "main", "OficinaService.actualizar")
+                .resolve_symbol("repo", "main", "OfficeService.actualizar")
                 .unwrap(),
-            vec!["OficinaService.actualizar"]
+            vec!["OfficeService.actualizar"]
         );
         assert_eq!(
             store
-                .get_callers("repo", "main", "OficinaService.actualizar")
+                .get_callers("repo", "main", "OfficeService.actualizar")
                 .unwrap(),
-            vec!["OficinaResource.actualizar"]
+            vec!["OfficeResource.actualizar"]
         );
     }
 
@@ -572,14 +572,14 @@ mod tests {
     #[test]
     fn traversal_does_not_re_expand_the_names_it_walks() {
         let store = java_like();
-        // `Oficina.persist` calls a bare `flush`; an unrelated `Repo.flush`
+        // `Office.persist` calls a bare `flush`; an unrelated `Repo.flush`
         // exists and calls something that must never surface here.
         store
             .replace_file_edges(
                 "repo",
                 "main",
-                "Oficina.java",
-                &[edge("Oficina.persist", "flush", "Oficina.java", 40)],
+                "Office.java",
+                &[edge("Office.persist", "flush", "Office.java", 40)],
             )
             .unwrap();
         store
@@ -592,11 +592,11 @@ mod tests {
             .unwrap();
 
         let down = store
-            .impact_analysis("repo", "main", "OficinaService.actualizar", 5)
+            .impact_analysis("repo", "main", "OfficeService.actualizar", 5)
             .unwrap()
             .downstream;
         let reached: Vec<&str> = down.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(reached.contains(&"Oficina.persist"));
+        assert!(reached.contains(&"Office.persist"));
         assert!(reached.contains(&"flush"));
         assert!(
             !reached.contains(&"noDebeAparecer"),
@@ -608,7 +608,7 @@ mod tests {
     /// bare name, so every declaration behind it is a legitimate entry point.
     ///
     /// And a seed still gets reported when it is reached as a neighbour. In
-    /// `OficinaResource.actualizar -> OficinaService.actualizar` both ends
+    /// `OfficeResource.actualizar -> OfficeService.actualizar` both ends
     /// answer to `actualizar`; treating a seed as already-seen would delete the
     /// one edge the question was actually about.
     #[test]
@@ -619,13 +619,13 @@ mod tests {
             .unwrap();
         assert!(impact
             .upstream
-            .contains(&("OficinaResource.actualizar".to_string(), 1)));
+            .contains(&("OfficeResource.actualizar".to_string(), 1)));
         assert!(impact
             .upstream
             .contains(&("TicketResource.actualizar".to_string(), 1)));
         assert!(impact
             .downstream
-            .contains(&("Oficina.persist".to_string(), 1)));
+            .contains(&("Office.persist".to_string(), 1)));
     }
 
     /// The repair path for a database whose ART indexes lost their entries to a

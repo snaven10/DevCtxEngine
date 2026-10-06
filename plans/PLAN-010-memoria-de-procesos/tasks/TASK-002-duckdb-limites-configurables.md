@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-010 — Memoria de procesos
 - **Especialista:** general-purpose (Rust)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
 - **Depende de:** TASK-001
 - **Estado:** `pending`
 
@@ -12,7 +12,7 @@
 
 Que el presupuesto de DuckDB de cada proceso sea configurable desde `config.yaml` (además del env),
 que el valor efectivo se verifique y se reporte, y que el default salga de medir la creación del HNSW
-sobre el store más grande disponible (REVFA_FrontEnd, 2.3 GB), no de una suposición. PLAN-010 DD-7.
+sobre el store más grande disponible (frontend, 2.3 GB), no de una suposición. PLAN-010 DD-7.
 
 ## Contexto verificado
 
@@ -42,7 +42,7 @@ sobre el store más grande disponible (REVFA_FrontEnd, 2.3 GB), no de una suposi
 ## Pasos
 
 - [ ] **Paso 1 — matriz de medición (antes de tocar defaults).** Sobre una **copia** del DB de
-      REVFA_FrontEnd en el scratchpad (nunca el original): `DROP INDEX` del HNSW y re-crearlo con
+      frontend en el scratchpad (nunca el original): `DROP INDEX` del HNSW y re-crearlo con
       `memory_limit` ∈ {512MB, 1GB, 2GB} × `threads` ∈ {2, 4}. Medir con `scripts/memprobe.sh`:
       ¿termina?, tiempo, `VmHWM`, bytes de spill en `<db>.tmp`. Repetir el `search` vectorial
       (latencia) con cada combinación. Mismo ejercicio rápido sobre el DB del central.
@@ -65,7 +65,7 @@ sobre el store más grande disponible (REVFA_FrontEnd, 2.3 GB), no de una suposi
       `DEVCTX_DB_MEMORY_LIMIT=1GB` además, gana el env.
 - [ ] Test: un literal inválido en config se ignora con aviso y queda el default (no inyecta SQL).
 - [ ] La matriz del paso 1 está en el Resultado y el default elegido crea el HNSW de la copia de
-      REVFA_FrontEnd sin OOM.
+      frontend sin OOM.
 - [ ] `a_new_store_caps_its_own_thread_count` sigue verde (o se adapta al nuevo default).
 
 ## Riesgos

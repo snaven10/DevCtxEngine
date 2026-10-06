@@ -6,7 +6,7 @@
 **Fase anterior:** hotfix 0.8.5 (D1 lotes de embeddings en serie + batch 8 por defecto; D2 liberación
 por inactividad del embedder del central + corrección del comentario falso). Lo ejecuta otra sesión
 fuera de este plan; PLAN-010 lo da por hecho y **no lo re-planifica**.
-**Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`). Sale de `main` una vez
+**Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`). Sale de `main` una vez
 publicado 0.8.5 (y de lo que haya en `main` de PLAN-008 P1 en ese momento). Rama sugerida:
 `feat/plan-010-memoria`.
 **Origen:** investigación verificada de consumo de memoria del 2026-10-05 (devctx 0.8.4, máquina
@@ -49,7 +49,7 @@ Este plan ataca lo estructural:
 | Proceso | RSS | VmHWM | Notas |
 |---|---|---|---|
 | central (`serve --central`) | **1.8 GB** | 1.9 GB | 1.77 GB `RssAnon`; modelo cargado por un `remember`/`recall` y nunca liberado |
-| serve `REVFA_FrontEnd` | 601 MB | **6.5 GB** | `DEVCTX_EMBED_BATCH_SIZE=8`; DB de 2.3 GB |
+| serve `frontend` | 601 MB | **6.5 GB** | `DEVCTX_EMBED_BATCH_SIZE=8`; DB de 2.3 GB |
 | serve `DevCtxEngine` | 508 MB | **18.2 GB** | batch 32 (default), índice completo |
 | 12 serves sin modelo cargado | 12-43 MB c/u | — | lo que cuesta un serve "vacío" |
 | zombies `<defunct>` | 6 | — | hijos `devctx` bajo procesos `devctx mcp` viejos (ver §2, H7) |
@@ -162,7 +162,7 @@ Resumen; el detalle y los tradeoffs están en [`PLAN-010-design.md`](./PLAN-010-
 - **Reindexar** cualquier proyecto: el criterio es justamente no tener que hacerlo.
 - **Zombies de MCPs ≤ 0.8.2** (H7): arreglados en 0.8.3; desaparecen al cerrar esas sesiones.
 - Ítems de PLAN-008 TASK-017 (idle exit con listener abierto, `in_tx`, kqueue…): siguen allá.
-- Tocar `/home/snaven10/revfa` más allá de lectura y medición (copias del DB para las pruebas de
+- Tocar `/home/you/acme` más allá de lectura y medición (copias del DB para las pruebas de
   HNSW se hacen en el scratchpad).
 
 ## 5. Tasks y orden
@@ -170,7 +170,7 @@ Resumen; el detalle y los tradeoffs están en [`PLAN-010-design.md`](./PLAN-010-
 | Task | Qué | Especialista | Depende de | Estado |
 |------|-----|--------------|------------|--------|
 | TASK-001 | Instrumentación de memoria (`status.memory`, logs de carga/liberación) y línea base post-0.8.5 | general-purpose (Rust) | — | `done` |
-| TASK-002 | DuckDB: `memory_limit`/`threads` en config, valores efectivos, defaults medidos con REVFA_FrontEnd | general-purpose (Rust) | TASK-001 | `pending` |
+| TASK-002 | DuckDB: `memory_limit`/`threads` en config, valores efectivos, defaults medidos con frontend | general-purpose (Rust) | TASK-001 | `pending` |
 | TASK-003 | Arnés de equivalencia: fixtures + vectores y scores dorados generados con fastembed | general-purpose (Rust) | — | `pending` |
 | TASK-004 | Motor ONNX propio para embeddings (`ort` + `tokenizers`), builtins y user-defined, CUDA y stall guard | general-purpose (Rust) | TASK-003 | `pending` |
 | TASK-005 | Reranker sobre el motor propio | general-purpose (Rust) | TASK-004 | `pending` |
@@ -210,14 +210,14 @@ de comparación (la columna se completa ahí).
 | RSS del central en reposo tras el idle de modelos | 1.8 GB; **0.9.0: 105 MB** (303 MB cargado) | ≤ 150 MB (sin modelo) |
 | RSS de un serve con modelo cargado, en reposo (DevCtxEngine) | 508 MB; **0.9.0: 300-315 MB** (pico de carga `VmHWM` ~710) | ≤ 250 MB, con el reparto modelo/ORT/DuckDB/HNSW explicado por `status.memory` |
 | Pico de indexación completa de DevCtxEngine (`VmHWM` del serve) | 18.2 GB; **0.9.0: 897 MiB** | ≤ 1.5 GB |
-| Pico de indexación incremental en REVFA_FrontEnd | 6.5 GB; **0.9.0: 753 MiB** (clon git, 149 archivos) | ≤ 1.5 GB |
+| Pico de indexación incremental en frontend | 6.5 GB; **0.9.0: 753 MiB** (clon git, 149 archivos) | ≤ 1.5 GB |
 | 3 serves con modelo cargado: páginas de pesos compartidas | 0 (todo `RssAnon`); **0.9.0: 3 serves = 679 MiB anon, Pss 742** | pesos en `RssFile`/`Pss` repartido; `RssAnon` por serve baja ≥ el tamaño del modelo (~98 MB) |
 | Embeddings motor nuevo vs fastembed, sobre el set de fixtures | — | coseno ≥ 0.9999 por vector; top-10 de `search` idéntico en el set de consultas |
 | Scores del reranker vs fastembed | — | `|Δ| ≤ 1e-3` y mismo orden en el set de fixtures |
 | Reindex requerido tras actualizar | — | **ninguno** (`extractor_stale`/aviso de modelo en `false`) |
 | Latencia de `search` (p50 y p95, 20 consultas, serve caliente) | **0.9.0: p50 30-37 ms, p95 40-70 ms** (CLI, serve caliente) | ≤ +10 % |
-| Throughput de indexación (chunks/s, DevCtxEngine completo) | **0.9.0: 8.9 chunks/s** (DevCtxEngine, 4 677 chunks; 7.9 en REVFA_FrontEnd) | ≥ −15 % (se acepta algo más lento a cambio del pico) |
-| DuckDB acotado y HNSW creado en REVFA_FrontEnd (2.3 GB) con el default elegido | 2 GB, sin medir | `CREATE INDEX … USING HNSW` termina sin OOM; `memory_limit` efectivo visible en `status` |
+| Throughput de indexación (chunks/s, DevCtxEngine completo) | **0.9.0: 8.9 chunks/s** (DevCtxEngine, 4 677 chunks; 7.9 en frontend) | ≥ −15 % (se acepta algo más lento a cambio del pico) |
+| DuckDB acotado y HNSW creado en frontend (2.3 GB) con el default elegido | 2 GB, sin medir | `CREATE INDEX … USING HNSW` termina sin OOM; `memory_limit` efectivo visible en `status` |
 | `status` informa memoria | no; **TASK-001: sí** (`status.memory`) | bloque `memory`: modelo cargado sí/no, RSS anon/file, DuckDB usado/límite, vectores HNSW |
 | `provider: central` (si se activa) | — | serve con `provider: central` en reposo ≤ 60 MB; `search` OK; error explícito con central caído |
 
@@ -236,7 +236,7 @@ de comparación (la columna se completa ahí).
   por máquina en la caché de modelos (no distribuirlo), con clave por versión de ORT + hash del
   `.onnx` + nivel de optimización; regenerar si no coincide (DD-5).
 - **HNSW fuera del `memory_limit`.** Bajar el límite puede no bajar el pico de crear el índice y sí
-  provocar spill del resto. Mitigación: TASK-002 mide en una copia de REVFA_FrontEnd antes de fijar
+  provocar spill del resto. Mitigación: TASK-002 mide en una copia de frontend antes de fijar
   defaults.
 - **Descarga de builtins sin fastembed.** Hay que reusar el layout de caché de hf-hub para no
   re-descargar (`models--Org--repo/snapshots/…` bajo `model_cache_dir`) y mantener

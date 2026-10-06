@@ -3,7 +3,7 @@
 **Fecha:** 2026-10-03
 **Fase:** 0 (borrador) — esqueleto aprobado por el usuario el 2026-10-03. Se detalla después de cerrar PLAN-008; las tasks son stubs de un
 párrafo y sus referencias `archivo:línea` se re-verifican al detallarlas.
-**Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`)
+**Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 **Origen:** consenso de dos sesiones sobre el inventario del grafo (`devctx-graph-inventory.md`) y el
 estado del arte (`research-state-of-art.md`), scratchpad de la sesión 695c60fd…, 2026-10-03.
 **Requiere:** cambio de schema + reindex completo de cada proyecto (~1 h por ~1400 archivos en 8 cores).
@@ -12,7 +12,7 @@ estado del arte (`research-state-of-art.md`), scratchpad de la sesión 695c60fd�
 
 ## 1. Problema (medido)
 
-Medido sobre una copia del índice de `REVFA_BackEnd` (rama `development`, binario 0.8.2):
+Medido sobre una copia del índice de `backend-a` (rama `development`, binario 0.8.2):
 
 | Métrica | Valor |
 |---|---|
@@ -29,7 +29,7 @@ Medido sobre una copia del índice de `REVFA_BackEnd` (rama `development`, binar
 Además, de campo: TS `export const x = () =>` no se extrae como símbolo; Python `get_references`
 deduplica por caller (pierde la 2.ª llamada), `impact` no ve callers a nivel de módulo, ruido de
 builtins; Java: caller vía campo inyectado por constructor en clase interna no se resuelve
-(`PrepartidaResource.java:310`, REVFA_REGISTRO_EXTERIOR).
+(`DraftResource.java:310`, backend-b).
 
 Causas (inventario §7): `type_map` plano por archivo con `or_insert` (`parser.rs:89-112`), resolución
 puramente sintáctica del receptor (`qualified_target`, `parser.rs:312-343`; `receiver_of`,
@@ -74,7 +74,7 @@ natural por símbolo: **no** (4/45 vs 27/45 con código fuente, mismo paper).
 | TASK-009 | Tool `traverse` | `traverse(symbol, edge_types, depth, direction)` sobre file/class/function con presupuesto y paginación | TASK-005 | `pending` |
 | TASK-010 | Vista skeleton por archivo | Tool `file_skeleton(file)`: símbolos de primer nivel con firma y rango | TASK-001 | `pending` |
 | TASK-011 | Docs EN + ES y guía de reindex | Schema nuevo, `devctx index --full` obligatorio, tools nuevas | TASK-008, TASK-009, TASK-010 | `pending` |
-| TASK-012 | Verificación de campo con métricas del §1 | Re-medir la tabla del §1 en REVFA_BackEnd y los casos de campo | TASK-011 | `pending` |
+| TASK-012 | Verificación de campo con métricas del §1 | Re-medir la tabla del §1 en backend-a y los casos de campo | TASK-011 | `pending` |
 
 ## 4. Riesgos
 
@@ -84,7 +84,7 @@ natural por símbolo: **no** (4/45 vs 27/45 con código fuente, mismo paper).
   preliminar: tabla nueva + reindex obligatorio detectado por la versión de extractor de PLAN-008
   TASK-007, sin migrar datos viejos).
 - **Costo de reindex.** ~1 h por ~1400 archivos en 8 cores (AGENTS.md §6), por proyecto y rama;
-  revfa tiene 13 repos. Además +10-30 % de tiempo de indexado estimado por la resolución extra
+  acme tiene 13 repos. Además +10-30 % de tiempo de indexado estimado por la resolución extra
   (estimación propia de la investigación, no medida).
 - **Grafo ruidoso vuelve contraproducente a PageRank**: TASK-006…008 no arrancan sin que TASK-002…005
   bajen el ruido medido (externos, tests, `var.*`).
@@ -102,8 +102,8 @@ natural por símbolo: **no** (4/45 vs 27/45 con código fuente, mismo paper).
 
 ## 6. Verificación (a detallar)
 
-Re-medir la tabla del §1 sobre REVFA_BackEnd tras reindex; casos de campo de §1 (TS arrow-const,
-Python, `PrepartidaResource.java:310`); latencia de `impact_analysis("map")` < 1 s; tokens de
+Re-medir la tabla del §1 sobre backend-a tras reindex; casos de campo de §1 (TS arrow-const,
+Python, `DraftResource.java:310`); latencia de `impact_analysis("map")` < 1 s; tokens de
 `repo_map` ≤ presupuesto.
 
 ## 7. Cierre

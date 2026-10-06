@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-007 — Planes en la raíz del workspace
 - **Especialista:** rust (modelo sugerido: sonnet)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/plans-workspace-root`
 - **Depende de:** —
 - **Estado:** `done`
 
@@ -12,7 +12,7 @@
 
 Que el estado de una task se encuentre donde los planes reales lo escriben y se lea aunque venga
 con emoji, bold, backticks o prosa de cola. Es la causa de 720 + ~600 de los 1592 warnings medidos
-en `~/revfa` (PLAN-007 §1.2).
+en `~/acme` (PLAN-007 §1.2).
 
 ## Contexto verificado
 
@@ -22,10 +22,10 @@ en `~/revfa` (PLAN-007 §1.2).
   línea con varios campos separados por ` · `.
 - `plans.rs:180` — `header_block`: entre el H1 y el primer `## `. Sin H1, hoy toma el texto entero.
 - `plans.rs:368` — `parse_task_doc` solo reconoce la clave `estado` (`plans.rs:379`).
-- `plans.rs:649` — `h1_title_strip_plan_prefix` solo quita `—`/`-`: 76 títulos de revfa quedan
+- `plans.rs:649` — `h1_title_strip_plan_prefix` solo quita `—`/`-`: 76 títulos de acme quedan
   como `": Actualizar configuración…"`; PLAN-008 tiene H1 `PLAN-1:` con dir `PLAN-008`.
 - `plans.rs:663` — `status_label`; `plans.rs:690` — `analyze` (`Status::Done => continue`).
-- Variantes reales de revfa (cuenta · texto), para los fixtures:
+- Variantes reales de acme (cuenta · texto), para los fixtures:
   237 `**Status:** done` · 232 `**Status:** pending` · 159 `` - **Estado:** `pending` `` ·
   32 `**Status:** completed` · 28 `**Status:** DONE` · 12 `Status: pending` (sin bold) ·
   11 `**Status**: pending` · 10 `**Status:** ✅ Completed — …` · 9 `**Status:** implemented — …` ·

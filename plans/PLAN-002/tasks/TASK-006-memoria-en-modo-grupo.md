@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-002 — MCP resuelve el proyecto por ruta
 - **Especialista:** —
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feature/mcp-auto-bind-por-path`
 - **Depende de:** TASK-002
 - **Estado:** `done`
 
@@ -21,7 +21,7 @@ del grupo — un repo elegido por heurística (TASK-002). Guardar ahí por defec
 la memoria en un repo que el usuario nunca eligió**, y `local` no lo recupera ningún repo hermano.
 
 Confirmado en vivo (2026-08-19): un `remember` con `scope: "group"` responde
-`{"scope": "group", "repo": "REVFA_BackEnd", "status": "created"}` — el `repo` sale del binding aun
+`{"scope": "group", "repo": "backend-a", "status": "created"}` — el `repo` sale del binding aun
 en scope group. O sea: el scope decide DÓNDE se guarda; el binding decide a qué repo se ATRIBUYE.
 Son dos cosas y hay que tratarlas por separado.
 
