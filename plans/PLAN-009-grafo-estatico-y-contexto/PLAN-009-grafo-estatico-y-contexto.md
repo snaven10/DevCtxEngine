@@ -229,7 +229,7 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 
 | Task | Qué | Especialista | Depende de | Estado |
 |------|-----|--------------|------------|--------|
-| TASK-001 | Arnés de evaluación del grafo y del contexto + línea base sobre 0.9.0 | general-purpose (Rust) | — | `pending` |
+| TASK-001 | Arnés de evaluación del grafo y del contexto + línea base sobre 0.9.0 | general-purpose (Rust) | — | `done` |
 | TASK-002 | Reindex barato: reusar vectores por `content_hash` del chunk | general-purpose (Rust) | — | `done` |
 | TASK-003 | Schema `symbols` + `edges`, ids estables, escritura por lotes y mantenimiento por archivo/rama | general-purpose (Rust) | TASK-001 | `pending` |
 | TASK-004 | Extracción estructurada por lenguaje: definiciones, imports, herencia, instanciación, `contains`, firmas | general-purpose (Rust) | TASK-003 | `pending` |
@@ -284,28 +284,28 @@ DevCtxEngine (Rust).
 
 | Criterio | Antes | Meta |
 |---|---|---|
-| Tipos de arista en el índice | 1 (`calls`) | ≥ 6: `calls`, `instantiates`, `imports`, `inherits`/`implements`, `contains`, `references` |
-| Nodos basura (`var.*`, constantes como tipo `LOG.*`, targets con `(`/espacios/saltos) | 481 + 1 272 + 0 | **0** |
-| `calls` guardadas sin `dst_id` ni marca `external` (no decididas) | 65 % sin calificar, 0 % ligadas | ≤ 15 % de las `calls` guardadas |
-| Aristas sin definición en el repo con marca `external` (o descartadas) | 0 % marcadas | 100 % de las que tienen evidencia (DD-9); el resto `low` |
-| Aristas desde tests marcadas `from_test` | 0 % | 100 % (= `path_kind` Test) |
-| Precisión de resolución sobre gold edges (40 sitios) | medir en TASK-001 | ≥ 90 % en `high`, ≥ 75 % global; cobertura (no `low`) ≥ 80 % |
-| Ocurrencias repetidas en un método | colapsadas en 1 | una fila por ocurrencia (test Python de `get_references`) |
-| `DraftResource.java:310` | `AlphaService.findPaginated` | `BetaService.findPaginated`, `high`, `resolution = field` |
-| `read_symbol("tokenInterceptor")` (frontend) | `[]` | definición en `lib-auth/.../token.interceptor.ts:78` |
-| `impact("get")` / `impact("map")` en backend-a | 3.9 s / 5.5 s (modelo), 1 883 / 2 569 upstream | p95 ≤ 300 ms; por defecto sin tests/externos, con `omitted` |
-| `external` con nombre calificado (`serde_json::from_str`, `Panache.withTransaction`) | `suggestions: []` (B2) | `external: true` + `called_from` |
-| `Foo::new` inexistente con un `new` hoja en el repo | `external: true` (falso) | no externo; `suggestions` |
-| `memories_by_symbol("Foo.Bar::baz")` | parte como archivo `Foo.Bar` | símbolo calificado, sin archivo |
-| `repo_map(budget=1024)` | no existe | tokens ≤ 1024 × 1.15; archivo esperado presente en ≥ 70 % de los casos del arnés con foco |
-| Relevancia de `build_context` (archivo/símbolo esperado en el brief, set del arnés) | medir en TASK-001 | ≥ base + 10 pp, y ningún caso pasa de acierto a fallo sin explicación en el Resultado |
-| `search --hybrid` (Hit@5 y MRR del arnés) | medir en TASK-001 | ≥ base (sin regresión > 2 % relativo); `--mode vector` idéntico a 0.9.0 |
+| Tipos de arista en el índice | 1 (`calls`; confirmado en los 5 repos medidos con 0.9.0) | ≥ 6: `calls`, `instantiates`, `imports`, `inherits`/`implements`, `contains`, `references` |
+| Nodos basura (`var.*`, constantes como tipo `LOG.*`, targets con `(`/espacios/saltos) | 481 + 1 272 + 0 (backend-a; idéntico en 0.9.0). Otros repos: backend-b 114 + 68 + 0, FrontEnd 0 + 0 + **135**, legacy-migration 0, DevCtxEngine 0 + 0 + 2 | **0** |
+| `calls` guardadas sin `dst_id` ni marca `external` (no decididas) | 65 % sin calificar, 0 % ligadas (BackEnd 65.3 %; backend-b 58.7 %, FrontEnd 69.9 %, Legacy 89.3 %, DevCtxEngine 94.0 %; 0 % con `dst_id`, la columna no existe) | ≤ 15 % de las `calls` guardadas |
+| Aristas sin definición en el repo con marca `external` (o descartadas) | 0 % marcadas (el esquema no tiene la marca; cota por nombre: 30.3 % de las aristas de BackEnd son "internas", 69.7 % de afuera) | 100 % de las que tienen evidencia (DD-9); el resto `low` |
+| Aristas desde tests marcadas `from_test` | 0 % marcadas (no hay columna); desde tests: BackEnd 57.4 %, backend-b 44.4 %, DevCtxEngine 14.7 %, FrontEnd 6.5 %, Legacy 12.1 % | 100 % (= `path_kind` Test) |
+| Precisión de resolución sobre gold edges (40 sitios) | **42 sitios, 0.9.0: correcto 19/42 = 45.2 %** (internos 12/32 = 37.5 %); sobre los decididos (calificados) 19/22 = 86.4 %; cobertura (calificado) 22/42 = 52 %; no hay `high`/`low` que separar | ≥ 90 % en `high`, ≥ 75 % global; cobertura (no `low`) ≥ 80 % |
+| Ocurrencias repetidas en un método | colapsadas en 1 (confirmado: la 2.ª `log.debug` de `migrate_one` no tiene arista) | una fila por ocurrencia (test Python de `get_references`) |
+| `DraftResource.java:310` (en <commit-b> la llamada está en **:304**) | `AlphaService.findPaginated` (confirmado en 0.9.0; también :363, que es de `GammaService`) | `BetaService.findPaginated`, `high`, `resolution = field` |
+| `read_symbol("tokenInterceptor")` (frontend) | `[]` (0.9.0: `definitions: []` **y** `external: true`, falso; en <commit-c> la definición está en :13) | definición en `lib-auth/.../token.interceptor.ts:78` |
+| `impact("get")` / `impact("map")` en backend-a | 3.9 s / 5.5 s (modelo), 1 883 / 2 569 upstream. **0.9.0 medido** (p50 / p95, serve caliente, máquina con carga 50-125): get 10.9 / 16.6 s, map 14.0 / 16.8 s; upstream 1 884 / 2 569 | p95 ≤ 300 ms; por defecto sin tests/externos, con `omitted` |
+| `external` con nombre calificado (`serde_json::from_str`, `Panache.withTransaction`) | `suggestions: []` (B2, candidato de PLAN-008). **0.9.0 final medido: `external: true` + `called_from` (60 y 9)**; `tokio::spawn` sin llamadas: `suggestions: []` | `external: true` + `called_from` |
+| `Foo::new` inexistente con un `new` hoja en el repo | `external: true` (falso) en el candidato; **0.9.0 final medido: `{definitions: [], suggestions: []}`, sin `external`** | no externo; `suggestions` |
+| `memories_by_symbol("Foo.Bar::baz")` | parte como archivo `Foo.Bar` (de PLAN-008; no re-medido: es una tool de memoria del serve vivo, fuera del sandbox) | símbolo calificado, sin archivo |
+| `repo_map(budget=1024)` | no existe (confirmado: ni CLI ni tools MCP de 0.9.0) | tokens ≤ 1024 × 1.15; archivo esperado presente en ≥ 70 % de los casos del arnés con foco |
+| Relevancia de `build_context` (archivo/símbolo esperado en el brief, set del arnés) | **0.9.0: archivo en el brief 24/30 = 80.0 %; símbolo 17/24 = 70.8 %** (30 casos; ver Resultado de TASK-001) | ≥ base + 10 pp, y ningún caso pasa de acierto a fallo sin explicación en el Resultado |
+| `search --hybrid` (Hit@5 y MRR del arnés) | **0.9.0 híbrido: Hit@5 21/30, Hit@10 22/30, MRR 0.619; vectorial: 22/30, 22/30, 0.552** (ruido entre corridas ≈ ±1 posición, ±0.01 de MRR) | ≥ base (sin regresión > 2 % relativo); `--mode vector` idéntico a 0.9.0 |
 | Contratos JSON de `search`, `read_symbol`, `get_references`, `impact_analysis`, `build_context` | 0.9.0 | solo cambios aditivos (`sym`, `confidence`, `via`…); tests de `mcp_tools` verdes |
-| `index --full` desde cero | medir en TASK-001 | ≤ +10 % |
+| `index --full` desde cero | DevCtxEngine 276 archivos / 4 796 chunks: 2 393 s; backend-b 216 / 3 253: 2 489 s; Legacy 62 / 312: 572 s — **con la máquina a carga 50-125 y 3-5 índices a la vez: NO comparables**; BackEnd y FrontEnd no reindexados (ver Resultado) | ≤ +10 % |
 | `index --full` tras subir `EXTRACTOR_VERSION` (con TASK-002) | = desde cero | ≤ 20 % del tiempo de 0.9.0 desde cero |
-| Tamaño del DB | medir en TASK-001 | ≤ +30 % |
-| Pico de RAM al indexar (`VmHWM`, frontend) | medir en TASK-001 | ≤ +200 MB |
-| Índice viejo tras actualizar | — | `extractor_stale: true` + aviso en `index_status` y en tools de grafo; tools nuevas piden `index --full` |
+| Tamaño del DB | DevCtxEngine 28.1 MB, backend-b 21.0 MB, Legacy 6.8 MB, BackEnd 622 MB (1 623 archivos, 19 306 chunks), FrontEnd 2.34 GB (2 ramas indexadas) | ≤ +30 % |
+| Pico de RAM al indexar (`VmHWM`, frontend) | **FrontEnd no medido** (> 25 min con la máquina cargada según PLAN-008 TASK-016; aquí la carga de 50-125 lo hizo inviable). Medido: DevCtxEngine 840 MiB, backend-b 727 MiB, Legacy 826 MiB | ≤ +200 MB |
+| Índice viejo tras actualizar | — (0.9.0 ya avisa: `extractor_stale: true` + `hint` en `status`, y `warning` en `symbol`) | `extractor_stale: true` + aviso en `index_status` y en tools de grafo; tools nuevas piden `index --full` |
 
 ## 7. Riesgos
 
