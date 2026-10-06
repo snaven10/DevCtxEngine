@@ -98,6 +98,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap()
@@ -114,6 +115,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: Some(branch),
         })
         .unwrap()
@@ -239,6 +241,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: Some("main"),
         })
         .unwrap();
@@ -257,6 +260,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: Some("feature"),
         })
         .unwrap();
@@ -461,6 +465,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: Some("no-such-branch"),
         })
         .unwrap_err();
@@ -563,6 +568,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -629,6 +635,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -725,6 +732,7 @@ mod tests {
             paths: Some(paths),
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap()
@@ -848,6 +856,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -931,6 +940,7 @@ mod tests {
             paths: None,
             exclude,
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap()
@@ -1007,6 +1017,7 @@ mod tests {
             paths: None,
             exclude: &["legacy/".to_string()],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -1229,6 +1240,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap()
@@ -1569,6 +1581,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .expect_err("the first write after the freeze must fail the run");
@@ -1755,6 +1768,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -1793,6 +1807,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -1917,6 +1932,7 @@ mod tests {
             paths: None,
             exclude: &[],
             hnsw: Some("cosine"),
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -1925,6 +1941,229 @@ mod tests {
             .get_index_meta("", "", PENDING_HNSW_META_KEY)
             .unwrap()
             .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- fixup: lazy embedder, no needless rebuilds, fingerprint ------------
+
+    /// A run under `fp` with the counting embedder, optionally watched by `sink`.
+    fn run_fp(
+        store: &Store,
+        root: &Path,
+        full: bool,
+        fp: &str,
+        hnsw: Option<&str>,
+        sink: Option<&dyn ProgressSink>,
+    ) -> (IndexResult, usize) {
+        let emb = CountingEmbedder(std::sync::atomic::AtomicUsize::new(0));
+        let res = run(IndexRequest {
+            store,
+            embedder: &emb,
+            repo_root: root,
+            incremental: !full,
+            model_name: "minilm-l6",
+            progress: sink,
+            paths: None,
+            exclude: &[],
+            hnsw,
+            embed_fingerprint: fp,
+            branch: None,
+        })
+        .unwrap();
+        (res, emb.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn vss_available() -> bool {
+        Store::open_in_memory(DIM)
+            .unwrap()
+            .enable_hnsw("cosine")
+            .unwrap_or(false)
+    }
+
+    /// A reindex that finds every vector reusable never builds the model.
+    #[test]
+    fn a_no_change_full_run_never_loads_the_embedder() {
+        let dir = reuse_repo("lazy");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let lazy = devctx_embed::LazyEmbedder::new(DIM, "minilm-l6", || {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(std::sync::Arc::new(CountingEmbedder(Default::default()))
+                as std::sync::Arc<dyn EmbeddingProvider>)
+        });
+        let go = |full: bool| {
+            run(IndexRequest {
+                store: &store,
+                embedder: &lazy,
+                repo_root: &dir,
+                incremental: !full,
+                model_name: "minilm-l6",
+                progress: None,
+                paths: None,
+                exclude: &[],
+                hnsw: None,
+                embed_fingerprint: "test-fp",
+                branch: None,
+            })
+            .unwrap()
+        };
+        let first = go(true);
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{first:?}"
+        );
+        let second = go(true);
+        assert_eq!(second.chunks_reused, second.chunks, "{second:?}");
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the model was loaded again for a run that embeds nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `--full` that changes no vector leaves the HNSW and BM25 indexes alone
+    /// (on the parent it dropped and rebuilt both, whatever it had changed).
+    #[test]
+    fn a_no_change_full_run_does_not_rebuild_the_derived_indexes() {
+        if !vss_available() {
+            return;
+        }
+        let dir = reuse_repo("norebuild");
+        let store = Store::open_in_memory(DIM).unwrap();
+        run_fp(&store, &dir, true, "test-fp", Some("cosine"), None);
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        let fts = store.rebuild_fts().unwrap();
+        let before = vectors_of(&store, &dir, "m.py");
+
+        let sink = CancelAt::new(None, usize::MAX);
+        let (res, n) = run_fp(&store, &dir, true, "test-fp", Some("cosine"), Some(&sink));
+        assert!(res.full_reindex && n == 0, "{res:?} {n}");
+        let phases = sink.phases();
+        assert!(
+            !phases.iter().any(|p| p == "hnsw" || p == "fts"),
+            "rebuilt for a run that changed nothing: {phases:?}"
+        );
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert_eq!(store.has_fts(), fts);
+        assert!(store
+            .get_index_meta("", "", PENDING_HNSW_META_KEY)
+            .unwrap()
+            .is_none());
+        assert_eq!(vectors_of(&store, &dir, "m.py"), before);
+
+        // An incremental run over nothing is the same.
+        let sink = CancelAt::new(None, usize::MAX);
+        run_fp(&store, &dir, false, "test-fp", Some("cosine"), Some(&sink));
+        assert!(!sink.phases().iter().any(|p| p == "hnsw" || p == "fts"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a run does change still rebuilds, and what is owed or missing is
+    /// still created by a run that changed nothing.
+    #[test]
+    fn owed_or_missing_indexes_are_built_even_when_nothing_changed() {
+        if !vss_available() {
+            return;
+        }
+        let dir = reuse_repo("owed");
+        let store = Store::open_in_memory(DIM).unwrap();
+        // No index ever existed; the config now wants one.
+        run_fp(&store, &dir, true, "test-fp", None, None);
+        assert!(store.hnsw_metric().is_none());
+        let sink = CancelAt::new(None, usize::MAX);
+        run_fp(&store, &dir, true, "test-fp", Some("cosine"), Some(&sink));
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert!(sink.phases().iter().any(|p| p == "hnsw"));
+
+        // An earlier run dropped it and died: the note says it is owed.
+        store.drop_hnsw().unwrap();
+        store
+            .set_index_meta("", "", PENDING_HNSW_META_KEY, "cosine")
+            .unwrap();
+        run_fp(&store, &dir, true, "test-fp", None, None);
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert!(store
+            .get_index_meta("", "", PENDING_HNSW_META_KEY)
+            .unwrap()
+            .is_none());
+
+        // A real change rebuilds.
+        write(&dir, "m.py", &three_functions("22222"));
+        commit_all(&dir, "edit");
+        let sink = CancelAt::new(None, usize::MAX);
+        run_fp(&store, &dir, false, "test-fp", Some("cosine"), Some(&sink));
+        assert!(
+            sink.phases().iter().any(|p| p == "hnsw"),
+            "{:?}",
+            sink.phases()
+        );
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Branch indexed under setup A, a run under B cut short, back to A: the
+    /// files B already re-embedded hold B's vectors, so nothing may be reused.
+    #[test]
+    fn an_interrupted_run_under_another_setup_poisons_no_reuse() {
+        let dir = five_file_repo("fp");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, n1) = run_fp(&store, &dir, true, "fp-a", None, None);
+        assert_eq!(n1, first.chunks);
+        // The same setup again does reuse.
+        let (again, n) = run_fp(&store, &dir, true, "fp-a", None, None);
+        assert!(
+            (n, again.chunks_reused) == (0, again.chunks),
+            "{again:?} {n}"
+        );
+
+        let sink = CancelAfter::new(2);
+        let (cut, _) = run_fp(&store, &dir, true, "fp-b", None, Some(&sink));
+        assert!(cut.cancelled, "{cut:?}");
+
+        let (back, n) = run_fp(&store, &dir, false, "fp-a", None, None);
+        assert_eq!(
+            back.chunks_reused, 0,
+            "reused vectors of another setup: {back:?}"
+        );
+        assert_eq!(n, back.chunks, "every chunk must be embedded again");
+        assert!(
+            back.full_reindex,
+            "an interrupted transition needs a full run"
+        );
+        // Settled: now the same setup reuses again.
+        let (settled, n) = run_fp(&store, &dir, true, "fp-a", None, None);
+        assert!(
+            n == 0 && settled.chunks_reused == settled.chunks,
+            "{settled:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index from before fingerprints is trusted (not forced into a full
+    /// run) but its vectors are not reused until a run has stamped it.
+    #[test]
+    fn an_index_without_a_fingerprint_is_stamped_not_reused() {
+        let dir = reuse_repo("legacy");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, _) = run_fp(&store, &dir, true, "test-fp", None, None);
+        let git = crate::git::GitRepo::open(&dir).unwrap();
+        let (rp, branch) = (git.root().to_string_lossy().to_string(), git.state().branch);
+        store
+            .delete_index_meta(&rp, &branch, devctx_store::EMBED_FP_META_KEY)
+            .unwrap();
+        let (res, n) = run_fp(&store, &dir, false, "test-fp", None, None);
+        assert!(!res.full_reindex && n == 0, "{res:?} {n}");
+        assert_eq!(
+            store
+                .get_index_meta(&rp, &branch, devctx_store::EMBED_FP_META_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("test-fp")
+        );
+        let (full, n) = run_fp(&store, &dir, true, "test-fp", None, None);
+        assert!(n == 0 && full.chunks_reused == first.chunks, "{full:?} {n}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

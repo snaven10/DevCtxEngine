@@ -3545,34 +3545,25 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         return Ok(());
     }
     let root = project_root(&cfg)?;
-    eprintln!(
-        "Loading embedder ({} / {})…",
-        cfg.embeddings.model, cfg.embeddings.provider
-    );
-    let embedder = build_embedder(&cfg)?;
-    let store = open_store(&cfg, embedder.dimension())?;
-
-    // Golden rule for bulk loads: don't maintain the HNSW index row-by-row.
-    // For a full reindex, drop it up front and rebuild once after the load —
-    // noted as owed *before* the drop, like the pipeline's own drop, so a
-    // process killed mid-run leaves the rebuild to the next run instead of
-    // losing the index for good. With the note in place the pipeline rebuilds
-    // it at the end of the run (once), and the rebuild below only covers
-    // what it could not.
-    if full && cfg.storage.hnsw {
-        store.set_index_meta(
-            "",
-            "",
-            devctx_index::PENDING_HNSW_META_KEY,
-            &cfg.storage.metric,
-        )?;
-        store.drop_hnsw()?;
-    }
+    // The model loads only if a chunk needs embedding: a run that finds every
+    // vector reusable (a `--full` over unchanged source) never pays the load.
+    // The store's width and the model name are known from the registry.
+    let settings = EmbedSettings::from_config(&cfg.embeddings);
+    let dimension = configured_dimension(&cfg);
+    let embedder = devctx_embed::LazyEmbedder::new(dimension, cfg.embeddings.model.clone(), || {
+        eprintln!(
+            "Loading embedder ({} / {})…",
+            cfg.embeddings.model, cfg.embeddings.provider
+        );
+        Ok(Arc::from(create_provider(&settings)?))
+    });
+    let store = open_store(&cfg, dimension)?;
+    let fingerprint = devctx_embed::embedding_fingerprint(&settings, dimension);
 
     let progress = IndexBar::new();
     let res = index_run(IndexRequest {
         store: &store,
-        embedder: embedder.as_ref(),
+        embedder: &embedder,
         repo_root: &root,
         incremental: !full,
         model_name: &cfg.embeddings.model,
@@ -3581,6 +3572,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         exclude: &cfg.indexing.effective_excludes(),
         branch: branch.as_deref(),
         hnsw: cfg.storage.hnsw.then_some(cfg.storage.metric.as_str()),
+        embed_fingerprint: &fingerprint,
     })?;
     progress.finish();
     devctx_mcp::state::report_index(&store, &root, &res);
@@ -3624,31 +3616,17 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         println!("  index built by an older extractor; run `devctx index --full` to rebuild it");
     }
 
-    let wanted_metric = if cfg.storage.metric.trim().eq_ignore_ascii_case("ip")
-        || cfg
-            .storage
-            .metric
-            .trim()
-            .eq_ignore_ascii_case("inner_product")
-    {
-        "ip"
-    } else {
-        "cosine"
-    };
-    if cfg.storage.hnsw && store.hnsw_metric().as_deref() == Some(wanted_metric) {
-        println!("  HNSW index ready (VSS, metric {wanted_metric})");
-    } else if cfg.storage.hnsw {
-        if store.enable_hnsw(&cfg.storage.metric)? {
-            println!(
-                "  HNSW index ready (VSS, metric {})",
-                if cfg.storage.metric.is_empty() {
-                    "cosine"
-                } else {
-                    &cfg.storage.metric
-                }
-            );
+    // The pipeline owns the HNSW index (`IndexRequest.hnsw`): it creates it when
+    // missing and rebuilds it when this run took it down. Here, only say so.
+    if cfg.storage.hnsw {
+        let wanted = devctx_store::normalize_metric(&cfg.storage.metric);
+        if store.hnsw_metric().as_deref() == Some(wanted) {
+            println!("  HNSW index ready (VSS, metric {wanted})");
         } else {
-            eprintln!("  HNSW requested but the VSS extension is unavailable; using brute-force");
+            eprintln!(
+                "  HNSW requested but not built (the VSS extension is unavailable, or the \
+                 server is stopping); using brute-force"
+            );
         }
     }
     // The pipeline rebuilds a BM25 index it took down; build one here only

@@ -123,3 +123,55 @@ todos los chunks del archivo. Implementa DD-20.
   visible: "Loading embedder" en un reindex 100 % reusado); cargarlo perezoso lo recortaría. Medir en
   release con TASK-016. Los índices ya creados por el serve sin HNSW lo reciben en la siguiente
   corrida de `index`.
+
+### Fixup (post-review de 7d92cd8)
+
+- **Embedder perezoso.** Nuevo `devctx_embed::LazyEmbedder` (dimensión y nombre salen de la
+  config/registro; el modelo se construye en el primer `embed`). Lo usan `cmd_index` (CLI directo)
+  y `do_index_inner` (serve: carga vía la caché con release por inactividad, fase `loading model`
+  solo cuando de verdad carga). Un reindex 100 % reusado ya no carga el modelo: sin el transitorio
+  de ~700 MiB (nota para PLAN-010).
+- **Sin rebuild innecesario.** HNSW y BM25 ya no se tiran al empezar la corrida sino justo antes de
+  la primera escritura (`Derived::take_down`, con la nota `pending_*` antes de cada drop). Un `--full`
+  que no cambia nada no escribe: el archivo con mismo hash, mismo extractor, todos los chunks
+  reusados y mismos conteos no se reescribe (el `commit` de las filas queda el de la corrida que las
+  escribió, como en cualquier archivo que el incremental salta). Se reconstruye si se tiró, si hay
+  nota pendiente, o si no había índice y la config lo pide (Paso 7); si la métrica configurada
+  difiere de la existente también. Se quitó el pre-drop del CLI y su creación duplicada de HNSW
+  (ahora solo informa). Un incremental sin cambios tampoco reconstruye (antes sí). Caso que sigue
+  reescribiendo: archivos que otra rama ya tiene idénticos (camino de copia entre ramas).
+- **I1 (review): fingerprint de embedding.** `devctx_embed::embedding_fingerprint` (provider |
+  modelo | dim | engine `fastembed-4/ort-2.0.0-rc.9` | `max_chars` | l2) por rama en `index_meta`
+  (`embedding_fingerprint`). Al empezar una corrida con fingerprint distinto al guardado se escribe
+  `transition` antes de tocar archivos y se fuerza full sin reuso; se estampa al completar. Reuso solo
+  si guardado == activo; un índice sin fingerprint (anterior) se confía pero no se reusa hasta que una
+  corrida lo estampe. El engine `ort` de PLAN-010 debe cambiar `LOCAL_ENGINE` hasta probar
+  bit-exactitud. `EXTRACTOR_VERSION` intacto.
+- **M1:** la corrida avisa ("this database has no HNSW index…") y AGENTS.md lo dice: un repo sin HNSW
+  paga la construcción completa en la primera corrida con `storage.hnsw`. **M2:** `load_vss` recuerda
+  el fallo en el proceso (flag en `Shared`), no reintenta `INSTALL` por red en cada corrida.
+- **Medición RELEASE** (`cargo build --release -p devctx-cli`, `index --full` directo,
+  `DEVCTX_NO_AUTOSERVE=1`, HOME/DEVCTX_HOME aislados, minilm-l6, memprobe.sh; baseline = 7d92cd8
+  compilado aparte):
+
+  | repo (archivos / chunks) | binario | desde cero | 2.º `--full` | ratio | VmHWM 2.º | chunks reusados / embebidos |
+  |---|---|---|---|---|---|---|
+  | DevCtxEngine (279 / 4859) | 7d92cd8 | 306 s | 20.0 s | 6,5 % | 388 MiB | 4859 / 0 |
+  | DevCtxEngine | fixup | 240 s | 4,4 s | **1,8 %** | **115 MiB** | 4859 / 0 |
+  | backend-b (216 / 3253), clon de solo lectura | 7d92cd8 | 141 s | 21,0 s | 14,9 % | 387 MiB | 3253 / 0 |
+  | backend-b | fixup | 169 s | 2,4 s | **1,4 %** | **103 MiB** | 3253 / 0 |
+
+  VmHWM de la corrida desde cero: 447-472 MiB (ambos binarios). Los tiempos desde cero varían entre
+  corridas (otra carga en la máquina); el ratio usa el desde cero de la misma fila. Criterio ≤ 20 %:
+  **cumplido** en ambos repos, en release. En 7d92cd8 ya se cumplía en release; el debug (34 %) lo
+  dominaban parse y carga del modelo en debug.
+- **Pendiente:** equivalencia del top-10 con el arnés de TASK-001 — PENDIENTE hasta que TASK-001
+  cierre (hoy solo está probada la igualdad de vectores almacenados antes/después).
+- **Tests nuevos (devctx-index):** `a_no_change_full_run_never_loads_the_embedder`,
+  `a_no_change_full_run_does_not_rebuild_the_derived_indexes`,
+  `owed_or_missing_indexes_are_built_even_when_nothing_changed`,
+  `an_interrupted_run_under_another_setup_poisons_no_reuse`,
+  `an_index_without_a_fingerprint_is_stamped_not_reused`; `devctx-embed`:
+  `the_fingerprint_changes_with_anything_that_changes_the_vectors`. Los de rebuild y fingerprint
+  fallan con el comportamiento anterior (en el padre ni compilan: no existen `LazyEmbedder` ni
+  `IndexRequest.embed_fingerprint`; la lógica que prueban es la que cambió).

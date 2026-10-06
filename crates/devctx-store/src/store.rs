@@ -124,6 +124,10 @@ struct Shared {
     /// Writers hold the read side for one statement; a freeze takes the write
     /// side to wait out the statements already running.
     gate: RwLock<()>,
+    /// `INSTALL … LOAD vss` failed once in this process. `INSTALL` reaches for
+    /// the network when the extension is not on disk, so a machine without it
+    /// would pay that on every run; the failure is remembered instead.
+    vss_unavailable: AtomicBool,
 }
 
 /// A connection borrowed for one write; see [`Store::w`].
@@ -294,11 +298,19 @@ impl Store {
     /// Best-effort load of the DuckDB VSS extension (for HNSW). Returns whether
     /// it loaded; silently no-ops when the extension is unavailable (e.g. offline).
     fn load_vss(&self) -> bool {
-        self.conn
+        if self.shared.vss_unavailable.load(Ordering::Relaxed) {
+            return false;
+        }
+        let ok = self
+            .conn
             .execute_batch(
                 "INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;",
             )
-            .is_ok()
+            .is_ok();
+        if !ok {
+            self.shared.vss_unavailable.store(true, Ordering::Relaxed);
+        }
+        ok
     }
 
     /// Best-effort load of the DuckDB FTS extension (for BM25 keyword search).
@@ -1317,7 +1329,7 @@ impl Store {
 /// always-correct one. The value reaches SQL by interpolation — both in the
 /// index name and in `WITH (metric = …)` — so anything unrecognized is mapped
 /// to `cosine` rather than passed through.
-fn normalize_metric(metric: &str) -> &'static str {
+pub fn normalize_metric(metric: &str) -> &'static str {
     match metric.trim().to_ascii_lowercase().as_str() {
         "ip" | "inner_product" => "ip",
         _ => "cosine",

@@ -1142,14 +1142,20 @@ fn do_index_inner(
     let store = state.open_store()?;
     let sink =
         SharedProgress::with_cancel(state.index_progress.clone(), state.index_cancel.clone());
-    sink.begin(LOADING_MODEL);
-    let embedder = match embedder_reporting(state, &sink) {
-        Ok(e) => e,
-        Err(e) => {
-            sink.finish();
-            return Err(e);
-        }
-    };
+    sink.begin("starting");
+    // Lazy: the model is loaded (through the server's cache, with its idle
+    // release) only when a chunk needs embedding. A run that finds every vector
+    // reusable never reintroduces the load transient.
+    let dimension = configured_dimension(&state.cfg);
+    let embedder =
+        devctx_embed::LazyEmbedder::new(dimension, state.cfg.embeddings.model.clone(), || {
+            sink.phase(LOADING_MODEL);
+            let loaded =
+                embedder_reporting(state, &sink).map_err(devctx_embed::EmbedError::Backend);
+            sink.phase("files");
+            loaded
+        });
+    let fingerprint = devctx_embed::embedding_fingerprint(&state.embed_settings, dimension);
     // Which branch this run is about. Declared config wins over what happens to
     // be checked out, so running `index` from a linked worktree keeps the
     // repository's trunk fresh instead of quietly indexing the worktree's
@@ -1170,7 +1176,7 @@ fn do_index_inner(
     let _finish = Finish(&sink);
     let run = index_run(IndexRequest {
         store: &store,
-        embedder: embedder.as_ref(),
+        embedder: &embedder,
         repo_root: &state.root,
         incremental: !full,
         model_name: &state.cfg.embeddings.model,
@@ -1183,6 +1189,7 @@ fn do_index_inner(
             .storage
             .hnsw
             .then_some(state.cfg.storage.metric.as_str()),
+        embed_fingerprint: &fingerprint,
     });
     let res = run.map_err(|e| e.to_string())?;
     if res.cancelled {

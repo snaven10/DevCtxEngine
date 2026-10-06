@@ -9,7 +9,10 @@ use devctx_chunk::{chunk_file, chunk_raw_text, content_hash, Chunk, ChunkConfig}
 use devctx_core::types::{VectorMetadata, VectorPoint};
 use devctx_embed::EmbeddingProvider;
 use devctx_parse::{detect_lang, extract_routes, parse, raw_text_language};
-use devctx_store::{FileState, IndexRecord, Store, StoredEdge, StoredRoute, EXTRACTOR_META_KEY};
+use devctx_store::{
+    normalize_metric, FileState, IndexRecord, Store, StoredEdge, StoredRoute, EMBED_FP_META_KEY,
+    EXTRACTOR_META_KEY,
+};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::error::{IndexError, Result};
@@ -164,6 +167,13 @@ pub struct IndexRequest<'a> {
     /// Without it a database that never had the index never got one from a run
     /// through the server: the pipeline only rebuilds what it took down.
     pub hnsw: Option<&'a str>,
+    /// Fingerprint of the embedding setup of this run (`devctx_embed::embedding_fingerprint`).
+    ///
+    /// Vectors are reused only when the branch's stored fingerprint equals it;
+    /// a run under a different one first marks the branch as in transition, so
+    /// an interrupted run cannot leave vectors of one setup under the
+    /// fingerprint of another.
+    pub embed_fingerprint: &'a str,
 }
 
 /// Summary of an indexing run.
@@ -245,36 +255,23 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         .ok()
         .flatten()
         .is_some();
-    // The BM25 index cannot survive the row deletions this run will make, so it
-    // comes down first and goes back up at the end if it was there.
-    let had_fts = req.store.has_fts() || pending_fts;
-    if had_fts {
-        // Noted *before* the drop: a process that dies anywhere between here
-        // and the rebuild must not lose the index for good.
-        req.store
-            .set_index_meta("", "", PENDING_FTS_META_KEY, "1")?;
-        req.store.drop_fts()?;
-    }
-    // The HNSW index has to come down for the same reason, and for a larger
-    // one: unlike FTS it survives the writes, so nothing forces the issue —
-    // it just makes every single insert pay to maintain the graph. Measured on
-    // a 1368-file branch of a real repository: 7 files a minute, an ETA of 108
-    // minutes, against minutes for the same work with the index absent and
-    // rebuilt once at the end.
+    // The BM25 index cannot survive the row deletions a run makes, and the HNSW
+    // index makes every insert pay to maintain the graph (measured on a
+    // 1368-file branch: 7 files a minute against minutes with it absent and
+    // rebuilt once at the end), so both come down before the run writes — and
+    // go back up at the end. Searches fall back to brute force meanwhile.
     //
-    // This is not specific to indexing a second branch. Every incremental run
-    // after the first has been paying it; a three-file commit hides the cost,
-    // and a large one does not.
-    //
-    // Searches fall back to brute force while it is down, which is what FTS
-    // already does and is the right trade: a slower search during an index
-    // beats an index that does not finish.
-    let had_hnsw = req.store.hnsw_metric().or(pending_hnsw);
-    if let Some(metric) = &had_hnsw {
-        req.store
-            .set_index_meta("", "", PENDING_HNSW_META_KEY, metric)?;
-        req.store.drop_hnsw()?;
-    }
+    // *Before the first write*, not before the run: a run that changes nothing
+    // (a `--full` over unchanged source, an incremental over nothing) would
+    // otherwise take both down only to rebuild the very same ones. Each is
+    // noted as owed right before it is dropped, so a process that dies anywhere
+    // after that must not lose the index for good.
+    let derived = Derived {
+        store: req.store,
+        fts: req.store.has_fts() || pending_fts,
+        hnsw: req.store.hnsw_metric().or(pending_hnsw),
+        down: std::cell::Cell::new(false),
+    };
     let git = GitRepo::open(req.repo_root)?;
     let state = git.state();
     let repo_short = git.short_name();
@@ -303,9 +300,27 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
 
     let explicit_paths = req.paths.filter(|p| !p.is_empty());
     let prev = req.store.get_index_record(&repo_path, &branch)?;
-    let model_changed = prev.as_ref().is_some_and(|p| {
-        p.model_name != req.model_name || p.model_dimension as usize != req.embedder.dimension()
-    });
+    // The index record is written only when a run *completes*, so on its own it
+    // cannot tell that an interrupted run already put vectors of another setup
+    // into the branch. The fingerprint is stamped on completion too, but a run
+    // under a different one overwrites it with "transition" *before* touching
+    // a file: reuse needs stored == active, and "transition" is never active.
+    let stored_fp = req
+        .store
+        .get_index_meta(&repo_path, &branch, EMBED_FP_META_KEY)?;
+    let fp_matches = stored_fp.as_deref() == Some(req.embed_fingerprint);
+    // `None` is an index from before fingerprints: its vectors are trusted as
+    // they always were (name and width), but not reused until a run stamps it.
+    let fp_legacy = stored_fp.is_none();
+    let embed_changed = !fp_matches && !fp_legacy;
+    let model_changed = embed_changed
+        || prev.as_ref().is_some_and(|p| {
+            p.model_name != req.model_name || p.model_dimension as usize != req.embedder.dimension()
+        });
+    if embed_changed {
+        req.store
+            .set_index_meta(&repo_path, &branch, EMBED_FP_META_KEY, FP_TRANSITION)?;
+    }
     let prev_extractor_stale =
         req.store
             .extractor_stale(&repo_path, &branch, &devctx_parse::extractor_fingerprint())?;
@@ -364,7 +379,9 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         written: 0,
         // Vectors are only comparable within the model that made them: the
         // branch's last completed run must have used this one, at this width.
-        reuse_vectors: prev.is_some() && !model_changed,
+        reuse_vectors: prev.is_some() && !model_changed && fp_matches,
+        extractor_current: !prev_extractor_stale,
+        derived,
     };
 
     let mut result = IndexResult {
@@ -559,6 +576,17 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // Same rule for the exclude set: stamped when a full run applied it, a
     // reconcile settled it, or nothing changed — never by a path-list run,
     // which looked at too little to prune.
+    // Every vector of this branch now comes from the active setup: a full run
+    // made them all, and an incremental one only runs when it already matched
+    // (or the index predates fingerprints).
+    if full_reindex || fp_matches || fp_legacy {
+        req.store.set_index_meta(
+            &repo_path,
+            &branch,
+            EMBED_FP_META_KEY,
+            req.embed_fingerprint,
+        )?;
+    }
     if full_reindex || reconcile_excludes || !exclude_stale {
         req.store
             .set_index_meta(&repo_path, &branch, EXCLUDE_META_KEY, &exclude_fp)?;
@@ -592,21 +620,36 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // the notes keep them owed to the next run. Checked before each, since
     // the first can be long enough for the request to arrive during it.
     if in_flight.alone() {
-        let hnsw = had_hnsw
+        // Owed: dropped by this run, or noted by an earlier one that was cut
+        // short — read again because a concurrent run may have dropped an
+        // index this one never saw.
+        let owed = (ctx.derived.down.get())
+            .then(|| ctx.derived.hnsw.clone())
+            .flatten()
             .or_else(|| {
                 req.store
                     .get_index_meta("", "", PENDING_HNSW_META_KEY)
                     .ok()
                     .flatten()
-            })
-            // Nothing took it down and nothing is owed: a database that never
-            // had one. Only the direct CLI path used to create it, so an index
-            // built through the server searched by full scan for good.
-            .or_else(|| {
-                req.hnsw
-                    .filter(|_| req.store.hnsw_metric().is_none())
-                    .map(str::to_string)
             });
+        // The config wins over what was there. Nothing owed and nothing there
+        // (or another metric): a database that never had one — only the direct
+        // CLI path used to create it, so an index built through the server
+        // searched by full scan for good.
+        let hnsw = match (owed, req.hnsw) {
+            (Some(_), Some(w)) => Some(w.to_string()),
+            (Some(o), None) => Some(o),
+            (None, Some(w)) if req.store.hnsw_metric().as_deref() != Some(normalize_metric(w)) => {
+                if req.store.hnsw_metric().is_none() {
+                    eprintln!(
+                        "· this database has no HNSW index and storage.hnsw is on: building it \
+                         now, over every vector (a one-time cost, whatever the size of this run)"
+                    );
+                }
+                Some(w.to_string())
+            }
+            _ => None,
+        };
         if let Some(metric) = &hnsw {
             if cancelled() {
                 eprintln!("· the server is stopping; the HNSW index is left for the next run");
@@ -614,7 +657,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 req.store.delete_index_meta("", "", PENDING_HNSW_META_KEY)?;
             }
         }
-        let fts = had_fts
+        let fts = (ctx.derived.down.get() && ctx.derived.fts)
             || req
                 .store
                 .get_index_meta("", "", PENDING_FTS_META_KEY)
@@ -795,6 +838,47 @@ struct Ctx<'a> {
     /// The index record names this run's model and dimension, so a chunk whose
     /// text is unchanged can keep its stored vector.
     reuse_vectors: bool,
+    /// The branch was last indexed by this build's extractor, so a file whose
+    /// content is unchanged would parse to the same symbols, edges and routes.
+    extractor_current: bool,
+    /// The derived indexes, taken down before the first write.
+    derived: Derived<'a>,
+}
+
+/// The `index_meta` value of [`EMBED_FP_META_KEY`] while a run under another
+/// embedding setup is in flight (or was interrupted).
+const FP_TRANSITION: &str = "transition";
+
+/// The BM25 and HNSW indexes a run takes down before its first write.
+struct Derived<'a> {
+    store: &'a Store,
+    /// A BM25 index exists (or is owed).
+    fts: bool,
+    /// Metric of the HNSW index that exists (or is owed).
+    hnsw: Option<String>,
+    down: std::cell::Cell<bool>,
+}
+
+impl Derived<'_> {
+    /// Drop them, once, noting each as owed first. Called before anything that
+    /// deletes or writes vectors.
+    fn take_down(&self) -> Result<()> {
+        if self.down.get() {
+            return Ok(());
+        }
+        if self.fts {
+            self.store
+                .set_index_meta("", "", PENDING_FTS_META_KEY, "1")?;
+            self.store.drop_fts()?;
+        }
+        if let Some(metric) = &self.hnsw {
+            self.store
+                .set_index_meta("", "", PENDING_HNSW_META_KEY, metric)?;
+            self.store.drop_hnsw()?;
+        }
+        self.down.set(true);
+        Ok(())
+    }
 }
 
 /// Test seam: `DEVCTX_TEST_STALL_IN_WRITE=<n>` stalls the run for good inside
@@ -834,6 +918,7 @@ impl Ctx<'_> {
     /// Forget a file: its vectors, edges, routes and state, as one
     /// transaction (see `index_file` for why one).
     fn delete_file(&self, file: &str) -> Result<()> {
+        self.derived.take_down()?;
         self.store.in_transaction(|| {
             self.store
                 .delete_by_file(self.repo_short, self.branch, file)?;
@@ -913,6 +998,7 @@ impl Ctx<'_> {
             self.branch,
             &devctx_parse::extractor_fingerprint(),
         )? {
+            self.derived.take_down()?;
             // One transaction, like the embedding path below; rolled back
             // (the old rows kept) when the source turns out to hold nothing.
             let copied = self.store.in_transaction_opt(|| {
@@ -975,6 +1061,38 @@ impl Ctx<'_> {
         let symbol_count = parsed.as_ref().map_or(0, |p| p.symbols.len());
         let chunk_count = chunks.len();
 
+        // What this branch already holds, for the no-write check below. (A file
+        // another branch also holds is copied above instead, which does write.)
+        let unchanged = if self.full_reindex && self.reuse_vectors && self.extractor_current {
+            self.store
+                .get_file_state(self.repo_path, self.branch, file)?
+                .filter(|st| st.content_hash == hash)
+        } else {
+            None
+        };
+        // A full run over a file whose content, parse and every chunk's vector
+        // are what the branch already holds: the rows it would write are the
+        // rows that are there. Writing them anyway deletes and re-inserts every
+        // vector, which is what forces the HNSW and BM25 indexes to be rebuilt
+        // for a run that changed nothing. (The commit stamped on the chunk rows
+        // stays that of the run that wrote them, as for any file an
+        // incremental run skips.)
+        if let Some(st) = &unchanged {
+            if reused == chunk_count
+                && st.chunk_count == chunk_count as i64
+                && st.symbol_count == symbol_count as i64
+                && st.language == language
+            {
+                self.indexed.insert(file.to_string());
+                result.files_indexed += 1;
+                result.symbols += symbol_count;
+                result.chunks += chunk_count;
+                result.chunks_reused += reused;
+                return Ok(());
+            }
+        }
+
+        self.derived.take_down()?;
         self.written += 1;
         let nth = self.written;
         self.store.in_transaction(|| {

@@ -1195,6 +1195,23 @@ fn a_forced_exit_mid_index_leaves_a_sound_database() {
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
+    // The full run needs writes to be cut inside of. Over the same embedding
+    // setup it would reuse every vector and write nothing (that is the point of
+    // reuse), so the branch is made to look as if it had been indexed by another
+    // engine, as after an upgrade: every file is re-embedded and rewritten with
+    // its content unchanged — the case this test is about.
+    {
+        let store = devctx_store::Store::open(&db_path(&root), DIM).unwrap();
+        let git = devctx_index::GitRepo::open(&root).unwrap();
+        store
+            .set_index_meta(
+                &git.root().to_string_lossy(),
+                &git.state().branch,
+                devctx_store::EMBED_FP_META_KEY,
+                "engine-before-the-upgrade",
+            )
+            .unwrap();
+    }
     let mut serve = start_indexing_serve(
         &tmp,
         &root,

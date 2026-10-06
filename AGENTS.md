@@ -214,6 +214,16 @@ Reckon **an hour per ~1400 files** on 8 cores. Things to know:
   (same `content_hash`, same model), so `index --full` after an extractor
   upgrade pays for parsing and the changed chunks, not for the embedder again.
   A different model embeds everything.
+  Reuse needs the branch's stored *embedding fingerprint* (provider, model,
+  width, engine, character cap, normalization) to equal the active one; a
+  different setup embeds everything, and an interrupted run under another setup
+  leaves the branch marked "transition" so it is never reused by mistake.
+  A `--full` over unchanged source rewrites nothing, loads no model and rebuilds
+  no HNSW/BM25 index.
+- **A database that has no HNSW index pays for building it at the first run
+  after `storage.hnsw` is on** — over every vector, even if that run only
+  changes three files (the run says so). Existing repositories indexed without
+  the index (the usual case before 0.10) hit this once.
 
 Enable HNSW first, in `.devctx/config.yaml`:
 

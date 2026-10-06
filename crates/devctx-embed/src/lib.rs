@@ -18,7 +18,7 @@ pub mod registry;
 pub mod local;
 
 pub use error::{EmbedError, Result};
-pub use provider::{l2_normalize, EmbeddingProvider};
+pub use provider::{l2_normalize, EmbeddingProvider, LazyEmbedder};
 
 /// Resolved settings for constructing an embedding provider.
 #[derive(Debug, Clone, Default)]
@@ -89,6 +89,42 @@ pub fn dimension_for(provider: &str, model: &str) -> usize {
     }
 }
 
+/// The engine that runs local models. Whatever replaces it (the `ort` engine of
+/// PLAN-010) must change this string until it is shown to produce the same
+/// vectors bit for bit: a vector reused across engines would be a silent lie.
+const LOCAL_ENGINE: &str = "fastembed-4/ort-2.0.0-rc.9";
+
+/// Everything that decides the numbers a model produces for a text: provider,
+/// model, width, engine, the per-text character cap and the normalization.
+///
+/// Two runs with equal fingerprints produce interchangeable vectors; vectors may
+/// only be reused across runs when the fingerprints are equal. Model name and
+/// dimension alone are not enough: the same name behind another engine, another
+/// provider or another truncation gives different vectors.
+pub fn embedding_fingerprint(s: &EmbedSettings, dimension: usize) -> String {
+    let provider = if s.provider.is_empty() {
+        "local"
+    } else {
+        s.provider.as_str()
+    };
+    let model = if s.model.is_empty() && provider == "local" {
+        registry::DEFAULT_LOCAL_MODEL
+    } else {
+        s.model.as_str()
+    };
+    match provider {
+        "local" => {
+            let max_chars = std::env::var("DEVCTX_EMBED_MAX_CHARS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(4096);
+            format!("local|{model}|{dimension}|{LOCAL_ENGINE}|max_chars={max_chars}|l2")
+        }
+        other => format!("{other}|{model}|{dimension}|http|l2"),
+    }
+}
+
 /// Construct an embedding provider from resolved settings.
 pub fn create_provider(s: &EmbedSettings) -> Result<Box<dyn EmbeddingProvider>> {
     match s.provider.as_str() {
@@ -145,6 +181,29 @@ fn create_local(_s: &EmbedSettings) -> Result<Box<dyn EmbeddingProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fingerprint_changes_with_anything_that_changes_the_vectors() {
+        let base = EmbedSettings {
+            provider: "local".into(),
+            model: "minilm-l6".into(),
+            ..Default::default()
+        };
+        let fp = embedding_fingerprint(&base, 384);
+        assert_eq!(fp, embedding_fingerprint(&base, 384));
+        assert_ne!(fp, embedding_fingerprint(&base, 768), "width");
+        let other = EmbedSettings {
+            model: "bge-small".into(),
+            ..base.clone()
+        };
+        assert_ne!(fp, embedding_fingerprint(&other, 384), "model");
+        let http = EmbedSettings {
+            provider: "openai".into(),
+            ..base.clone()
+        };
+        assert_ne!(fp, embedding_fingerprint(&http, 384), "provider");
+        assert!(fp.contains(LOCAL_ENGINE) && fp.contains("max_chars="));
+    }
 
     #[test]
     fn openai_provider_selected_with_key() {

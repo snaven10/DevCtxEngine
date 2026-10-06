@@ -11,6 +11,10 @@ use crate::store::Store;
 /// The `index_meta` key under which the extractor fingerprint is stored.
 pub const EXTRACTOR_META_KEY: &str = "extractor";
 
+/// `index_meta` key holding the fingerprint of the embedding setup the vectors
+/// of a branch were made with (see `devctx_embed::embedding_fingerprint`).
+pub const EMBED_FP_META_KEY: &str = "embedding_fingerprint";
+
 /// One `index_state` row: what was last indexed for a (repo_path, branch).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRecord {
@@ -200,6 +204,35 @@ impl Store {
         )?;
         match stmt.query_row(params![repo_path, branch, file], |r| r.get::<_, String>(0)) {
             Ok(h) => Ok(Some(h)),
+            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The recorded state of one file, if any.
+    pub fn get_file_state(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        file: &str,
+    ) -> Result<Option<FileState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content_hash, language, symbol_count, chunk_count FROM file_state
+             WHERE repo_path = ? AND branch = ? AND file_path = ?",
+        )?;
+        let row = stmt.query_row(params![repo_path, branch, file], |r| {
+            Ok(FileState {
+                repo_path: repo_path.to_string(),
+                branch: branch.to_string(),
+                file_path: file.to_string(),
+                content_hash: r.get::<_, String>(0)?,
+                language: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                symbol_count: r.get::<_, i64>(2)?,
+                chunk_count: r.get::<_, i64>(3)?,
+            })
+        });
+        match row {
+            Ok(f) => Ok(Some(f)),
             Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
