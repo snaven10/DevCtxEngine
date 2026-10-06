@@ -11,6 +11,16 @@ use crate::store::Store;
 /// The `index_meta` key under which the extractor fingerprint is stored.
 pub const EXTRACTOR_META_KEY: &str = "extractor";
 
+/// What a branch must have been indexed with to be a source for a copy: the
+/// active extractor and embedding setup.
+#[derive(Debug, Clone, Copy)]
+pub struct CopySetup<'a> {
+    pub extractor: &'a str,
+    pub embed_fp: &'a str,
+    pub model_name: &'a str,
+    pub dimension: i64,
+}
+
 /// `index_meta` key holding the fingerprint of the embedding setup the vectors
 /// of a branch were made with (see `devctx_embed::embedding_fingerprint`).
 pub const EMBED_FP_META_KEY: &str = "embedding_fingerprint";
@@ -277,30 +287,53 @@ impl Store {
     /// whose `index_meta` records `extractor` (the current fingerprint) are
     /// offered; a branch from an older extractor, or one with no record, would
     /// smuggle its stale symbols into a branch about to be stamped fresh.
+    ///
+    /// The same holds for the vectors: a source qualifies only if they were made
+    /// by the active embedding setup. Its `EMBED_FP_META_KEY` must equal
+    /// `embed_fp` (a branch in "transition" never does), or it must have none —
+    /// an index from before fingerprints — while its `index_state` names the
+    /// same `model_name` and `dimension`. Without that, a copy would put another
+    /// setup's vectors under this one's seal.
     pub fn branch_with_same_content(
         &self,
         repo_path: &str,
         file: &str,
         content_hash: &str,
         except_branch: &str,
-        extractor: &str,
+        setup: &CopySetup,
     ) -> Result<Option<String>> {
+        let CopySetup {
+            extractor,
+            embed_fp,
+            model_name,
+            dimension,
+        } = *setup;
         let mut stmt = self.conn.prepare(
             "SELECT f.branch FROM file_state f
              JOIN index_meta m
                ON m.repo_path = f.repo_path AND m.branch = f.branch AND m.key = ?
+             LEFT JOIN index_meta e
+               ON e.repo_path = f.repo_path AND e.branch = f.branch AND e.key = ?
+             LEFT JOIN index_state s
+               ON s.repo_path = f.repo_path AND s.branch = f.branch
              WHERE f.repo_path = ? AND f.file_path = ? AND f.content_hash = ?
                AND f.branch <> ? AND m.value = ?
+               AND (e.value = ?
+                    OR (e.value IS NULL AND s.model_name = ? AND s.model_dimension = ?))
              LIMIT 1",
         )?;
         match stmt.query_row(
             duckdb::params![
                 EXTRACTOR_META_KEY,
+                EMBED_FP_META_KEY,
                 repo_path,
                 file,
                 content_hash,
                 except_branch,
-                extractor
+                extractor,
+                embed_fp,
+                model_name,
+                dimension
             ],
             |r| r.get::<_, String>(0),
         ) {

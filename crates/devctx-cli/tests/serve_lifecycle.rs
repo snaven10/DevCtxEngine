@@ -1251,6 +1251,21 @@ fn a_forced_exit_mid_index_leaves_a_sound_database() {
             store.count(&Default::default()).unwrap() > 0,
             "the earlier index is still there"
         );
+        // The cut run had already put vectors of the new setup into some files:
+        // the branch must still be marked "transition", never the old or the new
+        // fingerprint, so no later run reuses them by mistake.
+        let git = devctx_index::GitRepo::open(&root).unwrap();
+        assert_eq!(
+            store
+                .get_index_meta(
+                    &git.root().to_string_lossy(),
+                    &git.state().branch,
+                    devctx_store::EMBED_FP_META_KEY
+                )
+                .unwrap()
+                .as_deref(),
+            Some("transition")
+        );
     }
     // The ART indexes are intact: an incremental run (which begins by deleting
     // the changed file's rows) works without a `--full`.

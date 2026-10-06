@@ -765,7 +765,7 @@ fn reindex_one(root: &std::path::Path, full: bool) -> Result<String> {
             "incremental"
         },
         short_commit(&field(&v, "commit")),
-        num(&v, "files_indexed"),
+        v["files_indexed"].as_u64().unwrap_or(0) + v["files_unchanged"].as_u64().unwrap_or(0),
         num(&v, "symbols"),
         num(&v, "chunks"),
         num(&v, "files_skipped"),
@@ -3590,7 +3590,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         } else {
             "incremental"
         },
-        res.files_indexed,
+        res.files_indexed + res.files_unchanged,
         res.files_skipped,
         res.files_deleted,
         res.files_pruned,
@@ -3603,6 +3603,12 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         println!(
             "  {} of those were copied from another branch, not embedded",
             res.files_copied
+        );
+    }
+    if res.files_unchanged > 0 {
+        println!(
+            "  {} of those were unchanged, nothing written for them",
+            res.files_unchanged
         );
     }
     if res.chunks_reused > 0 {

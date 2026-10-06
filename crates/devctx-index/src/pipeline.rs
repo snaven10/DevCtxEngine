@@ -187,6 +187,10 @@ pub struct IndexResult {
     pub full_reindex: bool,
     /// Files parsed and stored.
     pub files_indexed: usize,
+    /// Files a full run found identical to what the branch holds (content,
+    /// parse and every vector), so it wrote nothing for them. Not counted in
+    /// `files_indexed`.
+    pub files_unchanged: usize,
     /// Files skipped (unchanged or unsupported).
     pub files_skipped: usize,
     /// Files removed from the index (via git deletions).
@@ -309,14 +313,19 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         .store
         .get_index_meta(&repo_path, &branch, EMBED_FP_META_KEY)?;
     let fp_matches = stored_fp.as_deref() == Some(req.embed_fingerprint);
-    // `None` is an index from before fingerprints: its vectors are trusted as
-    // they always were (name and width), but not reused until a run stamps it.
+    // `None` is an index from before fingerprints. Every such index came from
+    // the one engine that existed, so it is trusted — and reused — when its
+    // record names this run's model and width; the run seals it below.
     let fp_legacy = stored_fp.is_none();
-    let embed_changed = !fp_matches && !fp_legacy;
-    let model_changed = embed_changed
-        || prev.as_ref().is_some_and(|p| {
-            p.model_name != req.model_name || p.model_dimension as usize != req.embedder.dimension()
-        });
+    let prev_model_differs = prev.as_ref().is_some_and(|p| {
+        p.model_name != req.model_name || p.model_dimension as usize != req.embedder.dimension()
+    });
+    // A stamped index under another setup (or one left in "transition"), or a
+    // legacy one about to change model: the run puts other vectors in, so the
+    // mark is written before the first file and nothing is reused until a run
+    // completes and re-seals.
+    let embed_changed = (!fp_matches && !fp_legacy) || (fp_legacy && prev_model_differs);
+    let model_changed = embed_changed || prev_model_differs;
     if embed_changed {
         req.store
             .set_index_meta(&repo_path, &branch, EMBED_FP_META_KEY, FP_TRANSITION)?;
@@ -372,6 +381,9 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         branch: &branch,
         commit: &head_commit,
         read_from: read_from.clone(),
+        model_name: req.model_name,
+        model_dimension: req.embedder.dimension() as i64,
+        embed_fingerprint: req.embed_fingerprint,
         full_reindex,
         cfg: ChunkConfig::default(),
         indexed: HashSet::new(),
@@ -379,7 +391,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         written: 0,
         // Vectors are only comparable within the model that made them: the
         // branch's last completed run must have used this one, at this width.
-        reuse_vectors: prev.is_some() && !model_changed && fp_matches,
+        reuse_vectors: prev.is_some() && !model_changed && (fp_matches || fp_legacy),
         extractor_current: !prev_extractor_stale,
         derived,
     };
@@ -823,6 +835,11 @@ struct Ctx<'a> {
     git: &'a GitRepo,
     /// Read file content from this branch's objects; `None` reads the work tree.
     read_from: Option<String>,
+    /// This run's embedding setup: what a branch must have been made with to be
+    /// a source for a copy.
+    model_name: &'a str,
+    model_dimension: i64,
+    embed_fingerprint: &'a str,
     repo_short: &'a str,
     repo_path: &'a str,
     branch: &'a str,
@@ -918,6 +935,15 @@ impl Ctx<'_> {
     /// Forget a file: its vectors, edges, routes and state, as one
     /// transaction (see `index_file` for why one).
     fn delete_file(&self, file: &str) -> Result<()> {
+        // A file that was never indexed (excluded, binary, added and removed
+        // between runs) has nothing to delete: do not take the indexes down.
+        if self
+            .store
+            .get_file_hash(self.repo_path, self.branch, file)?
+            .is_none()
+        {
+            return Ok(());
+        }
         self.derived.take_down()?;
         self.store.in_transaction(|| {
             self.store
@@ -991,13 +1017,34 @@ impl Ctx<'_> {
         // Safe because the key is the content hash: identical bytes, identical
         // chunks. What differs between the two rows is only which branch they
         // are filed under.
-        if let Some(src) = self.store.branch_with_same_content(
-            self.repo_path,
-            file,
-            &hash,
-            self.branch,
-            &devctx_parse::extractor_fingerprint(),
-        )? {
+        //
+        // Not when this branch already holds the file as it is (a `--full` over
+        // a branch that is up to date): copying would delete and rewrite rows
+        // that are right, and take the derived indexes down for it.
+        let own = if self.reuse_vectors && self.extractor_current {
+            self.store
+                .get_file_state(self.repo_path, self.branch, file)?
+                .filter(|st| st.content_hash == hash)
+        } else {
+            None
+        };
+        let source = if own.is_some() {
+            None
+        } else {
+            self.store.branch_with_same_content(
+                self.repo_path,
+                file,
+                &hash,
+                self.branch,
+                &devctx_store::CopySetup {
+                    extractor: &devctx_parse::extractor_fingerprint(),
+                    embed_fp: self.embed_fingerprint,
+                    model_name: self.model_name,
+                    dimension: self.model_dimension,
+                },
+            )?
+        };
+        if let Some(src) = source {
             self.derived.take_down()?;
             // One transaction, like the embedding path below; rolled back
             // (the old rows kept) when the source turns out to hold nothing.
@@ -1061,15 +1108,8 @@ impl Ctx<'_> {
         let symbol_count = parsed.as_ref().map_or(0, |p| p.symbols.len());
         let chunk_count = chunks.len();
 
-        // What this branch already holds, for the no-write check below. (A file
-        // another branch also holds is copied above instead, which does write.)
-        let unchanged = if self.full_reindex && self.reuse_vectors && self.extractor_current {
-            self.store
-                .get_file_state(self.repo_path, self.branch, file)?
-                .filter(|st| st.content_hash == hash)
-        } else {
-            None
-        };
+        // `own` (above) is what this branch already holds, for the no-write check.
+        let unchanged = own;
         // A full run over a file whose content, parse and every chunk's vector
         // are what the branch already holds: the rows it would write are the
         // rows that are there. Writing them anyway deletes and re-inserts every
@@ -1084,7 +1124,7 @@ impl Ctx<'_> {
                 && st.language == language
             {
                 self.indexed.insert(file.to_string());
-                result.files_indexed += 1;
+                result.files_unchanged += 1;
                 result.symbols += symbol_count;
                 result.chunks += chunk_count;
                 result.chunks_reused += reused;

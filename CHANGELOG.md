@@ -3,6 +3,30 @@
 Notable changes per release. Dates are tag dates. The plan behind 0.8.3 – 0.9.0
 is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
 
+## Unreleased (0.10.0)
+
+### Changed
+
+- **Reindex reuses vectors by chunk `content_hash`** (PLAN-009 TASK-002): a
+  `--full` over unchanged source embeds nothing, loads no model and rebuilds no
+  HNSW/BM25 index. The branch's embedding fingerprint (provider, model, width,
+  engine read from `Cargo.lock`, character cap, normalization, HTTP endpoint)
+  must equal the active one; a run under another setup marks the branch
+  "transition" until it completes.
+- **Indexes from before fingerprints** are reused only when their recorded model
+  and width equal the active ones (and no run left them in "transition"); the
+  run seals them. The same rule decides which branches may be a source for the
+  cross-branch copy, which now also requires the source's fingerprint to match.
+- `index` reports `files_unchanged` (files a `--full` found identical and did
+  not write) separately from `files_indexed`.
+
+### Fixed
+
+- A `--full` over several indexed branches no longer copies and rewrites every
+  file another branch holds; and a branch made by another embedding setup is no
+  longer a copy source.
+- Deleting a file the index never held no longer drops the HNSW/BM25 indexes.
+
 ## 0.9.0 — 2026-10-05
 
 The agent-facing half of PLAN-008 (P1): tool output that fits in a context

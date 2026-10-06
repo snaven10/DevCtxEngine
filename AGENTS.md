@@ -218,6 +218,17 @@ Reckon **an hour per ~1400 files** on 8 cores. Things to know:
   width, engine, character cap, normalization) to equal the active one; a
   different setup embeds everything, and an interrupted run under another setup
   leaves the branch marked "transition" so it is never reused by mistake.
+  The engine part is read from `Cargo.lock` at build time (`fastembed-<v>/ort-<v>`),
+  so a `cargo update` of either one makes every index re-embed once; for an
+  HTTP provider the endpoint (without credentials) is part of it. The device
+  (CPU or CUDA) is not: it moves vectors only at the rounding level.
+  An index **from before fingerprints** is reused only if its recorded model
+  *and* width equal the active ones and no run left it in "transition"; the run
+  seals it with the active fingerprint (every such index came from the one engine
+  that existed). The same rule decides whether another branch may be a source for
+  the cross-branch copy: its fingerprint must equal the active one, or be absent
+  with the same model and width. A `--full` over a branch that already holds a
+  file as it is writes nothing for it, even if another branch holds it too.
   A `--full` over unchanged source rewrites nothing, loads no model and rebuilds
   no HNSW/BM25 index.
 - **A database that has no HNSW index pays for building it at the first run

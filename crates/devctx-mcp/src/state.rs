@@ -1150,8 +1150,11 @@ fn do_index_inner(
     let embedder =
         devctx_embed::LazyEmbedder::new(dimension, state.cfg.embeddings.model.clone(), || {
             sink.phase(LOADING_MODEL);
-            let loaded =
-                embedder_reporting(state, &sink).map_err(devctx_embed::EmbedError::Backend);
+            let loaded = embedder_reporting(state, &sink).map_err(|e| {
+                // `Backend` prints its own prefix; do not stack a second one.
+                let e = e.strip_prefix("local embedding backend: ").unwrap_or(&e);
+                devctx_embed::EmbedError::Backend(e.to_string())
+            });
             sink.phase("files");
             loaded
         });
@@ -1225,6 +1228,7 @@ fn do_index_inner(
         "files_pruned": res.files_pruned,
         "files_renamed": res.files_renamed,
         "files_copied": res.files_copied,
+        "files_unchanged": res.files_unchanged,
         "chunks_reused": res.chunks_reused,
         "symbols": res.symbols,
         "chunks": res.chunks,

@@ -175,3 +175,35 @@ todos los chunks del archivo. Implementa DD-20.
   `the_fingerprint_changes_with_anything_that_changes_the_vectors`. Los de rebuild y fingerprint
   fallan con el comportamiento anterior (en el padre ni compilan: no existen `LazyEmbedder` ni
   `IndexRequest.embed_fingerprint`; la lógica que prueban es la que cambió).
+
+### Fixup 2 (review de c8a4790)
+
+- **I1: copia entre ramas.** `Store::branch_with_same_content` exige ahora que la rama fuente tenga
+  `embedding_fingerprint` == activo, o ninguno con el mismo modelo y dimensión en `index_state`
+  (legacy compatible); una rama en `transition` o de otro setup ya no es fuente
+  (`crates/devctx-store/src/state.rs`). En `index_file` la copia se salta cuando la rama ya tiene el
+  archivo igual (`own`: mismo hash, `reuse_vectors` y extractor vigente): un `--full` con ≥ 2 ramas
+  indexadas no escribe nada ni reconstruye HNSW/FTS, así el 1,4-1,8 % vale con varias ramas. Tests:
+  `a_full_run_over_two_indexed_branches_writes_nothing`,
+  `a_copy_needs_a_source_made_by_the_active_embedding_setup` (fallan sin el cambio, comprobado
+  desactivando ambos filtros).
+- **I2: `LOCAL_ENGINE`** sale de `Cargo.lock` en `crates/devctx-embed/build.rs`
+  (`fastembed-<v>/ort-<v>`, `env!`); test `the_local_engine_is_the_locked_one`.
+- **Legacy:** un índice sin fingerprint se reusa solo si su `index_state` tiene mismo modelo y
+  dimensión y no hay `transition`; la corrida lo sella. Un legacy que cambia de modelo ahora también
+  escribe `transition` antes de tocar archivos (si no, una corrida cortada y vuelta al modelo viejo
+  habría reusado vectores ajenos). Misma regla para la copia entre ramas. Tests:
+  `a_legacy_index_with_the_same_model_is_reused_and_sealed`,
+  `a_legacy_index_is_not_reused_across_models_or_after_a_transition`. Documentado en AGENTS.md y
+  CHANGELOG (Unreleased 0.10.0).
+- **Menores:** el endpoint (sin credenciales ni query) entra al fingerprint de proveedores HTTP; el
+  device CUDA/CPU queda fuera (diferencias a nivel de redondeo, documentado). `delete_file` solo baja
+  los índices derivados si el archivo estaba en `file_state`
+  (`deleting_a_file_never_indexed_leaves_the_derived_indexes_alone`). `IndexResult.files_unchanged`
+  separado de `files_indexed` (JSON y resumen del CLI). El error del serve ya no repite el prefijo
+  "local embedding backend:". `a_forced_exit_mid_index_leaves_a_sound_database` afirma que el
+  fingerprint sigue en `transition`. `enable_hnsw` ya reemplaza el índice al cambiar la métrica
+  (hace `drop_hnsw` antes de crear): test `enable_hnsw_replaces_the_index_when_the_metric_changes`.
+- **Medición multi-rama:** no hecha (los tests con dos ramas lo cubren: 0 archivos copiados, 0
+  embebidos, sin fase hnsw/fts).
+

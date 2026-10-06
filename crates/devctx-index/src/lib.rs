@@ -289,8 +289,9 @@ mod tests {
         // The pass that used to fail.
         let second = index_branch(&store, &dir, "feature", true);
         assert_eq!(
-            second.files_indexed, first.files_indexed,
-            "a repeat of the same work must produce the same result"
+            second.files_indexed + second.files_unchanged,
+            first.files_indexed,
+            "a repeat of the same work must cover the same files"
         );
 
         // And it is a replacement, not an accumulation.
@@ -323,9 +324,9 @@ mod tests {
         assert!(!store.extractor_stale(&repo_path, "main", &now).unwrap());
 
         // Control: main is now fresh, so a fresh branch may copy from it.
-        store
-            .set_index_meta(&repo_path, "feature", "extractor", &now)
-            .unwrap();
+        // (Dropped first: a branch that already holds the file copies nothing.)
+        let repo = dir.file_name().unwrap().to_string_lossy().to_string();
+        store.drop_branch(&repo, &repo_path, "feature").unwrap();
         let again = index_branch(&store, &dir, "feature", true);
         assert!(
             again.files_copied > 0,
@@ -391,7 +392,12 @@ mod tests {
                     "a.py",
                     &hash_a,
                     "main",
-                    &extractor_fingerprint()
+                    &devctx_store::CopySetup {
+                        extractor: &extractor_fingerprint(),
+                        embed_fp: "test-fp",
+                        model_name: "minilm-l6",
+                        dimension: DIM as i64
+                    }
                 )
                 .unwrap(),
             None,
@@ -408,7 +414,12 @@ mod tests {
                     "a.py",
                     &hash_a,
                     "feature",
-                    &extractor_fingerprint()
+                    &devctx_store::CopySetup {
+                        extractor: &extractor_fingerprint(),
+                        embed_fp: "test-fp",
+                        model_name: "minilm-l6",
+                        dimension: DIM as i64
+                    }
                 )
                 .unwrap()
                 .as_deref(),
@@ -574,7 +585,11 @@ mod tests {
         .unwrap();
 
         assert!(r2.full_reindex);
-        assert_eq!(r2.files_indexed, 1, "only a.rs remains");
+        assert_eq!(
+            r2.files_indexed + r2.files_unchanged,
+            1,
+            "only a.rs remains"
+        );
         assert_eq!(r2.files_pruned, 1, "b.rs should be pruned");
 
         let b_hits = store
@@ -2141,29 +2156,264 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An index from before fingerprints is trusted (not forced into a full
-    /// run) but its vectors are not reused until a run has stamped it.
+    /// An index from before fingerprints, made by the same model at the same
+    /// width, is reusable (every such index came from the one engine that
+    /// existed) and is sealed with the active fingerprint by the run.
     #[test]
-    fn an_index_without_a_fingerprint_is_stamped_not_reused() {
+    fn a_legacy_index_with_the_same_model_is_reused_and_sealed() {
         let dir = reuse_repo("legacy");
         let store = Store::open_in_memory(DIM).unwrap();
         let (first, _) = run_fp(&store, &dir, true, "test-fp", None, None);
         let git = crate::git::GitRepo::open(&dir).unwrap();
         let (rp, branch) = (git.root().to_string_lossy().to_string(), git.state().branch);
-        store
-            .delete_index_meta(&rp, &branch, devctx_store::EMBED_FP_META_KEY)
-            .unwrap();
-        let (res, n) = run_fp(&store, &dir, false, "test-fp", None, None);
-        assert!(!res.full_reindex && n == 0, "{res:?} {n}");
-        assert_eq!(
+        let drop_fp = || {
+            store
+                .delete_index_meta(&rp, &branch, devctx_store::EMBED_FP_META_KEY)
+                .unwrap()
+        };
+        let fp_now = || {
             store
                 .get_index_meta(&rp, &branch, devctx_store::EMBED_FP_META_KEY)
                 .unwrap()
-                .as_deref(),
-            Some("test-fp")
-        );
+        };
+        drop_fp();
+        // Incremental: not forced into a full run, sealed.
+        let (res, n) = run_fp(&store, &dir, false, "test-fp", None, None);
+        assert!(!res.full_reindex && n == 0, "{res:?} {n}");
+        assert_eq!(fp_now().as_deref(), Some("test-fp"));
+        // Full over a legacy index: reused straight away, then sealed.
+        drop_fp();
         let (full, n) = run_fp(&store, &dir, true, "test-fp", None, None);
         assert!(n == 0 && full.chunks_reused == first.chunks, "{full:?} {n}");
+        assert_eq!(fp_now().as_deref(), Some("test-fp"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One run under `model` / `fp`, optionally on a named branch and watched.
+    #[allow(clippy::too_many_arguments)]
+    fn run_as(
+        store: &Store,
+        root: &Path,
+        branch: Option<&str>,
+        full: bool,
+        fp: &str,
+        model: &str,
+        hnsw: Option<&str>,
+        sink: Option<&dyn ProgressSink>,
+    ) -> (IndexResult, usize) {
+        let emb = CountingEmbedder(std::sync::atomic::AtomicUsize::new(0));
+        let res = run(IndexRequest {
+            store,
+            embedder: &emb,
+            repo_root: root,
+            incremental: !full,
+            model_name: model,
+            progress: sink,
+            paths: None,
+            exclude: &[],
+            hnsw,
+            embed_fingerprint: fp,
+            branch,
+        })
+        .unwrap();
+        (res, emb.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A legacy index (no fingerprint) of another model is not reused, and an
+    /// interrupted run of another model over it leaves it unusable by the old
+    /// one (the "transition" mark is written for legacy indexes too).
+    #[test]
+    fn a_legacy_index_is_not_reused_across_models_or_after_a_transition() {
+        let dir = five_file_repo("legacy2");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let git = crate::git::GitRepo::open(&dir).unwrap();
+        let (rp, branch) = (git.root().to_string_lossy().to_string(), git.state().branch);
+        let key = devctx_store::EMBED_FP_META_KEY;
+
+        run_as(&store, &dir, None, true, "fp", "minilm-l6", None, None);
+        store.delete_index_meta(&rp, &branch, key).unwrap();
+        // Other model: nothing reusable.
+        let (other, n) = run_as(&store, &dir, None, true, "fp2", "bge-small", None, None);
+        assert_eq!(other.chunks_reused, 0, "{other:?}");
+        assert_eq!(n, other.chunks);
+
+        // Legacy again, a run under another model is cut short, then the
+        // original model comes back: files the cut run re-embedded hold the
+        // other model's vectors, so nothing may be reused.
+        store.delete_index_meta(&rp, &branch, key).unwrap();
+        let sink = CancelAfter::new(2);
+        let (cut, _) = run_as(&store, &dir, None, true, "fp", "minilm-l6", None, None);
+        assert!(!cut.cancelled);
+        store.delete_index_meta(&rp, &branch, key).unwrap();
+        let (cut, _) = run_as(
+            &store,
+            &dir,
+            None,
+            true,
+            "fp2",
+            "bge-small",
+            None,
+            Some(&sink),
+        );
+        assert!(cut.cancelled, "{cut:?}");
+        assert_eq!(
+            store.get_index_meta(&rp, &branch, key).unwrap().as_deref(),
+            Some("transition")
+        );
+        let (back, n) = run_as(&store, &dir, None, false, "fp", "minilm-l6", None, None);
+        assert_eq!(back.chunks_reused, 0, "{back:?}");
+        assert_eq!(n, back.chunks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A branch that already holds everything has nothing to copy: a `--full`
+    /// over two indexed branches writes nothing (on the parent it copied every
+    /// file the other branch holds, rewriting rows and the derived indexes).
+    #[test]
+    fn a_full_run_over_two_indexed_branches_writes_nothing() {
+        let dir = two_branch_repo("two_full");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (m, f) = ("minilm-l6", "test-fp");
+        run_as(&store, &dir, Some("main"), true, f, m, None, None);
+        run_as(&store, &dir, Some("feature"), true, f, m, None, None);
+        let before = files_on(&store, "main");
+
+        let hnsw = vss_available().then_some("cosine");
+        run_as(&store, &dir, Some("main"), true, f, m, hnsw, None);
+        let sink = CancelAt::new(None, usize::MAX);
+        let (again, n) = run_as(&store, &dir, Some("main"), true, f, m, hnsw, Some(&sink));
+        assert_eq!(again.files_copied, 0, "{again:?}");
+        assert_eq!(n, 0, "{again:?}");
+        assert_eq!(again.files_indexed, 0, "{again:?}");
+        assert!(again.files_unchanged > 0, "{again:?}");
+        assert_eq!(again.chunks_reused, again.chunks, "{again:?}");
+        assert!(
+            !sink.phases().iter().any(|p| p == "hnsw" || p == "fts"),
+            "{:?}",
+            sink.phases()
+        );
+        assert_eq!(files_on(&store, "main"), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A branch indexed under another embedding setup (or in transition) is no
+    /// source for a copy: its vectors would be sealed under this one's name.
+    /// A legacy branch (no fingerprint) is a source only for the same model.
+    #[test]
+    fn a_copy_needs_a_source_made_by_the_active_embedding_setup() {
+        let key = devctx_store::EMBED_FP_META_KEY;
+        let m = "minilm-l6";
+        let setup = |tag: &str| {
+            let dir = two_branch_repo(tag);
+            let store = Store::open_in_memory(DIM).unwrap();
+            let rp = GitRepo::open(&dir)
+                .unwrap()
+                .root()
+                .to_string_lossy()
+                .to_string();
+            (dir, store, rp)
+        };
+
+        // Another fingerprint.
+        let (dir, store, rp) = setup("cp_other");
+        run_as(&store, &dir, Some("feature"), true, "fp-a", m, None, None);
+        let (res, n) = run_as(&store, &dir, Some("main"), true, "fp-b", m, None, None);
+        assert_eq!(res.files_copied, 0, "{res:?}");
+        assert_eq!(n, res.chunks, "all embedded under the active setup");
+        assert_eq!(
+            store.get_index_meta(&rp, "main", key).unwrap().as_deref(),
+            Some("fp-b")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Source in transition.
+        let (dir, store, rp) = setup("cp_trans");
+        run_as(&store, &dir, Some("feature"), true, "fp-a", m, None, None);
+        store
+            .set_index_meta(&rp, "feature", key, "transition")
+            .unwrap();
+        let (res, _) = run_as(&store, &dir, Some("main"), true, "fp-a", m, None, None);
+        assert_eq!(res.files_copied, 0, "{res:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Same fingerprint: control, it does copy.
+        let (dir, store, _) = setup("cp_same");
+        run_as(&store, &dir, Some("feature"), true, "fp-a", m, None, None);
+        let (res, _) = run_as(&store, &dir, Some("main"), true, "fp-a", m, None, None);
+        assert!(res.files_copied > 0, "{res:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Legacy source, same model: compatible.
+        let (dir, store, rp) = setup("cp_legacy");
+        run_as(&store, &dir, Some("feature"), true, "fp-a", m, None, None);
+        store.delete_index_meta(&rp, "feature", key).unwrap();
+        let (res, _) = run_as(&store, &dir, Some("main"), true, "fp-a", m, None, None);
+        assert!(res.files_copied > 0, "{res:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Legacy source of another model: not.
+        let (dir, store, rp) = setup("cp_legacy_model");
+        run_as(
+            &store,
+            &dir,
+            Some("feature"),
+            true,
+            "fp-a",
+            "bge-small",
+            None,
+            None,
+        );
+        store.delete_index_meta(&rp, "feature", key).unwrap();
+        let (res, _) = run_as(&store, &dir, Some("main"), true, "fp-a", m, None, None);
+        assert_eq!(res.files_copied, 0, "{res:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a file the index never held changes nothing, so it must not
+    /// take the derived indexes down (and force their rebuild).
+    #[test]
+    fn deleting_a_file_never_indexed_leaves_the_derived_indexes_alone() {
+        if !vss_available() {
+            return;
+        }
+        let dir = reuse_repo("ghost");
+        let store = Store::open_in_memory(DIM).unwrap();
+        run_fp(&store, &dir, true, "test-fp", Some("cosine"), None);
+        let sink = CancelAt::new(None, usize::MAX);
+        let ghost = vec!["ghost.py".to_string()];
+        let res = run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: true,
+            model_name: "minilm-l6",
+            progress: Some(&sink),
+            paths: Some(&ghost),
+            exclude: &[],
+            hnsw: Some("cosine"),
+            embed_fingerprint: "test-fp",
+            branch: None,
+        })
+        .unwrap();
+        assert_eq!(res.files_deleted, 1, "{res:?}");
+        assert!(
+            !sink.phases().iter().any(|p| p == "hnsw" || p == "fts"),
+            "{:?}",
+            sink.phases()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Asking for another metric replaces the HNSW index (one exists at a time).
+    #[test]
+    fn enable_hnsw_replaces_the_index_when_the_metric_changes() {
+        if !vss_available() {
+            return;
+        }
+        let store = Store::open_in_memory(DIM).unwrap();
+        assert!(store.enable_hnsw("cosine").unwrap());
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert!(store.enable_hnsw("ip").unwrap());
+        assert_eq!(store.hnsw_metric().as_deref(), Some("ip"));
     }
 }

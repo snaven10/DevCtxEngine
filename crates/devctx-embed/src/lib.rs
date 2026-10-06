@@ -89,10 +89,12 @@ pub fn dimension_for(provider: &str, model: &str) -> usize {
     }
 }
 
-/// The engine that runs local models. Whatever replaces it (the `ort` engine of
-/// PLAN-010) must change this string until it is shown to produce the same
-/// vectors bit for bit: a vector reused across engines would be a silent lie.
-const LOCAL_ENGINE: &str = "fastembed-4/ort-2.0.0-rc.9";
+/// The engine that runs local models, as `fastembed-<version>/ort-<version>`
+/// read from `Cargo.lock` by `build.rs`, so a `cargo update` of either changes
+/// it. Whatever replaces them (the `ort` engine of PLAN-010) must change this
+/// string until it is shown to produce the same vectors bit for bit: a vector
+/// reused across engines would be a silent lie.
+const LOCAL_ENGINE: &str = env!("DEVCTX_LOCAL_ENGINE");
 
 /// Everything that decides the numbers a model produces for a text: provider,
 /// model, width, engine, the per-text character cap and the normalization.
@@ -121,7 +123,21 @@ pub fn embedding_fingerprint(s: &EmbedSettings, dimension: usize) -> String {
                 .unwrap_or(4096);
             format!("local|{model}|{dimension}|{LOCAL_ENGINE}|max_chars={max_chars}|l2")
         }
-        other => format!("{other}|{model}|{dimension}|http|l2"),
+        // The endpoint is part of what makes the vectors: a "custom" or
+        // OpenAI-compatible URL may serve another model under the same name.
+        // (The device — CPU or CUDA — stays out: it moves vectors only at the
+        // rounding level.) Credentials and query strings are not recorded.
+        other => {
+            let endpoint = s.endpoint.as_deref().unwrap_or("");
+            let endpoint = endpoint.split('?').next().unwrap_or("");
+            let endpoint = match endpoint.split_once("://") {
+                Some((scheme, rest)) => {
+                    format!("{scheme}://{}", rest.rsplit('@').next().unwrap_or(rest))
+                }
+                None => endpoint.to_string(),
+            };
+            format!("{other}|{model}|{dimension}|http|{endpoint}|l2")
+        }
     }
 }
 
@@ -203,6 +219,41 @@ mod tests {
         };
         assert_ne!(fp, embedding_fingerprint(&http, 384), "provider");
         assert!(fp.contains(LOCAL_ENGINE) && fp.contains("max_chars="));
+        let at = |url: &str| EmbedSettings {
+            provider: "custom".into(),
+            endpoint: Some(url.into()),
+            ..base.clone()
+        };
+        assert_ne!(
+            embedding_fingerprint(&at("http://a/v1"), 384),
+            embedding_fingerprint(&at("http://b/v1"), 384),
+            "endpoint"
+        );
+        assert_eq!(
+            embedding_fingerprint(&at("http://u:p@a/v1?key=1"), 384),
+            embedding_fingerprint(&at("http://a/v1"), 384),
+            "credentials are not part of it"
+        );
+    }
+
+    /// `LOCAL_ENGINE` is read from `Cargo.lock`: it must name the versions the
+    /// lock holds (a stale or unreadable lock would leave "unlocked").
+    #[test]
+    fn the_local_engine_is_the_locked_one() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .unwrap();
+        let ver = |p: &str| {
+            let at = lock.find(&format!("name = \"{p}\"\nversion = \"")).unwrap();
+            let rest = &lock[at..];
+            let v = rest.split('"').nth(3).unwrap();
+            v.to_string()
+        };
+        assert_eq!(
+            LOCAL_ENGINE,
+            format!("fastembed-{}/ort-{}", ver("fastembed"), ver("ort"))
+        );
     }
 
     #[test]
