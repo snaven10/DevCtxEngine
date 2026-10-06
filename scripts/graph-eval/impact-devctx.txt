@@ -1,0 +1,8 @@
+# Lista fija para medir la latencia de `impact` (formato: repo | símbolo).
+# Nombres ambiguos a propósito (`get`, `map`, `open`): son los que hacen crecer el recorrido.
+# La lista de un repo privado vive con sus casos, fuera del repo (DEVCTX_EVAL_IMPACT).
+DevCtxEngine|get
+DevCtxEngine|map
+DevCtxEngine|open
+DevCtxEngine|Store.open
+DevCtxEngine|search_ranked

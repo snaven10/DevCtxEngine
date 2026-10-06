@@ -1,0 +1,13 @@
+# Gold edges de Rust (PLAN-009 TASK-001, DD-1). Etiquetados a mano contra ecce342, antes de medir.
+#
+# Formato:  repo | archivo:línea | destino calificado esperado | external? | archivo del destino (opcional)
+#   - destino: `Tipo.metodo` (el `::` de Rust se escribe `.`), o la función suelta si no tiene tipo.
+#   - external?: `external` si el destino NO está definido en el repo; `-` si sí.
+#   - archivo del destino: solo cuando hay homónimos (se reporta aparte; el esquema 0.9.0 no lo guarda).
+# La línea es la de la llamada, contra el commit indicado arriba.
+DevCtxEngine|crates/devctx-core/src/procmem.rs:68|ProcMemory.parse_status|-|crates/devctx-core/src/procmem.rs
+DevCtxEngine|crates/devctx-mcp/src/state.rs:233|Instant.now|external|
+DevCtxEngine|crates/devctx-core/src/fallback.rs:49|CudaFallback.switch_to_cpu|-|crates/devctx-core/src/fallback.rs
+DevCtxEngine|crates/devctx-mcp/src/state.rs:294|Store.open|-|crates/devctx-store/src/store.rs
+DevCtxEngine|crates/devctx-summarize/src/extractive.rs:85|EmbeddingProvider.embed|-|crates/devctx-embed/src/provider.rs
+DevCtxEngine|crates/devctx-summarize/src/extractive.rs:73|split_sentences|-|crates/devctx-summarize/src/extractive.rs
