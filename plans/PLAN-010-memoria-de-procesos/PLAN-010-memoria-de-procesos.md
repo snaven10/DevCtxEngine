@@ -169,7 +169,7 @@ Resumen; el detalle y los tradeoffs están en [`PLAN-010-design.md`](./PLAN-010-
 
 | Task | Qué | Especialista | Depende de | Estado |
 |------|-----|--------------|------------|--------|
-| TASK-001 | Instrumentación de memoria (`status.memory`, logs de carga/liberación) y línea base post-0.8.5 | general-purpose (Rust) | — | `pending` |
+| TASK-001 | Instrumentación de memoria (`status.memory`, logs de carga/liberación) y línea base post-0.8.5 | general-purpose (Rust) | — | `done` |
 | TASK-002 | DuckDB: `memory_limit`/`threads` en config, valores efectivos, defaults medidos con REVFA_FrontEnd | general-purpose (Rust) | TASK-001 | `pending` |
 | TASK-003 | Arnés de equivalencia: fixtures + vectores y scores dorados generados con fastembed | general-purpose (Rust) | — | `pending` |
 | TASK-004 | Motor ONNX propio para embeddings (`ort` + `tokenizers`), builtins y user-defined, CUDA y stall guard | general-purpose (Rust) | TASK-003 | `pending` |

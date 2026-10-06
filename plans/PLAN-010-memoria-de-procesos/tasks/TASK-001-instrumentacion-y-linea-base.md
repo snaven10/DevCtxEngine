@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-010 — Memoria de procesos
 - **Especialista:** general-purpose (Rust)
-- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
+- **Proyecto:** DevCtxEngine (`/home/snaven10/personal/DevCtxEngine`), rama `feat/plan-010-medicion`
 - **Depende de:** — (primera del plan; requiere 0.8.5 publicado en `main`)
 - **Estado:** `done`
 
@@ -69,13 +69,13 @@ las tasks siguientes. Confirmar o refutar HM-1…HM-4 del diseño (§1).
 
 ## Criterios de aceptación
 
-- [ ] `curl /status` del serve y del central devuelven `memory` con los cuatro sub-bloques; test de
+- [x] `curl /status` del serve y del central devuelven `memory` con los cuatro sub-bloques; test de
       integración que valida forma y tipos (no números).
-- [ ] Con el modelo liberado, `memory.models.embedder.loaded == false` sin haber disparado una carga
+- [x] Con el modelo liberado, `memory.models.embedder.loaded == false` sin haber disparado una carga
       (test: `status` sobre un serve recién abierto no carga el modelo).
-- [ ] Parser de `/proc/self/status` con test unitario sobre texto fijo; compila en Windows/macOS
+- [x] Parser de `/proc/self/status` con test unitario sobre texto fijo; compila en Windows/macOS
       (`cfg`).
-- [ ] Resultado con la tabla E1-E6 completa y el veredicto de HM-1…HM-4 (cuánto de los ~500 MB es
+- [x] Resultado con la tabla E1-E6 completa y el veredicto de HM-1…HM-4 (cuánto de los ~500 MB es
       modelo/ORT vs DuckDB/HNSW).
 
 ## Riesgos
@@ -150,12 +150,14 @@ Crear el HNSW por el camino directo: 1.7 s (4.7 k vec) y ~6 s (14 k vec), pico `
   (~70 %); DuckDB (12-42) y HNSW (17-48) son poco.
 - **HM-2 (HNSW cuesta decenas/cientos de MB): decenas, lineal.** ~3.4 KB por vector medido (+17 MiB con
   4.7 k vectores, +48 con 14.4 k). Extrapolación (no medida): 100 k vectores ~340 MiB.
-- **HM-3 (soltado el modelo vuelve a < 60): parcial.** 84 / 91 / 56 en serves con datos y 105 en el central:
-  quedan ~25-35 MiB sobre un serve vacío (82); `malloc_trim` devuelve casi todo, no todo.
-- **HM-4 (el pico de indexar lo domina un lote): confirmada, con matiz.** El pico de indexar (753-897) es
-  casi todo el **transitorio de carga del modelo** (`VmHWM` 712 con sólo abrir el modelo y hacer un
-  `search`, contra 300 estable); indexar agrega ~75-190 encima. Los 18.2 GB / 6.5 GB de 0.8.4 ya no existen
-  desde 0.8.5.
+- **HM-3 (soltado el modelo vuelve a < 60): refutada en 2 de 3 serves y en el central.** Umbral < 60 MiB:
+  84 y 91 no lo cumplen, 56 sí; el central da 105. Un serve recién abierto, sin modelo, ya está en 82
+  (97 con HNSW), así que el piso es el proceso base + DuckDB + HNSW, no un resto del modelo;
+  `malloc_trim` devuelve prácticamente todo lo del modelo. La hipótesis fijó un umbral por debajo de ese piso.
+- **HM-4 (el pico de indexar lo domina un lote): refutada: el pico es la carga del modelo.** El pico de
+  indexar (753-897) es casi todo el **transitorio de carga del modelo** (`VmHWM` 712 con sólo abrir el
+  modelo y hacer un `search`, contra 300 estable); indexar agrega ~75-190 encima, no un lote dominante.
+  Los 18.2 GB / 6.5 GB de 0.8.4 ya no existen desde 0.8.5.
 
 ### Insumos para decidir (sin decidirlo)
 
