@@ -464,6 +464,28 @@ class C {
                 "fn a() { struct P { n1: u8 } }\nmod a { struct P { m_mod: u8 } }\n",
                 &["m_mod"],
             ),
+            // Java overloads around an anonymous class: `O()` and `O(int)`,
+            // `m(int)` and `m(String)` are different scopes, so adding an
+            // overload above does not hand the old `run` an ordinal.
+            (
+                Lang::java(),
+                "L.java",
+                "\
+class O {
+    O() { new Runnable() { public void run() { m_ctor(); } }; }
+    void m(String s) { new Runnable() { public void run() { m_str(); } }; }
+}
+",
+                "\
+class O {
+    O(int x) { new Runnable() { public void run() { n1(); } }; }
+    O() { new Runnable() { public void run() { m_ctor(); } }; }
+    void m(int i) { new Runnable() { public void run() { n2(); } }; }
+    void m(String s) { new Runnable() { public void run() { m_str(); } }; }
+}
+",
+                &["m_ctor", "m_str"],
+            ),
         ];
         for (lang, file, before, after, markers) in cases {
             let a = ids(*lang, before, file);

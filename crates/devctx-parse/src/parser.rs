@@ -503,9 +503,11 @@ fn last_path_segment(t: &str) -> &str {
 }
 
 /// Names of every scope around `def`, outermost first: its qualifier, and
-/// the shape of that qualifier — one character per scope, `f` for a
-/// callable (a node of the language's `function_kinds`), `s` for anything
-/// else — `None` when no scope is callable.
+/// the shape of that qualifier — one entry per scope, `f` for a callable (a
+/// node of the language's `function_kinds`), `s` for anything else — `None`
+/// when no scope is callable. In a language with overloads (Java) a
+/// callable's entry carries its parameter types, `f(int)`: two constructors
+/// `O()` and `O(int)`, each with an anonymous class's `run`, are two scopes.
 ///
 /// A scope is a container (class, `impl`, trait…), any other symbol of the
 /// file (a Rust `mod`, an enclosing function or method — a Python decorator's
@@ -523,10 +525,11 @@ fn qualifier_chain(
     def_ids: &HashSet<usize>,
 ) -> (Vec<String>, Option<String>) {
     let mut chain = Vec::new();
-    let mut shape = Vec::new();
+    // One entry per scope, so the order can be reversed with the chain.
+    let mut shape: Vec<String> = Vec::new();
     if let Some(recv) = go_receiver_type(def, bytes) {
         chain.push(recv);
-        shape.push('s');
+        shape.push("s".into());
     }
     let mut cur = def.parent();
     while let Some(n) = cur {
@@ -544,15 +547,26 @@ fn qualifier_chain(
         if let Some(name) = name {
             chain.push(name);
             let callable = lang.function_kinds().iter().any(|k| k == n.kind());
-            shape.push(if callable { 'f' } else { 's' });
+            let entry = if !callable {
+                "s".to_string()
+            } else if let Some(params) = lang.overloads().then(|| param_types(n, bytes)).flatten() {
+                // Overloads of one name are separate scopes: `O()` and
+                // `O(int)` each with an anonymous `run` are not one
+                // `O.O.run` told apart by source order.
+                format!("f({params})")
+            } else {
+                "f".to_string()
+            };
+            shape.push(entry);
         }
         cur = n.parent();
     }
     chain.reverse();
     shape.reverse();
     let shape = shape
-        .contains(&'f')
-        .then(|| shape.into_iter().collect::<String>());
+        .iter()
+        .any(|e| e.starts_with('f'))
+        .then(|| shape.concat());
     (chain, shape)
 }
 

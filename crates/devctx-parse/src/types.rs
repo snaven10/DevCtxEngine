@@ -41,9 +41,10 @@ pub struct Symbol {
     /// The trait of the Rust `impl Trait for Type` the symbol sits in
     /// (`Display`, `From<A>`); part of the id's disambiguator (DD-3).
     pub trait_of: Option<String>,
-    /// Which enclosing scopes of `qualified` are callables: one character per
+    /// Which enclosing scopes of `qualified` are callables: one entry per
     /// scope, outermost first, `f` for a function or method, `s` otherwise
-    /// (`Some("sf")` for `Outer.start.run`); `None` when none is. Part of the
+    /// (`Some("sf")` for `Outer.start.run`; Java adds the callable's
+    /// parameter types, `Some("sf(int)")`); `None` when none is. Part of the
     /// id's disambiguator (DD-3): a function `a` and a module `a` both
     /// qualify their contents as `a.P`.
     pub scope_shape: Option<String>,

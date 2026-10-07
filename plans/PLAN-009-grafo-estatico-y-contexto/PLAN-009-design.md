@@ -181,7 +181,10 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   separados — **solo Java** (`"overloads": true`); y la **forma del scope** cuando algún scope
   envolvente es invocable: un carácter por scope, `f` si el nodo está en `function_kinds`, `s` si
   no, tras `@` (`Outer.start.run` → `@sf`; sin scope invocable no se agrega nada, así que los ids
-  de métodos de clase y funciones de módulo no la llevan). Resuelve la ambigüedad del `.`:
+  de métodos de clase y funciones de módulo no la llevan; en lenguajes con `"overloads": true`
+  el carácter `f` lleva los tipos de parámetro del invocable, `f(int)`, porque dos sobrecargas
+  `O()` y `O(int)` —o `m(int)` y `m(String)`—, cada una con una clase anónima con `run`, daban
+  las dos `O.O.run` `@sf` y caían al ordinal: `@sf()` y `@sf(int)`). Resuelve la ambigüedad del `.`:
   `fn a() { struct P }` y `mod a { struct P }` (Rust los permite, son namespaces distintos; TS
   fusiona `function a` con `namespace a`; Java un método `a` y una clase interna `a`) daban los dos
   `a.P`. Se eligió el disambiguator y no `qualified` porque `qualified` es lo que lee una persona
@@ -197,7 +200,8 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   único caso en que insertar un homónimo arriba mueve un id; el test
   `inserting_a_homonym_above_keeps_existing_ids` fija que no pasa en: Rust `mod tests`, dos impls
   de trait, `fn a`/`mod a` del mismo nombre, decoradores Python, receptores Go, clases anónimas
-  Java en métodos distintos, en un constructor, en campos y en constantes de enum, y objetos
+  Java en métodos distintos, en sobrecargas distintas (constructores o métodos), en un constructor, en
+  campos y en constantes de enum, y objetos
   literales TS/JS en variables o propiedades distintas. **Casos que siguen cayendo al ordinal
   (abiertos, conocidos):**
   - redefinición real (Python `def f` dos veces; `function f` repetida en JS no estricto);
@@ -205,7 +209,9 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
     `static {}`/de instancia, o lambda; y dos expresiones `new X() {…}` en un mismo campo;
   - objetos literales sin variable ni propiedad que los nombre: argumentos de llamada
     (`describe({ run() {} })` dos veces), `export default {…}`, elementos de arreglo, `return {…}`;
-    también los que cuelgan de un `pair` con clave string o computada;
+    también los que cuelgan de un `pair` con clave string o computada (`{ 'a': { run() {} } }`,
+    `{ [k]: { run() {} } }`: la clave no es un identificador y el `pair` no aporta segmento, así
+    que dos de esos `run` en el mismo objeto comparten calificado y se separan por ordinal);
   - Java: clases anónimas dentro de lambdas (la lambda no tiene nombre, no es scope) en un mismo
     método;
   - TS/JS: funciones flecha y expresiones de función no son símbolos todavía (TASK-004 las agrega
