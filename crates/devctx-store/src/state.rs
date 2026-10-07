@@ -15,6 +15,8 @@ pub const EXTRACTOR_META_KEY: &str = "extractor";
 /// active extractor and embedding setup.
 #[derive(Debug, Clone, Copy)]
 pub struct CopySetup<'a> {
+    /// The repository's short name, which the graph tables are keyed by.
+    pub repo: &'a str,
     pub extractor: &'a str,
     pub embed_fp: &'a str,
     pub model_name: &'a str,
@@ -119,6 +121,7 @@ impl Store {
 
     /// Insert or replace an index record.
     pub fn save_index_record(&self, rec: &IndexRecord) -> Result<()> {
+        self.forget_graph_step(Some(&rec.branch));
         self.w()?.execute(
             "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
             params![rec.repo_path, rec.branch],
@@ -197,7 +200,9 @@ impl Store {
     /// ([`graph_out_of_step`](Self::graph_out_of_step)): the stamp is only
     /// rewritten by a full run, so an older binary's incremental runs leave
     /// it saying "current" over files whose `symbols` rows they never wrote.
-    /// `repo` is the short name the graph tables are keyed by.
+    /// `repo` is the short name the graph tables are keyed by. The graph
+    /// check is cached (the graph tools ask on every call): see
+    /// [`graph_out_of_step_cached`](Self::graph_out_of_step_cached).
     ///
     /// [`extractor fingerprint`]: EXTRACTOR_META_KEY
     pub fn extractor_stale(
@@ -214,17 +219,18 @@ impl Store {
         {
             return Ok(true);
         }
-        self.graph_out_of_step(repo, repo_path, branch)
+        self.graph_out_of_step_cached(repo, repo_path, branch)
     }
 
-    /// Whether `file_state` and the symbol graph disagree on which files a
-    /// branch holds: a file with symbols but no `file` symbol row (added by
-    /// a binary that does not write the graph, 0.9.0 after a downgrade), or a
-    /// `file` symbol row whose file has no state any more (deleted by one).
+    /// Whether `file_state` and the symbol graph disagree on a branch: a
+    /// file with symbols but no `file` symbol row (added by a binary that
+    /// does not write the graph, 0.9.0 after a downgrade), a `file` symbol
+    /// row whose file has no state any more (deleted by one), or a `file`
+    /// symbol row whose `content_hash` is not the file's (modified by one:
+    /// its symbol rows are still there, only older).
     ///
-    /// Two anti-joins, cheap enough for every status. Not caught: a file such
-    /// a binary *modified*, whose symbol rows are still there, only older —
-    /// telling that apart needs a hash the graph does not keep.
+    /// Three anti-joins over one branch. Callers that ask on every tool call
+    /// use [`graph_out_of_step_cached`](Self::graph_out_of_step_cached).
     pub fn graph_out_of_step(&self, repo: &str, repo_path: &str, branch: &str) -> Result<bool> {
         let n: bool = self.conn.query_row(
             "SELECT EXISTS (
@@ -239,11 +245,41 @@ impl Store {
                    AND NOT EXISTS (SELECT 1 FROM file_state f
                        WHERE f.repo_path = ? AND f.branch = s.branch
                          AND f.file_path = s.file)
+             ) OR EXISTS (
+                 SELECT 1 FROM symbols s JOIN file_state f
+                   ON f.repo_path = ? AND f.branch = s.branch AND f.file_path = s.file
+                 WHERE s.repo = ? AND s.branch = ? AND s.kind = 'file'
+                   AND s.content_hash IS DISTINCT FROM f.content_hash
              )",
-            params![repo_path, branch, repo, repo, branch, repo_path],
+            params![repo_path, branch, repo, repo, branch, repo_path, repo_path, repo, branch],
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    /// [`graph_out_of_step`](Self::graph_out_of_step), remembered per
+    /// `(repo, repo_path, branch)` and the branch's `index_state.indexed_at`:
+    /// the graph tools ask on every call, and a copy between branches on
+    /// every file. A run that writes the branch ends by stamping a new
+    /// `indexed_at`; this process's own writes to the branch (`file_state`,
+    /// the graph tables, `index_state`) and a rolled-back transaction also
+    /// drop the answer, so it is never older than the rows.
+    pub fn graph_out_of_step_cached(
+        &self,
+        repo: &str,
+        repo_path: &str,
+        branch: &str,
+    ) -> Result<bool> {
+        let indexed_at = self
+            .get_index_record(repo_path, branch)?
+            .map(|r| r.indexed_at);
+        let key = (repo.to_string(), repo_path.to_string(), branch.to_string());
+        if let Some(v) = self.cached_graph_step(&key, &indexed_at) {
+            return Ok(v);
+        }
+        let v = self.graph_out_of_step(repo, repo_path, branch)?;
+        self.remember_graph_step(key, indexed_at, v);
+        Ok(v)
     }
 
     /// The last-indexed content hash for a file, if recorded.
@@ -295,6 +331,7 @@ impl Store {
 
     /// Insert or replace a file-state row.
     pub fn save_file_state(&self, fs: &FileState) -> Result<()> {
+        self.forget_graph_step(Some(&fs.branch));
         self.w()?.execute(
             "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
             params![fs.repo_path, fs.branch, fs.file_path],
@@ -331,7 +368,13 @@ impl Store {
     /// produced them*. Rows also carry symbols and edges, so only branches
     /// whose `index_meta` records `extractor` (the current fingerprint) are
     /// offered; a branch from an older extractor, or one with no record, would
-    /// smuggle its stale symbols into a branch about to be stamped fresh.
+    /// smuggle its stale symbols into a branch about to be stamped fresh. The
+    /// seal is not enough on its own: an older binary's incremental runs
+    /// leave it saying "current" over a graph they did not write, so a branch
+    /// whose graph is [out of step](Self::graph_out_of_step) is not offered
+    /// either (answer cached, see [`graph_out_of_step_cached`]).
+    ///
+    /// [`graph_out_of_step_cached`]: Self::graph_out_of_step_cached
     ///
     /// The same holds for the vectors: a source qualifies only if they were made
     /// by the active embedding setup. Its `EMBED_FP_META_KEY` must equal
@@ -348,6 +391,7 @@ impl Store {
         setup: &CopySetup,
     ) -> Result<Option<String>> {
         let CopySetup {
+            repo,
             extractor,
             embed_fp,
             model_name,
@@ -365,9 +409,9 @@ impl Store {
                AND f.branch <> ? AND m.value = ?
                AND (e.value = ?
                     OR (e.value IS NULL AND s.model_name = ? AND s.model_dimension = ?))
-             LIMIT 1",
+             ORDER BY f.branch",
         )?;
-        match stmt.query_row(
+        let candidates = stmt.query_map(
             duckdb::params![
                 EXTRACTOR_META_KEY,
                 EMBED_FP_META_KEY,
@@ -381,11 +425,14 @@ impl Store {
                 dimension
             ],
             |r| r.get::<_, String>(0),
-        ) {
-            Ok(b) => Ok(Some(b)),
-            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+        )?;
+        for branch in candidates {
+            let branch = branch?;
+            if !self.graph_out_of_step_cached(repo, repo_path, &branch)? {
+                return Ok(Some(branch));
+            }
         }
+        Ok(None)
     }
 
     /// Every branch this repository has rows for, so a caller can tell which
@@ -412,6 +459,7 @@ impl Store {
     }
 
     pub fn delete_file_state(&self, repo_path: &str, branch: &str, file: &str) -> Result<()> {
+        self.forget_graph_step(Some(branch));
         self.w()?.execute(
             "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
             params![repo_path, branch, file],
@@ -523,6 +571,7 @@ mod tests {
             kind: "file".into(),
             name: file.into(),
             qualified: file.into(),
+            content_hash: Some("h".into()),
             ..Default::default()
         };
         let stale = || store.extractor_stale("r", "/repo", "main", "v2-x").unwrap();
@@ -551,6 +600,130 @@ mod tests {
             .replace_file_graph("other", "main", "c.py", &[file_sym("c.py")], &[])
             .unwrap();
         assert!(!stale());
+
+        // Modified by the older binary: new state, the old graph rows.
+        store
+            .save_file_state(&FileState {
+                content_hash: "h2".into(),
+                ..state("b.py", 1)
+            })
+            .unwrap();
+        assert!(
+            stale(),
+            "graph rows parsed from other bytes than the file's"
+        );
+    }
+
+    fn sealed_branch(store: &Store, branch: &str, file: &str, in_step: bool) {
+        use crate::symbols::StoredSymbol;
+        store
+            .set_index_meta("/repo", branch, EXTRACTOR_META_KEY, "v2-x")
+            .unwrap();
+        store
+            .set_index_meta("/repo", branch, EMBED_FP_META_KEY, "fp")
+            .unwrap();
+        store
+            .save_file_state(&FileState {
+                repo_path: "/repo".into(),
+                branch: branch.into(),
+                file_path: file.into(),
+                content_hash: "h".into(),
+                language: "python".into(),
+                symbol_count: 1,
+                chunk_count: 1,
+            })
+            .unwrap();
+        let row = StoredSymbol {
+            id: devctx_core::symbol_id::file_symbol_id("r", file),
+            file: file.into(),
+            kind: "file".into(),
+            name: file.into(),
+            qualified: file.into(),
+            content_hash: Some(if in_step { "h" } else { "old" }.into()),
+            ..Default::default()
+        };
+        store
+            .replace_file_graph("r", branch, file, &[row], &[])
+            .unwrap();
+    }
+
+    /// The seal of a branch says "current" also after an older binary's
+    /// incremental runs: a branch whose graph is out of step with its files
+    /// must not be the source of a copy, or its old rows spread to the
+    /// branch being indexed under a fresh seal.
+    #[test]
+    fn a_branch_out_of_step_is_not_a_copy_source() {
+        let store = Store::open_in_memory(3).unwrap();
+        let setup = CopySetup {
+            repo: "r",
+            extractor: "v2-x",
+            embed_fp: "fp",
+            model_name: "m",
+            dimension: 3,
+        };
+        let source = |store: &Store| {
+            store
+                .branch_with_same_content("/repo", "a.py", "h", "feature", &setup)
+                .unwrap()
+        };
+        sealed_branch(&store, "dev", "a.py", false);
+        assert_eq!(source(&store), None, "dev's graph is older than its files");
+        sealed_branch(&store, "main", "a.py", true);
+        assert_eq!(source(&store).as_deref(), Some("main"));
+    }
+
+    /// The graph check is remembered until the branch changes: a new
+    /// `indexed_at`, or a write of this process to the branch.
+    #[test]
+    fn the_graph_check_is_cached_until_the_branch_changes() {
+        let store = Store::open_in_memory(3).unwrap();
+        sealed_branch(&store, "main", "a.py", true);
+        let record = |at: &str| IndexRecord {
+            repo_path: "/repo".into(),
+            branch: "main".into(),
+            last_commit: "c".into(),
+            model_name: "m".into(),
+            model_dimension: 3,
+            file_count: 1,
+            symbol_count: 1,
+            chunk_count: 1,
+            indexed_at: at.into(),
+        };
+        store.save_index_record(&record("1")).unwrap();
+        let cached = || {
+            store
+                .graph_out_of_step_cached("r", "/repo", "main")
+                .unwrap()
+        };
+        assert!(!cached());
+        // Behind the store's back (another binary): the answer is the cached one…
+        store
+            .conn
+            .execute_batch("UPDATE file_state SET content_hash = 'h2'")
+            .unwrap();
+        assert!(store.graph_out_of_step("r", "/repo", "main").unwrap());
+        assert!(!cached(), "cached under the same indexed_at");
+        // …until that run stamps the branch.
+        store
+            .conn
+            .execute_batch("UPDATE index_state SET indexed_at = '2'")
+            .unwrap();
+        assert!(cached());
+        // This process's own writes drop it at once.
+        sealed_branch(&store, "main", "a.py", true);
+        assert!(!cached());
+        store
+            .save_file_state(&FileState {
+                repo_path: "/repo".into(),
+                branch: "main".into(),
+                file_path: "b.py".into(),
+                content_hash: "h".into(),
+                language: "python".into(),
+                symbol_count: 1,
+                chunk_count: 1,
+            })
+            .unwrap();
+        assert!(cached(), "b.py has no graph rows");
     }
 
     /// Totals must survive a run that changed nothing: an incremental index

@@ -395,6 +395,7 @@ mod tests {
                     &hash_a,
                     "main",
                     &devctx_store::CopySetup {
+                        repo: &repo_short_of(&dir),
                         extractor: &extractor_fingerprint(),
                         embed_fp: "test-fp",
                         model_name: "minilm-l6",
@@ -417,6 +418,7 @@ mod tests {
                     &hash_a,
                     "feature",
                     &devctx_store::CopySetup {
+                        repo: &repo_short_of(&dir),
                         extractor: &extractor_fingerprint(),
                         embed_fp: "test-fp",
                         model_name: "minilm-l6",

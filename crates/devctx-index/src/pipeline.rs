@@ -1042,6 +1042,7 @@ impl Ctx<'_> {
                 &hash,
                 self.branch,
                 &devctx_store::CopySetup {
+                    repo: self.repo_short,
                     extractor: &devctx_parse::extractor_fingerprint(),
                     embed_fp: self.embed_fingerprint,
                     model_name: self.model_name,
@@ -1149,7 +1150,7 @@ impl Ctx<'_> {
             }
             stall_inside_write(nth);
             if let Some(parsed) = &parsed {
-                self.store_edges(file, parsed)?;
+                self.store_edges(file, parsed, &hash)?;
             }
             self.store_routes(file, &content)?;
             self.store.save_file_state(&FileState {
@@ -1255,6 +1256,7 @@ impl Ctx<'_> {
         &self,
         file: &str,
         parsed: &devctx_parse::ParsedFile,
+        content_hash: &str,
     ) -> devctx_store::Result<()> {
         let edges: Vec<StoredEdge> = parsed
             .edges
@@ -1269,7 +1271,7 @@ impl Ctx<'_> {
             .collect();
         self.store
             .replace_file_edges(self.repo_short, self.branch, file, &edges)?;
-        let (symbols, edges) = graph_rows(file, parsed);
+        let (symbols, edges) = graph_rows(file, parsed, content_hash);
         self.store
             .replace_file_graph(self.repo_short, self.branch, file, &symbols, &edges)
     }
@@ -1296,10 +1298,12 @@ impl Ctx<'_> {
 /// The `symbols` and `edges` rows of one parsed file (ids already assigned):
 /// the file symbol first, then every symbol; one edge per call occurrence,
 /// module-level ones included, unresolved (`dst_id` and the rest are the link
-/// pass's to fill, PLAN-009 DD-6).
+/// pass's to fill, PLAN-009 DD-6). The file symbol carries `content_hash`,
+/// the value `file_state` records for the same bytes.
 fn graph_rows(
     file: &str,
     parsed: &devctx_parse::ParsedFile,
+    content_hash: &str,
 ) -> (Vec<StoredSymbol>, Vec<StoredSymbolEdge>) {
     let is_test = devctx_core::path_kind(file, &parsed.language) == devctx_core::PathKind::Test;
     let symbols = std::iter::once(&parsed.file_symbol)
@@ -1322,6 +1326,8 @@ fn graph_rows(
             rank: None,
             in_degree: None,
             is_test,
+            content_hash: (s.kind == devctx_parse::symbol_id::FILE_KIND)
+                .then(|| content_hash.to_string()),
         })
         .collect();
     let mut edges: Vec<StoredSymbolEdge> = parsed

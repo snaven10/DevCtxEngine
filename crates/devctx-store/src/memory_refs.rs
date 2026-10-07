@@ -427,6 +427,7 @@ impl Store {
     /// ever, and — worse than the disk — a branch name reused later inherits
     /// them, so a fresh branch starts out answering with someone else's code.
     pub fn drop_branch(&self, repo: &str, repo_path: &str, branch: &str) -> Result<usize> {
+        self.forget_graph_step(Some(branch));
         // One transaction: a cut half-way (an error, a process that ends) used
         // to leave the branch half-deleted, repaired only by the next prune.
         self.in_transaction(|| {

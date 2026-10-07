@@ -18,7 +18,13 @@ pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
         .iter()
         .all(|t| table_exists(conn, t));
     conn.execute_batch(RELATIONAL_DDL)?;
-    if !had_all && checkpoint_is_safe(conn) {
+    // `symbols.content_hash` came after the table, before any release: a
+    // database written by a development build of PLAN-009 lacks it.
+    let had_columns = column_exists(conn, "symbols", "content_hash");
+    if !had_columns {
+        conn.execute_batch("ALTER TABLE symbols ADD COLUMN IF NOT EXISTS content_hash VARCHAR;")?;
+    }
+    if !(had_all && had_columns) && checkpoint_is_safe(conn) {
         // A table created on an existing database is DDL in the WAL; a process
         // dying before the next checkpoint leaves a log whose replay breaks
         // the ART indexes (see `Store::checkpoint`). Best-effort, as there.
@@ -50,6 +56,15 @@ pub(crate) fn checkpoint_is_safe(conn: &Connection) -> bool {
     conn.query_row(
         "SELECT count(*) > 0 FROM duckdb_extensions() WHERE extension_name = 'vss' AND loaded",
         [],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) > 0 FROM duckdb_columns() WHERE table_name = ? AND column_name = ?",
+        [table, column],
         |r| r.get::<_, bool>(0),
     )
     .unwrap_or(false)
@@ -324,7 +339,9 @@ CREATE TABLE IF NOT EXISTS symbols (
     exported    BOOLEAN,
     rank        DOUBLE,
     in_degree   INTEGER,
-    is_test     BOOLEAN
+    is_test     BOOLEAN,
+    -- The file symbol's only: the file's `content_hash`, as in `file_state`.
+    content_hash VARCHAR
 );
 
 -- `src_id` is always a symbol of `file` (the file symbol for a module-level

@@ -128,7 +128,14 @@ struct Shared {
     /// the network when the extension is not on disk, so a machine without it
     /// would pay that on every run; the failure is remembered instead.
     vss_unavailable: AtomicBool,
+    /// [`Store::graph_out_of_step`] answers, per `(repo, repo_path, branch)`,
+    /// with the branch's `index_state.indexed_at` they were computed under
+    /// (see [`Store::graph_out_of_step_cached`]).
+    graph_step: std::sync::Mutex<GraphStepCache>,
 }
+
+/// `(repo, repo_path, branch)` → `(indexed_at, out of step)`.
+type GraphStepCache = std::collections::HashMap<(String, String, String), (Option<String>, bool)>;
 
 /// A connection borrowed for one write; see [`Store::w`].
 pub(crate) struct WriteConn<'a> {
@@ -156,6 +163,9 @@ impl Drop for TxGuard<'_> {
             // Never gated: a rollback writes nothing to the WAL, and a frozen
             // store must still be able to abandon what it started.
             let _ = self.store.conn.execute_batch("ROLLBACK");
+            // An answer read inside the transaction may describe rows that
+            // are gone now.
+            self.store.forget_graph_step(None);
         }
         self.store.in_tx.store(false, Ordering::SeqCst);
     }
@@ -999,6 +1009,11 @@ impl Store {
     /// carries its file (PLAN-009 DD-3), so the renamed file's symbols are new
     /// ones, which the reindex of `new` writes. Edges elsewhere that resolved
     /// into it are unresolved for the link pass. One transaction.
+    ///
+    /// `file_state` is not touched: the caller re-keys it (or re-indexes
+    /// `new`). Until it does, the graph check reads the branch as out of step
+    /// (`old` has state and no `file` symbol row). No production caller
+    /// today: the pipeline indexes a rename as a delete plus an add.
     pub fn rename_file(&self, repo: &str, branch: &str, old: &str, new: &str) -> Result<usize> {
         self.in_transaction(|| {
             let n = self.w()?.execute(
@@ -1358,6 +1373,42 @@ fn value_to_f32_vec(v: Value) -> Vec<f32> {
 }
 
 impl Store {
+    /// A cached [`graph_out_of_step`](Self::graph_out_of_step) answer, if one
+    /// was computed under the same `indexed_at`.
+    pub(crate) fn cached_graph_step(
+        &self,
+        key: &(String, String, String),
+        indexed_at: &Option<String>,
+    ) -> Option<bool> {
+        let g = self.shared.graph_step.lock().ok()?;
+        g.get(key)
+            .filter(|(at, _)| at == indexed_at)
+            .map(|(_, v)| *v)
+    }
+
+    pub(crate) fn remember_graph_step(
+        &self,
+        key: (String, String, String),
+        indexed_at: Option<String>,
+        out_of_step: bool,
+    ) {
+        if let Ok(mut g) = self.shared.graph_step.lock() {
+            g.insert(key, (indexed_at, out_of_step));
+        }
+    }
+
+    /// Drop the cached answers of `branch` (of every branch with `None`):
+    /// called by every write that can change them — `file_state`, the
+    /// graph tables, `index_state`, a rollback.
+    pub(crate) fn forget_graph_step(&self, branch: Option<&str>) {
+        if let Ok(mut g) = self.shared.graph_step.lock() {
+            match branch {
+                Some(b) => g.retain(|(_, _, kb), _| kb != b),
+                None => g.clear(),
+            }
+        }
+    }
+
     /// Forget the resolved metric so the next search re-reads it.
     fn invalidate_metric_cache(&self) {
         if let Ok(mut g) = self.metric_cache.lock() {

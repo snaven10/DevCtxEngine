@@ -51,6 +51,11 @@ pub struct StoredSymbol {
     pub in_degree: Option<i32>,
     /// The file is a test (`path_kind`).
     pub is_test: bool,
+    /// The file symbol's only: the `content_hash` of the file the rows were
+    /// parsed from, the same value `file_state` records. Lets
+    /// [`Store::graph_out_of_step`] tell rows another binary left behind on a
+    /// file it modified.
+    pub content_hash: Option<String>,
 }
 
 /// A row of `edges`: one occurrence of a relation.
@@ -100,6 +105,7 @@ const SYMBOL_COLS: &[&str] = &[
     "rank",
     "in_degree",
     "is_test",
+    "content_hash",
 ];
 
 const EDGE_COLS: &[&str] = &[
@@ -137,12 +143,13 @@ fn row_to_symbol(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbol> {
         rank: r.get(14)?,
         in_degree: r.get(15)?,
         is_test: r.get::<_, Option<bool>>(16)?.unwrap_or(false),
+        content_hash: r.get(17)?,
     })
 }
 
 const SYMBOL_SELECT: &str = "SELECT id, parent_id, file, kind, name, qualified, container, \
      package, signature, start_line, end_line, start_byte, end_byte, exported, rank, \
-     in_degree, is_test FROM symbols";
+     in_degree, is_test, content_hash FROM symbols";
 
 fn row_to_edge(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbolEdge> {
     Ok(StoredSymbolEdge {
@@ -172,6 +179,7 @@ impl Store {
         file: &str,
         symbols: &[StoredSymbol],
     ) -> Result<()> {
+        self.forget_graph_step(Some(branch));
         self.w()?.execute(
             "DELETE FROM symbols WHERE repo = ? AND branch = ? AND file = ?",
             params![repo, branch, file],
@@ -202,6 +210,7 @@ impl Store {
                 s.rank,
                 s.in_degree,
                 s.is_test,
+                s.content_hash,
             ])?;
         }
         app.flush()?;
@@ -264,6 +273,7 @@ impl Store {
 
     /// Forget `file`'s symbols and edges.
     pub fn delete_file_graph(&self, repo: &str, branch: &str, file: &str) -> Result<()> {
+        self.forget_graph_step(Some(branch));
         self.in_transaction(|| {
             self.w()?.execute(
                 "DELETE FROM symbols WHERE repo = ? AND branch = ? AND file = ?",
