@@ -191,8 +191,8 @@ mod tests {
     fn declared_types_from_signatures() {
         assert_eq!(
             declared_type(
-                "public static Uni<Office> findByCodigo(String c)",
-                "findByCodigo"
+                "public static Uni<Office> findByCode(String c)",
+                "findByCode"
             )
             .as_deref(),
             Some("Uni")

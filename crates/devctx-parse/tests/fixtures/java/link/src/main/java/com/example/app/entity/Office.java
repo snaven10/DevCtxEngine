@@ -5,8 +5,9 @@ import io.smallrye.mutiny.Uni;
 
 public class Office extends PanacheEntity {
     public String code;
+    public Office parent;
 
-    public static Uni<Office> findByCodigo(String c) {
+    public static Uni<Office> findByCode(String c) {
         return find("code", c).firstResult();
     }
 

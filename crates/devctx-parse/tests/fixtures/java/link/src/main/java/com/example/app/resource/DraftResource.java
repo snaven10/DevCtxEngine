@@ -68,7 +68,7 @@ public class DraftResource {
     }
 
     Uni<Office> find(String c) {
-        return Office.findByCodigo(c).flatMap(o -> o.persist());
+        return Office.findByCode(c).flatMap(o -> o.persist());
     }
 
     void listing() {

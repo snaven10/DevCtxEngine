@@ -276,8 +276,16 @@ impl Scopes {
         if param.via != Via::Param || param.ty.is_none() {
             return;
         }
-        let ty = param.ty.clone();
         let class_scope = self.scope_of(func, lang);
+        // The field's declared type types it; the constructor only labels
+        // the edge (`Foo(ServiceImpl s) { this.s = s; }` with `Service s`
+        // stays `Service`, so its callers stay `Service.m`'s).
+        let declared = self.by_scope.get(&class_scope).and_then(|bs| {
+            bs.iter()
+                .find(|b| b.name == p.name && b.via == Via::Field && b.ty.is_some())
+                .and_then(|b| b.ty.clone())
+        });
+        let ty = declared.or_else(|| param.ty.clone());
         self.push(
             class_scope,
             Binding {

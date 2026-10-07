@@ -1,4 +1,4 @@
-version 6
+version 7
 == src/main/java/com/example/shop/OrderService.java (java) package=com.example.shop
 sym	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7	parent=-	container=-	-	L1-43	
 sym	class	OrderService	dc29a699ee8c525b	parent=src/main/java/com/example/shop/OrderService.java	container=-	pub	L9-38	public class OrderService extends BaseService implements Auditable, Serializable
@@ -39,7 +39,7 @@ L27	implements	OrderService.Line -> Comparable
 L27	references	OrderService.Line -> String
 L28	references	OrderService.Line.compareTo -> Line
 L32	instantiates	OrderService.Cache.clear -> Order
-L36	call	OrderService.init.run -> flush	graph=OrderService.init.run	hint=bare /0
+L36	call	OrderService.init.run -> flush	graph=OrderService.init.run	hint=anon Runnable bare /0
 L36	instantiates	OrderService.init -> Runnable
 L40	inherits	Auditable -> Named
 L41	references	Auditable.audit -> String

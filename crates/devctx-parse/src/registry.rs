@@ -188,6 +188,12 @@ const SOURCES: &[&str] = &[
 /// by lexical scope (Java `scopes`: each inner class its own fields, `var`
 /// from its initializer, for-each elements, `this.x = x` injection); a
 /// constant (`LOG`) is never taken for a type; literals type their receiver.
+/// 7: review of TASK-005 — a dotted receiver whose first segment a scope binds
+/// is `member <fields> <hint>`, never a package; a bare or `this` call in an
+/// anonymous class is `anon <Type> …`; lambda parameters and pattern
+/// variables are bindings (untyped, or typed by the pattern); a constructor
+/// injection keeps the field's declared type; a trailing comma before `)`
+/// folds unless the group has one element.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -195,7 +201,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 6;
+pub const EXTRACTOR_VERSION: u32 = 7;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

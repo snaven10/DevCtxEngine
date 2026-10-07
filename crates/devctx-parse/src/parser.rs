@@ -775,7 +775,7 @@ enum Recv {
     /// A local, parameter or field whose type the scope knows (or `new
     /// T()`, `(T) e`): the type as written and how it was found.
     Typed(String, Via),
-    /// A name no scope binds: a type (`Office.findByCodigo`), a package, an
+    /// A name no scope binds: a type (`Office.findByCode`), a package, an
     /// inherited field, a lambda parameter.
     Name(String),
     /// A declaration whose type nothing local says (`var q =
@@ -786,6 +786,12 @@ enum Recv {
     Chain(Option<(String, Box<Recv>)>),
     /// Any other expression.
     Expr,
+    /// A dotted receiver whose first segment a scope binds (`target.parent`,
+    /// `this.cfg.server`): the fields after it, and what types the first.
+    Member(Vec<String>, Box<Recv>),
+    /// A bare or `this` call inside an anonymous class (`new TimerTask() {
+    /// … cancel() }`): the class it extends first, then the enclosing scopes.
+    Anon(String, Box<Recv>),
 }
 
 impl Recv {
@@ -812,7 +818,8 @@ impl Recv {
     /// The `edges.hint` (PLAN-009 DD-6): space-separated, what the link pass
     /// re-resolves the occurrence from without the source — `bare`, `this`,
     /// `super`, `typed <via> <Type>`, `name <receiver>`, `untyped`, `expr`,
-    /// `chain [<previous callee> <its hint>]` (`path` for a Rust path call);
+    /// `chain [<previous callee> <its hint>]`, `member <a.b> <hint of the
+    /// first segment>`, `anon <Type> <bare|this>` (`path` for a Rust path call);
     /// the parser appends ` /<arguments>`.
     fn hint(&self) -> String {
         match self {
@@ -825,6 +832,8 @@ impl Recv {
             Recv::Expr => "expr".into(),
             Recv::Chain(None) => "chain".into(),
             Recv::Chain(Some((prev, recv))) => format!("chain {prev} {}", recv.hint()),
+            Recv::Member(path, base) => format!("member {} {}", path.join("."), base.hint()),
+            Recv::Anon(ty, inner) => format!("anon {ty} {}", inner.hint()),
         }
     }
 }
@@ -838,10 +847,44 @@ const CALL_KINDS: &[&str] = &["method_invocation", "call_expression", "call"];
 
 /// The receiver of the call whose callee is `callee`.
 fn classify(callee: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -> Recv {
-    match receiver_node(callee) {
+    let recv = match receiver_node(callee) {
         Some(recv) => classify_receiver(recv, bytes, scopes, depth),
         None => Recv::Bare,
+    };
+    match recv {
+        Recv::Bare | Recv::This => match anonymous_supertype(callee, bytes) {
+            Some(ty) => Recv::Anon(ty, Box::new(recv)),
+            None => recv,
+        },
+        other => other,
     }
+}
+
+/// The type an anonymous class around `node` extends, if one is nearer
+/// than any named class (`new TimerTask() { … }` → `TimerTask`).
+fn anonymous_supertype(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "class_body" => {
+                let parent = n.parent()?;
+                if parent.kind() != "object_creation_expression" {
+                    return None; // a named class's body
+                }
+                let ty = parent.child_by_field_name("type")?.utf8_text(bytes).ok()?;
+                return crate::resolve::scope::TypeText::parse(ty)
+                    .map(|t| t.base)
+                    .filter(|t| nameable(t));
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration" => return None,
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    None
 }
 
 fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -> Recv {
@@ -875,7 +918,7 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
                 prev.map(|(c, n)| (n, Box::new(classify(c, bytes, scopes, depth + 1)))),
             );
         }
-        // A literal is of its type (`"RESUELTO".equals(x)`, `Foo.class`).
+        // A literal is of its type (`"done".equals(x)`, `Foo.class`).
         "string_literal" => return Recv::Typed("String".into(), Via::Local),
         "class_literal" => return Recv::Typed("Class".into(), Via::Local),
         _ => {}
@@ -895,13 +938,31 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
         None => scopes.lookup(recv, &t),
     };
     let key = member.unwrap_or(&t);
-    match found {
-        Some(b) => match &b.ty {
-            Some(ty) if nameable(&ty.base) => Recv::Typed(ty.base.clone(), b.via),
-            _ => Recv::Untyped,
-        },
-        None => Recv::Name(key.to_string()),
+    let typed = |b: &crate::resolve::scope::Binding| match &b.ty {
+        Some(ty) if nameable(&ty.base) => Recv::Typed(ty.base.clone(), b.via),
+        _ => Recv::Untyped,
+    };
+    if let Some(b) = found {
+        return typed(b);
     }
+    // `target.parent`, `this.cfg.server`: a binding, then its fields — never
+    // a package path (PLAN-009 TASK-005 review).
+    if let Some((first, rest)) = key.split_once('.') {
+        let base = match member {
+            Some(_) => scopes.field(recv, first),
+            None => scopes.lookup(recv, first),
+        };
+        let path: Vec<String> = rest.split('.').map(str::to_string).collect();
+        match base {
+            Some(b) => return Recv::Member(path, Box::new(typed(b))),
+            // `this.x.y` with `x` declared elsewhere (a supertype).
+            None if member.is_some() => {
+                return Recv::Member(path, Box::new(Recv::Name(first.to_string())))
+            }
+            None => {}
+        }
+    }
+    Recv::Name(key.to_string())
 }
 
 /// The callee name node of a call node (`a.b(…)` → `b`, `f(…)` → `f`).
@@ -952,7 +1013,7 @@ fn receiver_node(callee: Node<'_>) -> Option<Node<'_>> {
 ///
 /// The receiver node of a chained call is the entire expression before the dot.
 /// In reactive Java that is routine, and it put graph nodes like
-/// `Office.findByCodigo(codigo).flatMap` — and three-line ones with a lambda
+/// `Office.findByCode(code).flatMap` — and three-line ones with a lambda
 /// inside — into the call graph, where they match nothing and are searchable by
 /// nobody.
 ///
@@ -1167,19 +1228,44 @@ fn impl_self_args(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
 
 /// Generic arguments and `where` bounds as one spelling, however `rustfmt`
 /// laid them out: no whitespace, no trailing comma before a `>` or at the end
-/// (`Foo<\n    T,\n>` → `Foo<T>`, `where\n    T: Copy,` → `whereT:Copy`).
-/// Part of an id's disambiguator (DD-3): a reformat is not another impl. A
-/// comma before `)` stays: `(u8,)` is a one-element tuple, `(u8)` is `u8`.
+/// (`Foo<\n    T,\n>` → `Foo<T>`, `where\n    T: Copy,` → `whereT:Copy`), nor
+/// before a `)` closing a group of several elements (`Fn(A, B,)` → `Fn(A,B)`).
+/// Part of an id's disambiguator (DD-3): a reformat is not another impl. The
+/// comma of a one-element group stays: `(u8,)` is a tuple, `(u8)` is `u8`.
 /// Comments are left out by the caller ([`uncommented`]).
 fn tidy_generics(text: &str) -> String {
-    let mut out: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    while out.contains(",>") {
-        out = out.replace(",>", ">");
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut out: Vec<char> = Vec::with_capacity(chars.len());
+    // Per open `(`/`<`: whether a comma at its depth came before.
+    let mut commas: Vec<bool> = Vec::new();
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '(' | '<' => commas.push(false),
+            ',' => {
+                let next = chars.get(i + 1).copied();
+                let several = commas.last().copied().unwrap_or(false);
+                match next {
+                    Some('>') => continue,
+                    Some(')') if several => continue,
+                    None => continue,
+                    _ => {
+                        if let Some(top) = commas.last_mut() {
+                            *top = true;
+                        }
+                    }
+                }
+            }
+            ')' | '>' => {
+                commas.pop();
+            }
+            _ => {}
+        }
+        out.push(c);
     }
-    while out.ends_with(',') {
+    while out.last() == Some(&',') {
         out.pop();
     }
-    out
+    out.into_iter().collect()
 }
 
 /// The text of `node` without the comments inside it (`where // sorted\n
@@ -1356,5 +1442,14 @@ mod tests {
         // A one-element tuple keeps its comma: it is not the bare type.
         assert_eq!(tidy_generics("Foo<(u8,)>"), "Foo<(u8,)>");
         assert_ne!(tidy_generics("Foo<(u8,)>"), tidy_generics("Foo<(u8)>"));
+        // A group of several elements folds its trailing comma.
+        assert_eq!(
+            tidy_generics("whereF: Fn(\n    A,\n    B,\n),"),
+            "whereF:Fn(A,B)"
+        );
+        assert_eq!(
+            tidy_generics("Foo<(\n    u8,\n    u16,\n)>"),
+            "Foo<(u8,u16)>"
+        );
     }
 }

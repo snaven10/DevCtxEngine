@@ -308,7 +308,7 @@ public class Svc {
     /// A fluent chain is the norm in reactive Java, and its receiver node is the
     /// whole expression before the dot — newlines, arguments and lambdas
     /// included. Measured on a Quarkus repository, that put call-graph nodes
-    /// named `Office.findByCodigo(codigo).flatMap` and a three-line expression
+    /// named `Office.findByCode(code).flatMap` and a three-line expression
     /// with a lambda inside it into the graph. A receiver nobody can name is
     /// not a qualifier: the honest answer is the bare callee.
     #[test]
@@ -316,7 +316,7 @@ public class Svc {
         let src = "\
 public class Svc {
     public void run() {
-        Office.findByCodigo(codigo).flatMap(o -> o.persist());
+        Office.findByCode(code).flatMap(o -> o.persist());
     }
 }
 ";

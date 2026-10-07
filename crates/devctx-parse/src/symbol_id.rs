@@ -559,6 +559,15 @@ class C {
                  impl<T> W<\n    T, // the value\n>\nwhere\n    // sorted\n    T: Copy, /* bound */\n{\n    fn get(&self) {\n        m_cmt();\n    }\n}\n",
                 &["m_cmt"],
             ),
+            // A vertical `Fn(A, B,)` bound is the one-line `Fn(A, B)`.
+            (
+                Lang::rust(),
+                "f.rs",
+                "struct W<F>(F);\nimpl<F> W<F> where F: Fn(u8, u16) { fn get(&self) { m_fn(); } }\n",
+                "struct W<F>(F);\nimpl<F> W<F> where F: Fn(u8) { fn get(&self) { n1(); } }\n\
+                 impl<F> W<F>\nwhere\n    F: Fn(\n        u8,\n        u16,\n    ),\n{\n    fn get(&self) {\n        m_fn();\n    }\n}\n",
+                &["m_fn"],
+            ),
             // Java overloads around an anonymous class: `O()` and `O(int)`,
             // `m(int)` and `m(String)` are different scopes, so adding an
             // overload above does not hand the old `run` an ordinal.

@@ -152,8 +152,10 @@ enum TypeRef {
 
 /// A member lookup through the supertypes.
 enum Member {
-    /// Found, in the type itself (`false`) or a supertype (`true`).
-    Found(usize, bool),
+    /// Found, in the type itself (`false`) or a supertype (`true`); and
+    /// whether an overload takes the call's arguments (`false`: the first
+    /// one, no surer than `medium`).
+    Found(usize, bool, bool),
     /// Not in the repository; some supertype is external (Panache,
     /// `Object`, an enum's `Enum`).
     External,
@@ -182,6 +184,9 @@ pub struct RepoIndex {
     /// Java: `package.Qualified` of every type.
     fq_types: HashMap<String, Vec<usize>>,
     supers: HashMap<u64, Vec<TypeRef>>,
+    /// Types sharing their fully qualified name with another (two modules
+    /// of one repository): never a `high` destination.
+    ambiguous: HashSet<usize>,
 }
 
 /// Methods every Java class has from `Object`, and every enum from `Enum`.
@@ -226,6 +231,7 @@ impl RepoIndex {
             packages: HashSet::new(),
             fq_types: HashMap::new(),
             supers: HashMap::new(),
+            ambiguous: HashSet::new(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.id, i);
@@ -257,6 +263,13 @@ impl RepoIndex {
                 }
             }
         }
+        idx.ambiguous = idx
+            .fq_types
+            .values()
+            .filter(|v| v.len() > 1)
+            .flatten()
+            .copied()
+            .collect();
         for e in facts.iter().filter(|e| e.kind == IMPORTS) {
             if let Some(info) = idx.files.get_mut(&e.file) {
                 info.imports.push(e.dst_name.clone());
@@ -297,6 +310,51 @@ impl RepoIndex {
             IMPORTS => self.resolve_import(e),
             _ => self.resolve_type_edge(e, src),
         })
+    }
+
+    /// The types below any of `roots` (ids), transitively through the
+    /// repository supertypes, `roots` included: what a changed supertype
+    /// can change the members of (the incremental pass, DD-6).
+    pub fn subtypes_of(&self, roots: &HashSet<u64>) -> HashSet<u64> {
+        let mut below: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (owner, supers) in &self.supers {
+            for r in supers {
+                if let TypeRef::Repo(s, _) = r {
+                    below.entry(self.syms[*s].id).or_default().push(*owner);
+                }
+            }
+        }
+        let mut out: HashSet<u64> = roots
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.by_id
+                    .get(id)
+                    .is_some_and(|&i| is_type(&self.syms[i].kind))
+            })
+            .collect();
+        let mut queue: Vec<u64> = out.iter().copied().collect();
+        while let Some(t) = queue.pop() {
+            for &sub in below.get(&t).into_iter().flatten() {
+                if out.insert(sub) {
+                    queue.push(sub);
+                }
+            }
+        }
+        out
+    }
+
+    /// The bare name of the symbol `id`.
+    pub fn name_of(&self, id: u64) -> Option<&str> {
+        self.by_id.get(&id).map(|&i| self.syms[i].name.as_str())
+    }
+
+    /// Whether the symbol `src_id` sits in (or is) one of `types`.
+    pub fn within(&self, src_id: u64, types: &HashSet<u64>) -> bool {
+        let src = self.by_id.get(&src_id).copied();
+        self.chain(src)
+            .iter()
+            .any(|&i| types.contains(&self.syms[i].id))
     }
 
     fn lang_of(&self, file: &str) -> Option<Lang> {
@@ -362,6 +420,9 @@ impl RepoIndex {
         let mut seen = HashSet::new();
         let mut queue = VecDeque::from([(t, false)]);
         let mut external_super = false;
+        // An overload no arity fits: kept while a supertype may have one
+        // that does (`persist(Entity)` own, `persist(Iterable)` inherited).
+        let mut loose: Option<(usize, bool)> = None;
         while let Some((cur, inherited)) = queue.pop_front() {
             if !seen.insert(cur) || seen.len() > 64 {
                 continue;
@@ -372,7 +433,11 @@ impl RepoIndex {
                 .filter(|&m| is_callable(&self.syms[m].kind) == callable)
                 .collect();
             if !found.is_empty() {
-                return Member::Found(self.pick_overload(&found, args), inherited);
+                let (m, exact) = self.pick_overload(&found, args);
+                if exact {
+                    return Member::Found(m, inherited, true);
+                }
+                loose.get_or_insert((m, inherited));
             }
             for r in self.supers.get(&self.syms[cur].id).into_iter().flatten() {
                 match *r {
@@ -381,6 +446,9 @@ impl RepoIndex {
                     TypeRef::Unknown => {}
                 }
             }
+        }
+        if let Some((m, inherited)) = loose {
+            return Member::Found(m, inherited, false);
         }
         let java = self.is_java(&self.syms[t].file);
         let implicit = java
@@ -431,14 +499,20 @@ impl RepoIndex {
         }
         let field: String = first.to_lowercase().chain(chars).collect();
         match self.find_member(t, &field, false, None) {
-            Member::Found(f, _) => Some(f),
+            Member::Found(f, _, _) => Some(f),
             _ => None,
         }
     }
 
-    /// Of several overloads, the first whose arity takes `args`.
-    fn pick_overload(&self, found: &[usize], args: Option<usize>) -> usize {
+    /// Of several overloads, the first whose arity takes `args`, and
+    /// whether one does (else the first, not exact).
+    fn pick_overload(&self, found: &[usize], args: Option<usize>) -> (usize, bool) {
+        // Arity is read from Java signatures only (a Rust method's `&self`
+        // is a parameter the call does not pass).
         let fits = |m: usize| -> bool {
+            if !self.is_java(&self.syms[m].file) {
+                return true;
+            }
             let (Some(n), Some(sig)) = (args, self.syms[m].signature.as_deref()) else {
                 return true;
             };
@@ -447,7 +521,10 @@ impl RepoIndex {
                 None => true,
             }
         };
-        found.iter().copied().find(|&m| fits(m)).unwrap_or(found[0])
+        match found.iter().copied().find(|&m| fits(m)) {
+            Some(m) => (m, true),
+            None => (found[0], false),
+        }
     }
 
     /// Callables named `name` anywhere, whose arity takes `args` (Java).
@@ -483,7 +560,8 @@ impl RepoIndex {
 
     /// A receiver nothing types: the name must exist in the repository to
     /// be kept, and then nothing decides it.
-    fn untyped(&self, callee: &str, file: &str, args: Option<usize>) -> Outcome {
+    fn untyped(&self, c: &Call<'_>) -> Outcome {
+        let (callee, file, args) = (c.callee, c.file, c.args);
         // Every Java object has `Object`'s methods; a repository type may
         // override them, so no more than medium.
         if self.is_java(file) && JAVA_OBJECT.contains(&callee) {
@@ -493,6 +571,33 @@ impl RepoIndex {
             Outcome::Discard
         } else {
             undecided()
+        }
+    }
+
+    /// A receiver whose type is named but unknown: never discarded, never
+    /// more than medium.
+    fn by_name_only_low(&self, c: &Call<'_>) -> Outcome {
+        let k = self.candidates(c.callee, c.file, c.args);
+        if k.len() == 1 {
+            hi(k[0], self, "unique_name")
+        } else {
+            undecided()
+        }
+    }
+
+    /// A dotted receiver outside Java: by name, never discarded.
+    fn untyped_or_low(&self, c: &Call<'_>) -> Outcome {
+        self.by_name_only_low(c)
+    }
+
+    /// How sure a type found as `how` is: `medium` by its name alone
+    /// (`unique_name`) or when two types share its fully qualified name
+    /// (two modules), else `high`.
+    fn type_conf(&self, t: usize, how: &str) -> &'static str {
+        if how == "unique_name" || self.ambiguous.contains(&t) {
+            "medium"
+        } else {
+            "high"
         }
     }
 
@@ -587,9 +692,19 @@ impl RepoIndex {
             if self.platform(file, name) {
                 return TypeRef::External;
             }
+            // A package path is external only with evidence: an import from
+            // that package root (the platform was checked above), outside
+            // the repository's packages. A dotted name the scope did not
+            // bind may be an inherited field's path, never a package by its
+            // case alone (TASK-005 review).
             let pkg = name.rsplit_once('.').map_or("", |(p, _)| p);
             let lower = first.chars().next().is_some_and(char::is_lowercase);
-            if lower && !self.packages.contains(pkg) && !self.packages.contains(first) {
+            let imported = info.is_some_and(|f| {
+                f.imports
+                    .iter()
+                    .any(|i| i.starts_with(&format!("{first}.")))
+            });
+            if lower && imported && !self.packages.contains(pkg) && !self.packages.contains(first) {
                 return TypeRef::External;
             }
             return TypeRef::Unknown;
@@ -646,7 +761,7 @@ impl RepoIndex {
 
     fn resolve_type_edge(&self, e: &LinkEdge, src: Option<usize>) -> Outcome {
         match self.resolve_type(&e.dst_name, &e.file, src) {
-            TypeRef::Repo(t, how) => hi(t, self, how),
+            TypeRef::Repo(t, how) => cap(hi(t, self, how), self.type_conf(t, how)),
             TypeRef::External => external("external_known"),
             TypeRef::Unknown => {
                 let simple = leaf(&e.dst_name);
@@ -691,13 +806,15 @@ impl RepoIndex {
             return external("external_known");
         }
         if let Some(t) = self.fq(target) {
-            return hi(t, self, "import");
+            return cap(hi(t, self, "import"), self.type_conf(t, "import"));
         }
         // `import static a.b.C.m`.
         if let Some((owner, member)) = target.rsplit_once('.') {
             if let Some(t) = self.fq(owner) {
                 return match self.find_member(t, member, true, None) {
-                    Member::Found(m, _) => hi(m, self, "import"),
+                    Member::Found(m, _, _) => {
+                        cap(hi(m, self, "import"), self.type_conf(t, "import"))
+                    }
                     _ => hi(t, self, "import"),
                 };
             }
@@ -722,84 +839,107 @@ impl RepoIndex {
             }
             _ => None,
         };
-        let file = e.file.as_str();
-        match tokens.as_slice() {
-            ["this"] => self.this_call(callee, src, file, args, false),
-            ["super"] => self.this_call(callee, src, file, args, true),
-            ["typed", via, ty] => self.typed_call(callee, via, ty, src, file, args),
-            ["name", recv] => self.name_call(callee, recv, src, file, args),
-            ["untyped"] | ["expr"] | ["chain"] => self.untyped(callee, file, args),
-            ["chain", prev, rest @ ..] if depth < 8 => {
-                self.chain_call(callee, prev, rest, e, src, args, depth)
-            }
-            ["chain", ..] => self.untyped(callee, file, args),
-            ["path"] => self.path_call(e, file, args),
-            ["bare"] => self.bare_call(callee, src, file, args),
+        let c = Call {
+            callee,
+            src,
+            file: e.file.as_str(),
+            args,
+        };
+        self.call_by_hint(&c, &tokens, e, depth)
+    }
+
+    fn call_by_hint(&self, c: &Call<'_>, tokens: &[&str], e: &LinkEdge, depth: u8) -> Outcome {
+        match tokens {
+            ["this"] => self.this_call(c, false),
+            ["super"] => self.this_call(c, true),
+            ["typed", via, ty] => self.typed_call(c, via, ty),
+            ["name", recv] => self.name_call(c, recv),
+            ["member", path, base @ ..] => self.member_call(c, path, base),
+            ["anon", ty, inner @ ..] => self.anon_call(c, ty, inner),
+            ["untyped"] | ["expr"] | ["chain"] => self.untyped(c),
+            ["chain", prev, rest @ ..] if depth < 8 => self.chain_call(c, prev, rest, e, depth),
+            ["chain", ..] => self.untyped(c),
+            ["path"] => self.path_call(c, e),
+            ["bare"] => self.bare_call(c),
             // A row with no hint (written before hints): qualified → as a
             // name, bare → as a bare call.
             _ => match e.dst_name.rsplit_once('.') {
-                Some((recv, _)) => self.name_call(callee, recv, src, file, args),
-                None => self.bare_call(callee, src, file, args),
+                Some((recv, _)) => self.name_call(c, recv),
+                None => self.bare_call(c),
             },
         }
     }
 
-    /// `this.m()` / `super.m()` (rule 1).
-    fn this_call(
-        &self,
-        callee: &str,
-        src: Option<usize>,
-        file: &str,
-        args: Option<usize>,
-        sup: bool,
-    ) -> Outcome {
-        let Some(&c) = self.containers(src).first() else {
-            return self.bare_call(callee, src, file, args);
-        };
-        if sup {
-            let mut external_super = false;
-            for r in self.supers.get(&self.syms[c].id).into_iter().flatten() {
-                match *r {
-                    TypeRef::Repo(s, _) => {
-                        if let Member::Found(m, _) = self.find_member(s, callee, true, args) {
-                            return hi(m, self, "inherited");
-                        }
-                    }
-                    TypeRef::External => external_super = true,
-                    TypeRef::Unknown => {}
-                }
-            }
-            return if external_super {
-                external("inherited")
-            } else {
-                undecided()
-            };
+    /// A member found in a type: `own` if in the type itself, `inherited`
+    /// if in a supertype; `medium` when no overload took the arguments or
+    /// the type is not sure (`type_conf`).
+    fn member_hit(&self, m: usize, inherited: bool, exact: bool, own: &'static str) -> Outcome {
+        let res = if inherited { "inherited" } else { own };
+        let out = hi(m, self, res);
+        if exact {
+            out
+        } else {
+            cap(out, "medium")
         }
-        match self.find_member(c, callee, true, args) {
-            Member::Found(m, false) => hi(m, self, "self"),
-            Member::Found(m, true) => hi(m, self, "inherited"),
+    }
+
+    /// `callee` looked up in the type `t`, resolved as `own`; missing: an
+    /// external supertype makes it an inherited external, a Lombok accessor
+    /// its field (`medium`), else undecided. Capped at `conf`.
+    fn in_type(&self, c: &Call<'_>, t: usize, own: &'static str, conf: &'static str) -> Outcome {
+        let out = match self.find_member(t, c.callee, true, c.args) {
+            Member::Found(m, inherited, exact) => self.member_hit(m, inherited, exact, own),
             Member::External => external("inherited"),
-            Member::Missing => undecided(),
+            Member::Missing => match self.accessor(t, c.callee) {
+                Some(f) => medium(f, self, own),
+                None => undecided(),
+            },
+        };
+        cap(out, conf)
+    }
+
+    /// `this.m()` / `super.m()` (rule 1).
+    fn this_call(&self, c: &Call<'_>, sup: bool) -> Outcome {
+        let Some(&k) = self.containers(c.src).first() else {
+            return self.bare_call(c);
+        };
+        if !sup {
+            return self.in_type(c, k, "self", "high");
+        }
+        let mut external_super = false;
+        for r in self.supers.get(&self.syms[k].id).into_iter().flatten() {
+            match *r {
+                TypeRef::Repo(s, how) => {
+                    if let Member::Found(m, _, exact) = self.find_member(s, c.callee, true, c.args)
+                    {
+                        let out = self.member_hit(m, true, exact, "inherited");
+                        return cap(out, self.type_conf(s, how));
+                    }
+                }
+                TypeRef::External => external_super = true,
+                TypeRef::Unknown => {}
+            }
+        }
+        if external_super {
+            external("inherited")
+        } else {
+            undecided()
         }
     }
 
     /// `m()` (rule 6, then 7-9): a member of an enclosing type (or its
     /// supertypes), a function of an enclosing scope of the file, a static
     /// import; then by name.
-    fn bare_call(
-        &self,
-        callee: &str,
-        src: Option<usize>,
-        file: &str,
-        args: Option<usize>,
-    ) -> Outcome {
+    fn bare_call(&self, c: &Call<'_>) -> Outcome {
+        let (callee, file, args) = (c.callee, c.file, c.args);
         let mut external_super = false;
-        for anc in self.chain(src) {
+        for anc in self.chain(c.src) {
             let s = &self.syms[anc];
             if is_type(&s.kind) {
                 match self.find_member(anc, callee, true, args) {
-                    Member::Found(m, false) => return hi(m, self, "self"),
-                    Member::Found(m, true) => return hi(m, self, "inherited"),
+                    Member::Found(m, inherited, exact) => {
+                        return self.member_hit(m, inherited, exact, "self")
+                    }
                     Member::External => external_super = true,
                     Member::Missing => {}
                 }
@@ -811,13 +951,14 @@ impl RepoIndex {
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|&c| self.syms[c].name == callee && is_callable(&self.syms[c].kind))
+                .filter(|&k| self.syms[k].name == callee && is_callable(&self.syms[k].kind))
                 .collect();
             if !local.is_empty() {
-                return hi(self.pick_overload(&local, args), self, "same_file");
+                let (m, exact) = self.pick_overload(&local, args);
+                return self.member_hit(m, false, exact, "same_file");
             }
         }
-        if src.is_none() {
+        if c.src.is_none() {
             // No source symbol: the file's top level.
             let top: Vec<usize> = self
                 .by_qualified
@@ -845,9 +986,11 @@ impl RepoIndex {
                     None => continue,
                 };
                 match self.java_type(owner, file, None) {
-                    TypeRef::Repo(t, _) => {
-                        if let Member::Found(m, _) = self.find_member(t, callee, true, args) {
-                            return hi(m, self, "import");
+                    TypeRef::Repo(t, how) => {
+                        if let Member::Found(m, _, exact) = self.find_member(t, callee, true, args)
+                        {
+                            let out = self.member_hit(m, false, exact, "import");
+                            return cap(out, self.type_conf(t, how));
                         }
                     }
                     TypeRef::External if !imp.ends_with(".*") => {
@@ -859,7 +1002,7 @@ impl RepoIndex {
                         static_external |=
                             leaf(owner).chars().next().is_some_and(char::is_uppercase);
                     }
-                    _ => {}
+                    TypeRef::Unknown => {}
                 }
             }
             // An unqualified Java call is a member or a static import: not
@@ -876,100 +1019,196 @@ impl RepoIndex {
     }
 
     /// `x.m()` with `x` typed by the scope (rules 2-4).
-    fn typed_call(
-        &self,
-        callee: &str,
-        via: &str,
-        ty: &str,
-        src: Option<usize>,
-        file: &str,
-        args: Option<usize>,
-    ) -> Outcome {
+    fn typed_call(&self, c: &Call<'_>, via: &str, ty: &str) -> Outcome {
         let resolution: &'static str = match via {
             "field" => "field",
             "param" => "param",
             "ctor_inject" => "ctor_inject",
             _ => "local",
         };
+        // `var x = T.of(…)`: `T` only if it has the method (DD-7).
         let statik = via == "static";
-        match self.resolve_type(ty, file, src) {
-            TypeRef::Repo(t, _) => match self.find_member(t, callee, true, args) {
-                Member::Found(m, false) => hi(m, self, resolution),
-                Member::Found(m, true) => hi(m, self, "inherited"),
-                Member::External if !statik => external("inherited"),
-                _ if statik => self.untyped(callee, file, args),
-                _ => match self.accessor(t, callee) {
-                    Some(f) => medium(f, self, resolution),
-                    None => undecided(),
-                },
-            },
+        match self.resolve_type(ty, c.file, c.src) {
+            TypeRef::Repo(t, how) => {
+                if statik
+                    && !matches!(
+                        self.find_member(t, c.callee, true, c.args),
+                        Member::Found(..)
+                    )
+                {
+                    return self.untyped(c);
+                }
+                self.in_type(c, t, resolution, self.type_conf(t, how))
+            }
             TypeRef::External if !statik => external("external_known"),
-            _ if statik => self.untyped(callee, file, args),
-            _ => self.by_name_only_low(callee, file, args),
+            _ if statik => self.untyped(c),
+            _ => self.by_name_only_low(c),
         }
     }
 
-    /// A receiver whose type is named but unknown: never discarded, never
-    /// more than medium.
-    fn by_name_only_low(&self, callee: &str, file: &str, args: Option<usize>) -> Outcome {
-        let c = self.candidates(callee, file, args);
-        if c.len() == 1 {
-            hi(c[0], self, "unique_name")
-        } else {
-            undecided()
+    /// The type a receiver hint names (`typed …`, `this`, `name …`), and
+    /// the `resolution` and confidence cap of what it types.
+    fn hint_type(
+        &self,
+        c: &Call<'_>,
+        base: &[&str],
+    ) -> Option<(TypeRef, &'static str, &'static str)> {
+        match base {
+            ["typed", via, ty] if *via != "static" => {
+                let res: &'static str = match *via {
+                    "field" => "field",
+                    "param" => "param",
+                    "ctor_inject" => "ctor_inject",
+                    _ => "local",
+                };
+                let r = self.resolve_type(ty, c.file, c.src);
+                let conf = match r {
+                    TypeRef::Repo(t, how) => self.type_conf(t, how),
+                    _ => "high",
+                };
+                Some((r, res, conf))
+            }
+            ["this"] => self
+                .containers(c.src)
+                .first()
+                .map(|&k| (TypeRef::Repo(k, "self"), "self", "high")),
+            ["name", recv] => match self.resolve_type(recv, c.file, c.src) {
+                TypeRef::Unknown => self.field_type(c, recv),
+                r => Some((r, "import", "high")),
+            },
+            _ => None,
+        }
+    }
+
+    /// The type of the field `name` of a type around the call (or of its
+    /// supertypes), by its declaration.
+    fn field_type(
+        &self,
+        c: &Call<'_>,
+        name: &str,
+    ) -> Option<(TypeRef, &'static str, &'static str)> {
+        if !self.is_java(c.file) {
+            return None;
+        }
+        for k in self.containers(c.src) {
+            if let Member::Found(f, inherited, _) = self.find_member(k, name, false, None) {
+                let fs = &self.syms[f];
+                let ty = fs
+                    .signature
+                    .as_deref()
+                    .and_then(|s| declared_type(s, name))?;
+                let how = if inherited { "inherited" } else { "field" };
+                let r = self.resolve_type(&ty, &fs.file, Some(f));
+                let conf = match r {
+                    TypeRef::Repo(t, h) => self.type_conf(t, h),
+                    _ => "high",
+                };
+                return Some((r, how, conf));
+            }
+        }
+        None
+    }
+
+    /// The type of the field `name` of the repository type `t`.
+    fn member_type(&self, t: usize, name: &str) -> (TypeRef, &'static str) {
+        match self.find_member(t, name, false, None) {
+            Member::Found(f, _, _) => {
+                let fs = &self.syms[f];
+                match fs.signature.as_deref().and_then(|s| declared_type(s, name)) {
+                    Some(ty) => match self.resolve_type(&ty, &fs.file, Some(f)) {
+                        TypeRef::Repo(n, how) => (TypeRef::Repo(n, how), self.type_conf(n, how)),
+                        r => (r, "high"),
+                    },
+                    None => (TypeRef::Unknown, "high"),
+                }
+            }
+            _ => (TypeRef::Unknown, "high"),
+        }
+    }
+
+    /// `target.parent.m()`, `this.cfg.server.m()`: the first segment's type,
+    /// then each field's declared type (PLAN-009 TASK-005 review).
+    fn member_call(&self, c: &Call<'_>, path: &str, base: &[&str]) -> Outcome {
+        if !self.is_java(c.file) {
+            // Other languages: as the dotted name it is (TASK-006/007).
+            return self.untyped_or_low(c);
+        }
+        let Some((mut r, _, mut conf)) = self.hint_type(c, base) else {
+            return self.untyped(c);
+        };
+        for seg in path.split('.') {
+            match r {
+                TypeRef::Repo(t, _) => {
+                    let (next, cf) = self.member_type(t, seg);
+                    r = next;
+                    conf = min_conf(conf, cf);
+                }
+                // A field of an external type: its type is unknown here.
+                _ => return self.untyped(c),
+            }
+        }
+        match r {
+            TypeRef::Repo(t, how) => {
+                self.in_type(c, t, "field", min_conf(conf, self.type_conf(t, how)))
+            }
+            TypeRef::External => cap(external("external_known"), conf),
+            TypeRef::Unknown => self.untyped(c),
+        }
+    }
+
+    /// A bare or `this` call in an anonymous class extending `ty`: its
+    /// supertype first. A name the supertype may have (external) that the
+    /// enclosing class also defines is undecided; then the enclosing scopes.
+    fn anon_call(&self, c: &Call<'_>, ty: &str, inner: &[&str]) -> Outcome {
+        let this = inner == ["this"];
+        match self.resolve_type(ty, c.file, c.src) {
+            TypeRef::Repo(t, how) => match self.find_member(t, c.callee, true, c.args) {
+                Member::Found(m, _, exact) => cap(
+                    self.member_hit(m, true, exact, "inherited"),
+                    self.type_conf(t, how),
+                ),
+                Member::External => self.anon_external(c),
+                Member::Missing if this => undecided(),
+                Member::Missing => self.bare_call(c),
+            },
+            TypeRef::External => self.anon_external(c),
+            TypeRef::Unknown if this => undecided(),
+            TypeRef::Unknown => cap(self.bare_call(c), "medium"),
+        }
+    }
+
+    /// The anonymous class's external supertype may have the name; if the
+    /// enclosing scopes define it too, nothing decides which.
+    fn anon_external(&self, c: &Call<'_>) -> Outcome {
+        match self.bare_call(c) {
+            Outcome::Resolved(Resolved {
+                dst_id: Some(_), ..
+            }) => undecided(),
+            _ => external("inherited"),
         }
     }
 
     /// `R.m()` with `R` bound by no scope (rule 5): a type, or an inherited
     /// field; else as untyped.
-    fn name_call(
-        &self,
-        callee: &str,
-        recv: &str,
-        src: Option<usize>,
-        file: &str,
-        args: Option<usize>,
-    ) -> Outcome {
-        match self.resolve_type(recv, file, src) {
-            TypeRef::Repo(t, how) => {
-                return match self.find_member(t, callee, true, args) {
-                    Member::Found(m, false) => hi(m, self, how),
-                    Member::Found(m, true) => hi(m, self, "inherited"),
-                    Member::External => external("inherited"),
-                    Member::Missing => match self.accessor(t, callee) {
-                        Some(f) => medium(f, self, how),
-                        None => undecided(),
-                    },
-                }
-            }
+    fn name_call(&self, c: &Call<'_>, recv: &str) -> Outcome {
+        match self.resolve_type(recv, c.file, c.src) {
+            TypeRef::Repo(t, how) => return self.in_type(c, t, how, self.type_conf(t, how)),
             TypeRef::External => return external("external_known"),
             TypeRef::Unknown => {}
         }
-        if self.is_java(file) {
+        if self.is_java(c.file) {
             // A field of an enclosing type or its supertypes (`LOG` of a
             // base class): typed by its declaration.
-            for c in self.containers(src) {
-                if let Member::Found(f, inherited) = self.find_member(c, recv, false, None) {
-                    let fs = &self.syms[f];
-                    let Some(ty) = fs.signature.as_deref().and_then(|s| declared_type(s, recv))
-                    else {
-                        break;
-                    };
-                    let how = if inherited { "inherited" } else { "field" };
-                    return match self.resolve_type(&ty, &fs.file, Some(f)) {
-                        TypeRef::Repo(t, _) => match self.find_member(t, callee, true, args) {
-                            Member::Found(m, _) => hi(m, self, how),
-                            Member::External => external("inherited"),
-                            Member::Missing => undecided(),
-                        },
-                        TypeRef::External => external("external_known"),
-                        TypeRef::Unknown => self.untyped(callee, file, args),
-                    };
-                }
+            if let Some((r, how, conf)) = self.field_type(c, recv) {
+                return match r {
+                    TypeRef::Repo(t, _) => self.in_type(c, t, how, conf),
+                    TypeRef::External => external("external_known"),
+                    TypeRef::Unknown => self.untyped(c),
+                };
             }
-            return self.untyped(callee, file, args);
+            return self.untyped(c);
         }
-        let qualified = format!("{recv}.{callee}");
+        let qualified = format!("{recv}.{}", c.callee);
         let exact: Vec<usize> = self
             .by_qualified
             .get(&qualified)
@@ -980,7 +1219,7 @@ impl RepoIndex {
         if exact.len() == 1 {
             return hi(exact[0], self, "unique_name");
         }
-        if self.platform(file, recv) || self.platform(file, &qualified) {
+        if self.platform(c.file, recv) || self.platform(c.file, &qualified) {
             return external("external_known");
         }
         undecided()
@@ -988,44 +1227,44 @@ impl RepoIndex {
 
     /// `a.b().c()`: the previous call (itself resolved the same way, back
     /// along the chain) types the receiver — a repository method by its
-    /// declared return type, without generics (DD-7, Java); an external one
-    /// makes this one external too (a repository name keeps it `medium`:
-    /// an external call can return a repository type). Else untyped.
-    #[allow(clippy::too_many_arguments)]
+    /// declared return type, without generics (DD-7, Java), never surer than
+    /// that call. After an external call nothing types it: a name the
+    /// repository defines, or shaped like an accessor, stays undecided (and
+    /// reachable by name, DD-10); any other is `chain_external`, `medium`.
     fn chain_call(
         &self,
-        callee: &str,
+        c: &Call<'_>,
         prev: &str,
         prev_hint: &[&str],
         e: &LinkEdge,
-        src: Option<usize>,
-        args: Option<usize>,
         depth: u8,
     ) -> Outcome {
-        let file = e.file.as_str();
         let inner = LinkEdge {
             dst_name: prev.to_string(),
             hint: Some(prev_hint.join(" ")),
             ..e.clone()
         };
-        let p = match self.resolve_call(&inner, src, depth + 1) {
+        let (p, prev_conf) = match self.resolve_call(&inner, c.src, depth + 1) {
             Outcome::Resolved(Resolved {
-                dst_id: Some(p), ..
-            }) => p,
+                dst_id: Some(p),
+                confidence,
+                ..
+            }) => (p, confidence),
             Outcome::Resolved(Resolved { external: true, .. }) => {
-                return if self.candidates(callee, file, args).is_empty() {
-                    external("return_type")
+                let known = !self.candidates(c.callee, c.file, c.args).is_empty();
+                return if known || accessor_shaped(c.callee) {
+                    undecided()
                 } else {
-                    external_medium("return_type")
+                    external_medium("chain_external")
                 };
             }
-            _ => return self.untyped(callee, file, args),
+            _ => return self.untyped(c),
         };
-        if !self.is_java(file) {
-            return self.untyped(callee, file, args);
+        if !self.is_java(c.file) {
+            return self.untyped(c);
         }
         let Some(&pi) = self.by_id.get(&p) else {
-            return self.untyped(callee, file, args);
+            return self.untyped(c);
         };
         let ps = &self.syms[pi];
         let Some(ret) = ps
@@ -1033,24 +1272,23 @@ impl RepoIndex {
             .as_deref()
             .and_then(|s| declared_type(s, &ps.name))
         else {
-            return self.untyped(callee, file, args);
+            return self.untyped(c);
         };
         match self.resolve_type(&ret, &ps.file, Some(pi)) {
-            TypeRef::Repo(t, _) => match self.find_member(t, callee, true, args) {
-                Member::Found(m, _) => hi(m, self, "return_type"),
-                Member::External => external("return_type"),
-                Member::Missing => match self.accessor(t, callee) {
-                    Some(f) => medium(f, self, "return_type"),
-                    None => undecided(),
-                },
-            },
-            TypeRef::External => external("return_type"),
-            TypeRef::Unknown => self.untyped(callee, file, args),
+            TypeRef::Repo(t, how) => {
+                let conf = min_conf(prev_conf, self.type_conf(t, how));
+                self.in_type(c, t, "return_type", conf)
+            }
+            // A declared external return type (`Uni<…>`): the method is
+            // that type's.
+            TypeRef::External => cap(external("external_known"), prev_conf),
+            TypeRef::Unknown => self.untyped(c),
         }
     }
 
     /// A Rust path call (`Foo::bar()` → `Foo.bar`, `std::fs::read()`).
-    fn path_call(&self, e: &LinkEdge, file: &str, args: Option<usize>) -> Outcome {
+    fn path_call(&self, c: &Call<'_>, e: &LinkEdge) -> Outcome {
+        let file = c.file;
         let exact: Vec<usize> = self
             .by_qualified
             .get(&e.dst_name)
@@ -1104,8 +1342,54 @@ impl RepoIndex {
             }
             return undecided();
         }
-        self.by_name_only_low(leaf(&e.dst_name), file, args)
+        self.by_name_only_low(c)
     }
+}
+
+/// One call being resolved.
+struct Call<'a> {
+    callee: &'a str,
+    src: Option<usize>,
+    file: &'a str,
+    args: Option<usize>,
+}
+
+fn rank(conf: &str) -> u8 {
+    match conf {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
+}
+
+/// The lower of two confidences.
+fn min_conf(a: &'static str, b: &'static str) -> &'static str {
+    if rank(a) <= rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// `o` no surer than `conf` (a chain is no surer than its previous call, a
+/// type found by its name alone no surer than `medium`).
+fn cap(o: Outcome, conf: &'static str) -> Outcome {
+    match o {
+        Outcome::Resolved(mut r) if rank(r.confidence) > rank(conf) => {
+            r.confidence = conf;
+            Outcome::Resolved(r)
+        }
+        o => o,
+    }
+}
+
+/// `getX`/`isX`/`setX`: a name an accessor would have, generated or not.
+fn accessor_shaped(name: &str) -> bool {
+    ["get", "is", "set"].iter().any(|p| {
+        name.strip_prefix(p)
+            .and_then(|r| r.chars().next())
+            .is_some_and(char::is_uppercase)
+    })
 }
 
 /// The link pass's rows of one parsed file (ids assigned), the way the

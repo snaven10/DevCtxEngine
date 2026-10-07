@@ -194,27 +194,28 @@ fn e_same_package_and_import() {
     );
 }
 
-/// (f) `Office.findByCodigo(c).flatMap(o -> o.persist())`: `findByCodigo`
+/// (f) `Office.findByCode(c).flatMap(o -> o.persist())`: `findByCode`
 /// resolved; `flatMap` is a method of its declared return type `Uni`
-/// (external); `Office.listAll().map(…)` follows an external call, so it is
-/// external too. `o.persist()` (an untyped lambda parameter) and
+/// (external); `Office.listAll().map(…)` follows an external call: nothing
+/// types it, and `map` is no name of the repository, so it is a weak
+/// external (`chain_external`, `medium`). `o.persist()` (an untyped lambda parameter) and
 /// `q.setParameter` (an untyped `var`) call names the repository lacks:
 /// dropped and counted.
 #[test]
 fn f_fluent_chains() {
     let l = linked();
     assert_eq!(
-        l.show(&l.call("DraftResource.find", "Office.findByCodigo")),
-        (q("Office.findByCodigo"), "high", "import", false)
+        l.show(&l.call("DraftResource.find", "Office.findByCode")),
+        (q("Office.findByCode"), "high", "import", false)
     );
     assert_eq!(
         l.show(&l.call("DraftResource.find", "flatMap")),
-        (None, "high", "return_type", true)
+        (None, "high", "external_known", true)
     );
     assert_eq!(l.call("DraftResource.find", "persist"), Outcome::Discard);
     assert_eq!(
         l.show(&l.call("DraftResource.listing", "map")),
-        (None, "high", "return_type", true)
+        (None, "medium", "chain_external", true)
     );
     let dropped = l
         .edges
@@ -271,7 +272,8 @@ fn i_for_each_variables() {
 }
 
 /// m-b: `contains` is never resolved by the link pass (DD-6): it comes
-/// resolved from the parse, and `resolve` declines it.
+/// resolved from the parse, and `resolve` declines it. (That the pass never
+/// loads nor rewrites those rows is `devctx-index`'s tests'.)
 #[test]
 fn the_link_pass_declines_contains() {
     let l = linked();
@@ -281,7 +283,6 @@ fn the_link_pass_declines_contains() {
         ..any
     };
     assert_eq!(l.index.resolve(&contains), None);
-    assert!(l.edges.iter().all(|e| e.kind != "contains"));
 }
 
 /// Conventions with no definition behind them: a call made available by a
@@ -310,4 +311,187 @@ fn static_imports_object_methods_literals_and_lombok() {
             (q("Reports.Row.label"), "medium", "param", false)
         );
     }
+}
+
+/// MAJOR 1 (review): a dotted receiver whose first segment is a binding is
+/// typed through its fields (`target.parent.rename()`, `this.cfg.server
+/// .port()`), never taken for a package; a real package path stays external.
+#[test]
+fn a_dotted_receiver_is_typed_through_its_fields() {
+    let l = linked();
+    assert_eq!(
+        l.show(&l.call("Cases.members", "rename")),
+        (q("Office.rename"), "high", "field", false)
+    );
+    assert_eq!(
+        l.show(&l.call("Cases.members", "port")),
+        (q("Cases.Server.port"), "high", "field", false)
+    );
+    assert_eq!(
+        l.show(&l.call("Cases.members", "of")),
+        (None, "high", "external_known", true)
+    );
+}
+
+/// MAJOR 2: after an external call nothing types the receiver: a name the
+/// repository defines, or one shaped like an accessor, stays undecided and
+/// not external; any other is external, but never `high`.
+#[test]
+fn a_call_after_an_external_one_is_not_external_by_default() {
+    let l = linked();
+    assert_eq!(
+        l.show(&l.call("Cases.afterExternal", "getOffice")),
+        (None, "low", "name_only", false)
+    );
+    assert_eq!(
+        l.show(&l.call("Cases.afterExternal", "rename")),
+        (None, "low", "name_only", false)
+    );
+    assert_eq!(
+        l.show(&l.call("Cases.afterExternal", "orElseThrow")),
+        (None, "medium", "chain_external", true)
+    );
+}
+
+/// MAJOR 3: a lambda parameter shadows the field of its name, untyped; an
+/// `instanceof` pattern variable is typed by its pattern.
+#[test]
+fn lambda_parameters_and_patterns_bind_their_names() {
+    let l = linked();
+    let outs = l.all("calls", "Cases.shadowed", "rename");
+    assert_eq!(outs.len(), 1, "the pattern's call is typed: Office.rename");
+    assert_eq!(l.show(&outs[0]), (None, "low", "name_only", false));
+    assert_eq!(
+        l.show(&l.call("Cases.shadowed", "Office.rename")),
+        (q("Office.rename"), "high", "local", false)
+    );
+}
+
+/// MINOR: a chain is no surer than its previous call (a Lombok accessor is
+/// `medium`), and an overload no arity fits is not `high`.
+#[test]
+fn confidence_never_escalates() {
+    let l = linked();
+    assert_eq!(
+        l.show(&l.call("Cases.escalation", "rename")),
+        (q("Office.rename"), "medium", "return_type", false)
+    );
+    assert_eq!(
+        l.show(&l.call("Cases.escalation", "Office.rename")),
+        (q("Office.rename"), "medium", "param", false)
+    );
+}
+
+/// Link a handful of sources given inline (path, language, text).
+fn link_sources(files: &[(&str, &str)]) -> Linked {
+    let (mut symbols, mut edges) = (Vec::new(), Vec::new());
+    for (path, src) in files {
+        let lang = devctx_parse::detect_lang(Path::new(path)).unwrap();
+        let mut pf = parse(lang, src).unwrap();
+        pf.assign_ids("repo", path);
+        let (s, e) = link_rows(path, &pf);
+        symbols.extend(s);
+        edges.extend(e);
+    }
+    let names = symbols
+        .iter()
+        .map(|s| (s.id, s.qualified.clone()))
+        .collect();
+    Linked {
+        index: RepoIndex::new(symbols, &edges),
+        edges,
+        names,
+    }
+}
+
+/// MINOR: an anonymous class is a scope: a bare call in it is its
+/// supertype's first. Its supertype is external here: a name the enclosing
+/// class also defines (`cancel`) is undecided, not the enclosing method in
+/// `high`; one it does not (`purge`) is the supertype's.
+#[test]
+fn an_anonymous_class_scopes_its_bare_calls() {
+    let l = link_sources(&[(
+        "p/Clock.java",
+        "package p;\nimport java.util.TimerTask;\nclass Clock {\n    void cancel() {}\n    \
+         void start() {\n        new TimerTask() { public void run() { cancel(); purge(); } };\n    }\n}\n",
+    )]);
+    assert_eq!(
+        l.show(&l.call("Clock.start.run", "cancel")),
+        (None, "low", "name_only", false)
+    );
+    assert_eq!(
+        l.show(&l.call("Clock.start.run", "purge")),
+        (None, "high", "inherited", true)
+    );
+}
+
+/// Deviation 4: constructor injection labels the edge, the field's declared
+/// type types it — `Service.m`, not the implementation the constructor takes.
+#[test]
+fn constructor_injection_keeps_the_declared_type() {
+    let l = link_sources(&[
+        (
+            "p/Service.java",
+            "package p;\npublic class Service { public void m() {} }\n",
+        ),
+        (
+            "p/ServiceImpl.java",
+            "package p;\npublic class ServiceImpl extends Service { public void m() {} }\n",
+        ),
+        (
+            "p/Foo.java",
+            "package p;\nclass Foo {\n    private final Service s;\n    \
+             Foo(ServiceImpl s) { this.s = s; }\n    void go() { s.m(); }\n}\n",
+        ),
+    ]);
+    assert_eq!(
+        l.show(&l.call("Foo.go", "Service.m")),
+        (q("Service.m"), "high", "ctor_inject", false)
+    );
+}
+
+/// MINOR: two types with one fully qualified name (two modules) are no
+/// `high` answer.
+#[test]
+fn a_duplicated_fully_qualified_type_is_not_high() {
+    let l = link_sources(&[
+        (
+            "a/src/p/Dup.java",
+            "package p;\npublic class Dup { public void m() {} }\n",
+        ),
+        (
+            "b/src/p/Dup.java",
+            "package p;\npublic class Dup { public void m() {} }\n",
+        ),
+        (
+            "c/src/q/User.java",
+            "package q;\nimport p.Dup;\nclass User { void go(Dup d) { d.m(); } }\n",
+        ),
+    ]);
+    let (dst, conf, _, _) = l.show(&l.call("User.go", "Dup.m"));
+    assert_eq!((dst.as_deref(), conf), (Some("Dup.m"), "medium"));
+}
+
+/// MINOR: outside Java a type found only by being the one of its name is
+/// `medium`, and so is what is typed by it.
+#[test]
+fn a_unique_name_type_does_not_make_a_typed_call_high() {
+    let l = link_sources(&[
+        ("a.py", "def f(repo: Repo):\n    repo.load()\n"),
+        ("b.py", "class Repo:\n    def load(self):\n        pass\n"),
+    ]);
+    let (dst, conf, _, _) = l.show(&l.call("f", "Repo.load"));
+    assert_eq!((dst.as_deref(), conf), (Some("Repo.load"), "medium"));
+}
+
+/// Arity is a Java rule: a Rust method's `&self` is no argument, so
+/// `self.m()` is not an overload "no arity fits".
+#[test]
+fn arity_is_read_from_java_signatures_only() {
+    let l = link_sources(&[(
+        "src/a.rs",
+        "struct S;\nimpl S {\n    fn m(&self) {}\n    fn go(&self) { self.m(); }\n}\n",
+    )]);
+    let (dst, conf, res, _) = l.show(&l.call("S.go", "S.m"));
+    assert_eq!((dst.as_deref(), conf, res), (Some("S.m"), "high", "self"));
 }

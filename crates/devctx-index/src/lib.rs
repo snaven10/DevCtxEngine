@@ -2656,10 +2656,14 @@ mod tests {
             .find(|e| e.kind == "calls" && e.dst_name == "Logger.info")
             .unwrap();
         assert_eq!((log.dst_id, log.external), (None, Some(true)));
-        // `.count()` after the external `List.stream()`: external too.
+        // `.count()` after the external `List.stream()`: nothing types it;
+        // no repository name: a weak external.
         let count = edges.iter().find(|e| e.dst_name == "count").unwrap();
-        assert_eq!(count.resolution.as_deref(), Some("return_type"));
-        assert_eq!(count.external, Some(true));
+        assert_eq!(count.resolution.as_deref(), Some("chain_external"));
+        assert_eq!(
+            (count.external, count.confidence.as_deref()),
+            (Some(true), Some("medium"))
+        );
         // An untyped lambda parameter calling a name the repository lacks:
         // dropped and counted.
         assert!(!edges.iter().any(|e| e.dst_name == "vanish"));
