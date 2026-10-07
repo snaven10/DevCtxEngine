@@ -205,3 +205,42 @@ resolución nueva), pero ya sin perder ocurrencias repetidas ni llamadas a nivel
   subir `EXTRACTOR_VERSION` otra vez si ya hubiera índices v2 que importen); (3) no verificado en
   macOS/Windows (solo Linux) ni con un `devctx` 0.9.0 instalado real (se usó el padre compilado,
   misma lectura); backend-a/frontend no reindexados.
+- **Fixup (review):** hallazgos de la revisión de 30c3d51, cada uno con test que falla en el padre.
+  - *MAJOR-1, ordinal inestable:* `qualified` solo tomaba ancestros de `container_kinds`, así que
+    había homónimos reales (Rust `helper` arriba y en `mod tests`; `X.fmt` de `impl Display` e
+    `impl Debug`; los `wrapper` de decoradores Python; métodos Go `String` de dos tipos; `run` de
+    clases anónimas Java) y el `#n` en orden de fuente movía ids al insertar uno arriba. Ahora
+    `qualifier_chain` (`parser.rs`) mete todo ancestro que es símbolo del archivo, todo contenedor,
+    los `scope_kinds` nuevos del JSON (TS/TSX `internal_module`/`module`) y el receptor Go;
+    `container_name` quita genéricos (`impl<T> Foo<T>` → `Foo`, arregla también `parent_of`);
+    `Symbol.trait_of` (trait de `impl Trait for`, con sus genéricos) entra al disambiguator. El
+    ordinal queda para redefiniciones. Tests: `inserting_a_homonym_above_keeps_existing_ids`
+    (Rust/Python/Go/Java), `qualified_names_carry_every_enclosing_symbol`,
+    `a_generic_impl_hangs_from_its_type`.
+  - *MAJOR-2, re-key por XOR:* opción (a). `rename_file_graph` borra las filas de la ruta vieja y
+    deja sin resolver las aristas de otros archivos que apuntaban a ellas; el reindex las recrea.
+    Sin camino XOR, el id vuelve al hash único de DD-3 (`fnv1a64(repo␟file␟kind_class␟qualified␟
+    disambiguator)`), con valor dorado fijado (`the_id_format_is_pinned`). Se quitan
+    `file_part`/`symbol_part`/`rename_delta`. Test: `a_rename_drops_the_old_rows_for_the_reindex`
+    (reemplaza `a_rename_rekeys_the_file_like_a_fresh_parse`). CHANGELOG corregido ("kept on
+    rename" decía lo contrario de lo que pasa ahora).
+  - *MINOR-1:* `"overloads"` fuera de typescript/tsx (`typescript_ids_ignore_parameter_types`).
+    Java usa los parámetros **siempre**: hacerlo solo con homónimos le cambiaría el id a la
+    sobrecarga original al agregar otra (el mismo defecto de MAJOR-1). Documentado en DD-3.
+  - *MINOR-2:* `Store::extractor_stale` recibe ahora el `repo` corto y también da `true` si
+    `graph_out_of_step` (archivo con símbolos sin fila `file`, o fila `file` sin `file_state`), así
+    un downgrade a 0.9.0 con incrementales bajo el sello `v2` se reporta y el incremental no
+    re-sella ni copia. Límite: archivos *modificados* por 0.9.0 no se detectan. Test:
+    `a_graph_out_of_step_with_its_files_reads_as_stale`.
+  - *MINOR-3:* `an_existing_hnsw_database_gains_the_tables` falla si VSS no carga, salvo
+    `DEVCTX_TEST_ALLOW_NO_VSS=1` (patrón de `require_fts`); test nuevo
+    `an_hnsw_database_without_vss_skips_the_checkpoint` (conexión sin autoload de extensiones).
+    `Store::try_checkpoint`/`force_checkpoint` aplican `checkpoint_is_safe` y devuelven
+    `StoreError::CheckpointUnsafe`; `checkpoint` lo traga como antes.
+  - *NITs:* golden de `symbol_id`; la firma corta en el `body` (`the_signature_excludes_a_one_line_body`:
+    `fn g() -> i32 { 1 }` → `fn g() -> i32`).
+  - `EXTRACTOR_VERSION` sigue en 2 (nada publicado). Bloques libres / `graph_edges` / hotfix
+    0.9.1: **decisión pendiente del usuario**, sin cambios de código; no se midió
+    `PRAGMA database_size` tras un segundo `--full`.
+  - Gate: `cargo fmt --check`; `cargo clippy --workspace --all-targets -D warnings` (y
+    `--features gpu`); `cargo test` por paquete con `TMPDIR=/var/tmp`: verde. Guardia privada vacía.

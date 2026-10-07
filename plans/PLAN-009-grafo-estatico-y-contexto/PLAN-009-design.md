@@ -156,16 +156,52 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
 - **`kind_class`** agrupa kinds intercambiables (`function`/`method` → `callable`;
   `class`/`interface`/`enum`/`record`/`struct`/`trait` → `type`) para que el id no cambie si un
   ajuste del extractor reclasifica `function` como `method`.
-- **`disambiguator`**: lista de tipos de parámetros normalizada (sin nombres ni espacios) cuando el
-  lenguaje sobrecarga (Java, TS overloads); si no hay o colisiona, el ordinal entre homónimos del
-  mismo contenedor en orden de fuente. Así `actualizar(Long, OfficeRequestDTO, String)` y una
-  sobrecarga conviven.
+- **`qualified`** lleva **todo scope envolvente**, no solo los contenedores de `container_kinds`:
+  cada ancestro que es símbolo del archivo (Rust `mod`, función envolvente, método — el `wrapper`
+  de un decorador Python, el método de una clase anónima Java), cada contenedor (`impl`, clase,
+  trait; el tipo de un `impl` sin argumentos genéricos: `impl<T> Foo<T>` → `Foo`), los
+  `scope_kinds` del JSON (TS/TSX `namespace`/`module`, que no son símbolos) y, en Go, el tipo del
+  receptor (`func (s *Svc[T]) Run` → `Svc.Run`). Ejemplos: `tests.helper`, `deco.wrapper`,
+  `Outer.start.run`. Así dos homónimos difieren por *dónde* están y no por su orden en el archivo.
+  (TASK-004 le agrega la ruta/paquete; la regla de scopes se mantiene.)
+- **`disambiguator`**: el trait de un `impl Trait for Tipo` de Rust, sin espacios y con sus
+  argumentos genéricos (`Display` y `Debug` de `X.fmt` difieren; `From<A>` y `From<B>` también), y
+  la lista de tipos de parámetros normalizada (sin nombres ni espacios) en lenguajes con
+  sobrecarga de cuerpos separados — **solo Java** (`"overloads": true`). Java la usa **siempre**,
+  no solo cuando hay homónimos: si dependiera de que exista otra sobrecarga, agregar una le
+  cambiaría el id a la original (el mismo defecto que el ordinal); el costo aceptado es que
+  cambiar el tipo de un parámetro cambia el id, que es lo que este DD ya dice abajo.
+  **TS/TSX no**: las firmas de sobrecarga no son símbolos (hay un solo cuerpo), así que los tipos no
+  desambiguan nada y solo volvían el id frágil a un refactor de tipos.
+- **Ordinal, último recurso:** solo si dos símbolos del archivo siguen compartiendo `kind_class`,
+  `qualified` y `disambiguator` (redefinición Python, dos clases anónimas con el mismo método en un
+  mismo método) o hay colisión de hash, se agrega `#n` en orden de fuente. Es el único caso en que
+  insertar un homónimo arriba mueve un id; el test `inserting_a_homonym_above_keeps_existing_ids`
+  fija que en los demás (Rust `mod tests`, dos impls de trait, decoradores, receptores Go, clases
+  anónimas Java) no pasa.
+- **Forma:** un solo FNV-1a sobre los cinco campos, separados por `␟` (0x1f), valor fijado por un
+  test dorado (`the_id_format_is_pinned`). TASK-003 probó primero una composición XOR (mitad
+  archivo ⊕ mitad símbolo) para que `rename_file` re-keyara sin re-parsear; se descartó en la
+  revisión: era exacta solo mientras `qualified` no dependiera de la ruta (TASK-004 la hace
+  depender), `rename_file` no tiene llamador de producción (el pipeline indexa un renombre como
+  borrar + agregar) y su test la validaba con la misma función.
+- **Renombre de archivo:** `Store::rename_file` mueve `vectors` y **borra** las filas de `symbols`
+  y `edges` de la ruta vieja; el reindex de la ruta nueva las escribe con ids nuevos. Las aristas de
+  otros archivos ya resueltas hacia esos ids quedan con `dst_id`/`confidence`/`resolution` en NULL
+  para que las re-resuelva el link pass (DD-6), en vez de apuntar a símbolos inexistentes.
+- **Desfase grafo/archivos:** el sello del extractor solo lo reescribe un `--full`, así que un
+  0.9.0 tras un downgrade puede hacer incrementales bajo un sello `v2` vigente. `extractor_stale`
+  además da `true` si `file_state` y `symbols` no coinciden en qué archivos hay (archivo con
+  símbolos sin fila `file`, o fila `file` sin `file_state`): dos anti-joins baratos. No detecta un
+  archivo que ese binario *modificó* (sus filas siguen, viejas); haría falta un hash que el grafo no
+  guarda.
 - FNV-1a 64 porque ya está en el árbol (`registry.rs:96-100`) y es estable entre plataformas y
   versiones (a diferencia de `DefaultHasher`). Probabilidad de colisión con 10⁶ símbolos ≈ 3·10⁻⁸;
   igual, el escritor detecta una colisión dentro del archivo y la resuelve con el ordinal.
-- **Estabilidad:** el id sobrevive a reindexar, a mover el cuerpo dentro del archivo y a cambiar la
-  firma de retorno. Cambia si cambia archivo, contenedor, nombre o parámetros: es otro símbolo a
-  efectos de "quién lo llama". No se intenta seguir renombres (fuera de alcance).
+- **Estabilidad:** el id sobrevive a reindexar, a mover el cuerpo dentro del archivo, a cambiar la
+  firma de retorno y a insertar homónimos en otros scopes. Cambia si cambia archivo, scope
+  envolvente, nombre, trait del `impl` o (Java) parámetros: es otro símbolo a efectos de "quién lo
+  llama". No se intenta seguir renombres (fuera de alcance).
 - El **símbolo de archivo** (`kind = file`, `qualified = <ruta>`) existe siempre: es el `src` de las
   llamadas a nivel de módulo (Python, scripts, `export const x = f()` en TS) y de las aristas
   `imports`, y la raíz de `contains`.
