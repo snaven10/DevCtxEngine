@@ -1240,6 +1240,8 @@ fn do_index_inner(
         "files_copied": res.files_copied,
         "files_unchanged": res.files_unchanged,
         "chunks_reused": res.chunks_reused,
+        "edges_discarded": res.edges_discarded,
+        "edges_unresolved": res.edges_unresolved,
         "symbols": res.symbols,
         "chunks": res.chunks,
     });

@@ -261,6 +261,18 @@ with open(f"{outdir}/edges.tsv", "w", encoding="utf-8", newline="") as fh:
     w = csv.writer(fh, delimiter="\t"); w.writerow(["source", "target", "kind", "source_file", "line"])
     for r in con.execute("select source, target, kind, source_file, line from graph_edges").fetchall():
         w.writerow([("" if x is None else str(x).replace("\t", " ").replace("\n", " ")) for x in r])
+# Esquema nuevo (TASK-005 en adelante): cada ocurrencia con su destino resuelto, para
+# `score.py gold --new-edges` (precisión por `confidence`/`resolution`).
+if have_new:
+    with open(f"{outdir}/edges_new.tsv", "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(["kind", "file", "line", "dst_name", "dst_qualified", "confidence", "resolution", "external"])
+        for r in con.execute("""select e.kind, e.file, e.line, e.dst_name, s.qualified, e.confidence,
+                                       e.resolution, coalesce(e.external, false)
+                                from edges e left join symbols s
+                                  on s.id = e.dst_id and s.repo = e.repo and s.branch = e.branch
+                                where e.kind in ('calls', 'instantiates')""").fetchall():
+            w.writerow([("" if x is None else str(x).replace("\t", " ").replace("\n", " ")) for x in r])
 with open(f"{outdir}/symbols.tsv", "w", encoding="utf-8", newline="") as fh:
     w = csv.writer(fh, delimiter="\t"); w.writerow(["symbol", "symbol_type", "file"])
     for r in con.execute("select distinct symbol, symbol_type, file from vectors where coalesce(symbol,'') <> '' and coalesce(memory_type,'') = ''").fetchall():
@@ -272,7 +284,9 @@ PY
     emit "### Gold edges"; emit ""
     for g in "${GOLD_FILES[@]}"; do
       if grep -q "^$repo|" "$g"; then
-        "${SCORE[@]}" gold --gold "$g" --edges "$W/edges.tsv" --symbols "$W/symbols.tsv" --repo "$repo" | tee -a "$REPORT"
+        newe=()
+        [[ -s "$W/edges_new.tsv" ]] && newe=(--new-edges "$W/edges_new.tsv")
+        "${SCORE[@]}" gold --gold "$g" --edges "$W/edges.tsv" --symbols "$W/symbols.tsv" --repo "$repo" "${newe[@]}" | tee -a "$REPORT"
         emit ""
       fi
     done

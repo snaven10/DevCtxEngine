@@ -12,9 +12,10 @@
 //! - the package;
 //! - each symbol: kind, qualified name, id, parent (the `contains` edge),
 //!   container, `exported`, lines and signature;
-//! - each call: source symbol → target, line, and the source name
+//! - each call: source symbol → target, line, the source name
 //!   `graph_edges` records (`-` for a call with no named function around
-//!   it, which `graph_edges` leaves out);
+//!   it, which `graph_edges` leaves out) and the receiver `hint` the link
+//!   pass resolves it from;
 //! - each instantiation and type use, supertype and import, with its source.
 //!
 //! - Output changed, version not bumped → fails: bump `EXTRACTOR_VERSION`
@@ -96,10 +97,11 @@ fn render() -> String {
             .chain(pf.module_edges.iter().map(|e| (e, "-")))
             .map(|(e, graph)| {
                 format!(
-                    "{}\tcall\t{} -> {}\tgraph={graph}",
+                    "{}\tcall\t{} -> {}\tgraph={graph}\thint={}",
                     e.line,
                     name(e.src_id),
-                    e.target
+                    e.target,
+                    e.hint.as_deref().unwrap_or("-")
                 )
             })
             .collect();

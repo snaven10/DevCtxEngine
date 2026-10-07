@@ -76,6 +76,22 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   one-element tuple argument (`impl Foo<(u8,)>`) no longer shares the ids of
   `impl Foo<(u8)>`, and `export default (foo);` marks `foo` exported.
 
+- **Link pass** (PLAN-009 TASK-005, **extractor version 6**: `devctx index
+  --full`): every run ends by resolving the branch's edges to the symbol they
+  reach (`dst_id`, `confidence`, `resolution`, `external`), incrementally after
+  the files it wrote. A call's receiver is typed by lexical scope in Java (each
+  inner class has its own fields; `var` from its initializer; for-each
+  elements; constructor injection), recorded per edge as `hint`, and a
+  constant such as `LOG` is never taken for a type, so `graph_edges` loses its
+  `var.*`/`LOG.*` targets. Java rules: imports, same package, nested types,
+  inheritance, Panache statics and `Object` methods as inherited externals,
+  static imports, the declared return type along a fluent chain. Calls on a
+  receiver nothing types, to a name the repository does not define, are
+  dropped and counted (`index_repo` reports `edges_discarded` and
+  `edges_unresolved`). Measured on two Java repositories: 2.7 % of calls left
+  undecided (was 100 %), 18 of 20 hand-labelled call sites resolved correctly,
+  all 18 of those marked `high`.
+
 ### Fixed
 
 - A `--full` over several indexed branches no longer copies and rewrites every

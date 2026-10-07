@@ -7,8 +7,10 @@ Solo biblioteca estándar. Lo invoca run.sh; también sirve a mano.
       Hit@5, Hit@10, MRR por modo (search) y presencia en el brief (context), por caso y
       agregado, global y por idioma.
   score.py gold --gold G.txt --edges E.tsv --symbols S.tsv --repo NAME [--tol N]
+               [--new-edges N.tsv]
       Precisión de resolución contra los gold edges, contando por "nombre calificado igual
-      al esperado".
+      al esperado". Con --new-edges (tabla `edges` resuelta, TASK-005 en adelante) agrega la
+      precisión de la resolución: global, en `high`, cobertura (no `low`) y por `resolution`.
   score.py pct N [N ...]            p50 / p95 / min / max de una lista de números.
 
 Todas las salidas son tablas markdown, listas para pegar en un `## Resultado`.
@@ -324,7 +326,81 @@ def cmd_gold(a: argparse.Namespace) -> int:
         exp = ("`external` " if s["external"] else "") + f"`{s['dst']}`"
         short = s["file"].rsplit("/", 1)[-1]
         print(f"| {short}:{s['line']} | {exp} | {st} | {('`' + got + '`') if got else '—'} |")
+    if a.new_edges:
+        print()
+        gold_new(sites, Path(a.new_edges), a.tol)
     return 0
+
+
+def judge_new(site: dict, rows: list[dict], tol: int) -> tuple[str, dict | None]:
+    """Un sitio contra la tabla `edges` resuelta. correcto = el destino resuelto (`dst_id` →
+    `qualified`) es el esperado (igual, o termina en `.esperado`: una clase interna), o el
+    sitio es `external` y la arista tiene la marca; error = resuelto a otro símbolo, o marcado
+    externo siendo interno (o al revés); sin decidir = ni destino ni marca (`low`); sin
+    arista = no hay ocurrencia con ese nombre en la línea (±tol), p. ej. descartada."""
+    want = norm_target(site["dst"])
+    wl = leaf(want)
+    cand = [r for r in rows if abs(int(r["line"]) - site["line"]) <= tol]
+    same = [r for r in cand if leaf(norm_target(r["dst_name"])) == wl
+            or (r["dst_qualified"] and leaf(norm_target(r["dst_qualified"])) == wl)]
+    if not same:
+        return "missing", None
+    same.sort(key=lambda r: abs(int(r["line"]) - site["line"]))
+    ext = lambda r: r["external"].lower() == "true"
+    if site["external"]:
+        for r in same:
+            if ext(r):
+                return "correct", r
+        for r in same:
+            if r["dst_qualified"]:
+                return "wrong", r
+        return "undecided", same[0]
+    for r in same:
+        q = norm_target(r["dst_qualified"]) if r["dst_qualified"] else ""
+        if q and (q == want or q.endswith("." + want)):
+            return "correct", r
+    for r in same:
+        if r["dst_qualified"] or ext(r):
+            return "wrong", r
+    return "undecided", same[0]
+
+
+def gold_new(sites: list[dict], path: Path, tol: int) -> None:
+    by_file: dict[str, list[dict]] = defaultdict(list)
+    for r in load_tsv(path):
+        by_file[r["file"]].append(r)
+    res = [(s, *judge_new(s, by_file.get(s["file"], []), tol)) for s in sites]
+    print("Resolución (tabla `edges`, TASK-005 en adelante): correcto = destino resuelto igual al "
+          "esperado (o marca `external` si el esperado es externo).")
+    print()
+    print("| grupo | sitios | correcto | error | sin decidir | sin arista | precisión global | "
+          "precisión en `high` | cobertura (no `low`) |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    groups = [("todos", res)]
+    for lg in sorted({lang_of(r[0]["file"]) for r in res}):
+        groups.append((lg, [r for r in res if lang_of(r[0]["file"]) == lg]))
+    groups.append(("internos", [r for r in res if not r[0]["external"]]))
+    groups.append(("externos", [r for r in res if r[0]["external"]]))
+    for label, rows in groups:
+        n = len(rows)
+        c = sum(1 for r in rows if r[1] == "correct")
+        w = sum(1 for r in rows if r[1] == "wrong")
+        u = sum(1 for r in rows if r[1] == "undecided")
+        m = sum(1 for r in rows if r[1] == "missing")
+        high = [r for r in rows if r[2] and r[2]["confidence"] == "high"]
+        ch = sum(1 for r in high if r[1] == "correct")
+        cov = sum(1 for r in rows if r[2] and r[2]["confidence"] in ("high", "medium"))
+        print(f"| {label} | {n} | {c} | {w} | {u} | {m} | {pct(c, n)} | {ch}/{len(high)} = "
+              f"{pct(ch, len(high))} | {pct(cov, n)} |")
+    print()
+    print("| archivo:línea | esperado | estado | confidence/resolution | destino |")
+    print("|---|---|---|---|---|")
+    for s, st, r in res:
+        exp = ("`external` " if s["external"] else "") + f"`{s['dst']}`"
+        short = s["file"].rsplit("/", 1)[-1]
+        how = f"{r['confidence']}/{r['resolution']}" if r else "—"
+        dst = (r["dst_qualified"] or ("external" if r["external"].lower() == "true" else r["dst_name"])) if r else "—"
+        print(f"| {short}:{s['line']} | {exp} | {st} | {how} | `{dst}` |")
 
 
 # --------------------------------------------------------------------------- latencias
@@ -353,6 +429,7 @@ def main(argv: list[str]) -> int:
     g.add_argument("--symbols", required=True)
     g.add_argument("--repo", required=True)
     g.add_argument("--tol", type=int, default=2)
+    g.add_argument("--new-edges", default=None)
     g.set_defaults(fn=cmd_gold)
     p = sub.add_parser("pct")
     p.add_argument("values", nargs="*")

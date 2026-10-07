@@ -106,6 +106,12 @@ pub struct GraphEdge {
     pub source_byte: Option<usize>,
     /// Id of the source symbol, `0` until [`ParsedFile::assign_ids`] runs.
     pub src_id: u64,
+    /// What the file says about the receiver (`edges.hint`, PLAN-009
+    /// TASK-005): `bare`, `this`, `super`, `typed <via> <Type>`, `name <r>`,
+    /// `untyped`, `expr`, `chain [<callee> <hint>]` or `path`, then
+    /// ` /<arguments>` when the grammar says. The link pass resolves the
+    /// occurrence from it and `target` without the source.
+    pub hint: Option<String>,
 }
 
 /// The result of parsing one file.

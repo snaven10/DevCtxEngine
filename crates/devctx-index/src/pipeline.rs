@@ -217,6 +217,13 @@ pub struct IndexResult {
     /// extractor: only the changed files were re-parsed, so the rest still
     /// carries what the old extractor produced. `--full` clears it.
     pub extractor_stale: bool,
+    /// Calls the link pass dropped (PLAN-009 DD-7): a receiver nothing types
+    /// (a fluent chain, an untyped local) and a name the repository does not
+    /// define. Counted, like `files_skipped`, rather than kept as noise.
+    pub edges_discarded: usize,
+    /// `calls` of the branch the link pass left with neither a destination
+    /// nor the `external` mark (undecided, `low`).
+    pub edges_unresolved: usize,
     /// The run stopped early because [`ProgressSink::cancelled`] said so (the
     /// server is shutting down). What it wrote is committed and checkpointed;
     /// the index record was **not** advanced, so the next incremental run
@@ -390,6 +397,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         full_reindex,
         cfg: ChunkConfig::default(),
         indexed: HashSet::new(),
+        graph_written: HashSet::new(),
         excluded,
         written: 0,
         // Vectors are only comparable within the model that made them: the
@@ -540,6 +548,41 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
             }
             ctx.delete_file(file)?;
             result.files_pruned += 1;
+        }
+    }
+
+    // The link pass (PLAN-009 DD-6): after every file and the prune, before
+    // the record and the extractor stamp. Skipped when the run wrote no graph
+    // rows: nothing it could re-resolve has changed.
+    if !result.cancelled && (full_reindex || !ctx.graph_written.is_empty()) {
+        let stats = heartbeat(req.progress, "link", || {
+            crate::link::link_branch(
+                req.store,
+                &repo_short,
+                &branch,
+                &ctx.graph_written,
+                full_reindex,
+                &cancelled,
+            )
+        })?;
+        result.edges_discarded = stats.discarded;
+        result.edges_unresolved = stats.unresolved_calls;
+        if stats.cancelled {
+            result.cancelled = true;
+        } else {
+            eprintln!(
+                "· link pass ({}): {} edges resolved, {} files rewritten, {} calls dropped \
+                 (untypable receiver, name not in the repository), {} calls undecided, {} ms \
+                 (load {} ms, write {} ms)",
+                if stats.full { "full" } else { "incremental" },
+                stats.resolved,
+                stats.files_written,
+                stats.discarded,
+                stats.unresolved_calls,
+                stats.ms,
+                stats.load_ms,
+                stats.write_ms
+            );
         }
     }
 
@@ -851,6 +894,9 @@ struct Ctx<'a> {
     cfg: ChunkConfig,
     /// Files that were (re)indexed this run — used to prune stale files.
     indexed: HashSet<String>,
+    /// Files whose graph rows this run wrote or deleted: the link pass's
+    /// incremental input (DD-6).
+    graph_written: HashSet<String>,
     /// Compiled `indexing.exclude` patterns.
     excluded: Gitignore,
     /// Files that reached the write step this run (for [`stall_inside_write`]).
@@ -937,7 +983,7 @@ impl Ctx<'_> {
 
     /// Forget a file: its vectors, edges, symbols, routes and state, as one
     /// transaction (see `index_file` for why one).
-    fn delete_file(&self, file: &str) -> Result<()> {
+    fn delete_file(&mut self, file: &str) -> Result<()> {
         // A file that was never indexed (excluded, binary, added and removed
         // between runs) has nothing to delete: do not take the indexes down.
         if self
@@ -960,6 +1006,7 @@ impl Ctx<'_> {
             self.store
                 .delete_file_state(self.repo_path, self.branch, file)
         })?;
+        self.graph_written.insert(file.to_string());
         Ok(())
     }
 
@@ -1076,6 +1123,7 @@ impl Ctx<'_> {
             })?;
             if let Some((symbols, chunks)) = copied {
                 self.indexed.insert(file.to_string());
+                self.graph_written.insert(file.to_string());
                 result.files_indexed += 1;
                 result.files_copied += 1;
                 result.symbols += symbols;
@@ -1165,6 +1213,9 @@ impl Ctx<'_> {
             Ok(())
         })?;
         self.indexed.insert(file.to_string());
+        if parsed.is_some() {
+            self.graph_written.insert(file.to_string());
+        }
 
         result.files_indexed += 1;
         result.symbols += symbol_count;
@@ -1336,6 +1387,7 @@ fn graph_rows(
         })
         .collect();
     let edge = |kind: &str, src_id: u64, dst_name: &str, line: u32| StoredSymbolEdge {
+        hint: None,
         kind: kind.to_string(),
         src_id,
         dst_id: None,
@@ -1353,7 +1405,10 @@ fn graph_rows(
         .edges
         .iter()
         .chain(&parsed.module_edges)
-        .map(|e| edge(&e.kind, e.src_id, &e.target, e.line));
+        .map(|e| StoredSymbolEdge {
+            hint: e.hint.clone(),
+            ..edge(&e.kind, e.src_id, &e.target, e.line)
+        });
     // `contains` is intra-file only (DD-6): a parent is a symbol of this
     // file, so the edge is resolved here and the link pass skips it.
     let file_ids: std::collections::HashSet<u64> = std::iter::once(file_id)

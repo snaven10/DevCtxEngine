@@ -1,4 +1,4 @@
-version 5
+version 6
 == src/main/java/com/example/shop/OrderService.java (java) package=com.example.shop
 sym	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7	parent=-	container=-	-	L1-43	
 sym	class	OrderService	dc29a699ee8c525b	parent=src/main/java/com/example/shop/OrderService.java	container=-	pub	L9-38	public class OrderService extends BaseService implements Auditable, Serializable
@@ -23,23 +23,23 @@ L9	implements	OrderService -> Auditable
 L9	implements	OrderService -> Serializable
 L9	inherits	OrderService -> BaseService
 L11	references	OrderService.repository -> OrderRepository
-L12	call	OrderService.LOG -> Logger.getLogger	graph=-
+L12	call	OrderService.LOG -> Logger.getLogger	graph=-	hint=name Logger /1
 L12	references	OrderService.LOG -> Logger
 L13	instantiates	OrderService.cache -> ArrayList
 L13	references	OrderService.cache -> List
 L13	references	OrderService.cache -> Order
 L15	references	OrderService.OrderService -> OrderRepository
-L17	call	OrderService.OrderService -> init	graph=OrderService.OrderService
+L17	call	OrderService.OrderService -> init	graph=OrderService.OrderService	hint=bare /0
 L20	references	OrderService.find -> Long
 L20	references	OrderService.find -> Order
 L21	references	OrderService.find -> String
-L22	call	OrderService.find -> OrderRepository.findById	graph=OrderService.find
+L22	call	OrderService.find -> OrderRepository.findById	graph=OrderService.find	hint=typed ctor_inject OrderRepository /1
 L22	references	OrderService.find -> Order
 L27	implements	OrderService.Line -> Comparable
 L27	references	OrderService.Line -> String
 L28	references	OrderService.Line.compareTo -> Line
 L32	instantiates	OrderService.Cache.clear -> Order
-L36	call	OrderService.init.run -> flush	graph=OrderService.init.run
+L36	call	OrderService.init.run -> flush	graph=OrderService.init.run	hint=bare /0
 L36	instantiates	OrderService.init -> Runnable
 L40	inherits	Auditable -> Named
 L41	references	Auditable.audit -> String
@@ -64,13 +64,13 @@ L3	import	rxjs#*	path=rxjs name=- alias=rx wildcard=true
 L4	import	./auth.store#default	path=./auth.store name=default alias=AuthStore wildcard=false
 L5	import	./polyfills	path=./polyfills name=- alias=- wildcard=false
 L7	references	tokenInterceptor -> Fn
-L8	call	tokenInterceptor -> inject	graph=tokenInterceptor
-L9	call	tokenInterceptor -> AuthStore.headers	graph=tokenInterceptor
-L9	call	tokenInterceptor -> clone	graph=tokenInterceptor
-L9	call	tokenInterceptor -> next	graph=tokenInterceptor
-L13	call	helper -> log	graph=helper
+L8	call	tokenInterceptor -> inject	graph=tokenInterceptor	hint=bare /1
+L9	call	tokenInterceptor -> AuthStore.headers	graph=tokenInterceptor	hint=typed local AuthStore /0
+L9	call	tokenInterceptor -> clone	graph=tokenInterceptor	hint=name req /1
+L9	call	tokenInterceptor -> next	graph=tokenInterceptor	hint=bare /1
+L13	call	helper -> log	graph=helper	hint=bare /1
 L16	inherits	Session -> Base
-L24	call	libs/auth/src/token.interceptor.ts -> Injectable	graph=-
+L24	call	libs/auth/src/token.interceptor.ts -> Injectable	graph=-	hint=bare /0
 L25	implements	AuthService -> Auditable
 L25	implements	AuthService -> OnInit
 L25	inherits	AuthService -> BaseService
@@ -79,20 +79,20 @@ L26	references	AuthService.cache -> Map
 L26	references	AuthService.cache -> Session
 L28	references	AuthService.constructor -> AuthStore
 L28	references	AuthService.constructor -> HttpClient
-L30	call	AuthService.constructor -> AuthService.tick	graph=AuthService.constructor
-L34	call	AuthService.ngOnInit -> AuthService.load	graph=AuthService.ngOnInit
-L35	call	AuthService.ngOnInit -> audit	graph=AuthService.ngOnInit
-L35	call	AuthService.ngOnInit -> map	graph=AuthService.ngOnInit
-L36	call	AuthService.ngOnInit -> AuthService.process	graph=AuthService.ngOnInit
-L36	call	AuthService.ngOnInit -> HttpClient.get	graph=AuthService.ngOnInit
-L36	call	AuthService.ngOnInit -> subscribe	graph=AuthService.ngOnInit
-L37	call	AuthService.ngOnInit.cb -> AuthService.track	graph=AuthService.ngOnInit.cb
-L38	call	AuthService.ngOnInit -> cb	graph=AuthService.ngOnInit
+L30	call	AuthService.constructor -> AuthService.tick	graph=AuthService.constructor	hint=this /0
+L34	call	AuthService.ngOnInit -> AuthService.load	graph=AuthService.ngOnInit	hint=this /0
+L35	call	AuthService.ngOnInit -> audit	graph=AuthService.ngOnInit	hint=bare /1
+L35	call	AuthService.ngOnInit -> map	graph=AuthService.ngOnInit	hint=expr /1
+L36	call	AuthService.ngOnInit -> AuthService.process	graph=AuthService.ngOnInit	hint=this /1
+L36	call	AuthService.ngOnInit -> HttpClient.get	graph=AuthService.ngOnInit	hint=typed local HttpClient /1
+L36	call	AuthService.ngOnInit -> subscribe	graph=AuthService.ngOnInit	hint=chain get typed local HttpClient /1
+L37	call	AuthService.ngOnInit.cb -> AuthService.track	graph=AuthService.ngOnInit.cb	hint=this /0
+L38	call	AuthService.ngOnInit -> cb	graph=AuthService.ngOnInit	hint=bare /0
 L41	references	AuthService.handle -> Event
-L42	call	AuthService.handle -> AuthService.load	graph=AuthService.handle
+L42	call	AuthService.handle -> AuthService.load	graph=AuthService.handle	hint=this /0
 L45	references	AuthService.load -> Session
 L46	instantiates	AuthService.load -> SessionImpl
-L50	call	libs/auth/src/token.interceptor.ts -> register	graph=-
+L50	call	libs/auth/src/token.interceptor.ts -> register	graph=-	hint=bare /1
 L54	import	./barrel#Other	path=./barrel name=Other alias=- wildcard=false
 L54	import	./barrel#Thing	path=./barrel name=Thing alias=Alias wildcard=false
 L55	import	./all#*	path=./all name=- alias=- wildcard=true
@@ -103,7 +103,7 @@ sym	function	Button.onClick	56580debb4e80180	parent=Button	container=-	priv	L4-4
 sym	function	Panel	5cf3006b7d7ef18d	parent=web/Button.tsx	container=-	pub	L8-10	function Panel(): JSX.Element
 L1	import	react#default	path=react name=default alias=React wildcard=false
 L3	references	Button -> Props
-L4	call	Button.onClick -> track	graph=Button.onClick
+L4	call	Button.onClick -> track	graph=Button.onClick	hint=bare /1
 L8	references	Panel -> JSX.Element
 == web/app.js (javascript) package=web/app
 sym	file	web/app.js	7333a95984a851a7	parent=-	container=-	-	L1-39	
@@ -117,15 +117,15 @@ sym	method	App.stop	a35e54b476e4e23d	parent=App	container=App	pub	L25-27	stop = 
 sym	function	onDone	0e374261e243a43b	parent=web/app.js	container=-	priv	L34-36	const onDone = function finish()
 L1	import	express#default	path=express name=default alias=express wildcard=false
 L2	import	./routes.js#route	path=./routes.js name=route alias=- wildcard=false
-L5	call	start -> listen	graph=start
-L9	call	boot -> start	graph=boot
+L5	call	start -> listen	graph=start	hint=bare /1
+L9	call	boot -> start	graph=boot	hint=bare /1
 L12	inherits	App -> Base
 L15	instantiates	App.constructor -> Server
-L16	call	App.constructor -> App.tick	graph=App.constructor
-L20	call	App.run -> boot	graph=App.run
-L26	call	App.stop -> close	graph=App.stop
-L31	call	web/app.js -> work	graph=-
-L35	call	onDone -> notify	graph=onDone
+L16	call	App.constructor -> App.tick	graph=App.constructor	hint=this /0
+L20	call	App.run -> boot	graph=App.run	hint=bare /0
+L26	call	App.stop -> close	graph=App.stop	hint=name server /0
+L31	call	web/app.js -> work	graph=-	hint=bare /0
+L35	call	onDone -> notify	graph=onDone	hint=bare /0
 == shop/orders.py (python) package=shop.orders
 sym	file	shop/orders.py	acd88c655c833ce3	parent=-	container=-	-	L1-34	
 sym	const	LIMIT	a3ec3be8cf532e5c	parent=shop/orders.py	container=-	pub	L6-6	LIMIT = 10
@@ -147,14 +147,14 @@ L9	inherits	OrderService -> mixins.Audited
 L10	references	OrderService.__init__ -> Repo
 L13	references	OrderService.find -> Order
 L13	references	OrderService.find -> int
-L14	call	OrderService.find -> Repo.get	graph=OrderService.find
-L18	call	OrderService._hidden.step -> audit	graph=OrderService._hidden.step
-L19	call	OrderService._hidden -> step	graph=OrderService._hidden
-L24	call	traced.wrapper -> record	graph=traced.wrapper
-L25	call	traced.wrapper -> f	graph=traced.wrapper
-L30	call	main -> OrderService	graph=main
-L30	call	main -> find	graph=main
-L33	call	shop/orders.py -> main	graph=-
+L14	call	OrderService.find -> Repo.get	graph=OrderService.find	hint=typed local Repo /1
+L18	call	OrderService._hidden.step -> audit	graph=OrderService._hidden.step	hint=bare /0
+L19	call	OrderService._hidden -> step	graph=OrderService._hidden	hint=bare /0
+L24	call	traced.wrapper -> record	graph=traced.wrapper	hint=bare /0
+L25	call	traced.wrapper -> f	graph=traced.wrapper	hint=bare /0
+L30	call	main -> OrderService	graph=main	hint=bare /1
+L30	call	main -> find	graph=main	hint=chain OrderService bare /1
+L33	call	shop/orders.py -> main	graph=-	hint=bare /0
 == crates/demo/src/cache.rs (rust) package=demo::cache
 sym	file	crates/demo/src/cache.rs	ef5c39f332d029f7	parent=-	container=-	-	L1-40	
 sym	const	LIMIT	593dad3c8269598e	parent=crates/demo/src/cache.rs	container=-	pub	L4-4	pub const LIMIT: usize = 8;
@@ -177,15 +177,15 @@ L2	import	crate::store::model::*	path=crate::store::model name=- alias=- wildcar
 L14	inherits	Named -> Clone
 L14	inherits	Named -> Send
 L21	references	Cached.new -> Cached
-L22	call	Cached.new -> Cached.build	graph=Cached.new
+L22	call	Cached.new -> Cached.build	graph=Cached.new	hint=path /1
 L25	references	Cached.build -> Cached
-L27	call	Cached.build.tag -> mark	graph=Cached.build.tag
+L27	call	Cached.build.tag -> mark	graph=Cached.build.tag	hint=bare /0
 L29	instantiates	Cached.build -> Cached
 L33	implements	Cached -> Named
 L34	references	Cached.name -> String
-L35	call	Cached.name -> Foo.bar	graph=Cached.name
-L36	call	Cached.name -> store::open	graph=Cached.name
-L37	call	Cached.name -> String.new	graph=Cached.name
+L35	call	Cached.name -> Foo.bar	graph=Cached.name	hint=path /0
+L36	call	Cached.name -> store::open	graph=Cached.name	hint=path /0
+L37	call	Cached.name -> String.new	graph=Cached.name	hint=path /0
 == api/server.go (go) package=api
 sym	file	api/server.go	53b33b78efb910e7	parent=-	container=-	-	L1-32	
 sym	const	Version	cba7bd18a30b70f0	parent=api/server.go	container=-	pub	L10-10	Version = "1"
@@ -207,6 +207,6 @@ L22	references	NewServer -> Server
 L23	instantiates	NewServer -> Server
 L26	references	Server.Handle -> Server
 L26	references	Server.Handle -> h.ResponseWriter
-L27	call	Server.Handle -> Println	graph=Server.Handle
-L28	call	Server.Handle -> helper	graph=Server.Handle
+L27	call	Server.Handle -> Println	graph=Server.Handle	hint=name fmt /1
+L28	call	Server.Handle -> helper	graph=Server.Handle	hint=name s /0
 L31	references	Server.helper -> Server

@@ -149,5 +149,12 @@ UNION ALL SELECT 'dst_name_expresion', count(*) FILTER (WHERE regexp_matches(dst
 WITH g AS (SELECT src_id, dst_name, count(*) AS n FROM edges WHERE kind = 'calls' GROUP BY 1, 2)
 SELECT 'pares_con_>1_ocurrencia' AS k, count(*) FILTER (WHERE n > 1)::VARCHAR AS v FROM g;
 
+-- @metric from_test_coherente
+-- `from_test` de cada arista contra `is_test` del símbolo fuente (los dos salen de
+-- `path_kind`): tiene que dar 0.
+SELECT 'from_test_distinto_de_is_test' AS k, count(*)::VARCHAR AS v
+FROM edges e JOIN symbols s ON s.id = e.src_id AND s.repo = e.repo AND s.branch = e.branch
+WHERE coalesce(e.from_test, false) <> coalesce(s.is_test, false);
+
 -- @metric simbolos
 SELECT kind AS k, count(*)::VARCHAR AS v FROM symbols GROUP BY kind ORDER BY count(*) DESC;

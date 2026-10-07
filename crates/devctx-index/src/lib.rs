@@ -10,6 +10,7 @@
 pub mod error;
 pub mod git;
 pub mod id;
+mod link;
 pub mod pipeline;
 
 pub use devctx_parse::extractor_fingerprint;
@@ -2620,6 +2621,206 @@ mod tests {
     /// (PLAN-009 TASK-004): calls, imports, supertypes, instantiations, type
     /// uses and containment, and its symbols carry their package,
     /// signature and visibility.
+    /// The link pass of a full run (PLAN-009 TASK-005, DD-6): a call across
+    /// files reaches its definition, an external one is marked, and the
+    /// `contains` rows come out exactly as the parse wrote them (m-b: the
+    /// link pass excludes `kind = 'contains'`).
+    #[test]
+    fn the_link_pass_resolves_across_files_and_leaves_contains_alone() {
+        let (dir, repo) = graph_repo(
+            "link",
+            &[
+                ("src/a/Caller.java", LINK_CALLER),
+                ("src/b/Helper.java", LINK_HELPER),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        let res = index_branch(&store, &dir, "main", true);
+        let helper = store
+            .file_symbols(&repo, "main", "src/b/Helper.java")
+            .unwrap();
+        let run = symbol(&helper, "Helper.run");
+        let edges = store
+            .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+            .unwrap();
+        let call = edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_name == "Helper.run")
+            .unwrap();
+        assert_eq!(call.dst_id, Some(run.id));
+        assert_eq!(call.confidence.as_deref(), Some("high"));
+        assert_eq!(call.resolution.as_deref(), Some("field"));
+        assert_eq!(call.external, Some(false));
+        let log = edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_name == "Logger.info")
+            .unwrap();
+        assert_eq!((log.dst_id, log.external), (None, Some(true)));
+        // `.count()` after the external `List.stream()`: external too.
+        let count = edges.iter().find(|e| e.dst_name == "count").unwrap();
+        assert_eq!(count.resolution.as_deref(), Some("return_type"));
+        assert_eq!(count.external, Some(true));
+        // An untyped lambda parameter calling a name the repository lacks:
+        // dropped and counted.
+        assert!(!edges.iter().any(|e| e.dst_name == "vanish"));
+        assert_eq!(res.edges_discarded, 1, "{res:?}");
+        let contains: Vec<_> = edges.iter().filter(|e| e.kind == "contains").collect();
+        assert!(!contains.is_empty());
+        for c in contains {
+            assert_eq!(c.resolution.as_deref(), Some("structural"), "{c:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const LINK_CALLER: &str = "\
+package a;
+
+import b.Helper;
+import java.util.List;
+import org.jboss.logging.Logger;
+
+public class Caller {
+    private static final Logger LOG = Logger.getLogger(Caller.class);
+    Helper helper;
+
+    long go(List<String> xs) {
+        helper.run();
+        LOG.info(\"x\");
+        xs.forEach(x -> x.vanish());
+        return xs.stream().count();
+    }
+}
+";
+
+    /// Enough files that one written file stays under the full-pass
+    /// threshold (a fifth of the branch): the incremental selection is what
+    /// is tested, not the full pass.
+    const LINK_FILLER: [(&str, &str); 6] = [
+        ("f1.py", "def f1():\n    pass\n"),
+        ("f2.py", "def f2():\n    pass\n"),
+        ("f3.py", "def f3():\n    pass\n"),
+        ("f4.py", "def f4():\n    pass\n"),
+        ("f5.py", "def f5():\n    pass\n"),
+        ("f6.py", "def f6():\n    pass\n"),
+    ];
+
+    const LINK_HELPER: &str = "\
+package b;
+
+public class Helper {
+    public void run() {}
+}
+";
+
+    /// The incremental link pass (DD-6 mode b, m-b): only `Helper.java`
+    /// changes, yet the edge of `Caller.java` into it is re-resolved — its
+    /// destination is gone (renamed), then a symbol named like it is back.
+    /// `Caller.java` is not reindexed, and its `contains` rows are never
+    /// touched by the link pass's rewrite of its edges.
+    #[test]
+    fn an_incremental_link_pass_follows_a_definition_that_moved() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkinc", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let caller = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap()
+        };
+        let before = caller(&store);
+        let contains = |edges: &[devctx_store::StoredSymbolEdge]| -> Vec<_> {
+            edges
+                .iter()
+                .filter(|e| e.kind == "contains")
+                .cloned()
+                .collect()
+        };
+        let call = |edges: &[devctx_store::StoredSymbolEdge]| {
+            edges
+                .iter()
+                .find(|e| e.kind == "calls" && e.dst_name == "Helper.run")
+                .cloned()
+                .unwrap()
+        };
+        assert!(call(&before).dst_id.is_some());
+
+        // `run` renamed: the edge's destination no longer exists.
+        write(
+            &dir,
+            "src/b/Helper.java",
+            &LINK_HELPER.replace("run()", "walk()"),
+        );
+        commit_all(&dir, "rename run");
+        let inc = index_branch(&store, &dir, "main", false);
+        assert_eq!(inc.files_indexed, 1, "only Helper.java: {inc:?}");
+        let after = caller(&store);
+        let moved = call(&after);
+        assert_eq!(moved.dst_id, None, "{moved:?}");
+        assert_eq!(moved.confidence.as_deref(), Some("low"));
+        assert_eq!(contains(&after), contains(&before), "contains untouched");
+
+        // Back under its name (an added symbol whose name the edge ends in).
+        write(
+            &dir,
+            "src/b/Helper.java",
+            &LINK_HELPER.replace("run()", "run() {}\n    public void walk()"),
+        );
+        commit_all(&dir, "run is back");
+        index_branch(&store, &dir, "main", false);
+        let helper = store
+            .file_symbols(&repo, "main", "src/b/Helper.java")
+            .unwrap();
+        let back = call(&caller(&store));
+        assert_eq!(back.dst_id, Some(symbol(&helper, "Helper.run").id));
+        assert_eq!(back.resolution.as_deref(), Some("field"));
+        assert_eq!(contains(&caller(&store)), contains(&before));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DD-6 mode (b) by name: an edge that is resolved and points at a
+    /// symbol that still exists is re-resolved when a written file adds a
+    /// symbol named like its destination — here a second `util_fn`, which
+    /// makes the unique name ambiguous. Only `c.py` is indexed; `a.py`'s
+    /// row is neither dangling nor undecided, so nothing but the name picks
+    /// it.
+    #[test]
+    fn an_added_homonym_reopens_a_resolved_edge_by_name() {
+        let mut files = vec![
+            ("a.py", "def go():\n    util_fn()\n"),
+            ("b.py", "def util_fn():\n    pass\n"),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkname", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let edge = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "a.py")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.kind == "calls" && e.dst_name == "util_fn")
+                .unwrap()
+        };
+        let first = edge(&store);
+        assert_eq!(first.resolution.as_deref(), Some("unique_name"));
+        assert_eq!(first.confidence.as_deref(), Some("medium"));
+        assert!(first.dst_id.is_some());
+
+        write(&dir, "c.py", "def util_fn():\n    pass\n");
+        commit_all(&dir, "a homonym");
+        let inc = index_branch(&store, &dir, "main", false);
+        assert_eq!(inc.files_indexed, 1, "{inc:?}");
+        let now = edge(&store);
+        assert_eq!(now.resolution.as_deref(), Some("name_only"), "{now:?}");
+        assert_eq!((now.dst_id, now.confidence.as_deref()), (None, Some("low")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn every_relation_of_a_file_is_an_edge() {
         let src = "\
@@ -2708,10 +2909,13 @@ public class A extends B implements C {
             assert_eq!(c.resolution.as_deref(), Some("structural"), "{c:?}");
             assert!(ids.contains(&c.src_id) && c.dst_id.is_some_and(|d| ids.contains(&d)));
         }
+        // Everything else went through the link pass (TASK-005): decided,
+        // with a confidence, whatever the answer.
         assert!(edges
             .iter()
             .filter(|e| e.kind != "contains")
-            .all(|e| e.dst_id.is_none() && e.confidence.is_none()));
+            .all(|e| e.confidence.is_some() && e.resolution.is_some()));
+        assert_eq!(one("calls", "helper").confidence.as_deref(), Some("low"));
         assert_no_orphans(&store, &repo, "main", &["src/A.java"]);
         // `graph_edges` stays calls only, in its 0.9.0 shape.
         let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();

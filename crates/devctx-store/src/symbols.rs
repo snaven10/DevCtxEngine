@@ -83,6 +83,9 @@ pub struct StoredSymbolEdge {
     pub from_test: bool,
     /// `treesitter` today.
     pub edge_source: String,
+    /// What the file said about a call's receiver (PLAN-009 TASK-005):
+    /// the link pass re-resolves the row from it and `dst_name`.
+    pub hint: Option<String>,
 }
 
 const SYMBOL_COLS: &[&str] = &[
@@ -122,6 +125,7 @@ const EDGE_COLS: &[&str] = &[
     "external",
     "from_test",
     "edge_source",
+    "hint",
 ];
 
 fn row_to_symbol(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbol> {
@@ -164,11 +168,12 @@ fn row_to_edge(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbolEdge> {
         external: r.get(8)?,
         from_test: r.get::<_, Option<bool>>(9)?.unwrap_or(false),
         edge_source: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+        hint: r.get(11)?,
     })
 }
 
 const EDGE_SELECT: &str = "SELECT kind, src_id, dst_id, dst_name, file, line, confidence, \
-     resolution, external, from_test, edge_source FROM edges";
+     resolution, external, from_test, edge_source, hint FROM edges";
 
 impl Store {
     /// Replace `file`'s rows in `symbols` with `symbols`.
@@ -261,6 +266,7 @@ impl Store {
                 e.external,
                 e.from_test,
                 e.edge_source,
+                e.hint,
             ])?;
         }
         app.flush()?;
@@ -281,6 +287,86 @@ impl Store {
             self.replace_file_symbols(repo, branch, file, symbols)?;
             self.replace_file_symbol_edges(repo, branch, file, edges)
         })
+    }
+
+    /// Replace the resolved edges of several files — every kind but
+    /// `contains`, which the link pass never touches (DD-6) — with theirs,
+    /// in one transaction (the caller's, or its own): each file's rows are
+    /// written whole. The link pass's writer. One `DELETE` for the batch:
+    /// per file, its scan of the unindexed table was most of the pass.
+    pub fn replace_files_linked_edges(
+        &self,
+        repo: &str,
+        branch: &str,
+        files: &[(&str, Vec<StoredSymbolEdge>)],
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        debug_assert!(files
+            .iter()
+            .all(|(_, rows)| rows.iter().all(|e| e.kind != "contains")));
+        self.in_transaction(|| {
+            self.forget_graph_step(Some(branch));
+            let marks = vec!["?"; files.len()].join(", ");
+            let mut args: Vec<&dyn duckdb::ToSql> = vec![&repo, &branch];
+            for (f, _) in files {
+                args.push(f);
+            }
+            self.w()?.execute(
+                &format!(
+                    "DELETE FROM edges WHERE repo = ? AND branch = ? AND kind <> 'contains' \
+                     AND file IN ({marks})"
+                ),
+                args.as_slice(),
+            )?;
+            let w = self.w()?;
+            let mut app = w.appender_with_columns("edges", EDGE_COLS)?;
+            for (file, rows) in files {
+                for e in rows {
+                    app.append_row(params![
+                        repo,
+                        branch,
+                        e.kind,
+                        e.src_id,
+                        e.dst_id,
+                        e.dst_name,
+                        file,
+                        e.line,
+                        e.confidence,
+                        e.resolution,
+                        e.external,
+                        e.from_test,
+                        e.edge_source,
+                        e.hint,
+                    ])?;
+                }
+            }
+            app.flush()?;
+            Ok(())
+        })
+    }
+
+    /// Every symbol of a branch (the link pass's index).
+    pub fn branch_symbols(&self, repo: &str, branch: &str) -> Result<Vec<StoredSymbol>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SYMBOL_SELECT} WHERE repo = ? AND branch = ? ORDER BY file, start_byte, id"
+        ))?;
+        let rows = stmt.query_map(params![repo, branch], row_to_symbol)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Every edge of a branch but `contains`, by file and line (what the
+    /// link pass resolves).
+    pub fn branch_linkable_edges(&self, repo: &str, branch: &str) -> Result<Vec<StoredSymbolEdge>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{EDGE_SELECT} WHERE repo = ? AND branch = ? AND kind <> 'contains'
+             ORDER BY file, line, src_id, dst_name"
+        ))?;
+        let rows = stmt.query_map(params![repo, branch], row_to_edge)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Forget `file`'s symbols and edges.

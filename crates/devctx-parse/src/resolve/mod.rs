@@ -8,9 +8,14 @@
 //! tree expands, how an import names its destination, and whether a name
 //! belongs to the platform.
 //!
-//! This is the part of DD-5's trait that TASK-004 needs (the local facts).
-//! The cross-file part — which files or symbols an import reaches — is the
-//! link pass's (TASK-005), and gets its methods there.
+//! TASK-004 gave it the local facts; TASK-005 the receiver's type within a
+//! file ([`scope`], [`LangResolver::init_type`]) and the cross-file half —
+//! which symbol an occurrence reaches, or whether it is external — in
+//! [`link`], with Java's rules in [`java`].
+
+pub mod java;
+pub mod link;
+pub mod scope;
 
 use tree_sitter::Node;
 
@@ -54,12 +59,20 @@ pub trait LangResolver: Sync {
                 .iter()
                 .any(|p| name.starts_with(p.as_str()))
     }
+
+    /// The type a declaration without one written takes from its
+    /// initializer (`var x = new T()`, `var x = (T) e`; `var x =
+    /// T.of(…)` as [`Via::Static`](scope::Via::Static)), and how. `None`:
+    /// nothing local says (`var q = em.createQuery(…)`).
+    fn init_type(&self, _init: Node<'_>, _bytes: &[u8]) -> Option<(scope::TypeText, scope::Via)> {
+        None
+    }
 }
 
 /// The resolver of `lang`.
 pub fn resolver_for(lang: Lang) -> &'static dyn LangResolver {
     match lang.key() {
-        "java" => &Java,
+        "java" => &java::Java,
         "typescript" | "tsx" | "javascript" => &Script,
         "python" => &Python,
         "rust" => &Rust,
@@ -97,53 +110,6 @@ impl LangResolver for Generic {
     }
     fn import_target(&self, imp: &ImportFact) -> String {
         imp.path.clone()
-    }
-}
-
-struct Java;
-
-impl LangResolver for Java {
-    fn package_from_path(&self, _path: &str) -> Option<String> {
-        None // `package x.y;` in the source
-    }
-
-    /// `public`, or a member of an interface or annotation (implicitly
-    /// public unless `private`).
-    fn exported(&self, def: Node<'_>, _name: &str, bytes: &[u8]) -> Option<bool> {
-        let modifiers = {
-            let mut cursor = def.walk();
-            let found = def
-                .named_children(&mut cursor)
-                .find(|c| c.kind() == "modifiers")
-                .and_then(|m| m.utf8_text(bytes).ok())
-                .unwrap_or_default();
-            found
-        };
-        let has = |word: &str| modifiers.split_whitespace().any(|w| w == word);
-        if has("public") {
-            return Some(true);
-        }
-        if has("private") {
-            return Some(false);
-        }
-        let in_interface = def
-            .parent()
-            .and_then(|body| body.parent())
-            .is_some_and(|c| {
-                matches!(
-                    c.kind(),
-                    "interface_declaration" | "annotation_type_declaration"
-                )
-            });
-        Some(in_interface)
-    }
-
-    fn import_target(&self, imp: &ImportFact) -> String {
-        if imp.wildcard {
-            format!("{}.*", imp.path)
-        } else {
-            imp.path.clone()
-        }
     }
 }
 

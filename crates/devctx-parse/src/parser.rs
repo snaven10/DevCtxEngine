@@ -9,11 +9,10 @@ use crate::facts::{
     FileFacts, ImportFact, InheritFact, RefFact, IMPLEMENTS, INHERITS, INSTANTIATES, REFERENCES,
 };
 use crate::lang::Lang;
+use crate::resolve::java::is_constant_name;
+use crate::resolve::scope::{Scopes, Via};
 use crate::resolve::{resolver_for, LangResolver};
 use crate::types::{GraphEdge, Import, ParsedFile, Symbol};
-
-/// Variable/field name → declared type, for receiver resolution.
-type TypeMap = HashMap<String, String>;
 
 /// The name node of every symbol (by node id) → the symbol's qualified name
 /// and start byte: which bindings of an anonymous callable are symbols.
@@ -74,8 +73,14 @@ impl LanguageParser {
 
         let (symbols, bound) = self.extract_symbols(root, bytes);
         let (imports, import_facts) = self.extract_imports(root, bytes);
-        let type_map = self.extract_type_bindings(root, bytes);
-        let (edges, module_edges, refs) = self.extract_references(root, bytes, &type_map, &bound);
+        let scopes = Scopes::build(
+            root,
+            bytes,
+            self.lang,
+            self.type_query.as_ref(),
+            self.resolver,
+        );
+        let (edges, module_edges, refs) = self.extract_references(root, bytes, &scopes, &bound);
         let file_symbol = Symbol {
             kind: devctx_core::symbol_id::FILE_KIND.to_string(),
             language: self.lang.name().to_string(),
@@ -104,32 +109,6 @@ impl LanguageParser {
         })
     }
 
-    /// Build the file-level variable/field → type map.
-    fn extract_type_bindings(&self, root: Node<'_>, bytes: &[u8]) -> TypeMap {
-        let mut map = TypeMap::new();
-        let Some(query) = &self.type_query else {
-            return map;
-        };
-        let names = query.capture_names();
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(query, root, bytes);
-        while let Some(m) = matches.next() {
-            let mut name = None;
-            let mut ty = None;
-            for cap in m.captures {
-                match names[cap.index as usize] {
-                    "name" => name = cap.node.utf8_text(bytes).ok(),
-                    "type" => ty = cap.node.utf8_text(bytes).ok(),
-                    _ => {}
-                }
-            }
-            if let (Some(n), Some(t)) = (name, ty) {
-                map.entry(n.to_string()).or_insert_with(|| t.to_string());
-            }
-        }
-        map
-    }
-
     /// Every reference: calls (split by whether a named function encloses
     /// them), instantiations and type uses.
     ///
@@ -141,7 +120,7 @@ impl LanguageParser {
         &self,
         root: Node<'_>,
         bytes: &[u8],
-        type_map: &TypeMap,
+        scopes: &Scopes,
         bound: &Bound,
     ) -> (Vec<GraphEdge>, Vec<GraphEdge>, Vec<RefFact>) {
         let names = self.references.capture_names();
@@ -169,9 +148,22 @@ impl LanguageParser {
                         continue;
                     };
                     let func = enclosing_source(callee, self.lang, bound);
-                    let target = match path {
-                        Some(p) => path_target(callee, p, callee_name, bytes, self.lang),
-                        None => qualified_target(callee, callee_name, bytes, type_map, self.lang),
+                    let (target, hint) = match path {
+                        Some(p) => (
+                            path_target(callee, p, callee_name, bytes, self.lang),
+                            "path".to_string(),
+                        ),
+                        None => {
+                            let recv = classify(callee, bytes, scopes, 0);
+                            (
+                                recv.target(callee, callee_name, bytes, self.lang),
+                                recv.hint(),
+                            )
+                        }
+                    };
+                    let hint = match call_arity(callee) {
+                        Some(n) => format!("{hint} /{n}"),
+                        None => hint,
                     };
                     let mut edge = GraphEdge {
                         source: String::new(),
@@ -181,6 +173,7 @@ impl LanguageParser {
                         byte: callee.start_byte(),
                         source_byte: func.as_ref().map(|(b, _)| *b),
                         src_id: 0,
+                        hint: Some(hint),
                     };
                     // Source: the enclosing function, qualified with its class if any.
                     match func {
@@ -768,46 +761,183 @@ fn binding_of(func: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-/// The edge target, resolved from the call receiver where possible:
-/// `self`/`this` → `EnclosingClass.callee`; a `Type`-looking receiver →
-/// `Type.callee`; a local/field whose type is known → `Type.callee`; otherwise
-/// the bare callee name.
-fn qualified_target(
-    callee: Node<'_>,
-    name: &str,
-    bytes: &[u8],
-    type_map: &TypeMap,
-    lang: Lang,
-) -> String {
-    let Some(receiver) = receiver_of(callee, bytes) else {
-        return name.to_string();
-    };
-    match receiver.as_str() {
-        "self" | "Self" | "this" | "cls" | "super" => {
-            enclosing_container(callee, lang.container_kinds())
+/// What a call's receiver is, as far as the file can tell (PLAN-009
+/// TASK-005, DD-7 rules 1-4): what the `edges` row keeps as its `hint` for
+/// the link pass, and what makes the `graph_edges` target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Recv {
+    /// No receiver: `foo()`.
+    Bare,
+    /// `this`/`self`/`Self`/`cls`.
+    This,
+    /// `super`.
+    Super,
+    /// A local, parameter or field whose type the scope knows (or `new
+    /// T()`, `(T) e`): the type as written and how it was found.
+    Typed(String, Via),
+    /// A name no scope binds: a type (`Office.findByCodigo`), a package, an
+    /// inherited field, a lambda parameter.
+    Name(String),
+    /// A declaration whose type nothing local says (`var q =
+    /// em.createQuery(…)`): never taken for a type.
+    Untyped,
+    /// Another call (`a.b().c()`): the previous callee and its receiver,
+    /// up to [`CHAIN_DEPTH`] calls back.
+    Chain(Option<(String, Box<Recv>)>),
+    /// Any other expression.
+    Expr,
+}
+
+impl Recv {
+    /// The `graph_edges` target (the format 0.9.0 reads, DD-2): `Type.callee`
+    /// for a typed receiver, `Container.callee` for `this`/`super`, a
+    /// capitalised name that is no constant (`Office.find`, never
+    /// `LOG.info`), else the bare callee.
+    fn target(&self, callee: Node<'_>, name: &str, bytes: &[u8], lang: Lang) -> String {
+        match self {
+            Recv::This | Recv::Super => enclosing_container(callee, lang.container_kinds())
                 .and_then(|c| container_name(c, bytes))
                 .map(|class| format!("{class}.{name}"))
-                .unwrap_or_else(|| name.to_string())
-        }
-        r if r.chars().next().is_some_and(|c| c.is_uppercase()) => format!("{r}.{name}"),
-        r => {
-            // Local/field receiver: resolve its declared type (also handles a
-            // `self.field` / `this.field` receiver by stripping the prefix).
-            let key = r
-                .strip_prefix("self.")
-                .or_else(|| r.strip_prefix("this."))
-                .unwrap_or(r);
-            match type_map.get(key) {
-                Some(ty) => format!("{ty}.{name}"),
-                None => name.to_string(),
+                .unwrap_or_else(|| name.to_string()),
+            Recv::Typed(ty, _) => format!("{ty}.{name}"),
+            Recv::Name(r)
+                if r.chars().next().is_some_and(char::is_uppercase) && !is_constant_name(r) =>
+            {
+                format!("{r}.{name}")
             }
+            _ => name.to_string(),
+        }
+    }
+
+    /// The `edges.hint` (PLAN-009 DD-6): space-separated, what the link pass
+    /// re-resolves the occurrence from without the source — `bare`, `this`,
+    /// `super`, `typed <via> <Type>`, `name <receiver>`, `untyped`, `expr`,
+    /// `chain [<previous callee> <its hint>]` (`path` for a Rust path call);
+    /// the parser appends ` /<arguments>`.
+    fn hint(&self) -> String {
+        match self {
+            Recv::Bare => "bare".into(),
+            Recv::This => "this".into(),
+            Recv::Super => "super".into(),
+            Recv::Typed(ty, via) => format!("typed {} {ty}", via.as_str()),
+            Recv::Name(r) => format!("name {r}"),
+            Recv::Untyped => "untyped".into(),
+            Recv::Expr => "expr".into(),
+            Recv::Chain(None) => "chain".into(),
+            Recv::Chain(Some((prev, recv))) => format!("chain {prev} {}", recv.hint()),
         }
     }
 }
 
-/// Text of the call's receiver (the object before the `.`), if this is a
-/// member/method call rather than a plain function call.
-fn receiver_of(callee: Node<'_>, bytes: &[u8]) -> Option<String> {
+/// How many calls back a chain's receiver is followed (`a.b().c().d()`):
+/// the link pass types each from the one before (DD-7).
+const CHAIN_DEPTH: u8 = 4;
+
+/// Node kinds of a call whose value can be a receiver.
+const CALL_KINDS: &[&str] = &["method_invocation", "call_expression", "call"];
+
+/// The receiver of the call whose callee is `callee`.
+fn classify(callee: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -> Recv {
+    match receiver_node(callee) {
+        Some(recv) => classify_receiver(recv, bytes, scopes, depth),
+        None => Recv::Bare,
+    }
+}
+
+fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -> Recv {
+    let text = |n: Node<'_>| n.utf8_text(bytes).unwrap_or_default().to_string();
+    match recv.kind() {
+        "this" | "self" => return Recv::This,
+        "super" => return Recv::Super,
+        "parenthesized_expression" => {
+            return match recv.named_child(0) {
+                Some(inner) => classify_receiver(inner, bytes, scopes, depth),
+                None => Recv::Expr,
+            }
+        }
+        "cast_expression" | "object_creation_expression" | "new_expression" => {
+            let ty = recv
+                .child_by_field_name("type")
+                .or_else(|| recv.child_by_field_name("constructor"))
+                .and_then(|t| crate::resolve::scope::TypeText::parse(&text(t)))
+                .map(|t| t.base)
+                .filter(|t| nameable(t));
+            return ty.map_or(Recv::Expr, |t| Recv::Typed(t, Via::Local));
+        }
+        k if CALL_KINDS.contains(&k) => {
+            if depth >= CHAIN_DEPTH {
+                return Recv::Chain(None);
+            }
+            let prev = inner_callee(recv)
+                .and_then(|c| c.utf8_text(bytes).ok().map(|n| (c, n.to_string())))
+                .filter(|(_, n)| nameable(n));
+            return Recv::Chain(
+                prev.map(|(c, n)| (n, Box::new(classify(c, bytes, scopes, depth + 1)))),
+            );
+        }
+        // A literal is of its type (`"RESUELTO".equals(x)`, `Foo.class`).
+        "string_literal" => return Recv::Typed("String".into(), Via::Local),
+        "class_literal" => return Recv::Typed("Class".into(), Via::Local),
+        _ => {}
+    }
+    let t = text(recv);
+    if !nameable(&t) {
+        return Recv::Expr;
+    }
+    match t.as_str() {
+        "self" | "Self" | "this" | "cls" => return Recv::This,
+        "super" => return Recv::Super,
+        _ => {}
+    }
+    let member = t.strip_prefix("self.").or_else(|| t.strip_prefix("this."));
+    let found = match member {
+        Some(m) => scopes.field(recv, m),
+        None => scopes.lookup(recv, &t),
+    };
+    let key = member.unwrap_or(&t);
+    match found {
+        Some(b) => match &b.ty {
+            Some(ty) if nameable(&ty.base) => Recv::Typed(ty.base.clone(), b.via),
+            _ => Recv::Untyped,
+        },
+        None => Recv::Name(key.to_string()),
+    }
+}
+
+/// The callee name node of a call node (`a.b(…)` → `b`, `f(…)` → `f`).
+fn inner_callee(call: Node<'_>) -> Option<Node<'_>> {
+    if let Some(name) = call.child_by_field_name("name") {
+        return Some(name); // Java `method_invocation`
+    }
+    let func = call.child_by_field_name("function")?;
+    for field in ["property", "field", "attribute"] {
+        if let Some(n) = func.child_by_field_name(field) {
+            return Some(n);
+        }
+    }
+    matches!(func.kind(), "identifier").then_some(func)
+}
+
+/// How many arguments the call of `callee` passes, when the grammar says.
+fn call_arity(callee: Node<'_>) -> Option<usize> {
+    let mut cur = callee.parent();
+    for _ in 0..2 {
+        let n = cur?;
+        if let Some(args) = n.child_by_field_name("arguments") {
+            let mut c = args.walk();
+            let count = args
+                .named_children(&mut c)
+                .filter(|a| !a.kind().contains("comment"))
+                .count();
+            return Some(count);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// The receiver node of a member/method call, if this is one.
+fn receiver_node(callee: Node<'_>) -> Option<Node<'_>> {
     let parent = callee.parent()?;
     let field = match parent.kind() {
         "attribute" | "member_expression" | "method_invocation" => "object",
@@ -815,11 +945,7 @@ fn receiver_of(callee: Node<'_>, bytes: &[u8]) -> Option<String> {
         "field_expression" => "value",
         _ => return None,
     };
-    parent
-        .child_by_field_name(field)
-        .and_then(|n| n.utf8_text(bytes).ok())
-        .filter(|t| nameable(t))
-        .map(str::to_string)
+    parent.child_by_field_name(field)
 }
 
 /// Can this receiver text stand for something a person could look up?

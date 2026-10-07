@@ -112,7 +112,10 @@ CREATE TABLE IF NOT EXISTS edges (
                               -- structural: `contains`, resuelto al parsear (DD-6), no por DD-7
     external    BOOLEAN,      -- sin definición en el repo y reconocido como de afuera (DD-9)
     from_test   BOOLEAN,      -- el archivo de la ocurrencia es de test
-    edge_source VARCHAR       -- 'treesitter' hoy; 'scip' previsto (plan propio)
+    edge_source VARCHAR,      -- 'treesitter' hoy; 'scip' previsto (plan propio)
+    hint        VARCHAR       -- TASK-005: el receptor de una llamada como lo vio el archivo
+                              -- (`typed field Foo /1`, `name Office`, `chain find name Office`);
+                              -- el link pass re-resuelve desde `dst_name` + `hint`, sin la fuente
 );
 ```
 
@@ -412,6 +415,15 @@ agregado, borrado o renombrado en la corrida, y (c) las que quedaron sin resolve
 cambiados superan un umbral (p. ej. 20 % de la rama) hace el pase completo, que es más simple y, con
 ~10⁵ aristas, cuesta segundos (TASK-005 lo mide). PageRank global se recalcula entero (milisegundos).
 
+**Implementado en TASK-005.** El motor (`RepoIndex` y reglas) es puro y vive en
+`devctx-parse/src/resolve/link.rs`; `devctx-index/src/link.rs` carga la rama (todos los símbolos y
+las aristas salvo `contains`), elige (a)+(b)+(c) —(b): `dst_id` que ya no existe o último segmento
+de `dst_name` igual al nombre de un símbolo de un archivo escrito—, pase completo sobre 1/5 de la
+rama, y reescribe solo los archivos con filas cambiadas, **64 archivos por transacción** y un
+`DELETE … kind <> 'contains' AND file IN (…)` por lote (cada archivo entero en una transacción;
+por archivo, transacción + scan costaban 10 ms: 14,1 → 2,8 s en backend-a). Medido en backend-a:
+pase completo 2,8 s, incremental de un archivo 0,62 s, `VmHWM` +103 MiB.
+
 **Memoria.** `RepoIndex` de frontend (2133 archivos): estimación < 100 MB (strings +
 `HashMap`s); TASK-005 lo mide con el método de PLAN-010 y es criterio de aceptación (master §6).
 
@@ -472,12 +484,33 @@ ocurrencia **se descarta** y se cuenta en `IndexResult.edges_discarded` (honesti
 `files_skipped`). Si `c` sí existe en el repo → se guarda como `name_only`/low. Esto elimina los
 `map`/`flatMap`/`subscribe` que hoy son el grueso de los 2 569 callers de `map`.
 
+**Implementado en TASK-005** (Java; el resto con reglas genéricas hasta TASK-006/007):
+- *Local:* `types` del JSON con roles (`@bind.field|param|local|assign`, `@init`, `@iter`) y una
+  clave nueva `scopes` (lista de node kinds, no query): cada binding vive en el scope más interno;
+  un local se ve después de su declaración; `var` toma su tipo de `new T`/`(T) e`, o de `T.of(…)`
+  como conjetura (`static`) que el link pass confirma solo si `T` tiene el método; for-each toma
+  el elemento de `List<Foo>`/`Foo[]`; `this.x = x` en un constructor da `ctor_inject` (gana sobre
+  `field`). Cada llamada lleva `edges.hint`; `dst_name` nunca se reescribe.
+- *Link:* además de la tabla: llamada sin calificar no encontrada en la jerarquía → import estático
+  (simple o comodín de una clase externa) o supertipo externo → externa; cadena hasta 4 llamadas
+  atrás, con el retorno declarado (Java) o externa si la anterior lo es (`medium` si el nombre
+  existe en el repo); receptor declarado sin tipo (o parámetro de lambda) = como cadena sin tipo
+  (descarte si el nombre no está en el repo); métodos de `Object` sobre receptor sin tipo →
+  externo `medium`; getter/setter de Lombok (`@Data`, `@Getter`, `@Setter`, `@Value`, `@Builder`)
+  → el campo, `medium`; un import comodín de un paquete ajeno solo es evidencia para nombres con
+  forma de tipo. Medido: Java 18/20 gold correctos, 18/18 en `high`; sin decidir 2,7 % en
+  backend-a y backend-b (Resultado de TASK-005).
+
 ## DD-8 — `confidence` y `resolution`
 
 - `confidence` es **ordinal y de tres valores** (high/medium/low), no un float: nadie sabe calibrar
   0.73 contra 0.81, y el consumidor (impact, traverse, PageRank) solo necesita filtrar y ponderar.
 - `resolution` guarda el **porqué** para auditar (`gold-edges` de DD-1 reporta precisión por
   `resolution`). Si una regla resulta mala en campo, se baja su `confidence` sin tocar el resto.
+- TASK-005 agrega `return_type` (una cadena tipada por el retorno declarado del método anterior, o
+  externa porque el anterior lo es) y usa `inherited` también para un miembro heredado de un
+  supertipo externo (Panache, `Object`). Externos y getters de Lombok pueden salir `medium`
+  cuando la evidencia es indirecta (ver DD-7, "Implementado en TASK-005").
 - `structural` es el valor de `contains` (DD-6), escrito al parsear: no es una regla de DD-7 y no
   pisa `same_file`, que es de la regla 6. El arnés no lo cuenta: `calls_por_confianza` filtra
   `kind = 'calls'` y `score.py` lee `graph_edges` (solo llamadas).

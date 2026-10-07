@@ -121,6 +121,33 @@ echo "$(echo "$(date +%s.%N) - $t0" | bc) s"; du -sb .devctx/state       # tama�
 `DEVCTX_NO_AUTOSERVE=1` indexa por la vía directa (la que construye el HNSW). Tomá la medida con
 la máquina quieta: el tiempo es dominado por el embedding y se infla con la carga.
 
+### Grafo sin modelo (`graph_bench`, TASK-005)
+
+Para medir el grafo de un repo grande sin pagar el embedding:
+
+```bash
+cargo build --release -p devctx-index --example graph_bench
+target/release/examples/graph_bench <repo> <ruta>/index.duckdb [--touch <archivo del repo>]
+```
+
+Corre `pipeline::run` con vectores constantes: parse, `symbols`/`edges` y link pass reales (la
+búsqueda sobre ese índice no significa nada). Imprime el resumen, el tiempo y el `VmHWM`; con
+`--touch` agrega un salto de línea al archivo e indexa solo ese (costo incremental de un archivo).
+El link pass imprime su línea (`· link pass (full|incremental): …, load … ms, write … ms`). Para el
+arnés, una carpeta `$ROOT/<repo>/.devctx/config.yaml` con `storage.db_path` apuntando al DuckDB y
+`DEVCTX=true DEVCTX_EVAL_STEPS=graph` (el paso `graph` no llama al binario). Usa solo API que
+existe desde 0.9.0: el mismo archivo compila contra un checkout anterior para el "antes".
+
+### Gold edges sobre la tabla `edges` (TASK-005 en adelante)
+
+Si el índice tiene `symbols`/`edges`, `run.sh` exporta `edges_new.tsv` (llamadas e instanciaciones
+con el `qualified` de su `dst_id`, `confidence`, `resolution`, `external`) y `score.py gold
+--new-edges` agrega una segunda tabla: correcto = destino resuelto igual al esperado (o que termina
+en `.esperado`, una clase interna) o marca `external` si el esperado es externo; error = resuelto a
+otro o marcado al revés; sin decidir = ni destino ni marca; sin arista = no hay ocurrencia (p. ej.
+descartada). Reporta precisión global, precisión en `high` y cobertura (no `low`), y por sitio la
+`confidence`/`resolution`.
+
 ## Para tasks posteriores
 
 Cada task que cambie el grafo o el ranking corre este arnés antes y después, con el mismo binario

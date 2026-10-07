@@ -135,6 +135,12 @@ impl Lang {
         &self.0.scope_kinds
     }
 
+    /// Node kinds that open a lexical scope for the `types` declarations
+    /// (PLAN-009 TASK-005); empty: the file is the only scope.
+    pub fn scopes(self) -> &'static [String] {
+        &self.0.scopes
+    }
+
     /// Whether callables overload by parameter types with separate bodies
     /// (Java), so a symbol id carries them.
     pub fn overloads(self) -> bool {

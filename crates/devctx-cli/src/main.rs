@@ -3618,6 +3618,13 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         );
     }
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);
+    if res.edges_discarded > 0 || res.edges_unresolved > 0 {
+        println!(
+            "  graph: {} calls dropped (untypable receiver, name not in the repository), \
+             {} calls undecided",
+            res.edges_discarded, res.edges_unresolved
+        );
+    }
     if res.extractor_stale {
         println!("  index built by an older extractor; run `devctx index --full` to rebuild it");
     }

@@ -62,10 +62,21 @@ pub struct LangDef {
     /// `@inherit.extends` / `@inherit.implements` on the supertype node.
     #[serde(default)]
     pub inherits: Option<String>,
-    /// Query capturing `@name`/`@type` pairs to resolve a receiver's type.
-    /// Absent for untyped languages.
+    /// Query capturing declarations, to type a call's receiver (PLAN-009
+    /// TASK-005): the bound `@name` and its written `@type`; `@init` (the
+    /// initializer a `var` takes its type from) and `@iter` (what a for-each
+    /// iterates, whose element it binds); the declaration as
+    /// `@bind.field`/`@bind.param`/`@bind.local` (how an edge it types is
+    /// resolved), or `@bind.assign` for a `this.x = x` whose right side is a
+    /// constructor parameter. Absent for untyped languages.
     #[serde(default)]
     pub types: Option<String>,
+    /// Node kinds that open a lexical scope for those declarations (a class
+    /// body, a method, a block, a lambda, a `for`): a binding belongs to the
+    /// innermost one around its name. Empty: one scope, the file, where the
+    /// first declaration of a name wins.
+    #[serde(default)]
+    pub scopes: Vec<String>,
     /// Query capturing imports: the statement as `@import`, and what it
     /// brings in as `@import.path` (module or full path), `@import.name`,
     /// `@import.alias`, `@import.wildcard`, `@import.default` (a default
@@ -172,6 +183,11 @@ const SOURCES: &[&str] = &[
 /// 5: review of 3ad7d54 — comments inside an `impl`'s `where` clause or
 /// generic arguments are no part of its id; `(u8,)` keeps its comma (a
 /// one-element tuple is not `u8`); `export default (name);` exports `name`.
+/// 6: the link pass's inputs (PLAN-009 TASK-005) — every call carries the
+/// receiver `hint` (`typed field Foo`, `name Office`, `chain find …`), typed
+/// by lexical scope (Java `scopes`: each inner class its own fields, `var`
+/// from its initializer, for-each elements, `this.x = x` injection); a
+/// constant (`LOG`) is never taken for a type; literals type their receiver.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -179,7 +195,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 5;
+pub const EXTRACTOR_VERSION: u32 = 6;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
@@ -279,6 +295,16 @@ mod tests {
         "type",
     ];
     const INHERIT_CAPTURES: &[&str] = &["inherit.extends", "inherit.implements"];
+    const TYPE_CAPTURES: &[&str] = &[
+        "name",
+        "type",
+        "init",
+        "iter",
+        "bind.field",
+        "bind.param",
+        "bind.local",
+        "bind.assign",
+    ];
     const IMPORT_CAPTURES: &[&str] = &[
         "import",
         "import.path",
@@ -335,7 +361,7 @@ mod tests {
                 ("inherits", def.inherits.as_ref(), INHERIT_CAPTURES),
                 ("imports", Some(&def.imports), IMPORT_CAPTURES),
                 ("package", def.package.as_ref(), &["package"][..]),
-                ("types", def.types.as_ref(), &["name", "type"][..]),
+                ("types", def.types.as_ref(), TYPE_CAPTURES),
             ] {
                 let Some(src) = src else { continue };
                 let query = Query::new(&grammar, src).unwrap_or_else(|e| {
@@ -362,6 +388,7 @@ mod tests {
                 .chain(&def.function_kinds)
                 .chain(&def.container_kinds)
                 .chain(&def.scope_kinds)
+                .chain(&def.scopes)
             {
                 assert!(
                     grammar.id_for_node_kind(kind, true) != 0,

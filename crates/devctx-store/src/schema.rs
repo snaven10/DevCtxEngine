@@ -18,11 +18,16 @@ pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
         .iter()
         .all(|t| table_exists(conn, t));
     conn.execute_batch(RELATIONAL_DDL)?;
-    // `symbols.content_hash` came after the table, before any release: a
-    // database written by a development build of PLAN-009 lacks it.
-    let had_columns = column_exists(conn, "symbols", "content_hash");
+    // `symbols.content_hash` and `edges.hint` came after the tables, before
+    // any release: a database written by a development build of PLAN-009
+    // lacks them.
+    let had_columns =
+        column_exists(conn, "symbols", "content_hash") && column_exists(conn, "edges", "hint");
     if !had_columns {
-        conn.execute_batch("ALTER TABLE symbols ADD COLUMN IF NOT EXISTS content_hash VARCHAR;")?;
+        conn.execute_batch(
+            "ALTER TABLE symbols ADD COLUMN IF NOT EXISTS content_hash VARCHAR;
+             ALTER TABLE edges ADD COLUMN IF NOT EXISTS hint VARCHAR;",
+        )?;
     }
     if !(had_all && had_columns) && checkpoint_is_safe(conn) {
         // A table created on an existing database is DDL in the WAL; a process
@@ -347,6 +352,9 @@ CREATE TABLE IF NOT EXISTS symbols (
 -- `src_id` is always a symbol of `file` (the file symbol for a module-level
 -- call); `dst_id` stays NULL until the link pass resolves the destination
 -- (PLAN-009 DD-6), and so do `confidence`, `resolution` and `external`.
+-- `hint` is what the file said about a call's receiver (`typed field Foo`,
+-- `name Office`, `chain find name Office /1`…): the link pass re-resolves
+-- the row from it and `dst_name`, which it never rewrites, without the source.
 CREATE TABLE IF NOT EXISTS edges (
     repo        VARCHAR,
     branch      VARCHAR,
@@ -360,7 +368,8 @@ CREATE TABLE IF NOT EXISTS edges (
     resolution  VARCHAR,
     external    BOOLEAN,
     from_test   BOOLEAN,
-    edge_source VARCHAR
+    edge_source VARCHAR,
+    hint        VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS branch_lineage (
