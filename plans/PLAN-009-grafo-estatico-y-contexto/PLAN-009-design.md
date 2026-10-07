@@ -241,8 +241,13 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   nuevo). Costo: la respuesta se cachea por `(repo, repo_path, rama)` junto con
   `index_state.indexed_at` de la rama (una corrida que escribe la rama termina con un `indexed_at`
   nuevo), y cada escritura de este proceso a la rama (`file_state`, tablas del grafo,
-  `index_state`, `drop_branch`) o un rollback la invalida, así que nunca es más vieja que las
-  filas. Sin caché era una consulta por tool call y una por archivo candidato a copia.
+  `index_state`, `drop_branch`) o un rollback la invalida, antes de escribir y **otra vez al
+  COMMIT** (hasta el commit otra conexión del serve lee las filas viejas y podía cachearlas con
+  el mismo `indexed_at`); cada invalidación sube una generación y una respuesta calculada a
+  través de una no se guarda; dentro de una transacción la conexión no usa la caché (ve sus
+  propias filas sin commit). Así nunca es más vieja que las filas confirmadas. El primer
+  anti-join mira los archivos de lenguaje parseable (`GRAPH_LANGUAGES`), no `symbol_count > 0`:
+  un archivo parseable sin símbolos agregado por 0.9.0 también queda sin fila `file`. Sin caché era una consulta por tool call y una por archivo candidato a copia.
 - FNV-1a 64 porque ya está en el árbol (`registry.rs:96-100`) y es estable entre plataformas y
   versiones (a diferencia de `DefaultHasher`). Probabilidad de colisión con 10⁶ símbolos ≈ 3·10⁻⁸;
   igual, el escritor detecta una colisión dentro del archivo y la resuelve con el ordinal.

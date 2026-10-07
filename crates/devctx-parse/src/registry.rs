@@ -225,6 +225,18 @@ mod tests {
         }
     }
 
+    /// The store tells a file a graph-less binary wrote by its language: the
+    /// list it uses must be exactly the languages parsed here.
+    #[test]
+    fn the_graph_languages_are_the_parsed_ones() {
+        let parsed: std::collections::BTreeSet<&str> = ALL.iter().map(LangDef::language).collect();
+        let listed: std::collections::BTreeSet<&str> = devctx_core::symbol_id::GRAPH_LANGUAGES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(parsed, listed);
+    }
+
     #[test]
     fn tsx_is_recorded_as_typescript() {
         assert_eq!(by_name("tsx").unwrap().language(), "typescript");

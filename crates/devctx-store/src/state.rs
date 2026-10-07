@@ -5,6 +5,8 @@
 
 use duckdb::params;
 
+use devctx_core::symbol_id::GRAPH_LANGUAGES;
+
 use crate::error::Result;
 use crate::store::Store;
 
@@ -223,8 +225,10 @@ impl Store {
     }
 
     /// Whether `file_state` and the symbol graph disagree on a branch: a
-    /// file with symbols but no `file` symbol row (added by a binary that
-    /// does not write the graph, 0.9.0 after a downgrade), a `file` symbol
+    /// file of a parseable language ([`GRAPH_LANGUAGES`]) with no `file`
+    /// symbol row — zero symbols included, since this binary writes the file
+    /// symbol for every such file — (added by a binary that does not write
+    /// the graph, 0.9.0 after a downgrade), a `file` symbol
     /// row whose file has no state any more (deleted by one), or a `file`
     /// symbol row whose `content_hash` is not the file's (modified by one:
     /// its symbol rows are still there, only older).
@@ -235,7 +239,8 @@ impl Store {
         let n: bool = self.conn.query_row(
             "SELECT EXISTS (
                  SELECT 1 FROM file_state f
-                 WHERE f.repo_path = ? AND f.branch = ? AND f.symbol_count > 0
+                 WHERE f.repo_path = ? AND f.branch = ?
+                   AND list_contains(string_split(?, ','), f.language)
                    AND NOT EXISTS (SELECT 1 FROM symbols s
                        WHERE s.repo = ? AND s.branch = f.branch AND s.kind = 'file'
                          AND s.file = f.file_path)
@@ -251,7 +256,18 @@ impl Store {
                  WHERE s.repo = ? AND s.branch = ? AND s.kind = 'file'
                    AND s.content_hash IS DISTINCT FROM f.content_hash
              )",
-            params![repo_path, branch, repo, repo, branch, repo_path, repo_path, repo, branch],
+            params![
+                repo_path,
+                branch,
+                GRAPH_LANGUAGES.join(","),
+                repo,
+                repo,
+                branch,
+                repo_path,
+                repo_path,
+                repo,
+                branch
+            ],
             |r| r.get(0),
         )?;
         Ok(n)
@@ -262,23 +278,36 @@ impl Store {
     /// the graph tools ask on every call, and a copy between branches on
     /// every file. A run that writes the branch ends by stamping a new
     /// `indexed_at`; this process's own writes to the branch (`file_state`,
-    /// the graph tables, `index_state`) and a rolled-back transaction also
-    /// drop the answer, so it is never older than the rows.
+    /// the graph tables, `index_state`) drop the answer before they run and
+    /// again when their transaction commits — until then another connection
+    /// reads, and could cache, the rows from before them — and a rolled-back
+    /// transaction drops it too. An answer computed across any of those drops
+    /// is returned but not kept; inside a transaction the cache is bypassed
+    /// (the connection sees its own uncommitted rows). So it is never older
+    /// than the committed rows.
     pub fn graph_out_of_step_cached(
         &self,
         repo: &str,
         repo_path: &str,
         branch: &str,
     ) -> Result<bool> {
+        if self.in_transaction_now() {
+            // Its own uncommitted rows: neither what the cache holds for
+            // everyone else nor something to keep in it.
+            return self.graph_out_of_step(repo, repo_path, branch);
+        }
+        let key = (repo.to_string(), repo_path.to_string(), branch.to_string());
+        // The generation is read before the rows: a write that lands in
+        // between bumps it, and the answer is not kept.
+        let generation = self.graph_step_generation();
         let indexed_at = self
             .get_index_record(repo_path, branch)?
             .map(|r| r.indexed_at);
-        let key = (repo.to_string(), repo_path.to_string(), branch.to_string());
         if let Some(v) = self.cached_graph_step(&key, &indexed_at) {
             return Ok(v);
         }
         let v = self.graph_out_of_step(repo, repo_path, branch)?;
-        self.remember_graph_step(key, indexed_at, v);
+        self.remember_graph_step(key, indexed_at, v, generation);
         Ok(v)
     }
 
@@ -579,8 +608,13 @@ mod tests {
         store
             .replace_file_graph("r", "main", "a.py", &[file_sym("a.py")], &[])
             .unwrap();
-        // A file without symbols has no graph to miss (raw text, empty code).
-        store.save_file_state(&state("README.md", 0)).unwrap();
+        // A file of no parseable language has no graph to miss (raw text).
+        store
+            .save_file_state(&FileState {
+                language: "markdown".into(),
+                ..state("README.md", 0)
+            })
+            .unwrap();
         assert!(!stale(), "in step");
 
         // Added by the older binary: state, no graph.
@@ -588,6 +622,17 @@ mod tests {
         assert!(stale(), "a file with symbols and no graph rows");
         store
             .replace_file_graph("r", "main", "b.py", &[file_sym("b.py")], &[])
+            .unwrap();
+        assert!(!stale());
+        // Also a parseable file with no symbol at all: this binary writes
+        // its file symbol anyway, the older one does not.
+        store.save_file_state(&state("empty.py", 0)).unwrap();
+        assert!(
+            stale(),
+            "a parseable file with no symbols and no graph rows"
+        );
+        store
+            .replace_file_graph("r", "main", "empty.py", &[file_sym("empty.py")], &[])
             .unwrap();
         assert!(!stale());
 
@@ -696,7 +741,13 @@ mod tests {
                 .unwrap()
         };
         assert!(!cached());
-        // Behind the store's back (another binary): the answer is the cached one…
+        // Behind the store's back: the answer is the cached one… The write
+        // goes through the raw connection because no other *process* can
+        // make it while this one holds the file: DuckDB opens a database
+        // read-write in one process only (an exclusive lock), so another
+        // binary's writes land between two opens, and a fresh open starts
+        // with an empty cache. What the cache must survive is the case below
+        // with this process's own connections.
         store
             .conn
             .execute_batch("UPDATE file_state SET content_hash = 'h2'")
@@ -724,6 +775,71 @@ mod tests {
             })
             .unwrap();
         assert!(cached(), "b.py has no graph rows");
+    }
+
+    /// A request handler on a cloned connection asks while the indexer is
+    /// inside a file's transaction: it reads the rows from before the
+    /// transaction, and must not keep that answer past the commit — the
+    /// writes forgot the cache *before* they ran, and `indexed_at` only
+    /// changes at the end of the run.
+    #[test]
+    fn an_answer_read_before_a_commit_is_dropped_by_it() {
+        let store = Store::open_in_memory(3).unwrap();
+        let handler = store.try_clone().unwrap();
+        sealed_branch(&store, "main", "a.py", true);
+        let cached = |s: &Store| s.graph_out_of_step_cached("r", "/repo", "main").unwrap();
+        assert!(!cached(&handler));
+        store
+            .in_transaction(|| {
+                // The file changes; its graph rows are not rewritten (the
+                // older-binary case), so after the commit it is out of step.
+                store.save_file_state(&FileState {
+                    repo_path: "/repo".into(),
+                    branch: "main".into(),
+                    file_path: "a.py".into(),
+                    content_hash: "h2".into(),
+                    language: "python".into(),
+                    symbol_count: 1,
+                    chunk_count: 1,
+                })?;
+                // The handler still sees the committed rows, and caches
+                // that answer.
+                assert!(!cached(&handler), "the handler reads the old snapshot");
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store.graph_out_of_step("r", "/repo", "main").unwrap(),
+            "committed: out of step"
+        );
+        assert!(
+            cached(&handler),
+            "the pre-commit answer outlived the commit"
+        );
+        assert!(cached(&store));
+    }
+
+    /// The same, rolled back: the answer from inside the transaction is the
+    /// one that must not survive, and the old one is right again.
+    #[test]
+    fn an_answer_read_inside_a_rolled_back_transaction_is_dropped() {
+        let store = Store::open_in_memory(3).unwrap();
+        let handler = store.try_clone().unwrap();
+        sealed_branch(&store, "main", "a.py", true);
+        let cached = |s: &Store| s.graph_out_of_step_cached("r", "/repo", "main").unwrap();
+        assert!(!cached(&store));
+        let out: Result<()> = store.in_transaction(|| {
+            store.delete_file_state("/repo", "main", "a.py")?;
+            // The writer sees its own rows, past the cache, and keeps them
+            // from the others.
+            assert!(cached(&store), "inside: the file symbol has no state");
+            assert!(!cached(&handler), "the writer's answer leaked");
+            assert!(cached(&store), "the handler's answer leaked");
+            Err(crate::StoreError::Decode("cut".into()))
+        });
+        assert!(out.is_err());
+        assert!(!cached(&store), "rolled back: in step again");
+        assert!(!cached(&handler));
     }
 
     /// Totals must survive a run that changed nothing: an incremental index

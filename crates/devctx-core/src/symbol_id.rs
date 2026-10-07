@@ -27,6 +27,13 @@ const SEP: u8 = 0x1f;
 /// root of a file's containment.
 pub const FILE_KIND: &str = "file";
 
+/// The `language` values (`file_state.language`, store spelling) of the
+/// files that get a graph: every parseable language. A file of one of them
+/// always has its file symbol, even with no other symbol, so a `file_state`
+/// row of one of them without it was written by a binary that does not
+/// write the graph. `devctx-parse` checks this list against its registry.
+pub const GRAPH_LANGUAGES: &[&str] = &["python", "javascript", "typescript", "go", "java", "rust"];
+
 /// FNV-1a 64 over `parts`, separated by [`SEP`]. Stable across platforms and
 /// releases, unlike `DefaultHasher`.
 pub fn fnv1a64(parts: &[&str]) -> u64 {

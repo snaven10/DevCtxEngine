@@ -114,6 +114,9 @@ pub struct Store {
     shared: Arc<Shared>,
     /// Whether this connection is inside [`in_transaction`](Self::in_transaction).
     in_tx: AtomicBool,
+    /// The open transaction dropped cached graph answers: its commit drops
+    /// them again (see [`forget_graph_step`](Self::forget_graph_step)).
+    tx_graph_dirty: AtomicBool,
 }
 
 /// State common to every connection of one open database.
@@ -134,8 +137,15 @@ struct Shared {
     graph_step: std::sync::Mutex<GraphStepCache>,
 }
 
-/// `(repo, repo_path, branch)` → `(indexed_at, out of step)`.
-type GraphStepCache = std::collections::HashMap<(String, String, String), (Option<String>, bool)>;
+/// The cached graph answers and a generation that every invalidation bumps.
+#[derive(Default)]
+pub(crate) struct GraphStepCache {
+    /// Bumped by every [`Store::forget_graph_step`]: an answer computed
+    /// across a bump may have read rows from before it, and is not kept.
+    generation: u64,
+    /// `(repo, repo_path, branch)` → `(indexed_at, out of step)`.
+    answers: std::collections::HashMap<(String, String, String), (Option<String>, bool)>,
+}
 
 /// A connection borrowed for one write; see [`Store::w`].
 pub(crate) struct WriteConn<'a> {
@@ -165,6 +175,8 @@ impl Drop for TxGuard<'_> {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             // An answer read inside the transaction may describe rows that
             // are gone now.
+            self.store.in_tx.store(false, Ordering::SeqCst);
+            self.store.tx_graph_dirty.store(false, Ordering::SeqCst);
             self.store.forget_graph_step(None);
         }
         self.store.in_tx.store(false, Ordering::SeqCst);
@@ -186,6 +198,7 @@ impl Store {
             metric_cache: std::sync::Mutex::new(None),
             shared: Arc::new(Shared::default()),
             in_tx: AtomicBool::new(false),
+            tx_graph_dirty: AtomicBool::new(false),
         };
         // Limits before any query can allocate against the defaults.
         store.apply_resource_limits();
@@ -211,6 +224,7 @@ impl Store {
             metric_cache: std::sync::Mutex::new(None),
             shared: Arc::new(Shared::default()),
             in_tx: AtomicBool::new(false),
+            tx_graph_dirty: AtomicBool::new(false),
         }
     }
 
@@ -233,6 +247,7 @@ impl Store {
             metric_cache: std::sync::Mutex::new(None),
             shared: Arc::new(Shared::default()),
             in_tx: AtomicBool::new(false),
+            tx_graph_dirty: AtomicBool::new(false),
         };
         store.apply_resource_limits();
         store.load_extensions(); // before the schema, as in `open`
@@ -295,6 +310,7 @@ impl Store {
             metric_cache: std::sync::Mutex::new(None),
             shared: self.shared.clone(),
             in_tx: AtomicBool::new(false),
+            tx_graph_dirty: AtomicBool::new(false),
         };
         store.load_extensions();
         Ok(store)
@@ -766,6 +782,13 @@ impl Store {
         };
         guard.finished = result.is_ok();
         drop(guard);
+        // The writes forgot the graph answers *before* they ran, and until
+        // this commit every other connection still read the old rows: one of
+        // them may have cached an answer from that snapshot under the same
+        // `indexed_at`. Forget again now that the rows are visible.
+        if result.is_ok() && self.tx_graph_dirty.swap(false, Ordering::SeqCst) {
+            self.forget_graph_step(None);
+        }
         result
     }
 
@@ -1381,30 +1404,61 @@ impl Store {
         indexed_at: &Option<String>,
     ) -> Option<bool> {
         let g = self.shared.graph_step.lock().ok()?;
-        g.get(key)
+        g.answers
+            .get(key)
             .filter(|(at, _)| at == indexed_at)
             .map(|(_, v)| *v)
     }
 
+    /// The current invalidation generation, read before computing an answer
+    /// and handed to [`remember_graph_step`](Self::remember_graph_step).
+    pub(crate) fn graph_step_generation(&self) -> u64 {
+        self.shared
+            .graph_step
+            .lock()
+            .map(|g| g.generation)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Whether this connection is inside [`in_transaction`](Self::in_transaction).
+    pub(crate) fn in_transaction_now(&self) -> bool {
+        self.in_tx.load(Ordering::SeqCst)
+    }
+
+    /// Keep an answer computed from generation `generation` on — unless an
+    /// invalidation happened since (it may have read rows from before a
+    /// write), or this connection is inside a transaction (the answer would
+    /// describe rows no other connection can see yet).
     pub(crate) fn remember_graph_step(
         &self,
         key: (String, String, String),
         indexed_at: Option<String>,
         out_of_step: bool,
+        generation: u64,
     ) {
+        if self.in_tx.load(Ordering::SeqCst) {
+            return;
+        }
         if let Ok(mut g) = self.shared.graph_step.lock() {
-            g.insert(key, (indexed_at, out_of_step));
+            if g.generation == generation {
+                g.answers.insert(key, (indexed_at, out_of_step));
+            }
         }
     }
 
     /// Drop the cached answers of `branch` (of every branch with `None`):
     /// called by every write that can change them — `file_state`, the
-    /// graph tables, `index_state`, a rollback.
+    /// graph tables, `index_state`, a rollback — before it runs, and again
+    /// (for every branch) when the transaction it ran in commits.
     pub(crate) fn forget_graph_step(&self, branch: Option<&str>) {
+        if self.in_tx.load(Ordering::SeqCst) {
+            self.tx_graph_dirty.store(true, Ordering::SeqCst);
+        }
         if let Ok(mut g) = self.shared.graph_step.lock() {
+            g.generation = g.generation.wrapping_add(1);
             match branch {
-                Some(b) => g.retain(|(_, _, kb), _| kb != b),
-                None => g.clear(),
+                Some(b) => g.answers.retain(|(_, _, kb), _| kb != b),
+                None => g.answers.clear(),
             }
         }
     }
