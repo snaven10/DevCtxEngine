@@ -92,4 +92,8 @@ fn a_default_export_of_a_name_exports_it() {
     pf.assign_ids("repo", "d.ts");
     assert_eq!(sym(&pf, "function", "a").exported, Some(true));
     assert_eq!(sym(&pf, "function", "b").exported, Some(false));
+    let mut pf =
+        devctx_parse::parse(Lang::javascript(), "function a() {}\nexport default (a);\n").unwrap();
+    pf.assign_ids("repo", "p.js");
+    assert_eq!(sym(&pf, "function", "a").exported, Some(true));
 }

@@ -40,6 +40,8 @@ fn every_graph_source_is_the_qualified_name_of_its_symbol() {
         let pf = facts(Lang::named(lang).unwrap(), fixture, path);
         let by_id = names(&pf);
         let qualified: Vec<&str> = pf.symbols.iter().map(|s| s.qualified.as_str()).collect();
+        // A fixture that lost its calls must not pass by checking nothing.
+        assert!(!pf.edges.is_empty(), "{lang}: no graph_edges calls at all");
         for e in &pf.edges {
             assert!(
                 qualified.contains(&e.source.as_str()),

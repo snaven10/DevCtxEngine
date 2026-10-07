@@ -549,6 +549,16 @@ class C {
                  impl<T> Foo<\n    T,\n> {\n    fn get(&self) {\n        m_trail();\n    }\n}\n",
                 &["m_trail"],
             ),
+            // A comment inside the `where` clause or the generic arguments
+            // is not part of the impl.
+            (
+                Lang::rust(),
+                "c.rs",
+                "struct W<T>(T);\nimpl<T> W<T> where T: Copy { fn get(&self) { m_cmt(); } }\n",
+                "struct W<T>(T);\nimpl<T> W<T> where T: Clone { fn get(&self) { n1(); } }\n\
+                 impl<T> W<\n    T, // the value\n>\nwhere\n    // sorted\n    T: Copy, /* bound */\n{\n    fn get(&self) {\n        m_cmt();\n    }\n}\n",
+                &["m_cmt"],
+            ),
             // Java overloads around an anonymous class: `O()` and `O(int)`,
             // `m(int)` and `m(String)` are different scopes, so adding an
             // overload above does not hand the old `run` an ordinal.
@@ -596,6 +606,23 @@ class O {
                 );
             }
         }
+    }
+
+    /// `(u8,)` is a one-element tuple and `(u8)` is `u8`: two impls, two
+    /// ids, however the trailing commas of a layout are folded.
+    #[test]
+    fn a_one_element_tuple_is_not_its_element() {
+        let pf = ids(
+            Lang::rust(),
+            "struct Foo<T>(T);\nimpl Foo<(u8,)> { fn get(&self) {} }\nimpl Foo<(u8)> { fn get(&self) {} }\n",
+            "u.rs",
+        );
+        let gets: Vec<_> = pf.symbols.iter().filter(|s| s.name == "get").collect();
+        assert_eq!(gets.len(), 2);
+        assert_ne!(gets[0].impl_args, gets[1].impl_args, "{gets:?}");
+        assert_ne!(gets[0].id, gets[1].id);
+        let impls: Vec<_> = pf.symbols.iter().filter(|s| s.kind == "impl").collect();
+        assert_ne!(impls[0].id, impls[1].id);
     }
 
     /// What the qualified name and the disambiguator say, per language.

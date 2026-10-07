@@ -187,7 +187,9 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   TASK-004 — costo aceptado: renombrar el parámetro de `impl<T> Foo<T>` cambia esos ids; desde la
   versión 4 del extractor, también sin comas finales antes de `>`/`)` ni al final del `where`,
   porque `rustfmt` escribe vertical un `where` largo —`where\n    T: Copy,`— o una lista larga de
-  argumentos —`Foo<\n    T,\n>`— y cambiaba el id del `impl`, de sus métodos y sus `contains`); la lista de tipos de parámetros normalizada (sin nombres,
+  argumentos —`Foo<\n    T,\n>`— y cambiaba el id del `impl`, de sus métodos y sus `contains`;
+  desde la versión 5, también sin los comentarios de adentro —`where // orden\n T: Copy`—, y sin
+  tocar la coma antes de `)`: `(u8,)` es una tupla de un elemento y no es `(u8)`); la lista de tipos de parámetros normalizada (sin nombres,
   espacios, argumentos genéricos ni paquete: `java.util.List<String>` → `List`, porque dos
   sobrecargas no pueden diferir solo en genéricos) en lenguajes con sobrecarga de cuerpos
   separados — **solo Java** (`"overloads": true`); y la **forma del scope** cuando algún scope
@@ -281,7 +283,9 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   desde los menores de la revisión de 6c3f63a: `where`/genéricos de un `impl` estables ante
   `rustfmt`, y la fuente de `graph_edges` de una función con nombre es el `qualified` de su
   símbolo —`traced.wrapper`, `C.init.run`, `C.m.f`; `const x = function named()` es `x`—, que
-  `tests/graph_sources.rs` exige en todos los fixtures). Si la
+  `tests/graph_sources.rs` exige en todos los fixtures; **5** desde la revisión de 3ad7d54:
+  comentarios fuera del disambiguator de un `impl`, la coma de una tupla de un elemento se
+  conserva, y `export default (foo);` exporta `foo`). Si la
   salida cambia y la versión no, falla con "la salida del extractor cambió: subí
   EXTRACTOR_VERSION y regenerá el golden"; si la versión cambió y el golden no, pide regenerarlo
   (`DEVCTX_UPDATE_GOLDEN=1 cargo test -p devctx-parse --test extractor_golden`).

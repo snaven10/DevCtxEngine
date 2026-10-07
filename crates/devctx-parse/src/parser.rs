@@ -1000,8 +1000,7 @@ fn go_receiver_type(def: Node<'_>, bytes: &[u8]) -> Option<String> {
 /// sits in it, of its members — `impl Display for X { fn fmt }` and `impl
 /// Debug for X { fn fmt }` are both `X.fmt`.
 fn trait_text(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
-    let tr = imp.child_by_field_name("trait")?.utf8_text(bytes).ok()?;
-    let tr = tidy_generics(tr);
+    let tr = tidy_generics(&uncommented(imp.child_by_field_name("trait")?, bytes));
     let args = tr.find('<').unwrap_or(tr.len());
     let name = last_path_segment(&tr[..args]);
     if name.is_empty() {
@@ -1011,7 +1010,7 @@ fn trait_text(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
 }
 
 /// The self type's generic arguments and the `where` clause of an `impl`
-/// node, without whitespace or trailing commas ([`tidy_generics`]: `impl
+/// node, without comments, whitespace or trailing commas ([`tidy_generics`]: `impl
 /// Foo<u8>` → `<u8>`, `impl<T> W<T> where T: Copy` → `<T>whereT:Copy`,
 /// also as `rustfmt` lays it out vertically); `None` for a non-generic one, or a node
 /// that is not an `impl`. Part of the id's disambiguator (DD-3), beside the
@@ -1021,7 +1020,7 @@ fn impl_self_args(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
     if imp.kind() != "impl_item" {
         return None;
     }
-    let compact = |n: Node<'_>| -> String { tidy_generics(n.utf8_text(bytes).unwrap_or_default()) };
+    let compact = |n: Node<'_>| -> String { tidy_generics(&uncommented(n, bytes)) };
     let ty = imp
         .child_by_field_name("type")
         .map(compact)
@@ -1041,18 +1040,46 @@ fn impl_self_args(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
 }
 
 /// Generic arguments and `where` bounds as one spelling, however `rustfmt`
-/// laid them out: no whitespace, no trailing comma before a `>`/`)` or at the
-/// end (`Foo<\n    T,\n>` → `Foo<T>`, `where\n    T: Copy,` → `whereT:Copy`).
-/// Part of an id's disambiguator (DD-3): a reformat is not another impl.
+/// laid them out: no whitespace, no trailing comma before a `>` or at the end
+/// (`Foo<\n    T,\n>` → `Foo<T>`, `where\n    T: Copy,` → `whereT:Copy`).
+/// Part of an id's disambiguator (DD-3): a reformat is not another impl. A
+/// comma before `)` stays: `(u8,)` is a one-element tuple, `(u8)` is `u8`.
+/// Comments are left out by the caller ([`uncommented`]).
 fn tidy_generics(text: &str) -> String {
     let mut out: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    while out.contains(",>") || out.contains(",)") {
-        out = out.replace(",>", ">").replace(",)", ")");
+    while out.contains(",>") {
+        out = out.replace(",>", ">");
     }
     while out.ends_with(',') {
         out.pop();
     }
     out
+}
+
+/// The text of `node` without the comments inside it (`where // sorted\n
+/// T: Copy` is `where T: Copy`): editing a comment is not another impl.
+fn uncommented(node: Node<'_>, bytes: &[u8]) -> String {
+    fn comments(n: Node<'_>, out: &mut Vec<(usize, usize)>) {
+        if n.kind().contains("comment") {
+            out.push((n.start_byte(), n.end_byte()));
+            return;
+        }
+        let mut cursor = n.walk();
+        for c in n.children(&mut cursor) {
+            comments(c, out);
+        }
+    }
+    let mut skip = Vec::new();
+    comments(node, &mut skip);
+    let mut text = Vec::with_capacity(node.end_byte() - node.start_byte());
+    let mut at = node.start_byte();
+    for (s, e) in skip {
+        text.extend_from_slice(&bytes[at..s]);
+        text.push(b' ');
+        at = e;
+    }
+    text.extend_from_slice(&bytes[at..node.end_byte()]);
+    String::from_utf8_lossy(&text).into_owned()
 }
 
 /// When `def` declares several names, each in its own declarator (TS/JS
@@ -1186,4 +1213,22 @@ fn simple_type_name(t: &str) -> String {
         }
     }
     out.rsplit('.').next().unwrap_or_default().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tidy_generics;
+
+    #[test]
+    fn tidy_generics_drops_layout_not_meaning() {
+        assert_eq!(tidy_generics("Foo<\n    T,\n>"), "Foo<T>");
+        assert_eq!(
+            tidy_generics("where\n    T: Copy,\n    U: Clone,"),
+            "whereT:Copy,U:Clone"
+        );
+        assert_eq!(tidy_generics("<A, B<C,>,>"), "<A,B<C>>");
+        // A one-element tuple keeps its comma: it is not the bare type.
+        assert_eq!(tidy_generics("Foo<(u8,)>"), "Foo<(u8,)>");
+        assert_ne!(tidy_generics("Foo<(u8,)>"), tidy_generics("Foo<(u8)>"));
+    }
 }

@@ -71,6 +71,10 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   class's method, `C.m.f` for a function nested in a method; `const x =
   function named() {}` is `x`), so `impact_analysis`/`get_references` no longer
   lose those callers; `export default foo;` marks `foo` exported.
+- **Extractor version 5** (`devctx index --full` again): a comment inside an
+  `impl`'s `where` clause or generic arguments no longer changes its ids, a
+  one-element tuple argument (`impl Foo<(u8,)>`) no longer shares the ids of
+  `impl Foo<(u8)>`, and `export default (foo);` marks `foo` exported.
 
 ### Fixed
 

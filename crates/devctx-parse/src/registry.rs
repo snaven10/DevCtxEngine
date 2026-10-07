@@ -169,6 +169,9 @@ const SOURCES: &[&str] = &[
 /// callable's `graph_edges` source is its symbol's qualified name
 /// (`traced.wrapper`, `C.init.run`, `C.m.f`; `const x = function named()`
 /// is `x`); `export default name;` exports `name`.
+/// 5: review of 3ad7d54 — comments inside an `impl`'s `where` clause or
+/// generic arguments are no part of its id; `(u8,)` keeps its comma (a
+/// one-element tuple is not `u8`); `export default (name);` exports `name`.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -176,7 +179,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 4;
+pub const EXTRACTOR_VERSION: u32 = 5;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

@@ -211,7 +211,7 @@ fn under_export(node: Node<'_>) -> bool {
 
 /// Is the top-level declaration `def` named by an `export { … }` clause of
 /// its file (`function foo() {}` … `export { foo }`, `export { foo as
-/// bar }`), or by an `export default foo;`? A clause with a `from`
+/// bar }`), or by an `export default foo;` (`(foo)` too)? A clause with a `from`
 /// re-exports another module's names.
 fn in_export_clause(def: Node<'_>, name: &str, bytes: &[u8]) -> bool {
     let top = match def.parent() {
@@ -230,9 +230,17 @@ fn in_export_clause(def: Node<'_>, name: &str, bytes: &[u8]) -> bool {
         .filter(|c| c.kind() == "export_statement" && c.child_by_field_name("source").is_none())
         .collect();
     statements.into_iter().any(|st| {
-        // `export default foo;`: the exported value is the bare name.
+        // `export default foo;` (or `(foo)`): the exported value is the
+        // bare name.
         let default = st
             .child_by_field_name("value")
+            .map(|v| {
+                if v.kind() == "parenthesized_expression" {
+                    v.named_child(0).unwrap_or(v)
+                } else {
+                    v
+                }
+            })
             .filter(|v| v.kind() == "identifier")
             .and_then(|v| v.utf8_text(bytes).ok());
         if default == Some(name) {
