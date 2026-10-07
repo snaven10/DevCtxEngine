@@ -22,7 +22,9 @@ por decisión del usuario (2026-10-07). No bloquea la 0.10.0.
 - Mediciones de PLAN-009 TASK-003 (follow-ups A-D) sobre DevCtxEngine, en bloques usados/libres de
   `PRAGMA database_size`:
   - índice desde cero con el binario equivalente a 0.9.0: 111/0;
-  - `--full` con el binario nuevo (tablas `symbols`/`edges`): 167/75;
+  - `--full` con el binario nuevo (tablas `symbols`/`edges`) **sobre ese índice 0.9.0 existente**:
+    167/75 (por eso no coincide con el "119+25" del Resultado de TASK-003, que es un índice nuevo
+    construido desde cero con el binario nuevo);
   - segundo `--full` sin cambios y un incremental sin cambios: 167/75 y 166/76 (no escriben, los
     libres no bajan);
   - un `--full` que reescribió 40 archivos: **178/95** — los libres crecen con las reescrituras.
