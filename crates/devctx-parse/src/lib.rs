@@ -44,9 +44,16 @@ thread_local! {
 /// The compiled queries are kept per language and thread: compiling them
 /// was a fixed cost paid on every file, and it grew with the structured
 /// extraction (PLAN-009 TASK-004) to dominate the parse of a small file.
+///
+/// Nothing in a parse calls `parse` again, but should something ever do
+/// (or a panic leave the cell borrowed mid-unwind in a caller that catches
+/// it), the nested call builds a parser of its own instead of panicking on
+/// the borrow.
 pub fn parse(lang: Lang, source: &str) -> Result<ParsedFile> {
     PARSERS.with(|cell| {
-        let mut parsers = cell.borrow_mut();
+        let Ok(mut parsers) = cell.try_borrow_mut() else {
+            return LanguageParser::new(lang)?.parse(source);
+        };
         let parser = match parsers.entry(lang.key()) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(LanguageParser::new(lang)?),

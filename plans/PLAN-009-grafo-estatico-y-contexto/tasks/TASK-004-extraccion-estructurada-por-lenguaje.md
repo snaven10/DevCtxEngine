@@ -182,12 +182,16 @@ DD-7.
     invalidaciones por escritura; en el padre hay una).
 - **Desviaciones:** `SymbolFact` no existe como tipo aparte (los símbolos siguen siendo `Symbol`,
   que lee el chunker); el paquete va en `symbols.package` y no en `qualified` (DD-3); `contains`
-  se escribe ya resuelto (`dst_id`, `high`, `same_file`) y la copia entre ramas lo conserva: ambos
+  se escribe ya resuelto (`dst_id`, `high`, `structural` —era `same_file` hasta el fixup de la
+  revisión—) y la copia entre ramas lo conserva: ambos
   extremos son del archivo y los ids no llevan rama (la task decía todas con `dst_id` NULL); `scopes`
   y `@init` quedan para TASK-005-007 (los consumen ellas); los decoradores TS siguen como `calls`
   (filtrarlos es de TASK-006); `exported` de Rust es "tiene `pub`" (métodos de un `impl Trait`
-  quedan `false`); parámetros de tipo (`T`) no generan `references`, nombres de builtins sí (DD-9:
-  las listas marcan `external`, no descartan).
+  quedan `false`); parámetros de tipo (`T`) no generan `references`, nombres de builtins sí
+  (`int`, `String`, `Vec`…: DD-9, las listas marcan `external`, no descartan). **Corrección
+  (revisión):** `platform_prefixes`/`builtins` se cargan y `LangResolver::is_platform` existe, pero
+  **nadie lo llama todavía** (solo sus tests) y `edges.external` queda NULL en toda arista que no
+  sea `contains`: marcar `external` es de **TASK-005** (link pass), no de esta task.
 - **Riesgos abiertos / siguiente:** (1) el sandbox de DevCtxEngine no reusó vectores por cambiar de
   `repo_path` (medida de reuso de ese repo por `content_hash`, no por corrida); (2) en la primera
   corrida de backend-b el `project.path` de la copia apuntaba al sandbox de TASK-003 y el índice se
@@ -195,3 +199,60 @@ DD-7.
   resultado copiado a este sandbox; (3) `references` a parámetros de tipo de un método genérico
   sin `type_parameters` en un ancestro (raro) siguen saliendo; (4) no verificado en macOS/Windows
   ni en backend-a/frontend; (5) Python sin `src/`-layout correcto en `package_from_path`.
+- **Fixup (review):** veredicto APPROVED WITH CHANGES sobre 5d9b8f2; cada punto con su test,
+  escrito antes del arreglo y fallando contra el padre salvo donde se indica.
+  - *M1 fuente de `graph_edges` en TS/JS:* `callable_name` nombraba a **cualquier** flecha por su
+    `pair`/asignación/declarador: `subscribe({ next: r => this.process(r) })` daba fuente
+    `AuthService.next` (no es símbolo), `const cb = () => …` dentro de `m` daba `C.cb` (el símbolo es
+    `C.m.cb`), `this.onTick = () => …` daba `C.this.onTick`, `exports.handler = …` daba
+    `exports.handler`. `impact_analysis`/`get_references` leen `graph_edges` por nombre, así que esos
+    callers se perdían. Ahora `enclosing_source` (`parser.rs`) acepta el binding de una flecha solo si
+    **es un símbolo** (el nodo nombre está en el mapa `Bound` que arma `extract_symbols`) y la nombra
+    con su `qualified`; si no, sigue subiendo. Tests `graph_edges_name_an_arrow_only_when_it_is_a_symbol`
+    (TS: fuente `AuthService.ngOnInit`, `AuthService.ngOnInit.cb`, `AuthService.constructor`; toda
+    fuente de `graph_edges` es el `qualified` de un símbolo) y `javascript_assignments_bind_no_graph_source`
+    (JS: `this.onTick` → constructor; `exports.handler` → símbolo de archivo, fuera de `graph_edges`).
+    Fixtures TS/JS ampliados.
+  - *M2 golden:* `extractor_golden.rs` ahora renderiza, por fixture, el paquete; por símbolo kind,
+    `qualified`, id, padre (`contains`), contenedor, `exported`, líneas y firma; por llamada fuente →
+    destino con el nombre de fuente de `graph_edges` (`graph=-` si no va); `references`/
+    `instantiates`, supertipos e imports (target, path, name, alias, wildcard), ordenados por línea y
+    texto. M1 habría fallado con este golden. Golden faltante: mensaje propio ("no se pudo leer el
+    golden … generalo con …") en vez de "subí EXTRACTOR_VERSION". `EXTRACTOR_VERSION` sigue en **3**
+    (nada se publicó; el golden se regeneró con `version 3`).
+  - *m1 declaradores múltiples:* `own_declarator` (`parser.rs`) da a cada nombre de `const a = …,
+    b = …` / Java `int a, b;` el rango de su `variable_declarator` (el primero desde la palabra clave
+    y su doc), con firma propia; `innermost_around` (`symbol_id.rs`) nunca hace padre a un símbolo
+    del mismo rango (Go `var a, b int`, sin nodo por nombre). Test
+    `declarators_of_one_declaration_are_siblings` (TS, Java, Go).
+  - *m2 `contains`:* `resolution = 'structural'` (`pipeline.rs::graph_rows`), no `same_file` (regla 6
+    de DD-7); `debug_assert` de que el padre es símbolo del archivo; DD-2/DD-6/DD-8 actualizados (el
+    arnés no lo cuenta: `calls_por_confianza` filtra `calls`, `score.py` lee `graph_edges`). Test:
+    `every_relation_of_a_file_is_an_edge` exige `structural` y ambos extremos en el archivo (falla en
+    el padre por el valor).
+  - *m3 ordinal de `impl` Rust:* `Symbol.impl_args` (argumentos genéricos del tipo propio + `where`,
+    sin espacios) entra al disambiguator tras `~`, para el `impl` y sus miembros. Casos nuevos en
+    `inserting_a_homonym_above_keeps_existing_ids` (`impl Foo<u8>` sobre `impl Foo<u16>`; `where T:
+    Clone` sobre `where T: Copy`), que ahora además compara el `parent_id` del símbolo marcado.
+  - *m4:* corregido arriba en Desviaciones: `is_platform` y `external` son de TASK-005.
+  - *m5 `exported`:* semántica documentada como "visible fuera del paquete/módulo" (`Symbol::exported`,
+    `LangResolver::exported`); Python anidado en una función → `false`; TS/JS `export { foo }` (sin
+    `from`) → `true`. Aviso en DD-6: filtrar candidatos por `exported` pierde la resolución
+    intra-paquete en Java/Go. Tests `a_nested_python_function_is_not_exported`,
+    `an_export_clause_exports_its_names`.
+  - *m6:* `every_definition_compiles` valida también `container_kinds` y `scope_kinds` contra el
+    grammar y cada `@definition.<kind>` contra `registry::DEFINITION_KINDS` (nuevo, público). Test
+    `a_misspelt_kind_is_rejected` (`@definition.contructor`, `class_declaraton` en ambas listas).
+  - *Desviación `contains` aceptada con condiciones:* intra-archivo, `debug_assert` + test; el link
+    pass de TASK-005 excluye `kind = 'contains'` y una contención entre archivos futura se escribe
+    sin resolver (DD-6).
+  - *NITs:* Go `var` y Rust `static` siguen como `const` (documentado en `Symbol::kind`: todo
+    binding de módulo no invocable; `mod foo;` sin cuerpo = `module` vacío); `qualifier_chain`
+    mira también `property` (JS `field_definition`), test `a_javascript_field_qualifies_what_it_holds`;
+    barrels TS/TSX/JS (`export { X as Y } from './y'`, `export * from`, `export * as ns from`) son
+    imports (`@import.name`/`.alias`/`.wildcard`/`.namespace`; el alias es el nombre re-exportado),
+    para TASK-005; la caché de parsers usa `try_borrow_mut` y, si la celda está tomada, arma un
+    parser propio en vez de entrar en pánico.
+  - *Plan:* "Pendientes post-009" en el master (`project.path` absoluto en `.devctx/config.yaml`).
+  - Gate: `cargo fmt --check`; `cargo clippy --workspace --all-targets -D warnings` (y `--features
+    gpu`); `cargo test --workspace` con `TMPDIR=/var/tmp`; guardia de identificadores privados vacía.

@@ -44,14 +44,18 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   the path), a signature (the head up to the body, multi-line collapsed) and
   `exported`. `edges` now holds `imports`, `inherits`, `implements`,
   `instantiates`, `references` (type uses) and `contains` besides `calls`;
-  only `contains` is resolved at write time (both ends in the file). Calls
-  inside an arrow-const have it as their source (they used to be dropped);
+  only `contains` is resolved at write time (both ends in the file,
+  `resolution = 'structural'`). Calls inside an arrow-const have it as their
+  source (they used to be dropped); a callback, an arrow bound to an object
+  key or to `this.x` is not a source, its calls belong to the enclosing
+  function; TS/JS re-exports (`export { x } from './y'`) are imports;
   Rust path calls keep their path (`Foo::bar()` → `Foo.bar`, `Self::new()` →
   the impl's type, `std::fs::read()` → `std::fs::read`); a Go method's calls
   come from `Type.method`. Constructors are chunks of their own; fields,
   constants and `impl`s are not (chunk churn on a Java repo: 80 of 3 284).
   Parsers are cached per language and thread (queries were compiled per file).
-  A golden test pins the extractor's output per version.
+  A golden test pins the extractor's output per version: symbols with their
+  parent, visibility and signature, and every edge with its source.
 - **The type of an `impl` is named as its definition is** (`impl<T> Foo<T>`,
   `impl Display for &'a Foo`, `impl crate::x::Foo` → `Foo`). This changes
   content, not format: the `graph_edges` source of such a method is now

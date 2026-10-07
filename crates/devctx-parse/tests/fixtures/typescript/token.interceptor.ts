@@ -27,11 +27,15 @@ export class AuthService extends BaseService implements OnInit, Auditable {
 
   constructor(private readonly http: HttpClient, store: AuthStore) {
     super();
+    this.onTick = () => this.tick();
   }
 
   ngOnInit(): void {
     this.load();
     [1, 2].map((x) => audit(x));
+    this.http.get(url).subscribe({ next: (r) => this.process(r) });
+    const cb = () => this.track();
+    cb();
   }
 
   handle = (e: Event) => {
@@ -44,3 +48,8 @@ export class AuthService extends BaseService implements OnInit, Auditable {
 }
 
 register(tokenInterceptor);
+
+export { helper };
+
+export { Other, Thing as Alias } from './barrel';
+export * from './all';

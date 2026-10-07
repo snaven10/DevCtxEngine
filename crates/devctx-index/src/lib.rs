@@ -2701,6 +2701,13 @@ public class A extends B implements C {
         let top = one("contains", "A");
         assert_eq!((top.src_id, top.dst_id), (file.id, Some(class.id)));
         assert_eq!(one("contains", "A.run").src_id, class.id);
+        // Intra-file only, and marked as such: `structural`, not DD-7's
+        // `same_file` (rule 6), so gold-edge precision does not count it.
+        let ids: std::collections::HashSet<u64> = syms.iter().map(|s| s.id).collect();
+        for c in &contains {
+            assert_eq!(c.resolution.as_deref(), Some("structural"), "{c:?}");
+            assert!(ids.contains(&c.src_id) && c.dst_id.is_some_and(|d| ids.contains(&d)));
+        }
         assert!(edges
             .iter()
             .filter(|e| e.kind != "contains")

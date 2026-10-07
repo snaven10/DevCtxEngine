@@ -225,6 +225,15 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 - Escribir en `/home/you/acme` más allá de lo que TASK-001 y TASK-016 piden con aprobación
   (archivo de casos privado, copias de DB en el scratchpad, reindex con aprobación).
 
+### Pendientes post-009
+
+- **`project.path` absoluto en `.devctx/config.yaml`.** Copiar un repo junto con su `.devctx/`
+  (un sandbox, un clon por `cp -r`) deja la copia apuntando al repo **original**: `devctx index`
+  en la copia indexa y escribe el índice del original (pasó en la medición de TASK-004, riesgo
+  abierto (2)). Opciones: resolver `project.path` relativo a la ubicación del config (o
+  derivarlo de ella y dejar el campo solo como dato), o avisar —y no indexar sin confirmación—
+  cuando no coincide con el cwd / la raíz git donde se corre. No entra en PLAN-009.
+
 ## 5. Tasks y orden
 
 | Task | Qué | Especialista | Depende de | Estado |

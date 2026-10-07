@@ -1,68 +1,200 @@
 version 3
-src/main/java/com/example/shop/OrderService.java	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7
-src/main/java/com/example/shop/OrderService.java	class	OrderService	dc29a699ee8c525b
-src/main/java/com/example/shop/OrderService.java	field	OrderService.repository	d14bd42ca4510f35
-src/main/java/com/example/shop/OrderService.java	field	OrderService.LOG	c29acd63195e2f4b
-src/main/java/com/example/shop/OrderService.java	field	OrderService.cache	1011c2a8d2e74fd3
-src/main/java/com/example/shop/OrderService.java	constructor	OrderService.OrderService	da7228a195cc8c80
-src/main/java/com/example/shop/OrderService.java	method	OrderService.find	0d00f50c1e38cd83
-src/main/java/com/example/shop/OrderService.java	record	OrderService.Line	6b4b8fc356bdbea7
-src/main/java/com/example/shop/OrderService.java	method	OrderService.Line.compareTo	1991438bc1baeff9
-src/main/java/com/example/shop/OrderService.java	class	OrderService.Cache	4c0cd0f07192bef7
-src/main/java/com/example/shop/OrderService.java	method	OrderService.Cache.clear	b2fb00d301d2fdd2
-src/main/java/com/example/shop/OrderService.java	method	OrderService.init	dfc52b440db039bf
-src/main/java/com/example/shop/OrderService.java	method	OrderService.init.run	87becec10e82fd60
-src/main/java/com/example/shop/OrderService.java	interface	Auditable	c9933d105e358b99
-src/main/java/com/example/shop/OrderService.java	method	Auditable.audit	7bdbbce95d55e19a
-libs/auth/src/token.interceptor.ts	file	libs/auth/src/token.interceptor.ts	92c6626910bfed2b
-libs/auth/src/token.interceptor.ts	function	tokenInterceptor	30e45bbecbb12c25
-libs/auth/src/token.interceptor.ts	function	helper	5bc1e54dfe1395c9
-libs/auth/src/token.interceptor.ts	interface	Session	034145a682447f39
-libs/auth/src/token.interceptor.ts	type	Token	e600c58b627640ce
-libs/auth/src/token.interceptor.ts	enum	Mode	14e48fb20b508c94
-libs/auth/src/token.interceptor.ts	class	AuthService	1f4e949af81928fe
-libs/auth/src/token.interceptor.ts	field	AuthService.cache	853984c02cab3b54
-libs/auth/src/token.interceptor.ts	constructor	AuthService.constructor	df8ce4205330e780
-libs/auth/src/token.interceptor.ts	method	AuthService.ngOnInit	239457ad0d7f55be
-libs/auth/src/token.interceptor.ts	method	AuthService.handle	603723a1fdf99df4
-libs/auth/src/token.interceptor.ts	method	AuthService.load	aa6523c96ef05432
-web/Button.tsx	file	web/Button.tsx	d596667f036499eb
-web/Button.tsx	function	Button	735feebece4ac8af
-web/Button.tsx	function	Button.onClick	56580debb4e80180
-web/Button.tsx	function	Panel	5cf3006b7d7ef18d
-web/app.js	file	web/app.js	7333a95984a851a7
-web/app.js	function	start	7611d737d64fd68a
-web/app.js	function	boot	8ab5fd0b3abb5e50
-web/app.js	class	App	f66407f4547233a3
-web/app.js	constructor	App.constructor	1c5c93ac52716cd9
-web/app.js	method	App.run	8b91df318509fb06
-web/app.js	method	App.stop	a35e54b476e4e23d
-shop/orders.py	file	shop/orders.py	acd88c655c833ce3
-shop/orders.py	const	LIMIT	a3ec3be8cf532e5c
-shop/orders.py	class	OrderService	cb51eb889b137853
-shop/orders.py	method	OrderService.__init__	dc81c89d2af44367
-shop/orders.py	method	OrderService.find	fc358287f1555fac
-shop/orders.py	method	OrderService._hidden	00580b228891d04a
-shop/orders.py	function	main	fc94a46ccc44a829
-crates/demo/src/cache.rs	file	crates/demo/src/cache.rs	ef5c39f332d029f7
-crates/demo/src/cache.rs	const	LIMIT	593dad3c8269598e
-crates/demo/src/cache.rs	const	NAME	e6007f701b459ace
-crates/demo/src/cache.rs	type	Map	05fdcc3190c7e37c
-crates/demo/src/cache.rs	struct	Cached	23cd766c1c4d96aa
-crates/demo/src/cache.rs	field	Cached.inner	f909692c2c3dc62c
-crates/demo/src/cache.rs	field	Cached.hits	8c4b769ca5f26b48
-crates/demo/src/cache.rs	trait	Named	5710b2875e264529
-crates/demo/src/cache.rs	impl	Cached	2b8728b980d08760
-crates/demo/src/cache.rs	method	Cached.new	7073efe2728def5a
-crates/demo/src/cache.rs	method	Cached.build	1d10706e55bd1544
-crates/demo/src/cache.rs	impl	Cached	c4e4e10bd2c24285
-crates/demo/src/cache.rs	method	Cached.name	866f8463f50e5b7c
-api/server.go	file	api/server.go	53b33b78efb910e7
-api/server.go	const	Version	cba7bd18a30b70f0
-api/server.go	interface	Handler	68e7a9294952b16f
-api/server.go	struct	Server	e715086cc772309e
-api/server.go	field	Server.store	75609f0046ef8139
-api/server.go	field	Server.Name	b6059c4427192455
-api/server.go	function	NewServer	5ca7cac7e3eb0064
-api/server.go	method	Server.Handle	6f44c7a117749a14
-api/server.go	method	Server.helper	1795d3dc53e46b66
+== src/main/java/com/example/shop/OrderService.java (java) package=com.example.shop
+sym	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7	parent=-	container=-	-	L1-43	
+sym	class	OrderService	dc29a699ee8c525b	parent=src/main/java/com/example/shop/OrderService.java	container=-	pub	L9-38	public class OrderService extends BaseService implements Auditable, Serializable
+sym	field	OrderService.repository	d14bd42ca4510f35	parent=OrderService	container=OrderService	priv	L10-11	@Inject OrderRepository repository;
+sym	field	OrderService.LOG	c29acd63195e2f4b	parent=OrderService	container=OrderService	priv	L12-12	private static final Logger LOG = Logger.getLogger("orders");
+sym	field	OrderService.cache	1011c2a8d2e74fd3	parent=OrderService	container=OrderService	priv	L13-13	private final List<Order> cache = new ArrayList<>();
+sym	constructor	OrderService.OrderService	da7228a195cc8c80	parent=OrderService	container=OrderService	pub	L15-18	public OrderService(OrderRepository repository)
+sym	method	OrderService.find	0d00f50c1e38cd83	parent=OrderService	container=OrderService	pub	L20-25	public Order find(Long id, String user)
+sym	record	OrderService.Line	6b4b8fc356bdbea7	parent=OrderService	container=OrderService	pub	L27-29	public record Line(String sku, int qty) implements Comparable<Line>
+sym	method	OrderService.Line.compareTo	1991438bc1baeff9	parent=OrderService.Line	container=Line	pub	L28-28	public int compareTo(Line other)
+sym	class	OrderService.Cache	4c0cd0f07192bef7	parent=OrderService	container=OrderService	priv	L31-33	static class Cache
+sym	method	OrderService.Cache.clear	b2fb00d301d2fdd2	parent=OrderService.Cache	container=Cache	priv	L32-32	void clear()
+sym	method	OrderService.init	dfc52b440db039bf	parent=OrderService	container=OrderService	priv	L35-37	private void init()
+sym	method	OrderService.init.run	87becec10e82fd60	parent=OrderService.init	container=OrderService	pub	L36-36	public void run()
+sym	interface	Auditable	c9933d105e358b99	parent=src/main/java/com/example/shop/OrderService.java	container=-	priv	L40-42	interface Auditable extends Named
+sym	method	Auditable.audit	7bdbbce95d55e19a	parent=Auditable	container=Auditable	pub	L41-41	String audit();
+L3	import	java.util.List	path=java.util.List name=- alias=- wildcard=false
+L4	import	java.util.*	path=java.util name=- alias=- wildcard=true
+L5	import	java.util.Objects.requireNonNull	path=java.util.Objects.requireNonNull name=- alias=- wildcard=false
+L6	import	com.example.shop.repo.OrderRepository	path=com.example.shop.repo.OrderRepository name=- alias=- wildcard=false
+L9	implements	OrderService -> Auditable
+L9	implements	OrderService -> Serializable
+L9	inherits	OrderService -> BaseService
+L11	references	OrderService.repository -> OrderRepository
+L12	call	OrderService.LOG -> Logger.getLogger	graph=-
+L12	references	OrderService.LOG -> Logger
+L13	instantiates	OrderService.cache -> ArrayList
+L13	references	OrderService.cache -> List
+L13	references	OrderService.cache -> Order
+L15	references	OrderService.OrderService -> OrderRepository
+L17	call	OrderService.OrderService -> init	graph=OrderService.OrderService
+L20	references	OrderService.find -> Long
+L20	references	OrderService.find -> Order
+L21	references	OrderService.find -> String
+L22	call	OrderService.find -> OrderRepository.findById	graph=OrderService.find
+L22	references	OrderService.find -> Order
+L27	implements	OrderService.Line -> Comparable
+L27	references	OrderService.Line -> String
+L28	references	OrderService.Line.compareTo -> Line
+L32	instantiates	OrderService.Cache.clear -> Order
+L36	instantiates	OrderService.init -> Runnable
+L40	inherits	Auditable -> Named
+L41	references	Auditable.audit -> String
+== libs/auth/src/token.interceptor.ts (typescript) package=libs/auth/src/token.interceptor
+sym	file	libs/auth/src/token.interceptor.ts	92c6626910bfed2b	parent=-	container=-	-	L1-56	
+sym	function	tokenInterceptor	30e45bbecbb12c25	parent=libs/auth/src/token.interceptor.ts	container=-	pub	L7-10	const tokenInterceptor: Fn = (req, next) =>
+sym	function	helper	5bc1e54dfe1395c9	parent=libs/auth/src/token.interceptor.ts	container=-	pub	L12-14	const helper = function ()
+sym	interface	Session	034145a682447f39	parent=libs/auth/src/token.interceptor.ts	container=-	pub	L16-18	interface Session extends Base<string>
+sym	type	Token	e600c58b627640ce	parent=libs/auth/src/token.interceptor.ts	container=-	pub	L20-20	type Token = string;
+sym	enum	Mode	14e48fb20b508c94	parent=libs/auth/src/token.interceptor.ts	container=-	pub	L22-22	enum Mode
+sym	class	AuthService	1f4e949af81928fe	parent=libs/auth/src/token.interceptor.ts	container=-	pub	L25-48	class AuthService extends BaseService implements OnInit, Auditable
+sym	field	AuthService.cache	853984c02cab3b54	parent=AuthService	container=AuthService	priv	L26-26	private cache: Map<string, Session> = new Map()
+sym	constructor	AuthService.constructor	df8ce4205330e780	parent=AuthService	container=AuthService	pub	L28-31	constructor(private readonly http: HttpClient, store: AuthStore)
+sym	method	AuthService.ngOnInit	239457ad0d7f55be	parent=AuthService	container=AuthService	pub	L33-39	ngOnInit(): void
+sym	method	AuthService.ngOnInit.cb	85033aee12d4abea	parent=AuthService.ngOnInit	container=AuthService	priv	L37-37	const cb = () =>
+sym	method	AuthService.handle	603723a1fdf99df4	parent=AuthService	container=AuthService	pub	L41-43	handle = (e: Event) =>
+sym	method	AuthService.load	aa6523c96ef05432	parent=AuthService	container=AuthService	priv	L45-47	private load(): Session
+L1	import	@angular/core#Injectable	path=@angular/core name=Injectable alias=- wildcard=false
+L1	import	@angular/core#inject	path=@angular/core name=inject alias=- wildcard=false
+L2	import	@angular/common/http#HttpInterceptorFn	path=@angular/common/http name=HttpInterceptorFn alias=Fn wildcard=false
+L3	import	rxjs#*	path=rxjs name=- alias=rx wildcard=true
+L4	import	./auth.store#default	path=./auth.store name=default alias=AuthStore wildcard=false
+L5	import	./polyfills	path=./polyfills name=- alias=- wildcard=false
+L7	references	tokenInterceptor -> Fn
+L8	call	tokenInterceptor -> inject	graph=tokenInterceptor
+L9	call	tokenInterceptor -> AuthStore.headers	graph=tokenInterceptor
+L9	call	tokenInterceptor -> clone	graph=tokenInterceptor
+L9	call	tokenInterceptor -> next	graph=tokenInterceptor
+L13	call	helper -> log	graph=helper
+L16	inherits	Session -> Base
+L24	call	libs/auth/src/token.interceptor.ts -> Injectable	graph=-
+L25	implements	AuthService -> Auditable
+L25	implements	AuthService -> OnInit
+L25	inherits	AuthService -> BaseService
+L26	instantiates	AuthService.cache -> Map
+L26	references	AuthService.cache -> Map
+L26	references	AuthService.cache -> Session
+L28	references	AuthService.constructor -> AuthStore
+L28	references	AuthService.constructor -> HttpClient
+L30	call	AuthService.constructor -> AuthService.tick	graph=AuthService.constructor
+L34	call	AuthService.ngOnInit -> AuthService.load	graph=AuthService.ngOnInit
+L35	call	AuthService.ngOnInit -> audit	graph=AuthService.ngOnInit
+L35	call	AuthService.ngOnInit -> map	graph=AuthService.ngOnInit
+L36	call	AuthService.ngOnInit -> AuthService.process	graph=AuthService.ngOnInit
+L36	call	AuthService.ngOnInit -> HttpClient.get	graph=AuthService.ngOnInit
+L36	call	AuthService.ngOnInit -> subscribe	graph=AuthService.ngOnInit
+L37	call	AuthService.ngOnInit.cb -> AuthService.track	graph=AuthService.ngOnInit.cb
+L38	call	AuthService.ngOnInit -> cb	graph=AuthService.ngOnInit
+L41	references	AuthService.handle -> Event
+L42	call	AuthService.handle -> AuthService.load	graph=AuthService.handle
+L45	references	AuthService.load -> Session
+L46	instantiates	AuthService.load -> SessionImpl
+L50	call	libs/auth/src/token.interceptor.ts -> register	graph=-
+L54	import	./barrel#Other	path=./barrel name=Other alias=- wildcard=false
+L54	import	./barrel#Thing	path=./barrel name=Thing alias=Alias wildcard=false
+L55	import	./all#*	path=./all name=- alias=- wildcard=true
+== web/Button.tsx (tsx) package=web/Button
+sym	file	web/Button.tsx	d596667f036499eb	parent=-	container=-	-	L1-11	
+sym	function	Button	735feebece4ac8af	parent=web/Button.tsx	container=-	pub	L3-6	const Button = (props: Props) =>
+sym	function	Button.onClick	56580debb4e80180	parent=Button	container=-	priv	L4-4	const onClick = () =>
+sym	function	Panel	5cf3006b7d7ef18d	parent=web/Button.tsx	container=-	pub	L8-10	function Panel(): JSX.Element
+L1	import	react#default	path=react name=default alias=React wildcard=false
+L3	references	Button -> Props
+L4	call	Button.onClick -> track	graph=Button.onClick
+L8	references	Panel -> JSX.Element
+== web/app.js (javascript) package=web/app
+sym	file	web/app.js	7333a95984a851a7	parent=-	container=-	-	L1-33	
+sym	function	start	7611d737d64fd68a	parent=web/app.js	container=-	pub	L4-6	const start = (port) =>
+sym	function	boot	8ab5fd0b3abb5e50	parent=web/app.js	container=-	priv	L8-10	function boot()
+sym	class	App	f66407f4547233a3	parent=web/app.js	container=-	pub	L12-28	class App extends Base
+sym	constructor	App.constructor	1c5c93ac52716cd9	parent=App	container=App	pub	L13-17	constructor()
+sym	method	App.run	8b91df318509fb06	parent=App	container=App	pub	L19-21	run()
+sym	field	App.count	17ad41dca9912cec	parent=App	container=App	pub	L23-23	count = 0
+sym	method	App.stop	a35e54b476e4e23d	parent=App	container=App	pub	L25-27	stop = () =>
+L1	import	express#default	path=express name=default alias=express wildcard=false
+L2	import	./routes.js#route	path=./routes.js name=route alias=- wildcard=false
+L5	call	start -> listen	graph=start
+L9	call	boot -> start	graph=boot
+L12	inherits	App -> Base
+L15	instantiates	App.constructor -> Server
+L16	call	App.constructor -> App.tick	graph=App.constructor
+L20	call	App.run -> boot	graph=App.run
+L26	call	App.stop -> close	graph=App.stop
+L31	call	web/app.js -> work	graph=-
+== shop/orders.py (python) package=shop.orders
+sym	file	shop/orders.py	acd88c655c833ce3	parent=-	container=-	-	L1-25	
+sym	const	LIMIT	a3ec3be8cf532e5c	parent=shop/orders.py	container=-	pub	L6-6	LIMIT = 10
+sym	class	OrderService	cb51eb889b137853	parent=shop/orders.py	container=-	pub	L9-17	class OrderService(BaseService, mixins.Audited):
+sym	method	OrderService.__init__	dc81c89d2af44367	parent=OrderService	container=OrderService	pub	L10-11	def __init__(self, repo: Repo):
+sym	method	OrderService.find	fc358287f1555fac	parent=OrderService	container=OrderService	pub	L13-14	def find(self, oid: int) -> Order:
+sym	method	OrderService._hidden	00580b228891d04a	parent=OrderService	container=OrderService	priv	L16-17	def _hidden(self):
+sym	function	main	fc94a46ccc44a829	parent=shop/orders.py	container=-	pub	L20-21	def main():
+L1	import	os	path=os name=- alias=- wildcard=false
+L2	import	logging	path=logging name=- alias=log wildcard=false
+L3	import	.models.Line	path=.models name=Line alias=L wildcard=false
+L3	import	.models.Order	path=.models name=Order alias=- wildcard=false
+L4	import	typing.*	path=typing name=- alias=- wildcard=true
+L9	inherits	OrderService -> BaseService
+L9	inherits	OrderService -> mixins.Audited
+L10	references	OrderService.__init__ -> Repo
+L13	references	OrderService.find -> Order
+L13	references	OrderService.find -> int
+L14	call	OrderService.find -> Repo.get	graph=OrderService.find
+L21	call	main -> OrderService	graph=main
+L21	call	main -> find	graph=main
+L24	call	shop/orders.py -> main	graph=-
+== crates/demo/src/cache.rs (rust) package=demo::cache
+sym	file	crates/demo/src/cache.rs	ef5c39f332d029f7	parent=-	container=-	-	L1-37	
+sym	const	LIMIT	593dad3c8269598e	parent=crates/demo/src/cache.rs	container=-	pub	L4-4	pub const LIMIT: usize = 8;
+sym	const	NAME	e6007f701b459ace	parent=crates/demo/src/cache.rs	container=-	priv	L5-5	static NAME: &str = "c";
+sym	type	Map	05fdcc3190c7e37c	parent=crates/demo/src/cache.rs	container=-	pub	L6-6	pub type Map = HashMap<String, u32>;
+sym	struct	Cached	23cd766c1c4d96aa	parent=crates/demo/src/cache.rs	container=-	pub	L9-12	pub struct Cached<T>
+sym	field	Cached.inner	f909692c2c3dc62c	parent=Cached	container=-	pub	L10-10	pub inner: T
+sym	field	Cached.hits	8c4b769ca5f26b48	parent=Cached	container=-	priv	L11-11	hits: u32
+sym	trait	Named	5710b2875e264529	parent=crates/demo/src/cache.rs	container=-	pub	L14-16	pub trait Named: Clone + Send
+sym	impl	Cached	9c4d3b2a26919144	parent=Cached	container=-	-	L18-28	impl<T: Clone> Cached<T>
+sym	method	Cached.new	769d643b2fad00d6	parent=Cached	container=Cached	pub	L19-23	pub fn new(inner: T) -> Self
+sym	method	Cached.build	900da28cfc5f3968	parent=Cached	container=Cached	priv	L25-27	fn build(inner: T) -> Cached<T>
+sym	impl	Cached	9d13d10a606a45d5	parent=Cached	container=-	-	L30-36	impl<T: Clone> Named for Cached<T>
+sym	method	Cached.name	0a51c92f9feb2990	parent=Cached	container=Cached	priv	L31-35	fn name(&self) -> String
+L1	import	std::collections::HashMap	path=std::collections::HashMap name=- alias=- wildcard=false
+L2	import	crate::store	path=crate::store name=- alias=- wildcard=false
+L2	import	crate::store::Store	path=crate::store::Store name=- alias=S wildcard=false
+L2	import	crate::store::model::*	path=crate::store::model name=- alias=- wildcard=true
+L14	inherits	Named -> Clone
+L14	inherits	Named -> Send
+L21	references	Cached.new -> Cached
+L22	call	Cached.new -> Cached.build	graph=Cached.new
+L25	references	Cached.build -> Cached
+L26	instantiates	Cached.build -> Cached
+L30	implements	Cached -> Named
+L31	references	Cached.name -> String
+L32	call	Cached.name -> Foo.bar	graph=Cached.name
+L33	call	Cached.name -> store::open	graph=Cached.name
+L34	call	Cached.name -> String.new	graph=Cached.name
+== api/server.go (go) package=api
+sym	file	api/server.go	53b33b78efb910e7	parent=-	container=-	-	L1-32	
+sym	const	Version	cba7bd18a30b70f0	parent=api/server.go	container=-	pub	L10-10	Version = "1"
+sym	interface	Handler	68e7a9294952b16f	parent=api/server.go	container=-	pub	L12-14	Handler interface
+sym	struct	Server	e715086cc772309e	parent=api/server.go	container=-	pub	L16-20	Server struct
+sym	field	Server.store	75609f0046ef8139	parent=Server	container=-	priv	L18-18	store *store.Store
+sym	field	Server.Name	b6059c4427192455	parent=Server	container=-	pub	L19-19	Name string
+sym	function	NewServer	5ca7cac7e3eb0064	parent=api/server.go	container=-	pub	L22-24	func NewServer() *Server
+sym	method	Server.Handle	6f44c7a117749a14	parent=Server	container=-	pub	L26-29	func (s *Server) Handle(w h.ResponseWriter)
+sym	method	Server.helper	1795d3dc53e46b66	parent=Server	container=-	priv	L31-31	func (s *Server) helper()
+L4	import	fmt	path=fmt name=- alias=- wildcard=false
+L5	import	net/http	path=net/http name=- alias=h wildcard=false
+L7	import	github.com/acme/demo/store	path=github.com/acme/demo/store name=- alias=- wildcard=false
+L17	inherits	Server -> Base
+L17	references	Server -> Base
+L18	references	Server.store -> store.Store
+L19	references	Server.Name -> string
+L22	references	NewServer -> Server
+L23	instantiates	NewServer -> Server
+L26	references	Server.Handle -> Server
+L26	references	Server.Handle -> h.ResponseWriter
+L27	call	Server.Handle -> Println	graph=Server.Handle
+L28	call	Server.Handle -> helper	graph=Server.Handle
+L31	references	Server.helper -> Server

@@ -1300,8 +1300,9 @@ impl Ctx<'_> {
 /// edge per occurrence (PLAN-009 TASK-004): every call (module-level ones
 /// included), import, supertype, instantiation and type use, unresolved
 /// (`dst_id` and the rest are the link pass's to fill, DD-6), and one
-/// `contains` per parent → child, resolved here because both ends are
-/// symbols of this file and an id carries no branch. The file symbol
+/// `contains` per parent → child, resolved here (`resolution =
+/// 'structural'`) because both ends are symbols of this file and an id
+/// carries no branch. The file symbol
 /// carries `content_hash`, the value `file_state` records for the same bytes.
 fn graph_rows(
     file: &str,
@@ -1353,12 +1354,24 @@ fn graph_rows(
         .iter()
         .chain(&parsed.module_edges)
         .map(|e| edge(&e.kind, e.src_id, &e.target, e.line));
+    // `contains` is intra-file only (DD-6): a parent is a symbol of this
+    // file, so the edge is resolved here and the link pass skips it.
+    let file_ids: std::collections::HashSet<u64> = std::iter::once(file_id)
+        .chain(parsed.symbols.iter().map(|s| s.id))
+        .collect();
     let contains = parsed.symbols.iter().filter_map(|s| {
         let parent = s.parent_id?;
+        debug_assert!(
+            file_ids.contains(&parent),
+            "contains {parent:x} -> {:x}: the parent is not a symbol of {file}",
+            s.id
+        );
         Some(StoredSymbolEdge {
             dst_id: Some(s.id),
             confidence: Some("high".to_string()),
-            resolution: Some("same_file".to_string()),
+            // Its own value: DD-7 rule 6 owns `same_file`, and gold-edge
+            // precision by `resolution` must not count containment.
+            resolution: Some("structural".to_string()),
             external: Some(false),
             ..edge(CONTAINS, parent, &s.qualified, s.start_line)
         })

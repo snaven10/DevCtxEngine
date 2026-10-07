@@ -113,6 +113,31 @@ impl LangDef {
     }
 }
 
+/// Every kind a definitions query may capture (`@definition.<kind>`).
+///
+/// A kind is part of the symbol id through its class
+/// ([`devctx_core::symbol_id::kind_class`]): a misspelt one
+/// (`@definition.contructor`) would be a class of its own and move every id
+/// it touches without anything failing, so `every_definition_compiles`
+/// rejects any kind not listed here. `method` and `constructor` are also
+/// derived at parse time (a `function` in a container, a JS `constructor`).
+pub const DEFINITION_KINDS: &[&str] = &[
+    "function",
+    "method",
+    "constructor",
+    "class",
+    "interface",
+    "enum",
+    "record",
+    "struct",
+    "trait",
+    "type",
+    "module",
+    "impl",
+    "field",
+    "const",
+];
+
 /// The embedded definitions, in registry order.
 const SOURCES: &[&str] = &[
     include_str!("../languages/python.json"),
@@ -260,6 +285,40 @@ mod tests {
     #[test]
     fn every_definition_compiles() {
         for def in ALL.iter() {
+            check(def);
+        }
+    }
+
+    /// A misspelt definition kind or node kind is caught, not silently
+    /// turned into a new id class or a scope that never matches.
+    #[test]
+    fn a_misspelt_kind_is_rejected() {
+        let java = by_name("java").unwrap();
+        let mut typo = java.clone();
+        typo.definitions = typo
+            .definitions
+            .replace("@definition.constructor", "@definition.contructor");
+        let err = std::panic::catch_unwind(|| check(&typo)).unwrap_err();
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("contructor"), "{msg}");
+        for field in ["container", "scope"] {
+            let mut typo = java.clone();
+            let list = if field == "container" {
+                &mut typo.container_kinds
+            } else {
+                &mut typo.scope_kinds
+            };
+            list.push("class_declaraton".into());
+            let err = std::panic::catch_unwind(|| check(&typo)).unwrap_err();
+            let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(msg.contains("class_declaraton"), "{field}: {msg}");
+        }
+        check(java);
+    }
+
+    /// Every check of `every_definition_compiles` on one definition.
+    fn check(def: &LangDef) {
+        {
             let grammar = grammar_for(&def.grammar)
                 .unwrap_or_else(|| panic!("`{}`: no grammar named `{}`", def.name, def.grammar));
             for (label, src, allowed) in [
@@ -278,7 +337,10 @@ mod tests {
                 // silently match nothing useful.
                 for name in query.capture_names() {
                     let known = allowed.contains(name)
-                        || (label == "definitions" && name.starts_with("definition."));
+                        || (label == "definitions"
+                            && name
+                                .strip_prefix("definition.")
+                                .is_some_and(|k| DEFINITION_KINDS.contains(&k)));
                     assert!(
                         known,
                         "`{}`: `{label}` captures unknown `@{name}`",
@@ -286,7 +348,13 @@ mod tests {
                     );
                 }
             }
-            for kind in def.type_names.iter().chain(&def.function_kinds) {
+            for kind in def
+                .type_names
+                .iter()
+                .chain(&def.function_kinds)
+                .chain(&def.container_kinds)
+                .chain(&def.scope_kinds)
+            {
                 assert!(
                     grammar.id_for_node_kind(kind, true) != 0,
                     "`{}`: no node kind `{kind}`",

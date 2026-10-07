@@ -26,8 +26,11 @@ pub trait LangResolver: Sync {
     fn package_from_path(&self, path: &str) -> Option<String>;
 
     /// Whether the definition `def` named `name` is visible outside its
-    /// file (`public`, `export`, `pub`, a capital Go name, no leading `_`
-    /// in Python); `None` when the language says nothing (a Rust `impl`).
+    /// package/module (`public`, `export`, `pub`, a capital Go name, no
+    /// leading `_` in Python); `None` when the language says nothing (a
+    /// Rust `impl`). See [`Symbol::exported`](crate::Symbol::exported):
+    /// Java package-private and Go lowercase names are `false` though their
+    /// package sees them.
     fn exported(&self, def: Node<'_>, name: &str, bytes: &[u8]) -> Option<bool>;
 
     /// The names an `@import.tree` capture brings in (a Rust `use`
@@ -152,7 +155,8 @@ impl LangResolver for Script {
         Some(strip_extension(path).to_string())
     }
 
-    /// Top level: under an `export` statement. A class member: not
+    /// Top level: under an `export` statement, or named by an `export {
+    /// name }` clause of the file. A class member: not
     /// `private`/`protected`/`#name`, and its class exported. Anything
     /// nested in a function: no.
     fn exported(&self, def: Node<'_>, name: &str, bytes: &[u8]) -> Option<bool> {
@@ -173,9 +177,11 @@ impl LangResolver for Script {
                 return Some(false);
             }
             let class = def.parent().and_then(|body| body.parent());
-            return Some(class.is_some_and(|c| under_export(c)));
+            return Some(class.is_some_and(|c| {
+                under_export(c) || in_export_clause(c, &class_name(c, bytes), bytes)
+            }));
         }
-        Some(under_export(def))
+        Some(under_export(def) || in_export_clause(def, name, bytes))
     }
 
     fn import_target(&self, imp: &ImportFact) -> String {
@@ -203,6 +209,54 @@ fn under_export(node: Node<'_>) -> bool {
     false
 }
 
+/// Is the top-level declaration `def` named by an `export { … }` clause of
+/// its file (`function foo() {}` … `export { foo }`, `export { foo as
+/// bar }`)? A clause with a `from` re-exports another module's names.
+fn in_export_clause(def: Node<'_>, name: &str, bytes: &[u8]) -> bool {
+    let top = match def.parent() {
+        Some(p) if p.kind() == "program" => p,
+        Some(p) if matches!(p.kind(), "lexical_declaration" | "variable_declaration") => {
+            match p.parent() {
+                Some(r) if r.kind() == "program" => r,
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    let mut cursor = top.walk();
+    let statements: Vec<Node<'_>> = top
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "export_statement" && c.child_by_field_name("source").is_none())
+        .collect();
+    statements.into_iter().any(|st| {
+        let mut c = st.walk();
+        let clauses: Vec<Node<'_>> = st
+            .named_children(&mut c)
+            .filter(|n| n.kind() == "export_clause")
+            .collect();
+        clauses.into_iter().any(|clause| {
+            let mut c = clause.walk();
+            let found = clause.named_children(&mut c).any(|spec| {
+                spec.kind() == "export_specifier"
+                    && spec
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(bytes).ok())
+                        == Some(name)
+            });
+            found
+        })
+    })
+}
+
+/// The `name` of a class declaration, empty if it has none.
+fn class_name(class: Node<'_>, bytes: &[u8]) -> String {
+    class
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
 struct Python;
 
 impl LangResolver for Python {
@@ -217,7 +271,16 @@ impl LangResolver for Python {
         Some(stem.replace('/', "."))
     }
 
-    fn exported(&self, _def: Node<'_>, name: &str, _bytes: &[u8]) -> Option<bool> {
+    /// No leading `_` (a dunder is public), and not nested in a function:
+    /// a decorator's `wrapper` is no name of its module.
+    fn exported(&self, def: Node<'_>, name: &str, _bytes: &[u8]) -> Option<bool> {
+        let mut cur = def.parent();
+        while let Some(n) = cur {
+            if n.kind() == "function_definition" {
+                return Some(false);
+            }
+            cur = n.parent();
+        }
         Some(!name.starts_with('_') || (name.starts_with("__") && name.ends_with("__")))
     }
 

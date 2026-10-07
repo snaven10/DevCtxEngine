@@ -25,7 +25,9 @@ impl ParsedFile {
     ///   overload exists — adding one must not move the other's id; and,
     ///   when an enclosing scope is a callable, the scope shape (`@sf` for
     ///   `Outer.start.run`), so `fn a() { struct P }` and `mod a { struct P }`
-    ///   differ. Else empty. Only two symbols still sharing kind class, qualified name and
+    ///   differ; and for a Rust `impl` and its members, the self type's
+    ///   generic arguments and `where` clause (`~<u8>`), so `impl Foo<u8>`
+    ///   and `impl Foo<u16>` differ. Else empty. Only two symbols still sharing kind class, qualified name and
     ///   disambiguator (a Python redefinition, two anonymous classes in one
     ///   method) take an ordinal in source order (`#1`, `#2`…), as does a
     ///   hash collision: the last resort, and the one case where inserting a
@@ -64,6 +66,10 @@ impl ParsedFile {
                 (None, Some(p)) => p.clone(),
                 (None, None) => String::new(),
             };
+            if let Some(args) = &sym.impl_args {
+                base.push('~');
+                base.push_str(args);
+            }
             if let Some(shape) = &sym.scope_shape {
                 base.push('@');
                 base.push_str(shape);
@@ -152,8 +158,11 @@ fn parent_of(symbols: &[Symbol], i: usize) -> Option<u64> {
 }
 
 /// The index of the smallest symbol whose span covers `[from, to]`, other
-/// than `skip`. Of two with the same span the earlier is the container of
-/// the later, never the reverse, so containment has no cycle.
+/// than `skip` and than any symbol with `skip`'s span (the names of one
+/// declaration that has no node per name, Go `var a, b int`; TS/JS and
+/// Java declarators each span their own, see `own_declarator`), so
+/// containment has no cycle. Of two candidates with one span the earlier
+/// wins: an occurrence inside a Go `var a, b T` is `a`'s.
 fn innermost_around(
     symbols: &[Symbol],
     from: usize,
@@ -165,10 +174,11 @@ fn innermost_around(
         if Some(j) == skip || t.start_byte > from || t.end_byte < to {
             continue;
         }
+        // Two symbols with one span are names of one declaration (Go `var
+        // a, b int`): siblings, never one the container of the other.
         if let Some(i) = skip {
             let s = &symbols[i];
-            let same_span = t.start_byte == s.start_byte && t.end_byte == s.end_byte;
-            if same_span && j > i {
+            if t.start_byte == s.start_byte && t.end_byte == s.end_byte {
                 continue;
             }
         }
@@ -501,6 +511,25 @@ class C {
                 "fn a() { struct P(u8, N1); }\nmod a { struct P(u8, M_mod); }\n",
                 &["M_mod"],
             ),
+            // Two inherent impls of one generic type differ by its arguments:
+            // inserting `impl Foo<u8>` above `impl Foo<u16>` moves neither the
+            // impl nor its methods (nor their parent ids).
+            (
+                Lang::rust(),
+                "g.rs",
+                "struct Foo<T>(T);\nimpl Foo<u16> { fn get(&self) { m_u16(); } }\n",
+                "struct Foo<T>(T);\nimpl Foo<u8> { fn get(&self) { n1(); } }\n\
+                 impl Foo<u16> { fn get(&self) { m_u16(); } }\n",
+                &["m_u16"],
+            ),
+            (
+                Lang::rust(),
+                "w.rs",
+                "struct W<T>(T);\nimpl<T> W<T> where T: Copy { fn get(&self) { m_copy(); } }\n",
+                "struct W<T>(T);\nimpl<T> W<T> where T: Clone { fn get(&self) { n1(); } }\n\
+                 impl<T> W<T> where T: Copy { fn get(&self) { m_copy(); } }\n",
+                &["m_copy"],
+            ),
             // Java overloads around an anonymous class: `O()` and `O(int)`,
             // `m(int)` and `m(String)` are different scopes, so adding an
             // overload above does not hand the old `run` an ordinal.
@@ -528,6 +557,16 @@ class O {
             let a = ids(*lang, before, file);
             let b = ids(*lang, after, file);
             for m in *markers {
+                let parent = |pf: &ParsedFile, src: &str| {
+                    let id = id_at(pf, src, m);
+                    pf.symbols.iter().find(|s| s.id == id).unwrap().parent_id
+                };
+                assert_eq!(
+                    parent(&a, before),
+                    parent(&b, after),
+                    "{}: the parent of the symbol around {m} changed id",
+                    lang.name()
+                );
                 assert_eq!(
                     id_at(&a, before, m),
                     id_at(&b, after, m),
@@ -706,5 +745,75 @@ public class Outer {
         assert_eq!(find_a.parent.as_deref(), Some("A"));
         assert_eq!(find_a.parent_id, Some(id_of(&pf, "Outer.A")));
         assert_eq!(find_a.signature, "void find()");
+    }
+
+    /// Several declarators in one declaration (`const a = …, b = …`, Java
+    /// `int a, b;`, Go `var a, b int`) are siblings: none is the parent of
+    /// another, and each one's calls and type uses are its own.
+    #[test]
+    fn declarators_of_one_declaration_are_siblings() {
+        let src = "const a = () => { x(); }, b = () => { y(); };\n";
+        let pf = ids(Lang::typescript(), src, "d.ts");
+        let file = pf.file_symbol.id;
+        for q in ["a", "b"] {
+            let s = pf.symbols.iter().find(|s| s.qualified == q).unwrap();
+            assert_eq!(s.parent_id, Some(file), "{q}: {:?}", pf.symbols);
+        }
+        let names: std::collections::HashMap<u64, &str> = pf
+            .symbols
+            .iter()
+            .map(|s| (s.id, s.qualified.as_str()))
+            .collect();
+        let calls: Vec<(&str, &str)> = pf
+            .edges
+            .iter()
+            .map(|e| (names[&e.src_id], e.target.as_str()))
+            .collect();
+        assert_eq!(calls, [("a", "x"), ("b", "y")]);
+        let graph: Vec<(&str, &str)> = pf
+            .edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str()))
+            .collect();
+        assert_eq!(graph, [("a", "x"), ("b", "y")]);
+
+        let pf = ids(Lang::java(), "class C { int a, b; Foo f, g; }\n", "C.java");
+        let c = id_of(&pf, "C");
+        for q in ["C.a", "C.b", "C.f", "C.g"] {
+            let s = pf.symbols.iter().find(|s| s.qualified == q).unwrap();
+            assert_eq!(s.parent_id, Some(c), "{q}: {:?}", pf.symbols);
+        }
+
+        let pf = ids(Lang::go(), "package p\nvar a, b int\n", "v.go");
+        for q in ["a", "b"] {
+            let s = pf.symbols.iter().find(|s| s.qualified == q).unwrap();
+            assert_eq!(
+                s.parent_id,
+                Some(pf.file_symbol.id),
+                "{q}: {:?}",
+                pf.symbols
+            );
+        }
+    }
+
+    /// `exported` means "visible outside the module": a Python function
+    /// nested in another is not, whatever its name.
+    #[test]
+    fn a_nested_python_function_is_not_exported() {
+        let pf = ids(
+            Lang::python(),
+            "def deco(f):\n    def wrapper():\n        pass\n    return wrapper\n\nclass K:\n    def m(self):\n        pass\n",
+            "d.py",
+        );
+        let exported = |q: &str| {
+            pf.symbols
+                .iter()
+                .find(|s| s.qualified == q)
+                .unwrap()
+                .exported
+        };
+        assert_eq!(exported("deco"), Some(true));
+        assert_eq!(exported("deco.wrapper"), Some(false));
+        assert_eq!(exported("K.m"), Some(true));
     }
 }

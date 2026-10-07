@@ -7,8 +7,14 @@ use crate::facts::FileFacts;
 pub struct Symbol {
     /// Symbol name.
     pub name: String,
-    /// Kind: `function`/`method`/`constructor`/`class`/`interface`/`enum`/
-    /// `record`/`struct`/`trait`/`type`/`module`/`impl`/`field`/`const`.
+    /// Kind: one of [`DEFINITION_KINDS`](crate::registry::DEFINITION_KINDS)
+    /// — `function`/`method`/`constructor`/`class`/`interface`/`enum`/
+    /// `record`/`struct`/`trait`/`type`/`module`/`impl`/`field`/`const` —
+    /// or `file`. `const` covers every module-level binding that is no
+    /// callable: Go `var` as well as `const`, Rust `static` as well as
+    /// `const`, a Python module assignment. A Rust `mod foo;` without a
+    /// body is a `module` with nothing in it (its contents live in another
+    /// file).
     pub kind: String,
     /// Source language (store `language` value).
     pub language: String,
@@ -38,9 +44,15 @@ pub struct Symbol {
     /// `const x = () => …`), whitespace collapsed, at most 200 characters
     /// (DD-17): `pub fn open(path: &Path) -> Result<Self>`.
     pub signature: String,
-    /// Visible outside the file (`public`, `export`, `pub`, a capital Go
-    /// name, no leading `_` in Python); `None` when the language says
-    /// nothing (a Rust `impl`).
+    /// Visible outside its package/module, by what the language declares:
+    /// `public` (Java; an interface member unless `private`), `export` or
+    /// `export { name }` (TS/JS; a class member: not `private`/`protected`/
+    /// `#x`, its class exported), `pub` of any kind (Rust), a capital name
+    /// (Go), a top-level or class-member name without a leading `_`
+    /// (Python; anything nested in a function is not). `None` when the
+    /// language says nothing (a Rust `impl`). Not "visible to another file":
+    /// Java package-private/`protected` and Go lowercase names are `false`
+    /// though the rest of their package sees them (PLAN-009 DD-6).
     pub exported: Option<bool>,
     /// Normalised parameter types (`Long,String`), only for languages that
     /// overload by them (Java); part of the id's disambiguator (DD-3).
@@ -48,6 +60,11 @@ pub struct Symbol {
     /// The trait of the Rust `impl Trait for Type` the symbol sits in
     /// (`Display`, `From<A>`); part of the id's disambiguator (DD-3).
     pub trait_of: Option<String>,
+    /// The self type's generic arguments and `where` clause of the Rust
+    /// `impl` the symbol is or sits in (`<u8>`, `<T>whereT:Copy`); part of
+    /// the id's disambiguator (DD-3), so `impl Foo<u8>` and `impl Foo<u16>`
+    /// (and their methods) differ.
+    pub impl_args: Option<String>,
     /// Which enclosing scopes of `qualified` are callables: one entry per
     /// scope, outermost first, `f` for a function or method, `s` otherwise
     /// (`Some("sf")` for `Outer.start.run`; Java adds the callable's

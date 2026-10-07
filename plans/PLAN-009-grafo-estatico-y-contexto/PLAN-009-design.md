@@ -108,7 +108,8 @@ CREATE TABLE IF NOT EXISTS edges (
     line        INTEGER,
     confidence  VARCHAR,      -- high|medium|low (DD-8)
     resolution  VARCHAR,      -- cómo se resolvió (DD-8): self|local|field|param|ctor_inject|import|
-                              -- same_file|same_package|unique_name|inherited|external_known|name_only
+                              -- same_file|same_package|unique_name|inherited|external_known|name_only;
+                              -- structural: `contains`, resuelto al parsear (DD-6), no por DD-7
     external    BOOLEAN,      -- sin definición en el repo y reconocido como de afuera (DD-9)
     from_test   BOOLEAN,      -- el archivo de la ocurrencia es de test
     edge_source VARCHAR       -- 'treesitter' hoy; 'scip' previsto (plan propio)
@@ -175,11 +176,15 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   `symbols.package`, **no** en `qualified`: el archivo ya está en el hash, `qualified` es lo que lee
   una persona y lo que busca TASK-008, y `graph_edges` usa la misma forma `Clase.metodo`.) Un `impl`
   de Rust es símbolo propio desde TASK-004 (kind `impl`, `qualified` = el nombre de su tipo,
-  disambiguator = su trait): sus métodos cuelgan de él por contención y él del tipo homónimo del
-  archivo.
+  disambiguator = su trait y los argumentos de su tipo): sus métodos cuelgan de él por contención y
+  él del tipo homónimo del archivo.
 - **`disambiguator`**: el trait de un `impl Trait for Tipo` de Rust, sin espacios ni ruta y con
   sus argumentos genéricos (`Display` y `Debug` de `X.fmt` difieren; `From<A>` y `From<B>`
-  también; `fmt::Display` es `Display`); la lista de tipos de parámetros normalizada (sin nombres,
+  también; `fmt::Display` es `Display`); para un `impl` y sus miembros, además, los argumentos
+  genéricos del tipo propio y la cláusula `where`, sin espacios, tras `~` (`impl Foo<u8>` y
+  `impl Foo<u16>` daban los dos `Foo` y sus `Foo.get` caían al ordinal, así que insertar uno arriba
+  movía el id del otro, el `parent_id` de sus métodos y sus `contains`; fixup de la revisión de
+  TASK-004 — costo aceptado: renombrar el parámetro de `impl<T> Foo<T>` cambia esos ids); la lista de tipos de parámetros normalizada (sin nombres,
   espacios, argumentos genéricos ni paquete: `java.util.List<String>` → `List`, porque dos
   sobrecargas no pueden diferir solo en genéricos) en lenguajes con sobrecarga de cuerpos
   separados — **solo Java** (`"overloads": true`); y la **forma del scope** cuando algún scope
@@ -221,7 +226,13 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   - TS/JS: funciones flecha y expresiones de función anónimas (callbacks) no son símbolos; desde
     TASK-004 sí lo son las asignadas a un `const`/`let`/`var` o a un campo de clase (kind `function`
     /`method`, nombradas por la variable o el campo);
-  - Go: dos `func init()` en un archivo (legal en Go) y funciones anónimas (no son símbolos).
+  - Go: dos `func init()` en un archivo (legal en Go) y funciones anónimas (no son símbolos);
+  - Rust: dos `impl Foo {}` idénticos (mismo tipo, mismos argumentos, mismo `where`).
+- **Varios nombres en una declaración** (TS/JS `const a = () => {}, b = () => {}`, Java
+  `int a, b;`, Go `var a, b int`): son hermanos, ninguno padre del otro. En TS/JS y Java cada uno
+  abarca su propio `variable_declarator` (el primero desde la palabra clave y su doc), así que sus
+  llamadas y usos de tipo son suyos; en Go no hay un nodo por nombre, comparten el rango, ninguno
+  contiene al otro y lo que haya adentro se atribuye al primero.
 - **Forma:** un solo FNV-1a sobre los cinco campos, separados por `␟` (0x1f), valor fijado por un
   test dorado (`the_id_format_is_pinned`). TASK-003 probó primero una composición XOR (mitad
   archivo ⊕ mitad símbolo) para que `rename_file` re-keyara sin re-parsear; se descartó en la
@@ -258,8 +269,11 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   ids tocando solo `parser.rs` y los índices de desarrollo de cd7d2a2 siguieron "vigentes". No se
   hashea el código fuente (un refactor, un comentario o `rustfmt` obligarían a todos a un `--full`
   con salida idéntica: el churn que TASK-002 evita). En su lugar: `EXTRACTOR_VERSION` sube a **3**
-  con TASK-004, y `crates/devctx-parse/tests/extractor_golden.rs` fija kind, `qualified` e id de
-  cada símbolo de un fixture por lenguaje (Rust, Java, TS, TSX, JS, Python, Go) contra
+  con TASK-004, y `crates/devctx-parse/tests/extractor_golden.rs` fija **todo lo que el índice
+  persiste de un parse** —paquete; por símbolo kind, `qualified`, id, padre (`contains`),
+  contenedor, `exported`, líneas y firma; por llamada fuente → destino y el nombre de fuente que
+  escribe `graph_edges`; `references`/`instantiates`, supertipos e imports con su fuente— de un
+  fixture por lenguaje (Rust, Java, TS, TSX, JS, Python, Go) contra
   `tests/golden/extractor.txt`, cuya primera línea guarda la versión con que se generó. Si la
   salida cambia y la versión no, falla con "la salida del extractor cambió: subí
   EXTRACTOR_VERSION y regenerá el golden"; si la versión cambió y el golden no, pide regenerarlo
@@ -366,6 +380,21 @@ separa:
    herencia), resuelve cada arista pendiente y escribe `dst_id`, `confidence`, `resolution`,
    `external`; después recalcula `rank`/`in_degree` (DD-12).
 
+**`contains` es intra-archivo y no pasa por el link pass.** Ambos extremos son símbolos del mismo
+archivo (lo afirma un `debug_assert` en `graph_rows` y el test `every_relation_of_a_file_is_an_edge`),
+así que se escribe resuelto al parsear (`dst_id`, `high`, `resolution = 'structural'`) y la copia
+entre ramas lo conserva. El link pass de TASK-005 **excluye `kind = 'contains'`** de lo que carga y
+resuelve. Una contención entre archivos que llegue en el futuro (p. ej. un `mod foo;` de Rust hacia
+`foo.rs`, un `partial`) se escribe **sin resolver** (`dst_id` NULL, sin `structural`), como
+cualquier otra arista, y la resuelve el link pass.
+
+**`exported` no sirve de filtro de candidatos intra-paquete.** `Symbol.exported` significa "visible
+fuera de su paquete/módulo" (`public`, `export` o `export { x }`, `pub`, mayúscula Go, sin `_` en
+Python y no anidado en una función). Java package-private/`protected` y Go en minúscula dan `false`
+aunque el resto del paquete los ve: un link pass que descarte candidatos con `exported = false`
+pierde toda la resolución dentro del paquete en Java y Go. Filtrar por `exported` solo vale para
+candidatos de **otro** paquete/módulo.
+
 **Incremental.** El link pass re-resuelve (a) las aristas de los archivos escritos en la corrida,
 (b) las aristas de otros archivos cuyo `dst_name` (o su último segmento) coincide con un símbolo
 agregado, borrado o renombrado en la corrida, y (c) las que quedaron sin resolver. Si los archivos
@@ -438,6 +467,9 @@ ocurrencia **se descarta** y se cuenta en `IndexResult.edges_discarded` (honesti
   0.73 contra 0.81, y el consumidor (impact, traverse, PageRank) solo necesita filtrar y ponderar.
 - `resolution` guarda el **porqué** para auditar (`gold-edges` de DD-1 reporta precisión por
   `resolution`). Si una regla resulta mala en campo, se baja su `confidence` sin tocar el resto.
+- `structural` es el valor de `contains` (DD-6), escrito al parsear: no es una regla de DD-7 y no
+  pisa `same_file`, que es de la regla 6. El arnés no lo cuenta: `calls_por_confianza` filtra
+  `kind = 'calls'` y `score.py` lee `graph_edges` (solo llamadas).
 - Las tools exponen `min_confidence` (default: `medium` en `impact`/`traverse`, `low` en
   `get_references`, porque "dónde se nombra esto" tolera ambigüedad si se la marca).
 

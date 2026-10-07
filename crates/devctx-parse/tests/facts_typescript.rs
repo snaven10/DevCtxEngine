@@ -29,7 +29,8 @@ fn an_exported_arrow_const_is_a_function_and_the_source_of_its_calls() {
         .iter()
         .any(|e| e.source == "tokenInterceptor" && e.target == "inject"));
     let helper = sym(&pf, "function", "helper");
-    assert_eq!(helper.exported, Some(false));
+    // Declared without `export`, exported by `export { helper }` below.
+    assert_eq!(helper.exported, Some(true));
     assert!(c.contains(&t2("helper", "log")));
     // An anonymous callback is no function: its call belongs to the method.
     assert!(c.contains(&t2("AuthService.ngOnInit", "audit")), "{c:?}");
@@ -56,6 +57,7 @@ fn typescript_symbols_classes_and_members() {
             "field AuthService.cache",
             "constructor AuthService.constructor",
             "method AuthService.ngOnInit",
+            "method AuthService.ngOnInit.cb",
             "method AuthService.handle",
             "method AuthService.load",
         ]
@@ -99,9 +101,69 @@ fn typescript_imports_are_structured() {
             "rxjs#*",
             "./auth.store#default",
             "./polyfills",
+            "./barrel#Thing",
+            "./barrel#Other",
+            "./all#*",
         ]
     );
+    // A barrel re-export is an import of what it re-exports (TASK-005
+    // follows it), aliased under the name it exports.
+    assert_eq!(pf.facts.imports[6].alias.as_deref(), Some("Alias"));
     let aliased = &pf.facts.imports[2];
     assert_eq!(aliased.alias.as_deref(), Some("Fn"));
     assert_eq!(pf.facts.imports[4].alias.as_deref(), Some("AuthStore"));
+}
+
+/// `graph_edges` names its source by text, and `impact_analysis` /
+/// `get_references` read it: an arrow is that source only when it is a
+/// symbol (a `const` or a class field). An arrow bound to an object key, to
+/// `this.x` or nested in a call belongs to the function that wrote it, and
+/// one bound to a local `const` is named as the symbol it is.
+#[test]
+fn graph_edges_name_an_arrow_only_when_it_is_a_symbol() {
+    let pf = facts(Lang::typescript(), "typescript/token.interceptor.ts", PATH);
+    let graph = |target: &str| -> Vec<String> {
+        pf.edges
+            .iter()
+            .filter(|e| e.target.ends_with(target))
+            .map(|e| e.source.clone())
+            .collect()
+    };
+    // `subscribe({ next: r => this.process(r) })`: `next` is no symbol.
+    assert_eq!(graph("process"), ["AuthService.ngOnInit"]);
+    // `const cb = () => …` inside a method is the symbol `…ngOnInit.cb`.
+    assert_eq!(graph("track"), ["AuthService.ngOnInit.cb"]);
+    // `this.onTick = () => …` in the constructor.
+    assert_eq!(graph("tick"), ["AuthService.constructor"]);
+    // The id-based source agrees with the text one.
+    let c = calls(&pf);
+    assert!(
+        c.contains(&t2("AuthService.ngOnInit", "AuthService.process")),
+        "{c:?}"
+    );
+    assert!(
+        c.contains(&t2("AuthService.ngOnInit.cb", "AuthService.track")),
+        "{c:?}"
+    );
+    assert!(
+        c.contains(&t2("AuthService.constructor", "AuthService.tick")),
+        "{c:?}"
+    );
+    // Every `graph_edges` source is the qualified name of a symbol.
+    let names: Vec<&str> = pf.symbols.iter().map(|s| s.qualified.as_str()).collect();
+    for e in &pf.edges {
+        assert!(
+            names.contains(&e.source.as_str()),
+            "{} is no symbol",
+            e.source
+        );
+    }
+}
+
+/// `exported` is "visible outside the module": `export { helper }` exports
+/// a symbol declared without the keyword.
+#[test]
+fn an_export_clause_exports_its_names() {
+    let pf = facts(Lang::typescript(), "typescript/token.interceptor.ts", PATH);
+    assert_eq!(sym(&pf, "function", "helper").exported, Some(true));
 }
