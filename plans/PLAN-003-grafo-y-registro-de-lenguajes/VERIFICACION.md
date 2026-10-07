@@ -20,7 +20,7 @@ publicado como en este build.
 Los cinco que desaparecieron:
 
 ```
-Office.findByCodigo(codigo).flatMap
+Office.findByCode(code).flatMap
 .persist(office).replaceWith
 Office.<Office>findById(idOffice).flatMap
 .persist(office).replaceWith(

@@ -22,7 +22,7 @@ cadena fluida el nodo `object` es toda la expresión previa. Targets reales que
 devolvió `devctx impact OfficeService.actualizar` sobre backend-a:
 
 ```
-Office.findByCodigo(codigo).flatMap
+Office.findByCode(code).flatMap
 Office.<Office>findById(idOffice).flatMap
 Office
         .persist(office).replaceWith(
@@ -45,8 +45,8 @@ nombre pelado — solo hay que llegar a ella.
 
 - [x] **Paso 1 — Escribir los tests que fallan.** En `crates/devctx-parse/src/lib.rs`,
       con fuente Java:
-      `Office.findByCodigo(c).flatMap(x -> y)` → el target de `flatMap` es
-      `flatMap`, **no** `Office.findByCodigo(c).flatMap`.
+      `Office.findByCode(c).flatMap(x -> y)` → el target de `flatMap` es
+      `flatMap`, **no** `Office.findByCode(c).flatMap`.
       Y `this.repo.save(x)` → sigue resolviendo por `type_map` como hoy.
 - [x] **Paso 2 — Añadir `fn clean_receiver(text: &str) -> Option<&str>`.**
       Devuelve `Some` solo si el texto completo es un identificador o una cadena
