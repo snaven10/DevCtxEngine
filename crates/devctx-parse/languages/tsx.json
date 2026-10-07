@@ -18,5 +18,8 @@
     "interface_declaration",
     "enum_declaration"
   ],
-  "overloads": true
+  "scope_kinds": [
+    "internal_module",
+    "module"
+  ]
 }

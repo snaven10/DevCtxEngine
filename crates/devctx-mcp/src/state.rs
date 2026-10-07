@@ -939,7 +939,12 @@ fn pick_graph_branch(
         // A failed read counts as unknown, which is stale: never a silent "fine".
         extractor_stale: indexed
             && store
-                .extractor_stale(repo_path, branch, &devctx_index::extractor_fingerprint())
+                .extractor_stale(
+                    repo,
+                    repo_path,
+                    branch,
+                    &devctx_index::extractor_fingerprint(),
+                )
                 .unwrap_or(true),
     };
     if has(current) {
@@ -1433,6 +1438,7 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
         Some(r) => {
             let stale = store
                 .extractor_stale(
+                    &git.short_name(),
                     &repo_path,
                     &r.branch,
                     &devctx_index::extractor_fingerprint(),

@@ -27,15 +27,20 @@ pub struct Symbol {
     pub doc_start_byte: usize,
     /// Enclosing symbol name (class/impl/…), if any.
     pub parent: Option<String>,
-    /// Name qualified by every enclosing container, `Outer.Inner.method`
-    /// (the file symbol's is its path, set by [`ParsedFile::assign_ids`]).
+    /// Name qualified by every enclosing scope — container, enclosing symbol
+    /// (module, function, class), TypeScript namespace, Go receiver — as
+    /// `Outer.Inner.method`, `tests.helper`, `deco.wrapper` (the file
+    /// symbol's is its path, set by [`ParsedFile::assign_ids`]).
     pub qualified: String,
-    /// Provisional signature: the definition's first line, whitespace
-    /// collapsed, at most 200 characters.
+    /// Provisional signature: the definition up to its body, first line
+    /// only, whitespace collapsed, at most 200 characters.
     pub signature: String,
     /// Normalised parameter types (`Long,String`), only for languages that
-    /// overload by them; part of the id's disambiguator (DD-3).
+    /// overload by them (Java); part of the id's disambiguator (DD-3).
     pub params: Option<String>,
+    /// The trait of the Rust `impl Trait for Type` the symbol sits in
+    /// (`Display`, `From<A>`); part of the id's disambiguator (DD-3).
+    pub trait_of: Option<String>,
     /// Stable id (DD-3), `0` until [`ParsedFile::assign_ids`] runs.
     pub id: u64,
     /// The container's id, or the file symbol's for a top-level symbol;

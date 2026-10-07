@@ -23,10 +23,17 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   symbol with a stable, branch-free id, and one row per call *occurrence* —
   the second call to the same target from one method, and module-level calls
   (sourced from a per-file symbol), are no longer lost. Written in the same
-  per-file transaction as the vectors, kept on delete, rename, branch copy and
-  branch prune. `graph_edges` is still written as before, so 0.9.0 can read a
-  downgraded index. **Extractor version 2:** existing indexes report
-  `extractor_stale` until `devctx index --full` (which reuses every vector).
+  per-file transaction as the vectors and maintained on delete, branch copy and
+  branch prune; a renamed file's rows are dropped and rewritten by the reindex
+  at the new path (the id carries the file, so its symbols get new ids). The
+  qualified name carries every enclosing scope (module, function, class,
+  namespace, Go receiver) and a Rust trait impl carries its trait, so adding a
+  homonym elsewhere in a file does not move an existing symbol's id.
+  `graph_edges` is still written as before, so 0.9.0 can read a downgraded
+  index. **Extractor version 2:** existing indexes report `extractor_stale`
+  until `devctx index --full` (which reuses every vector); so does one whose
+  graph lost step with its files (files added or deleted by 0.9.0 after a
+  downgrade).
 
 ### Fixed
 
@@ -36,7 +43,9 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
 - Deleting a file the index never held no longer drops the HNSW/BM25 indexes.
 - Opening an index that has an HNSW index loads VSS *before* creating tables
   added by a release: the checkpoint after the DDL failed fatally ("unknown
-  index type 'HNSW'") and invalidated the database for the process.
+  index type 'HNSW'") and invalidated the database for the process. Where VSS
+  cannot be loaded at all (offline), every checkpoint over such an index is
+  skipped instead, leaving the write-ahead log for an open that can.
 
 ## 0.9.0 — 2026-10-05
 

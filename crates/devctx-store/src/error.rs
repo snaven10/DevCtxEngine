@@ -30,6 +30,16 @@ pub enum StoreError {
     #[error("the database is frozen: the server is shutting down and accepts no more writes")]
     Frozen,
 
+    /// A checkpoint was refused because it would invalidate the database: it
+    /// holds an HNSW index and the VSS extension is not loaded (an offline
+    /// machine that never installed it), which DuckDB fails fatally. The WAL
+    /// is left for an open that can load VSS.
+    #[error(
+        "checkpoint skipped: the database has an HNSW index and the VSS extension is not \
+         loaded, so DuckDB would invalidate it; the write-ahead log is kept"
+    )]
+    CheckpointUnsafe,
+
     /// An I/O failure (e.g. creating the database directory).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

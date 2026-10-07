@@ -330,9 +330,12 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         req.store
             .set_index_meta(&repo_path, &branch, EMBED_FP_META_KEY, FP_TRANSITION)?;
     }
-    let prev_extractor_stale =
-        req.store
-            .extractor_stale(&repo_path, &branch, &devctx_parse::extractor_fingerprint())?;
+    let prev_extractor_stale = req.store.extractor_stale(
+        &repo_short,
+        &repo_path,
+        &branch,
+        &devctx_parse::extractor_fingerprint(),
+    )?;
     // The exclude set decides what belongs in the index, and an incremental run
     // only looks at what changed since the last commit, so a rule added since
     // would leave what it now covers behind forever. A different fingerprint

@@ -190,6 +190,20 @@ impl Store {
         Ok(store)
     }
 
+    /// A store over an already-open connection, extensions and schema as the
+    /// caller left them: for tests that need a connection `open` would not
+    /// make (one that cannot load VSS).
+    #[cfg(test)]
+    pub(crate) fn over_connection(conn: Connection, dim: usize) -> Self {
+        Self {
+            conn,
+            dim,
+            metric_cache: std::sync::Mutex::new(None),
+            shared: Arc::new(Shared::default()),
+            in_tx: AtomicBool::new(false),
+        }
+    }
+
     /// Open and immediately release the database file at `path`, to learn
     /// whether another process holds it — without loading a model or touching
     /// the schema. A file that does not exist yet is not a conflict.
@@ -548,7 +562,14 @@ impl Store {
     /// out of a server whose indexing run is mid-file. Callers that are about
     /// to end the process need to know, so they can escalate to
     /// [`force_checkpoint`](Self::force_checkpoint).
+    ///
+    /// Refused with [`StoreError::CheckpointUnsafe`] when the checkpoint would
+    /// have to bind an HNSW index without VSS loaded — DuckDB fails that
+    /// fatally and invalidates the database for the rest of the process.
     pub fn try_checkpoint(&self) -> Result<()> {
+        if !schema::checkpoint_is_safe(&self.conn) {
+            return Err(StoreError::CheckpointUnsafe);
+        }
         self.conn.execute_batch("CHECKPOINT;")?;
         Ok(())
     }
@@ -560,7 +581,12 @@ impl Store {
     /// doing is lost — which it would be anyway once the process exits — but the
     /// rows already committed are folded into the file instead of being left in
     /// a WAL whose replay breaks the ART indexes (see `checkpoint`).
+    ///
+    /// Refused like [`try_checkpoint`](Self::try_checkpoint) when unsafe.
     pub fn force_checkpoint(&self) -> Result<()> {
+        if !schema::checkpoint_is_safe(&self.conn) {
+            return Err(StoreError::CheckpointUnsafe);
+        }
         self.conn.execute_batch("FORCE CHECKPOINT;")?;
         Ok(())
     }
@@ -969,17 +995,17 @@ impl Store {
 
     /// Update the `file` column for every row of a renamed file.
     ///
-    /// The file's `symbols` and `edges` move too, re-keyed: a symbol id
-    /// carries its file (PLAN-009 DD-3), so the renamed file's ids change —
-    /// to the ones a parse at the new path would give — and resolved edges
-    /// into it follow. One transaction.
+    /// The file's `symbols` and `edges` are dropped instead: a symbol id
+    /// carries its file (PLAN-009 DD-3), so the renamed file's symbols are new
+    /// ones, which the reindex of `new` writes. Edges elsewhere that resolved
+    /// into it are unresolved for the link pass. One transaction.
     pub fn rename_file(&self, repo: &str, branch: &str, old: &str, new: &str) -> Result<usize> {
         self.in_transaction(|| {
             let n = self.w()?.execute(
                 "UPDATE vectors SET file = ? WHERE repo = ? AND branch = ? AND file = ?",
                 [new, repo, branch, old],
             )?;
-            self.rename_file_graph(repo, branch, old, new)?;
+            self.rename_file_graph(repo, branch, old)?;
             Ok(n)
         })
     }

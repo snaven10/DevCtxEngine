@@ -6,22 +6,19 @@
 //! branch has one id, a branch copy needs no re-tagging, and moving a function
 //! within its file keeps the id that a memory or an agent wrote down.
 //!
-//! The two halves are hashed apart and combined with XOR:
-//!
 //! ```text
-//! id = fnv1a64("F" ␟ repo ␟ file)  XOR  fnv1a64("S" ␟ kind_class ␟ qualified ␟ disambiguator)
+//! id = fnv1a64(repo ␟ file ␟ kind_class ␟ qualified ␟ disambiguator)
 //! ```
 //!
-//! rather than as one run over all five fields. Same inputs, same stability,
-//! and one property a single run cannot give: renaming a file changes every id
-//! in it by the same mask ([`rename_delta`]), so the store can re-key a renamed
-//! file's rows without re-parsing it — the disambiguator, which it does not
-//! keep, cancels out. It also makes two symbols of one file collide exactly
-//! when their *what* halves do, wherever the file lives, so the ordinal that
-//! settles a collision is the same before and after a rename.
+//! One run over the five fields. A renamed file is a new set of symbols:
+//! its rows are deleted and the reindex writes them at the new path. (A
+//! first cut hashed the file and the symbol apart and XORed them, so a rename
+//! could re-key the rows without a parse; the qualified name carries the path
+//! too once TASK-004 lands, which breaks that, and nothing renamed through it
+//! anyway — the pipeline indexes a rename as a delete plus an add.)
 //!
 //! Lives in `devctx-core` because both the parser (which assigns ids) and the
-//! store (which re-keys them on a rename) need the same function.
+//! store (which names a file's own symbol) need the same function.
 
 /// The ASCII unit separator: keeps `["ab", "c"]` apart from `["a", "bc"]`.
 const SEP: u8 = 0x1f;
@@ -49,16 +46,6 @@ fn step(h: u64, b: u8) -> u64 {
     (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
 }
 
-/// The *where* half of an id.
-pub fn file_part(repo: &str, file: &str) -> u64 {
-    fnv1a64(&["F", repo, file])
-}
-
-/// The *what* half of an id.
-pub fn symbol_part(kind_class: &str, qualified: &str, disambiguator: &str) -> u64 {
-    fnv1a64(&["S", kind_class, qualified, disambiguator])
-}
-
 /// The id of a symbol (see the module docs). `kind_class` is
 /// [`kind_class`]`(kind)`, so a re-classification between interchangeable
 /// kinds (`function` ↔ `method`) keeps the id.
@@ -69,20 +56,12 @@ pub fn symbol_id(
     qualified: &str,
     disambiguator: &str,
 ) -> u64 {
-    file_part(repo, file) ^ symbol_part(kind_class, qualified, disambiguator)
+    fnv1a64(&[repo, file, kind_class, qualified, disambiguator])
 }
 
 /// The id of a file's own symbol, whose qualified name is the path itself.
 pub fn file_symbol_id(repo: &str, file: &str) -> u64 {
     symbol_id(repo, file, FILE_KIND, file, "")
-}
-
-/// What to XOR a symbol id with when its file moves from `old` to `new`.
-///
-/// Exact for every symbol but the file's own ([`file_symbol_id`]), whose
-/// qualified name is the path and so changes with it.
-pub fn rename_delta(repo: &str, old: &str, new: &str) -> u64 {
-    file_part(repo, old) ^ file_part(repo, new)
 }
 
 /// Kinds that are the same thing to a caller share one class, so the id does
@@ -103,6 +82,8 @@ pub fn sym_hex(id: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GOLDEN: &str = "8c7a385edfa98a4f";
 
     #[test]
     fn the_id_is_a_pure_function_of_its_inputs() {
@@ -130,14 +111,17 @@ mod tests {
         assert_ne!(fnv1a64(&["ab", "c"]), fnv1a64(&["a", "bc"]));
     }
 
+    /// The id is part of the index format: a change here re-keys every
+    /// stored id and needs an `EXTRACTOR_VERSION` bump.
     #[test]
-    fn a_rename_shifts_every_id_by_one_mask() {
-        let id = |file: &str, q: &str| symbol_id("r", file, "callable", q, "Long,String");
-        let d = rename_delta("r", "a/Old.java", "b/New.java");
-        assert_eq!(id("a/Old.java", "Svc.run") ^ d, id("b/New.java", "Svc.run"));
+    fn the_id_format_is_pinned() {
         assert_eq!(
-            id("a/Old.java", "Svc.stop") ^ d,
-            id("b/New.java", "Svc.stop")
+            sym_hex(symbol_id("repo", "src/a.rs", "callable", "Point.mag", "")),
+            GOLDEN
+        );
+        assert_eq!(
+            file_symbol_id("repo", "src/a.rs"),
+            fnv1a64(&["repo", "src/a.rs", "file", "src/a.rs", ""])
         );
     }
 

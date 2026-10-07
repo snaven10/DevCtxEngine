@@ -321,7 +321,9 @@ mod tests {
         assert_eq!(main.files_copied, 0, "stale rows must not be copied");
         assert!(!main.extractor_stale);
         let now = extractor_fingerprint();
-        assert!(!store.extractor_stale(&repo_path, "main", &now).unwrap());
+        assert!(!store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, "main", &now)
+            .unwrap());
 
         // Control: main is now fresh, so a fresh branch may copy from it.
         // (Dropped first: a branch that already holds the file copies nothing.)
@@ -623,7 +625,9 @@ mod tests {
         let branch = r1.branch.clone();
         let now = extractor_fingerprint();
         assert!(
-            !store.extractor_stale(&repo_path, &branch, &now).unwrap(),
+            !store
+                .extractor_stale(&repo_short_of(&dir), &repo_path, &branch, &now)
+                .unwrap(),
             "a fresh index carries the current extractor"
         );
         assert!(!r1.extractor_stale);
@@ -632,13 +636,17 @@ mod tests {
         store
             .set_index_meta(&repo_path, &branch, "extractor", "v0-old")
             .unwrap();
-        assert!(store.extractor_stale(&repo_path, &branch, &now).unwrap());
+        assert!(store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, &branch, &now)
+            .unwrap());
         write(&dir, "b.rs", "pub fn b() -> i32 { 2 }\n");
         commit_all(&dir, "add b");
         let r2 = index(&store, &dir);
         assert!(!r2.full_reindex);
         assert!(r2.extractor_stale, "an incremental run must not hide it");
-        assert!(store.extractor_stale(&repo_path, &branch, &now).unwrap());
+        assert!(store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, &branch, &now)
+            .unwrap());
 
         let r3 = run(IndexRequest {
             store: &store,
@@ -655,7 +663,9 @@ mod tests {
         })
         .unwrap();
         assert!(r3.full_reindex && !r3.extractor_stale);
-        assert!(!store.extractor_stale(&repo_path, &branch, &now).unwrap());
+        assert!(!store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, &branch, &now)
+            .unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1438,6 +1448,10 @@ mod tests {
             self.hit.load(std::sync::atomic::Ordering::SeqCst)
                 || self.seen.load(std::sync::atomic::Ordering::SeqCst) >= self.files
         }
+    }
+
+    fn repo_short_of(dir: &Path) -> String {
+        GitRepo::open(dir).unwrap().short_name()
     }
 
     fn repo_path_of(dir: &Path) -> String {
@@ -2657,7 +2671,9 @@ mod tests {
         store.delete_file_graph(&repo, "main", "a.py").unwrap();
         let now = extractor_fingerprint();
         assert!(now.starts_with("v2-"), "{now}");
-        assert!(store.extractor_stale(&repo_path, "main", &now).unwrap());
+        assert!(store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, "main", &now)
+            .unwrap());
 
         write(&dir, "b.py", "def b():\n    pass\n");
         commit_all(&dir, "add b");
@@ -2670,7 +2686,9 @@ mod tests {
 
         let full = index_branch(&store, &dir, "main", true);
         assert!(!full.extractor_stale);
-        assert!(!store.extractor_stale(&repo_path, "main", &now).unwrap());
+        assert!(!store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, "main", &now)
+            .unwrap());
         assert_eq!(store.file_symbols(&repo, "main", "a.py").unwrap().len(), 2);
         assert_eq!(
             store

@@ -1,15 +1,13 @@
 //! Assigning stable ids to a parsed file's symbols and edges (PLAN-009 DD-3).
 //!
-//! The hash itself lives in [`devctx_core::symbol_id`], shared with the store,
-//! which re-keys a renamed file without re-parsing it. What lives here is the
-//! part that needs the parse: which disambiguator each symbol gets, which
-//! symbol contains which, and which symbol each call comes from.
+//! The hash itself lives in [`devctx_core::symbol_id`], shared with the store.
+//! What lives here is the part that needs the parse: which disambiguator each
+//! symbol gets, which symbol contains which, and which symbol each call comes
+//! from.
 
 use std::collections::{HashMap, HashSet};
 
-pub use devctx_core::symbol_id::{
-    file_symbol_id, kind_class, rename_delta, sym_hex, symbol_id, FILE_KIND,
-};
+pub use devctx_core::symbol_id::{file_symbol_id, kind_class, sym_hex, symbol_id, FILE_KIND};
 
 use crate::types::{GraphEdge, ParsedFile, Symbol};
 
@@ -17,11 +15,19 @@ impl ParsedFile {
     /// Give every symbol its id and parent id, name the file symbol after
     /// `file`, and point every edge at its source symbol.
     ///
-    /// - **Disambiguator:** the normalised parameter types where the language
-    ///   overloads (so `run(Long)` and `run(String)` differ), else empty. Two
-    ///   symbols of the file still sharing kind class, qualified name and
-    ///   disambiguator take an ordinal in source order (`#1`, `#2`…), and so
-    ///   does a hash collision.
+    /// - **Qualified name** (set by the parser): every enclosing scope, so
+    ///   homonyms differ by where they are — `tests.helper`, `deco.wrapper`,
+    ///   `Outer.start.run`, Go `T.String`.
+    /// - **Disambiguator:** the trait of a Rust `impl Trait for` (so
+    ///   `Display`'s and `Debug`'s `X.fmt` differ), and the normalised
+    ///   parameter types where the language overloads with separate bodies
+    ///   (Java: `run(Long)` and `run(String)`), always, not only when an
+    ///   overload exists — adding one must not move the other's id. Else
+    ///   empty. Only two symbols still sharing kind class, qualified name and
+    ///   disambiguator (a Python redefinition, two anonymous classes in one
+    ///   method) take an ordinal in source order (`#1`, `#2`…), as does a
+    ///   hash collision: the last resort, and the one case where inserting a
+    ///   homonym above moves an id.
     /// - **Parent:** the innermost symbol whose span contains this one; else,
     ///   for a symbol whose container is not itself a symbol (a Rust `impl`),
     ///   the type of that name in this file; else the file symbol.
@@ -39,7 +45,12 @@ impl ParsedFile {
         let mut seen: HashMap<(String, String, String), usize> = HashMap::new();
         for sym in &mut self.symbols {
             let class = kind_class(&sym.kind).to_string();
-            let base = sym.params.clone().unwrap_or_default();
+            let base = match (&sym.trait_of, &sym.params) {
+                (Some(t), Some(p)) => format!("{t}|{p}"),
+                (Some(t), None) => t.clone(),
+                (None, Some(p)) => p.clone(),
+                (None, None) => String::new(),
+            };
             let n = seen
                 .entry((class.clone(), sym.qualified.clone(), base.clone()))
                 .or_insert(0);
@@ -289,6 +300,186 @@ setup()
         );
     }
 
+    /// The id of the symbol whose source text contains `marker`.
+    fn id_at(pf: &ParsedFile, src: &str, marker: &str) -> u64 {
+        pf.symbols
+            .iter()
+            .filter(|s| src[s.start_byte..s.end_byte].contains(marker))
+            .min_by_key(|s| s.end_byte - s.start_byte)
+            .unwrap_or_else(|| panic!("no symbol around {marker}: {:?}", pf.symbols))
+            .id
+    }
+
+    /// Inserting a homonym *above* an existing symbol must not move that
+    /// symbol's id: an ordinal in source order would hand the old id to the
+    /// newcomer, and a stored id would silently point at another function.
+    /// The qualified name carries every enclosing symbol (module, function,
+    /// class) and a Rust trait impl carries its trait, so the ordinal is
+    /// left for true redefinitions only.
+    #[test]
+    fn inserting_a_homonym_above_keeps_existing_ids() {
+        let cases: &[(Lang, &str, &str, &str, &[&str])] = &[
+            (
+                Lang::rust(),
+                "src/x.rs",
+                "\
+fn helper() { m_top(); }
+struct X;
+impl Display for X { fn fmt(&self) { m_display(); } }
+mod tests { fn helper() { m_tests(); } }
+",
+                "\
+mod other { fn helper() { n1(); } }
+impl Debug for X { fn fmt(&self) { n2(); } }
+fn helper() { m_top(); }
+struct X;
+impl Display for X { fn fmt(&self) { m_display(); } }
+mod tests { fn helper() { m_tests(); } }
+",
+                &["m_top", "m_display", "m_tests"],
+            ),
+            (
+                Lang::python(),
+                "deco.py",
+                "\
+def deco_a(f):
+    def wrapper():
+        m_a()
+    return wrapper
+
+def deco_b(f):
+    def wrapper():
+        m_b()
+    return wrapper
+",
+                "\
+def deco_z(f):
+    def wrapper():
+        n1()
+    return wrapper
+
+def deco_a(f):
+    def wrapper():
+        m_a()
+    return wrapper
+
+def deco_b(f):
+    def wrapper():
+        m_b()
+    return wrapper
+",
+                &["m_a", "m_b"],
+            ),
+            (
+                Lang::go(),
+                "t.go",
+                "package p\nfunc (a A) String() string { return m_a() }\n",
+                "package p\nfunc (b *B) String() string { return n1() }\n\
+                 func (a A) String() string { return m_a() }\n",
+                &["m_a"],
+            ),
+            (
+                Lang::java(),
+                "Outer.java",
+                "\
+class Outer {
+    void start() { new Runnable() { public void run() { m_start(); } }; }
+}
+",
+                "\
+class Outer {
+    void stop() { new Runnable() { public void run() { n1(); } }; }
+    void start() { new Runnable() { public void run() { m_start(); } }; }
+}
+",
+                &["m_start"],
+            ),
+        ];
+        for (lang, file, before, after, markers) in cases {
+            let a = ids(*lang, before, file);
+            let b = ids(*lang, after, file);
+            for m in *markers {
+                assert_eq!(
+                    id_at(&a, before, m),
+                    id_at(&b, after, m),
+                    "{}: the symbol around {m} changed id\nbefore {:#?}\nafter {:#?}",
+                    lang.name(),
+                    a.symbols,
+                    b.symbols
+                );
+            }
+        }
+    }
+
+    /// What the qualified name and the disambiguator say, per language.
+    #[test]
+    fn qualified_names_carry_every_enclosing_symbol() {
+        let q = |lang: Lang, src: &str| -> Vec<(String, Option<String>)> {
+            ids(lang, src, "f")
+                .symbols
+                .iter()
+                .map(|s| (s.qualified.clone(), s.trait_of.clone()))
+                .collect()
+        };
+        let rust = q(
+            Lang::rust(),
+            "mod a { struct P<T>(T); impl<T> P<T> { fn get(&self) { fn inner() {} } } \
+             impl<T> From<T> for P<T> { fn from(t: T) -> Self { P(t) } } }",
+        );
+        let names: Vec<&str> = rust.iter().map(|(q, _)| q.as_str()).collect();
+        assert_eq!(
+            names,
+            ["a", "a.P", "a.P.get", "a.P.get.inner", "a.P.from"],
+            "{rust:?}"
+        );
+        assert_eq!(rust[4].1.as_deref(), Some("From<T>"));
+        assert_eq!(rust[2].1, None);
+        let py = q(
+            Lang::python(),
+            "def deco(f):\n    def wrapper():\n        pass\n",
+        );
+        assert_eq!(py[1].0, "deco.wrapper");
+        let ts = q(
+            Lang::typescript(),
+            "namespace N { export function f() {} }\nfunction g() { function h() {} }\n",
+        );
+        let names: Vec<&str> = ts.iter().map(|(q, _)| q.as_str()).collect();
+        assert_eq!(names, ["N.f", "g", "g.h"], "{ts:?}");
+    }
+
+    /// A generic impl names its type without the parameters, so its methods
+    /// hang from the struct the file defines (`impl<T> Foo<T>` → `Foo`).
+    #[test]
+    fn a_generic_impl_hangs_from_its_type() {
+        let src = "struct Foo<T>(T);\nimpl<T> Foo<T> {\n    fn get(&self) {}\n}\n";
+        let pf = ids(Lang::rust(), src, "g.rs");
+        let get = pf.symbols.iter().find(|s| s.name == "get").unwrap();
+        assert_eq!(get.qualified, "Foo.get");
+        assert_eq!(get.parent.as_deref(), Some("Foo"));
+        assert_eq!(get.parent_id, Some(id_of(&pf, "Foo")));
+    }
+
+    /// TypeScript overload signatures are not symbols, so parameter types
+    /// would only make the id fragile to a type refactor: TS ids ignore them.
+    /// Java keeps them (its overloads are separate bodies).
+    #[test]
+    fn typescript_ids_ignore_parameter_types() {
+        let a = ids(Lang::typescript(), "function f(x: number) {}\n", "f.ts");
+        let b = ids(Lang::typescript(), "function f(x: string) {}\n", "f.ts");
+        assert_eq!(a.symbols[0].id, b.symbols[0].id);
+        assert_eq!(a.symbols[0].params, None);
+    }
+
+    /// The signature stops at the body, also when the body is on its line.
+    #[test]
+    fn the_signature_excludes_a_one_line_body() {
+        let pf = ids(Lang::python(), "def f(x): return x\n", "s.py");
+        assert_eq!(pf.symbols[0].signature, "def f(x):");
+        let pf = ids(Lang::rust(), "fn g() -> i32 { 1 }\nstruct S;\n", "s.rs");
+        assert_eq!(pf.symbols[0].signature, "fn g() -> i32");
+        assert_eq!(pf.symbols[1].signature, "struct S;");
+    }
+
     /// A nested class qualifies its members with the whole chain, so two
     /// inner classes with a member of the same name do not collide.
     #[test]
@@ -306,6 +497,6 @@ public class Outer {
         let find_a = pf.symbols.iter().find(|s| s.id == a).unwrap();
         assert_eq!(find_a.parent.as_deref(), Some("A"));
         assert_eq!(find_a.parent_id, Some(id_of(&pf, "Outer.A")));
-        assert_eq!(find_a.signature, "void find() {}");
+        assert_eq!(find_a.signature, "void find()");
     }
 }

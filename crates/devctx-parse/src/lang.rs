@@ -111,8 +111,14 @@ impl Lang {
         &self.0.container_kinds
     }
 
-    /// Whether callables overload by parameter types (Java, TypeScript), so a
-    /// symbol id carries them.
+    /// Node kinds that are no symbol of their own but name a scope, so they
+    /// enter a symbol's qualified name (a TypeScript `namespace`).
+    pub fn scope_kinds(self) -> &'static [String] {
+        &self.0.scope_kinds
+    }
+
+    /// Whether callables overload by parameter types with separate bodies
+    /// (Java), so a symbol id carries them.
     pub fn overloads(self) -> bool {
         self.0.overloads
     }

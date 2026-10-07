@@ -10,8 +10,6 @@
 
 use duckdb::params;
 
-use devctx_core::symbol_id::{file_symbol_id, rename_delta, FILE_KIND};
-
 use crate::error::Result;
 use crate::store::Store;
 
@@ -356,60 +354,26 @@ impl Store {
         self.replace_file_graph(repo, to_branch, file, &symbols, &edges)
     }
 
-    /// Move `old`'s graph rows to `new`, re-keying every id of the file.
+    /// Forget `old`'s graph rows on a rename; the reindex of `new` writes
+    /// them again.
     ///
-    /// The id carries the file (DD-3), so a renamed file's symbols are new
-    /// symbols to the index: same as a fresh parse at `new` would give them,
-    /// which the XOR composition of the id makes computable from the stored
-    /// id alone (`devctx_core::symbol_id`). Edges from other files already
-    /// resolved to one of them follow. Memories keep pointing by name.
-    pub(crate) fn rename_file_graph(
-        &self,
-        repo: &str,
-        branch: &str,
-        old: &str,
-        new: &str,
-    ) -> Result<()> {
-        let delta = rename_delta(repo, old, new);
-        let old_file = file_symbol_id(repo, old);
-        let new_file = file_symbol_id(repo, new);
-        let base = new.rsplit('/').next().unwrap_or(new);
-        // f(x): the file symbol gets its own new id, everything else the mask.
-        let remap = |col: &str| {
-            format!("CASE WHEN {col} = {old_file} THEN {new_file}::UBIGINT ELSE xor({col}, {delta}::UBIGINT) END")
-        };
+    /// A symbol id carries its file (DD-3), so the renamed file's symbols are
+    /// new symbols: nothing of the old rows is worth keeping under a new key,
+    /// and the qualified names would have to change with the path anyway.
+    /// Edges from other files already resolved into the old ids lose their
+    /// destination (`dst_id` and its resolution), which the link pass
+    /// re-resolves (DD-6), rather than pointing at symbols that no longer
+    /// exist. Memories keep pointing by name.
+    pub(crate) fn rename_file_graph(&self, repo: &str, branch: &str, old: &str) -> Result<()> {
         self.in_transaction(|| {
-            // Destinations first, while `symbols` still says which ids are
-            // the old file's.
             self.w()?.execute(
-                &format!(
-                    "UPDATE edges SET dst_id = {}
-                     WHERE repo = ? AND branch = ? AND dst_id IN
-                         (SELECT id FROM symbols WHERE repo = ? AND branch = ? AND file = ?)",
-                    remap("dst_id")
-                ),
-                params![repo, branch, repo, branch, old],
+                "UPDATE edges SET dst_id = NULL, confidence = NULL, resolution = NULL,
+                     external = NULL
+                 WHERE repo = ? AND branch = ? AND file <> ? AND dst_id IN
+                     (SELECT id FROM symbols WHERE repo = ? AND branch = ? AND file = ?)",
+                params![repo, branch, old, repo, branch, old],
             )?;
-            self.w()?.execute(
-                &format!(
-                    "UPDATE edges SET src_id = {}, file = ?
-                     WHERE repo = ? AND branch = ? AND file = ?",
-                    remap("src_id")
-                ),
-                params![new, repo, branch, old],
-            )?;
-            self.w()?.execute(
-                &format!(
-                    "UPDATE symbols SET id = {}, parent_id = {}, file = ?,
-                         qualified = CASE WHEN kind = ? THEN ? ELSE qualified END,
-                         name = CASE WHEN kind = ? THEN ? ELSE name END
-                     WHERE repo = ? AND branch = ? AND file = ?",
-                    remap("id"),
-                    remap("parent_id")
-                ),
-                params![new, FILE_KIND, new, FILE_KIND, base, repo, branch, old],
-            )?;
-            Ok(())
+            self.delete_file_graph(repo, branch, old)
         })
     }
 }
@@ -417,7 +381,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devctx_core::symbol_id::symbol_id;
+    use devctx_core::symbol_id::{file_symbol_id, symbol_id, FILE_KIND};
 
     const DIM: usize = 3;
 
@@ -553,10 +517,11 @@ mod tests {
         assert_eq!(store.graph_row_counts("r", "dev").unwrap(), (2, 2));
     }
 
-    /// A rename re-keys the file to exactly the ids a parse at the new path
-    /// gives, and edges elsewhere that resolved into it follow.
+    /// A rename forgets the old path's graph rows, keeps nothing under the
+    /// new path for the reindex to collide with, and unresolves the edges of
+    /// other files that pointed into it (the link pass re-resolves them).
     #[test]
-    fn a_rename_rekeys_the_file_like_a_fresh_parse() {
+    fn a_rename_drops_the_old_rows_for_the_reindex() {
         let store = Store::open_in_memory(DIM).unwrap();
         let (s, e) = file_graph("r", "src/a.py");
         store
@@ -565,6 +530,7 @@ mod tests {
         // b.py calls a.py's `run`, already resolved.
         let (bs, mut be) = file_graph("r", "b.py");
         be[0].dst_id = Some(s[1].id);
+        be[0].confidence = Some("high".into());
         store
             .replace_file_graph("r", "main", "b.py", &bs, &be)
             .unwrap();
@@ -573,27 +539,29 @@ mod tests {
             .rename_file("r", "main", "src/a.py", "lib/moved.py")
             .unwrap();
 
-        let (want, want_edges) = file_graph("r", "lib/moved.py");
-        let got = store.file_symbols("r", "main", "lib/moved.py").unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].id, want[0].id, "the file symbol");
-        assert_eq!(got[0].qualified, "lib/moved.py");
-        assert_eq!(got[0].name, "moved.py");
-        assert_eq!(got[1].id, want[1].id);
-        assert_eq!(got[1].parent_id, Some(want[0].id));
-        assert_eq!(
-            store
-                .file_symbol_edges("r", "main", "lib/moved.py")
-                .unwrap(),
-            want_edges
-        );
-        assert!(store
-            .file_symbols("r", "main", "src/a.py")
-            .unwrap()
-            .is_empty());
+        for f in ["src/a.py", "lib/moved.py"] {
+            assert!(
+                store.file_symbols("r", "main", f).unwrap().is_empty(),
+                "{f}"
+            );
+            assert!(
+                store.file_symbol_edges("r", "main", f).unwrap().is_empty(),
+                "{f}"
+            );
+        }
         let b = store.file_symbol_edges("r", "main", "b.py").unwrap();
-        assert_eq!(b[0].dst_id, Some(want[1].id), "the resolved caller follows");
-        assert_eq!(b[1].dst_id, None);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].dst_id, None, "no edge points at a symbol that is gone");
+        assert_eq!(b[0].confidence, None);
+        assert_eq!(store.file_symbols("r", "main", "b.py").unwrap(), bs);
+
+        // The reindex at the new path writes ids of their own, not the old ones.
+        let (moved, moved_edges) = file_graph("r", "lib/moved.py");
+        assert_ne!(moved[1].id, s[1].id);
+        store
+            .replace_file_graph("r", "main", "lib/moved.py", &moved, &moved_edges)
+            .unwrap();
+        assert_eq!(store.graph_row_counts("r", "main").unwrap(), (4, 4));
     }
 
     /// The tables are created on a database that predates them, and the DDL
@@ -627,6 +595,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Build an HNSW index for a test that is *about* one. VSS is expected
+    /// (installed on first use; CI has the network), so its absence fails the
+    /// test instead of passing it with nothing asserted. An environment that
+    /// genuinely cannot load it opts out with `DEVCTX_TEST_ALLOW_NO_VSS=1`,
+    /// and the skip is announced. Same contract as `require_fts`.
+    fn require_vss(store: &Store, test: &str) -> bool {
+        if store.enable_hnsw("cosine").unwrap() {
+            return true;
+        }
+        assert!(
+            std::env::var_os("DEVCTX_TEST_ALLOW_NO_VSS").is_some(),
+            "{test}: the DuckDB VSS extension could not be loaded; set \
+             DEVCTX_TEST_ALLOW_NO_VSS=1 to skip HNSW tests explicitly"
+        );
+        eprintln!("SKIPPED {test}: VSS unavailable (DEVCTX_TEST_ALLOW_NO_VSS)");
+        false
+    }
+
+    /// A database with an HNSW index and one vector, and without the graph
+    /// tables (as a 0.9.0 index is), folded into the file. `None` when the
+    /// test was skipped for want of VSS.
+    fn hnsw_db_without_graph_tables(test: &str) -> Option<std::path::PathBuf> {
+        let dir = std::env::temp_dir().join(format!("devctx_{test}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.duckdb");
+        let store = Store::open(&db, DIM).unwrap();
+        if !require_vss(&store, test) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO vectors (id, vector, repo, branch, file)
+                 VALUES ('p', [0.1, 0.2, 0.3]::FLOAT[3], 'r', 'main', 'a.rs');
+                 DROP TABLE symbols; DROP TABLE edges; CHECKPOINT;",
+            )
+            .unwrap();
+        Some(db)
+    }
+
     /// The same upgrade over an index with an HNSW index (`storage.hnsw`, the
     /// default `init` writes). The checkpoint after the new tables has to bind
     /// the HNSW index; opened without VSS loaded first, DuckDB failed it with
@@ -634,33 +644,60 @@ mod tests {
     /// a real 0.9.0 index before this test existed.
     #[test]
     fn an_existing_hnsw_database_gains_the_tables() {
-        let dir = std::env::temp_dir().join(format!("devctx_symbols_hnsw_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("index.duckdb");
-        {
-            let store = Store::open(&db, DIM).unwrap();
-            if !store.enable_hnsw("cosine").unwrap() {
-                eprintln!("VSS unavailable (offline?): skipped");
-                let _ = std::fs::remove_dir_all(&dir);
-                return;
-            }
-            store
-                .conn
-                .execute_batch(
-                    "INSERT INTO vectors (id, vector, repo, branch, file)
-                     VALUES ('p', [0.1, 0.2, 0.3]::FLOAT[3], 'r', 'main', 'a.rs');
-                     DROP TABLE symbols; DROP TABLE edges; CHECKPOINT;",
-                )
-                .unwrap();
-        }
+        let test = "an_existing_hnsw_database_gains_the_tables";
+        let Some(db) = hnsw_db_without_graph_tables(test) else {
+            return;
+        };
         {
             let store = Store::open(&db, DIM).expect("an HNSW index must open after an upgrade");
             assert_eq!(store.graph_row_counts("r", "main").unwrap(), (0, 0));
-            let wal = dir.join("index.duckdb.wal");
+            let wal = db.with_extension("duckdb.wal");
             assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), 0);
             store.delete_by_file("r", "main", "a.rs").unwrap();
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// The machine that cannot load VSS (offline, never installed): every
+    /// checkpoint over the HNSW index would invalidate the database, so the
+    /// schema upgrade and `Store`'s own checkpoints skip it, the connection
+    /// stays usable, and the WAL waits for an open that can load VSS.
+    #[test]
+    fn an_hnsw_database_without_vss_skips_the_checkpoint() {
+        let test = "an_hnsw_database_without_vss_skips_the_checkpoint";
+        let Some(db) = hnsw_db_without_graph_tables(test) else {
+            return;
+        };
+        {
+            let config = duckdb::Config::default()
+                .enable_autoload_extension(false)
+                .unwrap();
+            let conn = duckdb::Connection::open_with_flags(&db, config).unwrap();
+            assert!(
+                !crate::schema::checkpoint_is_safe(&conn),
+                "VSS is not loaded here"
+            );
+            crate::schema::init_schema(&conn, DIM).expect("the upgrade must not checkpoint");
+            let store = Store::over_connection(conn, DIM);
+            assert!(matches!(
+                store.try_checkpoint(),
+                Err(crate::StoreError::CheckpointUnsafe)
+            ));
+            assert!(matches!(
+                store.force_checkpoint(),
+                Err(crate::StoreError::CheckpointUnsafe)
+            ));
+            store.checkpoint(); // best-effort: no panic, no invalidation
+            let (s, e) = file_graph("r", "a.py");
+            store
+                .replace_file_graph("r", "main", "a.py", &s, &e)
+                .expect("the database is still valid");
+            assert_eq!(store.graph_row_counts("r", "main").unwrap(), (2, 2));
+        }
+        // An open that loads VSS replays the WAL and can checkpoint it.
+        let store = Store::open(&db, DIM).unwrap();
+        assert_eq!(store.graph_row_counts("r", "main").unwrap(), (2, 2));
+        store.try_checkpoint().unwrap();
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 }

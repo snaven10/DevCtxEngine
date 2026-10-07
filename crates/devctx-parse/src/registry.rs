@@ -60,8 +60,14 @@ pub struct LangDef {
     /// Node kinds that act as symbol containers, for the parent of a symbol and
     /// for telling a method from a function.
     pub container_kinds: Vec<String>,
-    /// Whether the language overloads callables by parameter types, so that
-    /// a symbol's id carries them (PLAN-009 DD-3).
+    /// Node kinds that are not symbols but name a scope (a TypeScript
+    /// `namespace`): they enter the qualified name of what they enclose, as
+    /// every enclosing symbol and container does (PLAN-009 DD-3).
+    #[serde(default)]
+    pub scope_kinds: Vec<String>,
+    /// Whether the language overloads callables by parameter types with
+    /// separate bodies (Java), so that a symbol's id carries them (PLAN-009
+    /// DD-3). Not TypeScript: its overload signatures are not symbols.
     #[serde(default)]
     pub overloads: bool,
 }

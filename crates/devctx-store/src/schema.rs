@@ -34,7 +34,9 @@ pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
 /// offline machine that never installed it): DuckDB then fails the checkpoint
 /// *fatally* and invalidates the database for the rest of the process. The
 /// DDL stays in the WAL instead — no worse than before the table existed.
-fn checkpoint_is_safe(conn: &Connection) -> bool {
+/// [`Store::checkpoint`](crate::Store::checkpoint) and its siblings ask the
+/// same question before every checkpoint.
+pub(crate) fn checkpoint_is_safe(conn: &Connection) -> bool {
     let hnsw = conn
         .query_row(
             "SELECT count(*) > 0 FROM duckdb_indexes() WHERE upper(sql) LIKE '%USING HNSW%'",

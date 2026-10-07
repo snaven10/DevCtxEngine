@@ -193,12 +193,57 @@ impl Store {
     /// recorded extractor — every index made before this existed — counts as
     /// stale: its extractor is unknown, and "unknown" must not read as "fine".
     ///
+    /// So does one whose graph is out of step with its files
+    /// ([`graph_out_of_step`](Self::graph_out_of_step)): the stamp is only
+    /// rewritten by a full run, so an older binary's incremental runs leave
+    /// it saying "current" over files whose `symbols` rows they never wrote.
+    /// `repo` is the short name the graph tables are keyed by.
+    ///
     /// [`extractor fingerprint`]: EXTRACTOR_META_KEY
-    pub fn extractor_stale(&self, repo_path: &str, branch: &str, current: &str) -> Result<bool> {
-        Ok(self
+    pub fn extractor_stale(
+        &self,
+        repo: &str,
+        repo_path: &str,
+        branch: &str,
+        current: &str,
+    ) -> Result<bool> {
+        if self
             .get_index_meta(repo_path, branch, EXTRACTOR_META_KEY)?
             .as_deref()
-            != Some(current))
+            != Some(current)
+        {
+            return Ok(true);
+        }
+        self.graph_out_of_step(repo, repo_path, branch)
+    }
+
+    /// Whether `file_state` and the symbol graph disagree on which files a
+    /// branch holds: a file with symbols but no `file` symbol row (added by
+    /// a binary that does not write the graph, 0.9.0 after a downgrade), or a
+    /// `file` symbol row whose file has no state any more (deleted by one).
+    ///
+    /// Two anti-joins, cheap enough for every status. Not caught: a file such
+    /// a binary *modified*, whose symbol rows are still there, only older —
+    /// telling that apart needs a hash the graph does not keep.
+    pub fn graph_out_of_step(&self, repo: &str, repo_path: &str, branch: &str) -> Result<bool> {
+        let n: bool = self.conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM file_state f
+                 WHERE f.repo_path = ? AND f.branch = ? AND f.symbol_count > 0
+                   AND NOT EXISTS (SELECT 1 FROM symbols s
+                       WHERE s.repo = ? AND s.branch = f.branch AND s.kind = 'file'
+                         AND s.file = f.file_path)
+             ) OR EXISTS (
+                 SELECT 1 FROM symbols s
+                 WHERE s.repo = ? AND s.branch = ? AND s.kind = 'file'
+                   AND NOT EXISTS (SELECT 1 FROM file_state f
+                       WHERE f.repo_path = ? AND f.branch = s.branch
+                         AND f.file_path = s.file)
+             )",
+            params![repo_path, branch, repo, repo, branch, repo_path],
+            |r| r.get(0),
+        )?;
+        Ok(n)
     }
 
     /// The last-indexed content hash for a file, if recorded.
@@ -438,18 +483,74 @@ mod tests {
         // Simulates a database created before the table existed.
         store.conn.execute_batch("DROP TABLE index_meta;").unwrap();
         crate::schema::init_schema(&store.conn, 3).unwrap();
-        assert!(store.extractor_stale("/repo", "main", "v1-x").unwrap());
+        let stale = |b: &str, fp: &str| store.extractor_stale("r", "/repo", b, fp).unwrap();
+        assert!(stale("main", "v1-x"));
         store
             .set_index_meta("/repo", "main", EXTRACTOR_META_KEY, "v1-x")
             .unwrap();
-        assert!(!store.extractor_stale("/repo", "main", "v1-x").unwrap());
-        assert!(store.extractor_stale("/repo", "main", "v2-y").unwrap());
-        assert!(store.extractor_stale("/repo", "dev", "v1-x").unwrap());
+        assert!(!stale("main", "v1-x"));
+        assert!(stale("main", "v2-y"));
+        assert!(stale("dev", "v1-x"));
         // Replacing, not appending.
         store
             .set_index_meta("/repo", "main", EXTRACTOR_META_KEY, "v2-y")
             .unwrap();
-        assert!(!store.extractor_stale("/repo", "main", "v2-y").unwrap());
+        assert!(!stale("main", "v2-y"));
+    }
+
+    /// A downgrade to a binary that does not write the graph, a few
+    /// incremental runs, and back: the stamp still says "current", the
+    /// graph has holes and orphans. Both read as a stale extractor.
+    #[test]
+    fn a_graph_out_of_step_with_its_files_reads_as_stale() {
+        use crate::symbols::StoredSymbol;
+        let store = Store::open_in_memory(3).unwrap();
+        store
+            .set_index_meta("/repo", "main", EXTRACTOR_META_KEY, "v2-x")
+            .unwrap();
+        let state = |file: &str, symbols: i64| FileState {
+            repo_path: "/repo".into(),
+            branch: "main".into(),
+            file_path: file.into(),
+            content_hash: "h".into(),
+            language: "python".into(),
+            symbol_count: symbols,
+            chunk_count: 1,
+        };
+        let file_sym = |file: &str| StoredSymbol {
+            id: devctx_core::symbol_id::file_symbol_id("r", file),
+            file: file.into(),
+            kind: "file".into(),
+            name: file.into(),
+            qualified: file.into(),
+            ..Default::default()
+        };
+        let stale = || store.extractor_stale("r", "/repo", "main", "v2-x").unwrap();
+        store.save_file_state(&state("a.py", 2)).unwrap();
+        store
+            .replace_file_graph("r", "main", "a.py", &[file_sym("a.py")], &[])
+            .unwrap();
+        // A file without symbols has no graph to miss (raw text, empty code).
+        store.save_file_state(&state("README.md", 0)).unwrap();
+        assert!(!stale(), "in step");
+
+        // Added by the older binary: state, no graph.
+        store.save_file_state(&state("b.py", 1)).unwrap();
+        assert!(stale(), "a file with symbols and no graph rows");
+        store
+            .replace_file_graph("r", "main", "b.py", &[file_sym("b.py")], &[])
+            .unwrap();
+        assert!(!stale());
+
+        // Deleted by the older binary: graph rows, no state.
+        store.delete_file_state("/repo", "main", "a.py").unwrap();
+        assert!(stale(), "graph rows of a file that is gone");
+        // Another repo's rows in the same database are not this one's.
+        store.delete_file_graph("r", "main", "a.py").unwrap();
+        store
+            .replace_file_graph("other", "main", "c.py", &[file_sym("c.py")], &[])
+            .unwrap();
+        assert!(!stale());
     }
 
     /// Totals must survive a run that changed nothing: an incremental index

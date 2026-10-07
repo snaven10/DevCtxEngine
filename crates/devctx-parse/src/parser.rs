@@ -1,6 +1,6 @@
 //! The tree-sitter-backed language parser.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
@@ -176,49 +176,56 @@ impl LanguageParser {
         let names = self.symbol_query.capture_names();
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.symbol_query, root, bytes);
-        let mut out = Vec::new();
-
+        // Every definition first: the qualified name of each symbol needs to
+        // know which of its ancestors are symbols too.
+        let mut defs = Vec::new();
         while let Some(m) = matches.next() {
             for cap in m.captures {
-                let mut kind = names[cap.index as usize].to_string();
+                let kind = names[cap.index as usize].to_string();
                 let name_node = cap.node;
                 let Ok(name) = name_node.utf8_text(bytes) else {
                     continue;
                 };
                 let def = name_node.parent().unwrap_or(name_node);
-
-                let container = enclosing_container(def, self.lang.container_kinds());
-                let parent = container.and_then(|c| container_name(c, bytes));
-                if kind == "function" && container.is_some() {
-                    kind = "method".to_string();
-                }
-
-                let head = doc_head(def, bytes);
-                let mut chain = container_chain(def, bytes, self.lang.container_kinds());
-                chain.push(name.to_string());
-                let params = self
-                    .lang
-                    .overloads()
-                    .then(|| param_types(def, bytes))
-                    .flatten();
-                out.push(Symbol {
-                    name: name.to_string(),
-                    kind,
-                    language: self.lang.name().to_string(),
-                    start_line: def.start_position().row as u32 + 1,
-                    end_line: def.end_position().row as u32 + 1,
-                    start_byte: def.start_byte(),
-                    end_byte: def.end_byte(),
-                    doc_start_line: head.start_position().row as u32 + 1,
-                    doc_start_byte: head.start_byte(),
-                    parent,
-                    qualified: chain.join("."),
-                    signature: first_line(def, bytes),
-                    params,
-                    id: 0,
-                    parent_id: None,
-                });
+                defs.push((kind, name.to_string(), def));
             }
+        }
+        let def_ids: HashSet<usize> = defs.iter().map(|(_, _, d)| d.id()).collect();
+
+        let mut out = Vec::with_capacity(defs.len());
+        for (mut kind, name, def) in defs {
+            let container = enclosing_container(def, self.lang.container_kinds());
+            let parent = container.and_then(|c| container_name(c, bytes));
+            if kind == "function" && container.is_some() {
+                kind = "method".to_string();
+            }
+
+            let head = doc_head(def, bytes);
+            let mut chain = qualifier_chain(def, bytes, self.lang, &def_ids);
+            chain.push(name.clone());
+            let params = self
+                .lang
+                .overloads()
+                .then(|| param_types(def, bytes))
+                .flatten();
+            out.push(Symbol {
+                name,
+                kind,
+                language: self.lang.name().to_string(),
+                start_line: def.start_position().row as u32 + 1,
+                end_line: def.end_position().row as u32 + 1,
+                start_byte: def.start_byte(),
+                end_byte: def.end_byte(),
+                doc_start_line: head.start_position().row as u32 + 1,
+                doc_start_byte: head.start_byte(),
+                parent,
+                qualified: chain.join("."),
+                signature: signature_of(def, bytes),
+                params,
+                trait_of: impl_trait(def, bytes, self.lang.container_kinds()),
+                id: 0,
+                parent_id: None,
+            });
         }
         out.sort_by_key(|s| s.start_byte);
         out
@@ -437,37 +444,110 @@ fn enclosing_container<'t>(node: Node<'t>, kinds: &[String]) -> Option<Node<'t>>
     None
 }
 
-/// Display name of a container node: its `name` field, or `type` (Rust `impl`).
+/// Display name of a container node: its `name` field, or `type` (Rust
+/// `impl`) without generic arguments, so `impl<T> Foo<T>` is `Foo` — the name
+/// the type's own definition has.
 fn container_name(container: Node<'_>, bytes: &[u8]) -> Option<String> {
-    let name_node = container
-        .child_by_field_name("name")
-        .or_else(|| container.child_by_field_name("type"))?;
-    name_node.utf8_text(bytes).ok().map(str::to_string)
+    if let Some(name) = container.child_by_field_name("name") {
+        return name.utf8_text(bytes).ok().map(str::to_string);
+    }
+    let ty = container.child_by_field_name("type")?;
+    ty.utf8_text(bytes).ok().map(bare_type_name)
 }
 
-/// Names of every container around `node`, outermost first: the qualifier of
-/// a nested symbol (`Outer.Inner`), where `parent` keeps only the nearest.
-fn container_chain(node: Node<'_>, bytes: &[u8], kinds: &[String]) -> Vec<String> {
+/// A type as written in a container or receiver position, reduced to the
+/// name its definition carries: no generic arguments (`Foo<T>`, Go
+/// `Foo[T]`), no reference or pointer (`&Foo`, `&mut Foo`, `*Foo`), no
+/// whitespace.
+fn bare_type_name(text: &str) -> String {
+    let mut t = text.trim();
+    loop {
+        let stripped = t
+            .strip_prefix('&')
+            .or_else(|| t.strip_prefix('*'))
+            .or_else(|| t.strip_prefix("mut "))
+            .or_else(|| t.strip_prefix("dyn "))
+            .map(str::trim_start);
+        match stripped {
+            Some(rest) => t = rest,
+            None => break,
+        }
+    }
+    let end = t.find(['<', '[']).unwrap_or(t.len());
+    t[..end].chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Names of every scope around `def`, outermost first: its qualifier.
+///
+/// A scope is a container (class, `impl`, trait…), any other symbol of the
+/// file (a Rust `mod`, an enclosing function or method — a Python decorator's
+/// `wrapper`, a Java anonymous class's method) or a language's `scope_kinds`
+/// (a TypeScript `namespace`). A Go method is qualified by its receiver type.
+/// So two homonyms differ by where they are, not by their order in the file
+/// (PLAN-009 DD-3), and the ordinal is left for true redefinitions.
+fn qualifier_chain(
+    def: Node<'_>,
+    bytes: &[u8],
+    lang: Lang,
+    def_ids: &HashSet<usize>,
+) -> Vec<String> {
     let mut chain = Vec::new();
-    let mut cur = enclosing_container(node, kinds);
-    while let Some(c) = cur {
-        if let Some(name) = container_name(c, bytes) {
+    if let Some(recv) = go_receiver_type(def, bytes) {
+        chain.push(recv);
+    }
+    let mut cur = def.parent();
+    while let Some(n) = cur {
+        let name = if lang.container_kinds().iter().any(|k| k == n.kind()) {
+            container_name(n, bytes)
+        } else if def_ids.contains(&n.id()) || lang.scope_kinds().iter().any(|k| k == n.kind()) {
+            n.child_by_field_name("name")
+                .and_then(|c| c.utf8_text(bytes).ok())
+                .map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(name) = name {
             chain.push(name);
         }
-        cur = enclosing_container(c, kinds);
+        cur = n.parent();
     }
     chain.reverse();
     chain
 }
 
+/// The receiver type of a Go method (`func (s *Svc[T]) Run()` → `Svc`).
+fn go_receiver_type(def: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let list = def.child_by_field_name("receiver")?;
+    let mut cursor = list.walk();
+    let param = list
+        .named_children(&mut cursor)
+        .find(|p| p.kind() == "parameter_declaration")?;
+    let ty = param.child_by_field_name("type")?.utf8_text(bytes).ok()?;
+    Some(bare_type_name(ty)).filter(|t| !t.is_empty())
+}
+
+/// The trait of the nearest `impl Trait for Type` around `def`, whitespace
+/// removed, generic arguments kept (`From<A>` and `From<B>` are two impls).
+/// Part of the id's disambiguator: `impl Display for X { fn fmt }` and
+/// `impl Debug for X { fn fmt }` are both `X.fmt`.
+fn impl_trait(def: Node<'_>, bytes: &[u8], kinds: &[String]) -> Option<String> {
+    let imp = enclosing_container(def, kinds)?;
+    let tr = imp.child_by_field_name("trait")?.utf8_text(bytes).ok()?;
+    Some(tr.chars().filter(|c| !c.is_whitespace()).collect())
+}
+
 /// Longest provisional signature kept, in characters.
 const SIGNATURE_MAX: usize = 200;
 
-/// The definition's first line with whitespace collapsed, capped at
-/// [`SIGNATURE_MAX`] characters: a provisional signature until the
-/// structured extraction (PLAN-009 TASK-004) cuts it at the body.
-fn first_line(def: Node<'_>, bytes: &[u8]) -> String {
-    let text = def.utf8_text(bytes).unwrap_or_default();
+/// The definition up to its body (the whole of it when it has none), first
+/// line only, whitespace collapsed, capped at [`SIGNATURE_MAX`] characters:
+/// `fn g() -> i32 { 1 }` is `fn g() -> i32`. Provisional until the structured
+/// extraction (PLAN-009 TASK-004).
+fn signature_of(def: Node<'_>, bytes: &[u8]) -> String {
+    let end = def
+        .child_by_field_name("body")
+        .map_or(def.end_byte(), |b| b.start_byte());
+    let text = std::str::from_utf8(&bytes[def.start_byte()..end]).unwrap_or_default();
     let line = text.lines().next().unwrap_or_default();
     line.split_whitespace()
         .collect::<Vec<_>>()
