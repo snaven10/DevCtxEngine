@@ -2665,8 +2665,9 @@ mod tests {
             (Some(true), Some("medium"))
         );
         // An untyped lambda parameter calling a name the repository lacks:
-        // dropped and counted.
-        assert!(!edges.iter().any(|e| e.dst_name == "vanish"));
+        // dropped — kept as `discarded`, out of the counts — and counted.
+        let vanish = edges.iter().find(|e| e.dst_name == "vanish").unwrap();
+        assert_eq!(vanish.resolution.as_deref(), Some("discarded"));
         assert_eq!(res.edges_discarded, 1, "{res:?}");
         let contains: Vec<_> = edges.iter().filter(|e| e.kind == "contains").collect();
         assert!(!contains.is_empty());
@@ -2783,6 +2784,306 @@ public class Helper {
         assert_eq!(back.dst_id, Some(symbol(&helper, "Helper.run").id));
         assert_eq!(back.resolution.as_deref(), Some("field"));
         assert_eq!(contains(&caller(&store)), contains(&before));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every non-`contains` edge of the branch, in a comparable order.
+    fn linked_rows(store: &Store, repo: &str) -> Vec<String> {
+        let mut rows: Vec<String> = store
+            .branch_linkable_edges(repo, "main")
+            .unwrap()
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Run the link pass over the whole branch, as a full run would, and
+    /// answer whether it changed any row: an incremental pass must leave
+    /// nothing for it to fix.
+    fn full_link_changes(store: &Store, repo: &str) -> Vec<(String, String)> {
+        let before = linked_rows(store, repo);
+        crate::link::link_branch(
+            store,
+            repo,
+            "main",
+            &std::collections::HashSet::new(),
+            true,
+            &|| false,
+        )
+        .unwrap();
+        let after = linked_rows(store, repo);
+        before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .chain((before.len() != after.len()).then(|| {
+                (
+                    format!("{} rows", before.len()),
+                    format!("{} rows", after.len()),
+                )
+            }))
+            .collect()
+    }
+
+    fn index_with(
+        store: &Store,
+        dir: &Path,
+        full: bool,
+        progress: Option<&dyn ProgressSink>,
+    ) -> IndexResult {
+        run(IndexRequest {
+            store,
+            embedder: &FakeEmbedder,
+            repo_root: dir,
+            incremental: !full,
+            model_name: "minilm-l6",
+            progress,
+            paths: None,
+            exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
+            branch: Some("main"),
+        })
+        .unwrap()
+    }
+
+    /// The incremental link pass leaves the branch exactly as a full one
+    /// would (TASK-005 review, MAJOR 4): after a supertype changes, a return
+    /// type changes, `@Data` is added and a package moves — each a write of
+    /// one file whose effect reaches edges of files not written.
+    #[test]
+    fn an_incremental_link_pass_equals_a_full_one() {
+        let mut files = vec![
+            (
+                "p/A.java",
+                "package p;\npublic class A { public void m() {} }\n",
+            ),
+            (
+                "p/C.java",
+                "package p;\npublic class C { public void m() {} }\n",
+            ),
+            ("p/B.java", "package p;\npublic class B extends A {}\n"),
+            (
+                "p/X.java",
+                "package p;\npublic class X { public void doIt() {} }\n",
+            ),
+            (
+                "p/Y.java",
+                "package p;\npublic class Y { public void doIt() {} }\n",
+            ),
+            (
+                "p/R.java",
+                "package p;\npublic class R { public X find() { return null; } }\n",
+            ),
+            (
+                "p/D.java",
+                "package p;\npublic class D { private String name; }\n",
+            ),
+            (
+                "p/M.java",
+                "package p;\npublic class M { public void run() {} }\n",
+            ),
+            (
+                "q/U.java",
+                "package q;\nimport p.B;\nimport p.R;\nimport p.D;\nimport p.M;\n\
+                 class U {\n    void go(B b, R r, D d, M m) {\n        b.m();\n        \
+                 r.find().doIt();\n        d.getName();\n        m.run();\n    }\n}\n",
+            ),
+        ];
+        files.extend(LINK_FILLER);
+        files.extend([
+            ("g1.py", "def g1():\n    pass\n"),
+            ("g2.py", "def g2():\n    pass\n"),
+            ("g3.py", "def g3():\n    pass\n"),
+            ("g4.py", "def g4():\n    pass\n"),
+        ]);
+        let (dir, repo) = graph_repo("linkeq", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        assert!(full_link_changes(&store, &repo).is_empty());
+        let steps: [(&str, &str); 4] = [
+            ("p/B.java", "package p;\npublic class B extends C {}\n"),
+            (
+                "p/R.java",
+                "package p;\npublic class R { public Y find() { return null; } }\n",
+            ),
+            (
+                "p/D.java",
+                "package p;\n@lombok.Data\npublic class D { private String name; }\n",
+            ),
+            (
+                "p/M.java",
+                "package r;\npublic class M { public void run() {} }\n",
+            ),
+        ];
+        for (file, text) in steps {
+            write(&dir, file, text);
+            commit_all(&dir, file);
+            let inc = index_with(&store, &dir, false, None);
+            assert_eq!(inc.files_indexed, 1, "{file}: {inc:?}");
+            let diff = full_link_changes(&store, &repo);
+            assert!(
+                diff.is_empty(),
+                "{file}: the incremental pass left {diff:#?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link pass cut short (a stop, a crash) is owed: the next run does it
+    /// in full, though its files are unchanged and it writes none (MAJOR 5).
+    #[test]
+    fn a_link_pass_cut_short_is_done_by_the_next_run() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkcut", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        write(
+            &dir,
+            "src/a/Caller.java",
+            &LINK_CALLER.replace("go(", "walk("),
+        );
+        commit_all(&dir, "rename go");
+        let stop = CancelAt::new(Some("link"), usize::MAX);
+        let cut = index_with(&store, &dir, false, Some(&stop));
+        assert!(cut.cancelled, "{cut:?}");
+        let unlinked = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind != "contains" && e.resolution.is_none())
+                .count()
+        };
+        assert!(unlinked(&store) > 0, "the cut left the file unlinked");
+        let next = index_with(&store, &dir, false, None);
+        assert_eq!(next.files_indexed, 0, "nothing to reindex: {next:?}");
+        assert_eq!(unlinked(&store), 0, "the owed link pass did not run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A build whose link rules differ from the ones that linked the branch
+    /// relinks it in full on its next run, changed files or not (MAJOR 6).
+    #[test]
+    fn a_new_link_version_relinks_the_branch() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkver", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let good = store
+            .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+            .unwrap();
+        // What an older rule wrote: resolved, so no incremental selection
+        // would pick it again.
+        let stale: Vec<_> = good
+            .iter()
+            .filter(|e| e.kind != "contains")
+            .map(|e| devctx_store::StoredSymbolEdge {
+                resolution: Some("unique_name".into()),
+                confidence: Some("medium".into()),
+                dst_id: Some(e.src_id),
+                external: Some(false),
+                ..e.clone()
+            })
+            .collect();
+        store
+            .replace_files_linked_edges(&repo, "main", &[("src/a/Caller.java", stale)])
+            .unwrap();
+        let repo_path = repo_path_of(&dir);
+        store
+            .set_index_meta(&repo_path, "main", crate::link::LINK_VERSION_META_KEY, "0")
+            .unwrap();
+        index_with(&store, &dir, false, None);
+        assert_eq!(
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap(),
+            good
+        );
+        assert_eq!(
+            store
+                .get_index_meta(&repo_path, "main", crate::link::LINK_VERSION_META_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(crate::link::LINK_VERSION)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dropped call is kept, marked `discarded` (MAJOR 7): when a written
+    /// file defines its name, the incremental pass reopens it by name.
+    #[test]
+    fn a_discarded_call_is_kept_and_reopens_by_name() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkdisc", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let vanish = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.dst_name == "vanish")
+                .expect("the dropped call is kept")
+        };
+        let first = vanish(&store);
+        assert_eq!(first.resolution.as_deref(), Some("discarded"));
+        assert_eq!((first.dst_id, first.external), (None, Some(false)));
+        write(
+            &dir,
+            "src/b/Ghost.java",
+            "package b;\npublic class Ghost { public void vanish() {} }\n",
+        );
+        commit_all(&dir, "a vanish");
+        index_with(&store, &dir, false, None);
+        assert_eq!(vanish(&store).resolution.as_deref(), Some("name_only"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that is no source (a README) is no graph write: it does not
+    /// wake the link pass (MINOR).
+    #[test]
+    fn a_non_graph_file_does_not_wake_the_link_pass() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, _repo) = graph_repo("linkmd", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        let full = index_with(&store, &dir, true, None);
+        assert!(full.edges_linked > 0, "{full:?}");
+        write(&dir, "README.md", "# notes\n");
+        commit_all(&dir, "docs");
+        let docs = index_with(&store, &dir, false, None);
+        assert_eq!(docs.files_indexed, 1, "{docs:?}");
+        assert_eq!(
+            docs.edges_linked, 0,
+            "the link pass ran for a README: {docs:?}"
+        );
+        std::fs::remove_file(dir.join("README.md")).unwrap();
+        commit_all(&dir, "no docs");
+        let gone = index_with(&store, &dir, false, None);
+        assert_eq!(gone.files_deleted, 1, "{gone:?}");
+        assert_eq!(
+            gone.edges_linked, 0,
+            "the link pass ran for a deleted README: {gone:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

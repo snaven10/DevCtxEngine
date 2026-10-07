@@ -25,6 +25,20 @@ use devctx_store::{Store, StoredSymbolEdge};
 
 use crate::error::Result;
 
+/// Version of the link rules (`devctx_parse::resolve::link` and this
+/// module): what the branch's edges were resolved under. A build with other
+/// rules relinks the branch in full on its next run, as the extractor
+/// version does for the parse.
+pub(crate) const LINK_VERSION: &str = "1";
+
+/// `index_meta` key of [`LINK_VERSION`].
+pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
+
+/// `index_meta` key set while a run owes the branch a link pass (from before
+/// its first file to the end of the pass): a run cut short leaves it, and the
+/// next run links in full.
+pub(crate) const LINK_PENDING_META_KEY: &str = "link_pending";
+
 /// What a link pass did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LinkStats {
@@ -32,8 +46,9 @@ pub struct LinkStats {
     pub full: bool,
     /// Edges re-resolved.
     pub resolved: usize,
-    /// Calls dropped: an untypable receiver and a name the repository does
-    /// not define (DD-7).
+    /// Calls of the branch marked `discarded` after the pass: an untypable
+    /// receiver and a name the repository does not define (DD-7). Kept, so
+    /// a later definition reopens them.
     pub discarded: usize,
     /// `calls` of the branch left with neither a destination nor the
     /// `external` mark, after the pass.
@@ -53,7 +68,9 @@ pub struct LinkStats {
 /// Files whose rewritten edges commit together. Each file's rows are written
 /// whole inside one transaction — never split across two — but a transaction
 /// (and a `DELETE` scan) per file cost ~10 ms each (1 254 files of a Java
-/// repository: 12.9 of the pass's 14.1 s), so several files share one.
+/// repository: 12.9 of the pass's 14.1 s), so several files share one. A
+/// reader during a pass can see the branch half relinked (some files with
+/// the old answers, some with the new): each answer is a whole file's.
 const WRITE_BATCH: usize = 64;
 
 /// Write `pending` (whole files) in one transaction, and empty it.
@@ -70,6 +87,10 @@ fn write_batch(
     pending.clear();
     Ok(())
 }
+
+/// The `resolution` of a call the link pass dropped (DD-7): kept as a row,
+/// excluded from the counts and the readers, reopened by name.
+pub const DISCARDED: &str = "discarded";
 
 /// The fraction of a branch's files over which a run re-resolves every edge.
 const FULL_PASS_DIVISOR: usize = 5;
@@ -106,13 +127,6 @@ pub(crate) fn link_branch(
     let files: HashSet<&str> = symbols.iter().map(|s| s.file.as_str()).collect();
     let full = full || written.len() * FULL_PASS_DIVISOR > files.len();
     let ids: HashSet<u64> = symbols.iter().map(|s| s.id).collect();
-    // Names a written file now defines: an edge elsewhere that names one may
-    // reach it now (an added symbol).
-    let fresh: HashSet<&str> = symbols
-        .iter()
-        .filter(|s| written.contains(&s.file))
-        .map(|s| s.name.as_str())
-        .collect();
     let facts: Vec<LinkEdge> = edges
         .iter()
         .filter(|e| matches!(e.kind.as_str(), "imports" | "inherits" | "implements"))
@@ -135,6 +149,24 @@ pub(crate) fn link_branch(
         &facts,
     );
     drop(facts);
+    // What a written file changed that other files' edges may depend on
+    // (DD-6 mode b): every name it defines — methods, fields, types — and
+    // every type below one of its types (a changed `extends` moves what
+    // their members inherit). An edge is reopened when its `dst_name` or a
+    // token of its `hint` (the receiver's type, a chain's previous callee)
+    // is one of those names, or when its source sits in one of those types.
+    let written_ids: HashSet<u64> = symbols
+        .iter()
+        .filter(|s| written.contains(&s.file))
+        .map(|s| s.id)
+        .collect();
+    let affected = index.subtypes_of(&written_ids);
+    let mut fresh: HashSet<&str> = symbols
+        .iter()
+        .filter(|s| written.contains(&s.file))
+        .map(|s| s.name.as_str())
+        .collect();
+    fresh.extend(affected.iter().filter_map(|&id| index.name_of(id)));
     let loaded = started.elapsed().as_millis();
     let mut writing = std::time::Duration::ZERO;
 
@@ -151,53 +183,86 @@ pub(crate) fn link_branch(
         });
         list.push(e);
     }
+    let reopened = |e: &StoredSymbolEdge| -> bool {
+        fresh.contains(leaf(&e.dst_name))
+            || e.hint.as_deref().is_some_and(|h| {
+                h.split(|c: char| c.is_whitespace() || c == '.')
+                    .any(|t| fresh.contains(t))
+            })
+            || (!affected.is_empty() && index.within(e.src_id, &affected))
+    };
     let mut pending: Vec<(&str, Vec<StoredSymbolEdge>)> = Vec::new();
     for file in order {
         // Between files, never inside one: each file's rows are written
-        // whole in their own transaction.
+        // whole inside one transaction.
         if cancelled() {
             stats.cancelled = true;
             break;
         }
         let rows = &by_file[file];
         let file_written = written.contains(file);
-        let mut out: Vec<StoredSymbolEdge> = Vec::with_capacity(rows.len());
-        let mut changed = false;
-        for e in rows {
+        // Rows are cloned only once one of them changes.
+        let mut out: Option<Vec<StoredSymbolEdge>> = None;
+        for (i, e) in rows.iter().enumerate() {
             let pick = full
                 || file_written
                 || e.resolution.is_none()
                 || e.dst_id.is_some_and(|d| !ids.contains(&d))
                 || (e.dst_id.is_none() && !e.external.unwrap_or(false))
-                || fresh.contains(leaf(&e.dst_name));
-            if !pick {
-                out.push((*e).clone());
-                continue;
-            }
-            stats.resolved += 1;
-            match index.resolve(&to_link(e)) {
-                None => out.push((*e).clone()),
-                Some(Outcome::Discard) => {
-                    stats.discarded += 1;
-                    changed = true;
-                }
-                Some(Outcome::Resolved(r)) => {
-                    let new = StoredSymbolEdge {
+                || reopened(e);
+            let new = if pick {
+                stats.resolved += 1;
+                match index.resolve(&to_link(e)) {
+                    None => None,
+                    // Kept, marked: out of the counts and the readers, and
+                    // reopened by name when the repository defines it later
+                    // (the order files are indexed in must not decide it).
+                    Some(Outcome::Discard) => Some(StoredSymbolEdge {
+                        dst_id: None,
+                        confidence: Some("low".to_string()),
+                        resolution: Some(DISCARDED.to_string()),
+                        external: Some(false),
+                        ..(*e).clone()
+                    }),
+                    Some(Outcome::Resolved(r)) => Some(StoredSymbolEdge {
                         dst_id: r.dst_id,
                         confidence: Some(r.confidence.to_string()),
                         resolution: Some(r.resolution.to_string()),
                         external: Some(r.external),
                         ..(*e).clone()
-                    };
-                    changed |= new != **e;
-                    out.push(new);
+                    }),
                 }
+                .filter(|n| n != *e)
+            } else {
+                None
+            };
+            match (new, out.as_mut()) {
+                (Some(n), Some(o)) => o.push(n),
+                (Some(n), None) => {
+                    let mut o: Vec<StoredSymbolEdge> = Vec::with_capacity(rows.len());
+                    o.extend(rows[..i].iter().map(|r| (*r).clone()));
+                    o.push(n);
+                    out = Some(o);
+                }
+                (None, Some(o)) => o.push((*e).clone()),
+                (None, None) => {}
             }
         }
-        stats.unresolved_calls += out
-            .iter()
-            .filter(|e| e.kind == "calls" && e.dst_id.is_none() && !e.external.unwrap_or(false))
-            .count();
+        let changed = out.is_some();
+        let tally = |rows: &mut dyn Iterator<Item = &StoredSymbolEdge>, stats: &mut LinkStats| {
+            for e in rows.filter(|e| e.kind == "calls") {
+                if e.resolution.as_deref() == Some(DISCARDED) {
+                    stats.discarded += 1;
+                } else if e.dst_id.is_none() && !e.external.unwrap_or(false) {
+                    stats.unresolved_calls += 1;
+                }
+            }
+        };
+        match &out {
+            Some(o) => tally(&mut o.iter(), &mut stats),
+            None => tally(&mut rows.iter().copied(), &mut stats),
+        }
+        let out = out.unwrap_or_default();
         if changed {
             pending.push((file, out));
             if pending.len() >= WRITE_BATCH {

@@ -129,14 +129,18 @@ SELECT kind AS k, count(*)::VARCHAR AS v FROM edges GROUP BY kind ORDER BY count
 
 -- @metric calls_resueltas
 -- % de `calls` con `dst_id`, y las no decididas (sin `dst_id` y sin marca `external`).
-SELECT 'calls' AS k, count(*) FILTER (WHERE kind = 'calls')::VARCHAR AS v FROM edges
-UNION ALL SELECT 'con_dst_id_pct', round(100.0 * count(*) FILTER (WHERE kind = 'calls' AND dst_id IS NOT NULL) / nullif(count(*) FILTER (WHERE kind = 'calls'), 0), 1)::VARCHAR FROM edges
-UNION ALL SELECT 'no_decididas_pct', round(100.0 * count(*) FILTER (WHERE kind = 'calls' AND dst_id IS NULL AND NOT coalesce(external, false)) / nullif(count(*) FILTER (WHERE kind = 'calls'), 0), 1)::VARCHAR FROM edges
-UNION ALL SELECT 'external_pct', round(100.0 * count(*) FILTER (WHERE kind = 'calls' AND coalesce(external, false)) / nullif(count(*) FILTER (WHERE kind = 'calls'), 0), 1)::VARCHAR FROM edges
-UNION ALL SELECT 'from_test_pct', round(100.0 * count(*) FILTER (WHERE kind = 'calls' AND coalesce(from_test, false)) / nullif(count(*) FILTER (WHERE kind = 'calls'), 0), 1)::VARCHAR FROM edges;
+-- Las descartadas por el link pass (`resolution = 'discarded'`, TASK-005) quedan como
+-- fila pero fuera de los porcentajes: se cuentan aparte.
+WITH c AS (SELECT * FROM edges WHERE kind = 'calls' AND coalesce(resolution, '') <> 'discarded')
+SELECT 'calls' AS k, count(*)::VARCHAR AS v FROM c
+UNION ALL SELECT 'descartadas', count(*)::VARCHAR FROM edges WHERE kind = 'calls' AND resolution = 'discarded'
+UNION ALL SELECT 'con_dst_id_pct', round(100.0 * count(*) FILTER (WHERE dst_id IS NOT NULL) / nullif(count(*), 0), 1)::VARCHAR FROM c
+UNION ALL SELECT 'no_decididas_pct', round(100.0 * count(*) FILTER (WHERE dst_id IS NULL AND NOT coalesce(external, false)) / nullif(count(*), 0), 1)::VARCHAR FROM c
+UNION ALL SELECT 'external_pct', round(100.0 * count(*) FILTER (WHERE coalesce(external, false)) / nullif(count(*), 0), 1)::VARCHAR FROM c
+UNION ALL SELECT 'from_test_pct', round(100.0 * count(*) FILTER (WHERE coalesce(from_test, false)) / nullif(count(*), 0), 1)::VARCHAR FROM c;
 
 -- @metric calls_por_confianza
-SELECT coalesce(confidence, '(null)') || '/' || coalesce(resolution, '(null)') AS k, count(*)::VARCHAR AS v
+SELECT coalesce(confidence, '(null)') || '/' || coalesce(resolution, '(null)') || CASE WHEN coalesce(external, false) THEN '/ext' ELSE '' END AS k, count(*)::VARCHAR AS v
 FROM edges WHERE kind = 'calls' GROUP BY 1 ORDER BY count(*) DESC;
 
 -- @metric basura_nuevo

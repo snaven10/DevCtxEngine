@@ -271,7 +271,8 @@ if have_new:
                                        e.resolution, coalesce(e.external, false)
                                 from edges e left join symbols s
                                   on s.id = e.dst_id and s.repo = e.repo and s.branch = e.branch
-                                where e.kind in ('calls', 'instantiates')""").fetchall():
+                                where e.kind in ('calls', 'instantiates')
+                                  and coalesce(e.resolution, '') <> 'discarded'""").fetchall():
             w.writerow([("" if x is None else str(x).replace("\t", " ").replace("\n", " ")) for x in r])
 with open(f"{outdir}/symbols.tsv", "w", encoding="utf-8", newline="") as fh:
     w = csv.writer(fh, delimiter="\t"); w.writerow(["symbol", "symbol_type", "file"])

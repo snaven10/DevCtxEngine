@@ -221,6 +221,8 @@ pub struct IndexResult {
     /// (a fluent chain, an untyped local) and a name the repository does not
     /// define. Counted, like `files_skipped`, rather than kept as noise.
     pub edges_discarded: usize,
+    /// Edges the link pass re-resolved this run (0: it did not run).
+    pub edges_linked: usize,
     /// `calls` of the branch the link pass left with neither a destination
     /// nor the `external` mark (undecided, `low`).
     pub edges_unresolved: usize,
@@ -475,6 +477,23 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         }
     }
 
+    // A link pass owed by an earlier run (cut short after writing files) or
+    // made under other link rules: this run links the whole branch. The mark
+    // goes down before the first file and comes off when a pass completes.
+    let link_owed = req
+        .store
+        .get_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY)?
+        .is_some();
+    let link_stale = req
+        .store
+        .get_index_meta(&repo_path, &branch, crate::link::LINK_VERSION_META_KEY)?
+        .as_deref()
+        != Some(crate::link::LINK_VERSION);
+    if !link_owed {
+        req.store
+            .set_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY, "1")?;
+    }
+
     if let Some(p) = req.progress {
         p.start(changes.len());
     }
@@ -553,19 +572,36 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
 
     // The link pass (PLAN-009 DD-6): after every file and the prune, before
     // the record and the extractor stamp. Skipped when the run wrote no graph
-    // rows: nothing it could re-resolve has changed.
-    if !result.cancelled && (full_reindex || !ctx.graph_written.is_empty()) {
+    // rows and owes no pass: nothing it could re-resolve has changed.
+    let link_full = full_reindex || link_owed || link_stale;
+    let link_needed = link_full || !ctx.graph_written.is_empty();
+    if !result.cancelled && !link_needed {
+        req.store
+            .delete_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY)?;
+    }
+    if !result.cancelled && link_needed {
         let stats = heartbeat(req.progress, "link", || {
             crate::link::link_branch(
                 req.store,
                 &repo_short,
                 &branch,
                 &ctx.graph_written,
-                full_reindex,
+                link_full,
                 &cancelled,
             )
         })?;
+        if !stats.cancelled {
+            req.store
+                .delete_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY)?;
+            req.store.set_index_meta(
+                &repo_path,
+                &branch,
+                crate::link::LINK_VERSION_META_KEY,
+                crate::link::LINK_VERSION,
+            )?;
+        }
         result.edges_discarded = stats.discarded;
+        result.edges_linked = stats.resolved;
         result.edges_unresolved = stats.unresolved_calls;
         if stats.cancelled {
             result.cancelled = true;
@@ -1006,7 +1042,10 @@ impl Ctx<'_> {
             self.store
                 .delete_file_state(self.repo_path, self.branch, file)
         })?;
-        self.graph_written.insert(file.to_string());
+        // Only a source's rows are graph rows (a README is none).
+        if detect_lang(Path::new(file)).is_some() {
+            self.graph_written.insert(file.to_string());
+        }
         Ok(())
     }
 
@@ -1123,7 +1162,9 @@ impl Ctx<'_> {
             })?;
             if let Some((symbols, chunks)) = copied {
                 self.indexed.insert(file.to_string());
-                self.graph_written.insert(file.to_string());
+                if lang.is_some() {
+                    self.graph_written.insert(file.to_string());
+                }
                 result.files_indexed += 1;
                 result.files_copied += 1;
                 result.symbols += symbols;
