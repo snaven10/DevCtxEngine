@@ -1296,15 +1296,19 @@ impl Ctx<'_> {
 }
 
 /// The `symbols` and `edges` rows of one parsed file (ids already assigned):
-/// the file symbol first, then every symbol; one edge per call occurrence,
-/// module-level ones included, unresolved (`dst_id` and the rest are the link
-/// pass's to fill, PLAN-009 DD-6). The file symbol carries `content_hash`,
-/// the value `file_state` records for the same bytes.
+/// the file symbol first, then every symbol, with the file's package; one
+/// edge per occurrence (PLAN-009 TASK-004): every call (module-level ones
+/// included), import, supertype, instantiation and type use, unresolved
+/// (`dst_id` and the rest are the link pass's to fill, DD-6), and one
+/// `contains` per parent → child, resolved here because both ends are
+/// symbols of this file and an id carries no branch. The file symbol
+/// carries `content_hash`, the value `file_state` records for the same bytes.
 fn graph_rows(
     file: &str,
     parsed: &devctx_parse::ParsedFile,
     content_hash: &str,
 ) -> (Vec<StoredSymbol>, Vec<StoredSymbolEdge>) {
+    use devctx_parse::facts::{CONTAINS, IMPORTS};
     let is_test = devctx_core::path_kind(file, &parsed.language) == devctx_core::PathKind::Test;
     let symbols = std::iter::once(&parsed.file_symbol)
         .chain(&parsed.symbols)
@@ -1316,13 +1320,13 @@ fn graph_rows(
             name: s.name.clone(),
             qualified: s.qualified.clone(),
             container: s.parent.clone(),
-            package: None,
+            package: parsed.facts.package.clone(),
             signature: (!s.signature.is_empty()).then(|| s.signature.clone()),
             start_line: s.start_line as i32,
             end_line: s.end_line as i32,
             start_byte: s.start_byte as i64,
             end_byte: s.end_byte as i64,
-            exported: None,
+            exported: s.exported,
             rank: None,
             in_degree: None,
             is_test,
@@ -1330,23 +1334,53 @@ fn graph_rows(
                 .then(|| content_hash.to_string()),
         })
         .collect();
-    let mut edges: Vec<StoredSymbolEdge> = parsed
+    let edge = |kind: &str, src_id: u64, dst_name: &str, line: u32| StoredSymbolEdge {
+        kind: kind.to_string(),
+        src_id,
+        dst_id: None,
+        dst_name: dst_name.to_string(),
+        file: file.to_string(),
+        line: line as i32,
+        confidence: None,
+        resolution: None,
+        external: None,
+        from_test: is_test,
+        edge_source: "treesitter".to_string(),
+    };
+    let file_id = parsed.file_symbol.id;
+    let calls = parsed
         .edges
         .iter()
         .chain(&parsed.module_edges)
-        .map(|e| StoredSymbolEdge {
-            kind: e.kind.clone(),
-            src_id: e.src_id,
-            dst_id: None,
-            dst_name: e.target.clone(),
-            file: file.to_string(),
-            line: e.line as i32,
-            confidence: None,
-            resolution: None,
-            external: None,
-            from_test: is_test,
-            edge_source: "treesitter".to_string(),
+        .map(|e| edge(&e.kind, e.src_id, &e.target, e.line));
+    let contains = parsed.symbols.iter().filter_map(|s| {
+        let parent = s.parent_id?;
+        Some(StoredSymbolEdge {
+            dst_id: Some(s.id),
+            confidence: Some("high".to_string()),
+            resolution: Some("same_file".to_string()),
+            external: Some(false),
+            ..edge(CONTAINS, parent, &s.qualified, s.start_line)
         })
+    });
+    let facts = &parsed.facts;
+    let imports = facts
+        .imports
+        .iter()
+        .map(|i| edge(IMPORTS, file_id, &i.target, i.line));
+    let inherits = facts
+        .inherits
+        .iter()
+        .map(|f| edge(&f.kind, f.src_id, &f.name, f.line));
+    let refs = facts
+        .refs
+        .iter()
+        .map(|r| edge(&r.kind, r.src_id, &r.name, r.line));
+    let mut edges: Vec<StoredSymbolEdge> = calls
+        .chain(contains)
+        .chain(imports)
+        .chain(inherits)
+        .chain(refs)
         .collect();
     edges.sort_by_key(|e| e.line);
     (symbols, edges)

@@ -171,8 +171,12 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   sin nombre propio (`[T]`, `(A, B)`) conserva su texto sin espacios (`[T].fmt`) y su padre cae al
   símbolo de archivo. Ejemplos: `tests.helper`, `deco.wrapper`, `Outer.start.run`, `a.run` y
   `b.run` (dos objetos literales), `Op.PLUS.apply`, `C.a.run`. Así dos homónimos difieren por
-  *dónde* están y no por su orden en el archivo. (TASK-004 le agrega la ruta/paquete; la regla de
-  scopes se mantiene.)
+  *dónde* están y no por su orden en el archivo. (TASK-004: el paquete/módulo va en la columna
+  `symbols.package`, **no** en `qualified`: el archivo ya está en el hash, `qualified` es lo que lee
+  una persona y lo que busca TASK-008, y `graph_edges` usa la misma forma `Clase.metodo`.) Un `impl`
+  de Rust es símbolo propio desde TASK-004 (kind `impl`, `qualified` = el nombre de su tipo,
+  disambiguator = su trait): sus métodos cuelgan de él por contención y él del tipo homónimo del
+  archivo.
 - **`disambiguator`**: el trait de un `impl Trait for Tipo` de Rust, sin espacios ni ruta y con
   sus argumentos genéricos (`Display` y `Debug` de `X.fmt` difieren; `From<A>` y `From<B>`
   también; `fmt::Display` es `Display`); la lista de tipos de parámetros normalizada (sin nombres,
@@ -214,9 +218,9 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
     que dos de esos `run` en el mismo objeto comparten calificado y se separan por ordinal);
   - Java: clases anónimas dentro de lambdas (la lambda no tiene nombre, no es scope) en un mismo
     método;
-  - TS/JS: funciones flecha y expresiones de función no son símbolos todavía (TASK-004 las agrega
-    como `arrow`/`function_expression` asignadas a `const`; con `variable_declarator` como scope ya
-    quedan nombradas);
+  - TS/JS: funciones flecha y expresiones de función anónimas (callbacks) no son símbolos; desde
+    TASK-004 sí lo son las asignadas a un `const`/`let`/`var` o a un campo de clase (kind `function`
+    /`method`, nombradas por la variable o el campo);
   - Go: dos `func init()` en un archivo (legal en Go) y funciones anónimas (no son símbolos).
 - **Forma:** un solo FNV-1a sobre los cinco campos, separados por `␟` (0x1f), valor fijado por un
   test dorado (`the_id_format_is_pinned`). TASK-003 probó primero una composición XOR (mitad
@@ -242,12 +246,24 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   `index_state.indexed_at` de la rama (una corrida que escribe la rama termina con un `indexed_at`
   nuevo), y cada escritura de este proceso a la rama (`file_state`, tablas del grafo,
   `index_state`, `drop_branch`) o un rollback la invalida, antes de escribir y **otra vez al
-  COMMIT** (hasta el commit otra conexión del serve lee las filas viejas y podía cachearlas con
+  COMMIT** (cada uno de esos escritores corre en una transacción, la del llamador o la suya, así
+  que también en autocommit hay invalidación después de escribir) (hasta el commit otra conexión del serve lee las filas viejas y podía cachearlas con
   el mismo `indexed_at`); cada invalidación sube una generación y una respuesta calculada a
   través de una no se guarda; dentro de una transacción la conexión no usa la caché (ve sus
   propias filas sin commit). Así nunca es más vieja que las filas confirmadas. El primer
   anti-join mira los archivos de lenguaje parseable (`GRAPH_LANGUAGES`), no `symbol_count > 0`:
   un archivo parseable sin símbolos agregado por 0.9.0 también queda sin fila `file`. Sin caché era una consulta por tool call y una por archivo candidato a copia.
+- **Versión de la salida, no del código (decidido en la revisión de TASK-004).** El fingerprint
+  (`EXTRACTOR_VERSION` + hash de `languages/*.json`) no ve el Rust del extractor: db0a0ea cambió
+  ids tocando solo `parser.rs` y los índices de desarrollo de cd7d2a2 siguieron "vigentes". No se
+  hashea el código fuente (un refactor, un comentario o `rustfmt` obligarían a todos a un `--full`
+  con salida idéntica: el churn que TASK-002 evita). En su lugar: `EXTRACTOR_VERSION` sube a **3**
+  con TASK-004, y `crates/devctx-parse/tests/extractor_golden.rs` fija kind, `qualified` e id de
+  cada símbolo de un fixture por lenguaje (Rust, Java, TS, TSX, JS, Python, Go) contra
+  `tests/golden/extractor.txt`, cuya primera línea guarda la versión con que se generó. Si la
+  salida cambia y la versión no, falla con "la salida del extractor cambió: subí
+  EXTRACTOR_VERSION y regenerá el golden"; si la versión cambió y el golden no, pide regenerarlo
+  (`DEVCTX_UPDATE_GOLDEN=1 cargo test -p devctx-parse --test extractor_golden`).
 - FNV-1a 64 porque ya está en el árbol (`registry.rs:96-100`) y es estable entre plataformas y
   versiones (a diferencia de `DefaultHasher`). Probabilidad de colisión con 10⁶ símbolos ≈ 3·10⁻⁸;
   igual, el escritor detecta una colisión dentro del archivo y la resuelve con el ordinal.
@@ -315,6 +331,21 @@ pub trait LangResolver {
 `ParsedFile` gana `facts: FileFacts` (símbolos con id/firma/paquete, referencias con su receptor ya
 tipado localmente o marcado como no tipable, imports estructurados, herencias). `edges` y `symbols`
 viejos se siguen derivando para el chunker y para `graph_edges` (DD-2).
+
+**Implementado en TASK-004** (desvíos): `references` usa `@reference.call` + `@name` (+ `@path` para
+`Foo::bar` de Rust), `@reference.new` + `@type`, `@reference.type` (+ `@type`) y la clave
+`type_names` dice qué nodos son nombres de tipo dentro de un uso (`List<Foo>` = `List` y `Foo`; los
+parámetros de tipo declarados, `T`, se descartan); `inherits` captura el supertipo
+(`@inherit.extends`/`@inherit.implements`) y el definidor es el símbolo más interno que lo
+contiene; `imports` agrega `@import.default`, `@import.namespace` y `@import.tree` (el `use` de
+Rust lo expande el resolver); `package` (Java, Go) es una clave nueva. `scopes` y `@init` en
+`types` quedan para TASK-005-007, que son quienes los consumen (resolución con scope). El trait
+`LangResolver` (`resolve/mod.rs`) tiene solo la parte local —`package_from_path`, `exported`,
+`expand_import_tree`, `import_target`, `is_platform`—: las queries las compila y corre
+`LanguageParser` una vez por lenguaje y hilo, no el trait (compilarlas por archivo era el costo
+dominante del parse); `import_targets` llega con el link pass. Formato del destino de `imports`:
+Java `a.b.C`/`a.b.*`, Python `a.b`/`.m.x`/`m.*`, Rust `crate::a::B`/`a::*`, Go `net/http`, TS/JS
+`./x#Nombre`/`./x#default`/`./x#*`/`./x`.
 
 **Alternativas descartadas:** todo en Rust (pierde el hash del fingerprint como detector de cambio y
 la revisión "un archivo por lenguaje" que justificó `registry.rs:8-12`); todo en queries

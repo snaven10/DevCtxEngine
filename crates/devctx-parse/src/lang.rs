@@ -72,16 +72,33 @@ impl Lang {
         registry::grammar_for(&self.0.grammar).expect("a registered grammar")
     }
 
-    /// tree-sitter query capturing symbol definitions. The capture name is the
-    /// symbol kind (`function`/`class`/…); `function` is reclassified to
-    /// `method` at parse time when nested in a container.
-    pub fn symbol_query(self) -> &'static str {
-        &self.0.symbols
+    /// tree-sitter query capturing definitions (`@definition.<kind>` +
+    /// `@name`). `function` is reclassified to `method` at parse time when
+    /// nested in a container.
+    pub fn definitions_query(self) -> &'static str {
+        &self.0.definitions
     }
 
-    /// tree-sitter query capturing call callees as `@callee`.
-    pub fn calls_query(self) -> &'static str {
-        &self.0.calls
+    /// tree-sitter query capturing calls, instantiations and type uses
+    /// (`@reference.call`/`.new`/`.type`).
+    pub fn references_query(self) -> &'static str {
+        &self.0.references
+    }
+
+    /// tree-sitter query capturing supertypes (`@inherit.extends`/
+    /// `.implements`), if the language has any.
+    pub fn inherits_query(self) -> Option<&'static str> {
+        self.0.inherits.as_deref()
+    }
+
+    /// tree-sitter query capturing the declared package (`@package`).
+    pub fn package_query(self) -> Option<&'static str> {
+        self.0.package.as_deref()
+    }
+
+    /// Node kinds that name a type inside a type use.
+    pub fn type_names(self) -> &'static [String] {
+        &self.0.type_names
     }
 
     /// tree-sitter query capturing `@name`/`@type` binding pairs to resolve a
@@ -90,7 +107,8 @@ impl Lang {
         self.0.types.as_deref()
     }
 
-    /// tree-sitter query capturing whole import statements as `@import`.
+    /// tree-sitter query capturing import statements (`@import`) and what
+    /// they bring in (`@import.path`, `.name`, `.alias`…).
     pub fn import_query(self) -> &'static str {
         &self.0.imports
     }

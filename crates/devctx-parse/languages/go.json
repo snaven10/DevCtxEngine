@@ -4,13 +4,59 @@
   "extensions": [
     "go"
   ],
-  "symbols": "(function_declaration name: (identifier) @function)\n(method_declaration name: (field_identifier) @method)\n(type_declaration (type_spec name: (type_identifier) @type))",
-  "calls": "(call_expression function: (identifier) @callee)\n(call_expression function: (selector_expression field: (field_identifier) @callee))",
+  "definitions": "(function_declaration name: (identifier) @name) @definition.function\n(method_declaration name: (field_identifier) @name) @definition.method\n(type_declaration (type_spec name: (type_identifier) @name type: (struct_type)) @definition.struct)\n(type_declaration (type_spec name: (type_identifier) @name type: (interface_type)) @definition.interface)\n(type_declaration (type_spec name: (type_identifier) @name) @definition.type)\n(type_spec type: (struct_type (field_declaration_list (field_declaration name: (field_identifier) @name) @definition.field)))\n(source_file (const_declaration (const_spec name: (identifier) @name) @definition.const))\n(source_file (var_declaration (var_spec name: (identifier) @name) @definition.const))",
+  "references": "(call_expression function: (identifier) @name) @reference.call\n(call_expression function: (selector_expression field: (field_identifier) @name)) @reference.call\n(composite_literal type: (_) @type) @reference.new\n(field_declaration type: (_) @type) @reference.type\n(parameter_declaration type: (_) @type) @reference.type\n(var_spec type: (_) @type) @reference.type\n(function_declaration result: (_) @type) @reference.type\n(method_declaration result: (_) @type) @reference.type",
+  "inherits": "(type_spec type: (struct_type (field_declaration_list (field_declaration !name type: (_) @inherit.extends))))\n(type_spec type: (interface_type (type_elem (_) @inherit.extends)))",
   "types": "(var_spec name: (identifier) @name type: (type_identifier) @type)\n(parameter_declaration name: (identifier) @name type: (type_identifier) @type)\n(field_declaration name: (field_identifier) @name type: (type_identifier) @type)",
-  "imports": "(import_declaration) @import",
+  "imports": "(import_declaration (import_spec name: (_) @import.alias path: (_) @import.path)) @import\n(import_declaration (import_spec !name path: (_) @import.path)) @import\n(import_declaration (import_spec_list (import_spec name: (_) @import.alias path: (_) @import.path))) @import\n(import_declaration (import_spec_list (import_spec !name path: (_) @import.path))) @import",
+  "package": "(package_clause (package_identifier) @package)",
+  "type_names": [
+    "type_identifier",
+    "qualified_type"
+  ],
   "function_kinds": [
     "function_declaration",
     "method_declaration"
   ],
-  "container_kinds": []
+  "container_kinds": [],
+  "platform_prefixes": [
+    "fmt.",
+    "os.",
+    "io.",
+    "net/",
+    "strings.",
+    "strconv.",
+    "errors.",
+    "context.",
+    "time.",
+    "sync.",
+    "log."
+  ],
+  "builtins": [
+    "len",
+    "cap",
+    "make",
+    "new",
+    "append",
+    "copy",
+    "delete",
+    "panic",
+    "recover",
+    "print",
+    "println",
+    "close",
+    "string",
+    "int",
+    "int64",
+    "int32",
+    "uint",
+    "uint64",
+    "byte",
+    "rune",
+    "bool",
+    "float64",
+    "float32",
+    "error",
+    "any"
+  ]
 }

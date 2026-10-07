@@ -30,12 +30,23 @@ impl ParsedFile {
     ///   method) take an ordinal in source order (`#1`, `#2`…), as does a
     ///   hash collision: the last resort, and the one case where inserting a
     ///   homonym above moves an id.
-    /// - **Parent:** the innermost symbol whose span contains this one; else,
-    ///   for a symbol whose container is not itself a symbol (a Rust `impl`),
-    ///   the type of that name in this file; else the file symbol.
+    /// - **Parent:** the innermost symbol whose span contains this one (a
+    ///   method's `impl`); for a Rust `impl`, the type of that name beside
+    ///   it; else, for a symbol whose container is not itself a symbol (a Go
+    ///   method's receiver type), the type of that name in this file; else
+    ///   the file symbol.
     /// - **Edge source:** the symbol defined by the enclosing function node;
     ///   else the innermost symbol around the call; else the file symbol.
+    ///   The same for instantiations and type uses; a supertype's is the
+    ///   innermost symbol around it (the class, `impl` or trait naming it).
+    /// - **Package:** for a language that derives it from the path (Python,
+    ///   TS/JS, Rust), the module path of `file`.
     pub fn assign_ids(&mut self, repo: &str, file: &str) {
+        if self.facts.package.is_none() {
+            if let Some(lang) = crate::Lang::named(&self.language) {
+                self.facts.package = crate::resolve::resolver_for(lang).package_from_path(file);
+            }
+        }
         let file_id = file_symbol_id(repo, file);
         self.file_symbol.kind = FILE_KIND.to_string();
         self.file_symbol.qualified = file.to_string();
@@ -100,12 +111,34 @@ impl ParsedFile {
         for e in self.edges.iter_mut().chain(self.module_edges.iter_mut()) {
             e.src_id = source_of(e);
         }
+        for r in &mut self.facts.refs {
+            r.src_id = r
+                .source_byte
+                .and_then(|b| by_start.get(&b).copied())
+                .or_else(|| innermost_around(symbols, r.byte, r.byte, None).map(|j| symbols[j].id))
+                .unwrap_or(file_id);
+        }
+        for f in &mut self.facts.inherits {
+            f.src_id = innermost_around(symbols, f.byte, f.byte, None)
+                .map(|j| symbols[j].id)
+                .unwrap_or(file_id);
+        }
     }
 }
 
 /// The parent of `symbols[i]`, if any symbol of the file can be it.
 fn parent_of(symbols: &[Symbol], i: usize) -> Option<u64> {
     let s = &symbols[i];
+    // An `impl` belongs to the type it implements, when the file defines
+    // it beside the `impl` (same scope, same qualified name).
+    if s.kind == "impl" {
+        if let Some(t) = symbols
+            .iter()
+            .find(|t| kind_class(&t.kind) == "type" && t.qualified == s.qualified)
+        {
+            return Some(t.id);
+        }
+    }
     if let Some(j) = innermost_around(symbols, s.start_byte, s.end_byte, Some(i)) {
         return Some(symbols[j].id);
     }
@@ -296,14 +329,18 @@ setup()
     fn rust_impl_methods_hang_from_their_type() {
         let src = "struct Point;\nimpl Point {\n    fn mag(&self) {}\n}\n";
         let pf = ids(Lang::rust(), src, "p.rs");
+        let imp = pf.symbols.iter().find(|s| s.kind == "impl").unwrap();
+        let mag = pf.symbols.iter().find(|s| s.name == "mag").unwrap();
+        // The method hangs from its `impl` (the container that holds it),
+        // the `impl` from the type it implements.
+        assert_eq!(mag.parent_id, Some(imp.id));
+        assert_eq!(imp.parent_id, Some(id_of(&pf, "Point")));
         assert_eq!(
-            pf.symbols
-                .iter()
-                .find(|s| s.name == "mag")
-                .unwrap()
-                .parent_id,
-            Some(id_of(&pf, "Point"))
+            (imp.name.as_str(), imp.qualified.as_str()),
+            ("Point", "Point")
         );
+        assert_ne!(imp.id, id_of(&pf, "Point"), "an impl is not its type");
+        assert_eq!(mag.parent.as_deref(), Some("Point"));
     }
 
     /// The id of the symbol whose source text contains `marker`.
@@ -460,9 +497,9 @@ class C {
             (
                 Lang::rust(),
                 "j.rs",
-                "mod a { struct P { m_mod: u8 } }\n",
-                "fn a() { struct P { n1: u8 } }\nmod a { struct P { m_mod: u8 } }\n",
-                &["m_mod"],
+                "mod a { struct P(u8, M_mod); }\n",
+                "fn a() { struct P(u8, N1); }\nmod a { struct P(u8, M_mod); }\n",
+                &["M_mod"],
             ),
             // Java overloads around an anonymous class: `O()` and `O(int)`,
             // `m(int)` and `m(String)` are different scopes, so adding an
@@ -506,10 +543,12 @@ class O {
     /// What the qualified name and the disambiguator say, per language.
     #[test]
     fn qualified_names_carry_every_enclosing_symbol() {
+        // `impl` symbols aside: they carry their type's qualified name.
         let q = |lang: Lang, src: &str| -> Vec<(String, Option<String>)> {
             ids(lang, src, "f")
                 .symbols
                 .iter()
+                .filter(|s| s.kind != "impl")
                 .map(|s| (s.qualified.clone(), s.trait_of.clone()))
                 .collect()
         };
@@ -555,6 +594,7 @@ impl<T> std::convert::From<T> for Foo { fn from(t: T) -> Self { Foo } }
         let got: Vec<(&str, Option<&str>)> = pf
             .symbols
             .iter()
+            .filter(|s| s.kind != "impl")
             .map(|s| (s.qualified.as_str(), s.trait_of.as_deref()))
             .collect();
         assert_eq!(
@@ -571,12 +611,25 @@ impl<T> std::convert::From<T> for Foo { fn from(t: T) -> Self { Foo } }
         );
         let foo = id_of(&pf, "Foo");
         for s in &pf.symbols[1..] {
-            let want = if s.qualified.starts_with("[T]") {
-                pf.file_symbol.id
-            } else {
-                foo
-            };
-            assert_eq!(s.parent_id, Some(want), "{s:?}");
+            if s.kind == "impl" {
+                // The impl hangs from its type when the file defines it.
+                let want = if s.qualified == "Foo" {
+                    foo
+                } else {
+                    pf.file_symbol.id
+                };
+                assert_eq!(s.parent_id, Some(want), "{s:?}");
+                continue;
+            }
+            // A method hangs from its impl.
+            let imp = pf
+                .symbols
+                .iter()
+                .rfind(|t| {
+                    t.kind == "impl" && t.start_byte < s.start_byte && t.end_byte >= s.end_byte
+                })
+                .unwrap();
+            assert_eq!(s.parent_id, Some(imp.id), "{s:?}");
             assert_eq!(
                 s.parent.as_deref(),
                 Some(&s.qualified[..s.qualified.len() - s.name.len() - 1])
@@ -608,7 +661,10 @@ class S {
         let get = pf.symbols.iter().find(|s| s.name == "get").unwrap();
         assert_eq!(get.qualified, "Foo.get");
         assert_eq!(get.parent.as_deref(), Some("Foo"));
-        assert_eq!(get.parent_id, Some(id_of(&pf, "Foo")));
+        let imp = pf.symbols.iter().find(|s| s.kind == "impl").unwrap();
+        assert_eq!((imp.name.as_str(), imp.qualified.as_str()), ("Foo", "Foo"));
+        assert_eq!(get.parent_id, Some(imp.id));
+        assert_eq!(imp.parent_id, Some(id_of(&pf, "Foo")));
     }
 
     /// TypeScript overload signatures are not symbols, so parameter types

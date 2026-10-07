@@ -2537,12 +2537,13 @@ mod tests {
         let edges = store
             .file_symbol_edges(&repo, "main", "tools/run.py")
             .unwrap();
-        let names: Vec<_> = edges
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == "calls").collect();
+        let names: Vec<_> = calls
             .iter()
             .map(|e| (e.dst_name.as_str(), e.line))
             .collect();
         assert_eq!(names, vec![("main", 4), ("configure", 5)]);
-        assert!(edges.iter().all(|e| e.src_id == file.id));
+        assert!(calls.iter().all(|e| e.src_id == file.id));
         // `graph_edges` has no row for them: 0.9.0 has no source to give one.
         assert!(store
             .graph_edges(&repo, "main", None, None, 0)
@@ -2588,11 +2589,12 @@ mod tests {
         let (dir, repo) = graph_repo("copy", &[("c.py", "def f():\n    g()\n    g()\n")]);
         let store = Store::open_in_memory(DIM).unwrap();
         index_branch(&store, &dir, "main", true);
-        // As if the link pass had resolved one of them on main.
+        // As if the link pass had resolved one of the calls on main.
         let syms = store.file_symbols(&repo, "main", "c.py").unwrap();
         let mut edges = store.file_symbol_edges(&repo, "main", "c.py").unwrap();
-        edges[0].dst_id = Some(syms[1].id);
-        edges[0].confidence = Some("high".into());
+        let call = edges.iter().position(|e| e.kind == "calls").unwrap();
+        edges[call].dst_id = Some(syms[1].id);
+        edges[call].confidence = Some("high".into());
         store
             .replace_file_graph(&repo, "main", "c.py", &syms, &edges)
             .unwrap();
@@ -2601,11 +2603,112 @@ mod tests {
         }
         assert_eq!(store.file_symbols(&repo, "dev", "c.py").unwrap(), syms);
         let copied = store.file_symbol_edges(&repo, "dev", "c.py").unwrap();
-        assert_eq!(copied.len(), 2);
-        assert!(copied
+        let (contains, calls): (Vec<_>, Vec<_>) = copied.iter().partition(|e| e.kind == "contains");
+        assert_eq!(calls.len(), 2);
+        assert!(calls
             .iter()
             .all(|e| e.dst_id.is_none() && e.confidence.is_none()));
+        // Both ends of a `contains` are symbols of the file, the same on
+        // every branch: it keeps its destination.
+        assert_eq!(contains.len(), 1);
+        assert_eq!(contains[0].dst_id, Some(syms[1].id));
         assert_no_orphans(&store, &repo, "dev", &["c.py"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file writes every relation it has, one row per occurrence
+    /// (PLAN-009 TASK-004): calls, imports, supertypes, instantiations, type
+    /// uses and containment, and its symbols carry their package,
+    /// signature and visibility.
+    #[test]
+    fn every_relation_of_a_file_is_an_edge() {
+        let src = "\
+package com.example;
+
+import java.util.List;
+
+public class A extends B implements C {
+    private List<D> ds = new ArrayList<>();
+
+    public A(D d) {
+        helper();
+    }
+
+    void run() {
+        helper();
+    }
+}
+";
+        let (dir, repo) = graph_repo("kinds", &[("src/A.java", src)]);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let syms = store.file_symbols(&repo, "main", "src/A.java").unwrap();
+        let edges = store
+            .file_symbol_edges(&repo, "main", "src/A.java")
+            .unwrap();
+        let kinds: std::collections::BTreeSet<&str> =
+            edges.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds.into_iter().collect::<Vec<_>>(),
+            [
+                "calls",
+                "contains",
+                "implements",
+                "imports",
+                "inherits",
+                "instantiates",
+                "references"
+            ]
+        );
+        let file = symbol(&syms, "src/A.java");
+        let class = symbol(&syms, "A");
+        let ctor = symbol(&syms, "A.A");
+        assert_eq!(ctor.kind, "constructor");
+        assert_eq!(ctor.signature.as_deref(), Some("public A(D d)"));
+        assert!(syms
+            .iter()
+            .all(|s| s.package.as_deref() == Some("com.example")));
+        assert_eq!(class.exported, Some(true));
+        assert_eq!(symbol(&syms, "A.run").exported, Some(false));
+        let one = |kind: &str, dst: &str| {
+            edges
+                .iter()
+                .find(|e| e.kind == kind && e.dst_name == dst)
+                .unwrap_or_else(|| panic!("no {kind} {dst} in {edges:#?}"))
+        };
+        assert_eq!(one("imports", "java.util.List").src_id, file.id);
+        assert_eq!(one("inherits", "B").src_id, class.id);
+        assert_eq!(one("implements", "C").src_id, class.id);
+        let field = symbol(&syms, "A.ds");
+        assert_eq!(one("instantiates", "ArrayList").src_id, field.id);
+        assert_eq!(one("references", "List").src_id, field.id);
+        assert_eq!(one("references", "D").src_id, field.id);
+        // The constructor is a symbol: its call and its parameter's type
+        // come from it.
+        assert!(edges
+            .iter()
+            .any(|e| e.kind == "calls" && e.dst_name == "helper" && e.src_id == ctor.id));
+        assert!(edges
+            .iter()
+            .any(|e| e.kind == "references" && e.dst_name == "D" && e.src_id == ctor.id));
+        // Containment is resolved in the file; nothing else is yet.
+        let contains: Vec<_> = edges.iter().filter(|e| e.kind == "contains").collect();
+        assert_eq!(
+            contains.len(),
+            syms.len() - 1,
+            "one per symbol but the file's"
+        );
+        let top = one("contains", "A");
+        assert_eq!((top.src_id, top.dst_id), (file.id, Some(class.id)));
+        assert_eq!(one("contains", "A.run").src_id, class.id);
+        assert!(edges
+            .iter()
+            .filter(|e| e.kind != "contains")
+            .all(|e| e.dst_id.is_none() && e.confidence.is_none()));
+        assert_no_orphans(&store, &repo, "main", &["src/A.java"]);
+        // `graph_edges` stays calls only, in its 0.9.0 shape.
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        assert!(old.iter().all(|e| e.kind == "calls"), "{old:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2621,7 +2724,8 @@ mod tests {
         );
         let store = Store::open_in_memory(DIM).unwrap();
         index_branch(&store, &dir, "main", true);
-        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), (4, 2));
+        // Two symbols per file; per file a call and a `contains`.
+        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), (4, 4));
         std::fs::remove_file(dir.join("b.py")).unwrap();
         commit_all(&dir, "drop b");
         let r = index_branch(&store, &dir, "main", false);
@@ -2634,7 +2738,7 @@ mod tests {
             .file_symbol_edges(&repo, "main", "b.py")
             .unwrap()
             .is_empty());
-        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), (2, 1));
+        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), (2, 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2672,7 +2776,7 @@ mod tests {
             .unwrap();
         store.delete_file_graph(&repo, "main", "a.py").unwrap();
         let now = extractor_fingerprint();
-        assert!(now.starts_with("v2-"), "{now}");
+        assert!(now.starts_with("v3-"), "{now}");
         assert!(store
             .extractor_stale(&repo_short_of(&dir), &repo_path, "main", &now)
             .unwrap());
@@ -2696,7 +2800,9 @@ mod tests {
             store
                 .file_symbol_edges(&repo, "main", "a.py")
                 .unwrap()
-                .len(),
+                .iter()
+                .filter(|e| e.kind == "calls")
+                .count(),
             1
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2731,7 +2837,8 @@ mod tests {
         assert_eq!(impact.upstream, vec![("Svc.run".to_string(), 1)]);
         // The new tables hold the occurrences 0.9.0 folded or dropped.
         let edges = store.file_symbol_edges(&repo, "main", "svc.py").unwrap();
-        assert_eq!(edges.len(), 4, "{edges:?}"); // helper ×2, Svc, run at module level
+        let calls = edges.iter().filter(|e| e.kind == "calls").count();
+        assert_eq!(calls, 4, "{edges:?}"); // helper ×2, Svc, run at module level
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

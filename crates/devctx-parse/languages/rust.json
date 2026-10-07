@@ -4,15 +4,42 @@
   "extensions": [
     "rs"
   ],
-  "symbols": "(function_item name: (identifier) @function)\n(struct_item name: (type_identifier) @struct)\n(enum_item name: (type_identifier) @enum)\n(trait_item name: (type_identifier) @trait)\n(mod_item name: (identifier) @module)",
-  "calls": "(call_expression function: (identifier) @callee)\n(call_expression function: (field_expression field: (field_identifier) @callee))\n(call_expression function: (scoped_identifier name: (identifier) @callee))",
+  "definitions": "(function_item name: (identifier) @name) @definition.function\n(struct_item name: (type_identifier) @name) @definition.struct\n(union_item name: (type_identifier) @name) @definition.struct\n(enum_item name: (type_identifier) @name) @definition.enum\n(trait_item name: (type_identifier) @name) @definition.trait\n(mod_item name: (identifier) @name) @definition.module\n(impl_item type: (_) @name) @definition.impl\n(const_item name: (identifier) @name) @definition.const\n(static_item name: (identifier) @name) @definition.const\n(type_item name: (type_identifier) @name) @definition.type\n(struct_item body: (field_declaration_list (field_declaration name: (field_identifier) @name) @definition.field))\n(union_item body: (field_declaration_list (field_declaration name: (field_identifier) @name) @definition.field))",
+  "references": "(call_expression function: (identifier) @name) @reference.call\n(call_expression function: (field_expression field: (field_identifier) @name)) @reference.call\n(call_expression function: (scoped_identifier path: (_) @path name: (identifier) @name)) @reference.call\n(struct_expression name: (_) @type) @reference.new\n(field_declaration type: (_) @type) @reference.type\n(parameter type: (_) @type) @reference.type\n(let_declaration type: (_) @type) @reference.type\n(function_item return_type: (_) @type) @reference.type\n(const_item type: (_) @type) @reference.type\n(static_item type: (_) @type) @reference.type",
+  "inherits": "(impl_item trait: (_) @inherit.implements)\n(trait_item bounds: (trait_bounds (_) @inherit.extends))",
   "types": "(let_declaration pattern: (identifier) @name type: (type_identifier) @type)\n(parameter pattern: (identifier) @name type: (type_identifier) @type)\n(field_declaration name: (field_identifier) @name type: (type_identifier) @type)",
-  "imports": "(use_declaration) @import",
+  "imports": "(use_declaration argument: (_) @import.tree) @import",
+  "type_names": [
+    "type_identifier",
+    "scoped_type_identifier"
+  ],
   "function_kinds": [
     "function_item"
   ],
   "container_kinds": [
     "impl_item",
     "trait_item"
+  ],
+  "platform_prefixes": [
+    "std::",
+    "core::",
+    "alloc::"
+  ],
+  "builtins": [
+    "Some",
+    "None",
+    "Ok",
+    "Err",
+    "Box",
+    "Vec",
+    "String",
+    "Option",
+    "Result",
+    "drop",
+    "println",
+    "format",
+    "panic",
+    "assert",
+    "assert_eq"
   ]
 }

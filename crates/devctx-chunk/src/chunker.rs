@@ -11,7 +11,17 @@ use devctx_parse::{ParsedFile, Symbol};
 use crate::chunk::{estimate_tokens, Chunk, ChunkConfig};
 
 /// Symbol kinds that act as class-level containers.
-const CONTAINER_KINDS: &[&str] = &["class", "struct", "enum", "trait", "interface"];
+const CONTAINER_KINDS: &[&str] = &["class", "struct", "enum", "trait", "interface", "record"];
+
+/// Symbol kinds that are outline, not code to search (PLAN-009 TASK-004): a
+/// field, a constant and a Rust `impl` (its methods are chunks of their
+/// own) get no chunk, no doc chunk and no line in the file chunk's list, so
+/// a file whose searchable code did not change keeps the same chunks.
+const OUTLINE_ONLY: &[&str] = &["field", "const", "impl"];
+
+fn is_outline_only(s: &Symbol) -> bool {
+    OUTLINE_ONLY.contains(&s.kind.as_str())
+}
 
 /// Chunk one parsed file into embeddable chunks.
 pub fn chunk_file(path: &str, source: &str, parsed: &ParsedFile, cfg: &ChunkConfig) -> Vec<Chunk> {
@@ -162,6 +172,7 @@ fn doc_chunks(path: &str, source: &str, parsed: &ParsedFile) -> Vec<Chunk> {
     parsed
         .symbols
         .iter()
+        .filter(|sym| !is_outline_only(sym))
         .filter_map(|sym| {
             let doc = slice(source, sym.doc_start_byte, sym.start_byte).trim();
             if doc.len() < MIN_DOC_CHARS {
@@ -199,8 +210,9 @@ fn is_container(s: &Symbol) -> bool {
     CONTAINER_KINDS.contains(&s.kind.as_str())
 }
 
+/// Code a person searches for: functions, methods and constructors.
 fn is_callable(s: &Symbol) -> bool {
-    s.kind == "function" || s.kind == "method"
+    matches!(s.kind.as_str(), "function" | "method" | "constructor")
 }
 
 fn file_chunk(path: &str, parsed: &ParsedFile, total_lines: u32) -> Chunk {
@@ -215,7 +227,7 @@ fn file_chunk(path: &str, parsed: &ParsedFile, total_lines: u32) -> Chunk {
         }
     }
     text.push_str("# Symbols:\n");
-    for s in &parsed.symbols {
+    for s in parsed.symbols.iter().filter(|s| !is_outline_only(s)) {
         text.push_str(&format!("- {} ({})\n", s.name, s.kind));
     }
     Chunk::new(text, "file", base, "file", 1, total_lines, String::new())
@@ -461,6 +473,53 @@ fn wait_for_exit(pid: u32) -> bool { true }
             content.lines().count(),
             "the tail is covered"
         );
+    }
+
+    /// A constructor is code someone searches for: it gets a chunk and is
+    /// listed among its class's methods. A field, a constant or a Rust
+    /// `impl` is outline: no chunk of its own, no doc chunk, no line in the
+    /// file chunk (PLAN-009 TASK-004).
+    #[test]
+    fn constructors_are_chunks_and_fields_are_not() {
+        let src = "\
+public class Svc {
+    /** The repository this service reads and writes through, injected. */
+    private final Repo repo;
+    public Svc(Repo repo) {
+        this.repo = repo;
+        register(repo, \"a constructor long enough to be a chunk of its own\");
+        register(repo, \"and some more text to pass the minimum chunk size\");
+    }
+}
+";
+        let parsed = devctx_parse::parse(devctx_parse::Lang::java(), src).unwrap();
+        let chunks = chunk_file("Svc.java", src, &parsed, &ChunkConfig::default());
+        assert!(
+            chunks.iter().any(|c| c.symbol_type == "constructor"
+                || (c.symbol_type == "grouped" && c.symbol_name.contains("Svc"))),
+            "{chunks:#?}"
+        );
+        let class = chunks.iter().find(|c| c.level == "class").unwrap();
+        assert!(class.text.contains("# methods: Svc"), "{}", class.text);
+        assert!(
+            !chunks.iter().any(|c| c.symbol_name == "repo"),
+            "{chunks:#?}"
+        );
+        let file = chunks.iter().find(|c| c.level == "file").unwrap();
+        assert!(!file.text.contains("repo (field)"), "{}", file.text);
+
+        let rs = "\
+/// A long explanation of why this constant has the value it has, for sure.
+pub const LIMIT: usize = 8;
+struct P;
+/// A long explanation of why this impl exists and what it is for, really.
+impl P { fn f(&self) {} }
+";
+        let parsed = devctx_parse::parse(devctx_parse::Lang::rust(), rs).unwrap();
+        let chunks = chunk_file("p.rs", rs, &parsed, &ChunkConfig::default());
+        assert!(!chunks.iter().any(|c| c.level == "doc"), "{chunks:#?}");
+        let file = chunks.iter().find(|c| c.level == "file").unwrap();
+        assert_eq!(file.text.matches("\n- ").count(), 2, "{}", file.text);
     }
 
     #[test]

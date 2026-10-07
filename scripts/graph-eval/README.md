@@ -99,6 +99,14 @@ git clone <repo> $SB/repos/<nombre> && (cd $SB/repos/<nombre> && devctx init --y
 `DEVCTX_HOME` también separa el serve: el serve del sandbox es otro proceso y se apaga con
 `devctx serve --stop` desde el repo del sandbox (nunca se mata por nombre de proceso).
 
+### Fase de parse (DD-21)
+
+`cargo build --release -p devctx-parse --example parse_bench` y
+`target/release/examples/parse_bench <dir> --runs 7`: parsea cada archivo como el indexador
+(`devctx_parse::parse`), mejor y mediana por corrida, y símbolos por kind. Usa solo la API que
+tiene toda release, así que el mismo archivo compila contra un checkout viejo (`git archive
+<ref>`) para comparar.
+
 ### Costo de indexado (se mide aparte, a mano)
 
 `run.sh` no reindexa. Sobre una **copia** del repo (nunca el vivo):

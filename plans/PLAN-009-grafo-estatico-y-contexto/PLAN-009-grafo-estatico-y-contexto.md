@@ -232,7 +232,7 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-001 | Arnés de evaluación del grafo y del contexto + línea base sobre 0.9.0 | general-purpose (Rust) | — | `done` |
 | TASK-002 | Reindex barato: reusar vectores por `content_hash` del chunk | general-purpose (Rust) | — | `done` |
 | TASK-003 | Schema `symbols` + `edges`, ids estables, escritura por lotes y mantenimiento por archivo/rama | general-purpose (Rust) | TASK-001 | `done` |
-| TASK-004 | Extracción estructurada por lenguaje: definiciones, imports, herencia, instanciación, `contains`, firmas | general-purpose (Rust) | TASK-003 | `pending` |
+| TASK-004 | Extracción estructurada por lenguaje: definiciones, imports, herencia, instanciación, `contains`, firmas | general-purpose (Rust) | TASK-003 | `done` |
 | TASK-005 | Motor de resolución y link pass + resolver Java (scopes, campos, inyección, `var`, imports, fluent) | general-purpose (Rust) | TASK-004 | `pending` |
 | TASK-006 | Resolver TypeScript/JavaScript (imports relativos y alias, DI, arrow-const) | general-purpose (Rust) | TASK-005 | `pending` |
 | TASK-007 | Resolvers Python, Rust y Go | general-purpose (Rust) | TASK-005 | `pending` |

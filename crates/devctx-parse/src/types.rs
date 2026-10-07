@@ -1,12 +1,14 @@
 //! Parse-domain types: symbols, imports and the parsed-file result.
 
+use crate::facts::FileFacts;
+
 /// A code symbol (function, method, class, …) extracted from a source file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Symbol {
     /// Symbol name.
     pub name: String,
-    /// Kind: `function`/`method`/`class`/`struct`/`enum`/`trait`/`interface`/
-    /// `type`/`module`.
+    /// Kind: `function`/`method`/`constructor`/`class`/`interface`/`enum`/
+    /// `record`/`struct`/`trait`/`type`/`module`/`impl`/`field`/`const`.
     pub kind: String,
     /// Source language (store `language` value).
     pub language: String,
@@ -32,9 +34,14 @@ pub struct Symbol {
     /// `Outer.Inner.method`, `tests.helper`, `deco.wrapper` (the file
     /// symbol's is its path, set by [`ParsedFile::assign_ids`]).
     pub qualified: String,
-    /// Provisional signature: the definition up to its body, first line
-    /// only, whitespace collapsed, at most 200 characters.
+    /// The definition up to its body (an arrow function's body for a
+    /// `const x = () => …`), whitespace collapsed, at most 200 characters
+    /// (DD-17): `pub fn open(path: &Path) -> Result<Self>`.
     pub signature: String,
+    /// Visible outside the file (`public`, `export`, `pub`, a capital Go
+    /// name, no leading `_` in Python); `None` when the language says
+    /// nothing (a Rust `impl`).
+    pub exported: Option<bool>,
     /// Normalised parameter types (`Long,String`), only for languages that
     /// overload by them (Java); part of the id's disambiguator (DD-3).
     pub params: Option<String>,
@@ -55,7 +62,8 @@ pub struct Symbol {
     pub parent_id: Option<u64>,
 }
 
-/// An import/use statement.
+/// An import/use statement, as text (the file chunk lists them; the
+/// structured form is [`FileFacts::imports`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Import {
     /// Raw statement text.
@@ -102,4 +110,7 @@ pub struct ParsedFile {
     pub module_edges: Vec<GraphEdge>,
     /// The file's own symbol (`kind = file`), spanning the whole source.
     pub file_symbol: Symbol,
+    /// Package, structured imports, supertypes, instantiations and type uses
+    /// (PLAN-009 TASK-004).
+    pub facts: FileFacts,
 }

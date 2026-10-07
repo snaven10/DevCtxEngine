@@ -5,21 +5,36 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::error::{ParseError, Result};
+use crate::facts::{
+    FileFacts, ImportFact, InheritFact, RefFact, IMPLEMENTS, INHERITS, INSTANTIATES, REFERENCES,
+};
 use crate::lang::Lang;
+use crate::resolve::{resolver_for, LangResolver};
 use crate::types::{GraphEdge, Import, ParsedFile, Symbol};
 
 /// Variable/field name → declared type, for receiver resolution.
 type TypeMap = HashMap<String, String>;
 
 /// A reusable parser for a single language. Owns the tree-sitter parser and the
-/// compiled symbol/import/calls/type queries.
+/// compiled queries of its definition (`languages/<lang>.json`).
 pub struct LanguageParser {
     lang: Lang,
     parser: Parser,
-    symbol_query: Query,
-    import_query: Query,
-    calls_query: Query,
+    resolver: &'static dyn LangResolver,
+    definitions: Query,
+    references: Query,
+    inherits: Option<Query>,
+    imports: Query,
+    package: Option<Query>,
     type_query: Option<Query>,
+}
+
+/// Compile one query of `lang`, naming the language on failure.
+fn compile(lang: Lang, src: &str) -> Result<Query> {
+    Query::new(&lang.grammar(), src).map_err(|source| ParseError::Query {
+        lang: lang.name(),
+        source,
+    })
 }
 
 impl LanguageParser {
@@ -30,41 +45,21 @@ impl LanguageParser {
         parser
             .set_language(&grammar)
             .map_err(|_| ParseError::Grammar(lang.name()))?;
-        let symbol_query =
-            Query::new(&grammar, lang.symbol_query()).map_err(|source| ParseError::Query {
-                lang: lang.name(),
-                source,
-            })?;
-        let import_query =
-            Query::new(&grammar, lang.import_query()).map_err(|source| ParseError::Query {
-                lang: lang.name(),
-                source,
-            })?;
-        let calls_query =
-            Query::new(&grammar, lang.calls_query()).map_err(|source| ParseError::Query {
-                lang: lang.name(),
-                source,
-            })?;
-        let type_query = match lang.type_bindings_query() {
-            Some(src) => Some(
-                Query::new(&grammar, src).map_err(|source| ParseError::Query {
-                    lang: lang.name(),
-                    source,
-                })?,
-            ),
-            None => None,
-        };
+        let optional = |src: Option<&str>| src.map(|s| compile(lang, s)).transpose();
         Ok(Self {
             lang,
             parser,
-            symbol_query,
-            import_query,
-            calls_query,
-            type_query,
+            resolver: resolver_for(lang),
+            definitions: compile(lang, lang.definitions_query())?,
+            references: compile(lang, lang.references_query())?,
+            inherits: optional(lang.inherits_query())?,
+            imports: compile(lang, lang.import_query())?,
+            package: optional(lang.package_query())?,
+            type_query: optional(lang.type_bindings_query())?,
         })
     }
 
-    /// Parse `source`, extracting symbols and imports.
+    /// Parse `source`: symbols, imports, calls and the structured facts.
     pub fn parse(&mut self, source: &str) -> Result<ParsedFile> {
         let tree = self
             .parser
@@ -74,9 +69,9 @@ impl LanguageParser {
         let bytes = source.as_bytes();
 
         let symbols = self.extract_symbols(root, bytes);
-        let imports = self.extract_imports(root, bytes);
+        let (imports, import_facts) = self.extract_imports(root, bytes);
         let type_map = self.extract_type_bindings(root, bytes);
-        let (edges, module_edges) = self.extract_edges(root, bytes, &type_map);
+        let (edges, module_edges, refs) = self.extract_references(root, bytes, &type_map);
         let file_symbol = Symbol {
             kind: devctx_core::symbol_id::FILE_KIND.to_string(),
             language: self.lang.name().to_string(),
@@ -88,6 +83,12 @@ impl LanguageParser {
             doc_start_byte: 0,
             ..Default::default()
         };
+        let facts = FileFacts {
+            package: self.extract_package(root, bytes),
+            imports: import_facts,
+            inherits: self.extract_inherits(root, bytes),
+            refs,
+        };
         Ok(ParsedFile {
             language: self.lang.name().to_string(),
             symbols,
@@ -95,6 +96,7 @@ impl LanguageParser {
             edges,
             module_edges,
             file_symbol,
+            facts,
         })
     }
 
@@ -124,90 +126,228 @@ impl LanguageParser {
         map
     }
 
-    /// Every call site, split by whether a named function encloses it.
+    /// Every reference: calls (split by whether a named function encloses
+    /// them), instantiations and type uses.
     ///
-    /// One edge per occurrence: two calls to the same target from the same
-    /// function are two edges (the store's `graph_edges` writer folds them,
-    /// the `edges` table keeps both). A call with no named enclosing function
-    /// goes to the second list instead of being dropped.
-    fn extract_edges(
+    /// One call edge per occurrence: two calls to the same target from the
+    /// same function are two edges (the store's `graph_edges` writer folds
+    /// them, the `edges` table keeps both). A call with no named enclosing
+    /// function goes to the second list instead of being dropped.
+    fn extract_references(
         &self,
         root: Node<'_>,
         bytes: &[u8],
         type_map: &TypeMap,
-    ) -> (Vec<GraphEdge>, Vec<GraphEdge>) {
+    ) -> (Vec<GraphEdge>, Vec<GraphEdge>, Vec<RefFact>) {
+        let names = self.references.capture_names();
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&self.calls_query, root, bytes);
+        let mut matches = cursor.matches(&self.references, root, bytes);
         let mut out = Vec::new();
         let mut module = Vec::new();
+        let mut refs = Vec::new();
         while let Some(m) = matches.next() {
+            let mut role = None;
+            let (mut name, mut path, mut ty) = (None, None, None);
             for cap in m.captures {
-                let callee = cap.node;
-                let Ok(name) = callee.utf8_text(bytes) else {
-                    continue;
-                };
-                let func = enclosing_function_node(callee, self.lang.function_kinds());
-                let target = qualified_target(callee, name, bytes, type_map, self.lang);
-                let mut edge = GraphEdge {
-                    source: String::new(),
-                    target,
-                    kind: "calls".to_string(),
-                    line: callee.start_position().row as u32 + 1,
-                    byte: callee.start_byte(),
-                    source_byte: func.map(|f| f.start_byte()),
-                    src_id: 0,
-                };
-                // Source: the enclosing function, qualified with its class if any.
-                match qualified_source(callee, bytes, self.lang) {
-                    Some(source) => {
-                        edge.source = source;
-                        out.push(edge);
-                    }
-                    None => module.push(edge),
+                match names[cap.index as usize] {
+                    "name" => name = Some(cap.node),
+                    "path" => path = Some(cap.node),
+                    "type" => ty = Some(cap.node),
+                    r => role = r.strip_prefix("reference.").map(|k| (k, cap.node)),
                 }
             }
+            let Some((role, node)) = role else { continue };
+            match role {
+                "call" => {
+                    let Some(callee) = name else { continue };
+                    let Ok(callee_name) = callee.utf8_text(bytes) else {
+                        continue;
+                    };
+                    let func = enclosing_named_function(callee, bytes, self.lang);
+                    let target = match path {
+                        Some(p) => path_target(callee, p, callee_name, bytes, self.lang),
+                        None => qualified_target(callee, callee_name, bytes, type_map, self.lang),
+                    };
+                    let mut edge = GraphEdge {
+                        source: String::new(),
+                        target,
+                        kind: "calls".to_string(),
+                        line: callee.start_position().row as u32 + 1,
+                        byte: callee.start_byte(),
+                        source_byte: func.map(|(f, _)| f.start_byte()),
+                        src_id: 0,
+                    };
+                    // Source: the enclosing function, qualified with its class if any.
+                    match qualified_source(callee, bytes, self.lang) {
+                        Some(source) => {
+                            edge.source = source;
+                            out.push(edge);
+                        }
+                        None => module.push(edge),
+                    }
+                }
+                "new" => {
+                    let target = ty.unwrap_or(node);
+                    let Some(name) = type_ref_name(target, bytes, self.lang) else {
+                        continue;
+                    };
+                    refs.push(self.ref_fact(INSTANTIATES, name, target, bytes));
+                }
+                "type" => {
+                    let mut found = Vec::new();
+                    type_name_nodes(ty.unwrap_or(node), self.lang.type_names(), &mut found);
+                    for t in found {
+                        let Some(name) = type_ref_name(t, bytes, self.lang) else {
+                            continue;
+                        };
+                        // A type parameter (`T` of `Cached<T>`) names nothing
+                        // outside its declaration.
+                        if is_type_parameter(t, &name, bytes) {
+                            continue;
+                        }
+                        refs.push(self.ref_fact(REFERENCES, name, t, bytes));
+                    }
+                }
+                _ => {}
+            }
         }
-        out.sort_by_key(|e| e.line);
-        module.sort_by_key(|e| e.line);
-        (out, module)
+        out.sort_by_key(|e| (e.line, e.byte));
+        module.sort_by_key(|e| (e.line, e.byte));
+        refs.sort_by_key(|r| (r.byte, r.kind != INSTANTIATES));
+        (out, module, refs)
+    }
+
+    fn ref_fact(&self, kind: &str, name: String, node: Node<'_>, bytes: &[u8]) -> RefFact {
+        RefFact {
+            kind: kind.to_string(),
+            name,
+            line: node.start_position().row as u32 + 1,
+            byte: node.start_byte(),
+            source_byte: enclosing_named_function(node, bytes, self.lang)
+                .map(|(f, _)| f.start_byte()),
+            src_id: 0,
+        }
+    }
+
+    /// Supertypes named by the file's type definitions.
+    fn extract_inherits(&self, root: Node<'_>, bytes: &[u8]) -> Vec<InheritFact> {
+        let Some(query) = &self.inherits else {
+            return Vec::new();
+        };
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, root, bytes);
+        let mut out = Vec::new();
+        while let Some(m) = matches.next() {
+            for cap in m.captures {
+                let kind = match names[cap.index as usize] {
+                    "inherit.extends" => INHERITS,
+                    "inherit.implements" => IMPLEMENTS,
+                    _ => continue,
+                };
+                let Some(name) = type_ref_name(cap.node, bytes, self.lang) else {
+                    continue;
+                };
+                out.push(InheritFact {
+                    kind: kind.to_string(),
+                    name,
+                    line: cap.node.start_position().row as u32 + 1,
+                    byte: cap.node.start_byte(),
+                    src_id: 0,
+                });
+            }
+        }
+        out.sort_by_key(|f| f.byte);
+        out.dedup();
+        out
+    }
+
+    /// The package the source declares (Java, Go).
+    fn extract_package(&self, root: Node<'_>, bytes: &[u8]) -> Option<String> {
+        let query = self.package.as_ref()?;
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, root, bytes);
+        let m = matches.next()?;
+        let node = m.captures.first()?.node;
+        let text: String = node
+            .utf8_text(bytes)
+            .ok()?
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        Some(text).filter(|t| !t.is_empty())
     }
 
     fn extract_symbols(&self, root: Node<'_>, bytes: &[u8]) -> Vec<Symbol> {
-        let names = self.symbol_query.capture_names();
+        let names = self.definitions.capture_names();
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&self.symbol_query, root, bytes);
+        let mut matches = cursor.matches(&self.definitions, root, bytes);
         // Every definition first: the qualified name of each symbol needs to
-        // know which of its ancestors are symbols too.
-        let mut defs = Vec::new();
+        // know which of its ancestors are symbols too. One (definition, name)
+        // pair captured by several patterns keeps the earliest pattern's kind.
+        let mut defs: Vec<(usize, String, String, Node<'_>)> = Vec::new();
+        let mut at: HashMap<(usize, usize), usize> = HashMap::new();
         while let Some(m) = matches.next() {
+            let mut def = None;
+            let mut name_node = None;
             for cap in m.captures {
-                let kind = names[cap.index as usize].to_string();
-                let name_node = cap.node;
-                let Ok(name) = name_node.utf8_text(bytes) else {
-                    continue;
-                };
-                let def = name_node.parent().unwrap_or(name_node);
-                defs.push((kind, name.to_string(), def));
+                let n = names[cap.index as usize];
+                if let Some(kind) = n.strip_prefix("definition.") {
+                    def = Some((kind, cap.node));
+                } else if n == "name" {
+                    name_node = Some(cap.node);
+                }
+            }
+            let (Some((kind, def)), Some(name_node)) = (def, name_node) else {
+                continue;
+            };
+            let Ok(text) = name_node.utf8_text(bytes) else {
+                continue;
+            };
+            // An `impl` is named after the type it implements, as written in
+            // its definition (`impl<T> Foo<T>` → `Foo`).
+            let name = if kind == "impl" {
+                bare_type_name(text)
+            } else {
+                text.to_string()
+            };
+            let entry = (m.pattern_index, kind.to_string(), name, def);
+            match at.get(&(def.id(), name_node.id())) {
+                Some(&i) if defs[i].0 <= m.pattern_index => {}
+                Some(&i) => defs[i] = entry,
+                None => {
+                    at.insert((def.id(), name_node.id()), defs.len());
+                    defs.push(entry);
+                }
             }
         }
-        let def_ids: HashSet<usize> = defs.iter().map(|(_, _, d)| d.id()).collect();
+        let def_ids: HashSet<usize> = defs.iter().map(|(_, _, _, d)| d.id()).collect();
 
         let mut out = Vec::with_capacity(defs.len());
-        for (mut kind, name, def) in defs {
+        for (_, mut kind, name, def) in defs {
             let container = enclosing_container(def, self.lang.container_kinds());
             let parent = container.and_then(|c| container_name(c, bytes));
             if kind == "function" && container.is_some() {
                 kind = "method".to_string();
             }
+            // A JS/TS class's `constructor` is a method by syntax.
+            if kind == "method" && name == "constructor" && def.kind() == "method_definition" {
+                kind = "constructor".to_string();
+            }
 
             let head = doc_head(def, bytes);
             let (mut chain, scope_shape) = qualifier_chain(def, bytes, self.lang, &def_ids);
             chain.push(name.clone());
-            let params = self
-                .lang
-                .overloads()
+            let params = (self.lang.overloads()
+                && devctx_core::symbol_id::kind_class(&kind) == "callable")
                 .then(|| param_types(def, bytes))
                 .flatten();
+            let trait_of = if kind == "impl" {
+                trait_text(def, bytes)
+            } else {
+                impl_trait(def, bytes, self.lang.container_kinds())
+            };
+            let exported = self.resolver.exported(def, &name, bytes);
             out.push(Symbol {
                 name,
                 kind,
@@ -221,34 +361,229 @@ impl LanguageParser {
                 parent,
                 qualified: chain.join("."),
                 signature: signature_of(def, bytes),
+                exported,
                 params,
-                trait_of: impl_trait(def, bytes, self.lang.container_kinds()),
+                trait_of,
                 scope_shape,
                 id: 0,
                 parent_id: None,
             });
         }
-        out.sort_by_key(|s| s.start_byte);
+        out.sort_by_key(|s| (s.start_byte, std::cmp::Reverse(s.end_byte)));
         out
     }
 
-    fn extract_imports(&self, root: Node<'_>, bytes: &[u8]) -> Vec<Import> {
+    /// The import statements as text (what the file chunk lists), and one
+    /// structured fact per name they bring in.
+    fn extract_imports(&self, root: Node<'_>, bytes: &[u8]) -> (Vec<Import>, Vec<ImportFact>) {
+        let names = self.imports.capture_names();
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&self.import_query, root, bytes);
-        let mut out = Vec::new();
+        let mut matches = cursor.matches(&self.imports, root, bytes);
+        let mut statements: Vec<Node<'_>> = Vec::new();
+        // (statement id, fact): a statement can bring in several names.
+        let mut facts: Vec<(usize, ImportFact)> = Vec::new();
         while let Some(m) = matches.next() {
+            let mut stmt = None;
+            let mut fact = ImportFact::default();
+            let mut tree = None;
+            // The line of what is imported: one `import (…)` block in Go
+            // spans several.
+            let mut at = None;
             for cap in m.captures {
-                if let Ok(text) = cap.node.utf8_text(bytes) {
-                    out.push(Import {
-                        statement: text.to_string(),
-                        line: cap.node.start_position().row as u32 + 1,
-                    });
+                let text = || -> String {
+                    cap.node
+                        .utf8_text(bytes)
+                        .unwrap_or_default()
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect()
+                };
+                match names[cap.index as usize] {
+                    "import" => stmt = Some(cap.node),
+                    "import.path" => {
+                        fact.path = unquote(&text()).to_string();
+                        at = Some(cap.node.start_position().row as u32 + 1);
+                    }
+                    "import.name" => fact.name = Some(text()),
+                    "import.alias" => fact.alias = Some(text()),
+                    "import.wildcard" => fact.wildcard = true,
+                    "import.default" => {
+                        fact.name = Some("default".into());
+                        fact.alias = Some(text());
+                    }
+                    "import.namespace" => {
+                        fact.wildcard = true;
+                        fact.alias = Some(text());
+                    }
+                    "import.tree" => tree = Some(cap.node),
+                    _ => {}
                 }
             }
+            let Some(stmt) = stmt else { continue };
+            if !statements.iter().any(|s| s.id() == stmt.id()) {
+                statements.push(stmt);
+            }
+            let line = at.unwrap_or(stmt.start_position().row as u32 + 1);
+            let expanded = match tree {
+                Some(t) => self.resolver.expand_import_tree(t, bytes),
+                None if fact.path.is_empty() => Vec::new(),
+                None => vec![fact],
+            };
+            for mut f in expanded {
+                f.line = line;
+                f.target = self.resolver.import_target(&f);
+                facts.push((stmt.id(), f));
+            }
         }
-        out.sort_by_key(|i| i.line);
-        out
+        // A pattern that only names the path (`import './x'`, `import a.B;`)
+        // also matches statements another pattern details: keep the detail.
+        let detailed: HashSet<(usize, String)> = facts
+            .iter()
+            .filter(|(_, f)| f.name.is_some() || f.alias.is_some() || f.wildcard)
+            .map(|(s, f)| (*s, f.path.clone()))
+            .collect();
+        let mut seen = HashSet::new();
+        let facts: Vec<ImportFact> = facts
+            .into_iter()
+            .filter(|(s, f)| {
+                let bare = f.name.is_none() && f.alias.is_none() && !f.wildcard;
+                !(bare && detailed.contains(&(*s, f.path.clone())))
+            })
+            .filter(|(s, f)| seen.insert((*s, f.clone())))
+            .map(|(_, f)| f)
+            .collect();
+        statements.sort_by_key(|n| n.start_byte());
+        let imports = statements
+            .iter()
+            .filter_map(|n| {
+                n.utf8_text(bytes).ok().map(|text| Import {
+                    statement: text.to_string(),
+                    line: n.start_position().row as u32 + 1,
+                })
+            })
+            .collect();
+        let mut facts = facts;
+        facts.sort_by_key(|f| f.line);
+        (imports, facts)
     }
+}
+
+/// Whether `name` is a type parameter declared by an item around `node`
+/// (its `type_parameters`: `<T: Clone>`, `<T extends X>`, `[T any]`).
+fn is_type_parameter(node: Node<'_>, name: &str, bytes: &[u8]) -> bool {
+    if name.contains(['.', ':']) {
+        return false;
+    }
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if let Some(params) = n.child_by_field_name("type_parameters") {
+            let mut cursor = params.walk();
+            let declared = params
+                .named_children(&mut cursor)
+                .any(|p| first_name(p, bytes).as_deref() == Some(name));
+            if declared {
+                return true;
+            }
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// The first identifier under `node` (itself included): the name a type
+/// parameter declares.
+fn first_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    if matches!(node.kind(), "type_identifier" | "identifier") {
+        return node.utf8_text(bytes).ok().map(str::to_string);
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    children.into_iter().find_map(|c| first_name(c, bytes))
+}
+
+/// A string literal's content (`"net/http"` → `net/http`).
+fn unquote(t: &str) -> &str {
+    t.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+}
+
+/// The outermost type-name nodes under `node` (itself included): each is one
+/// reference. A type name is not descended into (`a.b.Foo` is one name),
+/// anything else is (`List<Foo>` is `List` and `Foo`).
+fn type_name_nodes<'t>(node: Node<'t>, kinds: &[String], out: &mut Vec<Node<'t>>) {
+    if kinds.iter().any(|k| k == node.kind()) {
+        out.push(node);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        type_name_nodes(child, kinds, out);
+    }
+}
+
+/// A type as an edge destination: the text without generic arguments,
+/// references, pointers or whitespace, path kept (`com.x.Base`,
+/// `fmt::Display`, `pkg.T`); `Self` is the enclosing type. `None` for
+/// something that is not a name (a lifetime, a literal, an expression).
+fn type_ref_name(node: Node<'_>, bytes: &[u8], lang: Lang) -> Option<String> {
+    let text = node.utf8_text(bytes).ok()?;
+    let mut t: &str = text.trim();
+    loop {
+        let stripped = t
+            .strip_prefix('&')
+            .or_else(|| t.strip_prefix('*'))
+            .or_else(|| t.strip_prefix("mut "))
+            .or_else(|| t.strip_prefix("dyn "))
+            .or_else(|| t.strip_prefix("[]"))
+            .map(str::trim_start);
+        match stripped {
+            Some(rest) => t = rest,
+            None => break,
+        }
+    }
+    let end = t.find(['<', '[', '(']).unwrap_or(t.len());
+    let name: String = t[..end].chars().filter(|c| !c.is_whitespace()).collect();
+    if name == "Self" {
+        return enclosing_container(node, lang.container_kinds())
+            .and_then(|c| container_name(c, bytes));
+    }
+    let ok = !name.is_empty()
+        && name
+            .split("::")
+            .flat_map(|seg| seg.split('.'))
+            .all(nameable);
+    ok.then_some(name)
+}
+
+/// The edge target of a path call (Rust `Foo::bar()`, `Self::new()`,
+/// `std::fs::read()`): `Type.callee` when the path ends in a type (or
+/// `Self`, the enclosing type), so it matches the method's qualified name;
+/// otherwise the module path, `path::callee`. A path that is not a plain
+/// run of names (`<T as Trait>::f`, `Vec::<u8>::new`) falls back to the
+/// bare callee.
+fn path_target(callee: Node<'_>, path: Node<'_>, name: &str, bytes: &[u8], lang: Lang) -> String {
+    let text: String = path
+        .utf8_text(bytes)
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let segments: Vec<&str> = text.split("::").collect();
+    if segments.is_empty() || !segments.iter().all(|s| nameable(s)) {
+        return name.to_string();
+    }
+    let last = segments[segments.len() - 1];
+    if last == "Self" {
+        return match enclosing_container(callee, lang.container_kinds())
+            .and_then(|c| container_name(c, bytes))
+        {
+            Some(ty) => format!("{ty}.{name}"),
+            None => name.to_string(),
+        };
+    }
+    if last.chars().next().is_some_and(char::is_uppercase) {
+        return format!("{last}.{name}");
+    }
+    format!("{text}::{name}")
 }
 
 /// Where a symbol's text really begins: at the doc comment above it, not at
@@ -333,27 +668,57 @@ fn is_inner_doc(node: Node<'_>, bytes: &[u8]) -> bool {
         .is_ok_and(|t| t.starts_with("//!") || t.starts_with("/*!"))
 }
 
-/// The nearest enclosing function/method definition node, if any.
-fn enclosing_function_node<'t>(node: Node<'t>, kinds: &[String]) -> Option<Node<'t>> {
+/// The nearest enclosing callable that has a name, and that name.
+///
+/// A callable is a node of the language's `function_kinds`. Its name is its
+/// `name` field or, for an anonymous function bound to something, what it is
+/// bound to: the variable of `const x = () => …`, the key of `{ x: () => … }`,
+/// the field of `x = () => …` in a class. Anonymous callbacks (`.map(x =>
+/// f(x))`) have none and are walked past, so the call inside belongs to the
+/// function that wrote the callback.
+fn enclosing_named_function<'t>(
+    node: Node<'t>,
+    bytes: &[u8],
+    lang: Lang,
+) -> Option<(Node<'t>, String)> {
     let mut cur = node.parent();
     while let Some(n) = cur {
-        if kinds.iter().any(|k| k == n.kind()) {
-            return Some(n);
+        if lang.function_kinds().iter().any(|k| k == n.kind()) {
+            if let Some(name) = callable_name(n, bytes) {
+                return Some((n, name));
+            }
         }
         cur = n.parent();
     }
     None
 }
 
-/// The edge source: the enclosing function, qualified as `Class.method` when the
-/// function is defined inside a container (class/impl/…).
+/// The name of a callable node (see [`enclosing_named_function`]).
+fn callable_name(func: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let text = |n: Node<'_>| n.utf8_text(bytes).ok().map(str::to_string);
+    if let Some(name) = func.child_by_field_name("name") {
+        return text(name);
+    }
+    let parent = func.parent()?;
+    let bound = match parent.kind() {
+        "variable_declarator" | "public_field_definition" => parent.child_by_field_name("name"),
+        "field_definition" => parent.child_by_field_name("property"),
+        "pair" => parent.child_by_field_name("key"),
+        "assignment_expression" => parent.child_by_field_name("left"),
+        _ => None,
+    }?;
+    text(bound).filter(|t| nameable(t))
+}
+
+/// The edge source: the enclosing named function, qualified as
+/// `Class.method` when the function is defined inside a container
+/// (class/impl/…) or has a receiver (a Go method, `Server.Handle`).
 fn qualified_source(node: Node<'_>, bytes: &[u8], lang: Lang) -> Option<String> {
-    let func = enclosing_function_node(node, lang.function_kinds())?;
-    let name = func
-        .child_by_field_name("name")
-        .and_then(|n| n.utf8_text(bytes).ok())?
-        .to_string();
-    match enclosing_container(func, lang.container_kinds()).and_then(|c| container_name(c, bytes)) {
+    let (func, name) = enclosing_named_function(node, bytes, lang)?;
+    let owner = enclosing_container(func, lang.container_kinds())
+        .and_then(|c| container_name(c, bytes))
+        .or_else(|| go_receiver_type(func, bytes));
+    match owner {
         Some(class) => Some(format!("{class}.{name}")),
         None => Some(name),
     }
@@ -374,10 +739,12 @@ fn qualified_target(
         return name.to_string();
     };
     match receiver.as_str() {
-        "self" | "this" | "cls" | "super" => enclosing_container(callee, lang.container_kinds())
-            .and_then(|c| container_name(c, bytes))
-            .map(|class| format!("{class}.{name}"))
-            .unwrap_or_else(|| name.to_string()),
+        "self" | "Self" | "this" | "cls" | "super" => {
+            enclosing_container(callee, lang.container_kinds())
+                .and_then(|c| container_name(c, bytes))
+                .map(|class| format!("{class}.{name}"))
+                .unwrap_or_else(|| name.to_string())
+        }
         r if r.chars().next().is_some_and(|c| c.is_uppercase()) => format!("{r}.{name}"),
         r => {
             // Local/field receiver: resolve its declared type (also handles a
@@ -587,7 +954,12 @@ fn go_receiver_type(def: Node<'_>, bytes: &[u8]) -> Option<String> {
 /// `impl Display for X { fn fmt }` and `impl Debug for X { fn fmt }` are both
 /// `X.fmt`.
 fn impl_trait(def: Node<'_>, bytes: &[u8], kinds: &[String]) -> Option<String> {
-    let imp = enclosing_container(def, kinds)?;
+    trait_text(enclosing_container(def, kinds)?, bytes)
+}
+
+/// The trait of an `impl` node, normalised as in [`impl_trait`]: the
+/// disambiguator of the `impl` symbol itself.
+fn trait_text(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
     let tr = imp.child_by_field_name("trait")?.utf8_text(bytes).ok()?;
     let tr: String = tr.chars().filter(|c| !c.is_whitespace()).collect();
     let args = tr.find('<').unwrap_or(tr.len());
@@ -598,25 +970,57 @@ fn impl_trait(def: Node<'_>, bytes: &[u8], kinds: &[String]) -> Option<String> {
     Some(format!("{name}{}", &tr[args..]))
 }
 
-/// Longest provisional signature kept, in characters.
+/// Longest signature kept, in characters.
 const SIGNATURE_MAX: usize = 200;
 
-/// The definition up to its body (the whole of it when it has none), first
-/// line only, whitespace collapsed, capped at [`SIGNATURE_MAX`] characters:
-/// `fn g() -> i32 { 1 }` is `fn g() -> i32`. Provisional until the structured
-/// extraction (PLAN-009 TASK-004).
+/// The definition up to its body, whitespace collapsed, capped at
+/// [`SIGNATURE_MAX`] characters (DD-17): `fn g() -> i32 { 1 }` is
+/// `fn g() -> i32`, a multi-line parameter list is one line. The body is
+/// the `body` field; for a function bound to a name (`const x = (a) => …`)
+/// the function's body; for a Go type, its `{`. A definition with no body
+/// (a field, a constant) is whole.
 fn signature_of(def: Node<'_>, bytes: &[u8]) -> String {
-    let end = def
-        .child_by_field_name("body")
-        .map_or(def.end_byte(), |b| b.start_byte());
+    let end = body_start(def, bytes).unwrap_or(def.end_byte());
     let text = std::str::from_utf8(&bytes[def.start_byte()..end]).unwrap_or_default();
-    let line = text.lines().next().unwrap_or_default();
-    line.split_whitespace()
+    text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+        .replace("( ", "(")
+        .replace(", )", ")")
+        .replace(" )", ")")
         .chars()
         .take(SIGNATURE_MAX)
         .collect()
+}
+
+/// Where the body of `def` starts, if it has one (see [`signature_of`]).
+fn body_start(def: Node<'_>, bytes: &[u8]) -> Option<usize> {
+    if let Some(body) = def.child_by_field_name("body") {
+        return Some(body.start_byte());
+    }
+    // `const x = () => …`, `x = function () {…}` in a class.
+    let mut cursor = def.walk();
+    let declarators: Vec<Node<'_>> = def
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "variable_declarator")
+        .collect();
+    let value = declarators
+        .first()
+        .and_then(|d| d.child_by_field_name("value"))
+        .or_else(|| def.child_by_field_name("value"));
+    if let Some(v) = value {
+        if matches!(v.kind(), "arrow_function" | "function_expression") {
+            return v.child_by_field_name("body").map(|b| b.start_byte());
+        }
+    }
+    if def.kind() == "type_spec" {
+        let text = &bytes[def.start_byte()..def.end_byte()];
+        return text
+            .iter()
+            .position(|b| *b == b'{')
+            .map(|i| def.start_byte() + i);
+    }
+    None
 }
 
 /// The declared parameter types of a callable, normalised (no names, no

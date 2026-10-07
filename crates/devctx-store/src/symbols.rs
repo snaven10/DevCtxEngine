@@ -179,6 +179,18 @@ impl Store {
         file: &str,
         symbols: &[StoredSymbol],
     ) -> Result<()> {
+        // In a transaction (the caller's, or its own): the cached graph
+        // check is dropped before the write and again at its commit.
+        self.in_transaction(|| self.replace_file_symbols_tx(repo, branch, file, symbols))
+    }
+
+    fn replace_file_symbols_tx(
+        &self,
+        repo: &str,
+        branch: &str,
+        file: &str,
+        symbols: &[StoredSymbol],
+    ) -> Result<()> {
         self.forget_graph_step(Some(branch));
         self.w()?.execute(
             "DELETE FROM symbols WHERE repo = ? AND branch = ? AND file = ?",
@@ -273,8 +285,8 @@ impl Store {
 
     /// Forget `file`'s symbols and edges.
     pub fn delete_file_graph(&self, repo: &str, branch: &str, file: &str) -> Result<()> {
-        self.forget_graph_step(Some(branch));
         self.in_transaction(|| {
+            self.forget_graph_step(Some(branch));
             self.w()?.execute(
                 "DELETE FROM symbols WHERE repo = ? AND branch = ? AND file = ?",
                 params![repo, branch, file],
@@ -341,7 +353,9 @@ impl Store {
     /// Symbols travel as they are: their ids carry no branch. Edges travel
     /// without their resolution (`dst_id`, `confidence`, `resolution`,
     /// `external`): what a call resolves to depends on the rest of the
-    /// branch, so the destination branch's link pass decides it again.
+    /// branch, so the destination branch's link pass decides it again. A
+    /// `contains` edge keeps it: both ends are symbols of this file, the
+    /// same on every branch.
     pub(crate) fn copy_file_graph(
         &self,
         repo: &str,
@@ -353,12 +367,17 @@ impl Store {
         let edges: Vec<StoredSymbolEdge> = self
             .file_symbol_edges(repo, from_branch, file)?
             .into_iter()
-            .map(|e| StoredSymbolEdge {
-                dst_id: None,
-                confidence: None,
-                resolution: None,
-                external: None,
-                ..e
+            .map(|e| {
+                if e.kind == "contains" {
+                    return e;
+                }
+                StoredSymbolEdge {
+                    dst_id: None,
+                    confidence: None,
+                    resolution: None,
+                    external: None,
+                    ..e
+                }
             })
             .collect();
         self.replace_file_graph(repo, to_branch, file, &symbols, &edges)

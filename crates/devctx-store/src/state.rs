@@ -123,28 +123,30 @@ impl Store {
 
     /// Insert or replace an index record.
     pub fn save_index_record(&self, rec: &IndexRecord) -> Result<()> {
-        self.forget_graph_step(Some(&rec.branch));
-        self.w()?.execute(
-            "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
-            params![rec.repo_path, rec.branch],
-        )?;
-        self.w()?.execute(
-            "INSERT INTO index_state (repo_path, branch, last_commit, model_name,
-                model_dimension, file_count, symbol_count, chunk_count, indexed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                rec.repo_path,
-                rec.branch,
-                rec.last_commit,
-                rec.model_name,
-                rec.model_dimension as i32,
-                rec.file_count as i32,
-                rec.symbol_count as i32,
-                rec.chunk_count as i32,
-                rec.indexed_at,
-            ],
-        )?;
-        Ok(())
+        self.in_transaction(|| {
+            self.forget_graph_step(Some(&rec.branch));
+            self.w()?.execute(
+                "DELETE FROM index_state WHERE repo_path = ? AND branch = ?",
+                params![rec.repo_path, rec.branch],
+            )?;
+            self.w()?.execute(
+                "INSERT INTO index_state (repo_path, branch, last_commit, model_name,
+                    model_dimension, file_count, symbol_count, chunk_count, indexed_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    rec.repo_path,
+                    rec.branch,
+                    rec.last_commit,
+                    rec.model_name,
+                    rec.model_dimension as i32,
+                    rec.file_count as i32,
+                    rec.symbol_count as i32,
+                    rec.chunk_count as i32,
+                    rec.indexed_at,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// One `index_meta` value for a (repo_path, branch), if recorded.
@@ -360,26 +362,28 @@ impl Store {
 
     /// Insert or replace a file-state row.
     pub fn save_file_state(&self, fs: &FileState) -> Result<()> {
-        self.forget_graph_step(Some(&fs.branch));
-        self.w()?.execute(
-            "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
-            params![fs.repo_path, fs.branch, fs.file_path],
-        )?;
-        self.w()?.execute(
-            "INSERT INTO file_state (repo_path, branch, file_path, content_hash, language,
-                symbol_count, chunk_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![
-                fs.repo_path,
-                fs.branch,
-                fs.file_path,
-                fs.content_hash,
-                fs.language,
-                fs.symbol_count as i32,
-                fs.chunk_count as i32,
-            ],
-        )?;
-        Ok(())
+        self.in_transaction(|| {
+            self.forget_graph_step(Some(&fs.branch));
+            self.w()?.execute(
+                "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
+                params![fs.repo_path, fs.branch, fs.file_path],
+            )?;
+            self.w()?.execute(
+                "INSERT INTO file_state (repo_path, branch, file_path, content_hash, language,
+                    symbol_count, chunk_count)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    fs.repo_path,
+                    fs.branch,
+                    fs.file_path,
+                    fs.content_hash,
+                    fs.language,
+                    fs.symbol_count as i32,
+                    fs.chunk_count as i32,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Delete a file-state row (on file deletion).
@@ -488,12 +492,14 @@ impl Store {
     }
 
     pub fn delete_file_state(&self, repo_path: &str, branch: &str, file: &str) -> Result<()> {
-        self.forget_graph_step(Some(branch));
-        self.w()?.execute(
-            "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
-            params![repo_path, branch, file],
-        )?;
-        Ok(())
+        self.in_transaction(|| {
+            self.forget_graph_step(Some(branch));
+            self.w()?.execute(
+                "DELETE FROM file_state WHERE repo_path = ? AND branch = ? AND file_path = ?",
+                params![repo_path, branch, file],
+            )?;
+            Ok(())
+        })
     }
 
     /// Files whose state row says they hold chunks while `vectors` holds none
@@ -817,6 +823,82 @@ mod tests {
             "the pre-commit answer outlived the commit"
         );
         assert!(cached(&store));
+    }
+
+    /// A writer called outside any transaction (autocommit) drops the cached
+    /// check after its write too, not only before it: a handler that asks
+    /// between the two reads the old rows, and its answer — computed after
+    /// the first drop, so under the same generation — would otherwise be
+    /// kept until the run's last `index_state`. Each writer runs in its own
+    /// transaction, whose commit drops the answers again: two invalidations
+    /// per write, the second once the rows are visible.
+    #[test]
+    fn an_autocommit_writer_invalidates_after_its_write_too() {
+        use crate::symbols::StoredSymbol;
+        let store = Store::open_in_memory(3).unwrap();
+        let state = FileState {
+            repo_path: "/repo".into(),
+            branch: "main".into(),
+            file_path: "a.py".into(),
+            content_hash: "h".into(),
+            language: "python".into(),
+            symbol_count: 1,
+            chunk_count: 1,
+        };
+        let record = IndexRecord {
+            repo_path: "/repo".into(),
+            branch: "main".into(),
+            last_commit: "c".into(),
+            model_name: "m".into(),
+            model_dimension: 3,
+            file_count: 1,
+            symbol_count: 1,
+            chunk_count: 1,
+            indexed_at: "1".into(),
+        };
+        let row = StoredSymbol {
+            id: 1,
+            file: "a.py".into(),
+            kind: "file".into(),
+            ..Default::default()
+        };
+        type Writer<'a> = Box<dyn Fn() -> Result<()> + 'a>;
+        let writers: Vec<(&str, Writer<'_>)> = vec![
+            (
+                "save_file_state",
+                Box::new(|| store.save_file_state(&state)),
+            ),
+            (
+                "delete_file_state",
+                Box::new(|| store.delete_file_state("/repo", "main", "a.py")),
+            ),
+            (
+                "save_index_record",
+                Box::new(|| store.save_index_record(&record)),
+            ),
+            (
+                "replace_file_symbols",
+                Box::new(|| {
+                    store.replace_file_symbols("r", "main", "a.py", std::slice::from_ref(&row))
+                }),
+            ),
+            (
+                "delete_file_graph",
+                Box::new(|| store.delete_file_graph("r", "main", "a.py")),
+            ),
+            (
+                "drop_branch",
+                Box::new(|| store.drop_branch("r", "/repo", "main").map(|_| ())),
+            ),
+        ];
+        for (name, write) in writers {
+            let before = store.graph_step_generation();
+            write().unwrap();
+            assert!(
+                store.graph_step_generation() >= before + 2,
+                "{name}: no invalidation after the write"
+            );
+        }
     }
 
     /// The same, rolled back: the answer from inside the transaction is the

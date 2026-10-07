@@ -7,12 +7,16 @@
     "cjs",
     "jsx"
   ],
-  "symbols": "(function_declaration name: (identifier) @function)\n(class_declaration name: (identifier) @class)\n(method_definition name: (property_identifier) @method)",
-  "calls": "(call_expression function: (identifier) @callee)\n(call_expression function: (member_expression property: (property_identifier) @callee))",
-  "imports": "(import_statement) @import",
+  "definitions": "(function_declaration name: (identifier) @name) @definition.function\n(generator_function_declaration name: (identifier) @name) @definition.function\n(class_declaration name: (identifier) @name) @definition.class\n(method_definition name: (property_identifier) @name) @definition.method\n(lexical_declaration (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression)])) @definition.function\n(variable_declaration (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression)])) @definition.function\n(field_definition property: (property_identifier) @name value: [(arrow_function) (function_expression)]) @definition.method\n(field_definition property: (property_identifier) @name) @definition.field",
+  "references": "(call_expression function: (identifier) @name) @reference.call\n(call_expression function: (member_expression property: (property_identifier) @name)) @reference.call\n(new_expression constructor: (_) @type) @reference.new",
+  "inherits": "(class_heritage (_) @inherit.extends)",
+  "imports": "(import_statement (import_clause (named_imports (import_specifier name: (_) @import.name alias: (_) @import.alias))) source: (string (string_fragment) @import.path)) @import\n(import_statement (import_clause (named_imports (import_specifier name: (_) @import.name !alias))) source: (string (string_fragment) @import.path)) @import\n(import_statement (import_clause (identifier) @import.default) source: (string (string_fragment) @import.path)) @import\n(import_statement (import_clause (namespace_import (identifier) @import.namespace)) source: (string (string_fragment) @import.path)) @import\n(import_statement source: (string (string_fragment) @import.path)) @import",
   "function_kinds": [
     "function_declaration",
-    "method_definition"
+    "generator_function_declaration",
+    "method_definition",
+    "arrow_function",
+    "function_expression"
   ],
   "container_kinds": [
     "class_declaration"
@@ -20,5 +24,36 @@
   "scope_kinds": [
     "variable_declarator",
     "pair"
+  ],
+  "platform_prefixes": [
+    "node:"
+  ],
+  "builtins": [
+    "console",
+    "JSON",
+    "Math",
+    "Object",
+    "Array",
+    "String",
+    "Number",
+    "Boolean",
+    "Promise",
+    "Date",
+    "RegExp",
+    "Error",
+    "Map",
+    "Set",
+    "WeakMap",
+    "Symbol",
+    "parseInt",
+    "parseFloat",
+    "setTimeout",
+    "clearTimeout",
+    "setInterval",
+    "clearInterval",
+    "fetch",
+    "window",
+    "document",
+    "require"
   ]
 }

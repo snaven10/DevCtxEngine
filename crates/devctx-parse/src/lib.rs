@@ -7,14 +7,17 @@
 //! `docs/architecture-spec.md` §3.
 
 pub mod error;
+pub mod facts;
 pub mod lang;
 pub mod parser;
 pub mod registry;
+pub mod resolve;
 pub mod routes;
 pub mod symbol_id;
 pub mod types;
 
 pub use error::{ParseError, Result};
+pub use facts::{FileFacts, ImportFact, InheritFact, RefFact};
 pub use lang::{lang_for_extension, raw_text_language, Lang};
 pub use parser::LanguageParser;
 pub use registry::{extractor_fingerprint, LangDef, EXTRACTOR_VERSION};
@@ -29,9 +32,27 @@ pub fn detect_lang(path: &Path) -> Option<Lang> {
     lang_for_extension(&ext)
 }
 
-/// Parse `source` as `lang`, extracting symbols and imports.
+thread_local! {
+    /// One parser per language per thread, built on first use.
+    static PARSERS: std::cell::RefCell<std::collections::HashMap<&'static str, LanguageParser>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Parse `source` as `lang`: symbols, imports, calls and the structured
+/// facts.
+///
+/// The compiled queries are kept per language and thread: compiling them
+/// was a fixed cost paid on every file, and it grew with the structured
+/// extraction (PLAN-009 TASK-004) to dominate the parse of a small file.
 pub fn parse(lang: Lang, source: &str) -> Result<ParsedFile> {
-    LanguageParser::new(lang)?.parse(source)
+    PARSERS.with(|cell| {
+        let mut parsers = cell.borrow_mut();
+        let parser = match parsers.entry(lang.key()) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(LanguageParser::new(lang)?),
+        };
+        parser.parse(source)
+    })
 }
 
 #[cfg(test)]
@@ -121,7 +142,7 @@ func (s *Server) Handle() {}
 func main() {}
 ";
         let pf = parse_ok(Lang::go(), src);
-        assert_eq!(find(&pf, "Server").kind, "type");
+        assert_eq!(find(&pf, "Server").kind, "struct");
         assert_eq!(find(&pf, "Handle").kind, "method");
         assert_eq!(find(&pf, "main").kind, "function");
         assert_eq!(pf.imports.len(), 1);

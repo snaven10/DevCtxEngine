@@ -35,6 +35,23 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   step with its files (files added, deleted or modified by 0.9.0 after a
   downgrade), and such a branch is no longer a source for the cross-branch
   copy.
+- **Structured extraction** (PLAN-009 TASK-004, **extractor version 3**:
+  existing indexes report `extractor_stale` until `devctx index --full`, which
+  reuses the vectors of unchanged chunks). New symbol kinds: `constructor`,
+  `record`, `field`, `const`, `impl` (Rust), TS/JS functions bound to a `const`
+  (`export const x = () => …`) and arrow-valued class fields, TS `enum`/`type`,
+  Go `struct`/`interface`. Symbols carry a package (declared or derived from
+  the path), a signature (the head up to the body, multi-line collapsed) and
+  `exported`. `edges` now holds `imports`, `inherits`, `implements`,
+  `instantiates`, `references` (type uses) and `contains` besides `calls`;
+  only `contains` is resolved at write time (both ends in the file). Calls
+  inside an arrow-const have it as their source (they used to be dropped);
+  Rust path calls keep their path (`Foo::bar()` → `Foo.bar`, `Self::new()` →
+  the impl's type, `std::fs::read()` → `std::fs::read`); a Go method's calls
+  come from `Type.method`. Constructors are chunks of their own; fields,
+  constants and `impl`s are not (chunk churn on a Java repo: 80 of 3 284).
+  Parsers are cached per language and thread (queries were compiled per file).
+  A golden test pins the extractor's output per version.
 - **The type of an `impl` is named as its definition is** (`impl<T> Foo<T>`,
   `impl Display for &'a Foo`, `impl crate::x::Foo` → `Foo`). This changes
   content, not format: the `graph_edges` source of such a method is now

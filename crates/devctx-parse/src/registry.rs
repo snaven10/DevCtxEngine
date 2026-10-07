@@ -45,16 +45,42 @@ pub struct LangDef {
     /// because the distinction is a grammar detail and nobody searches for it.
     #[serde(default)]
     pub store_language: Option<String>,
-    /// Query capturing definitions; the capture name is the symbol kind.
-    pub symbols: String,
-    /// Query capturing call callees as `@callee`.
-    pub calls: String,
+    /// Query capturing definitions, `tags.scm` style (PLAN-009 DD-5): the
+    /// definition node as `@definition.<kind>` and its name as `@name`. One
+    /// node captured by several patterns keeps the first pattern's kind (an
+    /// arrow-valued field is a `method`, not a `field`).
+    pub definitions: String,
+    /// Query capturing references: `@reference.call` with the callee as
+    /// `@name` (and, for a path call like Rust's `Foo::bar`, the path as
+    /// `@path`); `@reference.new` with the instantiated type as `@type`;
+    /// `@reference.type` around a type use (a field's, a parameter's, a
+    /// variable's or a return type), the node itself or its `@type` child,
+    /// whose type names ([`type_names`](Self::type_names)) are each one
+    /// reference.
+    pub references: String,
+    /// Query capturing supertypes inside a type definition:
+    /// `@inherit.extends` / `@inherit.implements` on the supertype node.
+    #[serde(default)]
+    pub inherits: Option<String>,
     /// Query capturing `@name`/`@type` pairs to resolve a receiver's type.
     /// Absent for untyped languages.
     #[serde(default)]
     pub types: Option<String>,
-    /// Query capturing whole import statements as `@import`.
+    /// Query capturing imports: the statement as `@import`, and what it
+    /// brings in as `@import.path` (module or full path), `@import.name`,
+    /// `@import.alias`, `@import.wildcard`, `@import.default` (a default
+    /// import's local name), `@import.namespace` (`* as x`), or
+    /// `@import.tree` for a language whose import is a tree the resolver
+    /// expands (a Rust `use`).
     pub imports: String,
+    /// Query capturing the file's declared package as `@package` (Java,
+    /// Go). The others derive it from the path.
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Node kinds that name a type inside a `@reference.type` capture: each
+    /// outermost one is a reference (`List<Foo>` is `List` and `Foo`).
+    #[serde(default)]
+    pub type_names: Vec<String>,
     /// Node kinds that define a callable, for resolving an edge's source.
     pub function_kinds: Vec<String>,
     /// Node kinds that act as symbol containers, for the parent of a symbol and
@@ -70,6 +96,14 @@ pub struct LangDef {
     /// DD-3). Not TypeScript: its overload signatures are not symbols.
     #[serde(default)]
     pub overloads: bool,
+    /// Prefixes of names that belong to the platform (JDK, `std`, the Go
+    /// standard library) — evidence for `external` (PLAN-009 DD-9).
+    #[serde(default)]
+    pub platform_prefixes: Vec<String>,
+    /// Bare names that belong to the platform (Python builtins, JS globals,
+    /// `java.lang` types): evidence for `external` too.
+    #[serde(default)]
+    pub builtins: Vec<String>,
 }
 
 impl LangDef {
@@ -103,7 +137,16 @@ const SOURCES: &[&str] = &[
 ///
 /// 2: the `symbols` and `edges` tables (PLAN-009 TASK-003) — an index made
 /// before them has neither, so it must read as stale.
-pub const EXTRACTOR_VERSION: u32 = 2;
+/// 3: structured extraction (PLAN-009 TASK-004) — new symbol kinds, `impl`
+/// symbols, the Java overload shape in ids, every edge kind.
+///
+/// The fingerprint hashes the JSON, not the Rust code, on purpose: a
+/// refactor, a comment or `rustfmt` must not make every user run `--full`.
+/// What is versioned is the *output*: `tests/extractor_golden.rs` pins the
+/// kinds, qualified names and ids the extractor produces for a fixture in
+/// every language, together with the version they were produced under, and
+/// fails when the output changes without a bump here.
+pub const EXTRACTOR_VERSION: u32 = 3;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
@@ -188,24 +231,67 @@ mod tests {
     ///
     /// Moving the queries into JSON traded a compile error for a runtime one.
     /// This is the trade being paid back: every embedded definition resolves its
-    /// grammar and compiles all four of its queries, so a bad node kind fails
-    /// here — naming the language and the query — rather than in somebody's
-    /// index run.
+    /// grammar and compiles every query it has (definitions, references,
+    /// inherits, imports, package, types), with only the captures the parser
+    /// reads, and every node kind it names exists — so a bad node kind or a
+    /// misspelt capture fails here, naming the language and the query, rather
+    /// than in somebody's index run.
+    const DEFINITION_CAPTURES: &[&str] = &["name"];
+    const REFERENCE_CAPTURES: &[&str] = &[
+        "reference.call",
+        "reference.new",
+        "reference.type",
+        "name",
+        "path",
+        "type",
+    ];
+    const INHERIT_CAPTURES: &[&str] = &["inherit.extends", "inherit.implements"];
+    const IMPORT_CAPTURES: &[&str] = &[
+        "import",
+        "import.path",
+        "import.name",
+        "import.alias",
+        "import.wildcard",
+        "import.default",
+        "import.namespace",
+        "import.tree",
+    ];
+
     #[test]
     fn every_definition_compiles() {
         for def in ALL.iter() {
             let grammar = grammar_for(&def.grammar)
                 .unwrap_or_else(|| panic!("`{}`: no grammar named `{}`", def.name, def.grammar));
-            for (label, src) in [
-                ("symbols", Some(&def.symbols)),
-                ("calls", Some(&def.calls)),
-                ("imports", Some(&def.imports)),
-                ("types", def.types.as_ref()),
+            for (label, src, allowed) in [
+                ("definitions", Some(&def.definitions), DEFINITION_CAPTURES),
+                ("references", Some(&def.references), REFERENCE_CAPTURES),
+                ("inherits", def.inherits.as_ref(), INHERIT_CAPTURES),
+                ("imports", Some(&def.imports), IMPORT_CAPTURES),
+                ("package", def.package.as_ref(), &["package"][..]),
+                ("types", def.types.as_ref(), &["name", "type"][..]),
             ] {
                 let Some(src) = src else { continue };
-                if let Err(e) = Query::new(&grammar, src) {
-                    panic!("`{}`: the `{label}` query does not compile: {e}", def.name);
+                let query = Query::new(&grammar, src).unwrap_or_else(|e| {
+                    panic!("`{}`: the `{label}` query does not compile: {e}", def.name)
+                });
+                // A capture the parser does not read is a typo that would
+                // silently match nothing useful.
+                for name in query.capture_names() {
+                    let known = allowed.contains(name)
+                        || (label == "definitions" && name.starts_with("definition."));
+                    assert!(
+                        known,
+                        "`{}`: `{label}` captures unknown `@{name}`",
+                        def.name
+                    );
                 }
+            }
+            for kind in def.type_names.iter().chain(&def.function_kinds) {
+                assert!(
+                    grammar.id_for_node_kind(kind, true) != 0,
+                    "`{}`: no node kind `{kind}`",
+                    def.name
+                );
             }
         }
     }
@@ -251,7 +337,7 @@ mod fingerprint_tests {
     #[test]
     fn the_fingerprint_is_stable_between_calls() {
         assert_eq!(extractor_fingerprint(), extractor_fingerprint());
-        assert!(extractor_fingerprint().starts_with("v2-"));
+        assert!(extractor_fingerprint().starts_with("v3-"));
     }
 
     #[test]
