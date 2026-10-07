@@ -29,11 +29,19 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   qualified name carries every enclosing scope (module, function, class,
   namespace, Go receiver) and a Rust trait impl carries its trait, so adding a
   homonym elsewhere in a file does not move an existing symbol's id.
-  `graph_edges` is still written as before, so 0.9.0 can read a downgraded
-  index. **Extractor version 2:** existing indexes report `extractor_stale`
-  until `devctx index --full` (which reuses every vector); so does one whose
-  graph lost step with its files (files added or deleted by 0.9.0 after a
-  downgrade).
+  `graph_edges` is still written in the same format, so 0.9.0 can read a
+  downgraded index. **Extractor version 2:** existing indexes report
+  `extractor_stale` until `devctx index --full`; so does one whose graph lost
+  step with its files (files added, deleted or modified by 0.9.0 after a
+  downgrade), and such a branch is no longer a source for the cross-branch
+  copy.
+- **The type of an `impl` is named as its definition is** (`impl<T> Foo<T>`,
+  `impl Display for &'a Foo`, `impl crate::x::Foo` → `Foo`). This changes
+  content, not format: the `graph_edges` source of such a method is now
+  `Foo.get` (was `Foo<T>.get`), and its chunks' context header changes with
+  it, so the first `--full` after upgrading re-embeds those chunks instead of
+  reusing them (measured on this repository: 40 of 4928 chunks, 143 of 16 123
+  `graph_edges` rows).
 
 ### Fixed
 
@@ -46,6 +54,12 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   index type 'HNSW'") and invalidated the database for the process. Where VSS
   cannot be loaded at all (offline), every checkpoint over such an index is
   skipped instead, leaving the write-ahead log for an open that can.
+
+### Known issues
+
+- 0.8.3 – 0.9.0: the first open of an HNSW database created with 0.8.2 or
+  earlier fails once with "unknown index type 'HNSW'"; retrying resolves it.
+  Fixed in this release (see above); there is no 0.9.1.
 
 ## 0.9.0 — 2026-10-05
 

@@ -99,8 +99,10 @@ resolución nueva), pero ya sin perder ocurrencias repetidas ni llamadas a nivel
   misma transacción por archivo que vectors/`graph_edges`/routes/file_state; ids estables DD-3;
   símbolo `file` por archivo como fuente de llamadas sin función envolvente; una fila por
   ocurrencia; mantenimiento en `delete_file`, `drop_branch`, `copy_file_rows`, `rename_file`;
-  `EXTRACTOR_VERSION = 2`. `graph_edges` sigue igual que en 0.9.0 (mismo contenido: solo llamadas
-  con función nombrada, deduplicadas por par).
+  `EXTRACTOR_VERSION = 2`. `graph_edges` mantiene el **formato** de 0.9.0 (solo llamadas con
+  función nombrada, deduplicadas por par), **no el contenido**: la fuente de un método de un `impl`
+  genérico o de referencia pasa de `Foo<T>.get` a `Foo.get` (corregido en los follow-ups: en
+  DevCtxEngine 143 de 16 123 filas cambian).
 - **Id (DD-3, con una desviación de forma):** `id = fnv1a64("F"␟repo␟file) XOR
   fnv1a64("S"␟kind_class␟qualified␟disambiguator)` (`devctx_core::symbol_id`). Mismas entradas y
   misma estabilidad que el hash único de DD-3, y además: un renombre de archivo desplaza todos los
@@ -144,8 +146,9 @@ resolución nueva), pero ya sin perder ocurrencias repetidas ni llamadas a nivel
   Tamaño: DD-21 (≤ +30 %) **cumplido, en el borde en DevCtxEngine**: las tablas nuevas ocupan
   5 bloques (~1,3 MB); el resto del salto son 25 bloques libres en el archivo (hipótesis no
   verificada: un auto-checkpoint del WAL a mitad de corrida reescribe bloques parciales; el padre
-  terminó con 0 libres). Q para el usuario si molesta: compactar al final del `--full` o dejar de
-  escribir `graph_edges` antes (riesgo previsto en esta task).
+  terminó con 0 libres). **Decidido (usuario):** DD-21 se mide en bloques usados (+7,2 %); los
+  bloques libres se miden y no se tocan (sin compactar; `graph_edges` se sigue escribiendo).
+  Medición tras un segundo `--full`/incremental en "Follow-ups A-D".
 - **Downgrade verificado:** el binario padre (lectura de `graph.rs` idéntica a 0.9.0 salvo
   comentarios, `git diff fdc7dd2`) abre el DB nuevo y `impact replace_file_edges` da salida
   **idéntica** byte a byte a la del binario nuevo; las tablas nuevas se ignoran.
@@ -165,8 +168,10 @@ resolución nueva), pero ya sin perder ocurrencias repetidas ni llamadas a nivel
   `Lang::overloads`, `LangDef.overloads`; `StoredSymbol`, `StoredSymbolEdge`;
   `Store::{replace_file_symbols, replace_file_symbol_edges, replace_file_graph,
   delete_file_graph, file_symbols, symbol_by_id, file_symbol_edges, graph_row_counts}`.
-  `Store::rename_file` ahora es transaccional y re-keya el grafo. `ParsedFile.symbols` y el texto de
-  los chunks no cambian (el reuso de vectores de TASK-002 sigue: 4928/4928 y 3253/3253 reusados).
+  `Store::rename_file` ahora es transaccional y re-keya el grafo. Con el commit original el texto
+  de los chunks no cambiaba (4928/4928 y 3253/3253 reusados); **ya no vale** desde el fixup: el
+  `parent` de un `impl` genérico/de referencia cambia el encabezado de sus chunks (re-medido en
+  "Follow-ups A-D": 4888/4928).
 - **Verificado por:** tests nuevos — core: `the_id_is_a_pure_function_of_its_inputs`,
   `a_rename_shifts_every_id_by_one_mask`, `interchangeable_kinds_share_a_class`; parse:
   `moving_a_body_within_the_file_keeps_the_id`, `java_overloads_get_distinct_ids`,
@@ -229,9 +234,11 @@ resolución nueva), pero ya sin perder ocurrencias repetidas ni llamadas a nivel
     sobrecarga original al agregar otra (el mismo defecto de MAJOR-1). Documentado en DD-3.
   - *MINOR-2:* `Store::extractor_stale` recibe ahora el `repo` corto y también da `true` si
     `graph_out_of_step` (archivo con símbolos sin fila `file`, o fila `file` sin `file_state`), así
-    un downgrade a 0.9.0 con incrementales bajo el sello `v2` se reporta y el incremental no
-    re-sella ni copia. Límite: archivos *modificados* por 0.9.0 no se detectan. Test:
-    `a_graph_out_of_step_with_its_files_reads_as_stale`.
+    un downgrade a 0.9.0 con incrementales bajo el sello `v2` se reporta y el incremental de esa
+    rama no re-sella ni la toma como copia de sí misma. *Corrección (follow-ups):* decía "ni
+    copia", inexacto: otras ramas sí la tomaban como fuente de copia (`branch_with_same_content`
+    solo miraba el sello) y los archivos *modificados* por 0.9.0 no se detectaban; ambos cerrados
+    en D. Test: `a_graph_out_of_step_with_its_files_reads_as_stale`.
   - *MINOR-3:* `an_existing_hnsw_database_gains_the_tables` falla si VSS no carga, salvo
     `DEVCTX_TEST_ALLOW_NO_VSS=1` (patrón de `require_fts`); test nuevo
     `an_hnsw_database_without_vss_skips_the_checkpoint` (conexión sin autoload de extensiones).
@@ -240,7 +247,59 @@ resolución nueva), pero ya sin perder ocurrencias repetidas ni llamadas a nivel
   - *NITs:* golden de `symbol_id`; la firma corta en el `body` (`the_signature_excludes_a_one_line_body`:
     `fn g() -> i32 { 1 }` → `fn g() -> i32`).
   - `EXTRACTOR_VERSION` sigue en 2 (nada publicado). Bloques libres / `graph_edges` / hotfix
-    0.9.1: **decisión pendiente del usuario**, sin cambios de código; no se midió
-    `PRAGMA database_size` tras un segundo `--full`.
+    0.9.1: **decidido por el usuario** después de este fixup (ver "Follow-ups A-D").
   - Gate: `cargo fmt --check`; `cargo clippy --workspace --all-targets -D warnings` (y
     `--features gpu`); `cargo test` por paquete con `TMPDIR=/var/tmp`: verde. Guardia privada vacía.
+- **Follow-ups A-D (segunda revisión):** cada uno con test que falla en el padre (bdc727e) o,
+  donde el padre no compila el test (API nueva), con la mutación comprobada.
+  - *A, tipo del `impl`:* `bare_type_name` (`parser.rs`) quita lifetimes, referencias, `mut`/
+    `const`, punteros, genéricos y ruta (`&'a mut Foo`, `crate::x::Foo`, `super::Foo` → `Foo`);
+    si no queda nombre (`[T]`) conserva el texto, y `parent_of` cae al archivo. `impl_trait`
+    quita la ruta del trait (`fmt::Display` → `Display`) y conserva sus genéricos. Casos en
+    `qualified_names_carry_every_enclosing_symbol` (falla en el padre: `'aFoo.fmt`, `.fmt`,
+    `crate::x::Foo.a`).
+  - *B, más ordinales de los que decía DD-3:* `scope_kinds` nuevos — TS/TSX/JS
+    `variable_declarator` y `pair` (objetos literales), Java `enum_constant`,
+    `constructor_declaration` y `variable_declarator` (constantes con cuerpo, clase anónima en
+    constructor o campo); el nombre de un scope sale de `name` o `key` y solo cuenta si es
+    identificador. La ambigüedad del `.` (`fn a(){struct P}` vs `mod a{struct P}`) se cierra con
+    la **forma del scope** en el disambiguator (`@f`, `@sf`: solo cuando hay un scope invocable),
+    no en `qualified` (lo lee una persona y TASK-008 busca por él) ni en `kind_class`. Nuevo
+    `Symbol.scope_shape`. Casos nuevos en `inserting_a_homonym_above_keeps_existing_ids` (falla en
+    el padre: constructor, TS, JS, enum/campo Java, `fn`/`mod`). Lo que sigue cayendo al ordinal
+    queda listado en DD-3.
+  - *NIT:* parámetros Java sin genéricos y con nombre simple (`java.util.Map<String, X>` → `Map`):
+    `java_parameter_types_are_simple_names` (falla en el padre). `Store::rename_file` documenta que
+    no toca `file_state` (sin llamador).
+  - *C, `container_name` también alimenta `graph_edges` y los chunks:* `qualified_source`/
+    `qualified_target` (fuente y `self.x()`) y `Symbol.parent` (encabezado de los chunks
+    `function`/`block`/`doc`/`class` y la lista `# methods` de la clase) usan el nombre reducido.
+    Re-medido (sandbox `mktemp -d -p /var/tmp`, release, minilm-l6, DevCtxEngine @ dc1aed3,
+    281 archivos / 4928 chunks): índice desde cero con el padre de TASK-003 (dc1aed3, = 0.9.0 en
+    extracción) 345 s; `--full` del binario nuevo encima: **4888 reusados, 40 re-embebidos
+    (0,8 %)** en 6 archivos (`pipeline.rs` 17, `fallback.rs` 7, `provider.rs` 6, `state.rs` 4,
+    `store.rs` 4, `memory/lib.rs` 2), 31,4 s. `graph_edges`: 16 123 filas en ambos, **143 distintas**
+    (`Ctx<'_>.index_file` → `Ctx.index_file`, `CudaFallback<M, E>.run` → `CudaFallback.run`). La
+    cifra vieja 4928/4928 era del commit original, antes del fixup. CHANGELOG corregido.
+  - *D, desfase grafo/archivos:* (1) columna `symbols.content_hash` (solo la fila `file`, mismo
+    valor que `file_state`; `ALTER … ADD COLUMN IF NOT EXISTS` para DBs de desarrollo) y tercer
+    anti-join en `graph_out_of_step`: un archivo *modificado* por 0.9.0 tras un downgrade se
+    detecta; (2) `branch_with_same_content` recorre las ramas candidatas y descarta las que estén
+    fuera de paso (`CopySetup.repo` nuevo), así una rama `v2` vieja deja de ser fuente de copia;
+    (3) `graph_out_of_step_cached`: respuesta cacheada por `(repo, repo_path, rama)` +
+    `index_state.indexed_at`, invalidada por cada escritura del proceso a la rama (`file_state`,
+    grafo, `index_state`, `drop_branch`) y por rollback; la usan `extractor_stale` (status, tools
+    de grafo, inicio de corrida) y la copia. Tests: `a_graph_out_of_step_with_its_files_reads_as_stale`
+    (caso "modificado"), `a_branch_out_of_step_is_not_a_copy_source`,
+    `the_graph_check_is_cached_until_the_branch_changes`; mutaciones (quitar el tercer anti-join,
+    quitar la compuerta de la copia) los hacen fallar.
+  - *Decisiones del usuario (registradas aquí, no tomadas en esta task):* **no hay hotfix 0.9.1**;
+    el orden VSS→schema sale con 0.10.0 y el CHANGELOG lo lista como known issue de
+    0.8.3–0.9.0. **Bloques libres:** se miden y no se tocan (sin compactar, `graph_edges` se sigue
+    escribiendo); DD-21 se mide en bloques usados (+7,2 %). Medido en el mismo sandbox
+    (`pragma_database_size`, bloques de 256 KiB, usados/libres): 0.9.0 111/0 → `--full` nuevo
+    167/75 (27,7 → 60,5 MiB) → segundo `--full` (nada escrito) 167/75 → incremental (nada
+    escrito) 166/76 → `--full` que reescribe 40 archivos 178/95 (68,2 MiB). Los libres **no
+    bajan**: DuckDB no los reutiliza solo en este patrón. Anotado en DD-21; lo vigila TASK-016.
+  - `EXTRACTOR_VERSION` sigue en 2: A, B y C cambian ids/texto de chunks sin release de por
+    medio (el fingerprint del extractor cambia igual por los `scope_kinds` del JSON).

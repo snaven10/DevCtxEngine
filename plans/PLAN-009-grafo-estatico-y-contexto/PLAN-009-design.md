@@ -159,26 +159,59 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
 - **`qualified`** lleva **todo scope envolvente**, no solo los contenedores de `container_kinds`:
   cada ancestro que es símbolo del archivo (Rust `mod`, función envolvente, método — el `wrapper`
   de un decorador Python, el método de una clase anónima Java), cada contenedor (`impl`, clase,
-  trait; el tipo de un `impl` sin argumentos genéricos: `impl<T> Foo<T>` → `Foo`), los
-  `scope_kinds` del JSON (TS/TSX `namespace`/`module`, que no son símbolos) y, en Go, el tipo del
-  receptor (`func (s *Svc[T]) Run` → `Svc.Run`). Ejemplos: `tests.helper`, `deco.wrapper`,
-  `Outer.start.run`. Así dos homónimos difieren por *dónde* están y no por su orden en el archivo.
-  (TASK-004 le agrega la ruta/paquete; la regla de scopes se mantiene.)
-- **`disambiguator`**: el trait de un `impl Trait for Tipo` de Rust, sin espacios y con sus
-  argumentos genéricos (`Display` y `Debug` de `X.fmt` difieren; `From<A>` y `From<B>` también), y
-  la lista de tipos de parámetros normalizada (sin nombres ni espacios) en lenguajes con
-  sobrecarga de cuerpos separados — **solo Java** (`"overloads": true`). Java la usa **siempre**,
+  trait), los `scope_kinds` del JSON (nodos que no son símbolos: TS/TSX `namespace`/`module`;
+  TS/TSX/JS `variable_declarator` y `pair`, la variable o propiedad que tiene un objeto literal;
+  Java `enum_constant` con cuerpo, `constructor_declaration` y `variable_declarator`, el campo o
+  local que tiene una clase anónima) y, en Go, el tipo del receptor. El nombre de un scope es su
+  campo `name` (o `key` en un `pair`) y solo cuenta si es un identificador o una ruta con puntos
+  (un `pair` con clave string o un patrón de desestructuración no aporta segmento).
+  El tipo de un `impl`/receptor se reduce al nombre que tiene su definición: sin referencia,
+  lifetime, `mut`/`const`, puntero, argumentos genéricos ni ruta (`impl<T> Foo<T>`,
+  `impl<'a> T for &'a mut Foo`, `impl crate::x::Foo`, `func (s *Svc[T])` → `Foo`/`Svc`); un tipo
+  sin nombre propio (`[T]`, `(A, B)`) conserva su texto sin espacios (`[T].fmt`) y su padre cae al
+  símbolo de archivo. Ejemplos: `tests.helper`, `deco.wrapper`, `Outer.start.run`, `a.run` y
+  `b.run` (dos objetos literales), `Op.PLUS.apply`, `C.a.run`. Así dos homónimos difieren por
+  *dónde* están y no por su orden en el archivo. (TASK-004 le agrega la ruta/paquete; la regla de
+  scopes se mantiene.)
+- **`disambiguator`**: el trait de un `impl Trait for Tipo` de Rust, sin espacios ni ruta y con
+  sus argumentos genéricos (`Display` y `Debug` de `X.fmt` difieren; `From<A>` y `From<B>`
+  también; `fmt::Display` es `Display`); la lista de tipos de parámetros normalizada (sin nombres,
+  espacios, argumentos genéricos ni paquete: `java.util.List<String>` → `List`, porque dos
+  sobrecargas no pueden diferir solo en genéricos) en lenguajes con sobrecarga de cuerpos
+  separados — **solo Java** (`"overloads": true`); y la **forma del scope** cuando algún scope
+  envolvente es invocable: un carácter por scope, `f` si el nodo está en `function_kinds`, `s` si
+  no, tras `@` (`Outer.start.run` → `@sf`; sin scope invocable no se agrega nada, así que los ids
+  de métodos de clase y funciones de módulo no la llevan). Resuelve la ambigüedad del `.`:
+  `fn a() { struct P }` y `mod a { struct P }` (Rust los permite, son namespaces distintos; TS
+  fusiona `function a` con `namespace a`; Java un método `a` y una clase interna `a`) daban los dos
+  `a.P`. Se eligió el disambiguator y no `qualified` porque `qualified` es lo que lee una persona
+  (`Outer.start.run`, no `Outer.start().run`) y lo que TASK-008 busca por nombre; ni `kind_class`,
+  que es la clase del símbolo, no la de sus scopes. Java la usa **siempre**,
   no solo cuando hay homónimos: si dependiera de que exista otra sobrecarga, agregar una le
   cambiaría el id a la original (el mismo defecto que el ordinal); el costo aceptado es que
   cambiar el tipo de un parámetro cambia el id, que es lo que este DD ya dice abajo.
   **TS/TSX no**: las firmas de sobrecarga no son símbolos (hay un solo cuerpo), así que los tipos no
   desambiguan nada y solo volvían el id frágil a un refactor de tipos.
 - **Ordinal, último recurso:** solo si dos símbolos del archivo siguen compartiendo `kind_class`,
-  `qualified` y `disambiguator` (redefinición Python, dos clases anónimas con el mismo método en un
-  mismo método) o hay colisión de hash, se agrega `#n` en orden de fuente. Es el único caso en que
-  insertar un homónimo arriba mueve un id; el test `inserting_a_homonym_above_keeps_existing_ids`
-  fija que en los demás (Rust `mod tests`, dos impls de trait, decoradores, receptores Go, clases
-  anónimas Java) no pasa.
+  `qualified` y `disambiguator` o hay colisión de hash, se agrega `#n` en orden de fuente. Es el
+  único caso en que insertar un homónimo arriba mueve un id; el test
+  `inserting_a_homonym_above_keeps_existing_ids` fija que no pasa en: Rust `mod tests`, dos impls
+  de trait, `fn a`/`mod a` del mismo nombre, decoradores Python, receptores Go, clases anónimas
+  Java en métodos distintos, en un constructor, en campos y en constantes de enum, y objetos
+  literales TS/JS en variables o propiedades distintas. **Casos que siguen cayendo al ordinal
+  (abiertos, conocidos):**
+  - redefinición real (Python `def f` dos veces; `function f` repetida en JS no estricto);
+  - dos clases anónimas Java con el mismo método dentro de un **mismo** método, inicializador
+    `static {}`/de instancia, o lambda; y dos expresiones `new X() {…}` en un mismo campo;
+  - objetos literales sin variable ni propiedad que los nombre: argumentos de llamada
+    (`describe({ run() {} })` dos veces), `export default {…}`, elementos de arreglo, `return {…}`;
+    también los que cuelgan de un `pair` con clave string o computada;
+  - Java: clases anónimas dentro de lambdas (la lambda no tiene nombre, no es scope) en un mismo
+    método;
+  - TS/JS: funciones flecha y expresiones de función no son símbolos todavía (TASK-004 las agrega
+    como `arrow`/`function_expression` asignadas a `const`; con `variable_declarator` como scope ya
+    quedan nombradas);
+  - Go: dos `func init()` en un archivo (legal en Go) y funciones anónimas (no son símbolos).
 - **Forma:** un solo FNV-1a sobre los cinco campos, separados por `␟` (0x1f), valor fijado por un
   test dorado (`the_id_format_is_pinned`). TASK-003 probó primero una composición XOR (mitad
   archivo ⊕ mitad símbolo) para que `rename_file` re-keyara sin re-parsear; se descartó en la
@@ -190,11 +223,20 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   otros archivos ya resueltas hacia esos ids quedan con `dst_id`/`confidence`/`resolution` en NULL
   para que las re-resuelva el link pass (DD-6), en vez de apuntar a símbolos inexistentes.
 - **Desfase grafo/archivos:** el sello del extractor solo lo reescribe un `--full`, así que un
-  0.9.0 tras un downgrade puede hacer incrementales bajo un sello `v2` vigente. `extractor_stale`
-  además da `true` si `file_state` y `symbols` no coinciden en qué archivos hay (archivo con
-  símbolos sin fila `file`, o fila `file` sin `file_state`): dos anti-joins baratos. No detecta un
-  archivo que ese binario *modificó* (sus filas siguen, viejas); haría falta un hash que el grafo no
-  guarda.
+  0.9.0 tras un downgrade puede hacer incrementales bajo un sello `v2` vigente.
+  `graph_out_of_step` da `true` si `file_state` y `symbols` no coinciden: archivo con símbolos sin
+  fila `file` (agregado por ese binario), fila `file` sin `file_state` (borrado) o fila `file` cuyo
+  `symbols.content_hash` no es el `file_state.content_hash` del archivo (modificado: sus filas
+  siguen, viejas). La columna `content_hash` de `symbols` solo se llena en la fila `file` (mismo
+  valor que `file_state`; la copia entre ramas la lleva tal cual). Tres anti-joins sobre una rama.
+  Lo usan `extractor_stale` (status, tools de grafo, inicio de cada corrida) y
+  `branch_with_same_content`: una rama fuera de paso no es fuente de copia aunque su sello diga
+  "vigente" (si no, sus filas viejas se propagaban a la rama que se indexa y quedaban bajo un sello
+  nuevo). Costo: la respuesta se cachea por `(repo, repo_path, rama)` junto con
+  `index_state.indexed_at` de la rama (una corrida que escribe la rama termina con un `indexed_at`
+  nuevo), y cada escritura de este proceso a la rama (`file_state`, tablas del grafo,
+  `index_state`, `drop_branch`) o un rollback la invalida, así que nunca es más vieja que las
+  filas. Sin caché era una consulta por tool call y una por archivo candidato a copia.
 - FNV-1a 64 porque ya está en el árbol (`registry.rs:96-100`) y es estable entre plataformas y
   versiones (a diferencia de `DefaultHasher`). Probabilidad de colisión con 10⁶ símbolos ≈ 3·10⁻⁸;
   igual, el escritor detecta una colisión dentro del archivo y la resuelve con el ordinal.
@@ -550,8 +592,18 @@ Efecto esperado: el `index --full` que exige este plan cuesta parse + link + los
 | `index --full` desde cero | ≤ +10 % sobre 0.9.0 (el embedding domina; parse + link ≤ +30 % de la fase de parse) | TASK-001 vs TASK-016 |
 | `index --full` tras subir `EXTRACTOR_VERSION` (con DD-20) | ≤ 20 % del tiempo de 0.9.0 desde cero | TASK-002, TASK-016 |
 | Link pass incremental (1 archivo) | < 2 s en backend-a | TASK-005 |
-| Tamaño del DB | ≤ +30 % (con `graph_edges` todavía escrito) | TASK-003, TASK-016 |
+| Tamaño del DB | ≤ +30 % en **bloques usados** (`total_blocks - free_blocks` de `pragma_database_size()`), índice desde cero, con `graph_edges` todavía escrito | TASK-003, TASK-016 |
 | Pico de RAM del indexado (`VmHWM`) | ≤ +200 MB sobre 0.9.0 en frontend | TASK-005, TASK-016 (coordina con PLAN-010) |
 | `impact` sobre `get`/`map` | p95 ≤ 300 ms (serve caliente) | TASK-009 |
 | `traverse` depth 2, `repo_map` 1k tokens | p95 ≤ 200 ms / ≤ 500 ms | TASK-011, TASK-013 |
 | `build_context` | ≤ +150 ms p50 por el ego-graph y la centralidad | TASK-012 |
+
+**Tamaño: decidido (usuario, revisión de TASK-003).** El presupuesto se mide en bloques usados, no
+en bytes del archivo: TASK-003 dio +7,2 % (111 → 119 bloques de 256 KiB en DevCtxEngine). Los
+bloques libres se **miden y no se tocan**: no se compacta al final del `--full` y `graph_edges` se
+sigue escribiendo (el downgrade a 0.9.0 depende de él). Medido en los follow-ups de TASK-003
+(DevCtxEngine, sandbox, índice 0.9.0 → `--full` del binario nuevo): 111 usados / 0 libres →
+167 / 75 (27,7 → 60,5 MiB; hipótesis no verificada: la reescritura deja filas borradas y bloques libres); un segundo
+`--full` y un incremental que no escriben nada no los cambian (167/75, 166/76); un `--full` que
+reescribe 40 archivos los **sube** (178 usados / 95 libres, 68,2 MiB): DuckDB no reutiliza esos
+bloques libres por sí solo en este patrón de escritura. Lo vigila TASK-016.
