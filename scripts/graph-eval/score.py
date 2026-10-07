@@ -355,9 +355,13 @@ def judge_new(site: dict, rows: list[dict], tol: int) -> tuple[str, dict | None]
             if r["dst_qualified"]:
                 return "wrong", r
         return "undecided", same[0]
+    # Un getter de Lombok apunta a su campo (`Dto.getX` → `Dto.x`, convención de TASK-005).
+    m = re.match(r"^(.*)\.(?:get|is|set)([A-Z]\w*)$", want)
+    field = f"{m.group(1)}.{m.group(2)[0].lower()}{m.group(2)[1:]}" if m else None
     for r in same:
         q = norm_target(r["dst_qualified"]) if r["dst_qualified"] else ""
-        if q and (q == want or q.endswith("." + want)):
+        if q and (q == want or q.endswith("." + want)
+                  or (field and (q == field or q.endswith("." + field)))):
             return "correct", r
     for r in same:
         if r["dst_qualified"] or ext(r):

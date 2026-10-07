@@ -145,8 +145,11 @@ con el `qualified` de su `dst_id`, `confidence`, `resolution`, `external`) y `sc
 --new-edges` agrega una segunda tabla: correcto = destino resuelto igual al esperado (o que termina
 en `.esperado`, una clase interna) o marca `external` si el esperado es externo; error = resuelto a
 otro o marcado al revés; sin decidir = ni destino ni marca; sin arista = no hay ocurrencia (p. ej.
-descartada). Reporta precisión global, precisión en `high` y cobertura (no `low`), y por sitio la
-`confidence`/`resolution`.
+descartada: las filas `resolution = 'discarded'` no se exportan). Un getter de Lombok cuenta como
+correcto si apunta al campo (`Dto.getX` → `Dto.x`, la convención del link pass). Reporta precisión
+global, precisión en `high` y cobertura (no `low`), y por sitio la `confidence`/`resolution`.
+`graph_metrics.sql` deja las descartadas fuera de los porcentajes de `calls_resueltas` y las cuenta
+aparte (`descartadas`).
 
 ## Para tasks posteriores
 

@@ -91,6 +91,19 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   `edges_unresolved`). Measured on two Java repositories: 2.7 % of calls left
   undecided (was 100 %), 18 of 20 hand-labelled call sites resolved correctly,
   all 18 of those marked `high`.
+- **Link pass, after review** (**extractor version 7**): a dotted receiver
+  whose first segment is a variable is typed through its fields, never taken
+  for a package; a call after an external one is no longer external by
+  default (`name_only` when the repository has the name, `chain_external`,
+  `medium`, otherwise); lambda parameters and pattern variables no longer take
+  the type of a field of their name; confidence never escalates along a chain;
+  an anonymous class scopes its calls; constructor injection keeps the field's
+  declared type. The incremental pass now matches a full one (tested), a pass
+  cut short is redone by the next run, a change of link rules relinks the
+  branch, and dropped calls are kept (`resolution = 'discarded'`) so a later
+  definition reopens them. Measured on two Java repositories: 8.1 % and 4.2 %
+  of calls undecided, 20 of 25 hand-labelled sites correct, all 19 `high`
+  ones right.
 
 ### Fixed
 

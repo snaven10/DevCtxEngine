@@ -37,15 +37,21 @@ generales + Java), DD-8 y DD-9.
 
 ## Archivos
 
-- **Crear:** `crates/devctx-parse/src/resolve/scope.rs` (scopes léxicos y `type_map` por scope),
-  `crates/devctx-parse/src/resolve/java.rs`, `crates/devctx-index/src/link.rs` (link pass:
-  `RepoIndex`, reglas 5-9 de DD-7, escritura de `dst_id`/`confidence`/`resolution`/`external`),
-  fixtures Java en `crates/devctx-parse/tests/fixtures/java/` (multi-archivo, con paquetes).
+(Como quedó; la versión original ponía el motor en `devctx-index`.)
+
+- **Crear:** `crates/devctx-parse/src/resolve/scope.rs` (scopes léxicos y bindings por scope),
+  `crates/devctx-parse/src/resolve/java.rs` (resolver Java: `init_type`, `declared_type`, `arity`),
+  `crates/devctx-parse/src/resolve/link.rs` (**el motor**: `RepoIndex`, reglas DD-7 1-9, puro),
+  `crates/devctx-index/src/link.rs` (orquestación del link pass: carga, selección incremental,
+  escritura por lotes, `LINK_VERSION`, `link_pending`), fixtures Java en
+  `crates/devctx-parse/tests/fixtures/java/link/` (multi-archivo, con paquetes),
+  `crates/devctx-index/examples/graph_bench.rs`.
 - **Modificar:** `crates/devctx-parse/src/parser.rs` (retira `qualified_target`/`extract_type_bindings`
-  planos en favor del scope), `crates/devctx-parse/languages/java.json` (`scopes`, `types` con
-  `generic_type`, `@init`, `platform_prefixes`), `crates/devctx-index/src/pipeline.rs` (llamar al
-  link pass; `IndexResult.edges_discarded`, `edges_unresolved`), `crates/devctx-store/src/symbols.rs`
-  (lecturas/escrituras del link pass por lotes).
+  planos en favor del scope; `hint` por llamada), `crates/devctx-parse/languages/java.json`
+  (`scopes`, `types` con roles), `crates/devctx-index/src/pipeline.rs` (llamar al link pass;
+  `IndexResult.edges_discarded`, `edges_unresolved`, `edges_linked`),
+  `crates/devctx-store/src/{schema.rs, symbols.rs}` (`edges.hint`; lecturas por rama y escritura por
+  lotes del link pass).
 
 ## Pasos
 
@@ -54,7 +60,7 @@ generales + Java), DD-8 y DD-9.
       `field`; (b) `var q = em.createQuery(…); q.setParameter(…)` → nada con `var.`; (c)
       `LOG.info(…)` con `private static final Logger LOG` → `Logger.info`, `external`; (d)
       constructor injection `this.repo = repo` → `ctor_inject`; (e) `import x.y.Z` y mismo paquete;
-      (f) `Office.findByCodigo(c).flatMap(o -> …)` → `findByCodigo` resuelto, `flatMap` descartado
+      (f) `Office.findByCode(c).flatMap(o -> …)` → `findByCode` resuelto, `flatMap` descartado
       y contado; (g) `new Foo()` → `instantiates`; (h) estático Panache no definido →
       `inherited` + `external`; (i) `for (Foo f : lista) f.bar()` con `List<Foo> lista`.
 - [x] **Paso 2 — scopes.** `type_map` por scope léxico (clase → método → bloque/lambda), campos por
@@ -99,7 +105,7 @@ generales + Java), DD-8 y DD-9.
 
 - **Estado final:** `done`.
 - **Resumen:** cada llamada sale del parse con su receptor tipado por **scope léxico** y un `hint`
-  persistido (`edges.hint`: `typed field BetaService`, `name Office`, `chain findByCodigo name
+  persistido (`edges.hint`: `typed field BetaService`, `name Office`, `chain findByCode name
   Office`, `bare`, `this`…), y un **link pass** por rama, al final de cada corrida, resuelve las
   aristas del branch a `dst_id`/`confidence`/`resolution`/`external` o descarta las llamadas que nada
   tipa (DD-7). Motor puro en `devctx-parse` (`resolve/link.rs`, testeable sobre parses, sin store),
@@ -133,8 +139,8 @@ generales + Java), DD-8 y DD-9.
   | **Java** (backend-a 16 + backend-b 4) | 20 | 10 (50 %) | **18 (90 %)** | **18/18 (100 %)** | 90 % |
   | Rust (DevCtxEngine) | 6 | 5 | 5 (83 %) | 4/4 | 83 % |
 
-  Los dos Java que fallan son parámetros de lambda sin tipo (`session -> session.createQuery(…)`, se
-  descarta; `h -> h.onResuelto(…)` sobre un `Stream<Handler>`, `name_only`): no hay inferencia del
+  Los dos Java que fallan son parámetros de lambda sin tipo (`s -> s.query(…)` sobre una sesión, se
+  descarta; `h -> h.onDone(…)` sobre un `Stream` de handlers, `name_only`): no hay inferencia del
   tipo de un lambda. Las tres llamadas de `DraftResource` (:245/:304/:363) resuelven a su servicio,
   `high` (`ctor_inject`: el campo de cada adaptador se asigna en su constructor), y `new
   AlphaServiceAdapter` a la clase interna (`same_file`). Rust (`Instant::now`, `Store::open`) queda
@@ -230,6 +236,56 @@ generales + Java), DD-8 y DD-9.
   frontend/legacy-migration ni en macOS/Windows; el `VmHWM` medido es del `graph_bench` (sin modelo),
   la diferencia (+103 MiB en backend-a) es la del link pass; (6) los sandbox de medición viven en
   `/var/tmp/devctx-t005-*` (snapshots de los repos, índices `graph_bench`).
+- **Revisión de c239de2 y d9ffc04 (REQUEST CHANGES), resuelta en commits encima de d9ffc04:**
+  - *MAJOR 1* receptor con puntos: si el primer segmento es un binding, `member <campos> <hint>`
+    tipado campo por campo; un nombre con puntos sin binding es paquete externo solo con evidencia
+    (plataforma o import desde esa raíz). *MAJOR 2* tras una llamada externa: `name_only` sin
+    `external` si el nombre existe en el repo o tiene forma de accessor, si no `chain_external`
+    `medium`; nunca `high`. *MAJOR 3* parámetros de lambda (sin tipo) y variables de patrón
+    (`instanceof`, `type_pattern`) son bindings. *MAJOR 4* el modo (b) también re-elige por los
+    tokens del `hint` y por herencia (tipos debajo de un tipo escrito), y
+    `an_incremental_link_pass_equals_a_full_one` compara fila a fila incremental contra
+    `link_branch(full=true)` en 4 escenarios (`extends`, tipo de retorno, `@Data`, `package`):
+    **0 filas distintas** (falla si se quita la regla de tokens). *MAJOR 5* `index_meta.link_pending`
+    (test `a_link_pass_cut_short_is_done_by_the_next_run`). *MAJOR 6* `LINK_VERSION` en
+    `index_meta.link_version` (test `a_new_link_version_relinks_the_branch`). *MAJOR 7* el
+    descarte queda como fila `resolution = 'discarded'`, fuera de conteos y lectores, reabierta por
+    nombre (test `a_discarded_call_is_kept_and_reopens_by_name`).
+  - *MINOR:* confianza nunca escala en una cadena ni por un tipo `unique_name`/FQN duplicado;
+    sobrecarga sin aridad compatible → supertipos o `medium` (la aridad solo en firmas Java); `,)`
+    se pliega salvo en un grupo de un elemento (`Fn(A, B,)` = `Fn(A, B)`, `(u8,)` ≠ `(u8)`); la
+    clase anónima es un scope (`anon <Tipo>`); `graph_written` solo con fuentes. Desviaciones: 64
+    archivos por transacción documentado (lectura mitad vieja/mitad nueva), motor en `devctx-parse`
+    (DD-6 y "Archivos" actualizados), `return_type` separado de `chain_external`, `ctor_inject`
+    solo etiqueta (tipo declarado del campo). NITs: aserción vacía de `contains` en `link_java`
+    quitada, clonado perezoso en el incremental, el accessor de Lombok apunta a un `field` desde una
+    arista `calls` (DD-8). Privacidad: literales y nombres de dominio reemplazados por genéricos
+    (`findByCode`, `"done"`, `onDone`), barrido de lo agregado sin otros hallazgos.
+    **`EXTRACTOR_VERSION` = 7.**
+  - *Re-medición* (mismo método; antes = 3ad7d54, d9ffc04 = esta task sin la revisión, después =
+    con la revisión; gold ampliado en el sandbox con 5 sitios de backend-a elegidos para la
+    revisión —dos `obj.campo.m()`, un `list.get(0).getX()` de Lombok, un `Optional.get().m()`
+    encadenado y un parámetro de lambda; no hay en los repos medidos una lambda que sombree un
+    campo, cubierta por `lambda_parameters_and_patterns_bind_their_names`—, etiquetados antes de
+    medir):
+
+    | | antes | d9ffc04 | después |
+    |---|---|---|---|
+    | gold Java (25 sitios) correcto / en `high` | 0 (sin `dst_id`) | 20/25 (80 %) · 20/20 | **20/25 (80 %) · 19/19 (100 %)** |
+    | gold Rust (6) | 0 | 5/6 · 4/4 | 5/6 · 4/4 |
+    | backend-a sin decidir / externas / con `dst_id` | 100 % / 0 / 0 | 2,7 % / 76,5 % / 20,9 % | **8,1 % / 70,6 % / 21,3 %** (+11 986 descartadas, fuera) |
+    | backend-b sin decidir / externas / con `dst_id` | 100 % / 0 / 0 | 2,7 % / 51,3 % / 46,0 % | **4,2 % / 49,6 % / 46,3 %** (+3 062 descartadas) |
+    | basura `var.*` / `LOG.*` | 892 / 1 761 | 0 / 0 | 0 / 0 |
+    | link pass backend-a completo / incremental 1 archivo | — | 2,8 s / 0,62 s | 2,6 s / 0,47 s |
+    | `VmHWM` backend-a (`graph_bench`) | 314 MiB | 417 MiB | 428 MiB (+114 MiB) |
+
+    El 2,7 % de d9ffc04 estaba inflado por las externas en `high` tras una llamada externa
+    (MAJOR 2: 14 108 llamadas ahora `chain_external` `medium` y el resto `name_only`) y por los
+    receptores con puntos tomados por paquetes (MAJOR 1). En el gold, d9ffc04 acertaba
+    `holder.amount.equals(…)` por la heurística de paquete equivocada; ahora acierta por la regla
+    de `Object` (`medium`). Los 5 fallos Java: tres parámetros de lambda o una `var` desde un
+    estático que devuelve `Optional` (descartados: "sin arista"), y dos `name_only` (un getter de
+    Lombok tras `list.get(0)`, honestamente sin decidir; un handler de un `Stream`).
 - **Menores de la revisión de TASK-004 (commits previos a esta task):** 3ad7d54 (m-a `where`/genéricos
   estables ante `rustfmt`, m-c fuente de `graph_edges` por el `qualified` del símbolo, `const x =
   function named()`, `export default foo;` → `EXTRACTOR_VERSION` 4) y c239de2 (comentarios fuera del

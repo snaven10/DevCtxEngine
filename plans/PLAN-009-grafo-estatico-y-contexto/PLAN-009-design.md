@@ -415,14 +415,31 @@ agregado, borrado o renombrado en la corrida, y (c) las que quedaron sin resolve
 cambiados superan un umbral (p. ej. 20 % de la rama) hace el pase completo, que es más simple y, con
 ~10⁵ aristas, cuesta segundos (TASK-005 lo mide). PageRank global se recalcula entero (milisegundos).
 
-**Implementado en TASK-005.** El motor (`RepoIndex` y reglas) es puro y vive en
-`devctx-parse/src/resolve/link.rs`; `devctx-index/src/link.rs` carga la rama (todos los símbolos y
-las aristas salvo `contains`), elige (a)+(b)+(c) —(b): `dst_id` que ya no existe o último segmento
-de `dst_name` igual al nombre de un símbolo de un archivo escrito—, pase completo sobre 1/5 de la
-rama, y reescribe solo los archivos con filas cambiadas, **64 archivos por transacción** y un
-`DELETE … kind <> 'contains' AND file IN (…)` por lote (cada archivo entero en una transacción;
-por archivo, transacción + scan costaban 10 ms: 14,1 → 2,8 s en backend-a). Medido en backend-a:
-pase completo 2,8 s, incremental de un archivo 0,62 s, `VmHWM` +103 MiB.
+**Implementado en TASK-005 (con los cambios de su revisión).** El motor (`RepoIndex` y reglas) es
+puro y vive en `devctx-parse/src/resolve/link.rs`; `devctx-index/src/link.rs` carga la rama (todos
+los símbolos y las aristas salvo `contains`), elige qué re-resolver y escribe:
+- *Selección incremental:* (a) aristas de los archivos escritos o borrados (solo fuentes: un `.md`
+  no cuenta); (b) las de otros archivos cuyo `dst_id` ya no existe, cuyo último segmento de
+  `dst_name` **o algún token de `hint`** (el tipo del receptor, el callee anterior de una cadena) es
+  un nombre que define un archivo escrito —métodos, campos **y tipos**—, o cuya fuente está dentro
+  de un tipo que hereda (transitivamente) de un tipo escrito; (c) las sin decidir, incluidas las
+  descartadas. Pase completo si lo escrito supera 1/5 de la rama. Un test fija que el incremental
+  deja la rama **igual fila a fila** que un pase completo tras cambiar un `extends`, un tipo de
+  retorno, agregar `@Data` y mover un paquete.
+- *Siempre al día:* `index_meta.link_pending` se marca antes de la fase de archivos y se borra al
+  completar un pase: una corrida cortada (parada, crash) deja la marca y la siguiente enlaza toda la
+  rama aunque no escriba nada. `index_meta.link_version` guarda `LINK_VERSION` (la versión de las
+  reglas, en Rust): si difiere, pase completo (~3 s en backend-a). El extractor tiene la suya
+  (`EXTRACTOR_VERSION`).
+- *Descartes:* una llamada sin tipo a un nombre que el repo no define no se borra: queda con
+  `resolution = 'discarded'` (`low`, sin `dst_id`, `external = false`), fuera de los conteos del
+  arnés y de los lectores, y el modo (b) la reabre por nombre cuando aparece la definición (el
+  resultado no depende del orden en que se indexan los archivos).
+- *Escritura:* solo los archivos con filas cambiadas, **64 archivos por transacción** y un `DELETE …
+  kind <> 'contains' AND file IN (…)` por lote; cada archivo entra entero en una transacción, pero
+  un lector concurrente puede ver la rama mitad con respuestas viejas y mitad con nuevas mientras
+  dura el pase (por archivo, transacción + scan costaban 10 ms: 14,1 → 2,5 s en backend-a).
+- Medido en backend-a: pase completo 2,6 s, incremental de un archivo 0,47 s, `VmHWM` +114 MiB.
 
 **Memoria.** `RepoIndex` de frontend (2133 archivos): estimación < 100 MB (strings +
 `HashMap`s); TASK-005 lo mide con el método de PLAN-010 y es criterio de aceptación (master §6).
@@ -484,22 +501,35 @@ ocurrencia **se descarta** y se cuenta en `IndexResult.edges_discarded` (honesti
 `files_skipped`). Si `c` sí existe en el repo → se guarda como `name_only`/low. Esto elimina los
 `map`/`flatMap`/`subscribe` que hoy son el grueso de los 2 569 callers de `map`.
 
-**Implementado en TASK-005** (Java; el resto con reglas genéricas hasta TASK-006/007):
+**Implementado en TASK-005** (Java; el resto con reglas genéricas hasta TASK-006/007; incluye la
+revisión):
 - *Local:* `types` del JSON con roles (`@bind.field|param|local|assign`, `@init`, `@iter`) y una
   clave nueva `scopes` (lista de node kinds, no query): cada binding vive en el scope más interno;
   un local se ve después de su declaración; `var` toma su tipo de `new T`/`(T) e`, o de `T.of(…)`
   como conjetura (`static`) que el link pass confirma solo si `T` tiene el método; for-each toma
-  el elemento de `List<Foo>`/`Foo[]`; `this.x = x` en un constructor da `ctor_inject` (gana sobre
-  `field`). Cada llamada lleva `edges.hint`; `dst_name` nunca se reescribe.
-- *Link:* además de la tabla: llamada sin calificar no encontrada en la jerarquía → import estático
-  (simple o comodín de una clase externa) o supertipo externo → externa; cadena hasta 4 llamadas
-  atrás, con el retorno declarado (Java) o externa si la anterior lo es (`medium` si el nombre
-  existe en el repo); receptor declarado sin tipo (o parámetro de lambda) = como cadena sin tipo
-  (descarte si el nombre no está en el repo); métodos de `Object` sobre receptor sin tipo →
-  externo `medium`; getter/setter de Lombok (`@Data`, `@Getter`, `@Setter`, `@Value`, `@Builder`)
-  → el campo, `medium`; un import comodín de un paquete ajeno solo es evidencia para nombres con
-  forma de tipo. Medido: Java 18/20 gold correctos, 18/18 en `high`; sin decidir 2,7 % en
-  backend-a y backend-b (Resultado de TASK-005).
+  el elemento de `List<Foo>`/`Foo[]`; parámetros de lambda sin tipo y variables de patrón
+  (`instanceof Foo f`) son bindings (sin tipo / con el del patrón), así un parámetro nunca toma el
+  tipo del campo homónimo; `this.x = x` en un constructor da la etiqueta `ctor_inject` pero el
+  **tipo declarado del campo** (no el del parámetro: `Foo(ServiceImpl s)` con `Service s` sigue en
+  `Service`). Un receptor con puntos cuyo primer segmento es un binding es `member <campos>
+  <hint>` (`target.parent.m()`, `this.cfg.server.port()`), nunca un paquete; una llamada sin
+  receptor o con `this` dentro de una clase anónima es `anon <Tipo> …`. Cada llamada lleva
+  `edges.hint`; `dst_name` nunca se reescribe.
+- *Link:* además de la tabla: un `member` se tipa campo por campo con el tipo declarado de cada uno;
+  un nombre con puntos que el scope no ligó es paquete externo solo con evidencia (prefijo de
+  plataforma, o un import desde esa raíz fuera de los paquetes del repo); llamada sin calificar no
+  encontrada en la jerarquía → import estático (simple o comodín de una clase externa) o supertipo
+  externo → externa; en una clase anónima, primero su supertipo (si es externo y la clase
+  envolvente también tiene el nombre: sin decidir); cadena hasta 4 llamadas atrás, con el retorno
+  declarado (Java) y **nunca más segura que la llamada anterior**; tras una llamada externa nada
+  tipa el receptor: si el nombre existe en el repo o tiene forma de accessor queda `name_only`
+  (sin `external`, alcanzable por nombre en DD-10), si no `chain_external` `medium`; receptor
+  declarado sin tipo = como cadena sin tipo (descarte si el nombre no está en el repo); métodos de
+  `Object` sobre receptor sin tipo → externo `medium`; getter/setter de Lombok → el campo,
+  `medium`; una sobrecarga que ninguna aridad toma busca en los supertipos y si no, `medium`; un
+  tipo con FQN duplicado (dos módulos) o hallado solo por nombre (`unique_name`, fuera de Java)
+  nunca da `high` a lo que tipa; la aridad se lee solo de firmas Java. Medido: ver el Resultado de
+  TASK-005.
 
 ## DD-8 — `confidence` y `resolution`
 
@@ -507,10 +537,14 @@ ocurrencia **se descarta** y se cuenta en `IndexResult.edges_discarded` (honesti
   0.73 contra 0.81, y el consumidor (impact, traverse, PageRank) solo necesita filtrar y ponderar.
 - `resolution` guarda el **porqué** para auditar (`gold-edges` de DD-1 reporta precisión por
   `resolution`). Si una regla resulta mala en campo, se baja su `confidence` sin tocar el resto.
-- TASK-005 agrega `return_type` (una cadena tipada por el retorno declarado del método anterior, o
-  externa porque el anterior lo es) y usa `inherited` también para un miembro heredado de un
-  supertipo externo (Panache, `Object`). Externos y getters de Lombok pueden salir `medium`
-  cuando la evidencia es indirecta (ver DD-7, "Implementado en TASK-005").
+- TASK-005 agrega `return_type` (evidencia fuerte: la cadena se tipó con el retorno declarado de
+  un método del repo, y la arista tiene `dst_id`), `chain_external` (débil: después de una llamada
+  externa, un nombre que el repo no tiene; siempre `medium`) y `discarded` (fila de una llamada
+  descartada, fuera de conteos y lecturas), y usa `inherited` también para un miembro heredado de
+  un supertipo externo (Panache, `Object`). Un getter de Lombok se resuelve con `dst_id` apuntando
+  al **campo** (kind `field`) desde una arista `calls`, `medium`: quien lea aristas `calls` no debe
+  suponer que el destino es invocable. Externos con evidencia indirecta y todo lo derivado de un
+  `unique_name` o de un tipo ambiguo salen `medium`.
 - `structural` es el valor de `contains` (DD-6), escrito al parsear: no es una regla de DD-7 y no
   pisa `same_file`, que es de la regla 6. El arnés no lo cuenta: `calls_por_confianza` filtra
   `kind = 'calls'` y `score.py` lee `graph_edges` (solo llamadas).
