@@ -180,6 +180,7 @@ Resumen; el detalle y los tradeoffs están en [`PLAN-010-design.md`](./PLAN-010-
 | TASK-009 | Modo opcional `embeddings.provider: central` (`/embed`, `RemoteProvider`, `base_url`) | general-purpose (Rust) | TASK-008 | `pending` |
 | TASK-010 | Docs EN + ES | general-purpose (Rust) | TASK-002, TASK-008, TASK-009 | `pending` |
 | TASK-011 | Verificación de campo antes/después contra §6 | — (orquestador, con aprobación del usuario) | TASK-010 | `pending` |
+| TASK-012 | Bloques libres que crecen con las reescrituras: curva de varias corridas y evaluación de recuperar espacio | general-purpose (Rust) | TASK-001 | `pending` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
 
@@ -339,6 +340,9 @@ Cada TASK llena su `## Resultado` con:
   TASK-006 (pesos compartidos vía mmap) y TASK-009 (`provider: central`) son las que actúan sobre lo
   primero; TASK-004/007 (motor ort propio y perillas) sobre lo segundo.
 - Q-1, Q-2 y Q-3 siguen abiertas y se deciden con los números de sus tasks.
+- **TASK-012 nueva (2026-10-07):** los bloques libres del archivo DuckDB crecen con las reescrituras
+  (75 → 95 al reescribir 40 archivos, medido en PLAN-009 TASK-003). Se mide la curva de varias corridas
+  y se evalúa recuperar espacio. No bloquea la 0.10.0.
 
 ## 13. Cierre
 
