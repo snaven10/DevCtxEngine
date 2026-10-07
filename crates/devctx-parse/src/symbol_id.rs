@@ -22,8 +22,10 @@ impl ParsedFile {
     ///   `Display`'s and `Debug`'s `X.fmt` differ), and the normalised
     ///   parameter types where the language overloads with separate bodies
     ///   (Java: `run(Long)` and `run(String)`), always, not only when an
-    ///   overload exists — adding one must not move the other's id. Else
-    ///   empty. Only two symbols still sharing kind class, qualified name and
+    ///   overload exists — adding one must not move the other's id; and,
+    ///   when an enclosing scope is a callable, the scope shape (`@sf` for
+    ///   `Outer.start.run`), so `fn a() { struct P }` and `mod a { struct P }`
+    ///   differ. Else empty. Only two symbols still sharing kind class, qualified name and
     ///   disambiguator (a Python redefinition, two anonymous classes in one
     ///   method) take an ordinal in source order (`#1`, `#2`…), as does a
     ///   hash collision: the last resort, and the one case where inserting a
@@ -45,12 +47,16 @@ impl ParsedFile {
         let mut seen: HashMap<(String, String, String), usize> = HashMap::new();
         for sym in &mut self.symbols {
             let class = kind_class(&sym.kind).to_string();
-            let base = match (&sym.trait_of, &sym.params) {
+            let mut base = match (&sym.trait_of, &sym.params) {
                 (Some(t), Some(p)) => format!("{t}|{p}"),
                 (Some(t), None) => t.clone(),
                 (None, Some(p)) => p.clone(),
                 (None, None) => String::new(),
             };
+            if let Some(shape) = &sym.scope_shape {
+                base.push('@');
+                base.push_str(shape);
+            }
             let n = seen
                 .entry((class.clone(), sym.qualified.clone(), base.clone()))
                 .or_insert(0);
@@ -394,6 +400,70 @@ class Outer {
 ",
                 &["m_start"],
             ),
+            // A Java constructor is a scope: its anonymous class's method is
+            // not the class's own method of the same name.
+            (
+                Lang::java(),
+                "O.java",
+                "class O {\n    O() { new Runnable() { public void run() { m_ctor(); } }; }\n}\n",
+                "class O {\n    void run() { n1(); }\n    \
+                 O() { new Runnable() { public void run() { m_ctor(); } }; }\n}\n",
+                &["m_ctor"],
+            ),
+            // Object literals are scopes through the variable (or property)
+            // that holds them.
+            (
+                Lang::typescript(),
+                "o.ts",
+                "const b = { run() { m_b(); } };\nconst c = { k: { run() { m_c(); } } };\n",
+                "const a = { run() { n1(); } };\nconst x = { k: { run() { n2(); } } };\n\
+                 const b = { run() { m_b(); } };\nconst c = { k: { run() { m_c(); } } };\n",
+                &["m_b", "m_c"],
+            ),
+            (
+                Lang::javascript(),
+                "o.js",
+                "const b = { run() { m_b(); } };\n",
+                "const a = { run() { n1(); } };\nconst b = { run() { m_b(); } };\n",
+                &["m_b"],
+            ),
+            // Java enum constants with bodies, and anonymous classes held by
+            // fields.
+            (
+                Lang::java(),
+                "Op.java",
+                "\
+enum Op {
+    MINUS { int apply() { return m_minus(); } };
+    abstract int apply();
+}
+class C {
+    Runnable b = new Runnable() { public void run() { m_b(); } };
+}
+",
+                "\
+enum Op {
+    PLUS { int apply() { return n1(); } },
+    MINUS { int apply() { return m_minus(); } };
+    abstract int apply();
+}
+class C {
+    Runnable a = new Runnable() { public void run() { n2(); } };
+    Runnable b = new Runnable() { public void run() { m_b(); } };
+}
+",
+                &["m_minus", "m_b"],
+            ),
+            // A function and a module of the same name (Rust keeps them in
+            // different namespaces) both qualify their contents as `a.P`; the
+            // disambiguator tells a callable scope apart.
+            (
+                Lang::rust(),
+                "j.rs",
+                "mod a { struct P { m_mod: u8 } }\n",
+                "fn a() { struct P { n1: u8 } }\nmod a { struct P { m_mod: u8 } }\n",
+                &["m_mod"],
+            ),
         ];
         for (lang, file, before, after, markers) in cases {
             let a = ids(*lang, before, file);
@@ -445,6 +515,66 @@ class Outer {
         );
         let names: Vec<&str> = ts.iter().map(|(q, _)| q.as_str()).collect();
         assert_eq!(names, ["N.f", "g", "g.h"], "{ts:?}");
+
+        // The type of an `impl` is reduced to the name its definition has:
+        // no lifetime, reference, `mut` or path; a type with no name of its
+        // own (a slice) keeps its text. The trait loses its path, not its
+        // generic arguments.
+        let src = "\
+struct Foo;
+impl<'a> Display for &'a Foo { fn fmt(&self) {} }
+impl<'a> Debug for &'a mut Foo { fn fmt(&self) {} }
+impl<T> fmt::Display for [T] { fn fmt(&self) {} }
+impl crate::x::Foo { fn a(&self) {} }
+impl super::Foo { fn b(&self) {} }
+impl<T> std::convert::From<T> for Foo { fn from(t: T) -> Self { Foo } }
+";
+        let pf = ids(Lang::rust(), src, "f");
+        let got: Vec<(&str, Option<&str>)> = pf
+            .symbols
+            .iter()
+            .map(|s| (s.qualified.as_str(), s.trait_of.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Foo", None),
+                ("Foo.fmt", Some("Display")),
+                ("Foo.fmt", Some("Debug")),
+                ("[T].fmt", Some("Display")),
+                ("Foo.a", None),
+                ("Foo.b", None),
+                ("Foo.from", Some("From<T>")),
+            ],
+        );
+        let foo = id_of(&pf, "Foo");
+        for s in &pf.symbols[1..] {
+            let want = if s.qualified.starts_with("[T]") {
+                pf.file_symbol.id
+            } else {
+                foo
+            };
+            assert_eq!(s.parent_id, Some(want), "{s:?}");
+            assert_eq!(
+                s.parent.as_deref(),
+                Some(&s.qualified[..s.qualified.len() - s.name.len() - 1])
+            );
+        }
+    }
+
+    /// Java parameter types are reduced to their simple name without
+    /// generic arguments: overloads cannot differ by them (erasure), and a
+    /// fully qualified spelling is the same type.
+    #[test]
+    fn java_parameter_types_are_simple_names() {
+        let src = "\
+class S {
+    void f(List<String> a, java.util.Map<String, List<Long>> b, String[] c, int... d) {}
+}
+";
+        let pf = ids(Lang::java(), src, "S.java");
+        let f = pf.symbols.iter().find(|s| s.name == "f").unwrap();
+        assert_eq!(f.params.as_deref(), Some("List,Map,String[],int..."));
     }
 
     /// A generic impl names its type without the parameters, so its methods

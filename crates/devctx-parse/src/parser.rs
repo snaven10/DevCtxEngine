@@ -201,7 +201,7 @@ impl LanguageParser {
             }
 
             let head = doc_head(def, bytes);
-            let mut chain = qualifier_chain(def, bytes, self.lang, &def_ids);
+            let (mut chain, scope_shape) = qualifier_chain(def, bytes, self.lang, &def_ids);
             chain.push(name.clone());
             let params = self
                 .lang
@@ -223,6 +223,7 @@ impl LanguageParser {
                 signature: signature_of(def, bytes),
                 params,
                 trait_of: impl_trait(def, bytes, self.lang.container_kinds()),
+                scope_shape,
                 id: 0,
                 parent_id: None,
             });
@@ -456,9 +457,11 @@ fn container_name(container: Node<'_>, bytes: &[u8]) -> Option<String> {
 }
 
 /// A type as written in a container or receiver position, reduced to the
-/// name its definition carries: no generic arguments (`Foo<T>`, Go
-/// `Foo[T]`), no reference or pointer (`&Foo`, `&mut Foo`, `*Foo`), no
-/// whitespace.
+/// name its definition carries: no reference or pointer (`&Foo`, `&'a mut
+/// Foo`, `*const Foo`), no generic arguments (`Foo<T>`, Go `Foo[T]`), no path
+/// (`crate::x::Foo`, `super::Foo` → `Foo`), no whitespace. A type with no
+/// name of its own (`[T]`, `(A, B)`) keeps its text without whitespace, so
+/// it still qualifies something and matches no definition.
 fn bare_type_name(text: &str) -> String {
     let mut t = text.trim();
     loop {
@@ -466,7 +469,9 @@ fn bare_type_name(text: &str) -> String {
             .strip_prefix('&')
             .or_else(|| t.strip_prefix('*'))
             .or_else(|| t.strip_prefix("mut "))
+            .or_else(|| t.strip_prefix("const "))
             .or_else(|| t.strip_prefix("dyn "))
+            .or_else(|| strip_lifetime(t))
             .map(str::trim_start);
         match stripped {
             Some(rest) => t = rest,
@@ -474,26 +479,54 @@ fn bare_type_name(text: &str) -> String {
         }
     }
     let end = t.find(['<', '[']).unwrap_or(t.len());
-    t[..end].chars().filter(|c| !c.is_whitespace()).collect()
+    let name = last_path_segment(&t[..end]);
+    let name: String = name.chars().filter(|c| !c.is_whitespace()).collect();
+    if name.is_empty() {
+        t.chars().filter(|c| !c.is_whitespace()).collect()
+    } else {
+        name
+    }
 }
 
-/// Names of every scope around `def`, outermost first: its qualifier.
+/// `t` without a leading lifetime (`'a Foo` → `Foo`).
+fn strip_lifetime(t: &str) -> Option<&str> {
+    let rest = t.strip_prefix('\'')?;
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    Some(&rest[end..])
+}
+
+/// The last segment of a `::` path (`std::fmt::Display` → `Display`).
+fn last_path_segment(t: &str) -> &str {
+    t.rsplit("::").next().unwrap_or(t).trim()
+}
+
+/// Names of every scope around `def`, outermost first: its qualifier, and
+/// the shape of that qualifier — one character per scope, `f` for a
+/// callable (a node of the language's `function_kinds`), `s` for anything
+/// else — `None` when no scope is callable.
 ///
 /// A scope is a container (class, `impl`, trait…), any other symbol of the
 /// file (a Rust `mod`, an enclosing function or method — a Python decorator's
 /// `wrapper`, a Java anonymous class's method) or a language's `scope_kinds`
-/// (a TypeScript `namespace`). A Go method is qualified by its receiver type.
-/// So two homonyms differ by where they are, not by their order in the file
-/// (PLAN-009 DD-3), and the ordinal is left for true redefinitions.
+/// (a TypeScript `namespace`, the variable or property holding an object
+/// literal, a Java enum constant, constructor or field). A Go method is
+/// qualified by its receiver type. So two homonyms differ by where they are,
+/// not by their order in the file (PLAN-009 DD-3), and the ordinal is left
+/// for true redefinitions. The shape goes into the id's disambiguator: a
+/// function `a` and a module `a` both qualify their contents as `a.P`.
 fn qualifier_chain(
     def: Node<'_>,
     bytes: &[u8],
     lang: Lang,
     def_ids: &HashSet<usize>,
-) -> Vec<String> {
+) -> (Vec<String>, Option<String>) {
     let mut chain = Vec::new();
+    let mut shape = Vec::new();
     if let Some(recv) = go_receiver_type(def, bytes) {
         chain.push(recv);
+        shape.push('s');
     }
     let mut cur = def.parent();
     while let Some(n) = cur {
@@ -501,18 +534,26 @@ fn qualifier_chain(
             container_name(n, bytes)
         } else if def_ids.contains(&n.id()) || lang.scope_kinds().iter().any(|k| k == n.kind()) {
             n.child_by_field_name("name")
+                .or_else(|| n.child_by_field_name("key"))
                 .and_then(|c| c.utf8_text(bytes).ok())
+                .filter(|t| nameable(t))
                 .map(str::to_string)
         } else {
             None
         };
         if let Some(name) = name {
             chain.push(name);
+            let callable = lang.function_kinds().iter().any(|k| k == n.kind());
+            shape.push(if callable { 'f' } else { 's' });
         }
         cur = n.parent();
     }
     chain.reverse();
-    chain
+    shape.reverse();
+    let shape = shape
+        .contains(&'f')
+        .then(|| shape.into_iter().collect::<String>());
+    (chain, shape)
 }
 
 /// The receiver type of a Go method (`func (s *Svc[T]) Run()` → `Svc`).
@@ -527,13 +568,20 @@ fn go_receiver_type(def: Node<'_>, bytes: &[u8]) -> Option<String> {
 }
 
 /// The trait of the nearest `impl Trait for Type` around `def`, whitespace
-/// removed, generic arguments kept (`From<A>` and `From<B>` are two impls).
-/// Part of the id's disambiguator: `impl Display for X { fn fmt }` and
-/// `impl Debug for X { fn fmt }` are both `X.fmt`.
+/// and path removed, generic arguments kept (`From<A>` and `From<B>` are two
+/// impls; `fmt::Display` is `Display`). Part of the id's disambiguator:
+/// `impl Display for X { fn fmt }` and `impl Debug for X { fn fmt }` are both
+/// `X.fmt`.
 fn impl_trait(def: Node<'_>, bytes: &[u8], kinds: &[String]) -> Option<String> {
     let imp = enclosing_container(def, kinds)?;
     let tr = imp.child_by_field_name("trait")?.utf8_text(bytes).ok()?;
-    Some(tr.chars().filter(|c| !c.is_whitespace()).collect())
+    let tr: String = tr.chars().filter(|c| !c.is_whitespace()).collect();
+    let args = tr.find('<').unwrap_or(tr.len());
+    let name = last_path_segment(&tr[..args]);
+    if name.is_empty() {
+        return Some(tr);
+    }
+    Some(format!("{name}{}", &tr[args..]))
 }
 
 /// Longest provisional signature kept, in characters.
@@ -558,7 +606,8 @@ fn signature_of(def: Node<'_>, bytes: &[u8]) -> String {
 }
 
 /// The declared parameter types of a callable, normalised (no names, no
-/// whitespace, comma-separated): `actualizar(Long id, Dto d)` → `Long,Dto`.
+/// whitespace, no generic arguments, simple names, comma-separated):
+/// `actualizar(Long id, java.util.List<Dto> d)` → `Long,List`.
 /// `None` when the node has no parameter list (a class, a field).
 fn param_types(def: Node<'_>, bytes: &[u8]) -> Option<String> {
     let list = def.child_by_field_name("parameters")?;
@@ -577,6 +626,7 @@ fn param_types(def: Node<'_>, bytes: &[u8]) -> Option<String> {
             if let Some(rest) = norm.strip_prefix(':') {
                 norm = rest.to_string(); // a TypeScript `type_annotation`
             }
+            norm = simple_type_name(&norm);
             if p.kind() == "spread_parameter" {
                 norm.push_str("...");
             }
@@ -584,4 +634,22 @@ fn param_types(def: Node<'_>, bytes: &[u8]) -> Option<String> {
         })
         .collect();
     Some(types.join(","))
+}
+
+/// A Java type reduced to its simple name: generic arguments dropped (no two
+/// overloads differ only by them: erasure) and the package path too
+/// (`java.util.List<String>[]` → `List[]`), so the spelling does not move
+/// the id.
+fn simple_type_name(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    let mut depth = 0usize;
+    for c in t.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.rsplit('.').next().unwrap_or_default().to_string()
 }

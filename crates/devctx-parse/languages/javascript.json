@@ -16,5 +16,9 @@
   ],
   "container_kinds": [
     "class_declaration"
+  ],
+  "scope_kinds": [
+    "variable_declarator",
+    "pair"
   ]
 }

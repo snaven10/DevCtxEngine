@@ -21,6 +21,8 @@
   ],
   "scope_kinds": [
     "internal_module",
-    "module"
+    "module",
+    "variable_declarator",
+    "pair"
   ]
 }

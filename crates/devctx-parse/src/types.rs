@@ -41,6 +41,12 @@ pub struct Symbol {
     /// The trait of the Rust `impl Trait for Type` the symbol sits in
     /// (`Display`, `From<A>`); part of the id's disambiguator (DD-3).
     pub trait_of: Option<String>,
+    /// Which enclosing scopes of `qualified` are callables: one character per
+    /// scope, outermost first, `f` for a function or method, `s` otherwise
+    /// (`Some("sf")` for `Outer.start.run`); `None` when none is. Part of the
+    /// id's disambiguator (DD-3): a function `a` and a module `a` both
+    /// qualify their contents as `a.P`.
+    pub scope_shape: Option<String>,
     /// Stable id (DD-3), `0` until [`ParsedFile::assign_ids`] runs.
     pub id: u64,
     /// The container's id, or the file symbol's for a top-level symbol;

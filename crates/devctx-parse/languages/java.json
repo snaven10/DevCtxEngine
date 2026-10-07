@@ -18,5 +18,10 @@
     "enum_declaration",
     "record_declaration"
   ],
-  "overloads": true
+  "overloads": true,
+  "scope_kinds": [
+    "enum_constant",
+    "constructor_declaration",
+    "variable_declarator"
+  ]
 }
