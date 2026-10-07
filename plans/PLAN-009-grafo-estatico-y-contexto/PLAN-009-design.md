@@ -184,7 +184,10 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   genéricos del tipo propio y la cláusula `where`, sin espacios, tras `~` (`impl Foo<u8>` y
   `impl Foo<u16>` daban los dos `Foo` y sus `Foo.get` caían al ordinal, así que insertar uno arriba
   movía el id del otro, el `parent_id` de sus métodos y sus `contains`; fixup de la revisión de
-  TASK-004 — costo aceptado: renombrar el parámetro de `impl<T> Foo<T>` cambia esos ids); la lista de tipos de parámetros normalizada (sin nombres,
+  TASK-004 — costo aceptado: renombrar el parámetro de `impl<T> Foo<T>` cambia esos ids; desde la
+  versión 4 del extractor, también sin comas finales antes de `>`/`)` ni al final del `where`,
+  porque `rustfmt` escribe vertical un `where` largo —`where\n    T: Copy,`— o una lista larga de
+  argumentos —`Foo<\n    T,\n>`— y cambiaba el id del `impl`, de sus métodos y sus `contains`); la lista de tipos de parámetros normalizada (sin nombres,
   espacios, argumentos genéricos ni paquete: `java.util.List<String>` → `List`, porque dos
   sobrecargas no pueden diferir solo en genéricos) en lenguajes con sobrecarga de cuerpos
   separados — **solo Java** (`"overloads": true`); y la **forma del scope** cuando algún scope
@@ -274,7 +277,11 @@ JSON como 16 hex (`"sym": "9f3ac1…"`).
   contenedor, `exported`, líneas y firma; por llamada fuente → destino y el nombre de fuente que
   escribe `graph_edges`; `references`/`instantiates`, supertipos e imports con su fuente— de un
   fixture por lenguaje (Rust, Java, TS, TSX, JS, Python, Go) contra
-  `tests/golden/extractor.txt`, cuya primera línea guarda la versión con que se generó. Si la
+  `tests/golden/extractor.txt`, cuya primera línea guarda la versión con que se generó (**4**
+  desde los menores de la revisión de 6c3f63a: `where`/genéricos de un `impl` estables ante
+  `rustfmt`, y la fuente de `graph_edges` de una función con nombre es el `qualified` de su
+  símbolo —`traced.wrapper`, `C.init.run`, `C.m.f`; `const x = function named()` es `x`—, que
+  `tests/graph_sources.rs` exige en todos los fixtures). Si la
   salida cambia y la versión no, falla con "la salida del extractor cambió: subí
   EXTRACTOR_VERSION y regenerá el golden"; si la versión cambió y el golden no, pide regenerarlo
   (`DEVCTX_UPDATE_GOLDEN=1 cargo test -p devctx-parse --test extractor_golden`).

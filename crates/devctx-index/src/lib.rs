@@ -2783,7 +2783,8 @@ public class A extends B implements C {
             .unwrap();
         store.delete_file_graph(&repo, "main", "a.py").unwrap();
         let now = extractor_fingerprint();
-        assert!(now.starts_with("v3-"), "{now}");
+        let version = format!("v{}-", devctx_parse::EXTRACTOR_VERSION);
+        assert!(now.starts_with(&version), "{now}");
         assert!(store
             .extractor_stale(&repo_short_of(&dir), &repo_path, "main", &now)
             .unwrap());

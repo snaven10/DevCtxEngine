@@ -30,3 +30,9 @@ export class App extends Base {
 exports.handler = function () {
   work();
 };
+
+const onDone = function finish() {
+  notify();
+};
+
+export default boot;

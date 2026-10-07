@@ -19,6 +19,9 @@ fn python_symbols_bases_and_module_level_calls() {
             "method OrderService.__init__",
             "method OrderService.find",
             "method OrderService._hidden",
+            "method OrderService._hidden.step",
+            "function traced",
+            "function traced.wrapper",
             "function main",
         ]
     );

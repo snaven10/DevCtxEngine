@@ -530,6 +530,25 @@ class C {
                  impl<T> W<T> where T: Copy { fn get(&self) { m_copy(); } }\n",
                 &["m_copy"],
             ),
+            // `rustfmt` writes a long `where` clause vertically, one bound a
+            // line with a trailing comma, and a long argument list with one
+            // after the last argument: neither is another impl.
+            (
+                Lang::rust(),
+                "v.rs",
+                "struct W<T>(T);\nimpl<T> W<T> where T: Copy { fn get(&self) { m_vert(); } }\n",
+                "struct W<T>(T);\nimpl<T> W<T> where T: Clone { fn get(&self) { n1(); } }\n\
+                 impl<T> W<T>\nwhere\n    T: Copy,\n{\n    fn get(&self) {\n        m_vert();\n    }\n}\n",
+                &["m_vert"],
+            ),
+            (
+                Lang::rust(),
+                "t.rs",
+                "struct Foo<T>(T);\nimpl<T> Foo<T> { fn get(&self) { m_trail(); } }\n",
+                "struct Foo<T>(T);\nimpl Foo<u8> { fn get(&self) { n1(); } }\n\
+                 impl<T> Foo<\n    T,\n> {\n    fn get(&self) {\n        m_trail();\n    }\n}\n",
+                &["m_trail"],
+            ),
             // Java overloads around an anonymous class: `O()` and `O(int)`,
             // `m(int)` and `m(String)` are different scopes, so adding an
             // overload above does not hand the old `run` an ordinal.

@@ -1,4 +1,4 @@
-version 3
+version 4
 == src/main/java/com/example/shop/OrderService.java (java) package=com.example.shop
 sym	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7	parent=-	container=-	-	L1-43	
 sym	class	OrderService	dc29a699ee8c525b	parent=src/main/java/com/example/shop/OrderService.java	container=-	pub	L9-38	public class OrderService extends BaseService implements Auditable, Serializable
@@ -39,6 +39,7 @@ L27	implements	OrderService.Line -> Comparable
 L27	references	OrderService.Line -> String
 L28	references	OrderService.Line.compareTo -> Line
 L32	instantiates	OrderService.Cache.clear -> Order
+L36	call	OrderService.init.run -> flush	graph=OrderService.init.run
 L36	instantiates	OrderService.init -> Runnable
 L40	inherits	Auditable -> Named
 L41	references	Auditable.audit -> String
@@ -105,14 +106,15 @@ L3	references	Button -> Props
 L4	call	Button.onClick -> track	graph=Button.onClick
 L8	references	Panel -> JSX.Element
 == web/app.js (javascript) package=web/app
-sym	file	web/app.js	7333a95984a851a7	parent=-	container=-	-	L1-33	
+sym	file	web/app.js	7333a95984a851a7	parent=-	container=-	-	L1-39	
 sym	function	start	7611d737d64fd68a	parent=web/app.js	container=-	pub	L4-6	const start = (port) =>
-sym	function	boot	8ab5fd0b3abb5e50	parent=web/app.js	container=-	priv	L8-10	function boot()
+sym	function	boot	8ab5fd0b3abb5e50	parent=web/app.js	container=-	pub	L8-10	function boot()
 sym	class	App	f66407f4547233a3	parent=web/app.js	container=-	pub	L12-28	class App extends Base
 sym	constructor	App.constructor	1c5c93ac52716cd9	parent=App	container=App	pub	L13-17	constructor()
 sym	method	App.run	8b91df318509fb06	parent=App	container=App	pub	L19-21	run()
 sym	field	App.count	17ad41dca9912cec	parent=App	container=App	pub	L23-23	count = 0
 sym	method	App.stop	a35e54b476e4e23d	parent=App	container=App	pub	L25-27	stop = () =>
+sym	function	onDone	0e374261e243a43b	parent=web/app.js	container=-	priv	L34-36	const onDone = function finish()
 L1	import	express#default	path=express name=default alias=express wildcard=false
 L2	import	./routes.js#route	path=./routes.js name=route alias=- wildcard=false
 L5	call	start -> listen	graph=start
@@ -123,14 +125,18 @@ L16	call	App.constructor -> App.tick	graph=App.constructor
 L20	call	App.run -> boot	graph=App.run
 L26	call	App.stop -> close	graph=App.stop
 L31	call	web/app.js -> work	graph=-
+L35	call	onDone -> notify	graph=onDone
 == shop/orders.py (python) package=shop.orders
-sym	file	shop/orders.py	acd88c655c833ce3	parent=-	container=-	-	L1-25	
+sym	file	shop/orders.py	acd88c655c833ce3	parent=-	container=-	-	L1-34	
 sym	const	LIMIT	a3ec3be8cf532e5c	parent=shop/orders.py	container=-	pub	L6-6	LIMIT = 10
-sym	class	OrderService	cb51eb889b137853	parent=shop/orders.py	container=-	pub	L9-17	class OrderService(BaseService, mixins.Audited):
+sym	class	OrderService	cb51eb889b137853	parent=shop/orders.py	container=-	pub	L9-19	class OrderService(BaseService, mixins.Audited):
 sym	method	OrderService.__init__	dc81c89d2af44367	parent=OrderService	container=OrderService	pub	L10-11	def __init__(self, repo: Repo):
 sym	method	OrderService.find	fc358287f1555fac	parent=OrderService	container=OrderService	pub	L13-14	def find(self, oid: int) -> Order:
-sym	method	OrderService._hidden	00580b228891d04a	parent=OrderService	container=OrderService	priv	L16-17	def _hidden(self):
-sym	function	main	fc94a46ccc44a829	parent=shop/orders.py	container=-	pub	L20-21	def main():
+sym	method	OrderService._hidden	00580b228891d04a	parent=OrderService	container=OrderService	priv	L16-19	def _hidden(self):
+sym	method	OrderService._hidden.step	f0cc13e8ff579505	parent=OrderService._hidden	container=OrderService	priv	L17-18	def step():
+sym	function	traced	f77a70f609bc9b5f	parent=shop/orders.py	container=-	pub	L22-26	def traced(f):
+sym	function	traced.wrapper	7600f30c713dd292	parent=traced	container=-	priv	L23-25	def wrapper():
+sym	function	main	fc94a46ccc44a829	parent=shop/orders.py	container=-	pub	L29-30	def main():
 L1	import	os	path=os name=- alias=- wildcard=false
 L2	import	logging	path=logging name=- alias=log wildcard=false
 L3	import	.models.Line	path=.models name=Line alias=L wildcard=false
@@ -142,11 +148,15 @@ L10	references	OrderService.__init__ -> Repo
 L13	references	OrderService.find -> Order
 L13	references	OrderService.find -> int
 L14	call	OrderService.find -> Repo.get	graph=OrderService.find
-L21	call	main -> OrderService	graph=main
-L21	call	main -> find	graph=main
-L24	call	shop/orders.py -> main	graph=-
+L18	call	OrderService._hidden.step -> audit	graph=OrderService._hidden.step
+L19	call	OrderService._hidden -> step	graph=OrderService._hidden
+L24	call	traced.wrapper -> record	graph=traced.wrapper
+L25	call	traced.wrapper -> f	graph=traced.wrapper
+L30	call	main -> OrderService	graph=main
+L30	call	main -> find	graph=main
+L33	call	shop/orders.py -> main	graph=-
 == crates/demo/src/cache.rs (rust) package=demo::cache
-sym	file	crates/demo/src/cache.rs	ef5c39f332d029f7	parent=-	container=-	-	L1-37	
+sym	file	crates/demo/src/cache.rs	ef5c39f332d029f7	parent=-	container=-	-	L1-40	
 sym	const	LIMIT	593dad3c8269598e	parent=crates/demo/src/cache.rs	container=-	pub	L4-4	pub const LIMIT: usize = 8;
 sym	const	NAME	e6007f701b459ace	parent=crates/demo/src/cache.rs	container=-	priv	L5-5	static NAME: &str = "c";
 sym	type	Map	05fdcc3190c7e37c	parent=crates/demo/src/cache.rs	container=-	pub	L6-6	pub type Map = HashMap<String, u32>;
@@ -154,11 +164,12 @@ sym	struct	Cached	23cd766c1c4d96aa	parent=crates/demo/src/cache.rs	container=-	p
 sym	field	Cached.inner	f909692c2c3dc62c	parent=Cached	container=-	pub	L10-10	pub inner: T
 sym	field	Cached.hits	8c4b769ca5f26b48	parent=Cached	container=-	priv	L11-11	hits: u32
 sym	trait	Named	5710b2875e264529	parent=crates/demo/src/cache.rs	container=-	pub	L14-16	pub trait Named: Clone + Send
-sym	impl	Cached	9c4d3b2a26919144	parent=Cached	container=-	-	L18-28	impl<T: Clone> Cached<T>
+sym	impl	Cached	9c4d3b2a26919144	parent=Cached	container=-	-	L18-31	impl<T: Clone> Cached<T>
 sym	method	Cached.new	769d643b2fad00d6	parent=Cached	container=Cached	pub	L19-23	pub fn new(inner: T) -> Self
-sym	method	Cached.build	900da28cfc5f3968	parent=Cached	container=Cached	priv	L25-27	fn build(inner: T) -> Cached<T>
-sym	impl	Cached	9d13d10a606a45d5	parent=Cached	container=-	-	L30-36	impl<T: Clone> Named for Cached<T>
-sym	method	Cached.name	0a51c92f9feb2990	parent=Cached	container=Cached	priv	L31-35	fn name(&self) -> String
+sym	method	Cached.build	900da28cfc5f3968	parent=Cached	container=Cached	priv	L25-30	fn build(inner: T) -> Cached<T>
+sym	method	Cached.build.tag	baac54ff8569c6cb	parent=Cached.build	container=Cached	priv	L26-28	fn tag()
+sym	impl	Cached	9d13d10a606a45d5	parent=Cached	container=-	-	L33-39	impl<T: Clone> Named for Cached<T>
+sym	method	Cached.name	0a51c92f9feb2990	parent=Cached	container=Cached	priv	L34-38	fn name(&self) -> String
 L1	import	std::collections::HashMap	path=std::collections::HashMap name=- alias=- wildcard=false
 L2	import	crate::store	path=crate::store name=- alias=- wildcard=false
 L2	import	crate::store::Store	path=crate::store::Store name=- alias=S wildcard=false
@@ -168,12 +179,13 @@ L14	inherits	Named -> Send
 L21	references	Cached.new -> Cached
 L22	call	Cached.new -> Cached.build	graph=Cached.new
 L25	references	Cached.build -> Cached
-L26	instantiates	Cached.build -> Cached
-L30	implements	Cached -> Named
-L31	references	Cached.name -> String
-L32	call	Cached.name -> Foo.bar	graph=Cached.name
-L33	call	Cached.name -> store::open	graph=Cached.name
-L34	call	Cached.name -> String.new	graph=Cached.name
+L27	call	Cached.build.tag -> mark	graph=Cached.build.tag
+L29	instantiates	Cached.build -> Cached
+L33	implements	Cached -> Named
+L34	references	Cached.name -> String
+L35	call	Cached.name -> Foo.bar	graph=Cached.name
+L36	call	Cached.name -> store::open	graph=Cached.name
+L37	call	Cached.name -> String.new	graph=Cached.name
 == api/server.go (go) package=api
 sym	file	api/server.go	53b33b78efb910e7	parent=-	container=-	-	L1-32	
 sym	const	Version	cba7bd18a30b70f0	parent=api/server.go	container=-	pub	L10-10	Version = "1"

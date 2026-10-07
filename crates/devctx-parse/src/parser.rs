@@ -168,7 +168,7 @@ impl LanguageParser {
                     let Ok(callee_name) = callee.utf8_text(bytes) else {
                         continue;
                     };
-                    let func = enclosing_source(callee, bytes, self.lang, bound);
+                    let func = enclosing_source(callee, self.lang, bound);
                     let target = match path {
                         Some(p) => path_target(callee, p, callee_name, bytes, self.lang),
                         None => qualified_target(callee, callee_name, bytes, type_map, self.lang),
@@ -196,7 +196,7 @@ impl LanguageParser {
                     let Some(name) = type_ref_name(target, bytes, self.lang) else {
                         continue;
                     };
-                    refs.push(self.ref_fact(INSTANTIATES, name, target, bytes, bound));
+                    refs.push(self.ref_fact(INSTANTIATES, name, target, bound));
                 }
                 "type" => {
                     let mut found = Vec::new();
@@ -210,7 +210,7 @@ impl LanguageParser {
                         if is_type_parameter(t, &name, bytes) {
                             continue;
                         }
-                        refs.push(self.ref_fact(REFERENCES, name, t, bytes, bound));
+                        refs.push(self.ref_fact(REFERENCES, name, t, bound));
                     }
                 }
                 _ => {}
@@ -222,20 +222,13 @@ impl LanguageParser {
         (out, module, refs)
     }
 
-    fn ref_fact(
-        &self,
-        kind: &str,
-        name: String,
-        node: Node<'_>,
-        bytes: &[u8],
-        bound: &Bound,
-    ) -> RefFact {
+    fn ref_fact(&self, kind: &str, name: String, node: Node<'_>, bound: &Bound) -> RefFact {
         RefFact {
             kind: kind.to_string(),
             name,
             line: node.start_position().row as u32 + 1,
             byte: node.start_byte(),
-            source_byte: enclosing_source(node, bytes, self.lang, bound).map(|(b, _)| b),
+            source_byte: enclosing_source(node, self.lang, bound).map(|(b, _)| b),
             src_id: 0,
         }
     }
@@ -725,43 +718,33 @@ fn is_inner_doc(node: Node<'_>, bytes: &[u8]) -> bool {
 /// `graph_edges` records for it.
 ///
 /// The nearest enclosing callable (a node of the language's
-/// `function_kinds`) that is a source:
+/// `function_kinds`) that is a **symbol**, named by its qualified name (every
+/// enclosing scope: `traced.wrapper`, `OrderService.init.run`, `C.m.f`, Go
+/// `Server.Handle`), from the symbol's start:
 ///
-/// - one with a `name` field, qualified as `Class.method` when it is
-///   defined inside a container (class/impl/…) or has a receiver (a Go
-///   method, `Server.Handle`);
-/// - an anonymous one bound to a **symbol** — the `const x = () => …` or the
-///   class field `x = () => …` the definitions query made one — named as
-///   that symbol (`C.m.cb` for a `const` inside a method), from its start.
+/// - one whose `name` is a symbol's name node (a function, a method, a
+///   constructor);
+/// - else one bound to a symbol — the `const x = () => …`, the `const x =
+///   function named() {…}` (the symbol is `x`, not `named`) or the class
+///   field `x = () => …` the definitions query made one (`C.m.cb` for a
+///   `const` inside a method).
 ///
-/// Any other anonymous callable is walked past, so the call inside belongs
-/// to the function that wrote it: a callback (`.map(x => f(x))`), an arrow
-/// bound to an object key (`subscribe({ next: r => … })`), to a member
-/// (`this.onTick = () => …`, `exports.handler = function …`). Their names
-/// are no symbols, and a source that names no symbol loses the caller to
-/// whoever reads `graph_edges` by name (`impact_analysis`,
-/// `get_references`).
-fn enclosing_source(
-    node: Node<'_>,
-    bytes: &[u8],
-    lang: Lang,
-    bound: &Bound,
-) -> Option<(usize, String)> {
+/// Any other callable is walked past, so the call inside belongs to the
+/// function that wrote it: a callback (`.map(x => f(x))`, `function
+/// named() {}` passed as an argument), an arrow bound to an object key
+/// (`subscribe({ next: r => … })`), to a member (`this.onTick = () => …`,
+/// `exports.handler = function …`). Their names are no symbols, and a source
+/// that names no symbol loses the caller to whoever reads `graph_edges` by
+/// name (`impact_analysis`, `get_references`).
+fn enclosing_source(node: Node<'_>, lang: Lang, bound: &Bound) -> Option<(usize, String)> {
     let mut cur = node.parent();
     while let Some(n) = cur {
         if lang.function_kinds().iter().any(|k| k == n.kind()) {
-            if let Some(name) = n.child_by_field_name("name") {
-                let name = name.utf8_text(bytes).ok()?.to_string();
-                let owner = enclosing_container(n, lang.container_kinds())
-                    .and_then(|c| container_name(c, bytes))
-                    .or_else(|| go_receiver_type(n, bytes));
-                let source = match owner {
-                    Some(class) => format!("{class}.{name}"),
-                    None => name,
-                };
-                return Some((n.start_byte(), source));
-            }
-            if let Some((q, start)) = binding_of(n).and_then(|b| bound.get(&b.id())) {
+            let own = n
+                .child_by_field_name("name")
+                .and_then(|m| bound.get(&m.id()));
+            let held = || binding_of(n).and_then(|b| bound.get(&b.id()));
+            if let Some((q, start)) = own.or_else(held) {
                 return Some((*start, q.clone()));
             }
         }
@@ -1018,7 +1001,7 @@ fn go_receiver_type(def: Node<'_>, bytes: &[u8]) -> Option<String> {
 /// Debug for X { fn fmt }` are both `X.fmt`.
 fn trait_text(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
     let tr = imp.child_by_field_name("trait")?.utf8_text(bytes).ok()?;
-    let tr: String = tr.chars().filter(|c| !c.is_whitespace()).collect();
+    let tr = tidy_generics(tr);
     let args = tr.find('<').unwrap_or(tr.len());
     let name = last_path_segment(&tr[..args]);
     if name.is_empty() {
@@ -1028,8 +1011,9 @@ fn trait_text(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
 }
 
 /// The self type's generic arguments and the `where` clause of an `impl`
-/// node, without whitespace (`impl Foo<u8>` → `<u8>`, `impl<T> W<T> where
-/// T: Copy` → `<T>whereT:Copy`); `None` for a non-generic one, or a node
+/// node, without whitespace or trailing commas ([`tidy_generics`]: `impl
+/// Foo<u8>` → `<u8>`, `impl<T> W<T> where T: Copy` → `<T>whereT:Copy`,
+/// also as `rustfmt` lays it out vertically); `None` for a non-generic one, or a node
 /// that is not an `impl`. Part of the id's disambiguator (DD-3), beside the
 /// trait: `impl Foo<u8>` and `impl Foo<u16>` are both `Foo`, and so are
 /// their methods.
@@ -1037,13 +1021,7 @@ fn impl_self_args(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
     if imp.kind() != "impl_item" {
         return None;
     }
-    let compact = |n: Node<'_>| -> String {
-        n.utf8_text(bytes)
-            .unwrap_or_default()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect()
-    };
+    let compact = |n: Node<'_>| -> String { tidy_generics(n.utf8_text(bytes).unwrap_or_default()) };
     let ty = imp
         .child_by_field_name("type")
         .map(compact)
@@ -1060,6 +1038,21 @@ fn impl_self_args(imp: Node<'_>, bytes: &[u8]) -> Option<String> {
         .unwrap_or_default();
     let out = format!("{args}{clause}");
     (!out.is_empty()).then_some(out)
+}
+
+/// Generic arguments and `where` bounds as one spelling, however `rustfmt`
+/// laid them out: no whitespace, no trailing comma before a `>`/`)` or at the
+/// end (`Foo<\n    T,\n>` → `Foo<T>`, `where\n    T: Copy,` → `whereT:Copy`).
+/// Part of an id's disambiguator (DD-3): a reformat is not another impl.
+fn tidy_generics(text: &str) -> String {
+    let mut out: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    while out.contains(",>") || out.contains(",)") {
+        out = out.replace(",>", ">").replace(",)", ")");
+    }
+    while out.ends_with(',') {
+        out.pop();
+    }
+    out
 }
 
 /// When `def` declares several names, each in its own declarator (TS/JS

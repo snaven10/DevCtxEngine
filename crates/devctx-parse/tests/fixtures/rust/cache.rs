@@ -23,6 +23,9 @@ impl<T: Clone> Cached<T> {
     }
 
     fn build(inner: T) -> Cached<T> {
+        fn tag() {
+            mark();
+        }
         Cached { inner, hits: 0 }
     }
 }

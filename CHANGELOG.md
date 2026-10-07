@@ -63,6 +63,14 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   it, so the first `--full` after upgrading re-embeds those chunks instead of
   reusing them (measured on this repository: 40 of 4928 chunks, 143 of 16 123
   `graph_edges` rows).
+- **Extractor version 4** (review of TASK-004; `devctx index --full` again):
+  a Rust `impl`'s ids no longer change when `rustfmt` lays its `where` clause
+  or generic arguments out vertically (trailing commas dropped); the
+  `graph_edges` source of a named function is its symbol's qualified name
+  (`traced.wrapper` for a decorator's `wrapper`, `C.init.run` for an anonymous
+  class's method, `C.m.f` for a function nested in a method; `const x =
+  function named() {}` is `x`), so `impact_analysis`/`get_references` no longer
+  lose those callers; `export default foo;` marks `foo` exported.
 
 ### Fixed
 

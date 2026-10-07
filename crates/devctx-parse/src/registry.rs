@@ -164,6 +164,11 @@ const SOURCES: &[&str] = &[
 /// before them has neither, so it must read as stale.
 /// 3: structured extraction (PLAN-009 TASK-004) — new symbol kinds, `impl`
 /// symbols, the Java overload shape in ids, every edge kind.
+/// 4: review of TASK-004 — a Rust `impl`'s generic arguments and `where`
+/// clause without trailing commas (ids stable under `rustfmt`); a named
+/// callable's `graph_edges` source is its symbol's qualified name
+/// (`traced.wrapper`, `C.init.run`, `C.m.f`; `const x = function named()`
+/// is `x`); `export default name;` exports `name`.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -171,7 +176,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 3;
+pub const EXTRACTOR_VERSION: u32 = 4;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
@@ -405,7 +410,7 @@ mod fingerprint_tests {
     #[test]
     fn the_fingerprint_is_stable_between_calls() {
         assert_eq!(extractor_fingerprint(), extractor_fingerprint());
-        assert!(extractor_fingerprint().starts_with("v3-"));
+        assert!(extractor_fingerprint().starts_with(&format!("v{EXTRACTOR_VERSION}-")));
     }
 
     #[test]

@@ -39,6 +39,7 @@ fn rust_symbols_impls_consts_and_fields() {
             "impl Cached",
             "method Cached.new",
             "method Cached.build",
+            "method Cached.build.tag",
             "impl Cached",
             "method Cached.name",
         ]

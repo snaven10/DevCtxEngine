@@ -14,7 +14,16 @@ class OrderService(BaseService, mixins.Audited):
         return self.repo.get(oid)
 
     def _hidden(self):
-        pass
+        def step():
+            audit()
+        step()
+
+
+def traced(f):
+    def wrapper():
+        record()
+        return f()
+    return wrapper
 
 
 def main():

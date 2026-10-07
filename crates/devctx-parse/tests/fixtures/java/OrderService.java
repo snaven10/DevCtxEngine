@@ -33,7 +33,7 @@ public class OrderService extends BaseService implements Auditable, Serializable
     }
 
     private void init() {
-        new Runnable() { public void run() {} };
+        new Runnable() { public void run() { flush(); } };
     }
 }
 

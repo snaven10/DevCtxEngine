@@ -18,6 +18,7 @@ fn javascript_arrow_consts_fields_and_constructors() {
             "method App.run",
             "field App.count",
             "method App.stop",
+            "function onDone",
         ]
     );
     let c = calls(&pf);
@@ -73,4 +74,22 @@ fn a_javascript_field_qualifies_what_it_holds() {
         "{:?}",
         outline(&pf)
     );
+}
+
+/// `export default boot;` exports `boot`, declared without the keyword (an
+/// export clause in all but name); `const onDone = function finish() {…}`
+/// is the symbol `onDone`, never `finish`.
+#[test]
+fn a_default_export_of_a_name_exports_it() {
+    let pf = facts(Lang::javascript(), "javascript/app.js", "web/app.js");
+    assert_eq!(sym(&pf, "function", "boot").exported, Some(true));
+    assert_eq!(sym(&pf, "function", "onDone").exported, Some(false));
+    let mut pf = devctx_parse::parse(
+        Lang::typescript(),
+        "function a() {}\nfunction b() {}\nexport default a;\n",
+    )
+    .unwrap();
+    pf.assign_ids("repo", "d.ts");
+    assert_eq!(sym(&pf, "function", "a").exported, Some(true));
+    assert_eq!(sym(&pf, "function", "b").exported, Some(false));
 }
