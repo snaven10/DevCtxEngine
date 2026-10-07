@@ -15,6 +15,7 @@ mod routes;
 mod schema;
 mod state;
 mod store;
+mod symbols;
 
 pub use error::{Result, StoreError};
 pub use graph::{GraphEdge, ImpactResult, Reference, StoredEdge};
@@ -25,6 +26,7 @@ pub use routes::StoredRoute;
 pub use schema::init_schema;
 pub use state::{CopySetup, FileState, IndexRecord, EMBED_FP_META_KEY, EXTRACTOR_META_KEY};
 pub use store::{normalize_metric, MemoryReport, Store};
+pub use symbols::{StoredSymbol, StoredSymbolEdge};
 
 #[cfg(test)]
 mod tests {

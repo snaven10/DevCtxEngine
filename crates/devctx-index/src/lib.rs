@@ -2416,4 +2416,302 @@ mod tests {
         assert!(store.enable_hnsw("ip").unwrap());
         assert_eq!(store.hnsw_metric().as_deref(), Some("ip"));
     }
+
+    // ── PLAN-009 TASK-003: the `symbols` and `edges` tables ──────────────
+
+    /// A one-commit repository on `main` with the given files.
+    fn graph_repo(tag: &str, files: &[(&str, &str)]) -> (PathBuf, String) {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_graph_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for (rel, content) in files {
+            write(&dir, rel, content);
+        }
+        commit_all(&dir, "init");
+        let repo = dir.file_name().unwrap().to_string_lossy().to_string();
+        (dir, repo)
+    }
+
+    fn symbol<'a>(
+        syms: &'a [devctx_store::StoredSymbol],
+        qualified: &str,
+    ) -> &'a devctx_store::StoredSymbol {
+        syms.iter()
+            .find(|s| s.qualified == qualified)
+            .unwrap_or_else(|| panic!("{qualified} not in {syms:?}"))
+    }
+
+    /// Every edge's source is a symbol of its own file and branch, and every
+    /// parent is too: what "no orphan rows" means for these tables.
+    fn assert_no_orphans(store: &Store, repo: &str, branch: &str, files: &[&str]) {
+        for f in files {
+            let syms = store.file_symbols(repo, branch, f).unwrap();
+            let ids: HashSet<u64> = syms.iter().map(|s| s.id).collect();
+            for s in &syms {
+                if let Some(p) = s.parent_id {
+                    assert!(ids.contains(&p), "{f}: parent of {s:?} is not in the file");
+                }
+            }
+            for e in store.file_symbol_edges(repo, branch, f).unwrap() {
+                assert!(
+                    ids.contains(&e.src_id),
+                    "{f}: source of {e:?} is not in the file"
+                );
+            }
+        }
+    }
+    use std::collections::HashSet;
+
+    /// The bug behind `get_references` losing calls: two calls to the same
+    /// target from one method were folded into one `graph_edges` row. The
+    /// `edges` table keeps one row per occurrence.
+    #[test]
+    fn two_calls_from_one_method_are_two_edges() {
+        let (dir, repo) = graph_repo(
+            "twice",
+            &[(
+                "mig.py",
+                "def migrate_one(log):\n    log.debug('a')\n    work()\n    log.debug('b')\n",
+            )],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let syms = store.file_symbols(&repo, "main", "mig.py").unwrap();
+        let src = symbol(&syms, "migrate_one").id;
+        let debug: Vec<_> = store
+            .file_symbol_edges(&repo, "main", "mig.py")
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.dst_name == "debug")
+            .collect();
+        assert_eq!(debug.len(), 2, "{debug:?}");
+        assert!(debug.iter().all(|e| e.src_id == src && e.kind == "calls"));
+        assert_eq!((debug[0].line, debug[1].line), (2, 4));
+        assert!(debug
+            .iter()
+            .all(|e| e.dst_id.is_none() && e.edge_source == "treesitter"));
+        // `graph_edges` keeps the 0.9.0 shape: one row per pair.
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        assert_eq!(old.iter().filter(|e| e.target == "debug").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Python call at module level has no enclosing function, and used to
+    /// be dropped. It is an edge from the file symbol now.
+    #[test]
+    fn a_module_level_python_call_is_sourced_from_the_file_symbol() {
+        let (dir, repo) = graph_repo(
+            "module",
+            &[(
+                "tools/run.py",
+                "def main():\n    pass\n\nmain()\nconfigure(main)\n",
+            )],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let syms = store.file_symbols(&repo, "main", "tools/run.py").unwrap();
+        let file = &syms[0];
+        assert_eq!(file.kind, "file");
+        assert_eq!(file.qualified, "tools/run.py");
+        assert_eq!(file.name, "run.py");
+        assert_eq!(file.parent_id, None);
+        assert_eq!(symbol(&syms, "main").parent_id, Some(file.id));
+        let edges = store
+            .file_symbol_edges(&repo, "main", "tools/run.py")
+            .unwrap();
+        let names: Vec<_> = edges
+            .iter()
+            .map(|e| (e.dst_name.as_str(), e.line))
+            .collect();
+        assert_eq!(names, vec![("main", 4), ("configure", 5)]);
+        assert!(edges.iter().all(|e| e.src_id == file.id));
+        // `graph_edges` has no row for them: 0.9.0 has no source to give one.
+        assert!(store
+            .graph_edges(&repo, "main", None, None, 0)
+            .unwrap()
+            .iter()
+            .all(|e| !e.source.is_empty()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The id carries no branch: the same symbol on two branches — copied or
+    /// re-parsed — has one id, and a copy carries edges without resolution.
+    #[test]
+    fn a_symbol_has_one_id_on_every_branch() {
+        let dir = two_branch_repo("graph_ids");
+        let repo = dir.file_name().unwrap().to_string_lossy().to_string();
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let feat = index_branch(&store, &dir, "feature", true);
+        assert!(feat.files_copied > 0, "a.py is copied, b.py re-parsed");
+        for f in ["a.py", "b.py"] {
+            let main = store.file_symbols(&repo, "main", f).unwrap();
+            let feature = store.file_symbols(&repo, "feature", f).unwrap();
+            assert_eq!(main.len(), 2, "{main:?}");
+            let ids = |v: &[devctx_store::StoredSymbol]| v.iter().map(|s| s.id).collect::<Vec<_>>();
+            assert_eq!(ids(&main), ids(&feature), "{f}");
+        }
+        assert_eq!(
+            symbol(
+                &store.file_symbols(&repo, "feature", "b.py").unwrap(),
+                "beta"
+            )
+            .id,
+            devctx_parse::symbol_id::symbol_id(&repo, "b.py", "callable", "beta", "")
+        );
+        assert_no_orphans(&store, &repo, "feature", &["a.py", "b.py"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `copy_file_rows` replaces the destination's graph rows (no duplicate
+    /// on a second copy) and drops the resolution of the edges it carries.
+    #[test]
+    fn copying_a_file_leaves_no_orphans_or_duplicates() {
+        let (dir, repo) = graph_repo("copy", &[("c.py", "def f():\n    g()\n    g()\n")]);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        // As if the link pass had resolved one of them on main.
+        let syms = store.file_symbols(&repo, "main", "c.py").unwrap();
+        let mut edges = store.file_symbol_edges(&repo, "main", "c.py").unwrap();
+        edges[0].dst_id = Some(syms[1].id);
+        edges[0].confidence = Some("high".into());
+        store
+            .replace_file_graph(&repo, "main", "c.py", &syms, &edges)
+            .unwrap();
+        for _ in 0..2 {
+            store.copy_file_rows(&repo, "main", "dev", "c.py").unwrap();
+        }
+        assert_eq!(store.file_symbols(&repo, "dev", "c.py").unwrap(), syms);
+        let copied = store.file_symbol_edges(&repo, "dev", "c.py").unwrap();
+        assert_eq!(copied.len(), 2);
+        assert!(copied
+            .iter()
+            .all(|e| e.dst_id.is_none() && e.confidence.is_none()));
+        assert_no_orphans(&store, &repo, "dev", &["c.py"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deleted file takes its symbols and edges with it.
+    #[test]
+    fn deleting_a_file_drops_its_graph_rows() {
+        let (dir, repo) = graph_repo(
+            "delete",
+            &[
+                ("a.py", "def a():\n    b()\n"),
+                ("b.py", "def b():\n    a()\n"),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), (4, 2));
+        std::fs::remove_file(dir.join("b.py")).unwrap();
+        commit_all(&dir, "drop b");
+        let r = index_branch(&store, &dir, "main", false);
+        assert_eq!(r.files_deleted, 1, "{r:?}");
+        assert!(store
+            .file_symbols(&repo, "main", "b.py")
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .file_symbol_edges(&repo, "main", "b.py")
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), (2, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping a branch takes its graph rows and nobody else's.
+    #[test]
+    fn dropping_a_branch_drops_its_graph_rows() {
+        let dir = two_branch_repo("graph_drop");
+        let repo = dir.file_name().unwrap().to_string_lossy().to_string();
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        index_branch(&store, &dir, "feature", true);
+        let main = store.graph_row_counts(&repo, "main").unwrap();
+        assert!(main.0 > 0);
+        assert_eq!(store.graph_row_counts(&repo, "feature").unwrap(), main);
+        store
+            .drop_branch(&repo, &repo_path_of(&dir), "feature")
+            .unwrap();
+        assert_eq!(store.graph_row_counts(&repo, "feature").unwrap(), (0, 0));
+        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), main);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index stamped by extractor v1 (0.9.0) has no symbol graph: it reads
+    /// stale, an incremental run does not hide that, and `--full` fills the
+    /// tables and re-stamps it.
+    #[test]
+    fn a_v1_index_reads_stale_until_a_full_run_fills_the_graph() {
+        let (dir, repo) = graph_repo("v1", &[("a.py", "def a():\n    b()\n")]);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let repo_path = repo_path_of(&dir);
+        // What 0.9.0 left: its own stamp, no rows in the new tables.
+        store
+            .set_index_meta(&repo_path, "main", "extractor", "v1-0123456789abcdef")
+            .unwrap();
+        store.delete_file_graph(&repo, "main", "a.py").unwrap();
+        let now = extractor_fingerprint();
+        assert!(now.starts_with("v2-"), "{now}");
+        assert!(store.extractor_stale(&repo_path, "main", &now).unwrap());
+
+        write(&dir, "b.py", "def b():\n    pass\n");
+        commit_all(&dir, "add b");
+        let inc = index_branch(&store, &dir, "main", false);
+        assert!(inc.extractor_stale, "an incremental run must not hide it");
+        assert!(store
+            .file_symbols(&repo, "main", "a.py")
+            .unwrap()
+            .is_empty());
+
+        let full = index_branch(&store, &dir, "main", true);
+        assert!(!full.extractor_stale);
+        assert!(!store.extractor_stale(&repo_path, "main", &now).unwrap());
+        assert_eq!(store.file_symbols(&repo, "main", "a.py").unwrap().len(), 2);
+        assert_eq!(
+            store
+                .file_symbol_edges(&repo, "main", "a.py")
+                .unwrap()
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A downgraded 0.9.0 reads `graph_edges` with the queries it always had
+    /// (the read side of `graph.rs` is unchanged since 0.9.0): the table must
+    /// stay what that release wrote — qualified sources, one row per pair, no
+    /// row without a source — next to the new tables it does not know.
+    #[test]
+    fn graph_edges_stays_readable_by_0_9_0() {
+        let (dir, repo) = graph_repo(
+            "compat",
+            &[(
+                "svc.py",
+                "class Svc:\n    def run(self):\n        self.helper()\n        self.helper()\n\n    def helper(self):\n        pass\n\nSvc().run()\n",
+            )],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!(
+            (old[0].source.as_str(), old[0].target.as_str()),
+            ("Svc.run", "Svc.helper")
+        );
+        let refs = store.find_references(&repo, "main", "Svc.helper").unwrap();
+        assert_eq!(refs.len(), 1);
+        let impact = store
+            .impact_analysis(&repo, "main", "Svc.helper", 2)
+            .unwrap();
+        assert_eq!(impact.upstream, vec![("Svc.run".to_string(), 1)]);
+        // The new tables hold the occurrences 0.9.0 folded or dropped.
+        let edges = store.file_symbol_edges(&repo, "main", "svc.py").unwrap();
+        assert_eq!(edges.len(), 4, "{edges:?}"); // helper ×2, Svc, run at module level
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

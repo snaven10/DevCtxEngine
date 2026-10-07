@@ -76,12 +76,25 @@ impl LanguageParser {
         let symbols = self.extract_symbols(root, bytes);
         let imports = self.extract_imports(root, bytes);
         let type_map = self.extract_type_bindings(root, bytes);
-        let edges = self.extract_edges(root, bytes, &type_map);
+        let (edges, module_edges) = self.extract_edges(root, bytes, &type_map);
+        let file_symbol = Symbol {
+            kind: devctx_core::symbol_id::FILE_KIND.to_string(),
+            language: self.lang.name().to_string(),
+            start_line: 1,
+            end_line: root.end_position().row as u32 + 1,
+            start_byte: 0,
+            end_byte: bytes.len(),
+            doc_start_line: 1,
+            doc_start_byte: 0,
+            ..Default::default()
+        };
         Ok(ParsedFile {
             language: self.lang.name().to_string(),
             symbols,
             imports,
             edges,
+            module_edges,
+            file_symbol,
         })
     }
 
@@ -111,31 +124,52 @@ impl LanguageParser {
         map
     }
 
-    fn extract_edges(&self, root: Node<'_>, bytes: &[u8], type_map: &TypeMap) -> Vec<GraphEdge> {
+    /// Every call site, split by whether a named function encloses it.
+    ///
+    /// One edge per occurrence: two calls to the same target from the same
+    /// function are two edges (the store's `graph_edges` writer folds them,
+    /// the `edges` table keeps both). A call with no named enclosing function
+    /// goes to the second list instead of being dropped.
+    fn extract_edges(
+        &self,
+        root: Node<'_>,
+        bytes: &[u8],
+        type_map: &TypeMap,
+    ) -> (Vec<GraphEdge>, Vec<GraphEdge>) {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.calls_query, root, bytes);
         let mut out = Vec::new();
+        let mut module = Vec::new();
         while let Some(m) = matches.next() {
             for cap in m.captures {
                 let callee = cap.node;
                 let Ok(name) = callee.utf8_text(bytes) else {
                     continue;
                 };
-                // Source: the enclosing function, qualified with its class if any.
-                let Some(source) = qualified_source(callee, bytes, self.lang) else {
-                    continue; // module-level call: no source symbol.
-                };
+                let func = enclosing_function_node(callee, self.lang.function_kinds());
                 let target = qualified_target(callee, name, bytes, type_map, self.lang);
-                out.push(GraphEdge {
-                    source,
+                let mut edge = GraphEdge {
+                    source: String::new(),
                     target,
                     kind: "calls".to_string(),
                     line: callee.start_position().row as u32 + 1,
-                });
+                    byte: callee.start_byte(),
+                    source_byte: func.map(|f| f.start_byte()),
+                    src_id: 0,
+                };
+                // Source: the enclosing function, qualified with its class if any.
+                match qualified_source(callee, bytes, self.lang) {
+                    Some(source) => {
+                        edge.source = source;
+                        out.push(edge);
+                    }
+                    None => module.push(edge),
+                }
             }
         }
         out.sort_by_key(|e| e.line);
-        out
+        module.sort_by_key(|e| e.line);
+        (out, module)
     }
 
     fn extract_symbols(&self, root: Node<'_>, bytes: &[u8]) -> Vec<Symbol> {
@@ -160,6 +194,13 @@ impl LanguageParser {
                 }
 
                 let head = doc_head(def, bytes);
+                let mut chain = container_chain(def, bytes, self.lang.container_kinds());
+                chain.push(name.to_string());
+                let params = self
+                    .lang
+                    .overloads()
+                    .then(|| param_types(def, bytes))
+                    .flatten();
                 out.push(Symbol {
                     name: name.to_string(),
                     kind,
@@ -171,6 +212,11 @@ impl LanguageParser {
                     doc_start_line: head.start_position().row as u32 + 1,
                     doc_start_byte: head.start_byte(),
                     parent,
+                    qualified: chain.join("."),
+                    signature: first_line(def, bytes),
+                    params,
+                    id: 0,
+                    parent_id: None,
                 });
             }
         }
@@ -397,4 +443,65 @@ fn container_name(container: Node<'_>, bytes: &[u8]) -> Option<String> {
         .child_by_field_name("name")
         .or_else(|| container.child_by_field_name("type"))?;
     name_node.utf8_text(bytes).ok().map(str::to_string)
+}
+
+/// Names of every container around `node`, outermost first: the qualifier of
+/// a nested symbol (`Outer.Inner`), where `parent` keeps only the nearest.
+fn container_chain(node: Node<'_>, bytes: &[u8], kinds: &[String]) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut cur = enclosing_container(node, kinds);
+    while let Some(c) = cur {
+        if let Some(name) = container_name(c, bytes) {
+            chain.push(name);
+        }
+        cur = enclosing_container(c, kinds);
+    }
+    chain.reverse();
+    chain
+}
+
+/// Longest provisional signature kept, in characters.
+const SIGNATURE_MAX: usize = 200;
+
+/// The definition's first line with whitespace collapsed, capped at
+/// [`SIGNATURE_MAX`] characters: a provisional signature until the
+/// structured extraction (PLAN-009 TASK-004) cuts it at the body.
+fn first_line(def: Node<'_>, bytes: &[u8]) -> String {
+    let text = def.utf8_text(bytes).unwrap_or_default();
+    let line = text.lines().next().unwrap_or_default();
+    line.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(SIGNATURE_MAX)
+        .collect()
+}
+
+/// The declared parameter types of a callable, normalised (no names, no
+/// whitespace, comma-separated): `actualizar(Long id, Dto d)` → `Long,Dto`.
+/// `None` when the node has no parameter list (a class, a field).
+fn param_types(def: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let list = def.child_by_field_name("parameters")?;
+    let mut cursor = list.walk();
+    let types: Vec<String> = list
+        .named_children(&mut cursor)
+        .filter(|p| !p.kind().contains("comment"))
+        .map(|p| {
+            let ty = p.child_by_field_name("type").or_else(|| {
+                (p.kind() == "spread_parameter")
+                    .then(|| p.named_child(0))
+                    .flatten()
+            });
+            let text = ty.and_then(|t| t.utf8_text(bytes).ok()).unwrap_or("?");
+            let mut norm: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            if let Some(rest) = norm.strip_prefix(':') {
+                norm = rest.to_string(); // a TypeScript `type_annotation`
+            }
+            if p.kind() == "spread_parameter" {
+                norm.push_str("...");
+            }
+            norm
+        })
+        .collect();
+    Some(types.join(","))
 }

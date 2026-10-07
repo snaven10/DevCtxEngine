@@ -1,7 +1,7 @@
 //! Parse-domain types: symbols, imports and the parsed-file result.
 
 /// A code symbol (function, method, class, …) extracted from a source file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Symbol {
     /// Symbol name.
     pub name: String,
@@ -27,6 +27,20 @@ pub struct Symbol {
     pub doc_start_byte: usize,
     /// Enclosing symbol name (class/impl/…), if any.
     pub parent: Option<String>,
+    /// Name qualified by every enclosing container, `Outer.Inner.method`
+    /// (the file symbol's is its path, set by [`ParsedFile::assign_ids`]).
+    pub qualified: String,
+    /// Provisional signature: the definition's first line, whitespace
+    /// collapsed, at most 200 characters.
+    pub signature: String,
+    /// Normalised parameter types (`Long,String`), only for languages that
+    /// overload by them; part of the id's disambiguator (DD-3).
+    pub params: Option<String>,
+    /// Stable id (DD-3), `0` until [`ParsedFile::assign_ids`] runs.
+    pub id: u64,
+    /// The container's id, or the file symbol's for a top-level symbol;
+    /// `None` for the file symbol itself.
+    pub parent_id: Option<u64>,
 }
 
 /// An import/use statement.
@@ -49,6 +63,12 @@ pub struct GraphEdge {
     pub kind: String,
     /// 1-based line of the call.
     pub line: u32,
+    /// Byte offset of the callee.
+    pub byte: usize,
+    /// Byte offset of the enclosing function node, if there is one.
+    pub source_byte: Option<usize>,
+    /// Id of the source symbol, `0` until [`ParsedFile::assign_ids`] runs.
+    pub src_id: u64,
 }
 
 /// The result of parsing one file.
@@ -60,6 +80,14 @@ pub struct ParsedFile {
     pub symbols: Vec<Symbol>,
     /// Extracted imports, in source order.
     pub imports: Vec<Import>,
-    /// Extracted call-graph edges, in source order.
+    /// Extracted call-graph edges whose source is a named function, in source
+    /// order. What `graph_edges` is made of.
     pub edges: Vec<GraphEdge>,
+    /// Calls with no named enclosing function — module level, a class body,
+    /// an anonymous function — in source order, `source` empty. They used to
+    /// be dropped; the `edges` table keeps them, sourced from the innermost
+    /// symbol around them or the file symbol.
+    pub module_edges: Vec<GraphEdge>,
+    /// The file's own symbol (`kind = file`), spanning the whole source.
+    pub file_symbol: Symbol,
 }

@@ -177,9 +177,16 @@ impl Store {
             shared: Arc::new(Shared::default()),
             in_tx: AtomicBool::new(false),
         };
-        store.apply_resource_limits(); // before any query can allocate against the defaults
-        schema::init_schema(&store.conn, dim)?;
+        // Limits before any query can allocate against the defaults.
+        store.apply_resource_limits();
+        // Extensions before the schema: on a database that already holds an
+        // HNSW index, the checkpoint `init_schema` takes after creating a
+        // table must bind that index, and without VSS loaded DuckDB fails it
+        // fatally — "unknown index type 'HNSW'", the database invalidated —
+        // which is what opening a 0.9.0 index with `storage.hnsw` did the
+        // first time a release added a table (PLAN-009 TASK-003).
         store.load_extensions(); // best-effort, so existing HNSW/FTS indexes are usable
+        schema::init_schema(&store.conn, dim)?;
         Ok(store)
     }
 
@@ -204,8 +211,8 @@ impl Store {
             in_tx: AtomicBool::new(false),
         };
         store.apply_resource_limits();
+        store.load_extensions(); // before the schema, as in `open`
         schema::init_schema(&store.conn, dim)?;
-        store.load_extensions();
         Ok(store)
     }
 
@@ -961,12 +968,20 @@ impl Store {
     }
 
     /// Update the `file` column for every row of a renamed file.
+    ///
+    /// The file's `symbols` and `edges` move too, re-keyed: a symbol id
+    /// carries its file (PLAN-009 DD-3), so the renamed file's ids change —
+    /// to the ones a parse at the new path would give — and resolved edges
+    /// into it follow. One transaction.
     pub fn rename_file(&self, repo: &str, branch: &str, old: &str, new: &str) -> Result<usize> {
-        let n = self.w()?.execute(
-            "UPDATE vectors SET file = ? WHERE repo = ? AND branch = ? AND file = ?",
-            [new, repo, branch, old],
-        )?;
-        Ok(n)
+        self.in_transaction(|| {
+            let n = self.w()?.execute(
+                "UPDATE vectors SET file = ? WHERE repo = ? AND branch = ? AND file = ?",
+                [new, repo, branch, old],
+            )?;
+            self.rename_file_graph(repo, branch, old, new)?;
+            Ok(n)
+        })
     }
 
     /// Count rows, optionally filtered.

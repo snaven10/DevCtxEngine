@@ -1,0 +1,666 @@
+//! The symbol graph (`symbols` + `edges`, PLAN-009 DD-2): per-file writers,
+//! basic reads, and the maintenance a file's rows need when it is deleted,
+//! renamed or copied to another branch.
+//!
+//! Every write deletes the file's rows and appends the new ones with DuckDB's
+//! `Appender` — one call per table rather than a statement per row, which is
+//! what an occurrence-per-row table (often thousands of rows per file) needs.
+//! The appender joins the caller's transaction (`Store::in_transaction`), so
+//! a file's vectors, `graph_edges`, symbols and edges commit together.
+
+use duckdb::params;
+
+use devctx_core::symbol_id::{file_symbol_id, rename_delta, FILE_KIND};
+
+use crate::error::Result;
+use crate::store::Store;
+
+/// A row of `symbols`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StoredSymbol {
+    /// Stable id (DD-3): the same on every branch.
+    pub id: u64,
+    /// Container's id; the file symbol's for a top-level symbol; `None` for
+    /// the file symbol.
+    pub parent_id: Option<u64>,
+    /// Repo-relative path.
+    pub file: String,
+    /// `file`/`class`/`method`/…
+    pub kind: String,
+    /// Bare name (`actualizar`; the base name for the file symbol).
+    pub name: String,
+    /// `OfficeService.actualizar`; the path for the file symbol.
+    pub qualified: String,
+    /// The nearest container's name, if any.
+    pub container: Option<String>,
+    /// Package / module, once the structured extraction knows it.
+    pub package: Option<String>,
+    /// Definition head without the body.
+    pub signature: Option<String>,
+    /// 1-based first line.
+    pub start_line: i32,
+    /// 1-based last line.
+    pub end_line: i32,
+    /// Byte offset of the definition.
+    pub start_byte: i64,
+    /// Byte offset of its end.
+    pub end_byte: i64,
+    /// public / export / pub, once known.
+    pub exported: Option<bool>,
+    /// Global PageRank, set by the link pass.
+    pub rank: Option<f64>,
+    /// Resolved non-test incoming calls, set by the link pass.
+    pub in_degree: Option<i32>,
+    /// The file is a test (`path_kind`).
+    pub is_test: bool,
+}
+
+/// A row of `edges`: one occurrence of a relation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredSymbolEdge {
+    /// `calls`/`instantiates`/`imports`/…
+    pub kind: String,
+    /// The symbol the occurrence is in (always one of `file`'s).
+    pub src_id: u64,
+    /// The destination's id, once the link pass resolves it.
+    pub dst_id: Option<u64>,
+    /// The destination as written, qualified as far as the file allows.
+    pub dst_name: String,
+    /// File of the occurrence.
+    pub file: String,
+    /// 1-based line.
+    pub line: i32,
+    /// `high`/`medium`/`low`, from the link pass.
+    pub confidence: Option<String>,
+    /// How the link pass resolved it.
+    pub resolution: Option<String>,
+    /// Defined outside the repository, with evidence.
+    pub external: Option<bool>,
+    /// The occurrence is in a test file.
+    pub from_test: bool,
+    /// `treesitter` today.
+    pub edge_source: String,
+}
+
+const SYMBOL_COLS: &[&str] = &[
+    "repo",
+    "branch",
+    "id",
+    "parent_id",
+    "file",
+    "kind",
+    "name",
+    "qualified",
+    "container",
+    "package",
+    "signature",
+    "start_line",
+    "end_line",
+    "start_byte",
+    "end_byte",
+    "exported",
+    "rank",
+    "in_degree",
+    "is_test",
+];
+
+const EDGE_COLS: &[&str] = &[
+    "repo",
+    "branch",
+    "kind",
+    "src_id",
+    "dst_id",
+    "dst_name",
+    "file",
+    "line",
+    "confidence",
+    "resolution",
+    "external",
+    "from_test",
+    "edge_source",
+];
+
+fn row_to_symbol(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbol> {
+    Ok(StoredSymbol {
+        id: r.get(0)?,
+        parent_id: r.get(1)?,
+        file: r.get(2)?,
+        kind: r.get(3)?,
+        name: r.get(4)?,
+        qualified: r.get(5)?,
+        container: r.get(6)?,
+        package: r.get(7)?,
+        signature: r.get(8)?,
+        start_line: r.get(9)?,
+        end_line: r.get(10)?,
+        start_byte: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
+        end_byte: r.get::<_, Option<i64>>(12)?.unwrap_or(0),
+        exported: r.get(13)?,
+        rank: r.get(14)?,
+        in_degree: r.get(15)?,
+        is_test: r.get::<_, Option<bool>>(16)?.unwrap_or(false),
+    })
+}
+
+const SYMBOL_SELECT: &str = "SELECT id, parent_id, file, kind, name, qualified, container, \
+     package, signature, start_line, end_line, start_byte, end_byte, exported, rank, \
+     in_degree, is_test FROM symbols";
+
+fn row_to_edge(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbolEdge> {
+    Ok(StoredSymbolEdge {
+        kind: r.get(0)?,
+        src_id: r.get(1)?,
+        dst_id: r.get(2)?,
+        dst_name: r.get(3)?,
+        file: r.get(4)?,
+        line: r.get::<_, Option<i32>>(5)?.unwrap_or(0),
+        confidence: r.get(6)?,
+        resolution: r.get(7)?,
+        external: r.get(8)?,
+        from_test: r.get::<_, Option<bool>>(9)?.unwrap_or(false),
+        edge_source: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+    })
+}
+
+const EDGE_SELECT: &str = "SELECT kind, src_id, dst_id, dst_name, file, line, confidence, \
+     resolution, external, from_test, edge_source FROM edges";
+
+impl Store {
+    /// Replace `file`'s rows in `symbols` with `symbols`.
+    pub fn replace_file_symbols(
+        &self,
+        repo: &str,
+        branch: &str,
+        file: &str,
+        symbols: &[StoredSymbol],
+    ) -> Result<()> {
+        self.w()?.execute(
+            "DELETE FROM symbols WHERE repo = ? AND branch = ? AND file = ?",
+            params![repo, branch, file],
+        )?;
+        if symbols.is_empty() {
+            return Ok(());
+        }
+        let w = self.w()?;
+        let mut app = w.appender_with_columns("symbols", SYMBOL_COLS)?;
+        for s in symbols {
+            app.append_row(params![
+                repo,
+                branch,
+                s.id,
+                s.parent_id,
+                file,
+                s.kind,
+                s.name,
+                s.qualified,
+                s.container,
+                s.package,
+                s.signature,
+                s.start_line,
+                s.end_line,
+                s.start_byte,
+                s.end_byte,
+                s.exported,
+                s.rank,
+                s.in_degree,
+                s.is_test,
+            ])?;
+        }
+        app.flush()?;
+        Ok(())
+    }
+
+    /// Replace `file`'s rows in `edges` with `edges`.
+    pub fn replace_file_symbol_edges(
+        &self,
+        repo: &str,
+        branch: &str,
+        file: &str,
+        edges: &[StoredSymbolEdge],
+    ) -> Result<()> {
+        self.w()?.execute(
+            "DELETE FROM edges WHERE repo = ? AND branch = ? AND file = ?",
+            params![repo, branch, file],
+        )?;
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let w = self.w()?;
+        let mut app = w.appender_with_columns("edges", EDGE_COLS)?;
+        for e in edges {
+            app.append_row(params![
+                repo,
+                branch,
+                e.kind,
+                e.src_id,
+                e.dst_id,
+                e.dst_name,
+                file,
+                e.line,
+                e.confidence,
+                e.resolution,
+                e.external,
+                e.from_test,
+                e.edge_source,
+            ])?;
+        }
+        app.flush()?;
+        Ok(())
+    }
+
+    /// Replace both of `file`'s graph tables, as one transaction (or as part
+    /// of the caller's).
+    pub fn replace_file_graph(
+        &self,
+        repo: &str,
+        branch: &str,
+        file: &str,
+        symbols: &[StoredSymbol],
+        edges: &[StoredSymbolEdge],
+    ) -> Result<()> {
+        self.in_transaction(|| {
+            self.replace_file_symbols(repo, branch, file, symbols)?;
+            self.replace_file_symbol_edges(repo, branch, file, edges)
+        })
+    }
+
+    /// Forget `file`'s symbols and edges.
+    pub fn delete_file_graph(&self, repo: &str, branch: &str, file: &str) -> Result<()> {
+        self.in_transaction(|| {
+            self.w()?.execute(
+                "DELETE FROM symbols WHERE repo = ? AND branch = ? AND file = ?",
+                params![repo, branch, file],
+            )?;
+            self.w()?.execute(
+                "DELETE FROM edges WHERE repo = ? AND branch = ? AND file = ?",
+                params![repo, branch, file],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// `file`'s symbols, in source order (the file symbol first).
+    pub fn file_symbols(&self, repo: &str, branch: &str, file: &str) -> Result<Vec<StoredSymbol>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SYMBOL_SELECT} WHERE repo = ? AND branch = ? AND file = ?
+             ORDER BY start_byte, end_byte DESC, id"
+        ))?;
+        let rows = stmt.query_map(params![repo, branch, file], row_to_symbol)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// The symbol with `id` on `branch`, if any.
+    pub fn symbol_by_id(&self, repo: &str, branch: &str, id: u64) -> Result<Option<StoredSymbol>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SYMBOL_SELECT} WHERE repo = ? AND branch = ? AND id = ? LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map(params![repo, branch, id], row_to_symbol)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    /// `file`'s edges, by line.
+    pub fn file_symbol_edges(
+        &self,
+        repo: &str,
+        branch: &str,
+        file: &str,
+    ) -> Result<Vec<StoredSymbolEdge>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{EDGE_SELECT} WHERE repo = ? AND branch = ? AND file = ?
+             ORDER BY line, src_id, dst_name"
+        ))?;
+        let rows = stmt.query_map(params![repo, branch, file], row_to_edge)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// `(symbols, edges)` rows of a branch.
+    pub fn graph_row_counts(&self, repo: &str, branch: &str) -> Result<(u64, u64)> {
+        let n = |table: &str| -> Result<u64> {
+            let n: i64 = self.conn.query_row(
+                &format!("SELECT count(*) FROM {table} WHERE repo = ? AND branch = ?"),
+                params![repo, branch],
+                |r| r.get(0),
+            )?;
+            Ok(n as u64)
+        };
+        Ok((n("symbols")?, n("edges")?))
+    }
+
+    /// Copy `file`'s symbols and edges from one branch to another.
+    ///
+    /// Symbols travel as they are: their ids carry no branch. Edges travel
+    /// without their resolution (`dst_id`, `confidence`, `resolution`,
+    /// `external`): what a call resolves to depends on the rest of the
+    /// branch, so the destination branch's link pass decides it again.
+    pub(crate) fn copy_file_graph(
+        &self,
+        repo: &str,
+        from_branch: &str,
+        to_branch: &str,
+        file: &str,
+    ) -> Result<()> {
+        let symbols = self.file_symbols(repo, from_branch, file)?;
+        let edges: Vec<StoredSymbolEdge> = self
+            .file_symbol_edges(repo, from_branch, file)?
+            .into_iter()
+            .map(|e| StoredSymbolEdge {
+                dst_id: None,
+                confidence: None,
+                resolution: None,
+                external: None,
+                ..e
+            })
+            .collect();
+        self.replace_file_graph(repo, to_branch, file, &symbols, &edges)
+    }
+
+    /// Move `old`'s graph rows to `new`, re-keying every id of the file.
+    ///
+    /// The id carries the file (DD-3), so a renamed file's symbols are new
+    /// symbols to the index: same as a fresh parse at `new` would give them,
+    /// which the XOR composition of the id makes computable from the stored
+    /// id alone (`devctx_core::symbol_id`). Edges from other files already
+    /// resolved to one of them follow. Memories keep pointing by name.
+    pub(crate) fn rename_file_graph(
+        &self,
+        repo: &str,
+        branch: &str,
+        old: &str,
+        new: &str,
+    ) -> Result<()> {
+        let delta = rename_delta(repo, old, new);
+        let old_file = file_symbol_id(repo, old);
+        let new_file = file_symbol_id(repo, new);
+        let base = new.rsplit('/').next().unwrap_or(new);
+        // f(x): the file symbol gets its own new id, everything else the mask.
+        let remap = |col: &str| {
+            format!("CASE WHEN {col} = {old_file} THEN {new_file}::UBIGINT ELSE xor({col}, {delta}::UBIGINT) END")
+        };
+        self.in_transaction(|| {
+            // Destinations first, while `symbols` still says which ids are
+            // the old file's.
+            self.w()?.execute(
+                &format!(
+                    "UPDATE edges SET dst_id = {}
+                     WHERE repo = ? AND branch = ? AND dst_id IN
+                         (SELECT id FROM symbols WHERE repo = ? AND branch = ? AND file = ?)",
+                    remap("dst_id")
+                ),
+                params![repo, branch, repo, branch, old],
+            )?;
+            self.w()?.execute(
+                &format!(
+                    "UPDATE edges SET src_id = {}, file = ?
+                     WHERE repo = ? AND branch = ? AND file = ?",
+                    remap("src_id")
+                ),
+                params![new, repo, branch, old],
+            )?;
+            self.w()?.execute(
+                &format!(
+                    "UPDATE symbols SET id = {}, parent_id = {}, file = ?,
+                         qualified = CASE WHEN kind = ? THEN ? ELSE qualified END,
+                         name = CASE WHEN kind = ? THEN ? ELSE name END
+                     WHERE repo = ? AND branch = ? AND file = ?",
+                    remap("id"),
+                    remap("parent_id")
+                ),
+                params![new, FILE_KIND, new, FILE_KIND, base, repo, branch, old],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use devctx_core::symbol_id::symbol_id;
+
+    const DIM: usize = 3;
+
+    fn sym(
+        repo: &str,
+        file: &str,
+        kind: &str,
+        qualified: &str,
+        parent: Option<u64>,
+    ) -> StoredSymbol {
+        let id = if kind == FILE_KIND {
+            file_symbol_id(repo, file)
+        } else {
+            symbol_id(repo, file, "callable", qualified, "")
+        };
+        StoredSymbol {
+            id,
+            parent_id: parent,
+            file: file.into(),
+            kind: kind.into(),
+            name: qualified.rsplit('.').next().unwrap().into(),
+            qualified: qualified.into(),
+            signature: Some(format!("fn {qualified}()")),
+            start_line: 1,
+            end_line: 2,
+            // The file symbol spans the file, so it sorts first.
+            start_byte: if kind == FILE_KIND { 0 } else { 10 },
+            end_byte: if kind == FILE_KIND { 100 } else { 20 },
+            ..Default::default()
+        }
+    }
+
+    fn file_graph(repo: &str, file: &str) -> (Vec<StoredSymbol>, Vec<StoredSymbolEdge>) {
+        let f = sym(repo, file, FILE_KIND, file, None);
+        let run = sym(repo, file, "function", "run", Some(f.id));
+        let call = |line| StoredSymbolEdge {
+            kind: "calls".into(),
+            src_id: run.id,
+            dst_name: "helper".into(),
+            file: file.into(),
+            line,
+            edge_source: "treesitter".into(),
+            ..Default::default()
+        };
+        let edges = vec![call(3), call(4)];
+        (vec![f, run], edges)
+    }
+
+    /// One row per occurrence: the writer does not fold two calls to the same
+    /// destination from the same symbol, which `graph_edges` does.
+    #[test]
+    fn repeated_occurrences_are_rows_of_their_own() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (s, e) = file_graph("r", "a.py");
+        store
+            .replace_file_graph("r", "main", "a.py", &s, &e)
+            .unwrap();
+        let back = store.file_symbol_edges("r", "main", "a.py").unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back, e);
+        assert_eq!(store.file_symbols("r", "main", "a.py").unwrap(), s);
+        // UBIGINT round-trips the whole range, top bit included.
+        let mut big = s.clone();
+        big[1].id = u64::MAX - 1;
+        store
+            .replace_file_symbols("r", "main", "a.py", &big)
+            .unwrap();
+        assert!(store
+            .symbol_by_id("r", "main", u64::MAX - 1)
+            .unwrap()
+            .is_some());
+    }
+
+    /// Replacing is replacing: a second write leaves only the second set, and
+    /// other files and branches are untouched.
+    #[test]
+    fn a_rewrite_replaces_only_its_own_file_and_branch() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (s, e) = file_graph("r", "a.py");
+        let (s2, e2) = file_graph("r", "b.py");
+        store
+            .replace_file_graph("r", "main", "a.py", &s, &e)
+            .unwrap();
+        store
+            .replace_file_graph("r", "main", "b.py", &s2, &e2)
+            .unwrap();
+        store
+            .replace_file_graph("r", "dev", "a.py", &s, &e)
+            .unwrap();
+        store
+            .replace_file_graph("r", "main", "a.py", &s[..1], &[])
+            .unwrap();
+        assert_eq!(store.file_symbols("r", "main", "a.py").unwrap().len(), 1);
+        assert!(store
+            .file_symbol_edges("r", "main", "a.py")
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.graph_row_counts("r", "main").unwrap(), (3, 2));
+        assert_eq!(store.graph_row_counts("r", "dev").unwrap(), (2, 2));
+    }
+
+    /// The appender writes inside the caller's transaction: a file whose
+    /// transaction fails leaves its old rows, never a half-written set.
+    #[test]
+    fn a_failed_transaction_keeps_the_old_rows() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (s, e) = file_graph("r", "a.py");
+        store
+            .replace_file_graph("r", "main", "a.py", &s, &e)
+            .unwrap();
+        let err = store.in_transaction(|| -> Result<()> {
+            store.replace_file_graph("r", "main", "a.py", &s[..1], &[])?;
+            assert_eq!(store.file_symbols("r", "main", "a.py")?.len(), 1);
+            Err(crate::StoreError::Decode("cut".into()))
+        });
+        assert!(err.is_err());
+        assert_eq!(store.file_symbols("r", "main", "a.py").unwrap(), s);
+        assert_eq!(store.file_symbol_edges("r", "main", "a.py").unwrap(), e);
+    }
+
+    #[test]
+    fn deleting_a_file_leaves_no_orphans() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (s, e) = file_graph("r", "a.py");
+        store
+            .replace_file_graph("r", "main", "a.py", &s, &e)
+            .unwrap();
+        store
+            .replace_file_graph("r", "dev", "a.py", &s, &e)
+            .unwrap();
+        store.delete_file_graph("r", "main", "a.py").unwrap();
+        assert_eq!(store.graph_row_counts("r", "main").unwrap(), (0, 0));
+        assert_eq!(store.graph_row_counts("r", "dev").unwrap(), (2, 2));
+    }
+
+    /// A rename re-keys the file to exactly the ids a parse at the new path
+    /// gives, and edges elsewhere that resolved into it follow.
+    #[test]
+    fn a_rename_rekeys_the_file_like_a_fresh_parse() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (s, e) = file_graph("r", "src/a.py");
+        store
+            .replace_file_graph("r", "main", "src/a.py", &s, &e)
+            .unwrap();
+        // b.py calls a.py's `run`, already resolved.
+        let (bs, mut be) = file_graph("r", "b.py");
+        be[0].dst_id = Some(s[1].id);
+        store
+            .replace_file_graph("r", "main", "b.py", &bs, &be)
+            .unwrap();
+
+        store
+            .rename_file("r", "main", "src/a.py", "lib/moved.py")
+            .unwrap();
+
+        let (want, want_edges) = file_graph("r", "lib/moved.py");
+        let got = store.file_symbols("r", "main", "lib/moved.py").unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, want[0].id, "the file symbol");
+        assert_eq!(got[0].qualified, "lib/moved.py");
+        assert_eq!(got[0].name, "moved.py");
+        assert_eq!(got[1].id, want[1].id);
+        assert_eq!(got[1].parent_id, Some(want[0].id));
+        assert_eq!(
+            store
+                .file_symbol_edges("r", "main", "lib/moved.py")
+                .unwrap(),
+            want_edges
+        );
+        assert!(store
+            .file_symbols("r", "main", "src/a.py")
+            .unwrap()
+            .is_empty());
+        let b = store.file_symbol_edges("r", "main", "b.py").unwrap();
+        assert_eq!(b[0].dst_id, Some(want[1].id), "the resolved caller follows");
+        assert_eq!(b[1].dst_id, None);
+    }
+
+    /// The tables are created on a database that predates them, and the DDL
+    /// is folded into the file at once, not left in the WAL for a replay.
+    #[test]
+    fn an_existing_database_gains_the_tables_with_a_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("devctx_symbols_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.duckdb");
+        {
+            let store = Store::open(&db, DIM).unwrap();
+            store
+                .conn
+                .execute_batch("DROP TABLE symbols; DROP TABLE edges; CHECKPOINT;")
+                .unwrap();
+        }
+        {
+            let store = Store::open(&db, DIM).unwrap();
+            let wal = dir.join("index.duckdb.wal");
+            let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(wal_len, 0, "the CREATE TABLE stayed in the WAL");
+            let (s, e) = file_graph("r", "a.py");
+            store
+                .replace_file_graph("r", "main", "a.py", &s, &e)
+                .unwrap();
+            store.checkpoint();
+        }
+        let store = Store::open(&db, DIM).unwrap();
+        assert_eq!(store.graph_row_counts("r", "main").unwrap(), (2, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same upgrade over an index with an HNSW index (`storage.hnsw`, the
+    /// default `init` writes). The checkpoint after the new tables has to bind
+    /// the HNSW index; opened without VSS loaded first, DuckDB failed it with
+    /// "unknown index type 'HNSW'" and invalidated the database — measured on
+    /// a real 0.9.0 index before this test existed.
+    #[test]
+    fn an_existing_hnsw_database_gains_the_tables() {
+        let dir = std::env::temp_dir().join(format!("devctx_symbols_hnsw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.duckdb");
+        {
+            let store = Store::open(&db, DIM).unwrap();
+            if !store.enable_hnsw("cosine").unwrap() {
+                eprintln!("VSS unavailable (offline?): skipped");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            store
+                .conn
+                .execute_batch(
+                    "INSERT INTO vectors (id, vector, repo, branch, file)
+                     VALUES ('p', [0.1, 0.2, 0.3]::FLOAT[3], 'r', 'main', 'a.rs');
+                     DROP TABLE symbols; DROP TABLE edges; CHECKPOINT;",
+                )
+                .unwrap();
+        }
+        {
+            let store = Store::open(&db, DIM).expect("an HNSW index must open after an upgrade");
+            assert_eq!(store.graph_row_counts("r", "main").unwrap(), (0, 0));
+            let wal = dir.join("index.duckdb.wal");
+            assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), 0);
+            store.delete_by_file("r", "main", "a.rs").unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -60,6 +60,10 @@ pub struct LangDef {
     /// Node kinds that act as symbol containers, for the parent of a symbol and
     /// for telling a method from a function.
     pub container_kinds: Vec<String>,
+    /// Whether the language overloads callables by parameter types, so that
+    /// a symbol's id carries them (PLAN-009 DD-3).
+    #[serde(default)]
+    pub overloads: bool,
 }
 
 impl LangDef {
@@ -90,7 +94,10 @@ const SOURCES: &[&str] = &[
 /// `devctx-index`'s `routes.rs`. A change to either needs a manual bump here,
 /// or existing indexes keep reading as fresh. Only a full run (`index --full`)
 /// stamps the fingerprint; incremental runs never re-stamp an older index.
-pub const EXTRACTOR_VERSION: u32 = 1;
+///
+/// 2: the `symbols` and `edges` tables (PLAN-009 TASK-003) — an index made
+/// before them has neither, so it must read as stale.
+pub const EXTRACTOR_VERSION: u32 = 2;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
@@ -226,7 +233,7 @@ mod fingerprint_tests {
     #[test]
     fn the_fingerprint_is_stable_between_calls() {
         assert_eq!(extractor_fingerprint(), extractor_fingerprint());
-        assert!(extractor_fingerprint().starts_with("v1-"));
+        assert!(extractor_fingerprint().starts_with("v2-"));
     }
 
     #[test]

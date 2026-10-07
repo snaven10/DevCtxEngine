@@ -1251,6 +1251,17 @@ fn a_forced_exit_mid_index_leaves_a_sound_database() {
             store.count(&Default::default()).unwrap() > 0,
             "the earlier index is still there"
         );
+        // The symbol graph is part of the same per-file transaction (the
+        // stall sits after the vectors, before the graph): no file lost its
+        // symbols or kept half of them.
+        let git = devctx_index::GitRepo::open(&root).unwrap();
+        let (repo, branch) = (git.short_name(), git.state().branch);
+        for i in 0..files {
+            let f = format!("m{i:03}.rs");
+            let syms = store.file_symbols(&repo, &branch, &f).unwrap();
+            let kinds: Vec<&str> = syms.iter().map(|s| s.kind.as_str()).collect();
+            assert_eq!(kinds, ["file", "function"], "{f}: {syms:?}");
+        }
         // The cut run had already put vectors of the new setup into some files:
         // the branch must still be marked "transition", never the old or the new
         // fingerprint, so no later run reuses them by mistake.

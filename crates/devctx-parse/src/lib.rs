@@ -11,6 +11,7 @@ pub mod lang;
 pub mod parser;
 pub mod registry;
 pub mod routes;
+pub mod symbol_id;
 pub mod types;
 
 pub use error::{ParseError, Result};

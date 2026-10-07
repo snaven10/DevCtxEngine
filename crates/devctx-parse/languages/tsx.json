@@ -17,5 +17,6 @@
     "class_declaration",
     "interface_declaration",
     "enum_declaration"
-  ]
+  ],
+  "overloads": true
 }

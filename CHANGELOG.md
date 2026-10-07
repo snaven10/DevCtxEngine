@@ -19,6 +19,14 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   cross-branch copy, which now also requires the source's fingerprint to match.
 - `index` reports `files_unchanged` (files a `--full` found identical and did
   not write) separately from `files_indexed`.
+- **New `symbols` and `edges` tables** (PLAN-009 TASK-003): one row per
+  symbol with a stable, branch-free id, and one row per call *occurrence* —
+  the second call to the same target from one method, and module-level calls
+  (sourced from a per-file symbol), are no longer lost. Written in the same
+  per-file transaction as the vectors, kept on delete, rename, branch copy and
+  branch prune. `graph_edges` is still written as before, so 0.9.0 can read a
+  downgraded index. **Extractor version 2:** existing indexes report
+  `extractor_stale` until `devctx index --full` (which reuses every vector).
 
 ### Fixed
 
@@ -26,6 +34,9 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   file another branch holds; and a branch made by another embedding setup is no
   longer a copy source.
 - Deleting a file the index never held no longer drops the HNSW/BM25 indexes.
+- Opening an index that has an HNSW index loads VSS *before* creating tables
+  added by a release: the checkpoint after the DDL failed fatally ("unknown
+  index type 'HNSW'") and invalidated the database for the process.
 
 ## 0.9.0 — 2026-10-05
 

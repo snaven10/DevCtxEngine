@@ -10,8 +10,8 @@ use devctx_core::types::{VectorMetadata, VectorPoint};
 use devctx_embed::EmbeddingProvider;
 use devctx_parse::{detect_lang, extract_routes, parse, raw_text_language};
 use devctx_store::{
-    normalize_metric, FileState, IndexRecord, Store, StoredEdge, StoredRoute, EMBED_FP_META_KEY,
-    EXTRACTOR_META_KEY,
+    normalize_metric, FileState, IndexRecord, Store, StoredEdge, StoredRoute, StoredSymbol,
+    StoredSymbolEdge, EMBED_FP_META_KEY, EXTRACTOR_META_KEY,
 };
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
@@ -932,7 +932,7 @@ impl Ctx<'_> {
                 .is_ignore()
     }
 
-    /// Forget a file: its vectors, edges, routes and state, as one
+    /// Forget a file: its vectors, edges, symbols, routes and state, as one
     /// transaction (see `index_file` for why one).
     fn delete_file(&self, file: &str) -> Result<()> {
         // A file that was never indexed (excluded, binary, added and removed
@@ -950,6 +950,8 @@ impl Ctx<'_> {
                 .delete_by_file(self.repo_short, self.branch, file)?;
             self.store
                 .delete_file_edges(self.repo_short, self.branch, file)?;
+            self.store
+                .delete_file_graph(self.repo_short, self.branch, file)?;
             self.store
                 .delete_file_routes(self.repo_short, self.branch, file)?;
             self.store
@@ -1088,7 +1090,8 @@ impl Ctx<'_> {
         let (language, parsed, chunks) = match lang {
             // Parseable code: chunk + embed, plus call-graph edges and routes.
             Some(lang) => {
-                let parsed = parse(lang, &content)?;
+                let mut parsed = parse(lang, &content)?;
+                parsed.assign_ids(self.repo_short, file);
                 let chunks = chunk_file(file, &content, &parsed, &self.cfg);
                 (parsed.language.clone(), Some(parsed), chunks)
             }
@@ -1262,7 +1265,10 @@ impl Ctx<'_> {
             })
             .collect();
         self.store
-            .replace_file_edges(self.repo_short, self.branch, file, &edges)
+            .replace_file_edges(self.repo_short, self.branch, file, &edges)?;
+        let (symbols, edges) = graph_rows(file, parsed);
+        self.store
+            .replace_file_graph(self.repo_short, self.branch, file, &symbols, &edges)
     }
 
     fn store_routes(&self, file: &str, content: &str) -> devctx_store::Result<()> {
@@ -1282,6 +1288,59 @@ impl Ctx<'_> {
         self.store
             .replace_file_routes(self.repo_short, self.branch, file, &routes, &now_stamp())
     }
+}
+
+/// The `symbols` and `edges` rows of one parsed file (ids already assigned):
+/// the file symbol first, then every symbol; one edge per call occurrence,
+/// module-level ones included, unresolved (`dst_id` and the rest are the link
+/// pass's to fill, PLAN-009 DD-6).
+fn graph_rows(
+    file: &str,
+    parsed: &devctx_parse::ParsedFile,
+) -> (Vec<StoredSymbol>, Vec<StoredSymbolEdge>) {
+    let is_test = devctx_core::path_kind(file, &parsed.language) == devctx_core::PathKind::Test;
+    let symbols = std::iter::once(&parsed.file_symbol)
+        .chain(&parsed.symbols)
+        .map(|s| StoredSymbol {
+            id: s.id,
+            parent_id: s.parent_id,
+            file: file.to_string(),
+            kind: s.kind.clone(),
+            name: s.name.clone(),
+            qualified: s.qualified.clone(),
+            container: s.parent.clone(),
+            package: None,
+            signature: (!s.signature.is_empty()).then(|| s.signature.clone()),
+            start_line: s.start_line as i32,
+            end_line: s.end_line as i32,
+            start_byte: s.start_byte as i64,
+            end_byte: s.end_byte as i64,
+            exported: None,
+            rank: None,
+            in_degree: None,
+            is_test,
+        })
+        .collect();
+    let mut edges: Vec<StoredSymbolEdge> = parsed
+        .edges
+        .iter()
+        .chain(&parsed.module_edges)
+        .map(|e| StoredSymbolEdge {
+            kind: e.kind.clone(),
+            src_id: e.src_id,
+            dst_id: None,
+            dst_name: e.target.clone(),
+            file: file.to_string(),
+            line: e.line as i32,
+            confidence: None,
+            resolution: None,
+            external: None,
+            from_test: is_test,
+            edge_source: "treesitter".to_string(),
+        })
+        .collect();
+    edges.sort_by_key(|e| e.line);
+    (symbols, edges)
 }
 
 /// The display path of a change (the destination for a rename).

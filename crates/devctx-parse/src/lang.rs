@@ -110,6 +110,12 @@ impl Lang {
     pub fn container_kinds(self) -> &'static [String] {
         &self.0.container_kinds
     }
+
+    /// Whether callables overload by parameter types (Java, TypeScript), so a
+    /// symbol id carries them.
+    pub fn overloads(self) -> bool {
+        self.0.overloads
+    }
 }
 
 impl PartialEq for Lang {
