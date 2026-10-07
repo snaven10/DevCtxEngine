@@ -19,7 +19,7 @@ Implementa DD-7 (Python, Rust, Go).
 - Python: `types` solo `assignment` y `typed_parameter` con anotación (`languages/python.json`); sin
   `self.x = Foo()`; llamadas de módulo descartadas (`crates/devctx-parse/src/parser.rs:125-127`,
   TASK-003 ya les da fuente). Builtins como targets pelados (`len`, `print`). Repo de campo:
-  legacy-migration (`src/pipeline.py`, `src/resolver.py`, scripts con `if __name__ == "__main__"`).
+  legacy-migration (módulos de la raíz y de `src/`, scripts con `if __name__ == "__main__"`).
 - Rust: `calls` con `scoped_identifier name:` → `Foo::bar` queda `bar` (`languages/rust.json`);
   `container_kinds: ["impl_item", "trait_item"]`; `impl Trait for T` no se registra; `types` solo
   `type_identifier` en `let`/params/campos. 49 `impl X for Y` en `crates/*/src/*.rs` de este repo.
@@ -38,7 +38,7 @@ Implementa DD-7 (Python, Rust, Go).
 ## Pasos
 
 - [ ] **Paso 1 — tests que fallan.** Python: dos llamadas a `helper()` desde el mismo método → dos
-      aristas; llamada a nivel de módulo; `from .resolver import resolver_id` (relativo);
+      aristas; llamada a nivel de módulo; `from .lookup import lookup_id` (relativo);
       `self.repo = Repo()` en `__init__` y `self.repo.save()`; `len(x)` → `external_known`. Rust:
       `Store::open(…)` → `Store.open` resuelto por `use`; `Self::helper()`; método de `impl Trait for
       T` → `T.m` + `implements`; `serde_json::from_str` → externo. Go: método con receptor; import

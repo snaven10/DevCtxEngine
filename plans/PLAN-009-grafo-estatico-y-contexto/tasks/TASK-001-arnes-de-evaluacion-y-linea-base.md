@@ -37,8 +37,8 @@ implementación de DD-1: métricas del grafo, precisión contra gold edges, rele
   - frontend: `lib-auth/src/lib/providers/token.interceptor.ts:78`
     (`export const tokenInterceptor`), `lib-auth/src/lib/services/auth.service.ts:60` y
     `lib-auth-data/src/lib/services/auth.service.ts:26` (dos `AuthService`).
-  - legacy-migration: `src/pipeline.py`, `src/resolver.py`, scripts con `if __name__ ==
-    "__main__"` (`e2e.py:164`, `backfill_folio_final.py:289`).
+  - legacy-migration: módulos de la raíz y de `src/`, scripts con `if __name__ ==
+    "__main__"` (rutas y líneas reales en el gold privado).
   - DevCtxEngine: los 41 casos de `bench-queries.txt` + identificadores (`search_ranked`,
     `symbol_definitions`, `replace_file_edges`, `Cached`).
 - Repo público en GitHub (`origin`): los casos de ACME no se commitean (Q-5 del master).
