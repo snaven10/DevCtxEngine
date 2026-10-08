@@ -2,6 +2,8 @@ use demo_store::ops::Named;
 use demo_store::{store::Store as S2, Store};
 use mystery::Thing;
 
+mod extra;
+mod review;
 mod util;
 use util::{self, tidy};
 

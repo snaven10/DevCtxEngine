@@ -9,3 +9,5 @@ mod tests {
         tidy();
     }
 }
+
+pub fn polish() {}

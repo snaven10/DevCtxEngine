@@ -243,6 +243,10 @@ const SOURCES: &[&str] = &[
 /// parameters, `:=`, `var`, `range` and type-switch variables are bindings;
 /// `x := New()` holds what the call returns, `&T{}` is `T`; an interface's
 /// method is a symbol.
+/// 15: TASK-007 review — a Rust type parameter (and `dyn A + B`) is typed
+/// by every bound (`Clone+Named`), `Arc::new(x)`/`Box::new(x)` hold what
+/// `x` does, `x = f()` with `f` a local value holds nothing; Go `var a, err
+/// = f()` types `a` only, an anonymous interface's method is no symbol.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -250,7 +254,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 14;
+pub const EXTRACTOR_VERSION: u32 = 15;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

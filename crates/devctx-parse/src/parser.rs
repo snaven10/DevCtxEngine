@@ -847,7 +847,9 @@ impl Recv {
                 .unwrap_or_else(|| name.to_string()),
             // What a call returns (`x = make()`): its type is the link
             // pass's to find.
-            Recv::Typed(ty, _) if ty.ends_with(')') || ty.ends_with('?') => name.to_string(),
+            Recv::Typed(ty, _) if ty.ends_with(')') || ty.ends_with('?') || ty.contains('+') => {
+                name.to_string()
+            }
             Recv::Typed(ty, _) => format!("{ty}.{name}"),
             Recv::Name(r)
                 if r.chars().next().is_some_and(char::is_uppercase) && !is_constant_name(r) =>
@@ -1062,6 +1064,12 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
         if b.func {
             return Recv::Name(key.to_string());
         }
+        // `let x = a.f()?; x.g()`: `g` after `a.f()?` (TASK-007 review).
+        if b.ty.is_none() && member.is_none() {
+            if let Some(chain) = init_chain(recv, b, key, bytes, scopes, depth) {
+                return chain;
+            }
+        }
         return typed(b);
     }
     // `target.parent`, `this.cfg.server`: a binding, then its fields — never
@@ -1093,6 +1101,56 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
         return Recv::Member(vec![key.to_string()], Box::new(Recv::This));
     }
     Recv::Name(key.to_string())
+}
+
+/// The chain a local's value is (`let x = a.f()?` → `chain f? <a's hint>`),
+/// for a call on it; `None` when it is no method call or names the local
+/// itself (`let s = s.trim()`).
+fn init_chain(
+    recv: Node<'_>,
+    b: &crate::resolve::scope::Binding,
+    name: &str,
+    bytes: &[u8],
+    scopes: &Scopes,
+    depth: u8,
+) -> Option<Recv> {
+    let (start, end) = b.init_call?;
+    if depth >= CHAIN_DEPTH {
+        return None;
+    }
+    let mut root = recv;
+    while let Some(p) = root.parent() {
+        root = p;
+    }
+    let init = root.descendant_for_byte_range(start, end)?;
+    let (call, unwrap) = match init.kind() {
+        "try_expression" => (init.named_child(0)?, true),
+        "await_expression" => (init.named_child(0)?, false),
+        _ => (init, false),
+    };
+    if !CALL_KINDS.contains(&call.kind()) {
+        return None;
+    }
+    let callee = inner_callee(call)?;
+    let text = callee.utf8_text(bytes).ok()?;
+    if !nameable(text) {
+        return None;
+    }
+    // `let s = s.trim()`: the value is the earlier `s`'s, not this one's.
+    if let Some(r) = receiver_node(callee) {
+        if r.utf8_text(bytes).ok()?.split('.').next() == Some(name) {
+            return None;
+        }
+    }
+    let prev = if unwrap {
+        format!("{text}?")
+    } else {
+        text.to_string()
+    };
+    Some(Recv::Chain(Some((
+        prev,
+        Box::new(classify(callee, bytes, scopes, depth + 1)),
+    ))))
 }
 
 /// Whether a TypeScript/JavaScript `this` at `node` is the instance of a
@@ -1207,7 +1265,8 @@ fn nameable(text: &str) -> bool {
 fn type_token(ty: &str) -> bool {
     let base = ty.strip_suffix('?').unwrap_or(ty);
     let base = base.strip_suffix("()").unwrap_or(base);
-    nameable(base)
+    // Several bounds (`Clone+Named`).
+    base.split('+').all(nameable)
 }
 
 /// Walk up from `node` to the nearest container (class/impl/…) definition.

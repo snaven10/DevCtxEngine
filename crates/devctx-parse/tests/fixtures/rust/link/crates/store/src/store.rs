@@ -25,6 +25,10 @@ impl Store {
 
     fn helper() {}
 
+    pub fn logger(&self) -> &Logger {
+        &self.log
+    }
+
     pub fn get(&self, key: &str) -> Option<&u32> {
         self.log.info();
         self.items.get(key)

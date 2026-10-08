@@ -226,3 +226,14 @@ fn a_package_needs_a_manifest() {
     assert_eq!(l.call("Service.run", "get"), UNDECIDED);
     assert_eq!(l.import(SERVICE, "requests"), UNDECIDED);
 }
+
+/// Review measurement: `x = self.repo.load()` makes a call on `x` a chain
+/// after it, typed by `load`'s annotation.
+#[test]
+fn a_local_from_a_method_call_is_a_chain() {
+    let l = linked();
+    assert_eq!(
+        l.call("Service.chained", "price"),
+        (s("Item.price"), s(REPO), "high", "return_type", false)
+    );
+}

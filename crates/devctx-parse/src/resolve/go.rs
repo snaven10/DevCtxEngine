@@ -254,49 +254,87 @@ impl RepoIndex {
             .find(|&i| is_type(&self.syms[i].kind))
     }
 
-    /// Where an import path leads (DD-9): under a `go.mod`'s `module`, or a
-    /// local `replace`, the repository's; a path whose first segment has no
-    /// dot is the standard library; any other path is another module once a
-    /// `go.mod` exists (Go builds nothing from outside its module without
-    /// one), and undecided without.
-    fn go_package(&self, path: &str) -> GoPkg {
+    /// Where an import path written in `from` leads (DD-9): under the
+    /// longest `module` (or local `replace`) prefix of a `go.mod`, the
+    /// repository's; a path whose first segment has no dot is the standard
+    /// library; any other path is another module when a `go.mod` above
+    /// `from` says the file is in a module (Go builds nothing from outside
+    /// its module without one), and undecided otherwise (review: a
+    /// `tools/go.mod` says nothing of a GOPATH or Bazel tree beside it).
+    fn go_package(&self, from: &str, path: &str) -> GoPkg {
+        let mut best: Option<(usize, String)> = None;
+        let mut consider = |prefix: &str, dir: &str| {
+            let rest = if path == prefix {
+                Some(String::new())
+            } else {
+                path.strip_prefix(&format!("{prefix}/")).map(str::to_string)
+            };
+            if let Some(rest) = rest {
+                if best.as_ref().is_none_or(|(n, _)| prefix.len() > *n) {
+                    best = Some((prefix.len(), join(dir, &rest)));
+                }
+            }
+        };
         for m in &self.go {
             if let Some(module) = &m.module {
-                if path == module {
-                    return GoPkg::Repo(m.dir.clone());
-                }
-                if let Some(rest) = path.strip_prefix(&format!("{module}/")) {
-                    return GoPkg::Repo(join(&m.dir, rest));
-                }
+                consider(module, &m.dir);
             }
-            for (from, to) in &m.local {
-                if path == from {
-                    return GoPkg::Repo(to.clone());
-                }
-                if let Some(rest) = path.strip_prefix(&format!("{from}/")) {
-                    return GoPkg::Repo(join(to, rest));
-                }
+            for (from_mod, to) in &m.local {
+                consider(from_mod, to);
             }
+        }
+        if let Some((_, dir)) = best {
+            return GoPkg::Repo(dir);
         }
         let first = path.split('/').next().unwrap_or(path);
         if !first.contains('.') {
             return GoPkg::External;
         }
-        if self.go.is_empty() {
-            GoPkg::Unknown
-        } else {
+        let d = dir_of(from);
+        let in_module = self
+            .go
+            .iter()
+            .any(|m| m.dir.is_empty() || d == m.dir || d.starts_with(&format!("{}/", m.dir)));
+        if in_module {
             GoPkg::External
+        } else {
+            GoPkg::Unknown
         }
     }
 
-    /// The package the local name `local` of `file` imports.
+    /// The package the local name `local` of `file` imports: an alias, else
+    /// the `package` clause of the repository directory it names (review),
+    /// else its last path segment.
     fn go_import_of(&self, file: &str, local: &str) -> Option<GoPkg> {
         let info = self.files.get(file)?;
-        let found = info
-            .go
+        for (path, alias) in &info.go {
+            let pkg = self.go_package(file, path);
+            let name = match (alias, &pkg) {
+                (Some(a), _) => a.clone(),
+                (None, GoPkg::Repo(dir)) => self
+                    .go_dir_package(dir)
+                    .unwrap_or_else(|| import_name(path).to_string()),
+                (None, _) => import_name(path).to_string(),
+            };
+            if name == local {
+                return Some(pkg);
+            }
+        }
+        None
+    }
+
+    /// The `package` clause of the Go files of `dir` (not an external
+    /// test package).
+    fn go_dir_package(&self, dir: &str) -> Option<String> {
+        self.files
             .iter()
-            .find(|(path, alias)| alias.as_deref().unwrap_or_else(|| import_name(path)) == local)?;
-        Some(self.go_package(&found.0))
+            .filter(|(f, i)| {
+                dir_of(f) == dir
+                    && i.lang.is_some_and(|l| l.key() == "go")
+                    && !i.package.as_deref().is_some_and(|p| p.ends_with("_test"))
+            })
+            .filter_map(|(_, i)| i.package.clone())
+            .min()
     }
 
     /// A Go type as written in `file` (`Server`, `store.Store`, `error`).
@@ -361,14 +399,19 @@ impl RepoIndex {
     pub(super) fn go_name(&self, c: &Call<'_>, recv: &str) -> Outcome {
         if let Some(pkg) = self.go_import_of(c.file, recv) {
             return match pkg {
-                GoPkg::Repo(dir) => match self
-                    .go_dir_items(&dir, None, c.callee)
-                    .into_iter()
-                    .find(|&i| is_callable(&self.syms[i].kind) || is_type(&self.syms[i].kind))
-                {
-                    Some(i) => hi(i, self, "import"),
-                    None => undecided(),
-                },
+                GoPkg::Repo(dir) => {
+                    let items: Vec<usize> = self
+                        .go_dir_items(&dir, None, c.callee)
+                        .into_iter()
+                        .filter(|&i| is_callable(&self.syms[i].kind) || is_type(&self.syms[i].kind))
+                        .collect();
+                    match items.as_slice() {
+                        [i] => hi(*i, self, "import"),
+                        // One name in several files (build tags).
+                        [i, ..] => cap(hi(*i, self, "import"), "medium"),
+                        [] => undecided(),
+                    }
+                }
                 GoPkg::External => external("external_known"),
                 GoPkg::Unknown => undecided(),
             };
@@ -385,25 +428,31 @@ impl RepoIndex {
     pub(super) fn go_value(&self, path: &str, file: &str) -> ValueType {
         let found = match path.split_once('.') {
             Some((pkg, name)) => match self.go_import_of(file, pkg) {
-                Some(GoPkg::Repo(dir)) => self.go_dir_items(&dir, None, name).into_iter().next(),
+                Some(GoPkg::Repo(dir)) => self.go_dir_items(&dir, None, name),
                 Some(GoPkg::External) => return ValueType::FromExternalCall,
                 _ => return ValueType::Unknown,
             },
-            None => self.go_package_items(file, path).into_iter().next(),
+            None => self.go_package_items(file, path),
         };
-        let Some(i) = found else {
+        let Some(&i) = found.first() else {
             return ValueType::Unknown;
         };
+        // One name in several files (build tags): no surer than medium.
+        let sure = if found.len() == 1 { "high" } else { "medium" };
         if is_type(&self.syms[i].kind) {
-            return ValueType::Repo(i, "local", "high");
+            return ValueType::Repo(i, "local", sure);
         }
         let fs = &self.syms[i];
         let Some(ret) = fs.signature.as_deref().and_then(return_type) else {
             return ValueType::Unknown;
         };
         match self.go_type(&ret, &fs.file, Some(i)) {
-            TypeRef::Repo(t, how) => ValueType::Repo(t, "return_type", self.type_conf(t, how)),
-            TypeRef::External => ValueType::External("high"),
+            TypeRef::Repo(t, how) => ValueType::Repo(
+                t,
+                "return_type",
+                super::link::min_conf(sure, self.type_conf(t, how)),
+            ),
+            TypeRef::External => ValueType::External(sure),
             TypeRef::Unknown => ValueType::Unknown,
         }
     }
@@ -411,7 +460,7 @@ impl RepoIndex {
     /// An `imports` row of a Go file: a package of the repository, or from
     /// outside.
     pub(super) fn go_import(&self, e: &LinkEdge) -> Outcome {
-        match self.go_package(&e.dst_name) {
+        match self.go_package(&e.file, &e.dst_name) {
             GoPkg::Repo(_) => Outcome::Resolved(Resolved {
                 dst_id: None,
                 confidence: "high",

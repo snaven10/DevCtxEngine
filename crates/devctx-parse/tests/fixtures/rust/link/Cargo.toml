@@ -3,3 +3,4 @@ members = ["crates/*"]
 
 [workspace.dependencies]
 serde_json = "1"
+wsdep = { path = "crates/store", package = "demo-store" }

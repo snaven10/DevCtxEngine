@@ -91,3 +91,50 @@ fn a_module_needs_its_go_mod() {
     assert_eq!(news[1], UNDECIDED);
     assert_eq!(l.call("Server.Handle", "Println"), EXTERNAL);
 }
+
+/// Review R6: a method missing from a type with an external embedded type
+/// (and an unresolved one) is external, `medium`.
+#[test]
+fn an_external_embedding_is_medium_evidence() {
+    let l = linked();
+    assert_eq!(
+        l.call("Locked.Go", "Locked.Close"),
+        (None, None, "medium", "inherited", true)
+    );
+}
+
+/// Review minors: two files of a package defining one name (build tags)
+/// give no `high`; an import's local name is the package clause of its
+/// directory; `var a, err = f()` types `a` only; a local closure shadows the
+/// package's function of that name; an anonymous interface's method is no
+/// symbol.
+#[test]
+fn package_names_tags_and_shadows() {
+    let l = linked();
+    assert_eq!(l.call("Review", "Platform").2, "medium");
+    assert_eq!(
+        l.call("Review", "Do"),
+        (s("Do"), s("lib/util2/do.go"), "high", "import", false)
+    );
+    assert_eq!(l.call("Review", "Error"), DISCARDED);
+    assert_eq!(l.call("Review", "helper"), UNDECIDED);
+    assert!(!l.symbols.iter().any(|s| s.name == "Shutdown"));
+}
+
+/// Review minors: a dotted import outside every module is undecided (a
+/// `go.mod` elsewhere in the repository says nothing of it); the longest
+/// module prefix wins.
+#[test]
+fn modules_are_matched_by_ancestor_and_longest_prefix() {
+    let l = link_dir_with(DIR, |env| env.go[0].dir = "nested".into());
+    let news = l.all("calls", "Server.Handle", "New");
+    assert_eq!(news[1], UNDECIDED);
+    let l = link_dir_with(DIR, |env| {
+        let mut m = env.go[0].clone();
+        m.dir = "elsewhere".into();
+        m.module = Some("github.com/acme/demo/store".into());
+        env.go.push(m);
+    });
+    let news = l.all("calls", "Server.Handle", "New");
+    assert_eq!(news[0], UNDECIDED);
+}

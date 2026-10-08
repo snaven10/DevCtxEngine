@@ -125,6 +125,15 @@ pub struct CargoManifest {
     /// may `use` from outside. A renamed dependency (`foo = { package =
     /// "bar" }`) is named by its key, as the code does.
     pub deps: Vec<String>,
+    /// Of those, the path dependencies: code name → the repository
+    /// directory of the crate it names (`foo = { path = "../bar", package =
+    /// "bar" }` → `foo` → `crates/bar`), sorted (TASK-007 review, R1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local: Vec<(String, String)>,
+    /// Of those, the ones inherited from the workspace (`foo.workspace =
+    /// true`): the workspace root's entry says what they are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<String>,
 }
 
 impl CargoManifest {
@@ -132,8 +141,30 @@ impl CargoManifest {
     /// does not parse.
     pub fn parse(text: &str, path: &str) -> Option<Self> {
         let entries = toml_entries(text)?;
+        let dir = dir_of(path).to_string();
         let (mut name, mut lib) = (None, None);
         let mut deps = Vec::new();
+        let mut local: Vec<(String, String)> = Vec::new();
+        let mut inherited: Vec<String> = Vec::new();
+        let mut note = |dep: &str, key: &[&str], value: &TomlValue| {
+            let code = dep.replace('-', "_");
+            deps.push(code.clone());
+            // `foo = { path = … }` / `foo.path = …` / `[dependencies.foo]`
+            // `path = …`; `workspace = true` likewise.
+            let mut fields: Vec<(String, TomlValue)> = Vec::new();
+            match (key, value) {
+                ([], TomlValue::Table(t)) => fields.extend(t.iter().cloned()),
+                ([k], v) => fields.push((k.to_string(), v.clone())),
+                _ => {}
+            }
+            for (k, v) in fields {
+                match (k.as_str(), &v) {
+                    ("path", TomlValue::Str(p)) => local.push((code.clone(), join(&dir, p))),
+                    ("workspace", TomlValue::Bool(true)) => inherited.push(code.clone()),
+                    _ => {}
+                }
+            }
+        };
         for e in &entries {
             let table: Vec<&str> = e.table.iter().map(String::as_str).collect();
             let key: Vec<&str> = e.key.iter().map(String::as_str).collect();
@@ -141,9 +172,9 @@ impl CargoManifest {
                 (["package"], ["name"]) => name = e.value.string(),
                 (["lib"], ["name"]) => lib = e.value.string(),
                 // `[dependencies]` `foo = "1"`, `foo.workspace = true`.
-                (t, [dep, ..]) if is_dependency_table(t) => deps.push(dep.to_string()),
+                (t, [dep, rest @ ..]) if is_dependency_table(t) => note(dep, rest, &e.value),
                 // `[dependencies.foo]` `version = "1"`.
-                ([t @ .., dep], _) if is_dependency_table(t) => deps.push(dep.to_string()),
+                ([t @ .., dep], k) if is_dependency_table(t) => note(dep, k, &e.value),
                 _ => {}
             }
         }
@@ -153,19 +184,24 @@ impl CargoManifest {
             let t: Vec<&str> = t.iter().map(String::as_str).collect();
             if let [head @ .., dep] = t.as_slice() {
                 if is_dependency_table(head) {
-                    deps.push(dep.to_string());
+                    deps.push(dep.replace('-', "_"));
                 }
             }
         }
-        let mut deps: Vec<String> = deps.into_iter().map(|d| d.replace('-', "_")).collect();
         deps.sort();
         deps.dedup();
+        local.sort();
+        local.dedup();
+        inherited.sort();
+        inherited.dedup();
         let krate = lib.or(name).map(|n| n.replace('-', "_"));
         Some(Self {
             path: path.to_string(),
-            dir: dir_of(path).to_string(),
+            dir,
             krate,
             deps,
+            local,
+            inherited,
         })
     }
 }
@@ -479,7 +515,10 @@ enum TomlValue {
     Str(String),
     /// The strings of an array (other elements dropped).
     Array(Vec<String>),
-    /// A number, a boolean, a date, an inline table.
+    Bool(bool),
+    /// An inline table's keys (dotted ones joined by `.`) and values.
+    Table(Vec<(String, TomlValue)>),
+    /// A number, a date.
     Other,
 }
 
@@ -494,7 +533,7 @@ impl TomlValue {
         match self {
             TomlValue::Array(a) => a.clone(),
             TomlValue::Str(s) => vec![s.clone()],
-            TomlValue::Other => Vec::new(),
+            _ => Vec::new(),
         }
     }
 }
@@ -752,8 +791,23 @@ fn parse_value(v: &str) -> Option<TomlValue> {
         }
         return Some(TomlValue::Array(out));
     }
-    if v.starts_with('{') {
-        return v.ends_with('}').then_some(TomlValue::Other);
+    if let Some(inner) = v.strip_prefix('{') {
+        let inner = inner.strip_suffix('}')?;
+        let mut out = Vec::new();
+        for item in split_top(inner) {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let (k, val) = split_key_value(item)?;
+            out.push((parse_key(k)?.join("."), parse_value(val)?));
+        }
+        return Some(TomlValue::Table(out));
+    }
+    match v {
+        "true" => return Some(TomlValue::Bool(true)),
+        "false" => return Some(TomlValue::Bool(false)),
+        _ => {}
     }
     let bare = v
         .chars()
@@ -864,6 +918,19 @@ default = ["a", "b"]
         )
         .unwrap();
         assert_eq!((ws.krate, ws.deps), (None, vec!["anyhow".to_string()]));
+        let paths = CargoManifest::parse(
+            "[package]\nname = \"app\"\n[dependencies]\nfoo = { package = \"bar\", path = \"../bar\" }\nbaz.workspace = true\nqux = { workspace = true }\n[dependencies.near]\npath = \"near\"\n",
+            "crates/app/Cargo.toml",
+        )
+        .unwrap();
+        assert_eq!(
+            paths.local,
+            [
+                ("foo".to_string(), "crates/bar".to_string()),
+                ("near".to_string(), "crates/app/near".to_string())
+            ]
+        );
+        assert_eq!(paths.inherited, ["baz", "qux"]);
         let named = CargoManifest::parse("[package]\nname = \"a-b\"\n", "a/Cargo.toml").unwrap();
         assert_eq!(named.krate.as_deref(), Some("a_b"));
     }

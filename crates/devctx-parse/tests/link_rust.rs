@@ -194,3 +194,165 @@ fn a_crate_needs_a_manifest() {
     assert_eq!(l.call("main", "serde_json::from_str"), UNDECIDED);
     assert_eq!(l.call("main", "Store.open"), UNDECIDED);
 }
+
+const REVIEW_SRC: &str = "crates/app/src/review.rs";
+const FAILURE: &str = "crates/store/src/failure.rs";
+
+/// Review R1: a crate of the workspace counts only as the file's own or a
+/// path dependency (mapped by its path, renamed by `package`, inherited from
+/// the workspace); a dependency the manifest declares from the registry is
+/// external though the workspace has a crate of that name; a workspace crate
+/// nobody declares is undecided.
+#[test]
+fn declared_dependencies_decide_which_crate() {
+    let l = linked();
+    assert_eq!(l.call("crates", "utils::tidy_up"), EXTERNAL);
+    assert_eq!(
+        l.call("crates", "store2::helpers::make"),
+        (s("make"), s(HELPERS), "high", "import", false)
+    );
+    assert_eq!(
+        l.call("crates", "Store.new"),
+        (s("Store.new"), s(STORE), "high", "import", false)
+    );
+    assert_eq!(l.call("crates", "orphan::lone"), UNDECIDED);
+    let _ = REVIEW_SRC;
+}
+
+/// Review R2: with several bounds, the one whose trait has the method.
+#[test]
+fn every_bound_is_tried() {
+    let l = linked();
+    for f in ["first", "second", "third"] {
+        assert_eq!(
+            l.call(f, "name"),
+            (s("Named.name"), s(OPS), "high", "param", false),
+            "{f}"
+        );
+    }
+}
+
+/// Review R3: two `From` impls give no `high`; an inherent method wins over
+/// a trait's of the same name.
+#[test]
+fn trait_impl_homonyms_are_not_sure() {
+    let l = linked();
+    assert_eq!(
+        l.call("overloads", "Failure.from").2,
+        "medium",
+        "{:?}",
+        l.call("overloads", "Failure.from")
+    );
+    assert_eq!(
+        l.call("overloads", "Failure.name"),
+        (s("Failure.name"), s(FAILURE), "high", "param", false)
+    );
+}
+
+/// Review R4: two definitions of a name (`#[cfg]`) are no sure destination.
+#[test]
+fn cfg_homonyms_are_medium() {
+    let l = linked();
+    assert_eq!(
+        l.call("platform", "demo_store::helpers::platform"),
+        (s("platform"), s(HELPERS), "medium", "import", false)
+    );
+}
+
+/// Review R5: a `use` inside a function is that function's.
+#[test]
+fn a_use_in_a_function_is_scoped_to_it() {
+    let l = linked();
+    assert_eq!(
+        l.call("t1", "polish"),
+        (s("polish"), s(UTIL), "high", "import", false)
+    );
+    assert_eq!(
+        l.call("t2", "polish"),
+        (
+            s("polish"),
+            s("crates/app/src/extra.rs"),
+            "high",
+            "import",
+            false
+        )
+    );
+}
+
+/// Review R6: a method missing from a type with an external supertype
+/// (`impl Display`) is external, `medium`.
+#[test]
+fn an_external_supertype_is_medium_evidence() {
+    let l = linked();
+    assert_eq!(
+        l.call("missing", "Store.render"),
+        (None, None, "medium", "inherited", true)
+    );
+}
+
+/// Review minors: `impl Ext for serde_json::Value` gives the repository's
+/// `Value` nothing; `Arc::new(T::f()?)` holds a `T`; a nested function
+/// shadows the imported one; a capitalised associated function of an enum
+/// is no variant; `format!` is no call.
+#[test]
+fn owners_values_and_variants() {
+    let l = linked();
+    assert_eq!(
+        l.call("not_mine", "demo_store.helpers.Value.ext"),
+        UNDECIDED
+    );
+    let saves = l.all("calls", "values", "save");
+    assert_eq!(saves[0], (s("Store.save"), s(OPS), "high", "local", false));
+    assert_eq!(saves[1], (s("Store.save"), s(OPS), "high", "local", false));
+    assert_eq!(
+        l.call("modes", "Mode.Parse"),
+        (s("Mode.Parse"), s(HELPERS), "high", "import", false)
+    );
+    assert!(!l
+        .edges
+        .iter()
+        .any(|e| e.kind == "calls" && e.dst_name == "format"));
+}
+
+/// Review measurement: `T::default()` that no `impl` of a repository type
+/// defines (a derive) holds a `T` (`medium`: nothing declares it).
+#[test]
+fn a_derived_default_is_its_type() {
+    let l = linked();
+    assert_eq!(
+        l.call("defaults", "save"),
+        (s("Store.save"), s(OPS), "medium", "local", false)
+    );
+}
+
+/// Review measurement: `let x = a.f()` makes a call on `x` a chain after
+/// `a.f()`, typed by `f`'s declared return type.
+#[test]
+fn a_local_from_a_method_call_is_a_chain() {
+    let l = linked();
+    let infos = l.all("calls", "chained", "info");
+    assert_eq!(infos.len(), 2, "{infos:?}");
+    for i in infos {
+        assert_eq!(
+            i,
+            (s("Logger.info"), s(HELPERS), "high", "return_type", false)
+        );
+    }
+}
+
+/// Review measurement: a test crate's `mod common;` is its
+/// `tests/common/mod.rs`.
+#[test]
+fn a_test_crate_reaches_its_common_module() {
+    let l = linked();
+    assert_eq!(
+        l.call("seeds", "seed"),
+        (
+            s("seed"),
+            s("crates/store/tests/common/mod.rs"),
+            "high",
+            "import",
+            false
+        )
+    );
+}

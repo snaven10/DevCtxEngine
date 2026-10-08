@@ -3016,7 +3016,10 @@ public class Helper {
                 "rs/src/c.rs",
                 "use crate::Svc;\n\npub fn go(s: Svc) {\n    s.run();\n}\n",
             ),
-            ("rw/app/Cargo.toml", "[package]\nname = \"rapp\"\n"),
+            (
+                "rw/app/Cargo.toml",
+                "[package]\nname = \"rapp\"\n[dependencies]\nralpha = { path = \"../alpha\" }\n",
+            ),
             (
                 "rw/app/src/main.rs",
                 "use ralpha::Thing;\n\nfn main() {\n    Thing::go();\n}\n",

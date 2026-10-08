@@ -17,7 +17,7 @@ use super::link::{
     RepoIndex, Resolved, TypeRef, ValueType, IMPORT_WEAK,
 };
 use super::scope::{TypeText, Via};
-use super::typescript::join;
+use super::typescript::{dir_of, join};
 use super::{compact, strip_extension, LangResolver};
 use crate::facts::ImportFact;
 
@@ -108,7 +108,17 @@ impl LangResolver for Rust {
                     }
                     return None;
                 }
-                callee_path(f, bytes).and_then(|p| typed(format!("{p}()")))
+                let path = callee_path(f, bytes)?;
+                // `Arc::new(x)`, `Box::new(x)`: the pointer is its content.
+                if let Some(ty) = path.strip_suffix(".new") {
+                    let last = ty.rsplit('.').next().unwrap_or(ty);
+                    if POINTERS.contains(&last) {
+                        let args = init.child_by_field_name("arguments")?;
+                        let first = args.named_child(0)?;
+                        return self.init_type(first, bytes);
+                    }
+                }
+                typed(format!("{path}()"))
             }
             "try_expression" => {
                 let inner = init.named_child(0)?;
@@ -288,7 +298,15 @@ fn type_of_node(node: Node<'_>, bytes: &[u8]) -> Option<TypeText> {
     match node.kind() {
         "reference_type" | "pointer_type" => type_of_node(node.child_by_field_name("type")?, bytes),
         "abstract_type" | "dynamic_type" => type_of_node(node.child_by_field_name("trait")?, bytes),
-        "bounded_type" => type_of_node(node.named_child(0)?, bytes),
+        // `dyn Send + Handler`: every bound (review R2).
+        "bounded_type" => {
+            let mut c = node.walk();
+            let parts: Vec<Node<'_>> = node
+                .named_children(&mut c)
+                .filter(|x| x.kind() != "lifetime")
+                .collect();
+            join_bounds(&parts, bytes)
+        }
         "generic_type" => {
             let base = node.child_by_field_name("type")?;
             let path = normalize_path(&compact(base, bytes))?;
@@ -311,8 +329,9 @@ fn type_of_node(node: Node<'_>, bytes: &[u8]) -> Option<TypeText> {
         }
         "type_identifier" => {
             let name = node.utf8_text(bytes).ok()?;
-            if let Some(bound) = type_param_bound(node, name, bytes) {
-                return type_of_node(bound, bytes);
+            let bounds = type_param_bounds(node, name, bytes);
+            if !bounds.is_empty() {
+                return join_bounds(&bounds, bytes);
             }
             if declares_type_param(node, name, bytes) {
                 return None;
@@ -330,11 +349,42 @@ fn type_of_node(node: Node<'_>, bytes: &[u8]) -> Option<TypeText> {
     }
 }
 
-/// The first trait bound of the type parameter `name` declared by an item
-/// around `node` (`<T: Store>`, `where T: Store`).
-fn type_param_bound<'t>(node: Node<'t>, name: &str, bytes: &[u8]) -> Option<Node<'t>> {
+/// Several bounds as one type: their names joined by `+` (`Clone+Named`);
+/// the link pass tries each (review R2).
+fn join_bounds(nodes: &[Node<'_>], bytes: &[u8]) -> Option<TypeText> {
+    let mut bases: Vec<String> = Vec::new();
+    let mut only: Option<TypeText> = None;
+    for n in nodes {
+        if let Some(t) = type_of_node(*n, bytes) {
+            for b in t.base.split('+') {
+                if !bases.iter().any(|x| x == b) {
+                    bases.push(b.to_string());
+                }
+            }
+            only.get_or_insert(t);
+        }
+    }
+    match bases.len() {
+        0 => None,
+        1 => only,
+        _ => Some(TypeText {
+            base: bases.join("+"),
+            elem: None,
+        }),
+    }
+}
+
+/// Every trait bound of the type parameter `name` declared by the item
+/// around `node` (`<T: A + B>`, `where T: A + B`).
+fn type_param_bounds<'t>(node: Node<'t>, name: &str, bytes: &[u8]) -> Vec<Node<'t>> {
+    let mut out = Vec::new();
+    let push_bounds = |b: Node<'t>, out: &mut Vec<Node<'t>>| {
+        let mut bc = b.walk();
+        out.extend(b.named_children(&mut bc).filter(|x| x.kind() != "lifetime"));
+    };
     let mut cur = node.parent();
     while let Some(n) = cur {
+        let mut declared = false;
         if let Some(params) = n.child_by_field_name("type_parameters") {
             let mut c = params.walk();
             for p in params.named_children(&mut c) {
@@ -343,10 +393,9 @@ fn type_param_bound<'t>(node: Node<'t>, name: &str, bytes: &[u8]) -> Option<Node
                     .or_else(|| p.child_by_field_name("left"))
                     .and_then(|x| x.utf8_text(bytes).ok());
                 if pname == Some(name) {
+                    declared = true;
                     if let Some(b) = p.child_by_field_name("bounds") {
-                        let mut bc = b.walk();
-                        let first = b.named_children(&mut bc).find(|x| x.kind() != "lifetime");
-                        return first;
+                        push_bounds(b, &mut out);
                     }
                 }
             }
@@ -362,16 +411,18 @@ fn type_param_bound<'t>(node: Node<'t>, name: &str, bytes: &[u8]) -> Option<Node
                     .child_by_field_name("left")
                     .and_then(|x| x.utf8_text(bytes).ok());
                 if left == Some(name) {
-                    let b = pred.child_by_field_name("bounds")?;
-                    let mut bc = b.walk();
-                    let first = b.named_children(&mut bc).find(|x| x.kind() != "lifetime");
-                    return first;
+                    if let Some(b) = pred.child_by_field_name("bounds") {
+                        push_bounds(b, &mut out);
+                    }
                 }
             }
         }
+        if declared || !out.is_empty() {
+            return out;
+        }
         cur = n.parent();
     }
-    None
+    out
 }
 
 /// Whether an item around `node` declares the type parameter `name`.
@@ -398,6 +449,34 @@ fn declares_type_param(node: Node<'_>, name: &str, bytes: &[u8]) -> bool {
 /// same way from text: `&'a mut Foo`, `Arc<dyn Foo>`, `impl Foo` → `Foo`;
 /// `Result<Self>` → `Result` holding `Self`.
 pub fn type_of_text(text: &str) -> Option<TypeText> {
+    // `dyn A + B`, `impl A + B`: every bound, joined (review R2).
+    let parts: Vec<&str> = split_top_level(text.trim(), '+');
+    if parts.len() > 1 {
+        let mut bases: Vec<String> = Vec::new();
+        for p in parts {
+            if let Some(t) = type_of_one(p) {
+                if !bases.contains(&t.base) {
+                    bases.push(t.base);
+                }
+            }
+        }
+        return match bases.len() {
+            0 => None,
+            1 => Some(TypeText {
+                base: bases.remove(0),
+                elem: None,
+            }),
+            _ => Some(TypeText {
+                base: bases.join("+"),
+                elem: None,
+            }),
+        };
+    }
+    type_of_one(text)
+}
+
+/// [`type_of_text`] of one bound.
+fn type_of_one(text: &str) -> Option<TypeText> {
     let mut t: &str = text.trim();
     loop {
         let next = t
@@ -420,14 +499,19 @@ pub fn type_of_text(text: &str) -> Option<TypeText> {
             None => break,
         }
     }
-    // `dyn A + Send`: the first bound.
-    let t = top_level_first(t, '+').trim();
+    let t = t.trim();
     let (head, args) = match t.find('<') {
         Some(i) => (&t[..i], Some(&t[i + 1..t.rfind('>')?])),
         None => (t, None),
     };
     let base = normalize_path(head)?;
-    let first = args.map(|a| top_level_first(a, ','));
+    // The first type argument, lifetimes skipped (`Cow<'a, Foo>`).
+    let first = args.and_then(|a| {
+        split_top_level(a, ',')
+            .into_iter()
+            .map(str::trim)
+            .find(|x| !x.starts_with('\''))
+    });
     let last = base.rsplit('.').next().unwrap_or(&base);
     if POINTERS.contains(&last) {
         return type_of_text(first?);
@@ -438,18 +522,24 @@ pub fn type_of_text(text: &str) -> Option<TypeText> {
     })
 }
 
-/// `text` up to the first `sep` outside `<…>` and `(…)`.
-fn top_level_first(text: &str, sep: char) -> &str {
+/// `text` split at `sep` outside `<…>`, `(…)` and `[…]`.
+fn split_top_level(text: &str, sep: char) -> Vec<&str> {
+    let mut out = Vec::new();
     let mut depth = 0usize;
+    let mut start = 0;
     for (i, c) in text.char_indices() {
         match c {
             '<' | '(' | '[' => depth += 1,
             '>' | ')' | ']' => depth = depth.saturating_sub(1),
-            c if c == sep && depth == 0 => return &text[..i],
+            c if c == sep && depth == 0 => {
+                out.push(&text[start..i]);
+                start = i + c.len_utf8();
+            }
             _ => {}
         }
     }
-    text
+    out.push(&text[start..]);
+    out
 }
 
 /// The return type a Rust signature declares (`pub fn open(p: &Path) ->
@@ -476,6 +566,60 @@ pub fn return_type(signature: &str) -> Option<TypeText> {
     let ty = ty.split(" where").next().unwrap_or(ty);
     let ty = ty.trim().trim_end_matches(';').trim();
     type_of_text(ty)
+}
+
+/// The type an `impl` signature names (`impl<T: X> Named for a::Foo<T>` →
+/// `a.Foo`), by its path.
+pub fn impl_type(signature: &str) -> Option<String> {
+    let rest = signature
+        .trim()
+        .strip_prefix("unsafe ")
+        .unwrap_or(signature.trim());
+    let rest = rest.strip_prefix("impl")?;
+    // Its generic parameters.
+    let rest = if rest.starts_with('<') {
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &rest[end..]
+    } else {
+        rest
+    };
+    let rest = rest.split(" where").next().unwrap_or(rest);
+    // `Trait for Type` at depth 0.
+    let mut depth = 0usize;
+    let mut cut = 0;
+    let bytes: Vec<char> = rest.chars().collect();
+    let text: String = bytes.iter().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            '<' | '(' => depth += 1,
+            '>' | ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0
+                && text[text.char_indices().nth(i).map_or(0, |(b, _)| b)..]
+                    .starts_with(" for ") =>
+            {
+                cut = i + 5;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let ty: String = bytes[cut..].iter().collect();
+    type_of_text(ty.trim()).map(|t| t.base)
 }
 
 /// A field's declared type (`pub items: HashMap<String, u32>`).
@@ -514,6 +658,9 @@ pub(super) struct RsUse {
     reexport: bool,
     /// The inline `mod` it is in; `None`: the file's own module.
     scope: Option<usize>,
+    /// The function it is in (its block's, not the module's: TASK-007
+    /// review, R5).
+    func: Option<usize>,
 }
 
 /// What a path reaches.
@@ -561,6 +708,89 @@ impl RepoIndex {
             .max_by_key(|m| m.dir.len())
     }
 
+    /// The module root of a crate: its code name, or `name@dir` when two
+    /// manifests of the repository give the same name (nested workspaces).
+    fn rs_crate_key(&self, m: &crate::resolve::env::CargoManifest) -> String {
+        let krate = m.krate.clone().unwrap_or_default();
+        let same = self
+            .cargo
+            .iter()
+            .filter(|o| o.krate.as_deref() == Some(krate.as_str()))
+            .count();
+        if same > 1 {
+            format!("{krate}@{}", m.dir)
+        } else {
+            krate
+        }
+    }
+
+    /// The crate whose manifest sits in the repository directory `dir`.
+    fn rs_crate_at(&self, dir: &str) -> RsRes {
+        match self
+            .cargo
+            .iter()
+            .find(|m| m.dir == dir && m.krate.is_some())
+        {
+            Some(m) => {
+                let key = self.rs_crate_key(m);
+                if self.rs.modules.contains_key(&key) {
+                    RsRes::Module(key)
+                } else {
+                    RsRes::Unknown
+                }
+            }
+            None => RsRes::Unknown,
+        }
+    }
+
+    /// What a path's first segment `name` names as a crate, as `file` sees
+    /// it (TASK-007 review, R1): the file's own crate; a path dependency of
+    /// its manifest (by the path, so a `package =` rename maps); one
+    /// inherited from the workspace (its root's entry); a declared
+    /// dependency from elsewhere (external, though the workspace has a
+    /// crate of that name). `None`: the manifest does not declare it.
+    fn rs_crate_ref(&self, file: &str, name: &str) -> Option<RsRes> {
+        let Some(m) = self.rs_manifest(file) else {
+            // No manifest: a workspace crate by name, or what an ancestor
+            // manifest declares.
+            if self.rs.krates.contains(name) && self.rs.modules.contains_key(name) {
+                return Some(RsRes::Module(name.to_string()));
+            }
+            let declared = self
+                .cargo
+                .iter()
+                .filter(|a| a.dir.is_empty() || file.starts_with(&format!("{}/", a.dir)))
+                .any(|a| a.deps.binary_search_by(|d| d.as_str().cmp(name)).is_ok());
+            return declared.then_some(RsRes::External);
+        };
+        if m.krate.as_deref() == Some(name) {
+            return Some(RsRes::Module(self.rs_crate_key(m)));
+        }
+        if let Some((_, dir)) = m.local.iter().find(|(n, _)| n == name) {
+            return Some(self.rs_crate_at(dir));
+        }
+        if m.inherited.iter().any(|n| n == name) {
+            // The workspace root above the crate that declares it.
+            let root = self
+                .cargo
+                .iter()
+                .filter(|a| a.dir.is_empty() || m.dir.starts_with(&format!("{}/", a.dir)))
+                .filter(|a| a.deps.binary_search_by(|d| d.as_str().cmp(name)).is_ok())
+                .max_by_key(|a| a.dir.len());
+            return Some(match root {
+                Some(r) => match r.local.iter().find(|(n, _)| n == name) {
+                    Some((_, dir)) => self.rs_crate_at(dir),
+                    None => RsRes::External,
+                },
+                None => RsRes::Unknown,
+            });
+        }
+        if m.deps.binary_search_by(|d| d.as_str().cmp(name)).is_ok() {
+            return Some(RsRes::External);
+        }
+        None
+    }
+
     /// The module path of a Rust file: `krate::a::b` under its crate's
     /// `src/` (`lib.rs`, `main.rs`, `mod.rs` naming their directory); a
     /// test, an example, a bench or a `src/bin/` file is a crate root of its
@@ -573,7 +803,7 @@ impl RepoIndex {
                 .and_then(|f| f.package.clone())
                 .unwrap_or_else(|| format!("crate#{file}"));
         };
-        let krate = m.krate.clone().unwrap_or_default();
+        let krate = self.rs_crate_key(m);
         let rel = if m.dir.is_empty() {
             file
         } else {
@@ -612,7 +842,12 @@ impl RepoIndex {
             return;
         }
         let mut rs = RsIndex {
-            krates: self.cargo.iter().filter_map(|m| m.krate.clone()).collect(),
+            krates: self
+                .cargo
+                .iter()
+                .filter(|m| m.krate.is_some())
+                .map(|m| self.rs_crate_key(m))
+                .collect(),
             ..Default::default()
         };
         for f in &rust {
@@ -622,6 +857,37 @@ impl RepoIndex {
                 .or_default()
                 .push(RsMod::File(f.clone()));
             rs.file_module.insert(f.clone(), m);
+        }
+        // A crate root of its own (a test, an example) declaring `mod x;`:
+        // `x.rs` or `x/mod.rs` beside it (`tests/common/mod.rs`, review).
+        let decls: Vec<usize> = (0..self.syms.len())
+            .filter(|&i| {
+                self.syms[i].kind == "module"
+                    && self.syms[i]
+                        .signature
+                        .as_deref()
+                        .is_some_and(|s| s.trim_end().ends_with(';'))
+            })
+            .collect();
+        for i in decls {
+            let s = &self.syms[i];
+            let Some(root) = rs.file_module.get(&s.file).cloned() else {
+                continue;
+            };
+            if !root.contains('#') || root.contains("::") {
+                continue;
+            }
+            let dir = dir_of(&s.file);
+            for cand in [
+                join(dir, &format!("{}.rs", s.name)),
+                join(dir, &format!("{}/mod.rs", s.name)),
+            ] {
+                if rs.file_module.contains_key(&cand) {
+                    let path = format!("{root}::{}", s.name);
+                    rs.modules.entry(path).or_default().push(RsMod::File(cand));
+                    break;
+                }
+            }
         }
         // Inline modules, outermost first (a parent's path before its
         // children's).
@@ -686,12 +952,26 @@ impl RepoIndex {
                     s.file == e.file && s.start_line <= e.line && e.line <= s.end_line
                 })
                 .max_by_key(|&m| self.syms[m].start_line);
+            // The innermost function around it.
+            let func = self
+                .by_id
+                .values()
+                .copied()
+                .filter(|&f| {
+                    let s = &self.syms[f];
+                    s.file == e.file
+                        && is_callable(&s.kind)
+                        && s.start_line <= e.line
+                        && e.line <= s.end_line
+                })
+                .max_by_key(|&f| self.syms[f].start_line);
             rs.uses.entry(e.file.clone()).or_default().push(RsUse {
                 segs,
                 local,
                 glob,
                 reexport: tokens.first() == Some(&"export"),
                 scope,
+                func,
             });
         }
         self.rs = rs;
@@ -709,11 +989,22 @@ impl RepoIndex {
         for i in impls {
             let name = self.syms[i].qualified.clone();
             let file = self.syms[i].file.clone();
-            let owner = match self.rs_type(&name, &file, Some(i)) {
+            // The type as written (`impl Ext for serde_json::Value`), not
+            // only its last segment.
+            let written = self.syms[i]
+                .signature
+                .as_deref()
+                .and_then(impl_type)
+                .unwrap_or_else(|| name.clone());
+            let owner = match self.rs_type(&written, &file, Some(i)) {
                 TypeRef::Repo(t, _) => Some(t),
+                // From outside: no type of the repository's (review).
+                TypeRef::External => None,
+                // A path that does not resolve is no guess either.
+                TypeRef::Unknown if written.contains('.') => None,
                 // Rust puts an inherent `impl` in its type's crate: a type
                 // of that name, alone in the crate.
-                _ => {
+                TypeRef::Unknown => {
                     let krate = crate_root(&self.rs.file_module[&file]).to_string();
                     let found: Vec<usize> = self
                         .by_name
@@ -758,21 +1049,6 @@ impl RepoIndex {
         )
     }
 
-    /// Whether `name` names a crate from outside, as `file` sees it: `std`,
-    /// `core`, `alloc`…, or a dependency its crate's manifest declares.
-    fn rs_external_crate(&self, file: &str, name: &str) -> bool {
-        if self
-            .lang_of(file)
-            .is_some_and(|l| l.def().platform_modules.iter().any(|m| m == name))
-        {
-            return true;
-        }
-        self.rs_manifest(file)
-            .into_iter()
-            .chain(self.cargo.iter().filter(|m| m.krate.is_none()))
-            .any(|m| m.deps.binary_search_by(|d| d.as_str().cmp(name)).is_ok())
-    }
-
     /// What module `module` has as `name`: an item, a child module, a name a
     /// `use` of it brings in (a re-export), a glob's.
     fn rs_item(&self, module: &str, name: &str, depth: u8) -> RsRes {
@@ -807,8 +1083,15 @@ impl RepoIndex {
                     .filter(|&i| self.syms[i].name == name && self.syms[i].kind != "impl"),
             );
         }
-        if let Some(&i) = found.iter().find(|&&i| self.syms[i].kind != "module") {
-            return RsRes::Item(i, true);
+        let items: Vec<usize> = found
+            .iter()
+            .copied()
+            .filter(|&i| self.syms[i].kind != "module")
+            .collect();
+        if let Some(&i) = items.first() {
+            // Two definitions of one name (`#[cfg(unix)]` and
+            // `#[cfg(not(unix))]`): no sure destination (review R4).
+            return RsRes::Item(i, items.len() == 1);
         }
         let child = format!("{module}::{name}");
         if !found.is_empty() || self.rs.modules.contains_key(&child) {
@@ -826,7 +1109,7 @@ impl RepoIndex {
                 .get(file)
                 .into_iter()
                 .flatten()
-                .filter(|u| u.scope == scope)
+                .filter(|u| u.scope == scope && u.func.is_none())
                 .collect();
             if let Some(u) = uses.iter().rev().find(|u| u.local.as_deref() == Some(name)) {
                 return self.rs_path_in(&u.segs, module, file, scope, depth + 1);
@@ -877,15 +1160,17 @@ impl RepoIndex {
                 None => RsRes::Unknown,
             },
             name => match self.rs_item(module, name, depth) {
-                RsRes::Missing | RsRes::Unknown => {
-                    if self.rs.krates.contains(name) && self.rs.modules.contains_key(name) {
-                        RsRes::Module(name.to_string())
-                    } else if self.rs_external_crate(file, name) || self.platform(file, name) {
+                RsRes::Missing | RsRes::Unknown => match self.rs_crate_ref(file, name) {
+                    Some(r) => r,
+                    None if self
+                        .lang_of(file)
+                        .is_some_and(|l| l.def().platform_modules.iter().any(|m| m == name))
+                        || self.platform(file, name) =>
+                    {
                         RsRes::External
-                    } else {
-                        RsRes::Unknown
                     }
-                }
+                    None => RsRes::Unknown,
+                },
                 r => r,
             },
         };
@@ -932,6 +1217,44 @@ impl RepoIndex {
         }
     }
 
+    /// A name a `use` inside a function around `ctx` brings in (the
+    /// innermost function first): it shadows the module's (review R5).
+    fn rs_fn_scoped(&self, file: &str, ctx: Option<usize>, name: &str) -> Option<RsRes> {
+        let uses = self.rs.uses.get(file)?;
+        let (module, scope) = self.rs_module_at(file, ctx);
+        for f in self.chain(ctx) {
+            let here: Vec<&RsUse> = uses.iter().filter(|u| u.func == Some(f)).collect();
+            if let Some(u) = here.iter().rev().find(|u| u.local.as_deref() == Some(name)) {
+                return Some(self.rs_path_in(&u.segs, &module, file, scope, 1));
+            }
+            for u in here.iter().filter(|u| u.glob) {
+                if let RsRes::Module(m) = self.rs_path_in(&u.segs, &module, file, scope, 1) {
+                    if let r @ RsRes::Item(..) = self.rs_item(&m, name, 1) {
+                        return Some(r);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A function nested in one around `ctx` named `name`.
+    fn rs_nested_fn(&self, ctx: Option<usize>, name: &str) -> Option<usize> {
+        for anc in self.chain(ctx) {
+            let s = &self.syms[anc];
+            if is_type(&s.kind) || s.kind == devctx_core::symbol_id::FILE_KIND {
+                continue;
+            }
+            if let Some(m) = self
+                .children_of(s.id)
+                .find(|&k| self.syms[k].name == name && is_callable(&self.syms[k].kind))
+            {
+                return Some(m);
+            }
+        }
+        None
+    }
+
     /// A path as written at the symbol `ctx` of `file` (`Self::` is the type
     /// of the `impl` around it).
     fn rs_path(&self, segs: &[String], file: &str, ctx: Option<usize>) -> RsRes {
@@ -944,6 +1267,17 @@ impl RepoIndex {
                 cur = self.rs_step(cur, seg, 0);
             }
             return cur;
+        }
+        if let Some(first) = segs
+            .first()
+            .filter(|f| !matches!(f.as_str(), "crate" | "self" | "super"))
+        {
+            if let Some(mut cur) = self.rs_fn_scoped(file, ctx, first) {
+                for seg in &segs[1..] {
+                    cur = self.rs_step(cur, seg, 0);
+                }
+                return cur;
+            }
         }
         let (module, scope) = self.rs_module_at(file, ctx);
         self.rs_path_in(segs, &module, file, scope, 0)
@@ -963,6 +1297,18 @@ impl RepoIndex {
     /// A type as written in a Rust file (`Foo`, `a.b.Foo`, `a::Foo`,
     /// `Self`), seen from `ctx`.
     pub(super) fn rs_type(&self, name: &str, file: &str, ctx: Option<usize>) -> TypeRef {
+        // Several bounds: a type only if exactly one is the repository's.
+        if name.contains('+') {
+            let repo: Vec<TypeRef> = name
+                .split('+')
+                .map(|p| self.rs_type(p, file, ctx))
+                .filter(|r| matches!(r, TypeRef::Repo(..)))
+                .collect();
+            return match repo.as_slice() {
+                [one] => *one,
+                _ => TypeRef::Unknown,
+            };
+        }
         let segs = split_path(name);
         let self_path = segs.first().map(String::as_str) == Some("Self");
         match self.rs_path(&segs, file, ctx) {
@@ -973,6 +1319,17 @@ impl RepoIndex {
             RsRes::External => TypeRef::External,
             _ => TypeRef::Unknown,
         }
+    }
+
+    /// Whether the type `t` (its `impl`s) has a member named `name`.
+    fn rs_has_member(&self, t: usize, name: &str) -> bool {
+        self.children_of(self.syms[t].id).any(|c| {
+            self.syms[c].name == name
+                || (self.syms[c].kind == "impl"
+                    && self
+                        .children_of(self.syms[c].id)
+                        .any(|m| self.syms[m].name == name))
+        })
     }
 
     /// A member missing from a repository type: a derive's or a blanket
@@ -999,8 +1356,11 @@ impl RepoIndex {
                 } else {
                     "medium"
                 };
+                // A variant's constructor: an enum's capitalised name that is
+                // no associated function of it.
                 let variant = self.syms[t].kind == "enum"
-                    && c.callee.chars().next().is_some_and(char::is_uppercase);
+                    && c.callee.chars().next().is_some_and(char::is_uppercase)
+                    && !self.rs_has_member(t, c.callee);
                 if variant {
                     return cap(hi(t, self, how), conf);
                 }
@@ -1026,7 +1386,10 @@ impl RepoIndex {
     /// a glob's, the prelude. Nothing visible: undecided, never a homonym.
     pub(super) fn rs_free(&self, c: &Call<'_>) -> Outcome {
         let (module, _) = self.rs_module_at(c.file, c.src);
-        match self.rs_item(&module, c.callee, 0) {
+        let found = self
+            .rs_fn_scoped(c.file, c.src, c.callee)
+            .unwrap_or_else(|| self.rs_item(&module, c.callee, 0));
+        match found {
             RsRes::Item(i, sure)
                 if is_callable(&self.syms[i].kind) || is_type(&self.syms[i].kind) =>
             {
@@ -1108,8 +1471,14 @@ impl RepoIndex {
     ) -> ValueType {
         let segs = split_path(path);
         let res = if segs.len() == 1 {
-            let (module, _) = self.rs_module_at(file, ctx);
-            self.rs_item(&module, &segs[0], 0)
+            // A nested function, a function's `use`, the module's item.
+            match self.rs_nested_fn(ctx, &segs[0]) {
+                Some(f) => RsRes::Item(f, true),
+                None => self.rs_fn_scoped(file, ctx, &segs[0]).unwrap_or_else(|| {
+                    let (module, _) = self.rs_module_at(file, ctx);
+                    self.rs_item(&module, &segs[0], 0)
+                }),
+            }
         } else {
             self.rs_path(&segs, file, ctx)
         };
@@ -1141,6 +1510,15 @@ impl RepoIndex {
             RsRes::Item(t, sure) if is_type(&self.syms[t].kind) => {
                 let how = self.rs_how(t, file, false);
                 ValueType::Repo(t, how, if sure { "high" } else { "medium" })
+            }
+            // `T::default()` of a repository type deriving `Default`: a `T`.
+            RsRes::Missing if segs.len() >= 2 && segs[segs.len() - 1] == "default" => {
+                match self.rs_path(&segs[..segs.len() - 1], file, ctx) {
+                    RsRes::Item(t, _) if is_type(&self.syms[t].kind) => {
+                        ValueType::Repo(t, "return_type", "medium")
+                    }
+                    _ => ValueType::Unknown,
+                }
             }
             RsRes::External => {
                 let typeish = segs.len() >= 2

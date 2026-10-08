@@ -163,6 +163,10 @@ pub struct Binding {
     pub func: bool,
     /// A Go method's receiver: the instance, as `self` is (TASK-007).
     pub this: bool,
+    /// An untyped local whose value is a method call (`let x = a.f()`): the
+    /// call's byte range, so a call on `x` is a chain after it (TASK-007
+    /// review). Rust, Go and Python only (`fields_by_link`).
+    pub init_call: Option<(usize, usize)>,
 }
 
 /// The bindings of a file, by scope.
@@ -341,6 +345,7 @@ impl Scopes {
                         member: member || (role == Some("func") && in_class),
                         func: true,
                         this: false,
+                        init_call: None,
                     },
                 );
                 continue;
@@ -364,6 +369,7 @@ impl Scopes {
                         member,
                         func: false,
                         this: role == Some("receiver"),
+                        init_call: None,
                     },
                 );
                 continue;
@@ -403,6 +409,21 @@ impl Scopes {
                     let elem = out.lookup(iterable, key)?.ty.as_ref()?.elem.clone()?;
                     Some((TypeText::parse(&elem)?, Via::Local))
                 });
+            // `x = f()` with `f` a local value (a closure, a parameter): what
+            // it returns is no function of the file's (review).
+            let inferred = inferred.filter(|(t, _)| {
+                let Some(callee) = t
+                    .base
+                    .strip_suffix('?')
+                    .unwrap_or(&t.base)
+                    .strip_suffix("()")
+                else {
+                    return true;
+                };
+                let first = callee.split('.').next().unwrap_or(callee);
+                let at = p.init.unwrap_or(p.name_node);
+                !out.lookup(at, first).is_some_and(|b| !b.func)
+            });
             let (ty, via) = match inferred {
                 Some((t, Via::Static)) => (Some(t), Via::Static),
                 // `inject(T)`: injected, a field or a local — only when the
@@ -412,6 +433,19 @@ impl Scopes {
                 Some((_, Via::CtorInject)) => (None, p.via),
                 Some((t, _)) => (Some(t), p.via),
                 None => (None, p.via),
+            };
+            // `let x = a.f()`: a call on `x` is a chain after `a.f()`.
+            let init_call = match (&ty, p.init) {
+                (None, Some(i)) if resolver.fields_by_link() && !p.member => {
+                    let call = if i.kind() == "try_expression" || i.kind() == "await_expression" {
+                        i.named_child(0).unwrap_or(i)
+                    } else {
+                        i
+                    };
+                    matches!(call.kind(), "call_expression" | "call")
+                        .then(|| (i.start_byte(), i.end_byte()))
+                }
+                _ => None,
             };
             out.push(
                 p.scope,
@@ -423,6 +457,7 @@ impl Scopes {
                     member: p.member,
                     func: false,
                     this: false,
+                    init_call,
                 },
             );
         }
@@ -511,6 +546,7 @@ impl Scopes {
                 member: true,
                 func: false,
                 this: false,
+                init_call: None,
             },
         );
         true

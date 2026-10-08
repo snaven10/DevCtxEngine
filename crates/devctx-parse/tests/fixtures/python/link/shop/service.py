@@ -46,6 +46,10 @@ class Service:
     def again(self):
         return None
 
+    def chained(self):
+        item = self.repo.load()
+        item.price()
+
     def shadow(self, repo):
         repo.save(1)
         f = lambda repo: repo.save(2)

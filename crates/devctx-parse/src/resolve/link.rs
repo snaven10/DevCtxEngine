@@ -238,6 +238,9 @@ pub struct RepoIndex {
     /// `impl` in a file other than its type's, a Go method beside its
     /// type's file.
     pub(super) owners: HashMap<usize, usize>,
+    /// Rust `impl Trait for T` symbols: a method there loses to an inherent
+    /// one of the same name (TASK-007 review, R3).
+    trait_impls: HashSet<u64>,
 }
 
 /// Methods every Java class has from `Object`, and every enum from `Enum`.
@@ -349,6 +352,7 @@ impl RepoIndex {
             go,
             rs: Default::default(),
             owners: HashMap::new(),
+            trait_impls: HashSet::new(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.id, i);
@@ -420,6 +424,11 @@ impl RepoIndex {
                 }
             }
         }
+        idx.trait_impls = facts
+            .iter()
+            .filter(|e| e.kind == IMPLEMENTS)
+            .map(|e| e.src_id)
+            .collect();
         idx.rs_build(facts);
         idx.go_build();
         let mut supers: HashMap<u64, Vec<TypeRef>> = HashMap::new();
@@ -762,6 +771,25 @@ impl RepoIndex {
                 None => true,
             }
         };
+        if !self.is_java(&self.syms[found[0]].file) {
+            // Outside Java nothing tells overloads apart: an inherent
+            // method over a trait impl's, and of several left, the first,
+            // no surer than `medium` (review R3: `From<A>` and `From<B>`).
+            let inherent: Vec<usize> = found
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    !self.syms[m]
+                        .parent_id
+                        .is_some_and(|p| self.trait_impls.contains(&p))
+                })
+                .collect();
+            return match inherent.as_slice() {
+                [m] => (*m, true),
+                [m, ..] => (*m, false),
+                [] => (found[0], found.len() == 1),
+            };
+        }
         match found.iter().copied().find(|&m| fits(m)) {
             Some(m) => (m, true),
             None => (found[0], false),
@@ -1187,6 +1215,14 @@ impl RepoIndex {
     ) -> Outcome {
         let out = match self.find_member(t, c.callee, true, c.args) {
             Member::Found(m, inherited, exact) => self.member_hit(m, inherited, exact, own),
+            // Rust and Go: an external supertype (an `impl Display`, an
+            // embedded `sync.Mutex`) may have it, nothing says it does
+            // (review R6).
+            Member::External
+                if matches!(self.lang_key(&self.syms[t].file), Some("rust" | "go")) =>
+            {
+                external_medium("inherited")
+            }
             Member::External => external("inherited"),
             Member::Missing => match self.accessor(t, c.callee) {
                 Some(f) => medium(f, self, own),
@@ -1345,6 +1381,10 @@ impl RepoIndex {
                 ValueType::Unknown => self.untyped(c),
             };
         }
+        // Several bounds (`T: Clone + Named`): the one that has it.
+        if ty.contains('+') {
+            return self.bounds_call(c, ty, c.file, c.src, resolution, "high");
+        }
         // `var x = T.of(…)`: `T` only if it has the method (DD-7).
         let statik = via == "static";
         match self.resolve_type(ty, c.file, c.src) {
@@ -1362,6 +1402,46 @@ impl RepoIndex {
             TypeRef::External if !statik => external("external_known"),
             _ if statik => self.untyped(c),
             _ => self.by_name_only_low(c),
+        }
+    }
+
+    /// `callee` on a value of several bounds (`Clone+Named`, TASK-007
+    /// review R2): the repository bound whose trait has it (`medium` if
+    /// several do); none, but an external bound: external, `medium`.
+    pub(super) fn bounds_call(
+        &self,
+        c: &Call<'_>,
+        ty: &str,
+        file: &str,
+        ctx: Option<usize>,
+        label: &'static str,
+        conf: &'static str,
+    ) -> Outcome {
+        let mut hits: Vec<(usize, bool, bool, &'static str)> = Vec::new();
+        let mut ext = false;
+        for part in ty.split('+') {
+            match self.resolve_type(part, file, ctx) {
+                TypeRef::Repo(t, how) => {
+                    if let Member::Found(m, inherited, exact) =
+                        self.find_member(t, c.callee, true, c.args)
+                    {
+                        hits.push((m, inherited, exact, self.type_conf(t, how)));
+                    }
+                }
+                TypeRef::External => ext = true,
+                TypeRef::Unknown => {}
+            }
+        }
+        match hits.as_slice() {
+            [(m, inherited, exact, tc)] => cap(
+                self.member_hit(*m, *inherited, *exact, label),
+                min_conf(conf, tc),
+            ),
+            [(m, inherited, exact, _), ..] => {
+                cap(self.member_hit(*m, *inherited, *exact, label), "medium")
+            }
+            [] if ext => cap(external_medium("external_known"), conf),
+            [] => undecided(),
         }
     }
 
@@ -1671,6 +1751,9 @@ impl RepoIndex {
         let Some(ret) = ret else {
             return self.untyped(c);
         };
+        if ret.contains('+') {
+            return self.bounds_call(c, &ret, &ps.file, Some(pi), "return_type", prev_conf);
+        }
         match self.resolve_type(&ret, &ps.file, Some(pi)) {
             TypeRef::Repo(t, how) => {
                 let conf = min_conf(prev_conf, self.type_conf(t, how));
