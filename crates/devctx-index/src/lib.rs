@@ -7,6 +7,7 @@
 //! matches an already-indexed branch are copied rather than re-embedded.
 //! See `docs/architecture-spec.md` §9.
 
+mod env;
 pub mod error;
 pub mod git;
 pub mod id;
@@ -2817,11 +2818,11 @@ public class Helper {
                 crate::git::Change::Renamed { to, .. } => to.clone(),
             })
             .collect();
-        let env = crate::tsconfig::load(
+        let env = crate::env::load(
             &|rel: &str| std::fs::read_to_string(dir.join(rel)).ok(),
             &files,
         )
-        .env;
+        .env();
         crate::link::link_branch(
             store,
             repo,
@@ -3261,6 +3262,48 @@ public class Helper {
             );
         }
         assert!(full_link_changes(&store, &repo, &dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-007: the `Cargo.toml`, `go.mod` and Python manifests are part of
+    /// the link environment. One left unreadable (a merge conflict) relinks
+    /// nothing; a changed one relinks the branch in full, though no source
+    /// file changed.
+    #[test]
+    fn a_changed_manifest_relinks_and_an_unreadable_one_does_not() {
+        let mut files = vec![
+            ("crates/a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("go.mod", "module example.com/m\n"),
+            ("requirements.txt", "requests\n"),
+            ("caller.py", "def go():\n    print(1)\n"),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, _repo) = graph_repo("linkcargo", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        for (file, broken) in [
+            ("crates/a/Cargo.toml", "[package]\n<<<<<<< HEAD\n"),
+            ("go.mod", "<<<<<<< HEAD\nmodule x\n"),
+            ("requirements.txt", "<<<<<<< HEAD\nrequests\n"),
+        ] {
+            write(&dir, file, broken);
+            commit_all(&dir, "conflict");
+            let inc = index_with(&store, &dir, false, None);
+            assert_eq!(inc.edges_linked, 0, "{file}: no relink: {inc:?}");
+        }
+        for (file, text) in [
+            (
+                "crates/a/Cargo.toml",
+                "[package]\nname = \"a\"\n[dependencies]\nserde = \"1\"\n",
+            ),
+            ("go.mod", "module example.com/renamed\n"),
+            ("requirements.txt", "requests\nhttpx\n"),
+        ] {
+            write(&dir, file, text);
+            commit_all(&dir, file);
+            let inc = index_with(&store, &dir, false, None);
+            assert!(inc.edges_linked > 0, "{file}: a full relink: {inc:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

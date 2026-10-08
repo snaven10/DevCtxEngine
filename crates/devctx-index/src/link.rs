@@ -17,15 +17,16 @@
 //! TypeScript/JavaScript file importing a written file, directly or through
 //! barrels re-exporting it (what an import binds can change though no name
 //! of the written file does: a barrel's `export … from` moved). A different
-//! `tsconfig` (aliases) relinks the branch in full. When the written files are
+//! link environment — `tsconfig` aliases, `package.json`, `Cargo.toml`,
+//! `go.mod`, Python manifests (`crate::env`) — relinks the branch in full. When the written files are
 //! more than a fifth of the branch, every edge is (the full pass). A file is
 //! rewritten only if one of its rows changed.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use devctx_parse::resolve::env::LinkEnv;
 use devctx_parse::resolve::link::{LinkEdge, LinkSymbol, Outcome, RepoIndex};
-use devctx_parse::resolve::typescript::ScriptEnv;
 use devctx_store::{Store, StoredSymbolEdge};
 
 use crate::error::Result;
@@ -39,14 +40,17 @@ pub(crate) const LINK_VERSION: &str = "6";
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
 
-/// `index_meta` key of the fingerprint of the TypeScript/JavaScript
-/// environment (`tsconfig`, `package.json` files) the branch was linked
-/// under: a changed alias or dependency relinks it in full, though no source
-/// file changed.
+/// `index_meta` key of the fingerprint of the link environment the branch
+/// was linked under — the `tsconfig` and `package.json` files (TASK-006),
+/// every `Cargo.toml`, `go.mod` and Python manifest (TASK-007): a changed
+/// alias, dependency, crate or module relinks it in full, though no source
+/// file changed. (The key keeps its TASK-006 name.)
 pub(crate) const LINK_CONFIG_META_KEY: &str = "link_tsconfig";
 
 /// `index_meta` key of that environment itself, the last one that could be
-/// read: a run that cannot read it (a merge conflict) links under this one.
+/// read: a run that cannot read a file of it (a merge conflict) links under
+/// that file's version here. An environment stored before TASK-007 (only
+/// TypeScript's) reads back as one.
 pub(crate) const LINK_ENV_META_KEY: &str = "link_script_env";
 
 /// `index_meta` key set while a run owes the branch a link pass (from before
@@ -201,14 +205,15 @@ fn to_link(e: &StoredSymbolEdge) -> LinkEdge {
 
 /// Run the link pass over `branch`. `written`: the files whose graph rows
 /// this run wrote or deleted; `full`: re-resolve every edge regardless;
-/// `env`: the TypeScript/JavaScript workspace (`tsconfig`, `package.json`).
+/// `env`: the workspace's link environment (`tsconfig`, `package.json`,
+/// `Cargo.toml`, `go.mod`, Python manifests).
 pub(crate) fn link_branch(
     store: &Store,
     repo: &str,
     branch: &str,
     written: &HashSet<String>,
     full: bool,
-    env: &ScriptEnv,
+    env: &LinkEnv,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LinkStats> {
     let started = Instant::now();
@@ -222,7 +227,7 @@ pub(crate) fn link_branch(
         .filter(|e| matches!(e.kind.as_str(), "imports" | "inherits" | "implements"))
         .map(to_link)
         .collect();
-    let index = RepoIndex::with_script_env(
+    let index = RepoIndex::with_env(
         symbols
             .iter()
             .map(|s| LinkSymbol {

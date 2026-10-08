@@ -266,6 +266,25 @@ impl RepoIndex {
         facts: &[LinkEdge],
         env: crate::resolve::typescript::ScriptEnv,
     ) -> Self {
+        Self::with_env(
+            symbols,
+            facts,
+            crate::resolve::env::LinkEnv {
+                script: env,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// [`RepoIndex::new`] with the workspace's whole environment: the
+    /// TypeScript/JavaScript one, and the `Cargo.toml`, `go.mod` and Python
+    /// manifests (PLAN-009 TASK-007).
+    pub fn with_env(
+        symbols: Vec<LinkSymbol>,
+        facts: &[LinkEdge],
+        env: crate::resolve::env::LinkEnv,
+    ) -> Self {
+        let crate::resolve::env::LinkEnv { script: env, .. } = env;
         let mut idx = Self {
             syms: symbols,
             by_id: HashMap::new(),

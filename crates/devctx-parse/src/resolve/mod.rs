@@ -13,6 +13,7 @@
 //! which symbol an occurrence reaches, or whether it is external — in
 //! [`link`], with Java's rules in [`java`].
 
+pub mod env;
 pub mod java;
 pub mod link;
 pub mod scope;
