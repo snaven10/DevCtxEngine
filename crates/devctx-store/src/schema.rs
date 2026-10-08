@@ -29,7 +29,17 @@ pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
              ALTER TABLE edges ADD COLUMN IF NOT EXISTS hint VARCHAR;",
         )?;
     }
-    if !(had_all && had_columns) && checkpoint_is_safe(conn) {
+    // The edges every reader means (PLAN-009 TASK-005): without the calls the
+    // link pass discarded, which stay as rows only to be reopened by name.
+    // A view, so a reader cannot forget the filter.
+    let had_view = view_exists(conn, "live_edges");
+    if !had_view {
+        conn.execute_batch(
+            "CREATE VIEW IF NOT EXISTS live_edges AS
+             SELECT * FROM edges WHERE coalesce(resolution, '') <> 'discarded';",
+        )?;
+    }
+    if !(had_all && had_columns && had_view) && checkpoint_is_safe(conn) {
         // A table created on an existing database is DDL in the WAL; a process
         // dying before the next checkpoint leaves a log whose replay breaks
         // the ART indexes (see `Store::checkpoint`). Best-effort, as there.
@@ -70,6 +80,15 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     conn.query_row(
         "SELECT count(*) > 0 FROM duckdb_columns() WHERE table_name = ? AND column_name = ?",
         [table, column],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+fn view_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) > 0 FROM duckdb_views() WHERE view_name = ?",
+        [name],
         |r| r.get::<_, bool>(0),
     )
     .unwrap_or(false)

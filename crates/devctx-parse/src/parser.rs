@@ -1255,6 +1255,8 @@ fn tidy_generics(text: &str) -> String {
                     }
                 }
             }
+            // The `>` of `->` closes no group.
+            '>' if i > 0 && chars[i - 1] == '-' => {}
             ')' | '>' => {
                 commas.pop();
             }
@@ -1450,6 +1452,11 @@ mod tests {
         assert_eq!(
             tidy_generics("Foo<(\n    u8,\n    u16,\n)>"),
             "Foo<(u8,u16)>"
+        );
+        // The `>` of `->` closes nothing.
+        assert_eq!(
+            tidy_generics("whereF:Fn(A, Box<dyn Fn() -> u8>,)"),
+            "whereF:Fn(A,Box<dynFn()->u8>)"
         );
     }
 }

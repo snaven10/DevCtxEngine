@@ -29,7 +29,7 @@ use crate::error::Result;
 /// module): what the branch's edges were resolved under. A build with other
 /// rules relinks the branch in full on its next run, as the extractor
 /// version does for the parse.
-pub(crate) const LINK_VERSION: &str = "1";
+pub(crate) const LINK_VERSION: &str = "2";
 
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
@@ -91,6 +91,28 @@ fn write_batch(
 /// The `resolution` of a call the link pass dropped (DD-7): kept as a row,
 /// excluded from the counts and the readers, reopened by name.
 pub const DISCARDED: &str = "discarded";
+
+/// The words of a hint (`typed field Foo`, `chain find name Office`): never
+/// names to match against what a written file defines (a field `name` would
+/// reopen every `name X` edge).
+const HINT_WORDS: &[&str] = &[
+    "bare",
+    "this",
+    "super",
+    "typed",
+    "field",
+    "param",
+    "local",
+    "ctor_inject",
+    "static",
+    "name",
+    "member",
+    "anon",
+    "untyped",
+    "expr",
+    "chain",
+    "path",
+];
 
 /// The fraction of a branch's files over which a run re-resolves every edge.
 const FULL_PASS_DIVISOR: usize = 5;
@@ -187,6 +209,7 @@ pub(crate) fn link_branch(
         fresh.contains(leaf(&e.dst_name))
             || e.hint.as_deref().is_some_and(|h| {
                 h.split(|c: char| c.is_whitespace() || c == '.')
+                    .filter(|t| !HINT_WORDS.contains(t))
                     .any(|t| fresh.contains(t))
             })
             || (!affected.is_empty() && index.within(e.src_id, &affected))
@@ -208,7 +231,10 @@ pub(crate) fn link_branch(
                 || file_written
                 || e.resolution.is_none()
                 || e.dst_id.is_some_and(|d| !ids.contains(&d))
-                || (e.dst_id.is_none() && !e.external.unwrap_or(false))
+                // (c) the undecided — a discarded row waits for its name.
+                || (e.dst_id.is_none()
+                    && !e.external.unwrap_or(false)
+                    && e.resolution.as_deref() != Some(DISCARDED))
                 || reopened(e);
             let new = if pick {
                 stats.resolved += 1;

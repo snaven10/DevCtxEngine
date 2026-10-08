@@ -321,7 +321,7 @@ fn a_dotted_receiver_is_typed_through_its_fields() {
     let l = linked();
     assert_eq!(
         l.show(&l.call("Cases.members", "rename")),
-        (q("Office.rename"), "high", "field", false)
+        (q("Office.rename"), "high", "param", false)
     );
     assert_eq!(
         l.show(&l.call("Cases.members", "port")),
@@ -406,8 +406,8 @@ fn link_sources(files: &[(&str, &str)]) -> Linked {
 
 /// MINOR: an anonymous class is a scope: a bare call in it is its
 /// supertype's first. Its supertype is external here: a name the enclosing
-/// class also defines (`cancel`) is undecided, not the enclosing method in
-/// `high`; one it does not (`purge`) is the supertype's.
+/// class also defines (`cancel`) is the enclosing method, but `medium` (the
+/// supertype may have it); one it does not (`purge`) is the supertype's.
 #[test]
 fn an_anonymous_class_scopes_its_bare_calls() {
     let l = link_sources(&[(
@@ -417,7 +417,7 @@ fn an_anonymous_class_scopes_its_bare_calls() {
     )]);
     assert_eq!(
         l.show(&l.call("Clock.start.run", "cancel")),
-        (None, "low", "name_only", false)
+        (q("Clock.cancel"), "medium", "self", false)
     );
     assert_eq!(
         l.show(&l.call("Clock.start.run", "purge")),
@@ -494,4 +494,46 @@ fn arity_is_read_from_java_signatures_only() {
     )]);
     let (dst, conf, res, _) = l.show(&l.call("S.go", "S.m"));
     assert_eq!((dst.as_deref(), conf, res), (Some("S.m"), "high", "self"));
+}
+
+/// Follow-ups of the second review: `@lombok.Data` is `@Data`; a member
+/// receiver is labelled by its base (a parameter's field is `param`); a
+/// static field of a type types its receiver (`Config.INSTANCE.m()`); a bare
+/// call in an anonymous class with an external supertype, defined only by
+/// the enclosing class, is the enclosing method's, `medium`.
+#[test]
+fn second_review_follow_ups() {
+    let l = link_sources(&[
+        (
+            "p/Row.java",
+            "package p;\n@lombok.Data\npublic class Row { private String label; }\n",
+        ),
+        (
+            "p/Config.java",
+            "package p;\npublic class Config {\n    public static final Config INSTANCE = new Config();\n    \
+             public Row row;\n    public void reload() {}\n}\n",
+        ),
+        (
+            "p/Use.java",
+            "package p;\nclass Use {\n    void go(Row r, Config c) {\n        r.getLabel();\n        \
+             c.row.getLabel();\n        Config.INSTANCE.reload();\n    }\n    void helper() {}\n    \
+             void start() {\n        new Runnable() { public void run() { helper(); } };\n    }\n}\n",
+        ),
+    ]);
+    assert_eq!(
+        l.show(&l.call("Use.go", "Row.getLabel")),
+        (q("Row.label"), "medium", "param", false)
+    );
+    assert_eq!(
+        l.show(&l.call("Use.go", "getLabel")),
+        (q("Row.label"), "medium", "param", false)
+    );
+    assert_eq!(
+        l.show(&l.call("Use.go", "Config.INSTANCE.reload")),
+        (q("Config.reload"), "high", "same_package", false)
+    );
+    assert_eq!(
+        l.show(&l.call("Use.start.run", "helper")),
+        (q("Use.helper"), "medium", "self", false)
+    );
 }

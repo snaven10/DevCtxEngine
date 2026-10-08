@@ -217,9 +217,11 @@ pub struct IndexResult {
     /// extractor: only the changed files were re-parsed, so the rest still
     /// carries what the old extractor produced. `--full` clears it.
     pub extractor_stale: bool,
-    /// Calls the link pass dropped (PLAN-009 DD-7): a receiver nothing types
-    /// (a fluent chain, an untyped local) and a name the repository does not
-    /// define. Counted, like `files_skipped`, rather than kept as noise.
+    /// Calls of the branch the link pass has discarded (PLAN-009 DD-7) — its
+    /// total after this run, not this run's: a receiver nothing types (a
+    /// fluent chain, an untyped local) and a name the repository does not
+    /// define. Kept as rows (`resolution = 'discarded'`, out of `live_edges`)
+    /// and reopened when a written file defines the name.
     pub edges_discarded: usize,
     /// Edges the link pass re-resolved this run (0: it did not run).
     pub edges_linked: usize,
@@ -591,14 +593,16 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
             )
         })?;
         if !stats.cancelled {
-            req.store
-                .delete_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY)?;
+            // The version first: a stop between the two leaves the pass
+            // owed, never a stale version with no pass owed.
             req.store.set_index_meta(
                 &repo_path,
                 &branch,
                 crate::link::LINK_VERSION_META_KEY,
                 crate::link::LINK_VERSION,
             )?;
+            req.store
+                .delete_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY)?;
         }
         result.edges_discarded = stats.discarded;
         result.edges_linked = stats.resolved;
@@ -607,7 +611,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
             result.cancelled = true;
         } else {
             eprintln!(
-                "· link pass ({}): {} edges resolved, {} files rewritten, {} calls dropped \
+                "· link pass ({}): {} edges resolved, {} files rewritten, {} calls discarded in the branch \
                  (untypable receiver, name not in the repository), {} calls undecided, {} ms \
                  (load {} ms, write {} ms)",
                 if stats.full { "full" } else { "incremental" },

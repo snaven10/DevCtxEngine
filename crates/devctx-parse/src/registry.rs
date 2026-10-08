@@ -194,6 +194,8 @@ const SOURCES: &[&str] = &[
 /// variables are bindings (untyped, or typed by the pattern); a constructor
 /// injection keeps the field's declared type; a trailing comma before `)`
 /// folds unless the group has one element.
+/// 8: the `>` of a `->` inside an `impl`'s generic arguments or `where`
+/// clause closes no group (`Fn(A, Box<dyn Fn() -> u8>,)` folds its comma).
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -201,7 +203,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 7;
+pub const EXTRACTOR_VERSION: u32 = 8;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

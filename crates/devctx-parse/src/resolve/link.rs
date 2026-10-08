@@ -481,7 +481,12 @@ impl RepoIndex {
             "@SuperBuilder",
         ]
         .iter()
-        .any(|a| sig.split_whitespace().any(|w| w.starts_with(a)));
+        .any(|a| {
+            // `@lombok.Data` is `@Data`.
+            sig.split_whitespace()
+                .map(|w| w.replacen("@lombok.", "@", 1))
+                .any(|w| w.starts_with(a))
+        });
         if !lombok {
             return None;
         }
@@ -1133,7 +1138,8 @@ impl RepoIndex {
             // Other languages: as the dotted name it is (TASK-006/007).
             return self.untyped_or_low(c);
         }
-        let Some((mut r, _, mut conf)) = self.hint_type(c, base) else {
+        // Labelled by its base (`p.f.m()` with `p` a parameter is `param`).
+        let Some((mut r, label, mut conf)) = self.hint_type(c, base) else {
             return self.untyped(c);
         };
         for seg in path.split('.') {
@@ -1149,7 +1155,7 @@ impl RepoIndex {
         }
         match r {
             TypeRef::Repo(t, how) => {
-                self.in_type(c, t, "field", min_conf(conf, self.type_conf(t, how)))
+                self.in_type(c, t, label, min_conf(conf, self.type_conf(t, how)))
             }
             TypeRef::External => cap(external("external_known"), conf),
             TypeRef::Unknown => self.untyped(c),
@@ -1180,7 +1186,14 @@ impl RepoIndex {
     /// The anonymous class's external supertype may have the name; if the
     /// enclosing scopes define it too, nothing decides which.
     fn anon_external(&self, c: &Call<'_>) -> Outcome {
+        let platformish = (self.is_java(c.file) && JAVA_OBJECT.contains(&c.callee))
+            || self.platform(c.file, c.callee);
         match self.bare_call(c) {
+            // The supertype may have it too: no surer than `medium`, and
+            // undecided for a name every object or the platform has.
+            out @ Outcome::Resolved(Resolved {
+                dst_id: Some(_), ..
+            }) if !platformish => cap(out, "medium"),
             Outcome::Resolved(Resolved {
                 dst_id: Some(_), ..
             }) => undecided(),
@@ -1197,6 +1210,23 @@ impl RepoIndex {
             TypeRef::Unknown => {}
         }
         if self.is_java(c.file) {
+            // `Config.INSTANCE.m()`: a type, then its (static) fields.
+            if let Some((first, rest)) = recv.split_once('.') {
+                if let TypeRef::Repo(mut t, how) = self.resolve_type(first, c.file, c.src) {
+                    let mut conf = self.type_conf(t, how);
+                    for seg in rest.split('.') {
+                        match self.member_type(t, seg) {
+                            (TypeRef::Repo(n, _), cf) => {
+                                t = n;
+                                conf = min_conf(conf, cf);
+                            }
+                            (TypeRef::External, _) => return external("external_known"),
+                            (TypeRef::Unknown, _) => return self.untyped(c),
+                        }
+                    }
+                    return self.in_type(c, t, how, conf);
+                }
+            }
             // A field of an enclosing type or its supertypes (`LOG` of a
             // base class): typed by its declaration.
             if let Some((r, how, conf)) = self.field_type(c, recv) {

@@ -3620,7 +3620,8 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);
     if res.edges_discarded > 0 || res.edges_unresolved > 0 {
         println!(
-            "  graph: {} calls dropped (untypable receiver, name not in the repository), \
+            "  graph: {} calls discarded in the branch (untypable receiver, name not in the \
+             repository), \
              {} calls undecided",
             res.edges_discarded, res.edges_unresolved
         );

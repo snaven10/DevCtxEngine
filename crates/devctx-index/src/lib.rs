@@ -2880,17 +2880,17 @@ public class Helper {
             ),
             (
                 "p/D.java",
-                "package p;\npublic class D { private String name; }\n",
+                "package p;\n@lombok.Data\npublic class D { private String name; }\n",
             ),
             (
-                "p/M.java",
-                "package p;\npublic class M { public void run() {} }\n",
+                "p/H.java",
+                "package p;\npublic class H { public X item; }\n",
             ),
             (
                 "q/U.java",
-                "package q;\nimport p.B;\nimport p.R;\nimport p.D;\nimport p.M;\n\
-                 class U {\n    void go(B b, R r, D d, M m) {\n        b.m();\n        \
-                 r.find().doIt();\n        d.getName();\n        m.run();\n    }\n}\n",
+                "package q;\nimport p.B;\nimport p.R;\nimport p.D;\nimport p.H;\n\
+                 class U {\n    void go(B b, R r, D d, H h) {\n        b.m();\n        \
+                 r.find().doIt();\n        d.getName();\n        h.item.doIt();\n    }\n}\n",
             ),
         ];
         files.extend(LINK_FILLER);
@@ -2900,37 +2900,72 @@ public class Helper {
             ("g3.py", "def g3():\n    pass\n"),
             ("g4.py", "def g4():\n    pass\n"),
         ]);
-        let (dir, repo) = graph_repo("linkeq", &files);
-        let store = Store::open_in_memory(DIM).unwrap();
-        index_with(&store, &dir, true, None);
-        assert!(full_link_changes(&store, &repo).is_empty());
-        let steps: [(&str, &str); 4] = [
-            ("p/B.java", "package p;\npublic class B extends C {}\n"),
+        // Each step: the file written, its new text, and the edge of
+        // `U.java` (not written) whose answer must change — so no scenario
+        // passes by changing nothing.
+        let steps: [(&str, &str, &str, i32); 4] = [
+            (
+                "p/B.java",
+                "package p;\npublic class B extends C {}\n",
+                "B.m",
+                8,
+            ),
             (
                 "p/R.java",
                 "package p;\npublic class R { public Y find() { return null; } }\n",
+                "doIt",
+                9,
             ),
+            // `@lombok.Data` removed: the getter's field (medium) becomes
+            // undecided — a resolved row the mode (c) does not pick.
             (
                 "p/D.java",
-                "package p;\n@lombok.Data\npublic class D { private String name; }\n",
+                "package p;\npublic class D { private String name; }\n",
+                "D.getName",
+                10,
             ),
+            // The type of a member receiver's field changes.
             (
-                "p/M.java",
-                "package r;\npublic class M { public void run() {} }\n",
+                "p/H.java",
+                "package p;\npublic class H { public Y item; }\n",
+                "doIt",
+                11,
             ),
         ];
-        for (file, text) in steps {
+        // Each scenario on a branch of its own, so every one is judged (and
+        // reported) whatever the others do.
+        let mut failures: Vec<String> = Vec::new();
+        for (i, (file, text, dst, line)) in steps.into_iter().enumerate() {
+            let (dir, repo) = graph_repo(&format!("linkeq{i}"), &files);
+            let store = Store::open_in_memory(DIM).unwrap();
+            index_with(&store, &dir, true, None);
+            assert!(full_link_changes(&store, &repo).is_empty());
+            let watched = |store: &Store| {
+                store
+                    .file_symbol_edges(&repo, "main", "q/U.java")
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.kind == "calls" && e.dst_name == dst && e.line == line)
+                    .unwrap_or_else(|| panic!("no {dst} at {line}"))
+            };
+            let before = watched(&store);
             write(&dir, file, text);
             commit_all(&dir, file);
             let inc = index_with(&store, &dir, false, None);
             assert_eq!(inc.files_indexed, 1, "{file}: {inc:?}");
+            let after = watched(&store);
+            if before == after {
+                failures.push(format!(
+                    "{file}: the watched edge did not change: {after:?}"
+                ));
+            }
             let diff = full_link_changes(&store, &repo);
-            assert!(
-                diff.is_empty(),
-                "{file}: the incremental pass left {diff:#?}"
-            );
+            if !diff.is_empty() {
+                failures.push(format!("{file}: the incremental pass left {diff:#?}"));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// A link pass cut short (a stop, a crash) is owed: the next run does it
@@ -3052,6 +3087,66 @@ public class Helper {
         commit_all(&dir, "a vanish");
         index_with(&store, &dir, false, None);
         assert_eq!(vanish(&store).resolution.as_deref(), Some("name_only"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rows the incremental pass re-resolves on its own, whatever was
+    /// written: the undecided ones (mode c), never the discarded.
+    fn undecided_live(store: &Store, repo: &str) -> usize {
+        store
+            .branch_linkable_edges(repo, "main")
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.dst_id.is_none()
+                    && !e.external.unwrap_or(false)
+                    && e.resolution.as_deref() != Some(crate::link::DISCARDED)
+            })
+            .count()
+    }
+
+    /// Discarded rows are reopened by name, not by mode (c): a run that
+    /// writes an unrelated file leaves them alone (follow-up 4).
+    #[test]
+    fn discarded_rows_wait_for_their_name() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkwait", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        assert_eq!(store.branch_discarded_calls(&repo, "main").unwrap(), 1);
+        let expected = undecided_live(&store, &repo);
+        write(&dir, "f1.py", "def f1():\n    return 1\n");
+        commit_all(&dir, "unrelated");
+        let inc = index_with(&store, &dir, false, None);
+        assert_eq!(inc.files_indexed, 1, "{inc:?}");
+        assert_eq!(inc.edges_linked, expected, "{inc:?}");
+        assert_eq!(inc.edges_discarded, 1, "the branch's total: {inc:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The words of a hint (`typed`, `field`, `name`…) are no names: a
+    /// written file defining a symbol `field` reopens nothing by them
+    /// (follow-up 2).
+    #[test]
+    fn hint_keywords_do_not_reopen_edges() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkkw", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let expected = undecided_live(&store, &repo);
+        write(&dir, "k.py", "field = 1\nname = 2\ntyped = 3\n");
+        commit_all(&dir, "keywords as names");
+        let inc = index_with(&store, &dir, false, None);
+        assert_eq!(inc.files_indexed, 1, "{inc:?}");
+        assert_eq!(inc.edges_linked, expected, "{inc:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

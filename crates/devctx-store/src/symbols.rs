@@ -347,6 +347,31 @@ impl Store {
         })
     }
 
+    /// `calls` of a branch with neither a destination nor the `external`
+    /// mark — undecided — over the `live_edges` view: a discarded call is
+    /// not counted (TASK-008 and the metrics read the same way).
+    pub fn branch_undecided_calls(&self, repo: &str, branch: &str) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM live_edges WHERE repo = ? AND branch = ? AND kind = 'calls'
+               AND dst_id IS NULL AND NOT coalesce(external, false)",
+            params![repo, branch],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// `calls` of a branch the link pass discarded (DD-7): kept as rows,
+    /// out of `live_edges`.
+    pub fn branch_discarded_calls(&self, repo: &str, branch: &str) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM edges WHERE repo = ? AND branch = ? AND kind = 'calls'
+               AND resolution = 'discarded'",
+            params![repo, branch],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// Every symbol of a branch (the link pass's index).
     pub fn branch_symbols(&self, repo: &str, branch: &str) -> Result<Vec<StoredSymbol>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -543,6 +568,31 @@ mod tests {
         };
         let edges = vec![call(3), call(4)];
         (vec![f, run], edges)
+    }
+
+    /// A call the link pass discarded stays a row but is out of the live
+    /// view and of the undecided count (follow-up 4 of TASK-005's review).
+    #[test]
+    fn discarded_calls_are_out_of_the_live_view() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (syms, mut edges) = file_graph("r", "a.py");
+        edges[1].resolution = Some("discarded".into());
+        edges[1].confidence = Some("low".into());
+        edges[1].external = Some(false);
+        store
+            .replace_file_graph("r", "main", "a.py", &syms, &edges)
+            .unwrap();
+        let live: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM live_edges WHERE repo = 'r' AND branch = 'main'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1);
+        assert_eq!(store.branch_undecided_calls("r", "main").unwrap(), 1);
+        assert_eq!(store.branch_discarded_calls("r", "main").unwrap(), 1);
     }
 
     /// One row per occurrence: the writer does not fold two calls to the same
