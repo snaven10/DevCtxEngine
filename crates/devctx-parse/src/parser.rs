@@ -817,6 +817,9 @@ impl Recv {
                 .and_then(|c| container_name(c, bytes))
                 .map(|class| format!("{class}.{name}"))
                 .unwrap_or_else(|| name.to_string()),
+            // What a call returns (`x = make()`): its type is the link
+            // pass's to find.
+            Recv::Typed(ty, _) if ty.ends_with(')') || ty.ends_with('?') => name.to_string(),
             Recv::Typed(ty, _) => format!("{ty}.{name}"),
             Recv::Name(r)
                 if r.chars().next().is_some_and(char::is_uppercase) && !is_constant_name(r) =>
@@ -944,6 +947,13 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
             return ty.map_or(Recv::Expr, |t| Recv::Typed(t, Via::Local));
         }
         k if CALL_KINDS.contains(&k) => {
+            // Python `super().m()`: the supertype's.
+            if recv
+                .child_by_field_name("function")
+                .is_some_and(|f| f.kind() == "identifier" && f.utf8_text(bytes) == Ok("super"))
+            {
+                return Recv::Super;
+            }
             if depth >= CHAIN_DEPTH {
                 return Recv::Chain(None);
             }
@@ -954,10 +964,13 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
                 prev.map(|(c, n)| (n, Box::new(classify(c, bytes, scopes, depth + 1)))),
             );
         }
-        // A literal is of its type (`"done".equals(x)`, `Foo.class`).
-        "string_literal" => return Recv::Typed("String".into(), Via::Local),
-        "class_literal" => return Recv::Typed("Class".into(), Via::Local),
-        _ => {}
+        // A literal is of its type (`"done".equals(x)`, `Foo.class`, Python
+        // `", ".join(…)`).
+        k => {
+            if let Some(t) = scopes.resolver().literal_type(k) {
+                return Recv::Typed(t.into(), Via::Local);
+            }
+        }
     }
     let t = text(recv);
     if !nameable(&t) {
@@ -975,7 +988,7 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
     };
     let key = member.unwrap_or(&t);
     let typed = |b: &crate::resolve::scope::Binding| match &b.ty {
-        Some(ty) if nameable(&ty.base) => Recv::Typed(ty.base.clone(), b.via),
+        Some(ty) if type_token(&ty.base) => Recv::Typed(ty.base.clone(), b.via),
         _ => Recv::Untyped,
     };
     if let Some(b) = found {
@@ -997,12 +1010,23 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
         let path: Vec<String> = rest.split('.').map(str::to_string).collect();
         match base {
             Some(b) => return Recv::Member(path, Box::new(typed(b))),
+            // Rust, Go, Python: the fields after `self`, typed by the link
+            // pass from their declarations (TASK-007).
+            None if member.is_some() && scopes.resolver().fields_by_link() => {
+                return Recv::Member(
+                    key.split('.').map(str::to_string).collect(),
+                    Box::new(Recv::This),
+                )
+            }
             // `this.x.y` with `x` declared elsewhere (a supertype).
             None if member.is_some() => {
                 return Recv::Member(path, Box::new(Recv::Name(first.to_string())))
             }
             None => {}
         }
+    }
+    if member.is_some() && scopes.resolver().fields_by_link() {
+        return Recv::Member(vec![key.to_string()], Box::new(Recv::This));
     }
     Recv::Name(key.to_string())
 }
@@ -1099,6 +1123,14 @@ fn nameable(text: &str) -> bool {
                 .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
                 && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
         })
+}
+
+/// A receiver's type as a hint carries it: a name (`Foo`, `a.b.Foo`), or
+/// what calling one returns (`make()`, Rust `Store.open()?`).
+fn type_token(ty: &str) -> bool {
+    let base = ty.strip_suffix('?').unwrap_or(ty);
+    let base = base.strip_suffix("()").unwrap_or(base);
+    nameable(base)
 }
 
 /// Walk up from `node` to the nearest container (class/impl/…) definition.

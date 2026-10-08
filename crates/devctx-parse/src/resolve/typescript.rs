@@ -472,7 +472,7 @@ impl TsConfig {
 
 // ------------------------------------------------------------- the link pass
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use super::link::{
@@ -596,7 +596,7 @@ pub(super) struct TsCache {
 
 /// How many re-exports deep a barrel is followed (`index.ts` → `lib/index.ts`
 /// → …).
-const BARREL_DEPTH: u8 = 4;
+pub(super) const BARREL_DEPTH: u8 = 4;
 
 impl RepoIndex {
     /// The file `spec` (written in `from`) names, or where it is from.
@@ -1058,53 +1058,21 @@ impl RepoIndex {
         }
     }
 
-    /// The TypeScript/JavaScript files whose imports may resolve differently
-    /// after `written` changed: those importing a written file, and
-    /// through barrels that re-export one, theirs (DD-6, the incremental
-    /// pass). A specifier is matched by every path it may name, so a file
-    /// added or deleted under it counts.
-    pub fn importers_of(&self, written: &HashSet<String>) -> HashSet<String> {
-        let mut out: HashSet<String> = HashSet::new();
-        if written.is_empty() {
-            return out;
+    /// Every path the imports of a TypeScript/JavaScript file may name, and
+    /// whether it re-exports (a barrel); `None` for a file with no imports.
+    pub(super) fn script_reach(&self, file: &str) -> Option<(Vec<String>, bool)> {
+        let info = self.files.get(file)?;
+        if info.script.is_empty() {
+            return None;
         }
-        // Every path each file's specifiers may name, computed once: the
-        // rounds below only look them up.
-        let reach: Vec<(&String, Vec<String>, bool)> = self
-            .files
+        let mut paths: Vec<String> = info
+            .script
             .iter()
-            .filter(|(_, info)| !info.script.is_empty())
-            .map(|(file, info)| {
-                let mut paths: Vec<String> = info
-                    .script
-                    .iter()
-                    .flat_map(|imp| self.spec_paths(file, &imp.spec))
-                    .collect();
-                paths.sort();
-                paths.dedup();
-                (file, paths, info.script.iter().any(|i| i.reexport))
-            })
+            .flat_map(|imp| self.spec_paths(file, &imp.spec))
             .collect();
-        let mut frontier: HashSet<String> = written.clone();
-        for _ in 0..=BARREL_DEPTH {
-            let mut next = HashSet::new();
-            for (file, paths, reexports) in &reach {
-                if out.contains(*file) {
-                    continue;
-                }
-                if paths.iter().any(|p| frontier.contains(p)) {
-                    out.insert((*file).clone());
-                    if *reexports {
-                        next.insert((*file).clone());
-                    }
-                }
-            }
-            if next.is_empty() {
-                break;
-            }
-            frontier = next;
-        }
-        out
+        paths.sort();
+        paths.dedup();
+        Some((paths, info.script.iter().any(|i| i.reexport)))
     }
 }
 

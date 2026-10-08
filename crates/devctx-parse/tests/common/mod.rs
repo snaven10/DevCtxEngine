@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+pub mod linked;
+
 use devctx_parse::{parse, Lang, ParsedFile, Symbol};
 
 /// Parse `tests/fixtures/<fixture>` as if it lived at `path` in repo `repo`.

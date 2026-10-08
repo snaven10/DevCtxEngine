@@ -154,6 +154,20 @@ pub(super) enum TypeRef {
     Unknown,
 }
 
+/// What a call returns, as a receiver's type (`x = make()`, TASK-007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ValueType {
+    /// An instance of a repository type: how it was found and how surely.
+    Repo(usize, &'static str, &'static str),
+    /// A type from outside the repository, declared (a return annotation,
+    /// a builtin type called), and how surely.
+    External(&'static str),
+    /// The value of a call from outside the repository: nothing types it.
+    FromExternalCall,
+    /// Nothing says.
+    Unknown,
+}
+
 /// A member lookup through the supertypes.
 enum Member {
     /// Found, in the type itself (`false`) or a supertype (`true`); and
@@ -169,11 +183,13 @@ enum Member {
 
 #[derive(Default)]
 pub(super) struct FileInfo {
-    lang: Option<Lang>,
-    package: Option<String>,
-    imports: Vec<String>,
+    pub(super) lang: Option<Lang>,
+    pub(super) package: Option<String>,
+    pub(super) imports: Vec<String>,
     /// TypeScript/JavaScript: each import and re-export, read back.
     pub(super) script: Vec<TsImport>,
+    /// Python: each import, read back.
+    pub(super) py: Vec<crate::resolve::python::PyImport>,
     /// The file symbol's id.
     pub(super) id: Option<u64>,
 }
@@ -200,6 +216,12 @@ pub struct RepoIndex {
     /// The workspace's `package.json` files: what a package is (DD-9).
     pub(super) manifests: Vec<crate::resolve::typescript::Manifest>,
     pub(super) ts_cache: crate::resolve::typescript::TsCache,
+    /// The workspace's Python manifests (PLAN-009 TASK-007).
+    pub(super) python: Vec<crate::resolve::env::PyManifest>,
+    pub(super) py_cache: crate::resolve::python::PyCache,
+    /// Every directory that holds a file of the branch (a namespace
+    /// package, a Go package).
+    pub(super) dirs: HashSet<String>,
 }
 
 /// Methods every Java class has from `Object`, and every enum from `Enum`.
@@ -284,7 +306,11 @@ impl RepoIndex {
         facts: &[LinkEdge],
         env: crate::resolve::env::LinkEnv,
     ) -> Self {
-        let crate::resolve::env::LinkEnv { script: env, .. } = env;
+        let crate::resolve::env::LinkEnv {
+            script: env,
+            python,
+            ..
+        } = env;
         let mut idx = Self {
             syms: symbols,
             by_id: HashMap::new(),
@@ -299,6 +325,9 @@ impl RepoIndex {
             ts: env.tsconfig,
             manifests: env.manifests,
             ts_cache: Default::default(),
+            python,
+            py_cache: Default::default(),
+            dirs: HashSet::new(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.id, i);
@@ -331,6 +360,15 @@ impl RepoIndex {
                 }
             }
         }
+        for f in idx.files.keys() {
+            let mut d = f.as_str();
+            while let Some((parent, _)) = d.rsplit_once('/') {
+                if !idx.dirs.insert(parent.to_string()) {
+                    break;
+                }
+                d = parent;
+            }
+        }
         idx.ambiguous = idx
             .fq_types
             .values()
@@ -344,6 +382,12 @@ impl RepoIndex {
                 if info.lang.is_some_and(is_script_lang) {
                     info.script
                         .push(TsImport::from_row(&e.dst_name, e.hint.as_deref()));
+                }
+                if info.lang.is_some_and(|l| l.key() == "python") {
+                    info.py.push(crate::resolve::python::PyImport::from_row(
+                        &e.dst_name,
+                        e.hint.as_deref(),
+                    ));
                 }
             }
         }
@@ -421,6 +465,53 @@ impl RepoIndex {
         out
     }
 
+    /// The files whose imports may resolve differently after `written`
+    /// changed: those importing a written file, and through files that
+    /// re-export what they import (a TypeScript barrel, any Python module),
+    /// theirs, up to four levels (DD-6, the incremental pass, mode d). A
+    /// specifier is matched by every path it may name, so a file added or
+    /// deleted under it counts.
+    pub fn importers_of(&self, written: &HashSet<String>) -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::new();
+        if written.is_empty() {
+            return out;
+        }
+        // Every path each file's imports may name, computed once: the
+        // rounds below only look them up.
+        let reach: Vec<(&String, Vec<String>, bool)> = self
+            .files
+            .keys()
+            .filter_map(|file| {
+                let (paths, reexports) = match self.lang_key(file) {
+                    Some("typescript" | "tsx" | "javascript") => self.script_reach(file)?,
+                    Some("python") => self.py_file_reach(file)?,
+                    _ => return None,
+                };
+                Some((file, paths, reexports))
+            })
+            .collect();
+        let mut frontier: HashSet<String> = written.clone();
+        for _ in 0..=crate::resolve::typescript::BARREL_DEPTH {
+            let mut next = HashSet::new();
+            for (file, paths, reexports) in &reach {
+                if out.contains(*file) {
+                    continue;
+                }
+                if paths.iter().any(|p| frontier.contains(p)) {
+                    out.insert((*file).clone());
+                    if *reexports {
+                        next.insert((*file).clone());
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        out
+    }
+
     /// The bare name of the symbol `id`.
     pub fn name_of(&self, id: u64) -> Option<&str> {
         self.by_id.get(&id).map(|&i| self.syms[i].name.as_str())
@@ -434,8 +525,18 @@ impl RepoIndex {
             .any(|&i| types.contains(&self.syms[i].id))
     }
 
-    fn lang_of(&self, file: &str) -> Option<Lang> {
+    pub(super) fn lang_of(&self, file: &str) -> Option<Lang> {
         self.files.get(file).and_then(|f| f.lang)
+    }
+
+    /// The registry key of `file`'s language.
+    pub(super) fn lang_key(&self, file: &str) -> Option<&'static str> {
+        self.lang_of(file).map(|l| l.key())
+    }
+
+    /// The symbols whose container is `id`.
+    pub(super) fn children_of(&self, id: u64) -> impl Iterator<Item = usize> + '_ {
+        self.children.get(&id).into_iter().flatten().copied()
     }
 
     fn is_java(&self, file: &str) -> bool {
@@ -698,6 +799,9 @@ impl RepoIndex {
         if self.is_script(file) {
             return self.script_type(name, file, ctx);
         }
+        if self.lang_key(file) == Some("python") {
+            return self.py_type(name, file, ctx);
+        }
         // Generic: this file (nested along the containers, then top level),
         // then a unique type of that name, then the platform.
         if let Some(t) = self.same_file_type(name, file, ctx) {
@@ -884,6 +988,9 @@ impl RepoIndex {
         if self.is_script(&e.file) {
             return self.script_import(e);
         }
+        if self.lang_key(&e.file) == Some("python") {
+            return self.py_import(e);
+        }
         let target = e.dst_name.as_str();
         if !self.is_java(&e.file) {
             return if self.platform(&e.file, target) {
@@ -950,12 +1057,19 @@ impl RepoIndex {
     }
 
     fn call_by_hint(&self, c: &Call<'_>, tokens: &[&str], e: &LinkEdge, depth: u8) -> Outcome {
+        let python = self.lang_key(c.file) == Some("python");
         match tokens {
             ["this"] => self.this_call(c, false),
             ["super"] => self.this_call(c, true),
             ["typed", via, ty] => self.typed_call(c, via, ty),
             ["name", recv] if self.is_script(c.file) => self.script_name(c, recv),
+            ["name", recv] if python => self.py_name(c, recv),
             ["name", recv] => self.name_call(c, recv),
+            ["bare"] if python => self.py_bare(c, true),
+            ["free"] if python => self.py_bare(c, false),
+            // Python declares no fields: an attribute's attribute is typed
+            // by nothing (TASK-007).
+            ["member", ..] if python => self.untyped(c),
             ["member", path, base @ ..] => self.member_call(c, path, base),
             ["anon", ty, inner @ ..] => self.anon_call(c, ty, inner),
             ["untyped"] | ["expr"] | ["chain"] => self.untyped(c),
@@ -1151,6 +1265,15 @@ impl RepoIndex {
             "ctor_inject" => "ctor_inject",
             _ => "local",
         };
+        // `x = make()`: what calling `make` returns (TASK-007).
+        if let Some(v) = self.value_of(ty, c.file, c.src) {
+            return match v {
+                ValueType::Repo(t, _, conf) => self.in_type(c, t, resolution, conf),
+                ValueType::External(conf) => cap(external("external_known"), conf),
+                ValueType::FromExternalCall => self.after_external(c),
+                ValueType::Unknown => self.untyped(c),
+            };
+        }
         // `var x = T.of(…)`: `T` only if it has the method (DD-7).
         let statik = via == "static";
         match self.resolve_type(ty, c.file, c.src) {
@@ -1186,6 +1309,15 @@ impl RepoIndex {
                     "ctor_inject" => "ctor_inject",
                     _ => "local",
                 };
+                if let Some(v) = self.value_of(ty, c.file, c.src) {
+                    return Some(match v {
+                        ValueType::Repo(t, how, conf) => (TypeRef::Repo(t, how), res, conf),
+                        ValueType::External(conf) => (TypeRef::External, res, conf),
+                        ValueType::FromExternalCall | ValueType::Unknown => {
+                            (TypeRef::Unknown, res, "medium")
+                        }
+                    });
+                }
                 let r = self.resolve_type(ty, c.file, c.src);
                 let conf = match r {
                     TypeRef::Repo(t, how) => self.type_conf(t, how),
@@ -1401,20 +1533,17 @@ impl RepoIndex {
                 confidence,
                 ..
             }) => (p, confidence),
-            Outcome::Resolved(Resolved { external: true, .. }) => {
-                let known = !self.candidates(c.callee, c.file, c.args).is_empty();
-                return if known || accessor_shaped(c.callee) {
-                    undecided()
-                } else {
-                    external_medium("chain_external")
-                };
-            }
+            Outcome::Resolved(Resolved { external: true, .. }) => return self.after_external(c),
             _ => return self.untyped(c),
         };
         let Some(&pi) = self.by_id.get(&p) else {
             return self.untyped(c);
         };
         let ps = &self.syms[pi];
+        // A class called (Python): the instance it makes.
+        if is_type(&ps.kind) {
+            return self.in_type(c, pi, "return_type", prev_conf);
+        }
         // The declared return type: a Java method's, a TypeScript
         // function's (`(): Observable<T>`).
         let sig = ps.signature.as_deref();
@@ -1422,6 +1551,8 @@ impl RepoIndex {
             sig.and_then(|s| declared_type(s, &ps.name))
         } else if self.is_script(&ps.file) {
             sig.and_then(crate::resolve::typescript::return_type)
+        } else if self.lang_key(&ps.file) == Some("python") {
+            sig.and_then(crate::resolve::python::return_type)
         } else {
             None
         };
@@ -1438,6 +1569,30 @@ impl RepoIndex {
             TypeRef::External => cap(external("external_known"), prev_conf),
             TypeRef::Unknown => self.untyped(c),
         }
+    }
+
+    /// After a call from outside the repository nothing types the receiver:
+    /// a name the repository defines, or shaped like an accessor, stays
+    /// undecided (and reachable by name, DD-10); any other is
+    /// `chain_external`, `medium` (TASK-005 review, MAJOR 2).
+    pub(super) fn after_external(&self, c: &Call<'_>) -> Outcome {
+        let known = !self.candidates(c.callee, c.file, c.args).is_empty();
+        if known || accessor_shaped(c.callee) {
+            undecided()
+        } else {
+            external_medium("chain_external")
+        }
+    }
+
+    /// The value a receiver typed `X()` (`x = make()`, TASK-007) holds:
+    /// what calling `X` returns, by the file's language; `None` for a type
+    /// as written (`Foo`).
+    pub(super) fn value_of(&self, ty: &str, file: &str, ctx: Option<usize>) -> Option<ValueType> {
+        let path = ty.strip_suffix("()")?;
+        Some(match self.lang_key(file) {
+            Some("python") => self.py_value(path, file, ctx),
+            _ => ValueType::Unknown,
+        })
     }
 
     /// A Rust path call (`Foo::bar()` → `Foo.bar`, `std::fs::read()`).
@@ -1585,11 +1740,15 @@ pub fn link_rows(file: &str, pf: &ParsedFile) -> (Vec<LinkSymbol>, Vec<LinkEdge>
         .map(|e| edge(&e.kind, e.src_id, &e.target, e.hint.clone(), e.line))
         .collect();
     let file_id = pf.file_symbol.id;
+    let hint = |i: &crate::facts::ImportFact| match Lang::named(&pf.language) {
+        Some(l) => resolver_for(l).import_hint(i),
+        None => i.hint(),
+    };
     edges.extend(
         pf.facts
             .imports
             .iter()
-            .map(|i| edge(IMPORTS, file_id, &i.target, i.hint(), i.line)),
+            .map(|i| edge(IMPORTS, file_id, &i.target, hint(i), i.line)),
     );
     edges.extend(
         pf.facts

@@ -172,6 +172,9 @@ pub struct Scopes {
     /// A bare name can be a member of the enclosing class (Java); in
     /// TypeScript/JavaScript a member is only `this.x`.
     implicit_this: bool,
+    /// The language's resolver (literal types, fields typed by the link).
+    resolver: &'static dyn LangResolver,
+    lang: Lang,
     root: usize,
 }
 
@@ -186,7 +189,20 @@ struct Pending<'t> {
     init: Option<Node<'t>>,
     iter: Option<Node<'t>>,
     assign: bool,
+    /// Python `self.x = v`: an attribute of the instance, assigned in a
+    /// method (TASK-007).
+    attr: bool,
     member: bool,
+}
+
+/// One capture of the `types` query.
+struct Capture<'t> {
+    pattern: usize,
+    role: Option<&'t str>,
+    name: Node<'t>,
+    ty: Option<Node<'t>>,
+    init: Option<Node<'t>>,
+    iter: Option<Node<'t>>,
 }
 
 impl Scopes {
@@ -196,13 +212,15 @@ impl Scopes {
         bytes: &[u8],
         lang: Lang,
         query: Option<&Query>,
-        resolver: &dyn LangResolver,
+        resolver: &'static dyn LangResolver,
         injects: bool,
     ) -> Self {
         let mut out = Self {
             by_scope: HashMap::new(),
             scoped: !lang.scopes().is_empty(),
             implicit_this: resolver.implicit_this(),
+            resolver,
+            lang,
             root: root.id(),
         };
         let Some(query) = query else {
@@ -211,32 +229,82 @@ impl Scopes {
         let names = query.capture_names();
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(query, root, bytes);
-        let mut pending: Vec<Pending<'_>> = Vec::new();
+        let mut captures: Vec<Capture<'_>> = Vec::new();
         while let Some(m) = matches.next() {
-            let (mut name, mut ty, mut init, mut iter) = (None, None, None, None);
-            let mut role = None;
+            let mut c = Capture {
+                pattern: m.pattern_index,
+                role: None,
+                name: root,
+                ty: None,
+                init: None,
+                iter: None,
+            };
+            let mut named = false;
             for cap in m.captures {
                 match names[cap.index as usize] {
-                    "name" => name = Some(cap.node),
-                    "type" => ty = Some(cap.node),
-                    "init" => init = Some(cap.node),
-                    "iter" => iter = Some(cap.node),
-                    r => role = r.strip_prefix("bind.").or(role),
+                    "name" => {
+                        c.name = cap.node;
+                        named = true;
+                    }
+                    "type" => c.ty = Some(cap.node),
+                    "init" => c.init = Some(cap.node),
+                    "iter" => c.iter = Some(cap.node),
+                    r => c.role = r.strip_prefix("bind.").or(c.role),
                 }
             }
-            let Some(name_node) = name else { continue };
+            if named {
+                captures.push(c);
+            }
+        }
+        // One name node binds once per scope: of several patterns that
+        // capture it (Python `x: Foo = make()` is typed and initialised; a
+        // class attribute is also an assignment), the first in the query
+        // wins.
+        let scope_for = |c: &Capture<'_>, out: &Scopes| -> usize {
+            match c.role {
+                Some("func") => match c.name.parent() {
+                    Some(def) => out.scope_of(def, lang),
+                    None => out.scope_of(c.name, lang),
+                },
+                // A parameter property belongs to the class around its
+                // constructor, not to the constructor; a Python attribute to
+                // the class around its method.
+                Some("inject") | Some("attr") => {
+                    match enclosing_kind(c.name, lang.function_kinds()) {
+                        Some(func) => out.scope_of(func, lang),
+                        None => out.scope_of(c.name, lang),
+                    }
+                }
+                _ => out.scope_of(c.name, lang),
+            }
+        };
+        let mut first: HashMap<(usize, usize), usize> = HashMap::new();
+        for c in &captures {
+            let key = (c.name.id(), scope_for(c, &out));
+            first
+                .entry(key)
+                .and_modify(|p| *p = (*p).min(c.pattern))
+                .or_insert(c.pattern);
+        }
+        let mut pending: Vec<Pending<'_>> = Vec::new();
+        for c in &captures {
+            let scope = scope_for(c, &out);
+            if first.get(&(c.name.id(), scope)) != Some(&c.pattern) {
+                continue;
+            }
+            let (role, name_node, ty, init, iter) = (c.role, c.name, c.ty, c.init, c.iter);
             let Ok(text) = name_node.utf8_text(bytes) else {
                 continue;
             };
             let via = match role {
-                Some("field") => Via::Field,
+                Some("field") | Some("attr") => Via::Field,
                 Some("param") => Via::Param,
                 // A constructor parameter property (`constructor(private x:
                 // T)`): a field of the class, injected (rule 4).
                 Some("inject") => Via::CtorInject,
                 _ => Via::Local,
             };
-            let member = matches!(role, Some("field") | Some("inject"));
+            let member = matches!(role, Some("field") | Some("inject") | Some("attr"));
             // A function bound to the name: a `function f` (hoisted: in scope
             // from the start of the scope around its declaration) or a
             // `const f = () => …` (from its declaration; anywhere in the
@@ -249,10 +317,6 @@ impl Scopes {
                 )
             });
             if role == Some("func") || func_value {
-                let scope = match name_node.parent() {
-                    Some(def) if role == Some("func") => out.scope_of(def, lang),
-                    _ => out.scope_of(name_node, lang),
-                };
                 let at = if role == Some("func") || scope == out.root {
                     0
                 } else {
@@ -260,6 +324,11 @@ impl Scopes {
                         .parent()
                         .map_or(name_node.start_byte(), |p| p.start_byte())
                 };
+                // A function of a class body is its method (Python): never
+                // a bare name of the methods.
+                let in_class = out
+                    .scope_node(name_node.parent().unwrap_or(name_node), lang)
+                    .is_some_and(|n| lang.container_kinds().iter().any(|k| k == n.kind()));
                 out.push(
                     scope,
                     Binding {
@@ -267,7 +336,7 @@ impl Scopes {
                         ty: None,
                         via,
                         at,
-                        member,
+                        member: member || (role == Some("func") && in_class),
                         func: true,
                     },
                 );
@@ -277,19 +346,10 @@ impl Scopes {
                 .parent()
                 .map_or(name_node.start_byte(), |p| p.start_byte());
             let written = ty
-                .and_then(|t| t.utf8_text(bytes).ok())
-                .filter(|t| t.trim() != "var")
-                .and_then(TypeText::parse);
+                .filter(|t| t.utf8_text(bytes).is_ok_and(|t| t.trim() != "var"))
+                .and_then(|t| resolver.type_text(t, bytes));
             let assign = role == Some("assign");
-            // A parameter property belongs to the class around its
-            // constructor, not to the constructor.
-            let scope = match role {
-                Some("inject") => match enclosing_kind(name_node, lang.function_kinds()) {
-                    Some(func) => out.scope_of(func, lang),
-                    None => out.scope_of(name_node, lang),
-                },
-                _ => out.scope_of(name_node, lang),
-            };
+            let attr = role == Some("attr");
             if written.is_some() && !assign {
                 out.push(
                     scope,
@@ -313,6 +373,7 @@ impl Scopes {
                 init,
                 iter,
                 assign,
+                attr,
                 member,
             });
         }
@@ -321,9 +382,17 @@ impl Scopes {
                 out.inject(&p, bytes, lang);
                 continue;
             }
+            // `self.x = x` with `x` a typed parameter of `__init__`: injected,
+            // as Java's `this.x = x` (rule 4).
+            if p.attr && out.inject(&p, bytes, lang) {
+                continue;
+            }
             let inferred = p
                 .init
-                .and_then(|i| resolver.init_type(i, bytes))
+                .and_then(|i| match out.param_type(i, bytes) {
+                    Some(t) if p.attr => Some((t, Via::Field)),
+                    _ => resolver.init_type(i, bytes),
+                })
                 .or_else(|| {
                     let iterable = p.iter?;
                     let key = iterable.utf8_text(bytes).ok()?;
@@ -352,14 +421,52 @@ impl Scopes {
                 },
             );
         }
+        out.settle_members();
         out
+    }
+
+    /// Several typed assignments of one attribute that disagree (Python
+    /// `self.x = A()` here, `self.x = B()` there): none types it.
+    fn settle_members(&mut self) {
+        for bs in self.by_scope.values_mut() {
+            let mut types: HashMap<String, Option<TypeText>> = HashMap::new();
+            let mut clash: Vec<String> = Vec::new();
+            for b in bs.iter().filter(|b| b.member && b.via == Via::Field) {
+                let Some(t) = &b.ty else { continue };
+                match types.get(&b.name) {
+                    Some(Some(prev)) if prev != t => clash.push(b.name.clone()),
+                    Some(_) => {}
+                    None => {
+                        types.insert(b.name.clone(), Some(t.clone()));
+                    }
+                }
+            }
+            for b in bs
+                .iter_mut()
+                .filter(|b| b.member && b.via == Via::Field && clash.contains(&b.name))
+            {
+                b.ty = None;
+            }
+        }
+    }
+
+    /// The type of a typed parameter an initializer names (`self.repo =
+    /// repo` with `repo: Repo`).
+    fn param_type(&self, init: Node<'_>, bytes: &[u8]) -> Option<TypeText> {
+        if init.kind() != "identifier" {
+            return None;
+        }
+        let b = self.lookup(init, init.utf8_text(bytes).ok()?)?;
+        (b.via == Via::Param && !b.member)
+            .then(|| b.ty.clone())
+            .flatten()
     }
 
     /// `this.x = x` inside a constructor, where `x` is a typed parameter:
     /// the field `x` of the class is typed by it (rule 4).
-    fn inject(&mut self, p: &Pending<'_>, bytes: &[u8], lang: Lang) {
+    fn inject(&mut self, p: &Pending<'_>, bytes: &[u8], lang: Lang) -> bool {
         let Some(func) = enclosing_kind(p.name_node, lang.function_kinds()) else {
-            return;
+            return false;
         };
         let is_ctor = func.kind().contains("constructor")
             || func
@@ -367,17 +474,17 @@ impl Scopes {
                 .and_then(|n| n.utf8_text(bytes).ok())
                 .is_some_and(|n| n == "constructor" || n == "__init__");
         if !is_ctor {
-            return;
+            return false;
         }
-        let Some(init) = p.init else { return };
+        let Some(init) = p.init else { return false };
         let Ok(key) = init.utf8_text(bytes) else {
-            return;
+            return false;
         };
         let Some(param) = self.lookup(init, key) else {
-            return;
+            return false;
         };
         if param.via != Via::Param || param.ty.is_none() || param.member {
-            return;
+            return false;
         }
         let class_scope = self.scope_of(func, lang);
         // The field's declared type types it; the constructor only labels
@@ -400,6 +507,7 @@ impl Scopes {
                 func: false,
             },
         );
+        true
     }
 
     fn push(&mut self, scope: usize, b: Binding) {
@@ -412,6 +520,15 @@ impl Scopes {
             return self.root;
         }
         enclosing_kind(node, lang.scopes()).map_or(self.root, |n| n.id())
+    }
+
+    /// The innermost scope node around `node` (not `node` itself); `None`
+    /// at the file's own scope.
+    fn scope_node<'t>(&self, node: Node<'t>, lang: Lang) -> Option<Node<'t>> {
+        if !self.scoped {
+            return None;
+        }
+        enclosing_kind(node, lang.scopes())
     }
 
     /// What `name` is bound to where `at` uses it: the innermost scope around
@@ -440,6 +557,15 @@ impl Scopes {
             }
             cur = n.parent();
         }
+        // A module binding seen from inside a function (Python): the body
+        // runs after the module's assignments, whatever their position.
+        let use_at = if self.resolver.late_module_bindings()
+            && enclosing_kind(at, self.lang.scopes()).is_some()
+        {
+            usize::MAX
+        } else {
+            use_at
+        };
         self.by_scope
             .get(&self.root)
             .and_then(|bs| pick(bs, name, use_at, self.implicit_this))
@@ -457,6 +583,11 @@ impl Scopes {
         self.implicit_this
     }
 
+    /// The language's resolver.
+    pub fn resolver(&self) -> &'static dyn LangResolver {
+        self.resolver
+    }
+
     /// A field of the class around `at` (`this.x`): the innermost class-level
     /// binding, never a local or a parameter.
     pub fn field(&self, at: Node<'_>, name: &str) -> Option<&Binding> {
@@ -471,7 +602,14 @@ impl Scopes {
                 for b in bs.iter().filter(|b| b.name == name && b.member) {
                     match b.via {
                         Via::CtorInject => return Some(b),
-                        Via::Field if found.is_none() => found = Some(b),
+                        // A typed assignment over an untyped one (Python
+                        // `self.x = None` then `self.x = Foo()`).
+                        Via::Field
+                            if found.is_none()
+                                || (found.is_some_and(|f| f.ty.is_none()) && b.ty.is_some()) =>
+                        {
+                            found = Some(b)
+                        }
                         _ => {}
                     }
                 }

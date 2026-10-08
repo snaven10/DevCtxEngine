@@ -1528,8 +1528,13 @@ fn graph_rows(
         })
     });
     let facts = &parsed.facts;
+    let resolver =
+        devctx_parse::Lang::named(&parsed.language).map(devctx_parse::resolve::resolver_for);
     let imports = facts.imports.iter().map(|i| StoredSymbolEdge {
-        hint: i.hint(),
+        hint: match resolver {
+            Some(r) => r.import_hint(i),
+            None => i.hint(),
+        },
         ..edge(IMPORTS, file_id, &i.target, i.line)
     });
     let inherits = facts

@@ -2986,6 +2986,22 @@ public class Helper {
                  s.run();\n}\n",
             ),
         ]);
+        // Python (TASK-007): a package `__init__.py` re-exporting a class,
+        // and a module from a distribution the manifest comes to declare.
+        files.extend([
+            ("py/pkg/__init__.py", "from .a import Svc\n"),
+            ("py/pkg/a.py", PY_SVC),
+            ("py/pkg/b.py", PY_SVC),
+            (
+                "py/app.py",
+                "from pkg import Svc\n\n\ndef go():\n    Svc().run()\n",
+            ),
+            ("requirements.txt", "httpx\n"),
+            (
+                "py/net.py",
+                "import requests\n\n\ndef go():\n    requests.get(\"u\")\n",
+            ),
+        ]);
         files.extend(LINK_FILLER);
         files.extend([
             ("g1.py", "def g1():\n    pass\n"),
@@ -2996,7 +3012,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 10] = [
+        let steps: [(&str, &str, &str, &str, i32); 12] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -3081,6 +3097,24 @@ public class Helper {
                 "g",
                 3,
             ),
+            // A package `__init__.py` re-exports `Svc` from the other module:
+            // it defines no name, so only the importers rule reaches `app.py`.
+            (
+                "py/pkg/__init__.py",
+                "from .b import Svc\n",
+                "py/app.py",
+                "run",
+                5,
+            ),
+            // The manifest declares `requests`: no source changes, only the
+            // environment rule (a full pass) makes `requests.get` external.
+            (
+                "requirements.txt",
+                "httpx\nrequests\n",
+                "py/net.py",
+                "get",
+                5,
+            ),
         ];
         // Each scenario on a branch of its own, so every one is judged (and
         // reported) whatever the others do.
@@ -3106,7 +3140,13 @@ public class Helper {
             write(&dir, file, text);
             commit_all(&dir, file);
             let inc = index_with(&store, &dir, false, None);
-            assert_eq!(inc.files_indexed, 1, "{file}: {inc:?}");
+            // A manifest may be no indexed file of its own (`.toml`, `.txt`).
+            let unindexed = [".toml", ".txt", "go.mod", ".cfg"]
+                .iter()
+                .any(|e| file.ends_with(e));
+            if !unindexed {
+                assert_eq!(inc.files_indexed, 1, "{file}: {inc:?}");
+            }
             let after = watched(&store);
             if before == after {
                 failures.push(format!(
@@ -3122,6 +3162,7 @@ public class Helper {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
+    const PY_SVC: &str = "class Svc:\n    def run(self):\n        pass\n";
     const TS_FOO: &str = "export class Foo {\n  g(): void {}\n}\n";
     const TS_SVC: &str = "export class Svc {\n  run(): void {}\n}\n";
     const TS_CONFIG_A: &str =
@@ -3562,15 +3603,18 @@ public class Helper {
 
     /// DD-6 mode (b) by name: an edge that is resolved and points at a
     /// symbol that still exists is re-resolved when a written file adds a
-    /// symbol named like its destination — here a second `util_fn`, which
-    /// makes the unique name ambiguous. Only `c.py` is indexed; `a.py`'s
+    /// symbol named like its destination — here a second `utilFn`, which
+    /// makes the unique name ambiguous. Only `c.ts` is indexed; `a.ts`'s
     /// row is neither dangling nor undecided, so nothing but the name picks
     /// it.
     #[test]
     fn an_added_homonym_reopens_a_resolved_edge_by_name() {
+        // A free name of a script nothing imports (TypeScript keeps rule 7 for
+        // it; Python no longer does, TASK-007: a name Python cannot see is
+        // undecided).
         let mut files = vec![
-            ("a.py", "def go():\n    util_fn()\n"),
-            ("b.py", "def util_fn():\n    pass\n"),
+            ("a.ts", "export function go(): void {\n  utilFn();\n}\n"),
+            ("b.ts", "export function utilFn(): void {}\n"),
         ];
         files.extend(LINK_FILLER);
         let (dir, repo) = graph_repo("linkname", &files);
@@ -3578,10 +3622,10 @@ public class Helper {
         index_branch(&store, &dir, "main", true);
         let edge = |store: &Store| {
             store
-                .file_symbol_edges(&repo, "main", "a.py")
+                .file_symbol_edges(&repo, "main", "a.ts")
                 .unwrap()
                 .into_iter()
-                .find(|e| e.kind == "calls" && e.dst_name == "util_fn")
+                .find(|e| e.kind == "calls" && e.dst_name == "utilFn")
                 .unwrap()
         };
         let first = edge(&store);
@@ -3589,7 +3633,7 @@ public class Helper {
         assert_eq!(first.confidence.as_deref(), Some("medium"));
         assert!(first.dst_id.is_some());
 
-        write(&dir, "c.py", "def util_fn():\n    pass\n");
+        write(&dir, "c.ts", "export function utilFn(): void {}\n");
         commit_all(&dir, "a homonym");
         let inc = index_branch(&store, &dir, "main", false);
         assert_eq!(inc.files_indexed, 1, "{inc:?}");

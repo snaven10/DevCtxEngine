@@ -16,6 +16,7 @@
 pub mod env;
 pub mod java;
 pub mod link;
+pub mod python;
 pub mod scope;
 pub mod typescript;
 
@@ -77,6 +78,43 @@ pub trait LangResolver: Sync {
     fn implicit_this(&self) -> bool {
         true
     }
+
+    /// Whether an attribute of `self`/`this` no scope binds is a field the
+    /// link pass types by its declaration (`member x this`): Rust and Go
+    /// declare fields apart from the methods, Python assigns them anywhere.
+    /// Java and TypeScript read such a name as before (TASK-005/006).
+    fn fields_by_link(&self) -> bool {
+        false
+    }
+
+    /// Whether a binding of the module's own scope is seen from inside a
+    /// function whatever its position (Python: a function body runs after
+    /// the module's assignments).
+    fn late_module_bindings(&self) -> bool {
+        false
+    }
+
+    /// The type a literal receiver of node kind `kind` has (`"x".equals` →
+    /// `String`).
+    fn literal_type(&self, kind: &str) -> Option<&'static str> {
+        match kind {
+            "string_literal" => Some("String"),
+            "class_literal" => Some("Class"),
+            _ => None,
+        }
+    }
+
+    /// A type as written in a declaration (`node`), reduced to what a
+    /// lookup needs.
+    fn type_text(&self, node: Node<'_>, bytes: &[u8]) -> Option<scope::TypeText> {
+        scope::TypeText::parse(node.utf8_text(bytes).ok()?)
+    }
+
+    /// What the `imports` edge of `imp` keeps besides its destination
+    /// (`edges.hint`).
+    fn import_hint(&self, imp: &ImportFact) -> Option<String> {
+        imp.hint()
+    }
 }
 
 /// The resolver of `lang`.
@@ -84,7 +122,7 @@ pub fn resolver_for(lang: Lang) -> &'static dyn LangResolver {
     match lang.key() {
         "java" => &java::Java,
         "typescript" | "tsx" | "javascript" => &Script,
-        "python" => &Python,
+        "python" => &python::Python,
         "rust" => &Rust,
         "go" => &Go,
         _ => &Generic,
@@ -92,7 +130,7 @@ pub fn resolver_for(lang: Lang) -> &'static dyn LangResolver {
 }
 
 /// `path` without its last extension (`src/a.ts` → `src/a`).
-fn strip_extension(path: &str) -> &str {
+pub(crate) fn strip_extension(path: &str) -> &str {
     match path.rsplit_once('.') {
         Some((stem, _)) if !stem.is_empty() && !stem.ends_with('/') => stem,
         _ => path,
@@ -258,49 +296,6 @@ fn class_name(class: Node<'_>, bytes: &[u8]) -> String {
         .and_then(|n| n.utf8_text(bytes).ok())
         .unwrap_or_default()
         .to_string()
-}
-
-struct Python;
-
-impl LangResolver for Python {
-    /// `pkg/sub/mod.py` → `pkg.sub.mod`; a package's `__init__.py` is the
-    /// package itself.
-    fn package_from_path(&self, path: &str) -> Option<String> {
-        let stem = strip_extension(path);
-        let stem = stem
-            .strip_suffix("/__init__")
-            .or_else(|| (stem == "__init__").then_some(""))
-            .unwrap_or(stem);
-        Some(stem.replace('/', "."))
-    }
-
-    /// No leading `_` (a dunder is public), and not nested in a function:
-    /// a decorator's `wrapper` is no name of its module.
-    fn exported(&self, def: Node<'_>, name: &str, _bytes: &[u8]) -> Option<bool> {
-        let mut cur = def.parent();
-        while let Some(n) = cur {
-            if n.kind() == "function_definition" {
-                return Some(false);
-            }
-            cur = n.parent();
-        }
-        Some(!name.starts_with('_') || (name.starts_with("__") && name.ends_with("__")))
-    }
-
-    fn import_target(&self, imp: &ImportFact) -> String {
-        let join = |tail: &str| {
-            if imp.path.chars().all(|c| c == '.') {
-                format!("{}{tail}", imp.path) // `from . import x` → `.x`
-            } else {
-                format!("{}.{tail}", imp.path)
-            }
-        };
-        match (&imp.name, imp.wildcard) {
-            (_, true) => join("*"),
-            (Some(n), false) => join(n),
-            (None, false) => imp.path.clone(),
-        }
-    }
 }
 
 struct Rust;

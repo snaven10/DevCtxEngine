@@ -68,7 +68,13 @@ pub struct LangDef {
     /// iterates, whose element it binds); the declaration as
     /// `@bind.field`/`@bind.param`/`@bind.local` (how an edge it types is
     /// resolved), or `@bind.assign` for a `this.x = x` whose right side is a
-    /// constructor parameter. Absent for untyped languages.
+    /// constructor parameter; `@bind.inject` for a constructor parameter
+    /// property, `@bind.func` for a function bound to its name (a function
+    /// of a class body is its method, no bare name), `@bind.attr` for a
+    /// Python `self.x = v` in a method (an attribute of the class, typed by
+    /// `v`). A capture named `@_x` is only a predicate's. Of several
+    /// patterns capturing one name in one scope, the first in the query
+    /// wins. Absent for untyped languages.
     #[serde(default)]
     pub types: Option<String>,
     /// Node kinds that open a lexical scope for those declarations (a class
@@ -115,6 +121,11 @@ pub struct LangDef {
     /// `java.lang` types): evidence for `external` too.
     #[serde(default)]
     pub builtins: Vec<String>,
+    /// Top-level modules of the platform (Python's standard library, Rust's
+    /// `std`/`core`/`alloc`): an import whose first segment is one of them is
+    /// from outside the repository (PLAN-009 TASK-007, DD-9).
+    #[serde(default)]
+    pub platform_modules: Vec<String>,
 }
 
 impl LangDef {
@@ -210,6 +221,14 @@ const SOURCES: &[&str] = &[
 /// 11: TASK-006 second review — a receiver bound to a function or a class
 /// (`fn.call()`, `Klass.make()` with `const Klass = class {…}`) is that
 /// name, not an untyped value.
+/// 12: Python `types` and `scopes` (PLAN-009 TASK-007): parameters, lambda
+/// and comprehension variables, loop and `with`/`except` targets are
+/// bindings that shadow attributes; `self.x = v` in a method types the
+/// attribute (`ctor_inject` from a typed parameter of `__init__`, else by
+/// `v`: `x = Foo()` and `x = make()` hold what calling it returns, `typed
+/// <via> Foo()`); an attribute no scope binds is `member x this`; a literal
+/// receiver is its builtin type; `super().m()` is `super`; a module binding
+/// is seen from any function; a `from … import` row's hint says `from`.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -217,7 +236,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 11;
+pub const EXTRACTOR_VERSION: u32 = 12;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
@@ -328,6 +347,7 @@ mod tests {
         "bind.assign",
         "bind.inject",
         "bind.func",
+        "bind.attr",
     ];
     const IMPORT_CAPTURES: &[&str] = &[
         "import",
@@ -394,7 +414,9 @@ mod tests {
                 // A capture the parser does not read is a typo that would
                 // silently match nothing useful.
                 for name in query.capture_names() {
+                    // `@_x`: only a predicate reads it (`#eq? @_self "self"`).
                     let known = allowed.contains(name)
+                        || name.starts_with('_')
                         || (label == "definitions"
                             && name
                                 .strip_prefix("definition.")

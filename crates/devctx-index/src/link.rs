@@ -14,9 +14,10 @@
 //! exists (its `dst_id` is gone: a deleted or renamed symbol) or whose
 //! destination's last segment names a symbol of a written file (an added
 //! one), (c) those that stayed unresolved, and (d) every edge of a
-//! TypeScript/JavaScript file importing a written file, directly or through
-//! barrels re-exporting it (what an import binds can change though no name
-//! of the written file does: a barrel's `export … from` moved). A different
+//! TypeScript/JavaScript or Python file importing a written file, directly or
+//! through barrels re-exporting it (what an import binds can change though no
+//! name of the written file does: a barrel's `export … from` moved, a
+//! package `__init__.py`'s `from .a import X`). A different
 //! link environment — `tsconfig` aliases, `package.json`, `Cargo.toml`,
 //! `go.mod`, Python manifests (`crate::env`) — relinks the branch in full. When the written files are
 //! more than a fifth of the branch, every edge is (the full pass). A file is
@@ -35,7 +36,7 @@ use crate::error::Result;
 /// module): what the branch's edges were resolved under. A build with other
 /// rules relinks the branch in full on its next run, as the extractor
 /// version does for the parse.
-pub(crate) const LINK_VERSION: &str = "6";
+pub(crate) const LINK_VERSION: &str = "7";
 
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
@@ -126,6 +127,9 @@ fn hint_names(hint: &str) -> Vec<&str> {
     loop {
         match rest {
             ["typed", _via, ty, ..] => {
+                // What a call returns (`make()`, TASK-007): the callee's path.
+                let ty = ty.strip_suffix('?').unwrap_or(ty);
+                let ty = ty.strip_suffix("()").unwrap_or(ty);
                 out.extend(ty.split('.'));
                 break;
             }
@@ -252,9 +256,10 @@ pub(crate) fn link_branch(
     // their members inherit). An edge is reopened when its `dst_name` or a
     // token of its `hint` (the receiver's type, a chain's previous callee)
     // is one of those names, or when its source sits in one of those types.
-    // (d) TypeScript/JavaScript files importing a written one (or a barrel
-    // re-exporting it): every edge, since what an import binds can change
-    // without any name of the written file changing. With them the
+    // (d) TypeScript/JavaScript and Python files importing a written one
+    // (or a barrel, any Python module, re-exporting it): every edge, since
+    // what an import binds can change without any name of the written file
+    // changing (a package `__init__.py` that re-exports another module). With them the
     // selection can exceed the full-pass threshold: then the full pass.
     let mut importers = if full {
         HashSet::new()
@@ -422,6 +427,11 @@ mod tests {
             ["item", "owner", "H"]
         );
         assert_eq!(hint_names("anon Runnable bare"), ["Runnable"]);
+        assert_eq!(hint_names("typed local mod.make() /1"), ["mod", "make"]);
+        assert_eq!(
+            hint_names("typed field Store.open()? /0"),
+            ["Store", "open"]
+        );
         assert!(hint_names("bare /2").is_empty());
     }
 }
