@@ -41,5 +41,5 @@ legacy-migration|FileG|FileF.f11|-|`from . import mod` (homónimo de la stdlib)|
 legacy-migration|FileH|ClassA.m2|-|script en la raíz: `x = ClassA(...)` a nivel de módulo y `x.m()`|undecided low/name_only|correct high/local
 legacy-migration|FileH|FileA.f9|-|script en la raíz: import absoluto del paquete|correct medium/unique_name|correct high/import
 legacy-migration|FileH|FileG.f12|-|ídem, otra función|correct medium/unique_name|correct high/import
-legacy-migration|FileJ|psycopg.connect|external|import de un paquete declarado con su nombre exacto (`psycopg[binary]`)|undecided low/name_only|correct high/external_known
+legacy-migration|FileJ|pkgA.connect|external|import de un paquete declarado con su nombre exacto y un extra (`pkgA[extra]`)|undecided low/name_only|correct high/external_known
 legacy-migration|FileK|fcntl.flock|external|módulo de la stdlib sin homónimo en el repo|undecided low/name_only|correct high/external_known
