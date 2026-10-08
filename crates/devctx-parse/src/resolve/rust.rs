@@ -1441,7 +1441,12 @@ impl RepoIndex {
             }
             RsRes::Item(k, sure) if self.syms[k].kind == "const" => {
                 let ks = &self.syms[k];
-                let Some(ty) = ks.signature.as_deref().and_then(field_type) else {
+                // `pub const C: Svc = Svc;`: the type before the value.
+                let decl = ks
+                    .signature
+                    .as_deref()
+                    .map(|s| s.split(" =").next().unwrap_or(s));
+                let Some(ty) = decl.and_then(field_type) else {
                     return self.untyped(c);
                 };
                 match self.rs_type(&ty.base, &ks.file, Some(k)) {
@@ -1631,6 +1636,35 @@ impl RepoIndex {
         out.sort();
         out.dedup();
         Some((out, uses.iter().any(|u| u.reexport)))
+    }
+
+    /// Whether a Rust path call's prefix (`std::fs`, `serde_json`) starts
+    /// with the platform or a crate declared from outside, directly — no
+    /// item, child module or `use` of the file by that name: its answer then
+    /// depends only on the environment (second review, N1).
+    pub fn rs_external_root(&self, file: &str, prefix: &str) -> bool {
+        let first = prefix.split("::").next().unwrap_or(prefix);
+        if matches!(first, "crate" | "self" | "super" | "Self") {
+            return false;
+        }
+        let bound = self.rs.uses.get(file).is_some_and(|u| {
+            u.iter()
+                .any(|u| u.glob || u.local.as_deref() == Some(first))
+        });
+        if bound {
+            return false;
+        }
+        let module = self.rs.file_module.get(file).cloned().unwrap_or_default();
+        if !matches!(self.rs_item(&module, first, 0), RsRes::Missing) {
+            return false;
+        }
+        if self
+            .lang_of(file)
+            .is_some_and(|l| l.def().platform_modules.iter().any(|m| m == first))
+        {
+            return true;
+        }
+        matches!(self.rs_crate_ref(file, first), Some(RsRes::External))
     }
 
     /// The names the `use`s of a Rust file bind and the segments of their

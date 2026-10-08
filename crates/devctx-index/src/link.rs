@@ -36,7 +36,7 @@ use crate::error::Result;
 /// module): what the branch's edges were resolved under. A build with other
 /// rules relinks the branch in full on its next run, as the extractor
 /// version does for the parse.
-pub(crate) const LINK_VERSION: &str = "13";
+pub(crate) const LINK_VERSION: &str = "14";
 
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
@@ -170,7 +170,9 @@ fn hint_names(hint: &str) -> Vec<&str> {
 fn types_a_chain(s: &devctx_store::StoredSymbol) -> bool {
     use devctx_parse::resolve::{go, java, python, rust, typescript};
     let class = devctx_core::symbol_id::kind_class(&s.kind);
-    if class == "type" || s.kind == "field" {
+    // A `const`/`static`/module variable is typed by its declaration too
+    // (second review, N2).
+    if class == "type" || s.kind == "field" || s.kind == "const" {
         return true;
     }
     if class != "callable" {
@@ -329,8 +331,21 @@ pub(crate) fn link_branch(
         // the `use`s that reach it, which the full pass on a new environment,
         // mode (a) and mode (d) cover: no name of a written file changes it
         // (TASK-007 review, performance).
-        if e.external == Some(true) && e.hint.as_deref().is_some_and(|h| h.starts_with("path ")) {
-            return false;
+        // Only an `external_known` path whose first segment names the
+        // platform or a crate from outside directly (not a derivable's
+        // `inherited`, not a path through a repository module or a `use`):
+        // second review, N1.
+        if e.external == Some(true) && e.resolution.as_deref() == Some("external_known") {
+            if let Some(prefix) = e
+                .hint
+                .as_deref()
+                .and_then(|h| h.strip_prefix("path "))
+                .and_then(|h| h.split_whitespace().next())
+            {
+                if index.rs_external_root(&e.file, prefix) {
+                    return false;
+                }
+            }
         }
         fresh.contains(dst_key(e))
             || e.hint

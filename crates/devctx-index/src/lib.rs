@@ -3033,7 +3033,7 @@ public class Helper {
             ("rs/Cargo.toml", "[package]\nname = \"rlib\"\n"),
             (
                 "rs/src/lib.rs",
-                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod ops2;\npub mod pre;\npub use a::Svc;\n",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod ops2;\npub mod ops3;\npub mod pre;\npub mod sub;\npub mod util2;\npub use a::Svc;\n",
             ),
             // A method in an `impl` of another file; a glob of a prelude
             // that re-exports a type from `std`.
@@ -3046,6 +3046,29 @@ public class Helper {
                 "use crate::a::Svc;\n\npub fn go(s: Svc) {\n    s.save();\n}\n",
             ),
             ("rs/src/pre.rs", "pub use std::collections::HashMap as Map;\n"),
+            // Second review: a missing derivable (external, `medium`) until an
+            // `impl` of another file defines it; a function re-exported from
+            // `std` until the module defines its own; a `const` of an
+            // importer typed by a re-exported type.
+            ("rs/src/ops3.rs", "use crate::a::Svc;\n"),
+            (
+                "rs/src/g.rs",
+                "use crate::a::Svc;\n\npub fn go() {\n    Svc::default();\n}\n",
+            ),
+            ("rs/src/util2.rs", "pub use std::mem::take;\n"),
+            (
+                "rs/src/h.rs",
+                "pub fn go(v: &mut i32) {\n    crate::util2::take(v);\n}\n",
+            ),
+            ("rs/src/sub/mod.rs", "pub mod k;\npub mod m;\n"),
+            (
+                "rs/src/sub/k.rs",
+                "use crate::Svc;\n\npub const C: Svc = Svc;\n",
+            ),
+            (
+                "rs/src/sub/m.rs",
+                "use super::k::C;\n\npub fn go() {\n    C.run();\n}\n",
+            ),
             (
                 "rs/src/f.rs",
                 "use crate::pre::*;\n\npub fn go() {\n    Map::new();\n}\n",
@@ -3092,7 +3115,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 21] = [
+        let steps: [(&str, &str, &str, &str, i32); 24] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -3214,7 +3237,7 @@ public class Helper {
             // crate root) reaches `c.rs`.
             (
                 "rs/src/lib.rs",
-                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod ops2;\npub mod pre;\npub use b::Svc;\n",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod ops2;\npub mod ops3;\npub mod pre;\npub mod sub;\npub mod util2;\npub use b::Svc;\n",
                 "rs/src/c.rs",
                 "Svc.run",
                 4,
@@ -3224,10 +3247,36 @@ public class Helper {
             // one of them.
             (
                 "rs/src/lib.rs",
-                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod ops2;\npub mod pre;\npub use b::Svc;\n",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod ops2;\npub mod ops3;\npub mod pre;\npub mod sub;\npub mod util2;\npub use b::Svc;\n",
                 "rs/src/c.rs",
                 "crate::Svc",
                 1,
+            ),
+            // Second review N1(a): `impl Default` in another file; the call
+            // was external (`inherited` `medium`): only its name reaches it.
+            (
+                "rs/src/ops3.rs",
+                "use crate::a::Svc;\n\nimpl Default for Svc {\n    fn default() -> Self {\n        Svc\n    }\n}\n",
+                "rs/src/g.rs",
+                "Svc.default",
+                4,
+            ),
+            // N1(b): the module defines its own `take` instead of re-exporting
+            // `std`'s: a path through a repository module, reopened by name.
+            (
+                "rs/src/util2.rs",
+                "pub fn take(_v: &mut i32) -> i32 {\n    0\n}\n",
+                "rs/src/h.rs",
+                "crate::util2::take",
+                2,
+            ),
+            // N2: an importer's `const` is typed by the re-exported type.
+            (
+                "rs/src/lib.rs",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod ops2;\npub mod ops3;\npub mod pre;\npub mod sub;\npub mod util2;\npub use b::Svc;\n",
+                "rs/src/sub/m.rs",
+                "C.run",
+                4,
             ),
             // Review: an `impl` of another file loses `save`; `e.rs` has no
             // `use` of it, and only its gone destination reaches it.
