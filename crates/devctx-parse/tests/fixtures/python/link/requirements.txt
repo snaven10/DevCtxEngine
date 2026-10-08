@@ -1,3 +1,5 @@
 # Declared distributions: their modules are packages from outside.
 requests>=2.31
 PyYAML>=6.0
+# Its modules are `python_utils`: `utils` is only a guess.
+python-utils>=3

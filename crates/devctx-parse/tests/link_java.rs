@@ -476,12 +476,16 @@ fn a_duplicated_fully_qualified_type_is_not_high() {
 }
 
 /// MINOR: outside Java a type found only by being the one of its name is
-/// `medium`, and so is what is typed by it.
+/// `medium`, and so is what is typed by it. (TypeScript: Python no longer
+/// takes a type it cannot see by its name, TASK-007.)
 #[test]
 fn a_unique_name_type_does_not_make_a_typed_call_high() {
     let l = link_sources(&[
-        ("a.py", "def f(repo: Repo):\n    repo.load()\n"),
-        ("b.py", "class Repo:\n    def load(self):\n        pass\n"),
+        (
+            "a.ts",
+            "export function f(repo: Repo): void {\n  repo.load();\n}\n",
+        ),
+        ("b.ts", "export class Repo {\n  load(): void {}\n}\n"),
     ]);
     let (dst, conf, _, _) = l.show(&l.call("f", "Repo.load"));
     assert_eq!((dst.as_deref(), conf), (Some("Repo.load"), "medium"));

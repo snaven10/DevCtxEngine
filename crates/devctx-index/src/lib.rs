@@ -2997,6 +2997,15 @@ public class Helper {
                 "from pkg import Svc\n\n\ndef go():\n    Svc().run()\n",
             ),
             ("requirements.txt", "httpx\n"),
+            // Review P2: `import pkg.sub` binds `pkg`; a script beside a
+            // directory that becomes a package.
+            ("pp/pkg/__init__.py", "from .inner.x import f\n"),
+            ("pp/pkg/inner/x.py", "def f():\n    pass\n"),
+            ("pp/pkg/inner/y.py", "def f():\n    pass\n"),
+            ("pp/pkg/sub.py", "def s():\n    pass\n"),
+            ("pp/use.py", "import pkg.sub\n\n\ndef go():\n    pkg.f()\n"),
+            ("sc/helper.py", "def assist():\n    pass\n"),
+            ("sc/run.py", "import helper\n\nhelper.assist()\n"),
             (
                 "py/net.py",
                 "import requests\n\n\ndef go():\n    requests.get(\"u\")\n",
@@ -3052,7 +3061,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 15] = [
+        let steps: [(&str, &str, &str, &str, i32); 17] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -3155,6 +3164,20 @@ public class Helper {
                 "get",
                 5,
             ),
+            // `pkg/__init__.py` re-exports `f` from the other module: only
+            // `pkg/__init__.py` in the reach of `import pkg.sub` reaches
+            // `use.py`.
+            (
+                "pp/pkg/__init__.py",
+                "from .inner.y import f\n",
+                "pp/use.py",
+                "f",
+                5,
+            ),
+            // `sc/` becomes a package: the script's own directory is no
+            // root any more, and only the rule that a written
+            // `__init__.py` reopens its directory reaches `run.py`.
+            ("sc/__init__.py", "X = 1\n", "sc/run.py", "assist", 3),
             // The crate root re-exports `Svc` from the other module: it
             // defines no `Svc`, so only the importers rule (a `use` of the
             // crate root) reaches `c.rs`.

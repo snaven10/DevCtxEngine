@@ -533,6 +533,25 @@ impl RepoIndex {
                 Some((file, paths, reexports))
             })
             .collect();
+        // A Python `__init__.py` written (added, deleted, changed) makes its
+        // directory a package or not: the roots of the scripts there move
+        // (review P2).
+        for w in written
+            .iter()
+            .filter(|w| w.rsplit('/').next() == Some("__init__.py"))
+        {
+            let dir = crate::resolve::typescript::dir_of(w);
+            out.extend(
+                self.files
+                    .keys()
+                    .filter(|f| {
+                        crate::resolve::typescript::dir_of(f) == dir
+                            && self.lang_key(f) == Some("python")
+                            && f.as_str() != w.as_str()
+                    })
+                    .cloned(),
+            );
+        }
         let mut frontier: HashSet<String> = written.clone();
         for _ in 0..=crate::resolve::typescript::BARREL_DEPTH {
             let mut next = HashSet::new();
@@ -1401,6 +1420,9 @@ impl RepoIndex {
             }
             TypeRef::External if !statik => external("external_known"),
             _ if statik => self.untyped(c),
+            // Python: a type nothing resolves (a `TypeVar`, an import not
+            // followed) types nothing; never a guess by name (review P1).
+            _ if self.lang_key(c.file) == Some("python") => self.untyped(c),
             _ => self.by_name_only_low(c),
         }
     }

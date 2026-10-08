@@ -166,10 +166,18 @@ pub fn type_text(text: &str) -> Option<TypeText> {
     if t.is_empty() {
         return None;
     }
+    // `Any` and `object` type nothing (review P1).
+    let short = t.rsplit('.').next().unwrap_or(t);
+    if matches!(short, "Any" | "object") {
+        return None;
+    }
     let members: Vec<&str> = split_top(t, '|')
         .into_iter()
         .filter(|m| *m != "None")
         .collect();
+    if members.len() > 1 {
+        return None; // `A | B`: no one type
+    }
     if members.len() == 1 && members[0] != t {
         return type_text(members[0]);
     }
@@ -185,8 +193,13 @@ pub fn type_text(text: &str) -> Option<TypeText> {
             short,
             "Optional" | "Annotated" | "Final" | "ClassVar" | "Required"
         ) || (short == "Union" && args.len() == 1)
+            // `type[X]`: the class itself, whose members a call reaches.
+            || matches!(short, "type" | "Type")
         {
             return type_text(args.first()?);
+        }
+        if short == "Union" {
+            return None; // several types
         }
         let elem = args.first().and_then(|a| type_text(a)).map(|e| e.base);
         return Some(TypeText {
@@ -341,6 +354,18 @@ enum PyExport {
     Unknown,
 }
 
+/// What says a top-level module is from outside the repository (review P3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// A manifest declares it under that exact (normalised or aliased) name.
+    Declared,
+    /// Only a name guessed from a declared distribution.
+    Guessed,
+    /// The standard library.
+    Stdlib,
+    None,
+}
+
 /// Memo of module lookups and exports.
 #[derive(Default)]
 pub(super) struct PyCache {
@@ -412,18 +437,14 @@ impl RepoIndex {
         roots
     }
 
-    /// Whether the top-level module `top`, imported in `from`, is from
-    /// outside the repository with evidence: the standard library, or a
-    /// distribution the root Python manifests or the nearest one declare
-    /// — and no manifest names the project itself so.
-    fn py_external(&self, from: &str, top: &str) -> bool {
-        if let Some(l) = self.lang_of(from) {
-            if l.def().platform_modules.iter().any(|m| m == top) {
-                return true;
-            }
-        }
+    /// What says the top-level module `top`, imported in `from`, is from
+    /// outside the repository: a distribution the root Python manifests or
+    /// the nearest one declare under that exact name (or a known alias), a
+    /// name only guessed from one (`python-utils` → `utils`), the standard
+    /// library — and nothing when a manifest names the project itself so.
+    fn py_external(&self, from: &str, top: &str) -> Evidence {
         if self.python.iter().any(|m| m.name.as_deref() == Some(top)) {
-            return false;
+            return Evidence::None;
         }
         let d = dir_of(from);
         let nearest = self
@@ -432,10 +453,24 @@ impl RepoIndex {
             .filter(|m| contains(&m.dir, d))
             .map(|m| m.dir.len())
             .max();
-        self.python
+        let mine: Vec<&crate::resolve::env::PyManifest> = self
+            .python
             .iter()
             .filter(|m| m.dir.is_empty() || Some(m.dir.len()) == nearest && contains(&m.dir, d))
-            .any(|m| m.deps.binary_search_by(|x| x.as_str().cmp(top)).is_ok())
+            .collect();
+        let has = |list: &Vec<String>| list.binary_search_by(|x| x.as_str().cmp(top)).is_ok();
+        if mine.iter().any(|m| has(&m.deps)) {
+            return Evidence::Declared;
+        }
+        if mine.iter().any(|m| has(&m.guessed)) {
+            return Evidence::Guessed;
+        }
+        if let Some(l) = self.lang_of(from) {
+            if l.def().platform_modules.iter().any(|m| m == top) {
+                return Evidence::Stdlib;
+            }
+        }
+        Evidence::None
     }
 
     /// The module `spec` names when `from` imports it.
@@ -469,19 +504,33 @@ impl RepoIndex {
                 }
                 base = dir_of(&base).to_string();
             }
+            // `from .. import x` must stay inside a package: past the top
+            // one is no module (review).
+            if dots > 1 && !self.files.contains_key(&join(&base, "__init__.py")) {
+                return PyMod::Unknown;
+            }
             return self.py_probe(&join(&base, &rel)).unwrap_or(PyMod::Unknown);
         }
         let top = rest.split('.').next().unwrap_or(rest);
         if top.is_empty() {
             return PyMod::Unknown;
         }
-        if self.py_external(from, top) {
-            return PyMod::External;
-        }
-        self.py_roots(from)
+        let repo = self
+            .py_roots(from)
             .iter()
-            .find_map(|r| self.py_probe(&join(r, &rel)))
-            .unwrap_or(PyMod::Unknown)
+            .find_map(|r| self.py_probe(&join(r, &rel)));
+        match self.py_external(from, top) {
+            Evidence::Declared => PyMod::External,
+            // A guessed distribution name the repository has a module of:
+            // the repository's (review P3).
+            Evidence::Guessed if repo.is_some() => repo.unwrap_or(PyMod::Unknown),
+            // A standard library name the repository also has (a script's
+            // own directory shadows it, a package's import does not):
+            // undecided.
+            Evidence::Stdlib if repo.is_some() => PyMod::Unknown,
+            Evidence::Guessed | Evidence::Stdlib => PyMod::External,
+            Evidence::None => repo.unwrap_or(PyMod::Unknown),
+        }
     }
 
     /// Every path an import of `from` may name, for the incremental
@@ -499,6 +548,15 @@ impl RepoIndex {
             self.py_roots(from).iter().map(|r| join(r, &rel)).collect()
         };
         let mut out = Vec::new();
+        let base_of = |b: &str| -> String {
+            // The root the module path was joined to.
+            let n = rel.split('/').filter(|x| !x.is_empty()).count();
+            let mut d = b.to_string();
+            for _ in 0..n {
+                d = dir_of(&d).to_string();
+            }
+            d
+        };
         for b in bases {
             let mut push = |p: &str| {
                 out.push(format!("{p}.py"));
@@ -508,6 +566,13 @@ impl RepoIndex {
             push(&b);
             if let Some(n) = &imp.name {
                 push(&join(&b, n));
+            }
+            // Every package on the way (`import pkg.sub` binds `pkg`, whose
+            // `__init__.py` is what `pkg.f()` reads: review P2).
+            let mut prefix = base_of(&b);
+            for seg in rel.split('/').filter(|x| !x.is_empty()) {
+                prefix = join(&prefix, seg);
+                out.push(join(&prefix, "__init__.py"));
             }
         }
         out
@@ -645,7 +710,22 @@ impl RepoIndex {
             .iter()
             .rev()
             .find(|i| i.local.as_deref() == Some(local))?;
-        Some(match &imp.name {
+        // Bound by two imports (`try: … except ImportError: …`): neither is
+        // sure (review).
+        let twice = self
+            .py_imports(file)
+            .iter()
+            .filter(|i| i.local.as_deref() == Some(local))
+            .count()
+            > 1;
+        Some(match self.py_binding_of(file, imp) {
+            PySym::Sym(i, how, _) if twice => PySym::Sym(i, how, false),
+            other => other,
+        })
+    }
+
+    fn py_binding_of(&self, file: &str, imp: &PyImport) -> PySym {
+        match &imp.name {
             Some(n) => match self.py_module(file, &imp.module) {
                 PyMod::External => PySym::External,
                 PyMod::Unknown => PySym::Unknown,
@@ -664,7 +744,7 @@ impl RepoIndex {
                     m => PySym::Module(m),
                 }
             }
-        })
+        }
     }
 
     /// A name no scope binds, as `file` sees it: a definition of the file (a
@@ -746,6 +826,13 @@ impl RepoIndex {
     /// see is no type of it.
     pub(super) fn py_type(&self, name: &str, file: &str, ctx: Option<usize>) -> TypeRef {
         let name = name.trim_matches(|c| c == '"' || c == '\'');
+        // `-> Self`: the class around (review P1).
+        if name == "Self" || name == "typing.Self" {
+            return match self.containers(ctx).first() {
+                Some(&t) => TypeRef::Repo(t, "self"),
+                None => TypeRef::Unknown,
+            };
+        }
         match self.py_symbol(name, file, ctx) {
             PySym::Sym(t, how, sure) if is_type(&self.syms[t].kind) => {
                 TypeRef::Repo(t, if sure { how } else { IMPORT_WEAK })

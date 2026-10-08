@@ -4,11 +4,13 @@
 # cliente. Esta copia los lista con alias opacos —archivo (FileA, FileB…), clase (ClassA), método
 # (m1, m2…) y función de módulo (f1, f2…), sin rutas ni números de línea—, el caso que muestrea cada
 # uno y el resultado medido sobre la tabla `edges` (línea exacta) con `graph_bench` en un snapshot de
-# `legacy-migration` (23 archivos .py, un paquete con imports relativos, scripts en la raíz y en
+# `legacy-migration` (86 archivos versionados, 23 de ellos .py: un paquete con imports relativos, scripts en la raíz y en
 # `scripts/` que importan el paquete, `requirements.txt`): antes = c1922d0 (TASK-006 cerrada),
 # ahora = TASK-007 (EXTRACTOR_VERSION 14, LINK_VERSION 9). Los 6 primeros son los de TASK-001
 # re-anclados al commit medido; los otros 19 se etiquetaron en TASK-007 leyendo el código ANTES de
-# medir. Los nombres de librerías públicas (logging, PyYAML, la stdlib) se dejan tal cual. FileF
+# medir, y los 2 últimos en su revisión (nombre declarado exacto y stdlib sin homónimo en el repo: la
+# evidencia débil de P3 no les quita el externo). Re-medido tras la revisión (EXTRACTOR_VERSION 16,
+# LINK_VERSION 11): mismos resultados en los 25 primeros. Los nombres de librerías públicas (logging, PyYAML, la stdlib) se dejan tal cual. FileF
 # tiene el MISMO nombre que un módulo de la stdlib: decide el import relativo.
 #
 # Formato: repo | sitio (alias) | destino esperado (alias) | external? | caso | antes | ahora
@@ -39,3 +41,5 @@ legacy-migration|FileG|FileF.f11|-|`from . import mod` (homónimo de la stdlib)|
 legacy-migration|FileH|ClassA.m2|-|script en la raíz: `x = ClassA(...)` a nivel de módulo y `x.m()`|undecided low/name_only|correct high/local
 legacy-migration|FileH|FileA.f9|-|script en la raíz: import absoluto del paquete|correct medium/unique_name|correct high/import
 legacy-migration|FileH|FileG.f12|-|ídem, otra función|correct medium/unique_name|correct high/import
+legacy-migration|FileJ|psycopg.connect|external|import de un paquete declarado con su nombre exacto (`psycopg[binary]`)|undecided low/name_only|correct high/external_known
+legacy-migration|FileK|fcntl.flock|external|módulo de la stdlib sin homónimo en el repo|undecided low/name_only|correct high/external_known

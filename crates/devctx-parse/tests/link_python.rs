@@ -237,3 +237,73 @@ fn a_local_from_a_method_call_is_a_chain() {
         (s("Item.price"), s(REPO), "high", "return_type", false)
     );
 }
+
+const FORMS: &str = "shop/typing_forms.py";
+
+/// Review P1: `Any`, `object`, a `TypeVar` and a `Union` of several types
+/// type nothing (never `external_known` high, never a guess by name);
+/// `type[X]` is `X`; `-> Self` is the class.
+#[test]
+fn typing_special_forms() {
+    let l = linked();
+    for f in ["anything", "either", "obj"] {
+        assert_eq!(l.call(f, "save"), UNDECIDED, "{f}");
+    }
+    assert_eq!(l.call("generic", "T.save"), UNDECIDED);
+    assert_eq!(
+        l.call("klass", "Repo.load"),
+        (s("Repo.load"), s(REPO), "high", "param", false)
+    );
+    assert_eq!(
+        l.call("Builder.go", "done"),
+        (s("Builder.done"), s(FORMS), "high", "return_type", false)
+    );
+}
+
+/// Review P3: a module named like the standard library, or like a name
+/// guessed from a distribution (`python-utils` → `utils`), that the
+/// repository has: never external with that evidence.
+#[test]
+fn weak_external_evidence_loses_to_the_repository() {
+    let l = linked();
+    assert_eq!(l.call("tools/cal.py", "plan"), UNDECIDED);
+    assert_eq!(
+        l.call("tools/cal.py", "helper2"),
+        (s("helper2"), s("utils.py"), "high", "import", false)
+    );
+    // An exact declared name still wins (`yaml`, `requests`).
+    assert_eq!(l.import(SERVICE, "requests"), EXTERNAL);
+}
+
+/// Review minors: an import in `try`/`except ImportError` bound twice is no
+/// sure destination; decorators; `import a.b as c`, `import a.b`, `from ..a
+/// import b`, and `from ...` past the top package.
+#[test]
+fn import_forms_and_fallbacks() {
+    let l = linked();
+    assert_eq!(l.call("build", "Store").2, "medium");
+    assert_eq!(
+        l.call("use", "decorated"),
+        (
+            s("decorated"),
+            s("shop/compat.py"),
+            "high",
+            "same_file",
+            false
+        )
+    );
+    assert_eq!(
+        l.call("go", "Repo"),
+        (s("Repo"), s(REPO), "high", "import", false)
+    );
+    assert_eq!(
+        l.call("go", "Item"),
+        (s("Item"), s(REPO), "high", "import", false)
+    );
+    assert_eq!(
+        l.call("make", "Repo"),
+        (s("Repo"), s(REPO), "high", "import", false)
+    );
+    assert_eq!(l.call("make", "ghost2"), UNDECIDED);
+    assert_eq!(l.import("shop/sub/deep.py", "...nothing.ghost2"), UNDECIDED);
+}

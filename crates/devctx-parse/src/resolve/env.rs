@@ -321,8 +321,14 @@ pub struct PyManifest {
     /// `[project] name` / `[tool.poetry] name` / `[metadata] name`, as an
     /// import name.
     pub name: Option<String>,
-    /// The import names of the declared distributions, sorted.
+    /// The import names of the declared distributions — normalised, or a
+    /// known alias (`PyYAML` → `yaml`) —, sorted.
     pub deps: Vec<String>,
+    /// Names only guessed from them (a `python_` prefix or a `_binary`
+    /// suffix taken off), sorted: weak evidence, which a module of the
+    /// repository of that name beats (TASK-007 review, P3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guessed: Vec<String>,
 }
 
 /// Distributions whose top-level module is not their normalised name.
@@ -343,6 +349,7 @@ const PY_IMPORT_NAMES: &[(&str, &str)] = &[
     ("pyopenssl", "OpenSSL"),
     ("python_dateutil", "dateutil"),
     ("python_dotenv", "dotenv"),
+    ("psycopg2_binary", "psycopg2"),
     ("pyyaml", "yaml"),
     ("scikit_image", "skimage"),
     ("scikit_learn", "sklearn"),
@@ -353,6 +360,14 @@ const PY_IMPORT_NAMES: &[(&str, &str)] = &[
 /// name without a `python_` prefix or a `_binary` suffix
 /// (`psycopg2-binary` → `psycopg2`).
 pub fn py_import_names(dist: &str) -> Vec<String> {
+    let mut out = py_sure_names(dist);
+    out.extend(py_guessed_names(dist));
+    out
+}
+
+/// The import names a distribution surely has: normalised, and a known
+/// alias (review P3: only these beat a module of the repository).
+fn py_sure_names(dist: &str) -> Vec<String> {
     let norm: String = dist
         .trim()
         .to_lowercase()
@@ -368,12 +383,24 @@ pub fn py_import_names(dist: &str) -> Vec<String> {
             out.push(m.to_string());
         }
     }
+    out
+}
+
+/// The names only guessed for a distribution: a `python_` prefix or a
+/// `_binary` suffix taken off.
+fn py_guessed_names(dist: &str) -> Vec<String> {
+    let sure = py_sure_names(dist);
+    let Some(norm) = sure.first() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
     if let Some(rest) = norm.strip_prefix("python_") {
         out.push(rest.to_string());
     }
     if let Some(rest) = norm.strip_suffix("_binary") {
         out.push(rest.to_string());
     }
+    out.retain(|g| !sure.contains(g));
     out
 }
 
@@ -494,10 +521,18 @@ impl PyManifest {
             .name
             .take()
             .and_then(|n| py_import_names(&n).into_iter().next());
-        let mut deps: Vec<String> = dists.iter().flat_map(|d| py_import_names(d)).collect();
+        let mut deps: Vec<String> = dists.iter().flat_map(|d| py_sure_names(d)).collect();
         deps.sort();
         deps.dedup();
+        let mut guessed: Vec<String> = dists
+            .iter()
+            .flat_map(|d| py_guessed_names(d))
+            .filter(|g| deps.binary_search(g).is_err())
+            .collect();
+        guessed.sort();
+        guessed.dedup();
         out.deps = deps;
+        out.guessed = guessed;
         Some(out)
     }
 }
@@ -979,6 +1014,9 @@ default = ["a", "b"]
         assert!(req.deps.contains(&"httpx".to_string()));
         assert!(req.deps.contains(&"yaml".to_string()), "{:?}", req.deps);
         assert!(req.deps.contains(&"dateutil".to_string()));
+        let guess = PyManifest::parse("python-utils\nfoo-binary\n", "requirements.txt").unwrap();
+        assert_eq!(guess.deps, ["foo_binary", "python_utils"]);
+        assert_eq!(guess.guessed, ["foo", "utils"]);
         assert!(!req.deps.iter().any(|d| d.contains("base") || d == "git"));
         let pp = PyManifest::parse(
             "[project]\nname = \"my-tool\"\ndependencies = [\n  \"requests>=2\",\n  \"beautifulsoup4\",\n]\n\n[project.optional-dependencies]\ntest = [\"pytest\"]\n\n[tool.poetry.dependencies]\npython = \"^3.11\"\nhttpx = \"*\"\n",
