@@ -475,8 +475,16 @@ los símbolos y las aristas salvo `contains`), elige qué re-resolver y escribe:
   desde que un paquete declarado es siempre external (mi2 de TASK-006), ningún escenario la detecta
   sola, porque la respuesta de una fila de import depende solo del módulo, y eso ya lo cubren el
   modo (d) y el fingerprint del entorno. No quitarla.
-- Medido: ver el Resultado de TASK-007 (pase completo de este repo ~0,2-0,3 s; incremental de un
-  archivo muy nombrado, del mismo orden, porque `new`/`get`/`open` reabren media rama por nombre).
+- Medido: ver el Resultado de TASK-007 (pase completo de este repo ~0,2-0,4 s; incremental de un
+  archivo muy importado, del mismo orden: lo domina cargar la rama).
+- *Revisión de TASK-007:* el alcance de un import de Python suma el `__init__.py` de cada paquete
+  del camino (`import pkg.sub` liga `pkg`), y un `__init__.py` escrito reabre su directorio (las
+  raíces de sus scripts cambian). Los nombres de los importadores que reabren por (d) son solo los
+  que pueden tipar una cadena —tipos, campos, invocables con retorno declarado no vacío—, en vez de
+  la lista fija `GENERIC_NAMES`. Una llamada por path de Rust resuelta externa no se reabre por
+  nombre (depende del entorno y de los `use`: pase completo, modo a, modo d). En un importador Rust
+  que no se escribió se reabren solo las filas que nombran lo que ligan sus `use` (más cadenas y
+  miembros; un glob de otro módulo lo reabre entero). Cada una con su escenario en la equivalencia.
 
 **Memoria.** `RepoIndex` de frontend (2133 archivos): estimación < 100 MB (strings +
 `HashMap`s); TASK-005 lo mide con el método de PLAN-010 y es criterio de aceptación (master §6).
@@ -648,6 +656,19 @@ revisión):
   (o un `replace` local) es del repo; uno cuyo primer segmento no tiene punto, la stdlib; cualquier
   otro, otro módulo cuando hay `go.mod` (sin `go.mod`, sin decidir). El receptor es `this`; un
   método en otro archivo del paquete tiene el tipo como dueño.
+- *Revisión de TASK-007:* Rust — un crate del workspace cuenta solo si es el propio o una
+  dependencia por path del `Cargo.toml` del archivo (por el path, así un `package =` llega; las
+  `workspace = true`, por la raíz); una declarada del registry es externa aunque haya un homónimo;
+  una no declarada, sin decidir. Varios bounds se prueban todos. Fuera de Java el método inherente
+  gana al de un `impl` de trait y varios candidatos dan `medium`; dos ítems homónimos (`#[cfg]`)
+  también. Un `use` dentro de una función es de ella. `let x = a.f()` hace de `x.g()` una cadena
+  tras `a.f()` (también Go y Python); `Arc::new(x)` vale `x`; `T::default()` sin `impl`, `T`
+  (`medium`). Un glob cuyo módulo reexporta el nombre desde afuera lo da externo, y una rama que no
+  se sigue va antes que la externa (también en barrels TS y `import *` de Python). Go — `go.mod`
+  ancestro para tratar como externo un import con punto, prefijo de módulo más largo, nombre local
+  por la cláusula `package` del destino, homónimos por build tags en `medium`. Python — `Any`,
+  `object`, `TypeVar` y uniones de varios tipos no tipan; `type[X]` es `X`; `Self` es la clase; un
+  tipo que no resuelve no cae a `unique_name`; dos imports del mismo nombre local dan `medium`.
 
 ## DD-8 — `confidence` y `resolution`
 
@@ -669,6 +690,11 @@ revisión):
   devuelve una llamada externa sigue las reglas de la cadena tras una externa (`chain_external`
   `medium`), y el de una llamada a una función del repo con retorno declarado sale `return_type`
   o con la etiqueta del binding (`local`, `field`).
+- Revisión de TASK-007: en Rust y Go, un miembro que falta en un tipo con un supertipo externo
+  (`impl Display`, un `sync.Mutex` embebido) es `inherited` + `external` `medium` (en Java y Python
+  sigue `high`: Panache, una base de `Exception`); dos `impl` de trait con el mismo método, dos
+  ítems homónimos bajo `#[cfg]` o dos archivos de un paquete Go con el mismo nombre (build tags)
+  nunca dan `high`.
 - `structural` es el valor de `contains` (DD-6), escrito al parsear: no es una regla de DD-7 y no
   pisa `same_file`, que es de la regla 6. El arnés no lo cuenta: `calls_por_confianza` filtra
   `kind = 'calls'` y `score.py` lee `graph_edges` (solo llamadas).
@@ -688,7 +714,11 @@ revisión):
   la stdlib de Python, `std`/`core`/`alloc`/`proc_macro`/`test` de Rust); la stdlib de Go se
   reconoce por la regla del lenguaje (primer segmento sin punto). La evidencia de los paquetes de
   terceros viene de los manifests (`Cargo.toml`, `go.mod`, `pyproject.toml`/`setup.cfg`/
-  `requirements*.txt`), que entran al fingerprint del entorno (DD-6).
+  `requirements*.txt`), que entran al fingerprint del entorno (DD-6). Revisión de TASK-007: en
+  Python solo un nombre declarado exacto (normalizado, o de la tabla de alias) es evidencia fuerte;
+  uno adivinado de una distribución (`python-utils` → `utils`) pierde con un módulo del repo de ese
+  nombre, y un nombre de la stdlib que el repo también tiene queda sin decidir. En Go, la regla de
+  "otro módulo" exige un `go.mod` sobre el archivo.
 
 ## DD-10 — Los lookups por nombre pasan a la tabla `symbols` (mismos contratos)
 

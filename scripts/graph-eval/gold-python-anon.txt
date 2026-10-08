@@ -10,7 +10,7 @@
 # re-anclados al commit medido; los otros 19 se etiquetaron en TASK-007 leyendo el código ANTES de
 # medir, y los 2 últimos en su revisión (nombre declarado exacto y stdlib sin homónimo en el repo: la
 # evidencia débil de P3 no les quita el externo). Re-medido tras la revisión (EXTRACTOR_VERSION 16,
-# LINK_VERSION 11): mismos resultados en los 25 primeros. Los nombres de librerías públicas (logging, PyYAML, la stdlib) se dejan tal cual. FileF
+# LINK_VERSION 13): mismos resultados en los 25 primeros. Los nombres de librerías públicas (logging, PyYAML, la stdlib) se dejan tal cual. FileF
 # tiene el MISMO nombre que un módulo de la stdlib: decide el import relativo.
 #
 # Formato: repo | sitio (alias) | destino esperado (alias) | external? | caso | antes | ahora

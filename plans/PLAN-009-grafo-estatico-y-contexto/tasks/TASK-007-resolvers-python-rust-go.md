@@ -200,3 +200,104 @@ Implementa DD-7 (Python, Rust, Go).
   `let x = a.metodo()` queda sin tipo. (4) El incremental de un archivo de Rust muy nombrado
   reabre buena parte de la rama por nombre (modo b), con costo del orden del completo (~0,3 s acá).
   (5) Sandbox de medición en `/var/tmp/devctx-t007-*`.
+- **Revisión de d8cda45 (REQUEST CHANGES, sin BLOCKER; dos revisiones en paralelo), resuelta en
+  commits encima de d8cda45:**
+  - *Rust/Go (eb2b376).* R1: un crate del workspace cuenta solo si es el propio o una dependencia
+    por path del `Cargo.toml` del archivo (mapeada por el path, así un `package =` renombrado llega;
+    las `workspace = true`, por la entrada de la raíz); una dependencia declarada del registry es
+    externa aunque el workspace tenga un homónimo; un crate que nadie declara queda sin decidir
+    (`CargoManifest.{local, inherited}`, tablas inline en el lector de TOML, crates homónimos de
+    workspaces anidados como `name@dir`). R2: un parámetro de tipo y `dyn A + B` se tipan por todos
+    sus bounds y el link prueba cada uno. R3: fuera de Java el método inherente gana al de un `impl`
+    de trait, y de varios candidatos (`From<A>`/`From<B>`) ninguno es `high`. R4: dos ítems
+    homónimos (`#[cfg]` dual) dan `medium`. R5: un `use` dentro de una función vale solo en ella
+    (rango de líneas, como los `mod`) y le gana al módulo. R6: en Rust y Go un método que falta con
+    un supertipo externo es `inherited` `medium`. Menores: el dueño de un `impl` sale de su tipo
+    escrito con ruta (y el fallback solo con `Unknown`), `Arc/Box/Rc::new(x)` vale lo que `x`, una
+    fn anidada o un valor local sombrean al `make` importado, una fn asociada con mayúscula no es
+    variante, lifetimes en los argumentos de un tipo; Go: `go.mod` ancestro para tratar como externo
+    un import con punto, prefijo de módulo más largo, nombre local por la cláusula `package`,
+    homónimos por build tags en `medium`, interfaces anónimas sin símbolos, `var a, err = f()` tipa
+    solo `a`. Medición (palanca pedida): `let x = a.f()` hace de `x.g()` una cadena tras `a.f()`
+    (Rust, Go, Python), `T::default()` sin `impl` vale `T` (`medium`) y un `mod x;` de un crate de
+    tests llega a `tests/x/mod.rs`. **`EXTRACTOR_VERSION` 15, `LINK_VERSION` 10.**
+  - *Python (6dd91d4).* P1: `Any`, `object`, un `TypeVar` y una unión de varios tipos no tipan nada
+    (antes `Any` daba `external_known` `high` y un tipo que no resuelve caía a `unique_name`);
+    `type[X]` es `X`; `-> Self` es la clase. P2: el alcance de un import suma el `__init__.py` de
+    cada paquete del camino, y un `__init__.py` escrito reabre su directorio. P3: solo un nombre
+    declarado exacto (o de la tabla de alias) le gana a un módulo del repo; uno adivinado
+    (`python-utils` → `utils`) pierde con el módulo del repo, y un nombre de la stdlib que el repo
+    también tiene queda sin decidir (`PyManifest.guessed`). Menores: dos imports del mismo nombre
+    local (`try`/`except ImportError`) dan `medium`; `from ...` más allá del paquete de arriba no es
+    módulo. **`EXTRACTOR_VERSION` 16, `LINK_VERSION` 11.**
+  - *Rendimiento (51fb4e1).* Los nombres de un importador que reabren por (d) son solo los que
+    pueden tipar una cadena (tipos, campos, invocables con retorno declarado no vacío): reemplaza
+    `GENERIC_NAMES`, que dejaba afuera un `pipe(): Repo`. Una llamada por path de Rust resuelta
+    externa no se reabre por nombre. En un importador Rust se reabren solo las filas que nombran lo
+    que ligan sus `use` (más cadenas y miembros; un glob de otro módulo lo reabre entero). Fix
+    encontrado por un escenario: un glob cuyo módulo reexporta el nombre desde afuera lo da externo,
+    y una rama que no se puede seguir va antes que la externa. **`LINK_VERSION` 12.**
+    `store.rs` tocado: **24 307 → 18 179 aristas re-resueltas**; 243 → 230 ms (lo domina cargar la
+    rama, ~140 ms, como en el pase completo: no se pudo bajar del orden del completo).
+  - *Menores (90b4d97).* TS y Python: en un barrel o un `import *`, la rama que no se puede seguir
+    va antes que la de un paquete (sin decidir, no externo `high`). TOML: arrays anidados en varias
+    líneas. Manifests de Python: `requirements/*.txt`, `nombre @ url`,
+    `[tool.poetry.dependencies.foo]`, línea en blanco en `install_requires`, `ruamel.yaml` →
+    `ruamel`. `tsconfig` (mi1): con la base rota y `tsconfig.json` legible gana el fresco; una base
+    de `extends` que no se lee conserva el último `tsconfig` bueno. **`LINK_VERSION` 13.**
+  - *Tests que fallaban antes del fix* (escritos primero; ver cada uno fallar): `link_rust` 7 de 7
+    nuevos (`declared_dependencies_decide_which_crate`, `every_bound_is_tried`,
+    `trait_impl_homonyms_are_not_sure`, `cfg_homonyms_are_medium`,
+    `a_use_in_a_function_is_scoped_to_it`, `an_external_supertype_is_medium_evidence`,
+    `owners_values_and_variants`) y, de la medición, `a_derived_default_is_its_type`,
+    `a_local_from_a_method_call_is_a_chain` (también en Python) y
+    `a_test_crate_reaches_its_common_module`; `link_go` 3 de 3 (`an_external_embedding_is_medium_evidence`,
+    `package_names_tags_and_shadows`, `modules_are_matched_by_ancestor_and_longest_prefix`);
+    `link_python` 3 de 3 (`typing_special_forms`, `weak_external_evidence_loses_to_the_repository`,
+    `import_forms_and_fallbacks`) más `an_unfollowable_star_import_is_not_outweighed_by_a_package`;
+    `link_typescript::an_unfollowable_branch_is_not_outweighed_by_a_package`;
+    `resolve::env::tests::manifest_reader_coverage`; `tsconfig::review_tests` (2). Escenarios
+    nuevos en `an_incremental_link_pass_equals_a_full_one`, cada uno verificado fallando sin su
+    regla (mutándola): `import pkg.sub` + `__init__.py` (sin los prefijos en el alcance), un
+    directorio que pasa a paquete (sin la reapertura del directorio), `pipe(): Foo` de un importador
+    (con la lista `GENERIC_NAMES`), la fila `use crate::Svc` de un importador (con el filtro de
+    importadores dejando afuera las filas que no son llamadas), el glob de un prelude (sin Rust en
+    el modo d); y uno que faltaba, un `impl` de otro archivo que pierde `save` (lo cubre el destino
+    que desaparece). `a_unique_name_type_does_not_make_a_typed_call_high` pasó a TypeScript.
+  - *Gold:* Rust a 26 sitios (6 nuevos: dependencia heredada del workspace, dos homónimos por
+    `#[cfg]`, un `use` dentro de una fn, un `clone` de un tipo con `impl Default`, un `store` sobre
+    `Arc::new(T::default())`; se quitó uno repetido de `EmbeddingProvider.embed`); Python a 27 (2
+    nuevos: un paquete declarado con su nombre exacto y un módulo de la stdlib sin homónimo, que la
+    evidencia débil de P3 no debe tocar). **No hay en los repos medibles sitios de R2 (varios
+    bounds), R3 (dos `impl From`), P1 (`Any`/`Union`/`Self`/`TypeVar`) ni del `try`/`except`:
+    quedan cubiertos solo por fixtures.**
+  - *Re-medición* (mismos snapshots; "ronda 1" = 8a83a34, "ahora" = 90b4d97):
+
+    | | Rust ronda 1 | Rust ahora | Python ronda 1 | Python ahora |
+    |---|---|---|---|---|
+    | sin decidir | 19,8 % | **17,5 %** | 1,6 % | 1,6 % |
+    | gold correcto / en `high` | 21/21 · 21/21 (con el gold de 21) | **26/26 · 22/22** | 24/25 · 24/24 | **26/27 · 26/26** |
+    | externas | 49,6 % | 52,0 % | 69,4 % | 69,5 % |
+    | link pass completo | 186-275 ms | 393 ms (carga alta) | 17-36 ms | 27 ms |
+
+    Rust ahora, externas: `external_known` `high` 8 475 (+357: llamadas a `std` dentro de `mod
+    tests` con `use super::*` que antes quedaban sin decidir por el orden de los globs),
+    `chain_external` `medium` 2 235, `external_known` `medium` 451, `inherited` `medium` 159 (los
+    `inherited` `high` desaparecen: R6). El 17,5 % sin decidir por hint: `chain chain` 26,6 %,
+    `untyped` 23,8 %, `chain typed` 15,5 %, `chain path` 12,2 %, `expr` 5,3 %, `chain untyped`
+    4,6 %, `chain free` 2,7 %, `member` 2,6 %: lo que queda son sobre todo cadenas tras una llamada
+    externa a un nombre que el repo también define (sin decidir por diseño, TASK-005) y receptores
+    sin tipo. Los gold que antes pasaban siguen pasando; en `high` 22/22 (los 4 restantes son
+    `medium` a propósito: homónimos por `#[cfg]`, el derivable y `T::default()`).
+    *Auditoría:* 20 aristas que pasaron a externas `high` en esta ronda, al azar: todas son llamadas
+    a `std` o a crates declarados (`Instant`, `Duration`, `Mutex::new`, `Path::new` en tests con `use
+    super::*`, `middleware::from_fn_with_state` de axum, `Vec::iter` tras `unwrap()`); dos leídas
+    línea a línea contra el código (el `iter` y un `PathBuf::clone` tras un método del repo que
+    declara `-> PathBuf`): correctas. 12 `return_type` nuevas al azar: consistentes con el hint, tres
+    leídas contra el código (`open_store()?` → `Store`, `serve_for()` → `Fake`,
+    `CudaFallback::<…>::new` → `Self`): correctas.
+    Java y TS: mismo desglose que antes de TASK-007.
+  - *No verificado / abierto:* no hay repo Python grande en el sandbox para medir el costo del modo
+    (d) de Python; el incremental de Rust sigue del orden del completo porque lo domina la carga de la
+    rama; no hay sitios reales de R2/R3/P1; el "Klass anidado sombreado" de TS (NIT) no se tocó.
+

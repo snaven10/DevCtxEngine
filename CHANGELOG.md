@@ -192,6 +192,31 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   the package) and `s.m()` writes `Type.m` to `graph_edges`; fields are typed
   by their declaration, `x := New()` by the declared result; interface methods
   are symbols. Covered by fixtures only (no Go repository was measured).
+- **Python, Rust and Go, after review** (PLAN-009 TASK-007, **extractor
+  version 16**, link rules version 13): a Rust workspace crate counts only as
+  the file's own or a path dependency of its `Cargo.toml` (a `package =`
+  rename follows the path; `workspace = true` follows the root's entry), so a
+  registry dependency named like a workspace crate is external and an
+  undeclared one undecided; every bound of a type parameter is tried; an
+  inherent method wins over a trait impl's, and several candidates (two
+  `From` impls, two `#[cfg]` definitions, Go build-tag files) are `medium`; a
+  `use` inside a function is that function's; a missing method of a type with
+  an external supertype is external at `medium` in Rust and Go; `let x =
+  a.f()` makes `x.g()` a chain typed by `f`'s return type. Go needs a
+  `go.mod` above a file before an import outside its module counts as
+  external, and names an import by its package clause. Python: `Any`,
+  `object`, a `TypeVar` and a multi-member union type nothing, `type[X]` is
+  `X`, `Self` is the class; only an exactly declared distribution name beats
+  a repository module of that name. A barrel or star import with a branch
+  that cannot be followed no longer counts as external. Manifests: nested
+  multi-line TOML arrays, `requirements/*.txt`, `name @ url`, Poetry
+  dependency tables. A readable `tsconfig.json` beside a broken
+  `tsconfig.base.json` is used fresh; a broken `extends` base keeps the last
+  good aliases. The incremental pass reopens fewer Rust edges (a widely
+  imported file: 24 307 → 18 179) and follows a Python package's
+  `__init__.py` through `import pkg.sub`. Measured: 17.5 % of Rust calls
+  undecided (was 19.8 %), 26 of 26 hand-labelled Rust sites and 26 of 27
+  Python sites correct.
 
 ### Fixed
 
