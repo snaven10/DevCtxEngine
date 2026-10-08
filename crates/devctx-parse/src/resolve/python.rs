@@ -412,7 +412,7 @@ impl RepoIndex {
                 return Some(PyMod::File(p));
             }
         }
-        (!path.is_empty() && self.dirs.contains(path)).then(|| PyMod::Dir(path.to_string()))
+        (!path.is_empty() && self.py_dirs.contains(path)).then(|| PyMod::Dir(path.to_string()))
     }
 
     /// Where an absolute import written in `from` may start: the file's own

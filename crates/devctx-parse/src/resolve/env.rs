@@ -317,7 +317,10 @@ fn unquote_go(s: &str) -> &str {
 
 /// A Python manifest of the repository: the distributions it declares, by
 /// the name their modules are imported under (best effort), and the
-/// project's own name (a module of the repository, not a dependency).
+/// project's own name (a module of the repository, not a dependency). A
+/// `-r other.txt` line is not followed: every `requirements*.txt` and
+/// `requirements/*.txt` of the branch is read on its own, so the file it
+/// names counts anyway.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PyManifest {
     /// Its repository path.
@@ -419,8 +422,8 @@ fn py_guessed_names(dist: &str) -> Vec<String> {
 /// `requests`); `None` for an option line, a path or a URL.
 fn requirement_name(line: &str) -> Option<&str> {
     let line = line.trim();
-    // `name @ https://…`: the name before the `@`.
-    let line = match line.split_once(" @ ") {
+    // `name @ https://…` (with or without spaces): the name before the `@`.
+    let line = match line.split_once('@') {
         Some((name, _)) => name.trim(),
         None => line,
     };
@@ -443,9 +446,15 @@ impl PyManifest {
     /// Read a Python manifest at the repository path `path` (its kind by
     /// file name); `None` when it does not parse.
     pub fn parse(text: &str, path: &str) -> Option<Self> {
+        // `requirements/base.txt` declares for the directory above
+        // `requirements/` (second review, n2).
+        let mut dir = dir_of(path);
+        if dir == "requirements" || dir.ends_with("/requirements") {
+            dir = dir_of(dir);
+        }
         let mut out = Self {
             path: path.to_string(),
-            dir: dir_of(path).to_string(),
+            dir: dir.to_string(),
             ..Default::default()
         };
         let mut dists: Vec<String> = Vec::new();
@@ -1078,10 +1087,13 @@ default = ["a", "b"]
             Some(ManifestKind::Requirements)
         );
         let req = PyManifest::parse(
-            "foo @ https://example.com/foo-1.0.whl\nruamel.yaml\nzope.interface\n",
+            "foo @ https://example.com/foo-1.0.whl\nruamel.yaml\nzope.interface\nbaz@https://example.com/baz.whl\n",
             "requirements/base.txt",
         )
         .unwrap();
+        // A `requirements/` directory declares for the one above it.
+        assert_eq!(req.dir, "");
+        assert!(req.deps.contains(&"baz".to_string()), "{:?}", req.deps);
         for d in ["foo", "ruamel", "zope"] {
             assert!(req.deps.contains(&d.to_string()), "{d}: {:?}", req.deps);
         }

@@ -315,3 +315,25 @@ fn an_unfollowable_star_import_is_not_outweighed_by_a_package() {
     let l = linked();
     assert_eq!(l.call("use_mixed", "thing2"), UNDECIDED);
 }
+
+/// Second review n2: a `requirements/base.txt` declares for the directory
+/// above `requirements/`.
+#[test]
+fn a_requirements_directory_declares_for_its_parent() {
+    let l = link_dir_with(DIR, |env| {
+        env.python = vec![devctx_parse::resolve::env::PyManifest::parse(
+            "requests\n",
+            "requirements/base.txt",
+        )
+        .unwrap()];
+    });
+    assert_eq!(l.call("Service.run", "get"), EXTERNAL);
+}
+
+/// Second review n1: a directory with no Python in it (a TypeScript
+/// `types/`) is no module that shadows the standard library's.
+#[test]
+fn a_directory_without_python_shadows_nothing() {
+    let l = linked();
+    assert_eq!(l.call("tools/typing_use.py", "SimpleNamespace"), EXTERNAL);
+}

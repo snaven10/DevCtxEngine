@@ -228,6 +228,9 @@ pub struct RepoIndex {
     /// Every directory that holds a file of the branch (a namespace
     /// package, a Go package).
     pub(super) dirs: HashSet<String>,
+    /// Of those, the ones holding a Python file (below them): a directory
+    /// of another language is no Python package (second review, n1).
+    pub(super) py_dirs: HashSet<String>,
     /// The workspace's `Cargo.toml` files (PLAN-009 TASK-007).
     pub(super) cargo: Vec<crate::resolve::env::CargoManifest>,
     /// The workspace's `go.mod` files.
@@ -348,6 +351,7 @@ impl RepoIndex {
             python,
             py_cache: Default::default(),
             dirs: HashSet::new(),
+            py_dirs: HashSet::new(),
             cargo,
             go,
             rs: Default::default(),
@@ -392,6 +396,15 @@ impl RepoIndex {
                     break;
                 }
                 d = parent;
+            }
+            if f.ends_with(".py") || f.ends_with(".pyi") {
+                let mut d = f.as_str();
+                while let Some((parent, _)) = d.rsplit_once('/') {
+                    if !idx.py_dirs.insert(parent.to_string()) {
+                        break;
+                    }
+                    d = parent;
+                }
             }
         }
         idx.ambiguous = idx
