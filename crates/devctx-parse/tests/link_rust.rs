@@ -356,3 +356,77 @@ fn a_test_crate_reaches_its_common_module() {
         )
     );
 }
+
+/// Second review N3: a Rust type nothing resolves (`mystery::Thing`) types
+/// nothing; the call is undecided, never `unique_name` against the
+/// repository's only `tidy_up`.
+#[test]
+fn an_unresolved_type_is_no_guess() {
+    let l = linked();
+    assert_eq!(l.call("mystery_typed", "mystery.Thing.tidy_up"), UNDECIDED);
+}
+
+/// Second review: a `use` inside a closure (a block) is that block's.
+#[test]
+fn a_use_in_a_block_is_scoped_to_it() {
+    let l = linked();
+    let calls = l.all("calls", "closure_use", "polish");
+    assert_eq!(
+        calls[0],
+        (
+            s("polish"),
+            s("crates/app/src/extra.rs"),
+            "high",
+            "import",
+            false
+        )
+    );
+    assert_eq!(
+        calls[1],
+        (s("polish"), s(REVIEW_SRC), "high", "same_file", false)
+    );
+}
+
+/// Second review: a file under no manifest — a dependency an ancestor
+/// manifest declares from the registry wins over a workspace crate of that
+/// name.
+#[test]
+fn without_a_manifest_the_ancestor_declaration_wins() {
+    let l = link_dir_with(DIR, |env| {
+        env.cargo.retain(|m| m.krate.as_deref() != Some("app"));
+        let root = env.cargo.iter_mut().find(|m| m.krate.is_none()).unwrap();
+        root.deps.push("utils".into());
+        root.deps.sort();
+    });
+    assert_eq!(l.call("crates", "utils::tidy_up"), EXTERNAL);
+}
+
+/// Second review: two manifests giving one crate name (nested workspaces)
+/// do not merge; a path dependency still reaches its own.
+#[test]
+fn homonymous_crates_keep_apart() {
+    let l = link_dir_with(DIR, |env| {
+        let mut twin = env
+            .cargo
+            .iter()
+            .find(|m| m.krate.as_deref() == Some("demo_store"))
+            .unwrap()
+            .clone();
+        twin.dir = "nested/store".into();
+        twin.path = "nested/store/Cargo.toml".into();
+        env.cargo.push(twin);
+    });
+    assert_eq!(
+        l.call("main", "Store.open"),
+        (s("Store.open"), s(STORE), "high", "import", false)
+    );
+}
+
+/// Second review: `use super::super::*` from a top-level inline `mod` is
+/// another module's glob: the importer filter reopens the whole file.
+#[test]
+fn a_glob_past_the_file_blocks_the_importer_filter() {
+    let l = linked();
+    assert!(l.index.rs_use_names(UTIL).is_none());
+    assert!(l.index.rs_use_names(MAIN).is_some());
+}

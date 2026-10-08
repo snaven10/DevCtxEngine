@@ -1158,6 +1158,7 @@ impl RepoIndex {
             src,
             file: e.file.as_str(),
             args,
+            line: e.line,
         };
         self.call_by_hint(&c, &tokens, e, depth)
     }
@@ -1420,9 +1421,10 @@ impl RepoIndex {
             }
             TypeRef::External if !statik => external("external_known"),
             _ if statik => self.untyped(c),
-            // Python: a type nothing resolves (a `TypeVar`, an import not
-            // followed) types nothing; never a guess by name (review P1).
-            _ if self.lang_key(c.file) == Some("python") => self.untyped(c),
+            // Python, Rust, Go: a type nothing resolves (a `TypeVar`, an
+            // import not followed, an undeclared crate's) types nothing;
+            // never a guess by name (review P1, second review N3).
+            _ if matches!(self.lang_key(c.file), Some("python" | "rust" | "go")) => self.untyped(c),
             _ => self.by_name_only_low(c),
         }
     }
@@ -1883,6 +1885,8 @@ pub(super) struct Call<'a> {
     pub(super) src: Option<usize>,
     pub(super) file: &'a str,
     pub(super) args: Option<usize>,
+    /// The call's line (a Rust `use` in a block reaches only its lines).
+    pub(super) line: i32,
 }
 
 /// TypeScript, TSX and JavaScript share one resolver.

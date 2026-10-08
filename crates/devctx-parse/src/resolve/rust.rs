@@ -76,6 +76,18 @@ impl LangResolver for Rust {
         }
     }
 
+    /// A `use` in a block keeps the block's lines (`in 12-20`).
+    fn import_hint(&self, imp: &ImportFact) -> Option<String> {
+        let base = imp.hint();
+        let Some((a, b)) = imp.block else {
+            return base;
+        };
+        Some(match base {
+            Some(h) => format!("{h} in {a}-{b}"),
+            None => format!("in {a}-{b}"),
+        })
+    }
+
     /// A bare name is never a method: `self.m()` and `Self::m()` reach one.
     fn implicit_this(&self) -> bool {
         false
@@ -661,6 +673,9 @@ pub(super) struct RsUse {
     /// The function it is in (its block's, not the module's: TASK-007
     /// review, R5).
     func: Option<usize>,
+    /// The lines of the block it is in (a closure's, a nested block's:
+    /// second review).
+    span: Option<(i32, i32)>,
 }
 
 /// What a path reaches.
@@ -751,17 +766,25 @@ impl RepoIndex {
     /// crate of that name). `None`: the manifest does not declare it.
     fn rs_crate_ref(&self, file: &str, name: &str) -> Option<RsRes> {
         let Some(m) = self.rs_manifest(file) else {
-            // No manifest: a workspace crate by name, or what an ancestor
-            // manifest declares.
-            if self.rs.krates.contains(name) && self.rs.modules.contains_key(name) {
-                return Some(RsRes::Module(name.to_string()));
-            }
-            let declared = self
+            // No manifest: what the nearest ancestor manifest declaring it
+            // says (a path dependency, else from outside), before a
+            // workspace crate by name (second review).
+            let declaring = self
                 .cargo
                 .iter()
                 .filter(|a| a.dir.is_empty() || file.starts_with(&format!("{}/", a.dir)))
-                .any(|a| a.deps.binary_search_by(|d| d.as_str().cmp(name)).is_ok());
-            return declared.then_some(RsRes::External);
+                .filter(|a| a.deps.binary_search_by(|d| d.as_str().cmp(name)).is_ok())
+                .max_by_key(|a| a.dir.len());
+            if let Some(a) = declaring {
+                return Some(match a.local.iter().find(|(n, _)| n == name) {
+                    Some((_, dir)) => self.rs_crate_at(dir),
+                    None => RsRes::External,
+                });
+            }
+            if self.rs.krates.contains(name) && self.rs.modules.contains_key(name) {
+                return Some(RsRes::Module(name.to_string()));
+            }
+            return None;
         };
         if m.krate.as_deref() == Some(name) {
             return Some(RsRes::Module(self.rs_crate_key(m)));
@@ -917,6 +940,21 @@ impl RepoIndex {
                 .push(RsMod::Inline(i));
             rs.inline_path.insert(i, path);
         }
+        // Callables and inline `mod`s by file, once (second review: a scan
+        // of every symbol per `use` was quadratic).
+        let mut callables: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, s) in self.syms.iter().enumerate() {
+            if is_callable(&s.kind) && rs.file_module.contains_key(&s.file) {
+                callables.entry(s.file.as_str()).or_default().push(i);
+            }
+        }
+        let mut inline_by_file: HashMap<&str, Vec<usize>> = HashMap::new();
+        for &m in rs.inline_path.keys() {
+            inline_by_file
+                .entry(self.syms[m].file.as_str())
+                .or_default()
+                .push(m);
+        }
         for e in facts.iter().filter(|e| e.kind == crate::facts::IMPORTS) {
             if !rs.file_module.contains_key(&e.file) {
                 continue;
@@ -943,35 +981,42 @@ impl RepoIndex {
                 alias.or_else(|| segs.last().cloned())
             };
             // The innermost inline `mod` around the `use`.
-            let scope = rs
-                .inline_path
-                .keys()
+            let scope = inline_by_file
+                .get(e.file.as_str())
+                .into_iter()
+                .flatten()
                 .copied()
                 .filter(|&m| {
                     let s = &self.syms[m];
-                    s.file == e.file && s.start_line <= e.line && e.line <= s.end_line
+                    s.start_line <= e.line && e.line <= s.end_line
                 })
                 .max_by_key(|&m| self.syms[m].start_line);
             // The innermost function around it.
-            let func = self
-                .by_id
-                .values()
+            let func = callables
+                .get(e.file.as_str())
+                .into_iter()
+                .flatten()
                 .copied()
                 .filter(|&f| {
                     let s = &self.syms[f];
-                    s.file == e.file
-                        && is_callable(&s.kind)
-                        && s.start_line <= e.line
-                        && e.line <= s.end_line
+                    s.start_line <= e.line && e.line <= s.end_line
                 })
                 .max_by_key(|&f| self.syms[f].start_line);
+            // The block it is in (`in a-b`).
+            let span = tokens
+                .iter()
+                .position(|t| *t == "in")
+                .and_then(|i| tokens.get(i + 1))
+                .and_then(|r| r.split_once('-'))
+                .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)));
             rs.uses.entry(e.file.clone()).or_default().push(RsUse {
                 segs,
                 local,
                 glob,
                 reexport: tokens.first() == Some(&"export"),
                 scope,
-                func,
+                func: func.filter(|_| span.is_some()).or(func),
+                span,
             });
         }
         self.rs = rs;
@@ -1224,11 +1269,27 @@ impl RepoIndex {
 
     /// A name a `use` inside a function around `ctx` brings in (the
     /// innermost function first): it shadows the module's (review R5).
-    fn rs_fn_scoped(&self, file: &str, ctx: Option<usize>, name: &str) -> Option<RsRes> {
+    fn rs_fn_scoped(
+        &self,
+        file: &str,
+        ctx: Option<usize>,
+        name: &str,
+        line: Option<i32>,
+    ) -> Option<RsRes> {
         let uses = self.rs.uses.get(file)?;
         let (module, scope) = self.rs_module_at(file, ctx);
         for f in self.chain(ctx) {
-            let here: Vec<&RsUse> = uses.iter().filter(|u| u.func == Some(f)).collect();
+            // A `use` in a block reaches only its lines (a closure's,
+            // second review); innermost block first.
+            let mut here: Vec<&RsUse> = uses
+                .iter()
+                .filter(|u| u.func == Some(f))
+                .filter(|u| match (u.span, line) {
+                    (Some((a, b)), Some(l)) => a <= l && l <= b,
+                    _ => true,
+                })
+                .collect();
+            here.sort_by_key(|u| u.span.map_or(0, |(a, _)| a));
             if let Some(u) = here.iter().rev().find(|u| u.local.as_deref() == Some(name)) {
                 return Some(self.rs_path_in(&u.segs, &module, file, scope, 1));
             }
@@ -1263,6 +1324,17 @@ impl RepoIndex {
     /// A path as written at the symbol `ctx` of `file` (`Self::` is the type
     /// of the `impl` around it).
     fn rs_path(&self, segs: &[String], file: &str, ctx: Option<usize>) -> RsRes {
+        self.rs_path_at(segs, file, ctx, None)
+    }
+
+    /// [`Self::rs_path`] for a call at `line`.
+    fn rs_path_at(
+        &self,
+        segs: &[String],
+        file: &str,
+        ctx: Option<usize>,
+        line: Option<i32>,
+    ) -> RsRes {
         if segs.first().map(String::as_str) == Some("Self") {
             let Some(&t) = self.containers(ctx).first() else {
                 return RsRes::Unknown;
@@ -1277,7 +1349,7 @@ impl RepoIndex {
             .first()
             .filter(|f| !matches!(f.as_str(), "crate" | "self" | "super"))
         {
-            if let Some(mut cur) = self.rs_fn_scoped(file, ctx, first) {
+            if let Some(mut cur) = self.rs_fn_scoped(file, ctx, first, line) {
                 for seg in &segs[1..] {
                     cur = self.rs_step(cur, seg, 0);
                 }
@@ -1353,7 +1425,7 @@ impl RepoIndex {
     pub(super) fn rs_path_call(&self, c: &Call<'_>, prefix: &str) -> Outcome {
         let segs = split_path(prefix);
         let self_path = segs.first().map(String::as_str) == Some("Self");
-        match self.rs_path(&segs, c.file, c.src) {
+        match self.rs_path_at(&segs, c.file, c.src, Some(c.line)) {
             RsRes::Item(t, sure) if is_type(&self.syms[t].kind) => {
                 let how = self.rs_how(t, c.file, self_path);
                 let conf = if sure {
@@ -1392,7 +1464,7 @@ impl RepoIndex {
     pub(super) fn rs_free(&self, c: &Call<'_>) -> Outcome {
         let (module, _) = self.rs_module_at(c.file, c.src);
         let found = self
-            .rs_fn_scoped(c.file, c.src, c.callee)
+            .rs_fn_scoped(c.file, c.src, c.callee, Some(c.line))
             .unwrap_or_else(|| self.rs_item(&module, c.callee, 0));
         match found {
             RsRes::Item(i, sure)
@@ -1484,10 +1556,12 @@ impl RepoIndex {
             // A nested function, a function's `use`, the module's item.
             match self.rs_nested_fn(ctx, &segs[0]) {
                 Some(f) => RsRes::Item(f, true),
-                None => self.rs_fn_scoped(file, ctx, &segs[0]).unwrap_or_else(|| {
-                    let (module, _) = self.rs_module_at(file, ctx);
-                    self.rs_item(&module, &segs[0], 0)
-                }),
+                None => self
+                    .rs_fn_scoped(file, ctx, &segs[0], None)
+                    .unwrap_or_else(|| {
+                        let (module, _) = self.rs_module_at(file, ctx);
+                        self.rs_item(&module, &segs[0], 0)
+                    }),
             }
         } else {
             self.rs_path(&segs, file, ctx)
@@ -1676,8 +1750,20 @@ impl RepoIndex {
         // A glob of the file's own module (`use super::*` in its `mod
         // tests`) brings the file's items and `use`s, which are here; a
         // glob of another module may bring any name.
-        let own =
-            |u: &RsUse| u.scope.is_some() && u.segs.iter().all(|s| s == "super" || s == "self");
+        // One `super` per inline `mod` it is in, at most (second review:
+        // `super::super::*` from a top-level `mod tests` is another file's).
+        let depth = |m: usize| {
+            self.chain(Some(m))
+                .into_iter()
+                .filter(|a| self.rs.inline_path.contains_key(a))
+                .count()
+        };
+        let own = |u: &RsUse| {
+            u.scope.is_some_and(|m| {
+                u.segs.iter().all(|s| s == "super" || s == "self")
+                    && u.segs.iter().filter(|s| *s == "super").count() <= depth(m)
+            })
+        };
         if uses.iter().any(|u| u.glob && !own(u)) {
             return None;
         }

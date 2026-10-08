@@ -491,8 +491,25 @@ impl LanguageParser {
                 None if fact.path.is_empty() => Vec::new(),
                 None => vec![fact],
             };
+            // A Rust `use` in a function's block reaches only that block.
+            let block = (self.lang.key() == "rust")
+                .then(|| {
+                    let mut cur = stmt.parent();
+                    while let Some(n) = cur {
+                        if n.kind() == "block" {
+                            return Some((
+                                n.start_position().row as u32 + 1,
+                                n.end_position().row as u32 + 1,
+                            ));
+                        }
+                        cur = n.parent();
+                    }
+                    None
+                })
+                .flatten();
             for mut f in expanded {
                 f.line = line;
+                f.block = block;
                 f.reexport |= fact_reexport;
                 f.target = self.resolver.import_target(&f);
                 facts.push((stmt.id(), f));

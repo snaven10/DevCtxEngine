@@ -11,3 +11,8 @@ mod tests {
 }
 
 pub fn polish() {}
+
+#[cfg(test)]
+mod deep {
+    use super::super::*;
+}

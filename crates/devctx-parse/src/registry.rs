@@ -249,6 +249,8 @@ const SOURCES: &[&str] = &[
 /// = f()` types `a` only, an anonymous interface's method is no symbol.
 /// 16: TASK-007 review, Python — `Any`, `object` and a union of several
 /// types type nothing; `type[X]` is `X`.
+/// 17: TASK-007 second review — a Rust `use` inside a block keeps the
+/// block's lines in its row's hint (`in 12-20`): it reaches only them.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -256,7 +258,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 16;
+pub const EXTRACTOR_VERSION: u32 = 17;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

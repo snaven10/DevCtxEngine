@@ -101,3 +101,18 @@ pub fn chained(t: Store) -> Result<(), String> {
     again.info();
     Ok(())
 }
+
+/// A type nothing resolves types nothing: never a guess by name.
+pub fn mystery_typed(t: mystery::Thing) {
+    t.tidy_up();
+}
+
+/// A `use` inside a closure is the closure's.
+pub fn closure_use() {
+    let c = || {
+        use crate::extra::polish;
+        polish();
+    };
+    c();
+    polish();
+}

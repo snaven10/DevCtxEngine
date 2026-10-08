@@ -42,6 +42,9 @@ pub struct ImportFact {
     /// (a barrel), not bound in the file (PLAN-009 TASK-006); a Rust `pub
     /// use` (TASK-007): bound and re-exported.
     pub reexport: bool,
+    /// Rust: the lines of the block a `use` inside a function is in (it
+    /// reaches only them, TASK-007 second review); `None` at module level.
+    pub block: Option<(u32, u32)>,
     /// What the `imports` edge records as its destination: the path joined
     /// with the name in the language's own syntax (`java.util.List`,
     /// `os.path.join`, `crate::a::B`, `./auth#login`, `net/http`), `*` for a
