@@ -29,9 +29,8 @@ implementación de DD-1: métricas del grafo, precisión contra gold edges, rele
 - Esquema actual: `graph_edges` y `vectors` (`crates/devctx-store/src/schema.rs:76-124`).
 - Anclas verificadas para los casos (2026-10-05):
   - backend-a: `src/main/java/com/example/app/service/OfficeService.java` (`actualizar`, l.113),
-    `src/main/java/com/example/app/async/handler/RenderResultHandler.java`
-    (`reactivarItem`, l.91; llamada l.69), paquete `item/batch/service/` (p. ej.
-    `ItemHistoryBatchService.java`).
+    un handler asíncrono y un paquete de servicios batch (nombres reales fuera del repo, en el
+    gold privado).
   - backend-b: `src/main/java/com/example/b/resource/DraftResource.java`
     (clases internas con campo `service`: l.234, l.293, l.352; llamada l.310).
   - frontend: `lib-auth/src/lib/providers/token.interceptor.ts:78`
