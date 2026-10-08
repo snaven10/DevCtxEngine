@@ -301,3 +301,16 @@ Implementa DD-7 (Python, Rust, Go).
     (d) de Python; el incremental de Rust sigue del orden del completo porque lo domina la carga de la
     rama; no hay sitios reales de R2/R3/P1; el "Klass anidado sombreado" de TS (NIT) no se tocó.
 
+- **Segunda revisión.**
+  - *Selección incremental (59f586b).* La regla "una llamada por path externa no se reabre por
+    nombre" queda solo para `external_known` cuyo primer segmento es la plataforma o un crate de
+    afuera declarado, sin ítem, módulo ni `use` del archivo con ese nombre; un `inherited` o un path
+    por un módulo del repo vuelven al modo (b). Los `const`/`static` de un importador reabren por (d).
+    Escenarios nuevos en la equivalencia incremental = completo (24 pasos). **`LINK_VERSION` 14.**
+  - *Rust (62c66fe).* Un tipo que no resuelve no tipa nada en Rust y Go (nunca `unique_name`); un
+    `use` dentro de un bloque llega solo a sus líneas; sin manifest gana la declaración del ancestro
+    más cercano; `use super::super::*` desde un `mod` de primer nivel bloquea el filtro de
+    importadores; `rs_build` indexa por archivo. **`EXTRACTOR_VERSION` 17, `LINK_VERSION` 15.**
+  - *Python (15ad34a).* `requirements/*.txt` declara para el directorio de arriba; un directorio sin
+    `.py` no sombrea la stdlib; `nombre@url` sin espacios; `-r` documentado como no seguido.
+    **`LINK_VERSION` 16.**
