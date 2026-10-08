@@ -83,26 +83,39 @@ pub(crate) fn load(read: &dyn Fn(&str) -> Option<String>, files: &[String]) -> L
     out
 }
 
-/// The environment the link pass runs under, its fingerprint, and whether it
-/// is the one just read (to store as the last good one). When something could
-/// not be read and the branch has a last good environment, that one, with its
-/// fingerprint: an unreadable file relinks nothing and loses no alias.
-pub(crate) fn choose(
-    loaded: Loaded,
-    stored_fingerprint: Option<&str>,
-    stored_env: Option<&str>,
-) -> (ScriptEnv, String, bool) {
-    if !loaded.unreadable.is_empty() {
-        if let (Some(fp), Some(env)) = (
-            stored_fingerprint,
-            stored_env.and_then(ScriptEnv::from_json),
-        ) {
-            return (env, fp.to_string(), false);
+/// The environment the link pass runs under (stored as the last good one:
+/// it is made only of parts that could be read) and its fingerprint. Per
+/// component (TASK-006 second review):
+/// what could be read is taken fresh; only an unreadable part comes from the
+/// last good environment — its `tsconfig`, or the manifest of the same
+/// directory — and an unreadable manifest that environment did not have is
+/// left out. So a broken file relinks nothing by itself and loses no alias,
+/// and never freezes the changes made to the rest.
+pub(crate) fn choose(loaded: Loaded, stored_env: Option<&str>) -> (ScriptEnv, String) {
+    let stored = stored_env.and_then(ScriptEnv::from_json);
+    let mut env = loaded.env;
+    if let Some(stored) = stored {
+        let tsconfig_broken = loaded
+            .unreadable
+            .iter()
+            .any(|f| NAMES.contains(&f.as_str()));
+        if tsconfig_broken {
+            env.tsconfig = stored.tsconfig.clone();
         }
+        for f in loaded
+            .unreadable
+            .iter()
+            .filter(|f| !NAMES.contains(&f.as_str()))
+        {
+            let dir = dir_of(f);
+            if let Some(m) = stored.manifests.iter().find(|m| m.dir == dir) {
+                env.manifests.push(m.clone());
+            }
+        }
+        env.manifests.sort_by(|a, b| a.dir.cmp(&b.dir));
     }
-    let fresh = loaded.unreadable.is_empty();
-    let fp = loaded.env.fingerprint();
-    (loaded.env, fp, fresh)
+    let fp = env.fingerprint();
+    (env, fp)
 }
 
 #[cfg(test)]
@@ -185,17 +198,92 @@ mod tests {
             )]),
             &[],
         );
-        let (env, fp, fresh) = choose(good, None, None);
-        assert!(fresh);
+        let (env, fp) = choose(good, None);
         let json = env.to_json();
         let broken = load(&reader(&[("tsconfig.base.json", "<<<<<<< ours")]), &[]);
-        let (kept, kept_fp, fresh) = choose(broken, Some(&fp), Some(&json));
-        assert!(!fresh);
+        let (kept, kept_fp) = choose(broken, Some(&json));
         assert_eq!((kept, kept_fp.as_str()), (env.clone(), fp.as_str()));
-        // Nothing stored yet: what could be read, not stored as good.
+        // Nothing stored yet: what could be read.
         let broken = load(&reader(&[("tsconfig.base.json", "<<<<<<< ours")]), &[]);
-        let (none, _, fresh) = choose(broken, None, None);
-        assert!(none.tsconfig.is_none() && !fresh);
+        let (none, _) = choose(broken, None);
+        assert!(none.tsconfig.is_none());
+    }
+
+    /// TASK-006 second review, mi1: a broken manifest added after a good
+    /// index (an Nx generator's template) costs only itself: a change of
+    /// `paths` in the same run is seen, and the other manifests are fresh.
+    #[test]
+    fn a_broken_manifest_added_later_freezes_nothing_else() {
+        let cfg = |target: &str| {
+            format!(r#"{{ "compilerOptions": {{ "paths": {{ "@a/x": ["{target}"] }} }} }}"#)
+        };
+        let good = load(
+            &reader(&[
+                ("tsconfig.base.json", &cfg("libs/a")),
+                ("package.json", r#"{ "dependencies": { "rxjs": "7" } }"#),
+            ]),
+            &["package.json".to_string()],
+        );
+        let (env, fp) = choose(good, None);
+        let json = env.to_json();
+        let files = [
+            "package.json".to_string(),
+            "tools/generators/x/files/package.json".to_string(),
+        ];
+        let later = load(
+            &reader(&[
+                ("tsconfig.base.json", &cfg("libs/b")),
+                (
+                    "package.json",
+                    r#"{ "dependencies": { "rxjs": "7", "lodash": "4" } }"#,
+                ),
+                (
+                    "tools/generators/x/files/package.json",
+                    r#"{ "name": "<%= name %>" "#,
+                ),
+            ]),
+            &files,
+        );
+        let (now, now_fp) = choose(later, Some(&json));
+        assert_eq!(
+            now.tsconfig.unwrap().paths[0].1,
+            ["libs/b".to_string()],
+            "the new alias is seen"
+        );
+        assert_eq!(now.manifests.len(), 1, "{:?}", now.manifests);
+        assert_eq!(now.manifests[0].deps, ["lodash", "rxjs"]);
+        assert_ne!(now_fp, fp);
+    }
+
+    /// An unreadable `tsconfig` keeps only the stored `tsconfig`: a
+    /// dependency added in the same run is seen.
+    #[test]
+    fn a_broken_tsconfig_keeps_only_the_stored_tsconfig() {
+        let good = load(
+            &reader(&[
+                (
+                    "tsconfig.base.json",
+                    r#"{ "compilerOptions": { "paths": { "@a/x": ["libs/a"] } } }"#,
+                ),
+                ("package.json", r#"{ "dependencies": { "rxjs": "7" } }"#),
+            ]),
+            &["package.json".to_string()],
+        );
+        let (env, _) = choose(good, None);
+        let json = env.to_json();
+        let later = load(
+            &reader(&[
+                ("tsconfig.base.json", "<<<<<<< ours"),
+                (
+                    "package.json",
+                    r#"{ "dependencies": { "rxjs": "7", "lodash": "4" } }"#,
+                ),
+            ]),
+            &["package.json".to_string()],
+        );
+        let (now, _) = choose(later, Some(&json));
+        assert_eq!(now.tsconfig, env.tsconfig);
+        assert_eq!(now.manifests[0].deps, ["lodash", "rxjs"]);
     }
 
     /// An `extends` array (TypeScript 5): later entries over earlier ones;

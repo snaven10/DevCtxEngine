@@ -3188,6 +3188,50 @@ public class Helper {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// TASK-006 second review, mi1: a `package.json` that is no JSON (an
+    /// Nx generator's template) committed after a good index, together with
+    /// a moved alias: the alias is seen, the broken manifest costs only
+    /// itself.
+    #[test]
+    fn a_broken_manifest_does_not_freeze_the_aliases() {
+        let mut files = vec![
+            ("web/libs/a/svc.ts", TS_SVC),
+            ("web/libs/b/svc.ts", TS_SVC),
+            ("tsconfig.base.json", TS_CONFIG_A),
+            (
+                "web/app/d.ts",
+                "import { Svc } from '@acme/svc';\nexport function go(s: Svc): void {\n  \
+                 s.run();\n}\n",
+            ),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkmanifest", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let watched = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "web/app/d.ts")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.kind == "calls" && e.dst_name == "Svc.run")
+                .unwrap()
+        };
+        let before = watched(&store);
+        write(
+            &dir,
+            "tools/generators/x/files/package.json",
+            "{ \"name\": \"<%= name %>\" ",
+        );
+        write(&dir, "tsconfig.base.json", TS_CONFIG_B);
+        commit_all(&dir, "generator template and a moved alias");
+        index_with(&store, &dir, false, None);
+        let after = watched(&store);
+        assert_ne!(after.dst_id, before.dst_id, "the moved alias: {after:?}");
+        assert_eq!(after.confidence.as_deref(), Some("high"));
+        assert!(full_link_changes(&store, &repo, &dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A link pass cut short (a stop, a crash) is owed: the next run does it
     /// in full, though its files are unchanged and it writes none (MAJOR 5).
     #[test]

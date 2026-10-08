@@ -512,7 +512,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let loaded = crate::tsconfig::load(&read_env, &branch_files);
     for f in &loaded.unreadable {
         eprintln!(
-            "· {f} could not be read: the link pass keeps the last environment it could read \
+            "· {f} could not be read: the link pass keeps its last readable version, if any \
              (TypeScript aliases, packages)"
         );
     }
@@ -525,8 +525,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     let stored_env =
         req.store
             .get_index_meta(&repo_path, &branch, crate::link::LINK_ENV_META_KEY)?;
-    let (script_env, env_fingerprint, env_fresh) =
-        crate::tsconfig::choose(loaded, stored_env_fp.as_deref(), stored_env.as_deref());
+    let (script_env, env_fingerprint) = crate::tsconfig::choose(loaded, stored_env.as_deref());
     let link_config_changed = stored_env_fp.as_deref() != Some(env_fingerprint.as_str());
     let link_stale = link_stale || link_config_changed;
     if !link_owed {
@@ -646,14 +645,12 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 crate::link::LINK_CONFIG_META_KEY,
                 &env_fingerprint,
             )?;
-            if env_fresh {
-                req.store.set_index_meta(
-                    &repo_path,
-                    &branch,
-                    crate::link::LINK_ENV_META_KEY,
-                    &script_env.to_json(),
-                )?;
-            }
+            req.store.set_index_meta(
+                &repo_path,
+                &branch,
+                crate::link::LINK_ENV_META_KEY,
+                &script_env.to_json(),
+            )?;
             req.store
                 .delete_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY)?;
         }
