@@ -14,6 +14,7 @@
 //! [`link`], with Java's rules in [`java`].
 
 pub mod env;
+pub mod go;
 pub mod java;
 pub mod link;
 pub mod python;
@@ -125,7 +126,7 @@ pub fn resolver_for(lang: Lang) -> &'static dyn LangResolver {
         "typescript" | "tsx" | "javascript" => &Script,
         "python" => &python::Python,
         "rust" => &rust::Rust,
-        "go" => &Go,
+        "go" => &go::Go,
         _ => &Generic,
     }
 }
@@ -297,22 +298,6 @@ fn class_name(class: Node<'_>, bytes: &[u8]) -> String {
         .and_then(|n| n.utf8_text(bytes).ok())
         .unwrap_or_default()
         .to_string()
-}
-
-struct Go;
-
-impl LangResolver for Go {
-    fn package_from_path(&self, _path: &str) -> Option<String> {
-        None // `package x` in the source
-    }
-
-    fn exported(&self, _def: Node<'_>, name: &str, _bytes: &[u8]) -> Option<bool> {
-        Some(name.chars().next().is_some_and(char::is_uppercase))
-    }
-
-    fn import_target(&self, imp: &ImportFact) -> String {
-        imp.path.clone()
-    }
 }
 
 #[cfg(test)]

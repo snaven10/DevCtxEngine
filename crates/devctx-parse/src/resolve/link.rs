@@ -194,6 +194,8 @@ pub(super) struct FileInfo {
     pub(super) script: Vec<TsImport>,
     /// Python: each import, read back.
     pub(super) py: Vec<crate::resolve::python::PyImport>,
+    /// Go: each import path and its alias.
+    pub(super) go: Vec<(String, Option<String>)>,
     /// The file symbol's id.
     pub(super) id: Option<u64>,
 }
@@ -228,6 +230,8 @@ pub struct RepoIndex {
     pub(super) dirs: HashSet<String>,
     /// The workspace's `Cargo.toml` files (PLAN-009 TASK-007).
     pub(super) cargo: Vec<crate::resolve::env::CargoManifest>,
+    /// The workspace's `go.mod` files.
+    pub(super) go: Vec<crate::resolve::env::GoModule>,
     /// Rust modules and `use`s.
     pub(super) rs: crate::resolve::rust::RsIndex,
     /// The type a symbol belongs to when it is not its container: a Rust
@@ -322,7 +326,7 @@ impl RepoIndex {
             script: env,
             python,
             cargo,
-            ..
+            go,
         } = env;
         let mut idx = Self {
             syms: symbols,
@@ -342,6 +346,7 @@ impl RepoIndex {
             py_cache: Default::default(),
             dirs: HashSet::new(),
             cargo,
+            go,
             rs: Default::default(),
             owners: HashMap::new(),
         };
@@ -405,9 +410,18 @@ impl RepoIndex {
                         e.hint.as_deref(),
                     ));
                 }
+                if info.lang.is_some_and(|l| l.key() == "go") {
+                    let alias = e
+                        .hint
+                        .as_deref()
+                        .and_then(|h| h.split_whitespace().skip_while(|t| *t != "as").nth(1))
+                        .map(str::to_string);
+                    info.go.push((e.dst_name.clone(), alias));
+                }
             }
         }
         idx.rs_build(facts);
+        idx.go_build();
         let mut supers: HashMap<u64, Vec<TypeRef>> = HashMap::new();
         for e in facts
             .iter()
@@ -841,6 +855,7 @@ impl RepoIndex {
         match self.lang_key(file) {
             Some("python") => return self.py_type(name, file, ctx),
             Some("rust") => return self.rs_type(name, file, ctx),
+            Some("go") => return self.go_type(name, file, ctx),
             _ => {}
         }
         // Generic: this file (nested along the containers, then top level),
@@ -1032,6 +1047,7 @@ impl RepoIndex {
         match self.lang_key(&e.file) {
             Some("python") => return self.py_import(e),
             Some("rust") => return self.rs_import(e),
+            Some("go") => return self.go_import(e),
             _ => {}
         }
         let target = e.dst_name.as_str();
@@ -1102,7 +1118,10 @@ impl RepoIndex {
     fn call_by_hint(&self, c: &Call<'_>, tokens: &[&str], e: &LinkEdge, depth: u8) -> Outcome {
         let python = self.lang_key(c.file) == Some("python");
         let rust = self.lang_key(c.file) == Some("rust");
+        let go = self.lang_key(c.file) == Some("go");
         match tokens {
+            ["name", recv] if go => self.go_name(c, recv),
+            ["bare"] | ["free"] if go => self.go_free(c),
             ["path", prefix] if rust => self.rs_path_call(c, prefix),
             ["path"] if rust => undecided(),
             ["name", recv] if rust => self.rs_name(c, recv),
@@ -1429,6 +1448,10 @@ impl RepoIndex {
                         .as_deref()
                         .and_then(crate::resolve::rust::field_type)
                         .map(|t| t.base),
+                    Some("go") => fs
+                        .signature
+                        .as_deref()
+                        .and_then(crate::resolve::go::field_type),
                     _ => fs.signature.as_deref().and_then(|s| declared_type(s, name)),
                 };
                 match declared {
@@ -1640,6 +1663,8 @@ impl RepoIndex {
                 ret
             };
             ret.map(|t| t.base)
+        } else if self.lang_key(&ps.file) == Some("go") {
+            sig.and_then(crate::resolve::go::return_type)
         } else {
             None
         };
@@ -1682,6 +1707,7 @@ impl RepoIndex {
         Some(match self.lang_key(file) {
             Some("python") => self.py_value(path, file, ctx),
             Some("rust") => self.rs_value(path, unwrap, file, ctx),
+            Some("go") => self.go_value(path, file),
             _ => ValueType::Unknown,
         })
     }

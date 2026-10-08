@@ -3026,6 +3026,19 @@ public class Helper {
                 "pub struct Thing;\n\nimpl Thing {\n    pub fn go() {}\n}\n",
             ),
         ]);
+        // Go (TASK-007): the `module` of `go.mod` decides which imports are
+        // the repository's.
+        files.extend([
+            ("gox/go.mod", "module example.com/m\n"),
+            (
+                "gox/store/store.go",
+                "package store\n\nfunc New() int {\n\treturn 1\n}\n",
+            ),
+            (
+                "gox/app/app.go",
+                "package app\n\nimport \"example.com/m/store\"\n\nfunc Go() {\n\tstore.New()\n}\n",
+            ),
+        ]);
         files.extend(LINK_FILLER);
         files.extend([
             ("g1.py", "def g1():\n    pass\n"),
@@ -3036,7 +3049,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 14] = [
+        let steps: [(&str, &str, &str, &str, i32); 15] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -3157,6 +3170,15 @@ public class Helper {
                 "rw/app/src/main.rs",
                 "Thing.go",
                 4,
+            ),
+            // The module is renamed: no source changes, only the environment
+            // rule makes the import another module's (external).
+            (
+                "gox/go.mod",
+                "module example.com/other\n",
+                "gox/app/app.go",
+                "New",
+                6,
             ),
         ];
         // Each scenario on a branch of its own, so every one is judged (and

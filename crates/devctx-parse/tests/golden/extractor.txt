@@ -1,4 +1,4 @@
-version 13
+version 14
 == src/main/java/com/example/shop/OrderService.java (java) package=com.example.shop
 sym	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7	parent=-	container=-	-	L1-43	
 sym	class	OrderService	dc29a699ee8c525b	parent=src/main/java/com/example/shop/OrderService.java	container=-	pub	L9-38	public class OrderService extends BaseService implements Auditable, Serializable
@@ -191,6 +191,7 @@ L37	call	Cached.name -> String.new	graph=Cached.name	hint=path String /0
 sym	file	api/server.go	53b33b78efb910e7	parent=-	container=-	-	L1-32	
 sym	const	Version	cba7bd18a30b70f0	parent=api/server.go	container=-	pub	L10-10	Version = "1"
 sym	interface	Handler	68e7a9294952b16f	parent=api/server.go	container=-	pub	L12-14	Handler interface
+sym	method	Handler.Serve	0d3dacb836c15eac	parent=Handler	container=-	pub	L13-13	Serve()
 sym	struct	Server	e715086cc772309e	parent=api/server.go	container=-	pub	L16-20	Server struct
 sym	field	Server.store	75609f0046ef8139	parent=Server	container=-	priv	L18-18	store *store.Store
 sym	field	Server.Name	b6059c4427192455	parent=Server	container=-	pub	L19-19	Name string
@@ -209,5 +210,5 @@ L23	instantiates	NewServer -> Server
 L26	references	Server.Handle -> Server
 L26	references	Server.Handle -> h.ResponseWriter
 L27	call	Server.Handle -> Println	graph=Server.Handle	hint=name fmt /1
-L28	call	Server.Handle -> helper	graph=Server.Handle	hint=name s /0
+L28	call	Server.Handle -> Server.helper	graph=Server.Handle	hint=this /0
 L31	references	Server.helper -> Server

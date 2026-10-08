@@ -23,7 +23,7 @@ fn a_method_with_a_receiver_is_qualified_by_its_type() {
     assert!(pf
         .edges
         .iter()
-        .any(|e| e.source == "Server.Handle" && e.target == "helper"));
+        .any(|e| e.source == "Server.Handle" && e.target == "Server.helper"));
     assert!(calls(&pf).contains(&t2("Server.Handle", "Println")));
 }
 
@@ -36,6 +36,8 @@ fn go_symbols_imports_and_embedding() {
         [
             "const Version",
             "interface Handler",
+            // An interface's method is a symbol (TASK-007).
+            "method Handler.Serve",
             "struct Server",
             "field Server.store",
             "field Server.Name",

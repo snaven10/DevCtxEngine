@@ -4,10 +4,23 @@
   "extensions": [
     "go"
   ],
-  "definitions": "(function_declaration name: (identifier) @name) @definition.function\n(method_declaration name: (field_identifier) @name) @definition.method\n(type_declaration (type_spec name: (type_identifier) @name type: (struct_type)) @definition.struct)\n(type_declaration (type_spec name: (type_identifier) @name type: (interface_type)) @definition.interface)\n(type_declaration (type_spec name: (type_identifier) @name) @definition.type)\n(type_spec type: (struct_type (field_declaration_list (field_declaration name: (field_identifier) @name) @definition.field)))\n(source_file (const_declaration (const_spec name: (identifier) @name) @definition.const))\n(source_file (var_declaration (var_spec name: (identifier) @name) @definition.const))",
+  "definitions": "(function_declaration name: (identifier) @name) @definition.function\n(method_declaration name: (field_identifier) @name) @definition.method\n(interface_type (method_elem name: (field_identifier) @name) @definition.method)\n(type_declaration (type_spec name: (type_identifier) @name type: (struct_type)) @definition.struct)\n(type_declaration (type_spec name: (type_identifier) @name type: (interface_type)) @definition.interface)\n(type_declaration (type_spec name: (type_identifier) @name) @definition.type)\n(type_spec type: (struct_type (field_declaration_list (field_declaration name: (field_identifier) @name) @definition.field)))\n(source_file (const_declaration (const_spec name: (identifier) @name) @definition.const))\n(source_file (var_declaration (var_spec name: (identifier) @name) @definition.const))",
   "references": "(call_expression function: (identifier) @name) @reference.call\n(call_expression function: (selector_expression field: (field_identifier) @name)) @reference.call\n(composite_literal type: (_) @type) @reference.new\n(field_declaration type: (_) @type) @reference.type\n(parameter_declaration type: (_) @type) @reference.type\n(var_spec type: (_) @type) @reference.type\n(function_declaration result: (_) @type) @reference.type\n(method_declaration result: (_) @type) @reference.type",
   "inherits": "(type_spec type: (struct_type (field_declaration_list (field_declaration !name type: (_) @inherit.extends))))\n(type_spec type: (interface_type (type_elem (_) @inherit.extends)))",
-  "types": "(var_spec name: (identifier) @name type: (type_identifier) @type)\n(parameter_declaration name: (identifier) @name type: (type_identifier) @type)\n(field_declaration name: (field_identifier) @name type: (type_identifier) @type)",
+  "types": "(method_declaration receiver: (parameter_list (parameter_declaration name: (identifier) @name type: (_) @type))) @bind.receiver\n(parameter_declaration name: (identifier) @name type: (_) @type) @bind.param\n(variadic_parameter_declaration name: (identifier) @name type: (_) @type) @bind.param\n(var_spec name: (identifier) @name type: (_) @type) @bind.local\n(var_spec name: (identifier) @name !type value: (expression_list . (_) @init)) @bind.local\n(short_var_declaration left: (expression_list . (identifier) @name) right: (expression_list . (_) @init)) @bind.local\n(short_var_declaration left: (expression_list (identifier) @name)) @bind.local\n(range_clause left: (expression_list (identifier) @name)) @bind.local\n(type_switch_statement alias: (expression_list (identifier) @name)) @bind.local\n(function_declaration name: (identifier) @name) @bind.func",
+  "scopes": [
+    "function_declaration",
+    "method_declaration",
+    "func_literal",
+    "block",
+    "for_statement",
+    "if_statement",
+    "expression_switch_statement",
+    "type_switch_statement",
+    "expression_case",
+    "type_case",
+    "communication_case"
+  ],
   "imports": "(import_declaration (import_spec name: (_) @import.alias path: (_) @import.path)) @import\n(import_declaration (import_spec !name path: (_) @import.path)) @import\n(import_declaration (import_spec_list (import_spec name: (_) @import.alias path: (_) @import.path))) @import\n(import_declaration (import_spec_list (import_spec !name path: (_) @import.path))) @import",
   "package": "(package_clause (package_identifier) @package)",
   "type_names": [

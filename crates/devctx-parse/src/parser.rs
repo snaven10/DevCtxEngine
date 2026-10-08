@@ -838,6 +838,11 @@ impl Recv {
         match self {
             Recv::This | Recv::Super => enclosing_container(callee, lang.container_kinds())
                 .and_then(|c| container_name(c, bytes))
+                // A Go method's receiver type.
+                .or_else(|| {
+                    let kinds = ["method_declaration".to_string()];
+                    enclosing_container(callee, &kinds).and_then(|m| go_receiver_type(m, bytes))
+                })
                 .map(|class| format!("{class}.{name}"))
                 .unwrap_or_else(|| name.to_string()),
             // What a call returns (`x = make()`): its type is the link
@@ -1045,6 +1050,8 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
     };
     let key = member.unwrap_or(&t);
     let typed = |b: &crate::resolve::scope::Binding| match &b.ty {
+        // A Go receiver is the instance (`self`).
+        _ if b.this => Recv::This,
         Some(ty) if type_token(&ty.base) => Recv::Typed(ty.base.clone(), b.via),
         _ => Recv::Untyped,
     };

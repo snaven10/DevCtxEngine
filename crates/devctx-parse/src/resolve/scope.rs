@@ -161,6 +161,8 @@ pub struct Binding {
     /// `function f` — hoisted, so in scope from the start of its scope — or
     /// a `const f = () => …`): calling the name calls that symbol.
     pub func: bool,
+    /// A Go method's receiver: the instance, as `self` is (TASK-007).
+    pub this: bool,
 }
 
 /// The bindings of a file, by scope.
@@ -338,6 +340,7 @@ impl Scopes {
                         at,
                         member: member || (role == Some("func") && in_class),
                         func: true,
+                        this: false,
                     },
                 );
                 continue;
@@ -360,6 +363,7 @@ impl Scopes {
                         at,
                         member,
                         func: false,
+                        this: role == Some("receiver"),
                     },
                 );
                 continue;
@@ -418,6 +422,7 @@ impl Scopes {
                     at: p.at,
                     member: p.member,
                     func: false,
+                    this: false,
                 },
             );
         }
@@ -505,6 +510,7 @@ impl Scopes {
                 at: p.at,
                 member: true,
                 func: false,
+                this: false,
             },
         );
         true

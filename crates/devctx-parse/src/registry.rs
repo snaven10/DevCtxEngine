@@ -72,7 +72,8 @@ pub struct LangDef {
     /// property, `@bind.func` for a function bound to its name (a function
     /// of a class body is its method, no bare name), `@bind.attr` for a
     /// Python `self.x = v` in a method (an attribute of the class, typed by
-    /// `v`). A capture named `@_x` is only a predicate's. Of several
+    /// `v`), `@bind.receiver` for a Go method's receiver (`self`). A capture
+    /// named `@_x` is only a predicate's. Of several
     /// patterns capturing one name in one scope, the first in the query
     /// wins. Absent for untyped languages.
     #[serde(default)]
@@ -237,6 +238,11 @@ const SOURCES: &[&str] = &[
 /// <prefix>` (generic arguments out: `Vec::<u8>::new` → `Vec.new`), also as
 /// a chain's previous call; `f()?.g()` is `chain f? …`; a bare name is never
 /// a method; a field of `self` is `member f this`; `pub use` re-exports.
+/// 14: Go `types` and `scopes` (TASK-007): the receiver is `this` (and the
+/// `graph_edges` target of `s.m()` is `Type.m`); parameters, closure
+/// parameters, `:=`, `var`, `range` and type-switch variables are bindings;
+/// `x := New()` holds what the call returns, `&T{}` is `T`; an interface's
+/// method is a symbol.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -244,7 +250,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 13;
+pub const EXTRACTOR_VERSION: u32 = 14;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
@@ -356,6 +362,7 @@ mod tests {
         "bind.inject",
         "bind.func",
         "bind.attr",
+        "bind.receiver",
     ];
     const IMPORT_CAPTURES: &[&str] = &[
         "import",
