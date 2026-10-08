@@ -17,6 +17,7 @@ pub mod env;
 pub mod java;
 pub mod link;
 pub mod python;
+pub mod rust;
 pub mod scope;
 pub mod typescript;
 
@@ -123,7 +124,7 @@ pub fn resolver_for(lang: Lang) -> &'static dyn LangResolver {
         "java" => &java::Java,
         "typescript" | "tsx" | "javascript" => &Script,
         "python" => &python::Python,
-        "rust" => &Rust,
+        "rust" => &rust::Rust,
         "go" => &Go,
         _ => &Generic,
     }
@@ -138,7 +139,7 @@ pub(crate) fn strip_extension(path: &str) -> &str {
 }
 
 /// The text of `node` without whitespace.
-fn compact(node: Node<'_>, bytes: &[u8]) -> String {
+pub(crate) fn compact(node: Node<'_>, bytes: &[u8]) -> String {
     node.utf8_text(bytes)
         .unwrap_or_default()
         .chars()
@@ -296,116 +297,6 @@ fn class_name(class: Node<'_>, bytes: &[u8]) -> String {
         .and_then(|n| n.utf8_text(bytes).ok())
         .unwrap_or_default()
         .to_string()
-}
-
-struct Rust;
-
-impl LangResolver for Rust {
-    /// `crates/my-crate/src/a/b.rs` → `my_crate::a::b`; `src/lib.rs`,
-    /// `main.rs` and `mod.rs` name their directory. A file outside any
-    /// `src/` (a test, an example) is its stem.
-    fn package_from_path(&self, path: &str) -> Option<String> {
-        let stem = strip_extension(path);
-        let parts: Vec<&str> = stem.split('/').collect();
-        let Some(src) = parts.iter().rposition(|p| *p == "src") else {
-            return Some(parts.last().copied().unwrap_or(stem).replace('-', "_"));
-        };
-        let krate = match src {
-            0 => "crate".to_string(),
-            i => parts[i - 1].replace('-', "_"),
-        };
-        let mut module: Vec<&str> = parts[src + 1..].to_vec();
-        if matches!(module.last(), Some(&"lib" | &"main" | &"mod")) {
-            module.pop();
-        }
-        let mut out = krate;
-        for m in module {
-            out.push_str("::");
-            out.push_str(m);
-        }
-        Some(out)
-    }
-
-    /// Any `pub` (`pub(crate)` included); an `impl` has no visibility.
-    fn exported(&self, def: Node<'_>, _name: &str, _bytes: &[u8]) -> Option<bool> {
-        if def.kind() == "impl_item" {
-            return None;
-        }
-        let mut cursor = def.walk();
-        let public = def
-            .children(&mut cursor)
-            .any(|c| c.kind() == "visibility_modifier");
-        Some(public)
-    }
-
-    fn expand_import_tree(&self, tree: Node<'_>, bytes: &[u8]) -> Vec<ImportFact> {
-        let mut out = Vec::new();
-        expand_use(tree, "", bytes, &mut out);
-        out
-    }
-
-    fn import_target(&self, imp: &ImportFact) -> String {
-        if imp.wildcard {
-            format!("{}::*", imp.path)
-        } else {
-            imp.path.clone()
-        }
-    }
-}
-
-/// `prefix::segment`, where `self` names the prefix itself.
-fn use_join(prefix: &str, segment: &str) -> String {
-    match (prefix.is_empty(), segment) {
-        (true, s) => s.to_string(),
-        (false, "self") => prefix.to_string(),
-        (false, s) => format!("{prefix}::{s}"),
-    }
-}
-
-/// Flatten a Rust `use` tree: `a::{b::C, d as e, f::*}` is `a::b::C`,
-/// `a::d` (alias `e`) and `a::f` (wildcard).
-fn expand_use(node: Node<'_>, prefix: &str, bytes: &[u8], out: &mut Vec<ImportFact>) {
-    let fact = |path: String, alias: Option<String>, wildcard: bool| ImportFact {
-        path,
-        alias,
-        wildcard,
-        ..Default::default()
-    };
-    match node.kind() {
-        "use_as_clause" => {
-            let path = node
-                .child_by_field_name("path")
-                .map(|p| compact(p, bytes))
-                .unwrap_or_default();
-            let alias = node.child_by_field_name("alias").map(|a| compact(a, bytes));
-            out.push(fact(use_join(prefix, &path), alias, false));
-        }
-        "use_wildcard" => {
-            let inner = node
-                .named_child(0)
-                .map(|p| compact(p, bytes))
-                .unwrap_or_default();
-            out.push(fact(use_join(prefix, &inner), None, true));
-        }
-        "use_list" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                expand_use(child, prefix, bytes, out);
-            }
-        }
-        "scoped_use_list" => {
-            let path = node
-                .child_by_field_name("path")
-                .map(|p| compact(p, bytes))
-                .unwrap_or_default();
-            let prefix = use_join(prefix, &path);
-            if let Some(list) = node.child_by_field_name("list") {
-                expand_use(list, &prefix, bytes, out);
-            }
-        }
-        k if k.contains("comment") => {}
-        _ => out.push(fact(use_join(prefix, &compact(node, bytes)), None, false)),
-    }
 }
 
 struct Go;

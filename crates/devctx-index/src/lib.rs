@@ -3002,6 +3002,30 @@ public class Helper {
                 "import requests\n\n\ndef go():\n    requests.get(\"u\")\n",
             ),
         ]);
+        // Rust (TASK-007): a `pub use` re-export of the crate root, and a
+        // crate whose `Cargo.toml` comes to make it the workspace's.
+        files.extend([
+            ("rs/Cargo.toml", "[package]\nname = \"rlib\"\n"),
+            (
+                "rs/src/lib.rs",
+                "pub mod a;\npub mod b;\npub mod c;\npub use a::Svc;\n",
+            ),
+            ("rs/src/a.rs", RS_SVC),
+            ("rs/src/b.rs", RS_SVC),
+            (
+                "rs/src/c.rs",
+                "use crate::Svc;\n\npub fn go(s: Svc) {\n    s.run();\n}\n",
+            ),
+            ("rw/app/Cargo.toml", "[package]\nname = \"rapp\"\n"),
+            (
+                "rw/app/src/main.rs",
+                "use ralpha::Thing;\n\nfn main() {\n    Thing::go();\n}\n",
+            ),
+            (
+                "rw/alpha/src/lib.rs",
+                "pub struct Thing;\n\nimpl Thing {\n    pub fn go() {}\n}\n",
+            ),
+        ]);
         files.extend(LINK_FILLER);
         files.extend([
             ("g1.py", "def g1():\n    pass\n"),
@@ -3012,7 +3036,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 12] = [
+        let steps: [(&str, &str, &str, &str, i32); 14] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -3115,6 +3139,25 @@ public class Helper {
                 "get",
                 5,
             ),
+            // The crate root re-exports `Svc` from the other module: it
+            // defines no `Svc`, so only the importers rule (a `use` of the
+            // crate root) reaches `c.rs`.
+            (
+                "rs/src/lib.rs",
+                "pub mod a;\npub mod b;\npub mod c;\npub use b::Svc;\n",
+                "rs/src/c.rs",
+                "Svc.run",
+                4,
+            ),
+            // A `Cargo.toml` makes `ralpha` a crate of the workspace: no
+            // source changes, only the environment rule resolves the path.
+            (
+                "rw/alpha/Cargo.toml",
+                "[package]\nname = \"ralpha\"\n",
+                "rw/app/src/main.rs",
+                "Thing.go",
+                4,
+            ),
         ];
         // Each scenario on a branch of its own, so every one is judged (and
         // reported) whatever the others do.
@@ -3163,6 +3206,7 @@ public class Helper {
     }
 
     const PY_SVC: &str = "class Svc:\n    def run(self):\n        pass\n";
+    const RS_SVC: &str = "pub struct Svc;\n\nimpl Svc {\n    pub fn run(&self) {}\n}\n";
     const TS_FOO: &str = "export class Foo {\n  g(): void {}\n}\n";
     const TS_SVC: &str = "export class Svc {\n  run(): void {}\n}\n";
     const TS_CONFIG_A: &str =

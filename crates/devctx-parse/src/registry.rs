@@ -229,6 +229,14 @@ const SOURCES: &[&str] = &[
 /// <via> Foo()`); an attribute no scope binds is `member x this`; a literal
 /// receiver is its builtin type; `super().m()` is `super`; a module binding
 /// is seen from any function; a `from … import` row's hint says `from`.
+/// 13: Rust `types` and `scopes` (TASK-007): parameters of any type (`&T`,
+/// `impl T`, `dyn T`, `Arc<T>` → `T`, a type parameter its first bound),
+/// closure parameters and every pattern binding (`let`, `if let`, `match`,
+/// `for`) are bindings; `let x = T::f()?` holds what the call returns; a
+/// trait method without a body is a symbol; a path call's hint is `path
+/// <prefix>` (generic arguments out: `Vec::<u8>::new` → `Vec.new`), also as
+/// a chain's previous call; `f()?.g()` is `chain f? …`; a bare name is never
+/// a method; a field of `self` is `member f this`; `pub use` re-exports.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -236,7 +244,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 12;
+pub const EXTRACTOR_VERSION: u32 = 13;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

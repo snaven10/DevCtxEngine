@@ -1,0 +1,8 @@
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+demo-store = { path = "../store" }
+serde_json.workspace = true
+tokio = { version = "1", features = ["full"] }

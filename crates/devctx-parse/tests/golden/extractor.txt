@@ -1,4 +1,4 @@
-version 12
+version 13
 == src/main/java/com/example/shop/OrderService.java (java) package=com.example.shop
 sym	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7	parent=-	container=-	-	L1-43	
 sym	class	OrderService	dc29a699ee8c525b	parent=src/main/java/com/example/shop/OrderService.java	container=-	pub	L9-38	public class OrderService extends BaseService implements Auditable, Serializable
@@ -164,6 +164,7 @@ sym	struct	Cached	23cd766c1c4d96aa	parent=crates/demo/src/cache.rs	container=-	p
 sym	field	Cached.inner	f909692c2c3dc62c	parent=Cached	container=-	pub	L10-10	pub inner: T
 sym	field	Cached.hits	8c4b769ca5f26b48	parent=Cached	container=-	priv	L11-11	hits: u32
 sym	trait	Named	5710b2875e264529	parent=crates/demo/src/cache.rs	container=-	pub	L14-16	pub trait Named: Clone + Send
+sym	method	Named.name	c30d0cb7317066f6	parent=Named	container=Named	priv	L15-15	fn name(&self) -> String;
 sym	impl	Cached	9c4d3b2a26919144	parent=Cached	container=-	-	L18-31	impl<T: Clone> Cached<T>
 sym	method	Cached.new	769d643b2fad00d6	parent=Cached	container=Cached	pub	L19-23	pub fn new(inner: T) -> Self
 sym	method	Cached.build	900da28cfc5f3968	parent=Cached	container=Cached	priv	L25-30	fn build(inner: T) -> Cached<T>
@@ -177,15 +178,15 @@ L2	import	crate::store::model::*	path=crate::store::model name=- alias=- wildcar
 L14	inherits	Named -> Clone
 L14	inherits	Named -> Send
 L21	references	Cached.new -> Cached
-L22	call	Cached.new -> Cached.build	graph=Cached.new	hint=path /1
+L22	call	Cached.new -> Cached.build	graph=Cached.new	hint=path Self /1
 L25	references	Cached.build -> Cached
-L27	call	Cached.build.tag -> mark	graph=Cached.build.tag	hint=bare /0
+L27	call	Cached.build.tag -> mark	graph=Cached.build.tag	hint=free /0
 L29	instantiates	Cached.build -> Cached
 L33	implements	Cached -> Named
 L34	references	Cached.name -> String
-L35	call	Cached.name -> Foo.bar	graph=Cached.name	hint=path /0
-L36	call	Cached.name -> store::open	graph=Cached.name	hint=path /0
-L37	call	Cached.name -> String.new	graph=Cached.name	hint=path /0
+L35	call	Cached.name -> Foo.bar	graph=Cached.name	hint=path Foo /0
+L36	call	Cached.name -> store::open	graph=Cached.name	hint=path store /0
+L37	call	Cached.name -> String.new	graph=Cached.name	hint=path String /0
 == api/server.go (go) package=api
 sym	file	api/server.go	53b33b78efb910e7	parent=-	container=-	-	L1-32	
 sym	const	Version	cba7bd18a30b70f0	parent=api/server.go	container=-	pub	L10-10	Version = "1"

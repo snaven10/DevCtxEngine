@@ -39,7 +39,8 @@ pub struct ImportFact {
     /// `.*`, `import *`, `* as ns`, `use x::*`.
     pub wildcard: bool,
     /// TypeScript/JavaScript `export … from`: the names are re-exported
-    /// (a barrel), not bound in the file (PLAN-009 TASK-006).
+    /// (a barrel), not bound in the file (PLAN-009 TASK-006); a Rust `pub
+    /// use` (TASK-007): bound and re-exported.
     pub reexport: bool,
     /// What the `imports` edge records as its destination: the path joined
     /// with the name in the language's own syntax (`java.util.List`,

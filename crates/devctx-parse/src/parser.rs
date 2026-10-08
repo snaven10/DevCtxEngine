@@ -155,9 +155,15 @@ impl LanguageParser {
                     };
                     let func = enclosing_source(callee, self.lang, bound);
                     let (target, hint) = match path {
+                        // The path as written, generic arguments out (`path
+                        // crate::a::Foo`, `path Self`): what the link pass
+                        // resolves it from (TASK-007).
                         Some(p) => (
                             path_target(callee, p, callee_name, bytes, self.lang),
-                            "path".to_string(),
+                            match path_prefix(p, bytes) {
+                                Some(prefix) => format!("path {prefix}"),
+                                None => "path".to_string(),
+                            },
                         ),
                         None => {
                             let recv = classify(callee, bytes, scopes, 0);
@@ -466,12 +472,20 @@ impl LanguageParser {
             }
             let Some(stmt) = stmt else { continue };
             // `export { x } from './y'`, `export * from './y'`: re-exported,
-            // not bound in the file.
-            fact.reexport = stmt.kind() == "export_statement";
+            // not bound in the file; a Rust `pub use` re-exports too.
+            fact.reexport = stmt.kind() == "export_statement"
+                || (stmt.kind() == "use_declaration" && {
+                    let mut c = stmt.walk();
+                    let public = stmt
+                        .children(&mut c)
+                        .any(|n| n.kind() == "visibility_modifier");
+                    public
+                });
             if !statements.iter().any(|s| s.id() == stmt.id()) {
                 statements.push(stmt);
             }
             let line = at.unwrap_or(stmt.start_position().row as u32 + 1);
+            let fact_reexport = fact.reexport;
             let expanded = match tree {
                 Some(t) => self.resolver.expand_import_tree(t, bytes),
                 None if fact.path.is_empty() => Vec::new(),
@@ -479,6 +493,7 @@ impl LanguageParser {
             };
             for mut f in expanded {
                 f.line = line;
+                f.reexport |= fact_reexport;
                 f.target = self.resolver.import_target(&f);
                 facts.push((stmt.id(), f));
             }
@@ -609,12 +624,10 @@ fn type_ref_name(node: Node<'_>, bytes: &[u8], lang: Lang) -> Option<String> {
 /// run of names (`<T as Trait>::f`, `Vec::<u8>::new`) falls back to the
 /// bare callee.
 fn path_target(callee: Node<'_>, path: Node<'_>, name: &str, bytes: &[u8], lang: Lang) -> String {
-    let text: String = path
-        .utf8_text(bytes)
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    // Generic arguments out (`Vec::<u8>::new` → `Vec.new`).
+    let Some(text) = path_prefix(path, bytes) else {
+        return name.to_string();
+    };
     let segments: Vec<&str> = text.split("::").collect();
     if segments.is_empty() || !segments.iter().all(|s| nameable(s)) {
         return name.to_string();
@@ -632,6 +645,13 @@ fn path_target(callee: Node<'_>, path: Node<'_>, name: &str, bytes: &[u8], lang:
         return format!("{last}.{name}");
     }
     format!("{text}::{name}")
+}
+
+/// A call's path as written, without whitespace or generic arguments
+/// (`Vec::<u8>` → `Vec`, `crate::a::Foo`, `Self`); `None` for one that is no
+/// plain run of names (`<T as Trait>`).
+fn path_prefix(path: Node<'_>, bytes: &[u8]) -> Option<String> {
+    crate::resolve::rust::normalize_path(path.utf8_text(bytes).ok()?).map(|p| p.replace('.', "::"))
 }
 
 /// Where a symbol's text really begins: at the doc comment above it, not at
@@ -804,6 +824,9 @@ enum Recv {
     /// A bare or `this` call inside an anonymous class (`new TimerTask() {
     /// … cancel() }`): the class it extends first, then the enclosing scopes.
     Anon(String, Box<Recv>),
+    /// A Rust path call's path (`a::b::f()` → `a::b`), when it is the
+    /// previous call of a chain.
+    Path(String),
 }
 
 impl Recv {
@@ -850,6 +873,7 @@ impl Recv {
             Recv::Chain(Some((prev, recv))) => format!("chain {prev} {}", recv.hint()),
             Recv::Member(path, base) => format!("member {} {}", path.join("."), base.hint()),
             Recv::Anon(ty, inner) => format!("anon {ty} {}", inner.hint()),
+            Recv::Path(p) => format!("path {p}"),
         }
     }
 }
@@ -863,6 +887,15 @@ const CALL_KINDS: &[&str] = &["method_invocation", "call_expression", "call"];
 
 /// The receiver of the call whose callee is `callee`.
 fn classify(callee: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -> Recv {
+    // Rust `a::f()` as a chain's previous call: its path.
+    if let Some(parent) = callee.parent().filter(|p| p.kind() == "scoped_identifier") {
+        if let Some(prefix) = parent
+            .child_by_field_name("path")
+            .and_then(|p| path_prefix(p, bytes))
+        {
+            return Recv::Path(prefix);
+        }
+    }
     let recv = match receiver_node(callee) {
         Some(recv) => classify_receiver(recv, bytes, scopes, depth),
         // TypeScript/JavaScript: `next(req)` with `next` a parameter or a
@@ -931,11 +964,35 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
         "this" if !scopes.implicit_this() && !this_is_a_class(recv) => return Recv::Untyped,
         "this" | "self" => return Recv::This,
         "super" => return Recv::Super,
-        "parenthesized_expression" => {
+        "parenthesized_expression" | "await_expression" => {
             return match recv.named_child(0) {
                 Some(inner) => classify_receiver(inner, bytes, scopes, depth),
                 None => Recv::Expr,
             }
+        }
+        // Rust `a.f()?.g()`: the previous call, unwrapped (`chain f? …`);
+        // `x?.g()` with `x: Option<Foo>`: `Foo` (TASK-007).
+        "try_expression" => {
+            let Some(inner) = recv.named_child(0) else {
+                return Recv::Expr;
+            };
+            return match classify_receiver(inner, bytes, scopes, depth) {
+                Recv::Chain(Some((prev, r))) => Recv::Chain(Some((format!("{prev}?"), r))),
+                Recv::Typed(ty, via) if !ty.ends_with(')') && !ty.ends_with('?') => {
+                    let elem = inner
+                        .utf8_text(bytes)
+                        .ok()
+                        .and_then(|k| scopes.lookup(inner, k))
+                        .and_then(|b| b.ty.as_ref())
+                        .and_then(|t| t.elem.clone());
+                    match elem {
+                        Some(e) if nameable(&e) => Recv::Typed(e, via),
+                        _ => Recv::Untyped,
+                    }
+                }
+                Recv::Typed(..) | Recv::Untyped | Recv::Name(_) => Recv::Untyped,
+                other => other,
+            };
         }
         "cast_expression" | "object_creation_expression" | "new_expression" => {
             let ty = recv
@@ -1070,7 +1127,20 @@ fn inner_callee(call: Node<'_>) -> Option<Node<'_>> {
             return Some(n);
         }
     }
-    matches!(func.kind(), "identifier").then_some(func)
+    // Rust `a::f()` (and `f::<T>()`): its last segment.
+    match func.kind() {
+        "identifier" => Some(func),
+        "scoped_identifier" => func.child_by_field_name("name"),
+        "generic_function" => {
+            let f = func.child_by_field_name("function")?;
+            match f.kind() {
+                "identifier" => Some(f),
+                "scoped_identifier" => f.child_by_field_name("name"),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// How many arguments the call of `callee` passes, when the grammar says.

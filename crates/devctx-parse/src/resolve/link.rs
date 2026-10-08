@@ -44,6 +44,10 @@ pub struct LinkSymbol {
     /// Visible outside its module (`export`, `public`…); `None` when the
     /// language says nothing.
     pub exported: Option<bool>,
+    /// 1-based first and last line (a Rust `use` inside an inline `mod`
+    /// belongs to it).
+    pub start_line: i32,
+    pub end_line: i32,
 }
 
 /// One occurrence to resolve.
@@ -222,6 +226,14 @@ pub struct RepoIndex {
     /// Every directory that holds a file of the branch (a namespace
     /// package, a Go package).
     pub(super) dirs: HashSet<String>,
+    /// The workspace's `Cargo.toml` files (PLAN-009 TASK-007).
+    pub(super) cargo: Vec<crate::resolve::env::CargoManifest>,
+    /// Rust modules and `use`s.
+    pub(super) rs: crate::resolve::rust::RsIndex,
+    /// The type a symbol belongs to when it is not its container: a Rust
+    /// `impl` in a file other than its type's, a Go method beside its
+    /// type's file.
+    pub(super) owners: HashMap<usize, usize>,
 }
 
 /// Methods every Java class has from `Object`, and every enum from `Enum`.
@@ -309,6 +321,7 @@ impl RepoIndex {
         let crate::resolve::env::LinkEnv {
             script: env,
             python,
+            cargo,
             ..
         } = env;
         let mut idx = Self {
@@ -328,6 +341,9 @@ impl RepoIndex {
             python,
             py_cache: Default::default(),
             dirs: HashSet::new(),
+            cargo,
+            rs: Default::default(),
+            owners: HashMap::new(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.id, i);
@@ -391,6 +407,7 @@ impl RepoIndex {
                 }
             }
         }
+        idx.rs_build(facts);
         let mut supers: HashMap<u64, Vec<TypeRef>> = HashMap::new();
         for e in facts
             .iter()
@@ -399,12 +416,14 @@ impl RepoIndex {
             let Some(&src) = idx.by_id.get(&e.src_id) else {
                 continue;
             };
-            // A Rust `impl Trait for T` gives `T` its supertype.
+            // A Rust `impl Trait for T` gives `T` its supertype (in its
+            // file, or `T`'s other file).
             let owner = if idx.syms[src].kind == "impl" {
                 idx.syms[src]
                     .parent_id
                     .and_then(|p| idx.by_id.get(&p).copied())
                     .filter(|&p| is_type(&idx.syms[p].kind))
+                    .or_else(|| idx.owners.get(&src).copied())
                     .unwrap_or(src)
             } else {
                 src
@@ -485,6 +504,7 @@ impl RepoIndex {
                 let (paths, reexports) = match self.lang_key(file) {
                     Some("typescript" | "tsx" | "javascript") => self.script_reach(file)?,
                     Some("python") => self.py_file_reach(file)?,
+                    Some("rust") => self.rs_file_reach(file)?,
                     _ => return None,
                 };
                 Some((file, paths, reexports))
@@ -569,12 +589,31 @@ impl RepoIndex {
         out
     }
 
-    /// The types around `src`, innermost first.
-    fn containers(&self, src: Option<usize>) -> Vec<usize> {
-        self.chain(src)
-            .into_iter()
-            .filter(|&i| is_type(&self.syms[i].kind))
-            .collect()
+    /// The types around `src`, innermost first; a symbol with an owner (a
+    /// Rust `impl` in another file than its type, a Go method) counts its
+    /// owner.
+    pub(super) fn containers(&self, src: Option<usize>) -> Vec<usize> {
+        let mut out = Vec::new();
+        for i in self.chain(src) {
+            if is_type(&self.syms[i].kind) {
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+            } else if let Some(&t) = self.owners.get(&i) {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    /// Make `child` one of the symbol `parent`'s children (an owner's).
+    pub(super) fn add_child(&mut self, parent: u64, child: usize) {
+        let list = self.children.entry(parent).or_default();
+        if !list.contains(&child) {
+            list.push(child);
+        }
     }
 
     /// Direct members of the type `t` named `name` (a Rust type's also in
@@ -799,8 +838,10 @@ impl RepoIndex {
         if self.is_script(file) {
             return self.script_type(name, file, ctx);
         }
-        if self.lang_key(file) == Some("python") {
-            return self.py_type(name, file, ctx);
+        match self.lang_key(file) {
+            Some("python") => return self.py_type(name, file, ctx),
+            Some("rust") => return self.rs_type(name, file, ctx),
+            _ => {}
         }
         // Generic: this file (nested along the containers, then top level),
         // then a unique type of that name, then the platform.
@@ -988,8 +1029,10 @@ impl RepoIndex {
         if self.is_script(&e.file) {
             return self.script_import(e);
         }
-        if self.lang_key(&e.file) == Some("python") {
-            return self.py_import(e);
+        match self.lang_key(&e.file) {
+            Some("python") => return self.py_import(e),
+            Some("rust") => return self.rs_import(e),
+            _ => {}
         }
         let target = e.dst_name.as_str();
         if !self.is_java(&e.file) {
@@ -1058,7 +1101,13 @@ impl RepoIndex {
 
     fn call_by_hint(&self, c: &Call<'_>, tokens: &[&str], e: &LinkEdge, depth: u8) -> Outcome {
         let python = self.lang_key(c.file) == Some("python");
+        let rust = self.lang_key(c.file) == Some("rust");
         match tokens {
+            ["path", prefix] if rust => self.rs_path_call(c, prefix),
+            ["path"] if rust => undecided(),
+            ["name", recv] if rust => self.rs_name(c, recv),
+            ["bare"] if rust => self.rs_bare(c),
+            ["free"] if rust => self.rs_free(c),
             ["this"] => self.this_call(c, false),
             ["super"] => self.this_call(c, true),
             ["typed", via, ty] => self.typed_call(c, via, ty),
@@ -1122,6 +1171,9 @@ impl RepoIndex {
             Member::External => external("inherited"),
             Member::Missing => match self.accessor(t, c.callee) {
                 Some(f) => medium(f, self, own),
+                None if self.lang_key(&self.syms[t].file) == Some("rust") => {
+                    self.rs_missing(c.callee)
+                }
                 None => undecided(),
             },
         };
@@ -1371,7 +1423,15 @@ impl RepoIndex {
         match self.find_member(t, name, false, None) {
             Member::Found(f, _, _) => {
                 let fs = &self.syms[f];
-                match fs.signature.as_deref().and_then(|s| declared_type(s, name)) {
+                let declared = match self.lang_key(&fs.file) {
+                    Some("rust") => fs
+                        .signature
+                        .as_deref()
+                        .and_then(crate::resolve::rust::field_type)
+                        .map(|t| t.base),
+                    _ => fs.signature.as_deref().and_then(|s| declared_type(s, name)),
+                };
+                match declared {
                     Some(ty) => match self.resolve_type(&ty, &fs.file, Some(f)) {
                         TypeRef::Repo(n, how) => (TypeRef::Repo(n, how), self.type_conf(n, how)),
                         r => (r, "high"),
@@ -1386,13 +1446,19 @@ impl RepoIndex {
     /// `target.parent.m()`, `this.cfg.server.m()`: the first segment's type,
     /// then each field's declared type (PLAN-009 TASK-005 review).
     fn member_call(&self, c: &Call<'_>, path: &str, base: &[&str]) -> Outcome {
-        if !self.is_java(c.file) {
-            // Other languages: as the dotted name it is (TASK-006/007).
+        if !self.is_java(c.file) && !matches!(self.lang_key(c.file), Some("rust" | "go")) {
+            // TypeScript/JavaScript: as the dotted name it is (TASK-006).
             return self.untyped_or_low(c);
         }
-        // Labelled by its base (`p.f.m()` with `p` a parameter is `param`).
+        // Labelled by its base (`p.f.m()` with `p` a parameter is `param`);
+        // Rust and Go `self.f.m()` by the field (rule 3).
         let Some((mut r, label, mut conf)) = self.hint_type(c, base) else {
             return self.untyped(c);
+        };
+        let label = if base == ["this"] && !self.is_java(c.file) {
+            "field"
+        } else {
+            label
         };
         for seg in path.split('.') {
             match r {
@@ -1522,6 +1588,19 @@ impl RepoIndex {
         e: &LinkEdge,
         depth: u8,
     ) -> Outcome {
+        let rust = self.lang_key(c.file) == Some("rust");
+        // Rust `a.f().unwrap().g()`: `g` on what `f` returns, unwrapped, as
+        // `a.f()?.g()` (TASK-007).
+        if rust && crate::resolve::rust::UNWRAPS.contains(&prev) {
+            if let ["chain", p2, rest @ ..] = prev_hint {
+                let p2 = format!("{}?", p2.trim_end_matches('?'));
+                return self.chain_call(c, &p2, rest, e, depth + 1);
+            }
+        }
+        let (prev, unwrap) = match prev.strip_suffix('?') {
+            Some(p) => (p, true),
+            None => (prev, false),
+        };
         let inner = LinkEdge {
             dst_name: prev.to_string(),
             hint: Some(prev_hint.join(" ")),
@@ -1553,6 +1632,14 @@ impl RepoIndex {
             sig.and_then(crate::resolve::typescript::return_type)
         } else if self.lang_key(&ps.file) == Some("python") {
             sig.and_then(crate::resolve::python::return_type)
+        } else if self.lang_key(&ps.file) == Some("rust") {
+            let ret = sig.and_then(crate::resolve::rust::return_type);
+            let ret = if unwrap {
+                ret.and_then(crate::resolve::rust::unwrapped)
+            } else {
+                ret
+            };
+            ret.map(|t| t.base)
         } else {
             None
         };
@@ -1588,9 +1675,13 @@ impl RepoIndex {
     /// what calling `X` returns, by the file's language; `None` for a type
     /// as written (`Foo`).
     pub(super) fn value_of(&self, ty: &str, file: &str, ctx: Option<usize>) -> Option<ValueType> {
-        let path = ty.strip_suffix("()")?;
+        let (path, unwrap) = match ty.strip_suffix("()?") {
+            Some(p) => (p, true),
+            None => (ty.strip_suffix("()")?, false),
+        };
         Some(match self.lang_key(file) {
             Some("python") => self.py_value(path, file, ctx),
+            Some("rust") => self.rs_value(path, unwrap, file, ctx),
             _ => ValueType::Unknown,
         })
     }
@@ -1723,6 +1814,8 @@ pub fn link_rows(file: &str, pf: &ParsedFile) -> (Vec<LinkSymbol>, Vec<LinkEdge>
             package: package.clone(),
             signature: (!s.signature.is_empty()).then(|| s.signature.clone()),
             exported: s.exported,
+            start_line: s.start_line as i32,
+            end_line: s.end_line as i32,
         })
         .collect();
     let edge = |kind: &str, src_id: u64, dst: &str, hint: Option<String>, line: u32| LinkEdge {

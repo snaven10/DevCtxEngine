@@ -36,6 +36,8 @@ fn rust_symbols_impls_consts_and_fields() {
             "field Cached.inner",
             "field Cached.hits",
             "trait Named",
+            // A trait method without a body is a symbol (TASK-007).
+            "method Named.name",
             "impl Cached",
             "method Cached.new",
             "method Cached.build",
