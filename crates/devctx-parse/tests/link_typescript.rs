@@ -352,9 +352,11 @@ fn imports_by_name_namespace_default_and_package() {
         l.call("run", "DefaultStore.clear"),
         (s("DefaultStore.clear"), s(STORE), "medium", "local", false)
     );
+    // A package the manifest declares is external, whatever the
+    // repository defines (TASK-006 second review, mi2).
     assert_eq!(
         l.call("run", "fromPackage"),
-        (None, None, "low", "name_only", false)
+        (None, None, "high", "external_known", true)
     );
     assert_eq!(
         l.call("run", "of"),
@@ -362,7 +364,7 @@ fn imports_by_name_namespace_default_and_package() {
     );
     assert_eq!(
         l.import("apps/shell/src/app/use-util.ts", "acme-sdk#formatName"),
-        (None, None, "low", "name_only", false)
+        (None, None, "high", "external_known", true)
     );
     assert_eq!(
         l.import("apps/shell/src/app/use-util.ts", "rxjs#of"),
@@ -479,14 +481,27 @@ fn a_tsconfig_with_comments_is_read() {
     assert_ne!(nested.fingerprint(), cfg.fingerprint());
 }
 
-/// TASK-006 review, M1: a name imported from a package that a repository file
-/// also defines is not that file's (no `unique_name` guess): undecided.
+/// TASK-006 review, M1: a name imported from a module nothing says is a
+/// package, that a repository file also defines, is not that file's (no
+/// `unique_name` guess): undecided. Second review, mi2: from a package the
+/// manifest declares it is external, though the repository has the name.
 #[test]
 fn a_package_import_is_never_a_repository_homonym() {
     let l = linked();
     assert_eq!(
-        l.call("usePackage", "formatName"),
+        l.call("usePackage", "helper"),
         (None, None, "low", "name_only", false)
+    );
+    for name in ["formatName", "filter"] {
+        assert_eq!(
+            l.call("usePackage", name),
+            (None, None, "high", "external_known", true),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        l.import("apps/shell/src/app/use-package.ts", "rxjs#filter"),
+        (None, None, "high", "external_known", true)
     );
 }
 
@@ -541,11 +556,31 @@ fn a_block_local_function_does_not_shadow_outside_its_block() {
         .map(|o| l.show(o))
         .collect();
     let blocks = "apps/shell/src/app/blocks.ts";
+    // Two blocks bind a `cb` each: both are `outer.cb`, so which one is not
+    // decided by the symbols — no surer than medium (second review).
     assert_eq!(
         calls,
         [
-            (s("outer.cb"), s(blocks), "high", "same_file", false),
+            (s("outer.cb"), s(blocks), "medium", "same_file", false),
             (s("cb"), s(blocks), "high", "same_file", false),
+            (s("outer.cb"), s(blocks), "medium", "same_file", false),
         ]
+    );
+}
+
+/// TASK-006 second review (NIT): a function or class bound to a name is no
+/// untyped value: `fn.call()` stays undecided (not discarded) and
+/// `Klass.make()` of a `const Klass = class { static make() }` is its
+/// method.
+#[test]
+fn bound_functions_and_classes_as_receivers() {
+    let l = linked();
+    assert_eq!(
+        l.call("build", "Klass.make"),
+        (s("Klass.make"), s(UTIL), "high", "same_file", false)
+    );
+    assert_eq!(
+        l.call("build", "call"),
+        (None, None, "low", "name_only", false)
     );
 }

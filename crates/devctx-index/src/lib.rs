@@ -2995,7 +2995,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 11] = [
+        let steps: [(&str, &str, &str, &str, i32); 10] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -3069,16 +3069,6 @@ public class Helper {
                 "web/app/e.ts",
                 "Svc.run",
                 3,
-            ),
-            // A file starts defining `map`: the import row `rxjs#map` of a
-            // file not written stops being external (DD-9). Only the
-            // import-row key (the name after `#`) reaches it.
-            (
-                "web/m3/util.ts",
-                "export function other(): void {}\nexport function map(): void {}\n",
-                "web/m3/f.ts",
-                "rxjs#map",
-                1,
             ),
             // The barrel behind `A.f()`'s return type moves: `c.ts` imports
             // only `A` (an importer of the barrel), and only an importer's
@@ -3228,6 +3218,48 @@ public class Helper {
         let after = watched(&store);
         assert_ne!(after.dst_id, before.dst_id, "the moved alias: {after:?}");
         assert_eq!(after.confidence.as_deref(), Some("high"));
+        assert!(full_link_changes(&store, &repo, &dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-006 second review, mi2: a file that starts defining `map` does
+    /// not change an import of `map` from a declared package (it stays
+    /// external), and the incremental pass equals a full one.
+    #[test]
+    fn a_repository_homonym_does_not_unmake_a_package_import() {
+        let mut files = vec![
+            (
+                "package.json",
+                "{ \"dependencies\": { \"rxjs\": \"7\" } }\n",
+            ),
+            (
+                "web/m3/f.ts",
+                "import { map } from 'rxjs';\nexport function useMap(): void {\n  map();\n}\n",
+            ),
+            ("web/m3/util.ts", "export function other(): void {}\n"),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkhomonym", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        write(
+            &dir,
+            "web/m3/util.ts",
+            "export function other(): void {}\nexport function map(): void {}\n",
+        );
+        commit_all(&dir, "a homonym");
+        index_with(&store, &dir, false, None);
+        let rows = store
+            .file_symbol_edges(&repo, "main", "web/m3/f.ts")
+            .unwrap();
+        for dst in ["rxjs#map", "map"] {
+            let e = rows.iter().find(|e| e.dst_name == dst).unwrap();
+            assert_eq!(
+                (e.external, e.confidence.as_deref()),
+                (Some(true), Some("high")),
+                "{e:?}"
+            );
+        }
         assert!(full_link_changes(&store, &repo, &dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

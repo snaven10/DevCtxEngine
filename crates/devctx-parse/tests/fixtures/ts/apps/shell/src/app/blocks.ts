@@ -6,4 +6,8 @@ export function outer(): void {
     cb();
   }
   cb();
+  {
+    const cb = (): void => {};
+    cb();
+  }
 }

@@ -16,6 +16,16 @@ use devctx_parse::resolve::typescript::{dir_of, join, Manifest, ScriptEnv, TsCon
 /// The candidates, in the order they are tried.
 const NAMES: &[&str] = &["tsconfig.base.json", "tsconfig.json"];
 
+/// Directories whose `package.json` files describe no package of the
+/// repository.
+const NOT_WORKSPACE: &[&str] = &[
+    "node_modules",
+    "dist",
+    "vendor",
+    "third_party",
+    "bower_components",
+];
+
 /// What was found.
 #[derive(Debug, Default)]
 pub(crate) struct Loaded {
@@ -70,7 +80,11 @@ pub(crate) fn load(read: &dyn Fn(&str) -> Option<String>, files: &[String]) -> L
     }
     for f in files {
         let is_manifest = f == "package.json" || f.ends_with("/package.json");
-        if !is_manifest || f.split('/').any(|seg| seg == "node_modules") {
+        // Build output and vendored code are no workspace package (their
+        // `name` is often a real dependency's): the directories indexing
+        // leaves out by default, at any depth (the caller also drops what the
+        // repository's own exclude set covers).
+        if !is_manifest || f.split('/').any(|seg| NOT_WORKSPACE.contains(&seg)) {
             continue;
         }
         let Some(text) = read(f) else { continue };
@@ -284,6 +298,41 @@ mod tests {
         let (now, _) = choose(later, Some(&json));
         assert_eq!(now.tsconfig, env.tsconfig);
         assert_eq!(now.manifests[0].deps, ["lodash", "rxjs"]);
+    }
+
+    /// TASK-006 second review, mi3: a `package.json` under build output or
+    /// vendored code (`dist/`, `vendor/`…) is no workspace package: its
+    /// `name` (often a real dependency's) must not take that package for the
+    /// repository's.
+    #[test]
+    fn manifests_of_build_output_and_vendored_code_are_left_out() {
+        let files: Vec<String> = [
+            "package.json",
+            "dist/libs/x/package.json",
+            "libs/y/vendor/z/package.json",
+            "third_party/w/package.json",
+            "bower_components/v/package.json",
+            "libs/real/package.json",
+        ]
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+        let rxjs = r#"{ "name": "rxjs", "dependencies": {} }"#;
+        let read = reader(&[
+            ("package.json", r#"{ "dependencies": { "rxjs": "7" } }"#),
+            ("dist/libs/x/package.json", rxjs),
+            ("libs/y/vendor/z/package.json", rxjs),
+            ("third_party/w/package.json", rxjs),
+            ("bower_components/v/package.json", rxjs),
+            ("libs/real/package.json", r#"{ "name": "@acme/real" }"#),
+        ]);
+        let dirs: Vec<String> = load(&read, &files)
+            .env
+            .manifests
+            .iter()
+            .map(|m| m.dir.clone())
+            .collect();
+        assert_eq!(dirs, ["", "libs/real"]);
     }
 
     /// An `extends` array (TypeScript 5): later entries over earlier ones;

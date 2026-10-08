@@ -508,6 +508,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     .iter()
     .map(|c| change_path(c).to_string())
     .filter(|f| f == "package.json" || f.ends_with("/package.json"))
+    .filter(|f| !ctx.is_excluded(f))
     .collect();
     let loaded = crate::tsconfig::load(&read_env, &branch_files);
     for f in &loaded.unreadable {

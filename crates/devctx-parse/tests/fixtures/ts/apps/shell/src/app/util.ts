@@ -14,8 +14,16 @@ export const api = {
 };
 
 export const Klass = class {
+  static make(): void {}
   m() {
     this.n();
   }
   n() {}
 };
+
+export function filter(): void {}
+
+export function build(): void {
+  Klass.make();
+  helper.call(null);
+}

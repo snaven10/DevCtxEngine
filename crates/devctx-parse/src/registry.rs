@@ -207,6 +207,9 @@ const SOURCES: &[&str] = &[
 /// (`function f` hoisted, `const f = () => …`), and a bare call no scope
 /// binds, or bound to the module's own function, is `free` (a function bound
 /// in a sibling block is not in scope).
+/// 11: TASK-006 second review — a receiver bound to a function or a class
+/// (`fn.call()`, `Klass.make()` with `const Klass = class {…}`) is that
+/// name, not an untyped value.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -214,7 +217,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 10;
+pub const EXTRACTOR_VERSION: u32 = 11;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

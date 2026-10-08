@@ -700,19 +700,6 @@ impl RepoIndex {
             .collect()
     }
 
-    /// Whether some TypeScript/JavaScript file of the repository defines
-    /// `name` at its top level: then an import of it is no evidence of a
-    /// package (DD-9, the TASK-005 review's lesson).
-    fn defined_in_repo(&self, name: &str) -> bool {
-        self.by_name.get(name).into_iter().flatten().any(|&i| {
-            let s = &self.syms[i];
-            // Not exported: no import, from anywhere, can be it.
-            s.exported != Some(false)
-                && self.is_script(&s.file)
-                && self.files.get(&s.file).and_then(|f| f.id) == s.parent_id
-        })
-    }
-
     /// What `file` exports as `name`: its own top-level symbol, a named
     /// re-export, or one of its `export *` (TypeScript's rules: a name two
     /// `export *` give is not exported).
@@ -806,12 +793,11 @@ impl RepoIndex {
             .iter()
             .find(|i| !i.reexport && i.local.as_deref() == Some(local))?;
         let name = imp.name.as_deref();
-        let package = |n: Option<&str>| match n {
-            Some(n) if n != "default" && self.defined_in_repo(n) => Imported::Unknown,
-            _ => Imported::External,
-        };
+        // A package the manifests declare (or a Node builtin) is the
+        // evidence: external, whatever the repository defines under the same
+        // name (TASK-006 second review, mi2).
         Some(match self.module(file, &imp.spec) {
-            Module::External => package(name),
+            Module::External => Imported::External,
             Module::Unknown => Imported::Unknown,
             Module::Repo(f) if imp.wildcard => Imported::Module(f),
             Module::Repo(f) => match name {
@@ -826,7 +812,7 @@ impl RepoIndex {
                 },
                 Some(n) => match self.export_of(&f, n, 0) {
                     Export::Found(i, sure) => Imported::Sym(i, sure),
-                    Export::External => package(Some(n)),
+                    Export::External => Imported::External,
                     Export::Missing | Export::Unknown => Imported::Unknown,
                 },
                 None => Imported::Unknown,
@@ -915,7 +901,14 @@ impl RepoIndex {
                 .collect();
             if !local.is_empty() {
                 let (m, exact) = self.pick_overload(&local, c.args);
-                return self.member_hit(m, false, exact, "same_file");
+                let out = self.member_hit(m, false, exact, "same_file");
+                // Two blocks of the function each bind the name: the symbols
+                // cannot say which one is in scope.
+                return if local.len() > 1 {
+                    cap(out, "medium")
+                } else {
+                    out
+                };
             }
         }
         if c.src.is_none() || !scoped {
@@ -989,6 +982,20 @@ impl RepoIndex {
             Some(Imported::Unknown) => return undecided(),
             None => {}
         }
+        // `Klass.make()` with `const Klass = class { static make() }`, or
+        // an object literal's `api.run()`: the file's only callable named
+        // `recv.callee` (the binding is the file's; no import has the name).
+        let own: Vec<usize> = self
+            .by_qualified
+            .get(&format!("{recv}.{callee}"))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&m| self.syms[m].file == file && is_callable(&self.syms[m].kind))
+            .collect();
+        if let [m] = own.as_slice() {
+            return hi(*m, self, "same_file");
+        }
         if self.platform(file, recv) {
             return external("external_known");
         }
@@ -1031,19 +1038,14 @@ impl RepoIndex {
             external: false,
         });
         match self.module(&e.file, &imp.spec) {
-            Module::External => match name {
-                Some(n) if n != "default" && self.defined_in_repo(n) => undecided(),
-                _ => external("external_known"),
-            },
+            Module::External => external("external_known"),
             Module::Unknown => undecided(),
             Module::Repo(f) => match name {
                 None => module_only,
                 Some(n) => match self.export_of(&f, n, 0) {
                     Export::Found(i, true) => hi(i, self, "import"),
                     Export::Found(i, false) => medium(i, self, "import"),
-                    Export::External if n == "default" || !self.defined_in_repo(n) => {
-                        external("external_known")
-                    }
+                    Export::External => external("external_known"),
                     _ if n == "default" => {
                         match imp.local.as_deref().map(|l| self.top_level(&f, l)) {
                             Some(v) if v.len() == 1 => medium(v[0], self, "import"),

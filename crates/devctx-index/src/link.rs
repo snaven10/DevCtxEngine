@@ -34,7 +34,7 @@ use crate::error::Result;
 /// module): what the branch's edges were resolved under. A build with other
 /// rules relinks the branch in full on its next run, as the extractor
 /// version does for the parse.
-pub(crate) const LINK_VERSION: &str = "5";
+pub(crate) const LINK_VERSION: &str = "6";
 
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
@@ -147,6 +147,28 @@ fn hint_names(hint: &str) -> Vec<&str> {
     out
 }
 
+/// Names an importer's symbols share with half the repository —
+/// constructors, Angular lifecycle hooks, the platform's iteration and
+/// reactive methods —, left out of the names that importers reopen by (d):
+/// they would reopen most of the branch's calls and type nothing a chain
+/// depends on (a hook or a constructor returns nothing to call on).
+const GENERIC_NAMES: &[&str] = &[
+    "constructor",
+    "ngOnInit",
+    "ngOnDestroy",
+    "ngOnChanges",
+    "ngDoCheck",
+    "ngAfterContentInit",
+    "ngAfterContentChecked",
+    "ngAfterViewInit",
+    "ngAfterViewChecked",
+    "subscribe",
+    "pipe",
+    "then",
+    "toString",
+    "valueOf",
+];
+
 /// The fraction of a branch's files over which a run re-resolves every edge.
 const FULL_PASS_DIVISOR: usize = 5;
 
@@ -257,7 +279,8 @@ pub(crate) fn link_branch(
         symbols
             .iter()
             .filter(|s| importers.contains(&s.file))
-            .map(|s| s.name.as_str()),
+            .map(|s| s.name.as_str())
+            .filter(|n| !GENERIC_NAMES.contains(n)),
     );
     let loaded = started.elapsed().as_millis();
     let mut writing = std::time::Duration::ZERO;

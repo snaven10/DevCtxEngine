@@ -979,6 +979,12 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
         _ => Recv::Untyped,
     };
     if let Some(b) = found {
+        // A function or class bound to the name (TypeScript/JavaScript):
+        // the name itself, as the file wrote it (`Klass.make()`,
+        // `fn.call()`), never an untyped value.
+        if b.func {
+            return Recv::Name(key.to_string());
+        }
         return typed(b);
     }
     // `target.parent`, `this.cfg.server`: a binding, then its fields — never
