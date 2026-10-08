@@ -13,7 +13,11 @@
 //! wrote or deleted, (b) the edges of other files whose destination no longer
 //! exists (its `dst_id` is gone: a deleted or renamed symbol) or whose
 //! destination's last segment names a symbol of a written file (an added
-//! one), and (c) those that stayed unresolved. When the written files are
+//! one), (c) those that stayed unresolved, and (d) every edge of a
+//! TypeScript/JavaScript file importing a written file, directly or through
+//! barrels re-exporting it (what an import binds can change though no name
+//! of the written file does: a barrel's `export … from` moved). A different
+//! `tsconfig` (aliases) relinks the branch in full. When the written files are
 //! more than a fifth of the branch, every edge is (the full pass). A file is
 //! rewritten only if one of its rows changed.
 
@@ -21,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use devctx_parse::resolve::link::{LinkEdge, LinkSymbol, Outcome, RepoIndex};
+use devctx_parse::resolve::typescript::TsConfig;
 use devctx_store::{Store, StoredSymbolEdge};
 
 use crate::error::Result;
@@ -29,10 +34,15 @@ use crate::error::Result;
 /// module): what the branch's edges were resolved under. A build with other
 /// rules relinks the branch in full on its next run, as the extractor
 /// version does for the parse.
-pub(crate) const LINK_VERSION: &str = "3";
+pub(crate) const LINK_VERSION: &str = "4";
 
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
+
+/// `index_meta` key of the `tsconfig` fingerprint the branch was linked
+/// under ([`crate::tsconfig::fingerprint`]): a changed alias relinks it in
+/// full, though no source file changed.
+pub(crate) const LINK_CONFIG_META_KEY: &str = "link_tsconfig";
 
 /// `index_meta` key set while a run owes the branch a link pass (from before
 /// its first file to the end of the pass): a run cut short leaves it, and the
@@ -152,13 +162,15 @@ fn to_link(e: &StoredSymbolEdge) -> LinkEdge {
 }
 
 /// Run the link pass over `branch`. `written`: the files whose graph rows
-/// this run wrote or deleted; `full`: re-resolve every edge regardless.
+/// this run wrote or deleted; `full`: re-resolve every edge regardless;
+/// `ts`: the workspace's `tsconfig` (TypeScript aliases).
 pub(crate) fn link_branch(
     store: &Store,
     repo: &str,
     branch: &str,
     written: &HashSet<String>,
     full: bool,
+    ts: Option<&TsConfig>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LinkStats> {
     let started = Instant::now();
@@ -172,7 +184,7 @@ pub(crate) fn link_branch(
         .filter(|e| matches!(e.kind.as_str(), "imports" | "inherits" | "implements"))
         .map(to_link)
         .collect();
-    let index = RepoIndex::new(
+    let index = RepoIndex::with_ts_config(
         symbols
             .iter()
             .map(|s| LinkSymbol {
@@ -187,6 +199,7 @@ pub(crate) fn link_branch(
             })
             .collect(),
         &facts,
+        ts.cloned(),
     );
     drop(facts);
     // What a written file changed that other files' edges may depend on
@@ -207,6 +220,14 @@ pub(crate) fn link_branch(
         .map(|s| s.name.as_str())
         .collect();
     fresh.extend(affected.iter().filter_map(|&id| index.name_of(id)));
+    // (d) TypeScript/JavaScript files importing a written one (or a barrel
+    // re-exporting it): every edge, since what an import binds can change
+    // without any name of the written file changing.
+    let importers = if full {
+        HashSet::new()
+    } else {
+        index.importers_of(written)
+    };
     let loaded = started.elapsed().as_millis();
     let mut writing = std::time::Duration::ZERO;
 
@@ -239,7 +260,7 @@ pub(crate) fn link_branch(
             break;
         }
         let rows = &by_file[file];
-        let file_written = written.contains(file);
+        let file_written = written.contains(file) || importers.contains(file);
         // Rows are cloned only once one of them changes.
         let mut out: Option<Vec<StoredSymbolEdge>> = None;
         for (i, e) in rows.iter().enumerate() {

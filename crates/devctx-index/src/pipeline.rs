@@ -491,6 +491,26 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         .get_index_meta(&repo_path, &branch, crate::link::LINK_VERSION_META_KEY)?
         .as_deref()
         != Some(crate::link::LINK_VERSION);
+    // The workspace's `tsconfig` (TypeScript aliases, PLAN-009 TASK-006),
+    // from the branch being indexed: another one than the branch was linked
+    // under relinks it in full, though no source file changed.
+    let ts = crate::tsconfig::load(&|rel: &str| match &read_from {
+        Some(b) => git.read_file_at(b, rel).ok(),
+        None => git.read_file(rel).ok(),
+    });
+    if let Some(file) = &ts.unreadable {
+        eprintln!(
+            "· {file} could not be read as a tsconfig: TypeScript aliases are not resolved, \
+             relative imports are"
+        );
+    }
+    let ts_fingerprint = crate::tsconfig::fingerprint(ts.config.as_ref());
+    let link_config_changed = req
+        .store
+        .get_index_meta(&repo_path, &branch, crate::link::LINK_CONFIG_META_KEY)?
+        .as_deref()
+        != Some(ts_fingerprint.as_str());
+    let link_stale = link_stale || link_config_changed;
     if !link_owed {
         req.store
             .set_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY, "1")?;
@@ -589,6 +609,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 &branch,
                 &ctx.graph_written,
                 link_full,
+                ts.config.as_ref(),
                 &cancelled,
             )
         })?;
@@ -600,6 +621,12 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 &branch,
                 crate::link::LINK_VERSION_META_KEY,
                 crate::link::LINK_VERSION,
+            )?;
+            req.store.set_index_meta(
+                &repo_path,
+                &branch,
+                crate::link::LINK_CONFIG_META_KEY,
+                &ts_fingerprint,
             )?;
             req.store
                 .delete_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY)?;

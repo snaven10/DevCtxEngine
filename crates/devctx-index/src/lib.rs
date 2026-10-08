@@ -12,6 +12,7 @@ pub mod git;
 pub mod id;
 mod link;
 pub mod pipeline;
+mod tsconfig;
 
 pub use devctx_parse::extractor_fingerprint;
 pub use error::{IndexError, Result};
@@ -2802,14 +2803,16 @@ public class Helper {
     /// Run the link pass over the whole branch, as a full run would, and
     /// answer whether it changed any row: an incremental pass must leave
     /// nothing for it to fix.
-    fn full_link_changes(store: &Store, repo: &str) -> Vec<(String, String)> {
+    fn full_link_changes(store: &Store, repo: &str, dir: &Path) -> Vec<(String, String)> {
         let before = linked_rows(store, repo);
+        let ts = crate::tsconfig::load(&|rel: &str| std::fs::read_to_string(dir.join(rel)).ok());
         crate::link::link_branch(
             store,
             repo,
             "main",
             &std::collections::HashSet::new(),
             true,
+            ts.config.as_ref(),
             &|| false,
         )
         .unwrap();
@@ -2911,6 +2914,37 @@ public class Helper {
                  r.find().doIt();\n        d.getName();\n        h.item.doIt();\n    }\n}\n",
             ),
         ];
+        // TypeScript (TASK-006): a barrel's named re-export, an alias of the
+        // `tsconfig`, a barrel re-exporting through another barrel.
+        files.extend([
+            ("web/libs/a/svc.ts", TS_SVC),
+            ("web/libs/b/svc.ts", TS_SVC),
+            (
+                "web/libs/barrel/index.ts",
+                "export { Svc } from '../a/svc';\n",
+            ),
+            (
+                "web/app/c.ts",
+                "import { Svc } from '../libs/barrel';\nexport class C {\n  \
+                 constructor(private s: Svc) {}\n  go(): void {\n    this.s.run();\n  }\n}\n",
+            ),
+            ("tsconfig.base.json", TS_CONFIG_A),
+            (
+                "web/app/d.ts",
+                "import { Svc } from '@acme/svc';\nexport function go(s: Svc): void {\n  \
+                 s.run();\n}\n",
+            ),
+            ("web/libs/deep/index.ts", "export * from './inner';\n"),
+            (
+                "web/libs/deep/inner.ts",
+                "export { Svc } from '../a/svc';\n",
+            ),
+            (
+                "web/app/e.ts",
+                "import { Svc } from '../libs/deep';\nexport function go(s: Svc): void {\n  \
+                 s.run();\n}\n",
+            ),
+        ]);
         files.extend(LINK_FILLER);
         files.extend([
             ("g1.py", "def g1():\n    pass\n"),
@@ -2921,7 +2955,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 6] = [
+        let steps: [(&str, &str, &str, &str, i32); 9] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -2969,6 +3003,33 @@ public class Helper {
                 "doIt",
                 5,
             ),
+            // A barrel re-exports `Svc` from the other library: only the
+            // importers rule reaches `c.ts` (the barrel defines no name).
+            (
+                "web/libs/barrel/index.ts",
+                "export { Svc } from '../b/svc';\n",
+                "web/app/c.ts",
+                "Svc.run",
+                5,
+            ),
+            // The alias moves: no source file changes, only the config rule
+            // (a full pass under another `tsconfig`) reaches `d.ts`.
+            (
+                "tsconfig.base.json",
+                TS_CONFIG_B,
+                "web/app/d.ts",
+                "Svc.run",
+                3,
+            ),
+            // The inner barrel of a barrel moves: the importers rule, through
+            // the outer barrel, reaches `e.ts`.
+            (
+                "web/libs/deep/inner.ts",
+                "export { Svc } from '../b/svc';\n",
+                "web/app/e.ts",
+                "Svc.run",
+                3,
+            ),
         ];
         // Each scenario on a branch of its own, so every one is judged (and
         // reported) whatever the others do.
@@ -2977,7 +3038,7 @@ public class Helper {
             let (dir, repo) = graph_repo(&format!("linkeq{i}"), &files);
             let store = Store::open_in_memory(DIM).unwrap();
             index_with(&store, &dir, true, None);
-            assert!(full_link_changes(&store, &repo).is_empty());
+            assert!(full_link_changes(&store, &repo, &dir).is_empty());
             let watched = |store: &Store| {
                 store
                     .file_symbol_edges(&repo, "main", seen_in)
@@ -2997,7 +3058,7 @@ public class Helper {
                     "{file}: the watched edge did not change: {after:?}"
                 ));
             }
-            let diff = full_link_changes(&store, &repo);
+            let diff = full_link_changes(&store, &repo, &dir);
             if !diff.is_empty() {
                 failures.push(format!("{file}: the incremental pass left {diff:#?}"));
             }
@@ -3005,6 +3066,12 @@ public class Helper {
         }
         assert!(failures.is_empty(), "{failures:#?}");
     }
+
+    const TS_SVC: &str = "export class Svc {\n  run(): void {}\n}\n";
+    const TS_CONFIG_A: &str =
+        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@acme/svc\": [\"web/libs/a/svc.ts\"] } } }\n";
+    const TS_CONFIG_B: &str =
+        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@acme/svc\": [\"web/libs/b/svc.ts\"] } } }\n";
 
     /// A link pass cut short (a stop, a crash) is owed: the next run does it
     /// in full, though its files are unchanged and it writes none (MAJOR 5).
