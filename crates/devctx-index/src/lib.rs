@@ -2968,6 +2968,22 @@ public class Helper {
                 "import { map } from 'rxjs';\nexport function useMap(): void {\n  map();\n}\n",
             ),
             ("web/m3/util.ts", "export function other(): void {}\n"),
+            ("web/m2/x.ts", TS_FOO),
+            ("web/m2/y.ts", TS_FOO),
+            ("web/m2/w.ts", "export { Foo } from './x';\n"),
+            (
+                "web/m2/a.ts",
+                "import { Foo } from './w';\nexport class A {\n  pipe(): Foo {\n    \
+                 return new Foo();\n  }\n}\n",
+            ),
+            (
+                "web/m2/h.ts",
+                "import { A } from './a';\nexport function get(): A {\n  return new A();\n}\n",
+            ),
+            (
+                "web/m2/c.ts",
+                "import { get } from './h';\nexport function go(): void {\n  get().pipe().g();\n}\n",
+            ),
             ("web/m1/x.ts", TS_FOO),
             ("web/m1/y.ts", TS_FOO),
             ("web/m1/w.ts", "export { Foo } from './x';\n"),
@@ -3017,7 +3033,22 @@ public class Helper {
             ("rs/Cargo.toml", "[package]\nname = \"rlib\"\n"),
             (
                 "rs/src/lib.rs",
-                "pub mod a;\npub mod b;\npub mod c;\npub use a::Svc;\n",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod ops2;\npub mod pre;\npub use a::Svc;\n",
+            ),
+            // A method in an `impl` of another file; a glob of a prelude
+            // that re-exports a type from `std`.
+            (
+                "rs/src/ops2.rs",
+                "use crate::a::Svc;\n\nimpl Svc {\n    pub fn save(&self) {}\n}\n",
+            ),
+            (
+                "rs/src/e.rs",
+                "use crate::a::Svc;\n\npub fn go(s: Svc) {\n    s.save();\n}\n",
+            ),
+            ("rs/src/pre.rs", "pub use std::collections::HashMap as Map;\n"),
+            (
+                "rs/src/f.rs",
+                "use crate::pre::*;\n\npub fn go() {\n    Map::new();\n}\n",
             ),
             ("rs/src/a.rs", RS_SVC),
             ("rs/src/b.rs", RS_SVC),
@@ -3061,7 +3092,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 17] = [
+        let steps: [(&str, &str, &str, &str, i32); 21] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -3183,11 +3214,44 @@ public class Helper {
             // crate root) reaches `c.rs`.
             (
                 "rs/src/lib.rs",
-                "pub mod a;\npub mod b;\npub mod c;\npub use b::Svc;\n",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod ops2;\npub mod pre;\npub use b::Svc;\n",
                 "rs/src/c.rs",
                 "Svc.run",
                 4,
             ),
+            // Review, performance: in a Rust importer only the rows that
+            // name what its `use`s bind are reopened; the `use` row itself is
+            // one of them.
+            (
+                "rs/src/lib.rs",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod ops2;\npub mod pre;\npub use b::Svc;\n",
+                "rs/src/c.rs",
+                "crate::Svc",
+                1,
+            ),
+            // Review: an `impl` of another file loses `save`; `e.rs` has no
+            // `use` of it, and only its gone destination reaches it.
+            (
+                "rs/src/ops2.rs",
+                "use crate::a::Svc;\n\nimpl Svc {}\n",
+                "rs/src/e.rs",
+                "Svc.save",
+                4,
+            ),
+            // Review, performance: an external path call is not reopened by
+            // name; when the glob it reaches it through re-exports a
+            // repository type instead, the importers rule still does.
+            (
+                "rs/src/pre.rs",
+                "pub use crate::a::Svc as Map;\n",
+                "rs/src/f.rs",
+                "Map.new",
+                4,
+            ),
+            // Review: an importer's `pipe(): Foo` types a chain like any
+            // other name with a declared return (the generic-name filter no
+            // longer drops it).
+            ("web/m2/w.ts", "export { Foo } from './y';\n", "web/m2/c.ts", "g", 3),
             // A `Cargo.toml` makes `ralpha` a crate of the workspace: no
             // source changes, only the environment rule resolves the path.
             (

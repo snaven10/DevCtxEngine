@@ -1116,22 +1116,27 @@ impl RepoIndex {
             }
             for u in uses.iter().filter(|u| u.glob) {
                 match self.rs_path_in(&u.segs, module, file, scope, depth + 1) {
+                    // The glob's module has the name, from outside (a
+                    // prelude re-exporting `std`): external, surely.
                     RsRes::Module(m) => match self.rs_item(&m, name, depth + 1) {
                         RsRes::Item(i, sure) => globbed.push((i, sure)),
                         RsRes::External => ext = true,
                         RsRes::Unknown => unk = true,
                         _ => {}
                     },
-                    RsRes::External => ext = true,
-                    RsRes::Unknown => unk = true,
+                    // A glob of a module from outside may or may not have it.
+                    RsRes::External | RsRes::Unknown => unk = true,
                     _ => {}
                 }
             }
         }
+        // A branch that cannot be followed first: it may hold the name
+        // (review: `unk` before `ext`).
         match globbed.as_slice() {
             [(i, sure)] => RsRes::Item(*i, *sure && !ext && !unk),
             [(i, _), ..] => RsRes::Item(*i, false),
-            [] if ext || unk => RsRes::Unknown,
+            [] if unk => RsRes::Unknown,
+            [] if ext => RsRes::External,
             [] => RsRes::Missing,
         }
     }
@@ -1626,6 +1631,28 @@ impl RepoIndex {
         out.sort();
         out.dedup();
         Some((out, uses.iter().any(|u| u.reexport)))
+    }
+
+    /// The names the `use`s of a Rust file bind and the segments of their
+    /// paths: what an edge of an importer of a written file must mention
+    /// for that file to change it (TASK-007 review, performance). `None`
+    /// when a glob `use` may bring any name.
+    pub fn rs_use_names(&self, file: &str) -> Option<HashSet<String>> {
+        let uses = self.rs.uses.get(file)?;
+        // A glob of the file's own module (`use super::*` in its `mod
+        // tests`) brings the file's items and `use`s, which are here; a
+        // glob of another module may bring any name.
+        let own =
+            |u: &RsUse| u.scope.is_some() && u.segs.iter().all(|s| s == "super" || s == "self");
+        if uses.iter().any(|u| u.glob && !own(u)) {
+            return None;
+        }
+        let mut out = HashSet::new();
+        for u in uses {
+            out.extend(u.segs.iter().cloned());
+            out.extend(u.local.iter().cloned());
+        }
+        Some(out)
     }
 
     /// The files a module path is made of, and where a file for it would

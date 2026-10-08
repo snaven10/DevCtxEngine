@@ -36,7 +36,7 @@ use crate::error::Result;
 /// module): what the branch's edges were resolved under. A build with other
 /// rules relinks the branch in full on its next run, as the extractor
 /// version does for the parse.
-pub(crate) const LINK_VERSION: &str = "11";
+pub(crate) const LINK_VERSION: &str = "12";
 
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
@@ -161,27 +161,35 @@ fn hint_names(hint: &str) -> Vec<&str> {
     out
 }
 
-/// Names an importer's symbols share with half the repository —
-/// constructors, Angular lifecycle hooks, the platform's iteration and
-/// reactive methods —, left out of the names that importers reopen by (d):
-/// they would reopen most of the branch's calls and type nothing a chain
-/// depends on (a hook or a constructor returns nothing to call on).
-const GENERIC_NAMES: &[&str] = &[
-    "constructor",
-    "ngOnInit",
-    "ngOnDestroy",
-    "ngOnChanges",
-    "ngDoCheck",
-    "ngAfterContentInit",
-    "ngAfterContentChecked",
-    "ngAfterViewInit",
-    "ngAfterViewChecked",
-    "subscribe",
-    "pipe",
-    "then",
-    "toString",
-    "valueOf",
-];
+/// Whether an importer's symbol can type a call after it (`a.f().g()`, a
+/// field in `a.x.g()`, a type): a type, a field, or a callable with a
+/// declared return that is something (not `void`, `None`, `()`). Only those
+/// names reopen edges by mode (d): a constructor, a lifecycle hook or any
+/// function returning nothing types no chain (TASK-007 review: it replaces
+/// a fixed list of generic names, which dropped `pipe(): Repo`).
+fn types_a_chain(s: &devctx_store::StoredSymbol) -> bool {
+    use devctx_parse::resolve::{go, java, python, rust, typescript};
+    let class = devctx_core::symbol_id::kind_class(&s.kind);
+    if class == "type" || s.kind == "field" {
+        return true;
+    }
+    if class != "callable" {
+        return false;
+    }
+    let Some(sig) = s.signature.as_deref() else {
+        return false;
+    };
+    let lang = devctx_parse::detect_lang(std::path::Path::new(&s.file));
+    let ret: Option<String> = match lang.map(|l| l.key()) {
+        Some("java") => java::declared_type(sig, &s.name),
+        Some("typescript" | "tsx" | "javascript") => typescript::return_type(sig),
+        Some("python") => python::return_type(sig),
+        Some("rust") => rust::return_type(sig).map(|t| t.base),
+        Some("go") => go::return_type(sig),
+        _ => None,
+    };
+    ret.is_some_and(|r| !matches!(r.as_str(), "void" | "None" | "undefined" | "never"))
+}
 
 /// The fraction of a branch's files over which a run re-resolves every edge.
 const FULL_PASS_DIVISOR: usize = 5;
@@ -296,9 +304,8 @@ pub(crate) fn link_branch(
     fresh.extend(
         symbols
             .iter()
-            .filter(|s| importers.contains(&s.file))
-            .map(|s| s.name.as_str())
-            .filter(|n| !GENERIC_NAMES.contains(n)),
+            .filter(|s| importers.contains(&s.file) && types_a_chain(s))
+            .map(|s| s.name.as_str()),
     );
     let loaded = started.elapsed().as_millis();
     let mut writing = std::time::Duration::ZERO;
@@ -317,6 +324,14 @@ pub(crate) fn link_branch(
         list.push(e);
     }
     let reopened = |e: &StoredSymbolEdge| -> bool {
+        // A Rust path call answered from outside (`std::fs::read`, a declared
+        // crate's, a `use` of one) depends only on the environment and on
+        // the `use`s that reach it, which the full pass on a new environment,
+        // mode (a) and mode (d) cover: no name of a written file changes it
+        // (TASK-007 review, performance).
+        if e.external == Some(true) && e.hint.as_deref().is_some_and(|h| h.starts_with("path ")) {
+            return false;
+        }
         fresh.contains(dst_key(e))
             || e.hint
                 .as_deref()
@@ -332,12 +347,49 @@ pub(crate) fn link_branch(
             break;
         }
         let rows = &by_file[file];
+        // A Rust importer (not written): only the edges that mention a name
+        // its `use`s bind can change through them; the rest is the file's
+        // own (its items, the prelude), which modes (b) and (c) cover
+        // (TASK-007 review, performance).
+        let use_names = if !written.contains(file) && importers.contains(file) {
+            index.rs_use_names(file)
+        } else {
+            None
+        };
+        let through_use = |e: &StoredSymbolEdge| -> bool {
+            let Some(names) = &use_names else {
+                return true;
+            };
+            // A type use, an instantiation, a `use` row: by the names its
+            // destination is written with.
+            if e.kind != "calls" {
+                return e
+                    .dst_name
+                    .split([':', '.'])
+                    .filter(|x| !x.is_empty())
+                    .any(|x| {
+                        names.contains(x) || matches!(x, "crate" | "self" | "super" | "Self")
+                    });
+            }
+            let Some(h) = e.hint.as_deref() else {
+                return true;
+            };
+            let first = h.split_whitespace().next().unwrap_or_default();
+            if matches!(first, "member" | "chain" | "anon") {
+                return true;
+            }
+            let tokens = hint_names(h);
+            names.contains(dst_key(e))
+                || tokens.iter().any(|t| {
+                    names.contains(*t) || matches!(*t, "crate" | "self" | "super" | "Self")
+                })
+        };
         let file_written = written.contains(file) || importers.contains(file);
         // Rows are cloned only once one of them changes.
         let mut out: Option<Vec<StoredSymbolEdge>> = None;
         for (i, e) in rows.iter().enumerate() {
             let pick = full
-                || file_written
+                || (file_written && through_use(e))
                 || e.resolution.is_none()
                 || e.dst_id.is_some_and(|d| !ids.contains(&d))
                 // (c) the undecided — a discarded row waits for its name.
