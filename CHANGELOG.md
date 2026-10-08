@@ -140,6 +140,16 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   `extends` array are read. The incremental pass reopens a TS import row by
   its imported name and follows an importer's return types, and falls back to
   the full pass when the importers exceed a fifth of the branch.
+- **TypeScript/JavaScript, second review** (**extractor version 11**, link
+  rules version 6): an unreadable `tsconfig` or `package.json` now falls back
+  per file, so a broken template manifest no longer freezes alias and
+  dependency changes; an import from a declared package is external even when
+  the repository defines the same name; manifests under `dist/`, `vendor/`
+  and other excluded directories are not workspace packages. A receiver bound
+  to a function or class (`fn.call()`, `Klass.make()` with `const Klass =
+  class {…}`) is read as that name: `fn.call()` is now undecided instead of
+  discarded, and `Klass.make()` resolves to the method. Two same-named
+  functions in sibling blocks resolve at `medium`.
 
 ### Fixed
 

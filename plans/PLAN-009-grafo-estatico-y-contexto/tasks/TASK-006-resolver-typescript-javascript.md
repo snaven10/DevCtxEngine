@@ -256,4 +256,45 @@ Implementa DD-7 (TS/JS).
     default externos el subconjunto tiene **uno solo** (`Swal.close()` de `sweetalert2`, que está en
     `dependencies`): correcto; no hay 20 que auditar en estas librerías (riesgo abierto: frontend
     entero).
+- **Segunda revisión (APROBADA con caveats), resuelta en commits encima de beafcc4:**
+  - *mi1* (2234c91, su propio commit): `choose` cae a lo guardado **por componente**: lo que se
+    pudo leer va fresco; de lo guardado solo el `tsconfig` si el suyo es ilegible, o el manifest del
+    mismo directorio; un manifest ilegible que lo guardado no tenía se ignora. Antes un
+    `package.json` que no es JSON (la plantilla de un generador Nx) congelaba el entorno viejo para
+    siempre y un alias movido seguía dando `high` al archivo de antes. El entorno que se guarda es
+    siempre el compuesto (solo partes legibles).
+  - *mi2* un import de un paquete que declara un manifest (o builtin de Node) es externo aunque el
+    repo defina el mismo nombre (`export function filter()` ya no deja sin decidir los `filter` de
+    `rxjs`); `defined_in_repo` se quitó. Con esto el escenario `rxjs#map` de la equivalencia (M3)
+    dejó de cambiar la arista vigilada: pasó a un test propio
+    (`a_repository_homonym_does_not_unmake_a_package_import`) y la clave por `#` del modo (b) queda
+    como defensa, sin escenario que solo ella detecte (toda respuesta de una fila `imports`
+    depende ya solo del módulo que nombra, que cubren el modo (d) y el fingerprint del entorno).
+  - *mi3* los `package.json` bajo `node_modules`, `dist`, `vendor`, `third_party`,
+    `bower_components` (a cualquier profundidad) y lo que excluye el indexado no son paquetes del
+    workspace.
+  - *mi4* "el más cercano" es el manifest más profundo que contiene al archivo: con `a/` y `a/b/`,
+    un archivo de `a/b/` mira `a/b` y la raíz, nunca `a/` (documentado en DD-7).
+  - *NIT* los nombres de importadores que reabren por (d) excluyen `constructor`, los hooks de
+    Angular (`ngOnInit`…) y `subscribe`/`pipe`/`then`/`toString`/`valueOf` (no tipan nada que una
+    cadena use y reabrirían casi toda la rama); un receptor bindeado a una función o clase es su
+    nombre (`fn.call()` sin decidir en vez de descartado; `Klass.make()` de `const Klass = class
+    {…}` resuelve a `Klass.make`, `same_file`, por ser el único invocable `recv.callee` del
+    archivo); dos funciones homónimas de bloques hermanos (`outer.cb` ×2) bajan a `medium`.
+  - **`EXTRACTOR_VERSION` = 11, `LINK_VERSION` = 6.** Commits: 2234c91 (mi1), 7b43503 (mi2, mi3 y
+    NITs) y el de esta documentación. Gate sobre cada uno: `fmt --check`, `clippy -D warnings` (y
+    `--features gpu`), `cargo test --workspace --locked`: verde.
+  - *Tests que fallaban antes del fix:* `tsconfig::tests::a_broken_manifest_added_later_freezes_nothing_else`
+    (el alias movido no se veía), `a_broken_tsconfig_keeps_only_the_stored_tsconfig` (la dependencia
+    nueva no se veía) y `a_broken_manifest_does_not_freeze_the_aliases` (integración: `high` al
+    archivo viejo) para mi1; en `link_typescript`, `a_package_import_is_never_a_repository_homonym`
+    (`filter`/`formatName` de un paquete declarado daban `low`), `imports_by_name_namespace_default_and_package`
+    (`fromPackage`), `a_block_local_function_does_not_shadow_outside_its_block` (`high` con dos
+    candidatos) y `bound_functions_and_classes_as_receivers` (`Klass.make`/`call` descartados);
+    `manifests_of_build_output_and_vendored_code_are_left_out` (mi3, los cinco manifests entraban).
+    `a_repository_homonym_does_not_unmake_a_package_import` se escribió después del fix.
+  - *Re-medición* (mismo snapshot con el `package.json` raíz): sin cambios — 10,8 % sin decidir,
+    65,6 % externas (1 085 `external_known` `high`, 185 `chain_external` `medium`), gold 20/20 con
+    20/20 en `high`. Link pass completo 49-110 ms con la máquina a carga 37 (el binario anterior,
+    en la misma carga, 89 ms): no comparable con las cifras de arriba.
 

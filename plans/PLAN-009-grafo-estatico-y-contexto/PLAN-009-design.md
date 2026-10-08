@@ -558,17 +558,24 @@ revisión):
   (`function f` elevada; `const f = () =>` desde su declaración, en todo el módulo si es de nivel
   superior): una llamada pelada ligada a una función de un scope envolvente es `bare`; una que
   ningún scope liga, o ligada a la función del módulo, es `free` (hint nuevo: el link no mira las
-  funciones anidadas de los envolventes, así una de un bloque hermano no la toma). Una unión con
+  funciones anidadas de los envolventes, así una de un bloque hermano no la toma); dos homónimas
+  de bloques hermanos dan `medium`. Un receptor bindeado a una función o clase es su nombre
+  (`Klass.make()` de `const Klass = class {…}` → `Klass.make`, `same_file`, si es el único
+  invocable `recv.callee` del archivo; `fn.call()` sin decidir). Una unión con
   `null`/`undefined` es el otro miembro. Cada fila `imports` lleva en `hint`
   `export` (re-export de barrel) y `as <local>`.
 - *Link:* el especificador se resuelve relativo (`.ts`, `.tsx`, `.js`→`.ts`, `/index.*`), por el
   patrón `paths` más largo (exacto primero) o bajo `baseUrl` del `tsconfig.base.json` (o
   `tsconfig.json`) de la raíz, un nivel de `extends` relativo (string o array); un especificador
   que no es del repo es paquete → externo **solo con evidencia** (revisión de TASK-006): una
-  dependencia del `package.json` raíz o del más cercano, o un builtin de Node; y aun así no si el
-  nombre importado lo define y exporta en su nivel superior algún archivo TS/JS del repo (DD-9).
-  Un alias o relativo sin archivo, o un módulo que ningún manifiesto declara, queda sin decidir, y
-  una llamada a un nombre así importado nunca cae a `unique_name`. Los
+  dependencia del `package.json` raíz o del más cercano —el más profundo que contiene al archivo:
+  con `a/` y `a/b/`, un archivo de `a/b/` mira `a/b` y la raíz, nunca `a/`—, o un builtin de
+  Node; con esa evidencia es externo aunque el repo defina el mismo nombre (segunda revisión). El
+  `name` de un `package.json` del repo hace del paquete uno del repo, salvo los de `node_modules`,
+  `dist`, `vendor`, `third_party`, `bower_components` y lo que excluye el indexado. Un alias o
+  relativo sin archivo, o un módulo que ningún manifiesto declara, queda sin decidir, y una
+  llamada a un nombre así importado nunca cae a `unique_name`. Un `tsconfig` o `package.json`
+  ilegible toma de lo guardado solo esa parte (el resto, fresco). Los
   barrels se siguen hasta 4 niveles (`export { X as Y } from`, `export * from`; dos `export *` que
   dan el mismo nombre no lo exportan): `high` si todas las ramas se siguieron, `medium` si no. Un
   import `default` se toma por el nombre local (`medium`, el símbolo no guarda si es el default).
