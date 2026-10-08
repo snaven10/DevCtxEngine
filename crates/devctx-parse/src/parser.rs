@@ -459,6 +459,9 @@ impl LanguageParser {
                 }
             }
             let Some(stmt) = stmt else { continue };
+            // `export { x } from './y'`, `export * from './y'`: re-exported,
+            // not bound in the file.
+            fact.reexport = stmt.kind() == "export_statement";
             if !statements.iter().any(|s| s.id() == stmt.id()) {
                 statements.push(stmt);
             }
@@ -849,6 +852,16 @@ const CALL_KINDS: &[&str] = &["method_invocation", "call_expression", "call"];
 fn classify(callee: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -> Recv {
     let recv = match receiver_node(callee) {
         Some(recv) => classify_receiver(recv, bytes, scopes, depth),
+        // TypeScript/JavaScript: `next(req)` with `next` a parameter or a
+        // local holds a value nothing types, never a function of that name
+        // (a function bound to a `const` is a symbol, not a binding).
+        None if !scopes.implicit_this()
+            && callee
+                .utf8_text(bytes)
+                .is_ok_and(|n| scopes.lookup(callee, n).is_some()) =>
+        {
+            Recv::Untyped
+        }
         None => Recv::Bare,
     };
     match recv {
@@ -890,6 +903,10 @@ fn anonymous_supertype(node: Node<'_>, bytes: &[u8]) -> Option<String> {
 fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -> Recv {
     let text = |n: Node<'_>| n.utf8_text(bytes).unwrap_or_default().to_string();
     match recv.kind() {
+        // TypeScript/JavaScript: `this` is the class only in a class's
+        // method or field; in an object literal's method, a class
+        // expression, a `function` or the module it is something else.
+        "this" if !scopes.implicit_this() && !this_is_a_class(recv) => return Recv::Untyped,
         "this" | "self" => return Recv::This,
         "super" => return Recv::Super,
         "parenthesized_expression" => {
@@ -963,6 +980,34 @@ fn classify_receiver(recv: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -
         }
     }
     Recv::Name(key.to_string())
+}
+
+/// Whether a TypeScript/JavaScript `this` at `node` is the instance of a
+/// declared class: the nearest scope that binds `this` (arrows do not) is a
+/// method or a field of a `class` declaration's body.
+fn this_is_a_class(node: Node<'_>) -> bool {
+    let declared = |body: Node<'_>| {
+        body.kind() == "class_body"
+            && body.parent().is_some_and(|c| {
+                matches!(c.kind(), "class_declaration" | "abstract_class_declaration")
+            })
+    };
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "arrow_function" => {}
+            "method_definition" => return n.parent().is_some_and(declared),
+            "class_body" => return declared(n),
+            "function_declaration"
+            | "function_expression"
+            | "generator_function_declaration"
+            | "generator_function"
+            | "program" => return false,
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    false
 }
 
 /// The callee name node of a call node (`a.b(…)` → `b`, `f(…)` → `f`).

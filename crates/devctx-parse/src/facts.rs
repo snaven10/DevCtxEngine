@@ -38,6 +38,9 @@ pub struct ImportFact {
     pub alias: Option<String>,
     /// `.*`, `import *`, `* as ns`, `use x::*`.
     pub wildcard: bool,
+    /// TypeScript/JavaScript `export … from`: the names are re-exported
+    /// (a barrel), not bound in the file (PLAN-009 TASK-006).
+    pub reexport: bool,
     /// What the `imports` edge records as its destination: the path joined
     /// with the name in the language's own syntax (`java.util.List`,
     /// `os.path.join`, `crate::a::B`, `./auth#login`, `net/http`), `*` for a
@@ -45,6 +48,22 @@ pub struct ImportFact {
     pub target: String,
     /// 1-based line.
     pub line: u32,
+}
+
+impl ImportFact {
+    /// What the `imports` edge keeps besides its destination (`edges.hint`,
+    /// PLAN-009 TASK-006): `export` for a re-export, `as <local>` for the
+    /// name it binds when it is not the imported one. `None` when neither.
+    pub fn hint(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.reexport {
+            parts.push("export".to_string());
+        }
+        if let Some(a) = &self.alias {
+            parts.push(format!("as {a}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
 }
 
 /// A supertype named by a type definition: `extends`/`implements`, a Rust

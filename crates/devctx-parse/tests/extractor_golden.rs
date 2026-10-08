@@ -119,13 +119,14 @@ fn render() -> String {
         );
         calls.extend(pf.facts.imports.iter().map(|i| {
             format!(
-                "{}\timport\t{}\tpath={} name={} alias={} wildcard={}",
+                "{}\timport\t{}\tpath={} name={} alias={} wildcard={} reexport={}",
                 i.line,
                 i.target,
                 i.path,
                 opt(&i.name),
                 opt(&i.alias),
-                i.wildcard
+                i.wildcard,
+                i.reexport
             )
         }));
         // Line first, then the text: a deterministic order that keeps an

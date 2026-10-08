@@ -1477,10 +1477,10 @@ fn graph_rows(
         })
     });
     let facts = &parsed.facts;
-    let imports = facts
-        .imports
-        .iter()
-        .map(|i| edge(IMPORTS, file_id, &i.target, i.line));
+    let imports = facts.imports.iter().map(|i| StoredSymbolEdge {
+        hint: i.hint(),
+        ..edge(IMPORTS, file_id, &i.target, i.line)
+    });
     let inherits = facts
         .inherits
         .iter()

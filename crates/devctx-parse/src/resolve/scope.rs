@@ -71,6 +71,18 @@ impl TypeText {
         if t.is_empty() {
             return None;
         }
+        // A TypeScript union with `null`/`undefined` is the other member
+        // (`Foo | null` → `Foo`); any other union stays as written (no name).
+        let members = top_level_split(&t, '|');
+        if members.len() > 1 {
+            let kept: Vec<&str> = members
+                .into_iter()
+                .filter(|m| !matches!(*m, "null" | "undefined" | "void" | ""))
+                .collect();
+            if let [one] = kept.as_slice() {
+                return TypeText::parse(one);
+            }
+        }
         if let Some(open) = t.find('<') {
             let base = t[..open].to_string();
             let inner = &t[open + 1..t.rfind('>').unwrap_or(t.len())];
@@ -93,6 +105,26 @@ impl TypeText {
             elem: None,
         })
     }
+}
+
+/// `text` split at `sep` outside `<…>`, `(…)`, `[…]` and `{…}`.
+fn top_level_split(text: &str, sep: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        match c {
+            '<' | '(' | '[' | '{' => depth += 1,
+            '>' | ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 => {
+                out.push(&text[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&text[start..]);
+    out
 }
 
 /// The first comma-separated argument at depth 0 of `inner`.
@@ -121,6 +153,10 @@ pub struct Binding {
     pub via: Via,
     /// Where the declaration starts: a local binds after it.
     pub at: usize,
+    /// A member of the enclosing class (a field, a constructor parameter
+    /// property, a field assigned from a constructor parameter): what `this.x`
+    /// reads, and — in a language with an implicit `this` (Java) — a bare `x`.
+    pub member: bool,
 }
 
 /// The bindings of a file, by scope.
@@ -129,6 +165,9 @@ pub struct Scopes {
     by_scope: HashMap<usize, Vec<Binding>>,
     /// The language has `scopes` (else: one flat file scope, first wins).
     scoped: bool,
+    /// A bare name can be a member of the enclosing class (Java); in
+    /// TypeScript/JavaScript a member is only `this.x`.
+    implicit_this: bool,
     root: usize,
 }
 
@@ -143,6 +182,7 @@ struct Pending<'t> {
     init: Option<Node<'t>>,
     iter: Option<Node<'t>>,
     assign: bool,
+    member: bool,
 }
 
 impl Scopes {
@@ -157,6 +197,7 @@ impl Scopes {
         let mut out = Self {
             by_scope: HashMap::new(),
             scoped: !lang.scopes().is_empty(),
+            implicit_this: resolver.implicit_this(),
             root: root.id(),
         };
         let Some(query) = query else {
@@ -185,8 +226,22 @@ impl Scopes {
             let via = match role {
                 Some("field") => Via::Field,
                 Some("param") => Via::Param,
+                // A constructor parameter property (`constructor(private x:
+                // T)`): a field of the class, injected (rule 4).
+                Some("inject") => Via::CtorInject,
                 _ => Via::Local,
             };
+            let member = matches!(role, Some("field") | Some("inject"));
+            // A function or class value is a symbol of its own (`const f =
+            // () => …`), not a variable whose type something says.
+            if init.is_some_and(|i| {
+                matches!(
+                    i.kind(),
+                    "arrow_function" | "function_expression" | "generator_function" | "class"
+                )
+            }) {
+                continue;
+            }
             let at = name_node
                 .parent()
                 .map_or(name_node.start_byte(), |p| p.start_byte());
@@ -195,8 +250,16 @@ impl Scopes {
                 .filter(|t| t.trim() != "var")
                 .and_then(TypeText::parse);
             let assign = role == Some("assign");
+            // A parameter property belongs to the class around its
+            // constructor, not to the constructor.
+            let scope = match role {
+                Some("inject") => match enclosing_kind(name_node, lang.function_kinds()) {
+                    Some(func) => out.scope_of(func, lang),
+                    None => out.scope_of(name_node, lang),
+                },
+                _ => out.scope_of(name_node, lang),
+            };
             if written.is_some() && !assign {
-                let scope = out.scope_of(name_node, lang);
                 out.push(
                     scope,
                     Binding {
@@ -204,11 +267,11 @@ impl Scopes {
                         ty: written,
                         via,
                         at,
+                        member,
                     },
                 );
                 continue;
             }
-            let scope = out.scope_of(name_node, lang);
             pending.push(Pending {
                 name: text.to_string(),
                 name_node,
@@ -218,6 +281,7 @@ impl Scopes {
                 init,
                 iter,
                 assign,
+                member,
             });
         }
         for p in pending {
@@ -236,6 +300,8 @@ impl Scopes {
                 });
             let (ty, via) = match inferred {
                 Some((t, Via::Static)) => (Some(t), Via::Static),
+                // `inject(T)` (Angular): injected, a field or a local.
+                Some((t, Via::CtorInject)) => (Some(t), Via::CtorInject),
                 Some((t, _)) => (Some(t), p.via),
                 None => (None, p.via),
             };
@@ -246,6 +312,7 @@ impl Scopes {
                     ty,
                     via,
                     at: p.at,
+                    member: p.member,
                 },
             );
         }
@@ -273,7 +340,7 @@ impl Scopes {
         let Some(param) = self.lookup(init, key) else {
             return;
         };
-        if param.via != Via::Param || param.ty.is_none() {
+        if param.via != Via::Param || param.ty.is_none() || param.member {
             return;
         }
         let class_scope = self.scope_of(func, lang);
@@ -282,7 +349,7 @@ impl Scopes {
         // stays `Service`, so its callers stay `Service.m`'s).
         let declared = self.by_scope.get(&class_scope).and_then(|bs| {
             bs.iter()
-                .find(|b| b.name == p.name && b.via == Via::Field && b.ty.is_some())
+                .find(|b| b.name == p.name && b.member && b.via == Via::Field && b.ty.is_some())
                 .and_then(|b| b.ty.clone())
         });
         let ty = declared.or_else(|| param.ty.clone());
@@ -293,6 +360,7 @@ impl Scopes {
                 ty,
                 via: Via::CtorInject,
                 at: p.at,
+                member: true,
             },
         );
     }
@@ -314,11 +382,13 @@ impl Scopes {
     /// parameter over its declaration, and the last local declared before
     /// `at`.
     pub fn lookup(&self, at: Node<'_>, name: &str) -> Option<&Binding> {
+        let visible = |b: &&Binding| self.implicit_this || !b.member;
         if !self.scoped {
             return self
                 .by_scope
                 .get(&self.root)?
                 .iter()
+                .filter(visible)
                 .find(|b| b.name == name);
         }
         let use_at = at.start_byte();
@@ -327,7 +397,7 @@ impl Scopes {
             if let Some(found) = self
                 .by_scope
                 .get(&n.id())
-                .and_then(|bs| pick(bs, name, use_at))
+                .and_then(|bs| pick(bs, name, use_at, self.implicit_this))
             {
                 return Some(found);
             }
@@ -335,7 +405,12 @@ impl Scopes {
         }
         self.by_scope
             .get(&self.root)
-            .and_then(|bs| pick(bs, name, use_at))
+            .and_then(|bs| pick(bs, name, use_at, self.implicit_this))
+    }
+
+    /// Whether a bare name can be a member of the enclosing class (Java).
+    pub fn implicit_this(&self) -> bool {
+        self.implicit_this
     }
 
     /// A field of the class around `at` (`this.x`): the innermost class-level
@@ -349,7 +424,7 @@ impl Scopes {
         while let Some(n) = cur {
             if let Some(bs) = self.by_scope.get(&n.id()) {
                 let mut found: Option<&Binding> = None;
-                for b in bs.iter().filter(|b| b.name == name) {
+                for b in bs.iter().filter(|b| b.name == name && b.member) {
                     match b.via {
                         Via::CtorInject => return Some(b),
                         Via::Field if found.is_none() => found = Some(b),
@@ -366,13 +441,22 @@ impl Scopes {
     }
 }
 
-/// The binding of `name` in one scope's list, as seen from `use_at`.
-fn pick<'b>(bs: &'b [Binding], name: &str, use_at: usize) -> Option<&'b Binding> {
+/// The binding of `name` in one scope's list, as seen from `use_at`; a
+/// member only where a bare name can be one (`implicit_this`).
+fn pick<'b>(
+    bs: &'b [Binding],
+    name: &str,
+    use_at: usize,
+    implicit_this: bool,
+) -> Option<&'b Binding> {
     let mut best: Option<&Binding> = None;
-    for b in bs.iter().filter(|b| b.name == name) {
+    for b in bs
+        .iter()
+        .filter(|b| b.name == name && (implicit_this || !b.member))
+    {
         match b.via {
-            Via::CtorInject => return Some(b),
-            Via::Local | Via::Static if b.at > use_at => {}
+            Via::CtorInject if b.member => return Some(b),
+            Via::Local | Via::Static | Via::CtorInject if b.at > use_at => {}
             _ => best = Some(b),
         }
     }
@@ -412,5 +496,7 @@ mod tests {
         let t = TypeText::parse("List<? extends Bar>").unwrap();
         assert_eq!(t.elem.as_deref(), Some("Bar"));
         assert_eq!(TypeText::parse("Foo").unwrap().elem, None);
+        assert_eq!(TypeText::parse("Foo | null").unwrap().base, "Foo");
+        assert_eq!(TypeText::parse("A | B").unwrap().base, "A|B");
     }
 }

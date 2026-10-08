@@ -19,6 +19,7 @@ use crate::facts::{CONTAINS, IMPLEMENTS, IMPORTS, INHERITS};
 use crate::lang::Lang;
 use crate::resolve::java::{arity, declared_type};
 use crate::resolve::resolver_for;
+use crate::resolve::typescript::{TsConfig, TsImport};
 use crate::types::ParsedFile;
 
 /// A symbol of the branch, as the link pass needs it.
@@ -85,7 +86,7 @@ pub enum Outcome {
     Discard,
 }
 
-fn hi(dst: usize, idx: &RepoIndex, resolution: &'static str) -> Outcome {
+pub(super) fn hi(dst: usize, idx: &RepoIndex, resolution: &'static str) -> Outcome {
     let confidence = if resolution == "unique_name" {
         "medium"
     } else {
@@ -99,7 +100,7 @@ fn hi(dst: usize, idx: &RepoIndex, resolution: &'static str) -> Outcome {
     })
 }
 
-fn external(resolution: &'static str) -> Outcome {
+pub(super) fn external(resolution: &'static str) -> Outcome {
     Outcome::Resolved(Resolved {
         dst_id: None,
         confidence: "high",
@@ -110,7 +111,7 @@ fn external(resolution: &'static str) -> Outcome {
 
 /// External, but only as far as the receiver goes (an untyped one's
 /// `toString`, a repository name after an external call): `medium`.
-fn external_medium(resolution: &'static str) -> Outcome {
+pub(super) fn external_medium(resolution: &'static str) -> Outcome {
     Outcome::Resolved(Resolved {
         dst_id: None,
         confidence: "medium",
@@ -121,7 +122,7 @@ fn external_medium(resolution: &'static str) -> Outcome {
 
 /// A destination found by convention, not by a definition (a Lombok
 /// accessor of a field): `medium`.
-fn medium(dst: usize, idx: &RepoIndex, resolution: &'static str) -> Outcome {
+pub(super) fn medium(dst: usize, idx: &RepoIndex, resolution: &'static str) -> Outcome {
     Outcome::Resolved(Resolved {
         dst_id: Some(idx.syms[dst].id),
         confidence: "medium",
@@ -130,7 +131,7 @@ fn medium(dst: usize, idx: &RepoIndex, resolution: &'static str) -> Outcome {
     })
 }
 
-fn undecided() -> Outcome {
+pub(super) fn undecided() -> Outcome {
     Outcome::Resolved(Resolved {
         dst_id: None,
         confidence: "low",
@@ -141,7 +142,7 @@ fn undecided() -> Outcome {
 
 /// How a type name resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TypeRef {
+pub(super) enum TypeRef {
     /// A type of the repository, and how it was found.
     Repo(usize, &'static str),
     /// From outside the repository, with evidence.
@@ -164,22 +165,26 @@ enum Member {
 }
 
 #[derive(Default)]
-struct FileInfo {
+pub(super) struct FileInfo {
     lang: Option<Lang>,
     package: Option<String>,
     imports: Vec<String>,
+    /// TypeScript/JavaScript: each import and re-export, read back.
+    pub(super) script: Vec<TsImport>,
+    /// The file symbol's id.
+    pub(super) id: Option<u64>,
 }
 
 /// What the link pass knows of a branch: its symbols, by id, qualified name,
 /// bare name and container; each file's package and imports; each type's
 /// supertypes, resolved.
 pub struct RepoIndex {
-    syms: Vec<LinkSymbol>,
-    by_id: HashMap<u64, usize>,
-    by_qualified: HashMap<String, Vec<usize>>,
-    by_name: HashMap<String, Vec<usize>>,
+    pub(super) syms: Vec<LinkSymbol>,
+    pub(super) by_id: HashMap<u64, usize>,
+    pub(super) by_qualified: HashMap<String, Vec<usize>>,
+    pub(super) by_name: HashMap<String, Vec<usize>>,
     children: HashMap<u64, Vec<usize>>,
-    files: HashMap<String, FileInfo>,
+    pub(super) files: HashMap<String, FileInfo>,
     packages: HashSet<String>,
     /// Java: `package.Qualified` of every type.
     fq_types: HashMap<String, Vec<usize>>,
@@ -187,6 +192,9 @@ pub struct RepoIndex {
     /// Types sharing their fully qualified name with another (two modules
     /// of one repository): never a `high` destination.
     ambiguous: HashSet<usize>,
+    /// The workspace's `tsconfig` (TypeScript `baseUrl`/`paths`).
+    pub(super) ts: Option<TsConfig>,
+    pub(super) ts_cache: crate::resolve::typescript::TsCache,
 }
 
 /// Methods every Java class has from `Object`, and every enum from `Enum`.
@@ -203,16 +211,16 @@ const JAVA_OBJECT: &[&str] = &[
 ];
 const JAVA_ENUM: &[&str] = &["values", "valueOf", "name", "ordinal", "compareTo"];
 
-fn is_type(kind: &str) -> bool {
+pub(super) fn is_type(kind: &str) -> bool {
     kind_class(kind) == "type"
 }
 
-fn is_callable(kind: &str) -> bool {
+pub(super) fn is_callable(kind: &str) -> bool {
     kind_class(kind) == "callable"
 }
 
 /// The last segment of a destination (`a.b.C.m` → `m`, `x::y` → `y`).
-fn leaf(name: &str) -> &str {
+pub(super) fn leaf(name: &str) -> &str {
     let after_colons = name.rsplit("::").next().unwrap_or(name);
     after_colons.rsplit('.').next().unwrap_or(after_colons)
 }
@@ -221,6 +229,17 @@ impl RepoIndex {
     /// Index `symbols`; `facts` brings each file's `imports` and each type's
     /// `inherits`/`implements` (every other edge in it is ignored).
     pub fn new(symbols: Vec<LinkSymbol>, facts: &[LinkEdge]) -> Self {
+        Self::with_ts_config(symbols, facts, None)
+    }
+
+    /// [`RepoIndex::new`] with a workspace's `tsconfig`, which TypeScript
+    /// and JavaScript imports resolve aliases and `baseUrl` paths through
+    /// (PLAN-009 TASK-006); `None`: relative imports only.
+    pub fn with_ts_config(
+        symbols: Vec<LinkSymbol>,
+        facts: &[LinkEdge],
+        ts: Option<TsConfig>,
+    ) -> Self {
         let mut idx = Self {
             syms: symbols,
             by_id: HashMap::new(),
@@ -232,6 +251,8 @@ impl RepoIndex {
             fq_types: HashMap::new(),
             supers: HashMap::new(),
             ambiguous: HashSet::new(),
+            ts,
+            ts_cache: Default::default(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.id, i);
@@ -243,6 +264,7 @@ impl RepoIndex {
                 info.package = s.package.clone();
             }
             if s.kind == FILE_KIND {
+                info.id = Some(s.id);
                 continue;
             }
             idx.by_qualified
@@ -273,6 +295,10 @@ impl RepoIndex {
         for e in facts.iter().filter(|e| e.kind == IMPORTS) {
             if let Some(info) = idx.files.get_mut(&e.file) {
                 info.imports.push(e.dst_name.clone());
+                if info.lang.is_some_and(is_script_lang) {
+                    info.script
+                        .push(TsImport::from_row(&e.dst_name, e.hint.as_deref()));
+                }
             }
         }
         let mut supers: HashMap<u64, Vec<TypeRef>> = HashMap::new();
@@ -294,6 +320,11 @@ impl RepoIndex {
                 src
             };
             let r = idx.resolve_type(&e.dst_name, &e.file, Some(src));
+            // A TypeScript class gets no implementation from an interface it
+            // `implements`: an external one makes no missing member external.
+            if r == TypeRef::External && e.kind == IMPLEMENTS && idx.is_script(&e.file) {
+                continue;
+            }
             supers.entry(idx.syms[owner].id).or_default().push(r);
         }
         idx.supers = supers;
@@ -365,13 +396,18 @@ impl RepoIndex {
         self.lang_of(file).is_some_and(|l| l.key() == "java")
     }
 
-    fn platform(&self, file: &str, name: &str) -> bool {
+    /// TypeScript, TSX or JavaScript.
+    pub(super) fn is_script(&self, file: &str) -> bool {
+        self.lang_of(file).is_some_and(is_script_lang)
+    }
+
+    pub(super) fn platform(&self, file: &str, name: &str) -> bool {
         self.lang_of(file)
             .is_some_and(|l| resolver_for(l).is_platform(l.def(), name))
     }
 
     /// `src` and every symbol around it, innermost first (file symbol last).
-    fn chain(&self, src: Option<usize>) -> Vec<usize> {
+    pub(super) fn chain(&self, src: Option<usize>) -> Vec<usize> {
         let mut out = Vec::new();
         let mut cur = src;
         while let Some(i) = cur {
@@ -511,7 +547,7 @@ impl RepoIndex {
 
     /// Of several overloads, the first whose arity takes `args`, and
     /// whether one does (else the first, not exact).
-    fn pick_overload(&self, found: &[usize], args: Option<usize>) -> (usize, bool) {
+    pub(super) fn pick_overload(&self, found: &[usize], args: Option<usize>) -> (usize, bool) {
         // Arity is read from Java signatures only (a Rust method's `&self`
         // is a parameter the call does not pass).
         let fits = |m: usize| -> bool {
@@ -554,7 +590,7 @@ impl RepoIndex {
     }
 
     /// Rules 7-9 for a callee nothing else decided.
-    fn by_name_only(&self, callee: &str, file: &str, args: Option<usize>) -> Outcome {
+    pub(super) fn by_name_only(&self, callee: &str, file: &str, args: Option<usize>) -> Outcome {
         let c = self.candidates(callee, file, args);
         match c.len() {
             1 => hi(c[0], self, "unique_name"),
@@ -565,7 +601,7 @@ impl RepoIndex {
 
     /// A receiver nothing types: the name must exist in the repository to
     /// be kept, and then nothing decides it.
-    fn untyped(&self, c: &Call<'_>) -> Outcome {
+    pub(super) fn untyped(&self, c: &Call<'_>) -> Outcome {
         let (callee, file, args) = (c.callee, c.file, c.args);
         // Every Java object has `Object`'s methods; a repository type may
         // override them, so no more than medium.
@@ -581,7 +617,7 @@ impl RepoIndex {
 
     /// A receiver whose type is named but unknown: never discarded, never
     /// more than medium.
-    fn by_name_only_low(&self, c: &Call<'_>) -> Outcome {
+    pub(super) fn by_name_only_low(&self, c: &Call<'_>) -> Outcome {
         let k = self.candidates(c.callee, c.file, c.args);
         if k.len() == 1 {
             hi(k[0], self, "unique_name")
@@ -598,7 +634,7 @@ impl RepoIndex {
     /// How sure a type found as `how` is: `medium` by its name alone
     /// (`unique_name`) or when two types share its fully qualified name
     /// (two modules), else `high`.
-    fn type_conf(&self, t: usize, how: &str) -> &'static str {
+    pub(super) fn type_conf(&self, t: usize, how: &str) -> &'static str {
         if how == "unique_name" || self.ambiguous.contains(&t) {
             "medium"
         } else {
@@ -609,9 +645,12 @@ impl RepoIndex {
     // ------------------------------------------------------------------ types
 
     /// Resolve a type name as written in `file`, seen from `ctx`.
-    fn resolve_type(&self, name: &str, file: &str, ctx: Option<usize>) -> TypeRef {
+    pub(super) fn resolve_type(&self, name: &str, file: &str, ctx: Option<usize>) -> TypeRef {
         if self.is_java(file) {
             return self.java_type(name, file, ctx);
+        }
+        if self.is_script(file) {
+            return self.script_type(name, file, ctx);
         }
         // Generic: this file (nested along the containers, then top level),
         // then a unique type of that name, then the platform.
@@ -638,7 +677,12 @@ impl RepoIndex {
 
     /// A type of `file` named `name`: nested in a container around `ctx`
     /// (innermost first), or top level.
-    fn same_file_type(&self, name: &str, file: &str, ctx: Option<usize>) -> Option<usize> {
+    pub(super) fn same_file_type(
+        &self,
+        name: &str,
+        file: &str,
+        ctx: Option<usize>,
+    ) -> Option<usize> {
         let in_file = |q: &str| {
             self.by_qualified
                 .get(q)
@@ -788,6 +832,9 @@ impl RepoIndex {
     }
 
     fn resolve_import(&self, e: &LinkEdge) -> Outcome {
+        if self.is_script(&e.file) {
+            return self.script_import(e);
+        }
         let target = e.dst_name.as_str();
         if !self.is_java(&e.file) {
             return if self.platform(&e.file, target) {
@@ -858,6 +905,7 @@ impl RepoIndex {
             ["this"] => self.this_call(c, false),
             ["super"] => self.this_call(c, true),
             ["typed", via, ty] => self.typed_call(c, via, ty),
+            ["name", recv] if self.is_script(c.file) => self.script_name(c, recv),
             ["name", recv] => self.name_call(c, recv),
             ["member", path, base @ ..] => self.member_call(c, path, base),
             ["anon", ty, inner @ ..] => self.anon_call(c, ty, inner),
@@ -865,12 +913,13 @@ impl RepoIndex {
             ["chain", prev, rest @ ..] if depth < 8 => self.chain_call(c, prev, rest, e, depth),
             ["chain", ..] => self.untyped(c),
             ["path"] => self.path_call(c, e),
-            ["bare"] => self.bare_call(c),
+            ["bare"] => self.any_bare(c),
             // A row with no hint (written before hints): qualified → as a
             // name, bare → as a bare call.
             _ => match e.dst_name.rsplit_once('.') {
+                Some((recv, _)) if self.is_script(c.file) => self.script_name(c, recv),
                 Some((recv, _)) => self.name_call(c, recv),
-                None => self.bare_call(c),
+                None => self.any_bare(c),
             },
         }
     }
@@ -878,7 +927,13 @@ impl RepoIndex {
     /// A member found in a type: `own` if in the type itself, `inherited`
     /// if in a supertype; `medium` when no overload took the arguments or
     /// the type is not sure (`type_conf`).
-    fn member_hit(&self, m: usize, inherited: bool, exact: bool, own: &'static str) -> Outcome {
+    pub(super) fn member_hit(
+        &self,
+        m: usize,
+        inherited: bool,
+        exact: bool,
+        own: &'static str,
+    ) -> Outcome {
         let res = if inherited { "inherited" } else { own };
         let out = hi(m, self, res);
         if exact {
@@ -891,7 +946,13 @@ impl RepoIndex {
     /// `callee` looked up in the type `t`, resolved as `own`; missing: an
     /// external supertype makes it an inherited external, a Lombok accessor
     /// its field (`medium`), else undecided. Capped at `conf`.
-    fn in_type(&self, c: &Call<'_>, t: usize, own: &'static str, conf: &'static str) -> Outcome {
+    pub(super) fn in_type(
+        &self,
+        c: &Call<'_>,
+        t: usize,
+        own: &'static str,
+        conf: &'static str,
+    ) -> Outcome {
         let out = match self.find_member(t, c.callee, true, c.args) {
             Member::Found(m, inherited, exact) => self.member_hit(m, inherited, exact, own),
             Member::External => external("inherited"),
@@ -906,7 +967,7 @@ impl RepoIndex {
     /// `this.m()` / `super.m()` (rule 1).
     fn this_call(&self, c: &Call<'_>, sup: bool) -> Outcome {
         let Some(&k) = self.containers(c.src).first() else {
-            return self.bare_call(c);
+            return self.any_bare(c);
         };
         if !sup {
             return self.in_type(c, k, "self", "high");
@@ -929,6 +990,15 @@ impl RepoIndex {
             external("inherited")
         } else {
             undecided()
+        }
+    }
+
+    /// A call without a receiver, by the file's language.
+    fn any_bare(&self, c: &Call<'_>) -> Outcome {
+        if self.is_script(c.file) {
+            self.script_bare(c)
+        } else {
+            self.bare_call(c)
         }
     }
 
@@ -1291,18 +1361,21 @@ impl RepoIndex {
             }
             _ => return self.untyped(c),
         };
-        if !self.is_java(c.file) {
-            return self.untyped(c);
-        }
         let Some(&pi) = self.by_id.get(&p) else {
             return self.untyped(c);
         };
         let ps = &self.syms[pi];
-        let Some(ret) = ps
-            .signature
-            .as_deref()
-            .and_then(|s| declared_type(s, &ps.name))
-        else {
+        // The declared return type: a Java method's, a TypeScript
+        // function's (`(): Observable<T>`).
+        let sig = ps.signature.as_deref();
+        let ret = if self.is_java(&ps.file) {
+            sig.and_then(|s| declared_type(s, &ps.name))
+        } else if self.is_script(&ps.file) {
+            sig.and_then(crate::resolve::typescript::return_type)
+        } else {
+            None
+        };
+        let Some(ret) = ret else {
             return self.untyped(c);
         };
         match self.resolve_type(&ret, &ps.file, Some(pi)) {
@@ -1378,11 +1451,16 @@ impl RepoIndex {
 }
 
 /// One call being resolved.
-struct Call<'a> {
-    callee: &'a str,
-    src: Option<usize>,
-    file: &'a str,
-    args: Option<usize>,
+pub(super) struct Call<'a> {
+    pub(super) callee: &'a str,
+    pub(super) src: Option<usize>,
+    pub(super) file: &'a str,
+    pub(super) args: Option<usize>,
+}
+
+/// TypeScript, TSX and JavaScript share one resolver.
+fn is_script_lang(l: Lang) -> bool {
+    matches!(l.key(), "typescript" | "tsx" | "javascript")
 }
 
 fn rank(conf: &str) -> u8 {
@@ -1394,7 +1472,7 @@ fn rank(conf: &str) -> u8 {
 }
 
 /// The lower of two confidences.
-fn min_conf(a: &'static str, b: &'static str) -> &'static str {
+pub(super) fn min_conf(a: &'static str, b: &'static str) -> &'static str {
     if rank(a) <= rank(b) {
         a
     } else {
@@ -1404,7 +1482,7 @@ fn min_conf(a: &'static str, b: &'static str) -> &'static str {
 
 /// `o` no surer than `conf` (a chain is no surer than its previous call, a
 /// type found by its name alone no surer than `medium`).
-fn cap(o: Outcome, conf: &'static str) -> Outcome {
+pub(super) fn cap(o: Outcome, conf: &'static str) -> Outcome {
     match o {
         Outcome::Resolved(mut r) if rank(r.confidence) > rank(conf) => {
             r.confidence = conf;
@@ -1460,7 +1538,7 @@ pub fn link_rows(file: &str, pf: &ParsedFile) -> (Vec<LinkSymbol>, Vec<LinkEdge>
         pf.facts
             .imports
             .iter()
-            .map(|i| edge(IMPORTS, file_id, &i.target, None, i.line)),
+            .map(|i| edge(IMPORTS, file_id, &i.target, i.hint(), i.line)),
     );
     edges.extend(
         pf.facts

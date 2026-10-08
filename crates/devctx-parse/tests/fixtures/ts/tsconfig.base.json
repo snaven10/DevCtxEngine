@@ -1,0 +1,12 @@
+// Nx-style workspace aliases (JSON with comments and trailing commas).
+{
+  "compilerOptions": {
+    /* where non-relative imports start */
+    "baseUrl": ".",
+    "paths": {
+      "@acme/auth": ["libs/auth/src/index.ts"],
+      "@acme/auth-data": ["libs/auth-data/src/index.ts"], // the homonym
+      "@acme/ui/*": ["libs/ui/src/*"],
+    },
+  },
+}

@@ -1,4 +1,4 @@
-version 8
+version 9
 == src/main/java/com/example/shop/OrderService.java (java) package=com.example.shop
 sym	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7	parent=-	container=-	-	L1-43	
 sym	class	OrderService	dc29a699ee8c525b	parent=src/main/java/com/example/shop/OrderService.java	container=-	pub	L9-38	public class OrderService extends BaseService implements Auditable, Serializable
@@ -15,10 +15,10 @@ sym	method	OrderService.init	dfc52b440db039bf	parent=OrderService	container=Orde
 sym	method	OrderService.init.run	87becec10e82fd60	parent=OrderService.init	container=OrderService	pub	L36-36	public void run()
 sym	interface	Auditable	c9933d105e358b99	parent=src/main/java/com/example/shop/OrderService.java	container=-	priv	L40-42	interface Auditable extends Named
 sym	method	Auditable.audit	7bdbbce95d55e19a	parent=Auditable	container=Auditable	pub	L41-41	String audit();
-L3	import	java.util.List	path=java.util.List name=- alias=- wildcard=false
-L4	import	java.util.*	path=java.util name=- alias=- wildcard=true
-L5	import	java.util.Objects.requireNonNull	path=java.util.Objects.requireNonNull name=- alias=- wildcard=false
-L6	import	com.example.shop.repo.OrderRepository	path=com.example.shop.repo.OrderRepository name=- alias=- wildcard=false
+L3	import	java.util.List	path=java.util.List name=- alias=- wildcard=false reexport=false
+L4	import	java.util.*	path=java.util name=- alias=- wildcard=true reexport=false
+L5	import	java.util.Objects.requireNonNull	path=java.util.Objects.requireNonNull name=- alias=- wildcard=false reexport=false
+L6	import	com.example.shop.repo.OrderRepository	path=com.example.shop.repo.OrderRepository name=- alias=- wildcard=false reexport=false
 L9	implements	OrderService -> Auditable
 L9	implements	OrderService -> Serializable
 L9	inherits	OrderService -> BaseService
@@ -57,17 +57,17 @@ sym	method	AuthService.ngOnInit	239457ad0d7f55be	parent=AuthService	container=Au
 sym	method	AuthService.ngOnInit.cb	85033aee12d4abea	parent=AuthService.ngOnInit	container=AuthService	priv	L37-37	const cb = () =>
 sym	method	AuthService.handle	603723a1fdf99df4	parent=AuthService	container=AuthService	pub	L41-43	handle = (e: Event) =>
 sym	method	AuthService.load	aa6523c96ef05432	parent=AuthService	container=AuthService	priv	L45-47	private load(): Session
-L1	import	@angular/core#Injectable	path=@angular/core name=Injectable alias=- wildcard=false
-L1	import	@angular/core#inject	path=@angular/core name=inject alias=- wildcard=false
-L2	import	@angular/common/http#HttpInterceptorFn	path=@angular/common/http name=HttpInterceptorFn alias=Fn wildcard=false
-L3	import	rxjs#*	path=rxjs name=- alias=rx wildcard=true
-L4	import	./auth.store#default	path=./auth.store name=default alias=AuthStore wildcard=false
-L5	import	./polyfills	path=./polyfills name=- alias=- wildcard=false
+L1	import	@angular/core#Injectable	path=@angular/core name=Injectable alias=- wildcard=false reexport=false
+L1	import	@angular/core#inject	path=@angular/core name=inject alias=- wildcard=false reexport=false
+L2	import	@angular/common/http#HttpInterceptorFn	path=@angular/common/http name=HttpInterceptorFn alias=Fn wildcard=false reexport=false
+L3	import	rxjs#*	path=rxjs name=- alias=rx wildcard=true reexport=false
+L4	import	./auth.store#default	path=./auth.store name=default alias=AuthStore wildcard=false reexport=false
+L5	import	./polyfills	path=./polyfills name=- alias=- wildcard=false reexport=false
 L7	references	tokenInterceptor -> Fn
 L8	call	tokenInterceptor -> inject	graph=tokenInterceptor	hint=bare /1
-L9	call	tokenInterceptor -> AuthStore.headers	graph=tokenInterceptor	hint=typed local AuthStore /0
-L9	call	tokenInterceptor -> clone	graph=tokenInterceptor	hint=name req /1
-L9	call	tokenInterceptor -> next	graph=tokenInterceptor	hint=bare /1
+L9	call	tokenInterceptor -> AuthStore.headers	graph=tokenInterceptor	hint=typed ctor_inject AuthStore /0
+L9	call	tokenInterceptor -> clone	graph=tokenInterceptor	hint=untyped /1
+L9	call	tokenInterceptor -> next	graph=tokenInterceptor	hint=untyped /1
 L13	call	helper -> log	graph=helper	hint=bare /1
 L16	inherits	Session -> Base
 L24	call	libs/auth/src/token.interceptor.ts -> Injectable	graph=-	hint=bare /0
@@ -84,8 +84,8 @@ L34	call	AuthService.ngOnInit -> AuthService.load	graph=AuthService.ngOnInit	hin
 L35	call	AuthService.ngOnInit -> audit	graph=AuthService.ngOnInit	hint=bare /1
 L35	call	AuthService.ngOnInit -> map	graph=AuthService.ngOnInit	hint=expr /1
 L36	call	AuthService.ngOnInit -> AuthService.process	graph=AuthService.ngOnInit	hint=this /1
-L36	call	AuthService.ngOnInit -> HttpClient.get	graph=AuthService.ngOnInit	hint=typed local HttpClient /1
-L36	call	AuthService.ngOnInit -> subscribe	graph=AuthService.ngOnInit	hint=chain get typed local HttpClient /1
+L36	call	AuthService.ngOnInit -> HttpClient.get	graph=AuthService.ngOnInit	hint=typed ctor_inject HttpClient /1
+L36	call	AuthService.ngOnInit -> subscribe	graph=AuthService.ngOnInit	hint=chain get typed ctor_inject HttpClient /1
 L37	call	AuthService.ngOnInit.cb -> AuthService.track	graph=AuthService.ngOnInit.cb	hint=this /0
 L38	call	AuthService.ngOnInit -> cb	graph=AuthService.ngOnInit	hint=bare /0
 L41	references	AuthService.handle -> Event
@@ -93,15 +93,15 @@ L42	call	AuthService.handle -> AuthService.load	graph=AuthService.handle	hint=th
 L45	references	AuthService.load -> Session
 L46	instantiates	AuthService.load -> SessionImpl
 L50	call	libs/auth/src/token.interceptor.ts -> register	graph=-	hint=bare /1
-L54	import	./barrel#Other	path=./barrel name=Other alias=- wildcard=false
-L54	import	./barrel#Thing	path=./barrel name=Thing alias=Alias wildcard=false
-L55	import	./all#*	path=./all name=- alias=- wildcard=true
+L54	import	./barrel#Other	path=./barrel name=Other alias=- wildcard=false reexport=true
+L54	import	./barrel#Thing	path=./barrel name=Thing alias=Alias wildcard=false reexport=true
+L55	import	./all#*	path=./all name=- alias=- wildcard=true reexport=true
 == web/Button.tsx (tsx) package=web/Button
 sym	file	web/Button.tsx	d596667f036499eb	parent=-	container=-	-	L1-11	
 sym	function	Button	735feebece4ac8af	parent=web/Button.tsx	container=-	pub	L3-6	const Button = (props: Props) =>
 sym	function	Button.onClick	56580debb4e80180	parent=Button	container=-	priv	L4-4	const onClick = () =>
 sym	function	Panel	5cf3006b7d7ef18d	parent=web/Button.tsx	container=-	pub	L8-10	function Panel(): JSX.Element
-L1	import	react#default	path=react name=default alias=React wildcard=false
+L1	import	react#default	path=react name=default alias=React wildcard=false reexport=false
 L3	references	Button -> Props
 L4	call	Button.onClick -> track	graph=Button.onClick	hint=bare /1
 L8	references	Panel -> JSX.Element
@@ -115,8 +115,8 @@ sym	method	App.run	8b91df318509fb06	parent=App	container=App	pub	L19-21	run()
 sym	field	App.count	17ad41dca9912cec	parent=App	container=App	pub	L23-23	count = 0
 sym	method	App.stop	a35e54b476e4e23d	parent=App	container=App	pub	L25-27	stop = () =>
 sym	function	onDone	0e374261e243a43b	parent=web/app.js	container=-	priv	L34-36	const onDone = function finish()
-L1	import	express#default	path=express name=default alias=express wildcard=false
-L2	import	./routes.js#route	path=./routes.js name=route alias=- wildcard=false
+L1	import	express#default	path=express name=default alias=express wildcard=false reexport=false
+L2	import	./routes.js#route	path=./routes.js name=route alias=- wildcard=false reexport=false
 L5	call	start -> listen	graph=start	hint=bare /1
 L9	call	boot -> start	graph=boot	hint=bare /1
 L12	inherits	App -> Base
@@ -137,11 +137,11 @@ sym	method	OrderService._hidden.step	f0cc13e8ff579505	parent=OrderService._hidde
 sym	function	traced	f77a70f609bc9b5f	parent=shop/orders.py	container=-	pub	L22-26	def traced(f):
 sym	function	traced.wrapper	7600f30c713dd292	parent=traced	container=-	priv	L23-25	def wrapper():
 sym	function	main	fc94a46ccc44a829	parent=shop/orders.py	container=-	pub	L29-30	def main():
-L1	import	os	path=os name=- alias=- wildcard=false
-L2	import	logging	path=logging name=- alias=log wildcard=false
-L3	import	.models.Line	path=.models name=Line alias=L wildcard=false
-L3	import	.models.Order	path=.models name=Order alias=- wildcard=false
-L4	import	typing.*	path=typing name=- alias=- wildcard=true
+L1	import	os	path=os name=- alias=- wildcard=false reexport=false
+L2	import	logging	path=logging name=- alias=log wildcard=false reexport=false
+L3	import	.models.Line	path=.models name=Line alias=L wildcard=false reexport=false
+L3	import	.models.Order	path=.models name=Order alias=- wildcard=false reexport=false
+L4	import	typing.*	path=typing name=- alias=- wildcard=true reexport=false
 L9	inherits	OrderService -> BaseService
 L9	inherits	OrderService -> mixins.Audited
 L10	references	OrderService.__init__ -> Repo
@@ -170,10 +170,10 @@ sym	method	Cached.build	900da28cfc5f3968	parent=Cached	container=Cached	priv	L25
 sym	method	Cached.build.tag	baac54ff8569c6cb	parent=Cached.build	container=Cached	priv	L26-28	fn tag()
 sym	impl	Cached	9d13d10a606a45d5	parent=Cached	container=-	-	L33-39	impl<T: Clone> Named for Cached<T>
 sym	method	Cached.name	0a51c92f9feb2990	parent=Cached	container=Cached	priv	L34-38	fn name(&self) -> String
-L1	import	std::collections::HashMap	path=std::collections::HashMap name=- alias=- wildcard=false
-L2	import	crate::store	path=crate::store name=- alias=- wildcard=false
-L2	import	crate::store::Store	path=crate::store::Store name=- alias=S wildcard=false
-L2	import	crate::store::model::*	path=crate::store::model name=- alias=- wildcard=true
+L1	import	std::collections::HashMap	path=std::collections::HashMap name=- alias=- wildcard=false reexport=false
+L2	import	crate::store	path=crate::store name=- alias=- wildcard=false reexport=false
+L2	import	crate::store::Store	path=crate::store::Store name=- alias=S wildcard=false reexport=false
+L2	import	crate::store::model::*	path=crate::store::model name=- alias=- wildcard=true reexport=false
 L14	inherits	Named -> Clone
 L14	inherits	Named -> Send
 L21	references	Cached.new -> Cached
@@ -196,9 +196,9 @@ sym	field	Server.Name	b6059c4427192455	parent=Server	container=-	pub	L19-19	Name
 sym	function	NewServer	5ca7cac7e3eb0064	parent=api/server.go	container=-	pub	L22-24	func NewServer() *Server
 sym	method	Server.Handle	6f44c7a117749a14	parent=Server	container=-	pub	L26-29	func (s *Server) Handle(w h.ResponseWriter)
 sym	method	Server.helper	1795d3dc53e46b66	parent=Server	container=-	priv	L31-31	func (s *Server) helper()
-L4	import	fmt	path=fmt name=- alias=- wildcard=false
-L5	import	net/http	path=net/http name=- alias=h wildcard=false
-L7	import	github.com/acme/demo/store	path=github.com/acme/demo/store name=- alias=- wildcard=false
+L4	import	fmt	path=fmt name=- alias=- wildcard=false reexport=false
+L5	import	net/http	path=net/http name=- alias=h wildcard=false reexport=false
+L7	import	github.com/acme/demo/store	path=github.com/acme/demo/store name=- alias=- wildcard=false reexport=false
 L17	inherits	Server -> Base
 L17	references	Server -> Base
 L18	references	Server.store -> store.Store

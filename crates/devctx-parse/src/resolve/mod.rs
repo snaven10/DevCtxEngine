@@ -16,6 +16,7 @@
 pub mod java;
 pub mod link;
 pub mod scope;
+pub mod typescript;
 
 use tree_sitter::Node;
 
@@ -66,6 +67,14 @@ pub trait LangResolver: Sync {
     /// nothing local says (`var q = em.createQuery(…)`).
     fn init_type(&self, _init: Node<'_>, _bytes: &[u8]) -> Option<(scope::TypeText, scope::Via)> {
         None
+    }
+
+    /// Whether a bare name can be a member of the enclosing class (Java's
+    /// implicit `this`). TypeScript/JavaScript reach a member only through
+    /// `this.x`: a bare `x` is a local, an import or a global, never the
+    /// field of that name.
+    fn implicit_this(&self) -> bool {
+        true
     }
 }
 
@@ -148,6 +157,16 @@ impl LangResolver for Script {
             }));
         }
         Some(under_export(def) || in_export_clause(def, name, bytes))
+    }
+
+    fn implicit_this(&self) -> bool {
+        false
+    }
+
+    /// `new T(…)` and `x as T` are `T`; `inject(T)` (Angular's DI) is `T`,
+    /// injected (DD-7 rule 4).
+    fn init_type(&self, init: Node<'_>, bytes: &[u8]) -> Option<(scope::TypeText, scope::Via)> {
+        typescript::init_type(init, bytes)
     }
 
     fn import_target(&self, imp: &ImportFact) -> String {
