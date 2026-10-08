@@ -128,6 +128,18 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   written one, through barrels. Measured on three libraries of an Angular/Nx
   workspace: 10.8 % of calls undecided (was 73.1 %), 20 of 20 hand-labelled
   call sites correct, all `high`.
+- **TypeScript/JavaScript, after review** (**extractor version 10**, link rules
+  version 5): a package is external only with evidence — a dependency of the
+  root or nearest `package.json`, or a Node builtin — so an unmapped alias or
+  an undeclared module stays undecided; a call to a name imported from where
+  nothing can follow is undecided rather than matched to a repository
+  homonym; only Angular's `inject` injects; a function bound in a sibling
+  block no longer shadows. An unreadable `tsconfig.base.json` or
+  `package.json` (a merge conflict) no longer relinks the branch without its
+  aliases: the last good environment is kept; a byte-order mark and an
+  `extends` array are read. The incremental pass reopens a TS import row by
+  its imported name and follows an importer's return types, and falls back to
+  the full pass when the importers exceed a fifth of the branch.
 
 ### Fixed
 

@@ -9,8 +9,10 @@
 # LINK_VERSION 4). Los nombres de librerías públicas (Angular, RxJS) se dejan tal cual. ClassA y
 # ClassB tienen el MISMO nombre en el código (dos librerías del monorepo): decide el import. Los 10
 # primeros son los de TASK-001 re-anclados al commit medido; los 10 últimos se etiquetaron en
-# TASK-006, leyendo el código antes de medir. No hay inyección por constructor (`constructor(private
-# x: T)`) en `frontend`: todo es `inject(T)`; ese caso lo cubren los fixtures.
+# TASK-006, leyendo el código antes de medir. Re-medido tras la revisión de TASK-006
+# (EXTRACTOR_VERSION 10, LINK_VERSION 5, con el package.json raíz en el snapshot): mismos
+# resultados en los 20. No hay inyección por constructor (`constructor(private x: T)`) en
+# `frontend`: todo es `inject(T)`; ese caso lo cubren los fixtures.
 #
 # Formato: repo | sitio (alias) | destino esperado (alias) | external? | caso | antes | ahora
 #   resultado: correct / undecided (sin destino ni marca) / missing (sin arista: descartada) +

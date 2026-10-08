@@ -182,3 +182,78 @@ Implementa DD-7 (TS/JS).
   declaraciones ambientales `.d.ts` no se resuelven; (5) el gold TS está sesgado a lib-auth (los
   sitios elegidos en TASK-001) y no hay inyección por constructor real en frontend (cubierta por
   fixtures); (6) sandbox de medición en `/var/tmp/devctx-t006-*`.
+- **Revisión de bf8abde/3dcd6ee (REQUEST CHANGES, sin BLOCKER), resuelta en commits encima de
+  ed417c9:**
+  - *M1* una llamada pelada a un nombre importado que no se puede seguir (de un paquete, de un
+    nombre que también define un archivo del repo) queda **sin decidir**, nunca `unique_name`
+    contra el homónimo (`import { map } from 'rxjs/operators'` con un `map` del repo).
+  - *M2* un paquete es externo solo con evidencia: dependencia (`dependencies`,
+    `devDependencies`, `peerDependencies`, `optionalDependencies`) del `package.json` raíz o del
+    más cercano al archivo, o módulo builtin de Node (`fs`, `node:x`); el nombre de un paquete del
+    workspace (`name` de un `package.json` del repo) es del repo. Lo demás (un alias de un
+    `tsconfig.json` de app que no se lee, un módulo que ningún manifiesto declara) queda sin decidir
+    también para imports namespace y default. `RepoIndex::with_script_env` (`ScriptEnv {tsconfig,
+    manifests}`, `Manifest::parse`). Un símbolo no exportado no cuenta como "definido en el repo"
+    (`LinkSymbol.exported`).
+  - *M3* el modo (b) lee el nombre de una fila `imports` de TS/JS después de `#` (`rxjs#map` →
+    `map`).
+  - *M4* un `tsconfig`/`package.json` ilegible no relinkea: se usa el último entorno bueno
+    (`index_meta.link_script_env`, con su fingerprint en `link_tsconfig`); si no hay uno guardado,
+    `tsconfig.base.json` roto cae a `tsconfig.json`; BOM UTF-8 ignorado; `extends` en array
+    (TypeScript 5) soportado; un `extends` de paquete o un base que no existe o no parsea se avisa
+    una vez en el resumen.
+  - *m1* el modo (d) agrega a los nombres "frescos" los de los símbolos de los importadores (una
+    cadena `a.f().g()` en un tercer archivo). *m2* si escritos + importadores superan 1/5 de la
+    rama, pase completo; las rutas de cada especificador se calculan una vez por pase. *m3*
+    `export_of` memoiza por (archivo, nombre, profundidad). *m5* solo el `inject` importado de
+    `@angular/core` inyecta. *NIT* `paths` documentado como ordenado por patrón; el tipo hallado
+    por un import no seguro se etiqueta `import_weak` (resolución `import`, `medium`), no
+    `unique_name`; una función de un bloque hermano (o declarada en un bloque que no rodea la
+    llamada) no sombrea: las funciones son bindings con scope (`function f` elevada, `const f = () =>`
+    desde su declaración) y una llamada pelada que ningún scope liga, o ligada a la función del
+    módulo, lleva el hint nuevo **`free`**.
+  - *m4 (privacidad)* rutas con número de línea y la lista de micro frontends saneadas en TASK-001,
+    TASK-006, TASK-008 y el master (commit aparte).
+  - **`EXTRACTOR_VERSION` = 10, `LINK_VERSION` = 5.** Commits: ec29b32 (privacidad), e0e1a8c (código: parse e index
+    juntos, porque `TsConfig::extends_of` cambia de forma para los dos) y el de esta documentación.
+    Gate sobre e0e1a8c: `fmt --check`, `clippy -D warnings` (y `--features gpu`), `cargo test
+    --workspace --locked`: verde.
+  - *Tests que fallaban antes del fix:* en `link_typescript` (14 tests), contra el código de
+    ed417c9 con `with_script_env` como envoltorio vacío: `a_package_import_is_never_a_repository_homonym`
+    (M1: daba `medium/unique_name` → `util.formatName`), `a_package_needs_a_manifest_or_a_node_builtin`
+    (M2: `fromAuth.selectUser()` daba externo `high`), `only_angulars_inject_injects` (m5),
+    `a_block_local_function_does_not_shadow_outside_its_block` (NIT: la segunda llamada iba a
+    `outer.cb`) y `the_interceptor_reaches_the_imported_auth_service` (el `inject` de Angular caía a
+    `unique_name` contra el helper local: M1). En `devctx-index`, verificados mutando cada regla
+    (el fix ya estaba escrito): el escenario `rxjs#map` de `an_incremental_link_pass_equals_a_full_one`
+    falla si el modo (b) no parte por `#` (M3); el de `a.f().g()` falla sin los nombres de los
+    importadores (m1); `an_unreadable_tsconfig_keeps_the_last_good_one` y
+    `tsconfig::tests::an_unreadable_file_keeps_the_last_good_environment` fallan si se ignora el
+    entorno guardado (M4: relinkeaba 3 aristas y perdía el alias).
+  - *Re-medición* (mismo snapshot más el `package.json` raíz de frontend, que el snapshot original
+    no tenía; antes = 331ca05, ed417c9 = TASK-006 sin la revisión, ahora = con la revisión):
+
+    | | antes | ed417c9 | ahora | ahora, sin el `package.json` raíz |
+    |---|---|---|---|---|
+    | sin decidir | 73,1 % | 10,8 % | **10,8 %** | 34,1 % |
+    | con `dst_id` | 18,3 % | 23,6 % | 23,6 % | 24,2 % |
+    | externas | 8,6 % | 65,6 % | **65,6 %** | 41,6 % |
+    | · `external_known` `high` | 157 | 1 085 | 1 085 | 629 |
+    | · `chain_external` `medium` | 8 | 185 | 185 | 164 |
+    | gold TS correcto / en `high` | 6/20 · 3/3 | 20/20 · 20/20 | **20/20 · 20/20** | — |
+    | link pass completo | 25 ms | 27 ms | 35 ms | — |
+
+    Con el `package.json` raíz las cifras no cambian: en este subconjunto todo lo que se marcaba
+    externo tenía evidencia. Sin él (solo el `package.json` de una librería) un tercio de las
+    llamadas vuelve a "sin decidir" en vez de quedar externo sin evidencia: es lo que M2 pide.
+    Desglose de las 1 085 `external_known` por receptor: 558 sin receptor (`free`: `inject`,
+    `signal`, `firstValueFrom`, `expect`, `it`, `atob`…), 353 por nombre (`console`,
+    `localStorage`, `TestBed`, `Validators`, `Date`…), 159 tipadas (`Router`, `FormGroup`,
+    `HttpClient`, `BehaviorSubject`…), 15 por retorno declarado. *Auditoría contra el código:* 20
+    `chain_external` al azar (cadenas de `expect(…).toBe`, `jest.fn().mockReturnValue`,
+    `http.post(…).pipe`, `pipe(…).subscribe`, `firstValueFrom(…).then`): 20/20 correctas; 30
+    `external_known` al azar (10 por nombre, 10 `free`, 10 tipadas): 30/30. De imports namespace o
+    default externos el subconjunto tiene **uno solo** (`Swal.close()` de `sweetalert2`, que está en
+    `dependencies`): correcto; no hay 20 que auditar en estas librerías (riesgo abierto: frontend
+    entero).
+

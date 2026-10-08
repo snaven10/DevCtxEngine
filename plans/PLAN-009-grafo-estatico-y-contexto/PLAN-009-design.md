@@ -429,8 +429,12 @@ los símbolos y las aristas salvo `contains`), elige qué re-resolver y escribe:
   importan un archivo escrito (por cualquier ruta que su especificador pueda nombrar, así que un
   archivo agregado o borrado cuenta), también a través de barrels que lo re-exportan: lo que un
   import liga puede cambiar sin que cambie ningún nombre del archivo escrito (un `export … from`
-  que se mueve). Pase completo si lo escrito supera 1/5 de la rama, o si el `tsconfig` (alias) no
-  es aquel con que se enlazó la rama (`index_meta.link_tsconfig`). Un test fija que el incremental
+  que se mueve); con ellos, los nombres de los símbolos de los importadores también reabren por (b)
+  (una cadena `a.f().g()` en un tercer archivo), y una fila `imports` de TS/JS se compara por el
+  nombre tras `#`. Pase completo si lo escrito (más los importadores) supera 1/5 de la rama, o si
+  el entorno TS/JS (`tsconfig`, `package.json`) no es aquel con que se enlazó la rama
+  (`index_meta.link_tsconfig`); uno ilegible no cuenta: se usa el último bueno
+  (`index_meta.link_script_env`). Un test fija que el incremental
   deja la rama **igual fila a fila** que un pase completo tras cambiar un `extends`, un tipo de
   retorno, agregar `@Data` y mover un paquete.
 - *Siempre al día:* `index_meta.link_pending` se marca antes de la fase de archivos y se borra al
@@ -550,13 +554,21 @@ revisión):
   (`LangResolver::implicit_this`): un nombre pelado nunca es un miembro, y una llamada pelada a un
   parámetro o local (`next(req)`) es sin tipo. `this` es la clase solo en un método o campo de una
   clase **declarada**; en un método de objeto literal, una *class expression* o una `function`, sin
-  tipo. Una unión con `null`/`undefined` es el otro miembro. Cada fila `imports` lleva en `hint`
+  tipo. Solo el `inject` importado de `@angular/core` inyecta. Las funciones son bindings con scope
+  (`function f` elevada; `const f = () =>` desde su declaración, en todo el módulo si es de nivel
+  superior): una llamada pelada ligada a una función de un scope envolvente es `bare`; una que
+  ningún scope liga, o ligada a la función del módulo, es `free` (hint nuevo: el link no mira las
+  funciones anidadas de los envolventes, así una de un bloque hermano no la toma). Una unión con
+  `null`/`undefined` es el otro miembro. Cada fila `imports` lleva en `hint`
   `export` (re-export de barrel) y `as <local>`.
 - *Link:* el especificador se resuelve relativo (`.ts`, `.tsx`, `.js`→`.ts`, `/index.*`), por el
   patrón `paths` más largo (exacto primero) o bajo `baseUrl` del `tsconfig.base.json` (o
-  `tsconfig.json`) de la raíz, un nivel de `extends` relativo; lo que no es del repo es paquete →
-  externo, salvo que el nombre importado lo defina en su nivel superior algún archivo TS/JS del
-  repo (DD-9: sin evidencia, no externo); un alias o relativo sin archivo queda sin decidir. Los
+  `tsconfig.json`) de la raíz, un nivel de `extends` relativo (string o array); un especificador
+  que no es del repo es paquete → externo **solo con evidencia** (revisión de TASK-006): una
+  dependencia del `package.json` raíz o del más cercano, o un builtin de Node; y aun así no si el
+  nombre importado lo define y exporta en su nivel superior algún archivo TS/JS del repo (DD-9).
+  Un alias o relativo sin archivo, o un módulo que ningún manifiesto declara, queda sin decidir, y
+  una llamada a un nombre así importado nunca cae a `unique_name`. Los
   barrels se siguen hasta 4 niveles (`export { X as Y } from`, `export * from`; dos `export *` que
   dan el mismo nombre no lo exportan): `high` si todas las ramas se siguieron, `medium` si no. Un
   import `default` se toma por el nombre local (`medium`, el símbolo no guarda si es el default).
