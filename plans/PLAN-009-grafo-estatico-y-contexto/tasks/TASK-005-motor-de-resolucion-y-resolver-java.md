@@ -30,7 +30,7 @@ generales + Java), DD-8 y DD-9.
   `service.findPaginated(…)` en l.310 → hoy `AlphaService.findPaginated`.
 - Inventario: 481 `var.*`, 1 272 `LOG.*`, 13 793 targets pelados que colisionan con métodos internos
   (`map` 1 247, `item` 1 446, `build` 771), `persist` sin calificar desde
-  `RenderResultHandler.java:107` (receptor con genérico o encadenado).
+  un handler asíncrono de backend-a (receptor con genérico o encadenado).
 - Momento del link pass: después de procesar archivos y antes del sello del extractor
   (`crates/devctx-index/src/pipeline.rs:542-562`); la poda de stale (l.478+) ya corrió.
 - `path_kind` para `from_test`: `crates/devctx-core/src/kind.rs:98`.
@@ -141,7 +141,7 @@ generales + Java), DD-8 y DD-9.
 
   Los dos Java que fallan son parámetros de lambda sin tipo (`s -> s.query(…)` sobre una sesión, se
   descarta; `h -> h.onDone(…)` sobre un `Stream` de handlers, `name_only`): no hay inferencia del
-  tipo de un lambda. Las tres llamadas de `DraftResource` (:245/:304/:363) resuelven a su servicio,
+  tipo de un lambda. Las tres llamadas de `DraftResource` resuelven a su servicio,
   `high` (`ctor_inject`: el campo de cada adaptador se asigna en su constructor), y `new
   AlphaServiceAdapter` a la clase interna (`same_file`). Rust (`Instant::now`, `Store::open`) queda
   con las reglas genéricas hasta TASK-007.
@@ -286,6 +286,32 @@ generales + Java), DD-8 y DD-9.
     de `Object` (`medium`). Los 5 fallos Java: tres parámetros de lambda o una `var` desde un
     estático que devuelve `Optional` (descartados: "sin arista"), y dos `name_only` (un getter de
     Lombok tras `list.get(0)`, honestamente sin decidir; un handler de un `Stream`).
+- **Follow-ups de la segunda pasada (APROBADA CON FOLLOW-UPS):**
+  - *1 `@lombok.X`:* `accessor()` normaliza `@lombok.Data` a `@Data`. Los escenarios de
+    `an_incremental_link_pass_equals_a_full_one` ahora corren cada uno en su rama y exigen que la
+    arista vigilada de un archivo **no escrito** cambie: `extends`, tipo de retorno, **quitar**
+    `@lombok.Data` (medium → sin decidir, una fila que el modo (c) no elige) y cambiar el tipo del
+    campo de un receptor `member`. Contra el código previo (31cf6e0): el de `@Data` falla (el bug
+    de `accessor()`); el de `member` pasa allí porque la selección de 31cf6e0 ya lo cubre por el
+    token del campo; contra la selección de d9ffc04 (sin tokens ni herencia) fallan los cuatro.
+  - *2:* las palabras del hint (`typed`, `field`, `name`, `member`, `chain`…) no son tokens:
+    `hint_keywords_do_not_reopen_edges`.
+  - *3:* en una anónima con supertipo externo, un nombre que solo define la envolvente vuelve a la
+    envolvente en `medium` (sin decidir si es de `Object` o de la plataforma).
+  - *4:* vista `live_edges` (sin `discarded`) y `Store::{branch_undecided_calls,
+    branch_discarded_calls}` para TASK-008; el modo (c) ya no re-resuelve los descartes: esperan a
+    su nombre de verdad (`discarded_rows_wait_for_their_name`; el incremental de backend-a pasó de
+    21 305 a 9 353 aristas re-resueltas); `IndexResult.edges_discarded` documentado como total de la
+    rama.
+  - *NIT:* `->` no cierra grupo en `tidy_generics`; `link_version` se graba antes de borrar
+    `link_pending`; `member` se etiqueta por su base (`param`, `local`, `field`…);
+    `Config.INSTANCE.m()` se tipa (tipo + campos estáticos); gold anonimizado en
+    `scripts/graph-eval/gold-java-anon.txt`. No hecho (opcional): tipar `List.get`/`Optional.get`
+    con el elemento del scope. **`EXTRACTOR_VERSION` = 8, `LINK_VERSION` = 2.**
+  - *Re-medición:* sin cambios de precisión (Java 20/25, `high` 19/19; Rust 5/6); sin decidir 8,1 %
+    / 4,2 %; link pass completo de backend-a 1,9 s, incremental de un archivo 0,44 s.
+  - *Privacidad:* el ejemplo del receptor encadenado de PLAN-003 pasó a nombres genéricos en
+    inglés (commit aparte), y el ejemplo de dominio del bloque de re-medición también.
 - **Menores de la revisión de TASK-004 (commits previos a esta task):** 3ad7d54 (m-a `where`/genéricos
   estables ante `rustfmt`, m-c fuente de `graph_edges` por el `qualified` del símbolo, `const x =
   function named()`, `export default foo;` → `EXTRACTOR_VERSION` 4) y c239de2 (comentarios fuera del

@@ -104,6 +104,11 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   definition reopens them. Measured on two Java repositories: 8.1 % and 4.2 %
   of calls undecided, 20 of 25 hand-labelled sites correct, all 19 `high`
   ones right.
+- **Extractor version 8, link rules version 2:** `@lombok.Data` is recognised
+  like `@Data`; discarded calls wait for their name instead of being
+  re-resolved on every run, and readers get them filtered out through the
+  `live_edges` view; a call in an anonymous class that only the enclosing
+  class defines resolves to it (`medium`); `Config.INSTANCE.m()` is typed.
 
 ### Fixed
 

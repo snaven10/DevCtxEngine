@@ -422,19 +422,21 @@ los símbolos y las aristas salvo `contains`), elige qué re-resolver y escribe:
   no cuenta); (b) las de otros archivos cuyo `dst_id` ya no existe, cuyo último segmento de
   `dst_name` **o algún token de `hint`** (el tipo del receptor, el callee anterior de una cadena) es
   un nombre que define un archivo escrito —métodos, campos **y tipos**—, o cuya fuente está dentro
-  de un tipo que hereda (transitivamente) de un tipo escrito; (c) las sin decidir, incluidas las
-  descartadas. Pase completo si lo escrito supera 1/5 de la rama. Un test fija que el incremental
+  de un tipo que hereda (transitivamente) de un tipo escrito (las palabras del hint —`typed`,
+  `field`, `name`…— no cuentan como tokens); (c) las sin decidir, **sin** las descartadas, que
+  esperan a su nombre por (b). Pase completo si lo escrito supera 1/5 de la rama. Un test fija que el incremental
   deja la rama **igual fila a fila** que un pase completo tras cambiar un `extends`, un tipo de
   retorno, agregar `@Data` y mover un paquete.
 - *Siempre al día:* `index_meta.link_pending` se marca antes de la fase de archivos y se borra al
-  completar un pase: una corrida cortada (parada, crash) deja la marca y la siguiente enlaza toda la
-  rama aunque no escriba nada. `index_meta.link_version` guarda `LINK_VERSION` (la versión de las
+  completar un pase (después de grabar `link_version`): una corrida cortada (parada, crash) deja la
+  marca y la siguiente enlaza toda la rama aunque no escriba nada. `index_meta.link_version` guarda `LINK_VERSION` (la versión de las
   reglas, en Rust): si difiere, pase completo (~3 s en backend-a). El extractor tiene la suya
   (`EXTRACTOR_VERSION`).
 - *Descartes:* una llamada sin tipo a un nombre que el repo no define no se borra: queda con
-  `resolution = 'discarded'` (`low`, sin `dst_id`, `external = false`), fuera de los conteos del
-  arnés y de los lectores, y el modo (b) la reabre por nombre cuando aparece la definición (el
-  resultado no depende del orden en que se indexan los archivos).
+  `resolution = 'discarded'` (`low`, sin `dst_id`, `external = false`), fuera de la vista
+  `live_edges` (la que van a leer las tools de TASK-008, y `Store::branch_undecided_calls`) y de los conteos del
+  arnés, y el modo (b) la reabre por nombre cuando aparece la definición (el resultado no depende
+  del orden en que se indexan los archivos).
 - *Escritura:* solo los archivos con filas cambiadas, **64 archivos por transacción** y un `DELETE …
   kind <> 'contains' AND file IN (…)` por lote; cada archivo entra entero en una transacción, pero
   un lector concurrente puede ver la rama mitad con respuestas viejas y mitad con nuevas mientras
