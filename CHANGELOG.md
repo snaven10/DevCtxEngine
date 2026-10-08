@@ -111,6 +111,23 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   class defines resolves to it (`medium`); `Config.INSTANCE.m()` is typed.
   Link rules version 3: a hint's names are read by position, so a callee
   called `name()` still reopens the edges after it.
+- **TypeScript/JavaScript resolution** (PLAN-009 TASK-006, **extractor
+  version 9**, link rules version 4): calls, type uses and imports resolve
+  through what the file imports — relative paths (`.js` written for `.ts`,
+  directory `index` files), the `paths` aliases and `baseUrl` of the root
+  `tsconfig.base.json`/`tsconfig.json` (comments, trailing commas, one
+  relative `extends`), barrels re-exporting up to four levels deep — and npm
+  packages are external only when the repository does not define the imported
+  name. Angular DI types receivers: constructor parameter properties and
+  `inject(T)` (in a field or a local) are `ctor_inject`. TS/JS get lexical
+  scopes: parameters, destructured names and `catch` variables shadow fields,
+  a bare name is never a member, `this` outside a declared class (an object
+  literal's method, a class expression) is untyped, and the declared return
+  type of a function types the next call of a chain. A changed `tsconfig`
+  relinks the branch; the incremental pass re-resolves the files importing a
+  written one, through barrels. Measured on three libraries of an Angular/Nx
+  workspace: 10.8 % of calls undecided (was 73.1 %), 20 of 20 hand-labelled
+  call sites correct, all `high`.
 
 ### Fixed
 

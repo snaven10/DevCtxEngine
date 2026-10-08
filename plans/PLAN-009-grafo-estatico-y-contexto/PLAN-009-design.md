@@ -425,7 +425,12 @@ los símbolos y las aristas salvo `contains`), elige qué re-resolver y escribe:
   de un tipo que hereda (transitivamente) de un tipo escrito (los nombres del hint se leen por
   posición —tipo del receptor, nombre, ruta de un `member`, callees de una cadena—, nunca sus
   palabras `typed`, `field`, `name`…); (c) las sin decidir, **sin** las descartadas, que
-  esperan a su nombre por (b). Pase completo si lo escrito supera 1/5 de la rama. Un test fija que el incremental
+  esperan a su nombre por (b); (d) desde TASK-006, todas las aristas de los archivos TS/JS que
+  importan un archivo escrito (por cualquier ruta que su especificador pueda nombrar, así que un
+  archivo agregado o borrado cuenta), también a través de barrels que lo re-exportan: lo que un
+  import liga puede cambiar sin que cambie ningún nombre del archivo escrito (un `export … from`
+  que se mueve). Pase completo si lo escrito supera 1/5 de la rama, o si el `tsconfig` (alias) no
+  es aquel con que se enlazó la rama (`index_meta.link_tsconfig`). Un test fija que el incremental
   deja la rama **igual fila a fila** que un pase completo tras cambiar un `extends`, un tipo de
   retorno, agregar `@Data` y mover un paquete.
 - *Siempre al día:* `index_meta.link_pending` se marca antes de la fase de archivos y se borra al
@@ -533,6 +538,34 @@ revisión):
   tipo con FQN duplicado (dos módulos) o hallado solo por nombre (`unique_name`, fuera de Java)
   nunca da `high` a lo que tipa; la aridad se lee solo de firmas Java. Medido: ver el Resultado de
   TASK-005.
+
+**Implementado en TASK-006** (TypeScript/TSX/JavaScript, un resolver compartido,
+`resolve/typescript.rs`):
+- *Local:* `scopes` (cuerpo de clase, método, función, flecha, bloque, `for`, `catch`) y `types`
+  con roles: campo con tipo o inicializado (`inject(T)`, `new T()`, `x as T` → su tipo),
+  propiedad-parámetro del constructor (`@bind.inject`: campo de la clase, `ctor_inject`),
+  parámetros (también desestructurados, de flecha, opcionales), locales y variables de `catch`, sin
+  tipo si no lo escriben; una variable cuyo valor es una función o una clase no es binding (es
+  símbolo). `inject(T)` da `ctor_inject` también en un local. Sin `this` implícito
+  (`LangResolver::implicit_this`): un nombre pelado nunca es un miembro, y una llamada pelada a un
+  parámetro o local (`next(req)`) es sin tipo. `this` es la clase solo en un método o campo de una
+  clase **declarada**; en un método de objeto literal, una *class expression* o una `function`, sin
+  tipo. Una unión con `null`/`undefined` es el otro miembro. Cada fila `imports` lleva en `hint`
+  `export` (re-export de barrel) y `as <local>`.
+- *Link:* el especificador se resuelve relativo (`.ts`, `.tsx`, `.js`→`.ts`, `/index.*`), por el
+  patrón `paths` más largo (exacto primero) o bajo `baseUrl` del `tsconfig.base.json` (o
+  `tsconfig.json`) de la raíz, un nivel de `extends` relativo; lo que no es del repo es paquete →
+  externo, salvo que el nombre importado lo defina en su nivel superior algún archivo TS/JS del
+  repo (DD-9: sin evidencia, no externo); un alias o relativo sin archivo queda sin decidir. Los
+  barrels se siguen hasta 4 niveles (`export { X as Y } from`, `export * from`; dos `export *` que
+  dan el mismo nombre no lo exportan): `high` si todas las ramas se siguieron, `medium` si no. Un
+  import `default` se toma por el nombre local (`medium`, el símbolo no guarda si es el default).
+  Receptor pelado: tipo o objeto del archivo, import (clase → miembro; objeto → `obj.m`; `* as ns`
+  → export del módulo), global de plataforma (`builtins`: DOM, Node, Jest), y si no, por nombre.
+  Llamada pelada: función de un scope envolvente (nunca miembro de la clase), import, global, por
+  nombre. Cadena: el retorno declarado de la firma (`(): Observable<T>` → `Observable`). Un
+  `implements` de una interfaz externa no vuelve externo a un miembro ausente. Sin tipar campo por
+  campo los receptores `member`. Medido: ver el Resultado de TASK-006.
 
 ## DD-8 — `confidence` y `resolution`
 

@@ -1,0 +1,37 @@
+# Gold edges de TypeScript de PLAN-009 TASK-006, ANONIMIZADOS para auditoría (no se pueden correr).
+#
+# Los sitios reales viven fuera del repo (DEVCTX_EVAL_GOLD, Q-5) porque nombran código de un
+# cliente. Esta copia los lista con alias opacos —archivo (FileA, FileB…), clase (ClassA, ClassB…),
+# método (m1, m2…) y función de módulo (f1, f2…), sin rutas ni números de línea—, el caso que
+# muestrea cada uno y el resultado medido sobre la tabla `edges` (`score.py gold --new-edges`,
+# línea exacta) en un snapshot de tres sublibrerías de `frontend` (93 archivos .ts, sin indexar el
+# repo entero): antes = 331ca05 (TASK-005 cerrada), ahora = TASK-006 (EXTRACTOR_VERSION 9,
+# LINK_VERSION 4). Los nombres de librerías públicas (Angular, RxJS) se dejan tal cual. ClassA y
+# ClassB tienen el MISMO nombre en el código (dos librerías del monorepo): decide el import. Los 10
+# primeros son los de TASK-001 re-anclados al commit medido; los 10 últimos se etiquetaron en
+# TASK-006, leyendo el código antes de medir. No hay inyección por constructor (`constructor(private
+# x: T)`) en `frontend`: todo es `inject(T)`; ese caso lo cubren los fixtures.
+#
+# Formato: repo | sitio (alias) | destino esperado (alias) | external? | caso | antes | ahora
+#   resultado: correct / undecided (sin destino ni marca) / missing (sin arista: descartada) +
+#   confidence/resolution de la arista elegida.
+frontend|FileA|ClassA.m1|-|local `inject(T)` en una función flecha exportada; import relativo; homónimo en otra librería|undecided low/name_only|correct high/ctor_inject
+frontend|FileA|ClassA.m2|-|ídem, otro método|undecided low/name_only|correct high/ctor_inject
+frontend|FileA|inject|external|función de Angular importada|undecided low/name_only|correct high/external_known
+frontend|FileB|ClassC.m3|-|campo inicializado con `inject(T)`|undecided low/name_only|correct high/ctor_inject
+frontend|FileB|f1|-|función importada por ruta relativa|correct medium/unique_name|correct high/import
+frontend|FileC|ClassB.m4|-|`this.m()` dentro del homónimo|correct high/self|correct high/self
+frontend|FileD|ClassB.m5|-|campo `inject(T)`, T por alias de `tsconfig` + barrel `export *` (el homónimo de la otra librería)|undecided low/name_only|correct high/ctor_inject
+frontend|FileD|f2|-|función exportada importada por ruta relativa|correct medium/unique_name|correct high/import
+frontend|FileE|ClassA.m1|-|local `inject(T)` en un guard funcional|undecided low/name_only|correct high/ctor_inject
+frontend|FileF|ClassD.m6|-|local `inject(T)` en otro guard funcional|undecided low/name_only|correct high/ctor_inject
+frontend|FileA|ClassA.m1|-|parámetro tipado de una función del módulo|undecided low/name_only|correct high/param
+frontend|FileA|f3|-|función del mismo archivo|correct high/same_file|correct high/same_file
+frontend|FileA|pipe|external|cadena tras un método del repo que declara `Observable<…>`|missing|correct high/external_known
+frontend|FileA|switchMap|external|operador de RxJS importado|undecided low/name_only|correct high/external_known
+frontend|FileB|HttpClient.post|external|campo `inject(HttpClient)`|undecided low/name_only|correct high/external_known
+frontend|FileB|ClassA.m7|-|`this.m()`|correct high/self|correct high/self
+frontend|FileG|ClassA.m8|-|campo `inject(T)`, T por alias + dos barrels (`export *`, luego `export { T } from`)|undecided low/name_only|correct high/ctor_inject
+frontend|FileG|ClassD.m9|-|ídem, otra clase|undecided low/name_only|correct high/ctor_inject
+frontend|FileG|Router.navigate|external|campo `inject(Router)`|undecided low/name_only|correct high/external_known
+frontend|FileG|f4|-|función por alias + tres barrels `export *`|correct medium/unique_name|correct high/import

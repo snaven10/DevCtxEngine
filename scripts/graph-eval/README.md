@@ -14,6 +14,7 @@ código, la relevancia de `search` y `build_context`, y el costo de indexar. Se 
 | `gold-devctx.txt` | 6 gold edges de Rust (este repo). |
 | `impact-devctx.txt` | Lista fija de símbolos para la latencia de `impact`. |
 | `gold-java-anon.txt` | Los gold edges de Java de TASK-005 **anonimizados** (alias opacos `ClassA.m1`, sin rutas ni números de línea), con el caso que muestrea cada uno y el resultado medido: para auditar, no para correr. |
+| `gold-ts-anon.txt` | Los gold edges de TypeScript de TASK-006, anonimizados igual (`FileA`, `ClassA.m1`, `f1`), con el caso y el resultado antes/después. |
 
 ## Uso rápido
 

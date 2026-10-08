@@ -4,7 +4,7 @@
 - **Especialista:** general-purpose (Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-009-grafo`
 - **Depende de:** TASK-005
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -42,30 +42,30 @@ Implementa DD-7 (TS/JS).
 
 ## Pasos
 
-- [ ] **Paso 1 — tests que fallan.** Fixture: `auth.service.ts` ×2 en carpetas distintas;
+- [x] **Paso 1 — tests que fallan.** Fixture: `auth.service.ts` ×2 en carpetas distintas;
       `interceptor.ts` con `export const tokenInterceptor = (…) => { const s = inject(AuthService);
       s.token(); }` importando uno de los dos por ruta relativa; un componente con
       `constructor(private readonly auth: AuthService)` que llama `this.auth.login()`; un import
       por alias `@acme/auth` mapeado en `tsconfig.base.json`; un barrel `index.ts` que reexporta;
       `rxjs`/`@angular/core` como externos.
-- [ ] **Paso 2 — imports.** Relativos (`.ts`, `.tsx`, `.js`, `/index.*`), alias por `paths`
+- [x] **Paso 2 — imports.** Relativos (`.ts`, `.tsx`, `.js`, `/index.*`), alias por `paths`
       (best-effort; si no hay `tsconfig`, solo relativos), reexports de barrels a un nivel; npm →
       externo.
-- [ ] **Paso 3 — DI.** Propiedades-parámetro del constructor y `inject(T)` → campo tipado
+- [x] **Paso 3 — DI.** Propiedades-parámetro del constructor y `inject(T)` → campo tipado
       (`ctor_inject`).
-- [ ] **Paso 4 — arrow-const y funciones de módulo** como fuente (TASK-004) y como destino
+- [x] **Paso 4 — arrow-const y funciones de módulo** como fuente (TASK-004) y como destino
       importado (`import { tokenInterceptor } from …`).
-- [ ] **Paso 5 — JS** con lo que aplique sin tipos (imports, `this`, arrow-const); receptores
+- [x] **Paso 5 — JS** con lo que aplique sin tipos (imports, `this`, arrow-const); receptores
       sin tipo → reglas 7-8 (`medium`/`low`).
-- [ ] **Paso 6 — medir** sobre frontend (con OK del usuario, es el repo más caro) o sobre una
+- [x] **Paso 6 — medir** sobre frontend (con OK del usuario, es el repo más caro) o sobre una
       sublibrería copiada al scratchpad: gold edges TS, % sin decidir, externos.
 
 ## Criterios de aceptación
 
-- [ ] Tests del paso 1 verdes; la llamada desde el interceptor resuelve al `AuthService` importado,
+- [x] Tests del paso 1 verdes; la llamada desde el interceptor resuelve al `AuthService` importado,
       no al otro (`high`, `import`/`ctor_inject`).
-- [ ] Gold edges TS: precisión ≥ 90 % en `high`, ≥ 75 % global.
-- [ ] `read_symbol("tokenInterceptor")` tiene definición (lo verifica TASK-008 sobre la tabla;
+- [x] Gold edges TS: precisión ≥ 90 % en `high`, ≥ 75 % global.
+- [x] `read_symbol("tokenInterceptor")` tiene definición (lo verifica TASK-008 sobre la tabla;
       acá, que el símbolo está en `symbols` con su firma).
 
 ## Riesgos
@@ -76,10 +76,111 @@ Implementa DD-7 (TS/JS).
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR (estado done/skipped). Contrato: PLAN-009 §11 -->
-- **Estado final:**
-- **Resumen:**
-- **Archivos tocados:**
-- **Verificado por:**
-- **Desviaciones:**
-- **Riesgos abiertos / siguiente:**
+- **Estado final:** `done`.
+- **Resumen:** las llamadas, usos de tipo e imports de TypeScript/TSX/JavaScript se resuelven por lo
+  que el archivo importa: rutas relativas (`.ts`/`.tsx`/`.js`→`.ts`/`index.*`), alias `paths` y
+  `baseUrl` del `tsconfig.base.json` de la raíz, barrels (`export { X } from`, `export * from`,
+  anidados hasta 4 niveles) y paquetes npm como externos (con evidencia, DD-9). La DI de Angular
+  tipa: propiedades-parámetro del constructor y `inject(T)` (en un campo o en un local de una
+  función flecha exportada) → `ctor_inject`. TS/TSX/JS tienen **scopes** (clase, método, función,
+  flecha, bloque, `for`, `catch`): parámetros (también desestructurados y de flecha), variables de
+  `catch` y locales son bindings que sombrean campos; un nombre pelado nunca es un miembro (no hay
+  `this` implícito); `this` fuera de una clase declarada (método de objeto literal, *class
+  expression*, `function`) no se tipa. El tipo de retorno declarado (`(): Observable<T>`) tipa la
+  siguiente llamada de una cadena. **`EXTRACTOR_VERSION` = 9, `LINK_VERSION` = 4.**
+- **Números (sandbox `mktemp -d -p /var/tmp`, 249 MB con los dos binarios y un clon de este repo):**
+  `graph_bench` (vectores constantes) sobre un snapshot de solo lectura de **tres sublibrerías de
+  frontend** (lib-auth, la librería de datos de auth y una app: 93 `.ts`, 162 archivos, más
+  el `tsconfig.base.json`), sin `.devctx` copiado (verificado con `find`), repo git propio; antes =
+  331ca05, después = esta task; mismos snapshots. **No se indexó frontend entero** (requiere OK del
+  usuario).
+
+  | frontend (subconjunto) | antes | después |
+  |---|---|---|
+  | `calls` guardadas (sin descartadas) | 1 919 | 1 936 |
+  | con `dst_id` | 18,3 % | 23,6 % |
+  | `external` | 8,6 % | 65,6 % |
+  | **sin decidir** | **73,1 %** | **10,8 %** |
+  | descartadas | 292 | 275 |
+  | link pass completo (3 corridas) | 25-34 ms | 30-38 ms |
+  | link pass incremental, 1 archivo (el servicio más importado) | 12 ms | 17 ms |
+  | `VmHWM` (`graph_bench`) | 99-106 MiB | 107 MiB |
+
+  Gold edges TS (20 sitios: los 10 de TASK-001 re-anclados al commit medido + 10 nuevos que cubren
+  `inject()` en campo y en local, función flecha exportada como fuente, alias de `tsconfig`, barrels
+  de 1-3 niveles, homónimos entre librerías y externos de Angular/RxJS; etiquetados leyendo el
+  código **antes** de medir; versión auditable con alias opacos en
+  `scripts/graph-eval/gold-ts-anon.txt`):
+
+  | | correcto | en `high` | cobertura (no `low`) |
+  |---|---|---|---|
+  | antes | 6/20 (30 %) | 3/3 | 30 % |
+  | **después** | **20/20 (100 %)** | **20/20 (100 %)** | 100 % |
+
+  Los dos homónimos (`AuthService` de cada librería) caen cada uno en su archivo (verificado por
+  `dst_id` → `symbols.file`, que `score.py` no mira). Además, una muestra aleatoria de 40 aristas
+  `high` del índice leída contra el código: 40/40 correctas (`self`, `import`, `ctor_inject`, y
+  externos de Angular, RxJS, Jest y del DOM). Sin regresión en los demás lenguajes: `graph_bench`
+  sobre un clon de este repo da los mismos `calls`, % sin decidir y `high` por extensión en Rust,
+  Python, Java y Go antes y después.
+- **Compuerta de ruido (master §5):** TS con basura 0 (los receptores siguen siendo nombres o
+  hints), externos con evidencia (import de paquete, global de plataforma, retorno declarado
+  externo), gold ≥ meta: **cumplida para TypeScript** (en el subconjunto medido).
+- **Hallazgos de §2:** confirmado que antes de esta task las llamadas TS no tenían más regla que el
+  nombre (73 % sin decidir); la estimación de memoria de DD-6 para frontend no se pudo verificar
+  (subconjunto).
+- **Archivos tocados:** `crates/devctx-parse/src/{facts.rs, parser.rs, registry.rs,
+  resolve/mod.rs, resolve/scope.rs, resolve/link.rs, resolve/typescript.rs (nuevo)}`,
+  `crates/devctx-parse/languages/{typescript,tsx,javascript}.json` (`types` con roles, `scopes`
+  nueva en TS/JS, `builtins` de navegador/Node/Jest), `crates/devctx-parse/tests/{link_typescript.rs
+  (nuevo), fixtures/ts/… (13 archivos, nuevos), extractor_golden.rs, golden/extractor.txt}`,
+  `crates/devctx-index/src/{tsconfig.rs (nuevo), link.rs, pipeline.rs, lib.rs}`,
+  `scripts/graph-eval/{gold-ts-anon.txt (nuevo), README.md}`, `CHANGELOG.md`, el design (DD-6,
+  DD-7) y el master (tabla). Públicos nuevos: `devctx_parse::resolve::typescript::{TsConfig
+  {base_url, paths}, TsConfig::{parse, extends_of, over, fingerprint, specifier}, TsImport
+  {spec, name, local, wildcard, reexport}, TsImport::from_row, Specifier, init_type, return_type,
+  probes, join, dir_of, SCRIPT_EXTENSIONS}`, `RepoIndex::{with_ts_config, importers_of}`,
+  `LangResolver::implicit_this`, `Scopes::implicit_this`, `Binding.member`,
+  `ImportFact.reexport`, `ImportFact::hint`. Capturas nuevas en `types`: `@bind.inject`. Clave de
+  `index_meta` nueva: `link_tsconfig`. Las filas `imports` llevan `edges.hint` (`export`, `as X`).
+- **Tests** (`TMPDIR=/var/tmp`): `link_typescript` (10: el interceptor al `AuthService` importado,
+  la función flecha como símbolo/fuente/destino, DI por constructor + alias + barrel + retorno
+  declarado, `inject()` en un campo con import renombrado, sombreado por parámetro de flecha/`catch`/
+  cast, imports por nombre/namespace/default/paquete y globales, `this` en objeto literal y *class
+  expression*, JS sin tipos, sin `tsconfig`, lectura del `tsconfig` con comentarios): **9 de 10
+  fallaban** contra el código previo con un `with_ts_config` vacío (el de lectura del `tsconfig`
+  pasaba: es la pieza nueva). `resolve::typescript::tests` (JSONC, retorno, filas de import,
+  especificadores, rutas), `resolve::scope::tests` (uniones con `null`), `tsconfig::tests`
+  (`extends`, archivo roto). `an_incremental_link_pass_equals_a_full_one` con **tres escenarios
+  TS** más, cada uno detectado por una sola regla, verificado mutándola: un barrel que cambia su
+  `export { Svc } from` (falla sin la regla de importadores), el alias de `tsconfig.base.json` que
+  cambia sin tocar fuentes (falla sin la del fingerprint del `tsconfig`) y el barrel interno de un
+  barrel (falla si la de importadores no atraviesa barrels). Gate: `cargo fmt --all -- --check`;
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` (y `--features gpu`); `cargo
+  test --workspace --locked`: verde.
+- **Contrato JSON:** sin cambios en las tools; `index` imprime una línea si el `tsconfig` no se
+  puede leer.
+- **Desviaciones:** (1) barrels hasta **4 niveles** de re-export, no uno: TS los sigue de forma
+  determinista y el patrón Nx real es `index.ts` → `lib/index.ts` → `services/index.ts`; `high` solo
+  si cada rama se pudo seguir, `medium` si un `export *` de un paquete o un módulo no encontrado
+  podría tenerlo, o al pasar el tope. (2) `inject(T)` da `ctor_inject` también en un local (guards e
+  interceptores funcionales), no solo en campos. (3) Los decoradores no se ignoran: `@Injectable()`
+  queda como llamada al import, externa. (4) Un import `default` no sabe qué símbolo es el default
+  (no se guarda): se toma el del nombre local, `medium`. (5) `this` fuera de una clase declarada se
+  trata como receptor sin tipo (low o descarte), en vez de resolver métodos de objetos literales;
+  una llamada pelada a un parámetro o local (`next(req)`) también. (6) Lección 2: el import desde un
+  paquete (o un alias sin `tsconfig`) de un nombre que algún archivo TS/JS del repo define en su
+  nivel superior no es externo; un alias de `paths` sin archivo es del repo (sin decidir), un
+  especificador que falla bajo `baseUrl` es un paquete. (7) `implements` de una interfaz externa no
+  vuelve externo un miembro ausente (las interfaces no implementan). (8) Incremental: modo (d)
+  nuevo, todas las aristas de los archivos TS/JS que importan un archivo escrito, también a través
+  de barrels; y el `tsconfig` cambiado relinkea la rama entera (fingerprint en `index_meta`).
+  (9) Los receptores `member` (`this.a.b.m()`) en TS siguen por nombre.
+- **Riesgos abiertos / siguiente:** (1) **no medido sobre frontend entero** (OK del usuario
+  pendiente): costo del link pass y del modo (d) con 2 133 archivos, `VmHWM`; (2) solo el
+  `tsconfig` de la raíz (un nivel de `extends` relativo): los `paths` de un `tsconfig.json` por app
+  no se leen; (3) las *signals* de Angular (`this.sig()`, llamar un campo) quedan sin decidir;
+  (4) CommonJS (`require`, `module.exports`), `export =`, imports dinámicos, componentes JSX y
+  declaraciones ambientales `.d.ts` no se resuelven; (5) el gold TS está sesgado a lib-auth (los
+  sitios elegidos en TASK-001) y no hay inyección por constructor real en frontend (cubierta por
+  fixtures); (6) sandbox de medición en `/var/tmp/devctx-t006-*`.
