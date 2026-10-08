@@ -690,8 +690,10 @@ impl RepoIndex {
         match found.as_slice() {
             [(i, sure)] => return PyExport::Found(*i, *sure && !ext && !unk),
             [_, ..] => return PyExport::Found(found.last().unwrap().0, false),
-            [] if ext => return PyExport::External,
+            // A star import that cannot be followed may have it: before an
+            // external one (review).
             [] if unk => return PyExport::Unknown,
+            [] if ext => return PyExport::External,
             [] => {}
         }
         // A package's submodule is an attribute once imported.

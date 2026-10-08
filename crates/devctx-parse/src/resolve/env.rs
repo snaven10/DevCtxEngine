@@ -103,6 +103,12 @@ impl ManifestKind {
             "pyproject.toml" => Self::PyProject,
             "setup.cfg" => Self::SetupCfg,
             n if n.starts_with("requirements") && n.ends_with(".txt") => Self::Requirements,
+            // `requirements/base.txt`, `requirements/dev.txt`.
+            n if n.ends_with(".txt")
+                && path.rsplit('/').nth(1).is_some_and(|d| d == "requirements") =>
+            {
+                Self::Requirements
+            }
             _ => return None,
         })
     }
@@ -383,6 +389,11 @@ fn py_sure_names(dist: &str) -> Vec<String> {
             out.push(m.to_string());
         }
     }
+    // A dotted distribution (`ruamel.yaml`, `zope.interface`) is imported
+    // by its first segment's package.
+    if let Some((top, _)) = dist.trim().split_once('.') {
+        out.push(top.to_lowercase().replace('-', "_"));
+    }
     out
 }
 
@@ -408,6 +419,11 @@ fn py_guessed_names(dist: &str) -> Vec<String> {
 /// `requests`); `None` for an option line, a path or a URL.
 fn requirement_name(line: &str) -> Option<&str> {
     let line = line.trim();
+    // `name @ https://…`: the name before the `@`.
+    let line = match line.split_once(" @ ") {
+        Some((name, _)) => name.trim(),
+        None => line,
+    };
     if line.is_empty() || line.starts_with('-') || line.starts_with('.') || line.contains("://") {
         return None;
     }
@@ -467,6 +483,9 @@ impl PyManifest {
                         (["tool", "poetry", "dependencies"], [d, ..])
                         | (["tool", "poetry", "dev-dependencies"], [d, ..])
                         | (["tool", "poetry", "group", _, "dependencies"], [d, ..])
+                        // `[tool.poetry.dependencies.foo]` `version = …`.
+                        | (["tool", "poetry", "dependencies", d], _)
+                        | (["tool", "poetry", "dev-dependencies", d], _)
                             if *d != "python" =>
                         {
                             dists.push(d.to_string());
@@ -483,7 +502,7 @@ impl PyManifest {
                     if conflict_marker(trimmed) {
                         return None;
                     }
-                    if trimmed.starts_with('#') || trimmed.starts_with(';') {
+                    if trimmed.starts_with('#') || trimmed.starts_with(';') || trimmed.is_empty() {
                         continue;
                     }
                     if trimmed.starts_with('[') && trimmed.ends_with(']') {
@@ -655,7 +674,7 @@ impl<'a> Lexer<'a> {
                 }
                 return (!acc.is_empty()).then_some(acc);
             };
-            let (clean, d, m) = strip_line(raw, multi);
+            let (clean, d, m) = strip_line(raw, multi, acc.is_empty());
             depth += d;
             multi = m;
             if !acc.is_empty() {
@@ -672,7 +691,11 @@ impl<'a> Lexer<'a> {
 /// A line without its comment, the change of bracket depth it makes
 /// outside strings, and whether a multi-line string is still open after it
 /// (its delimiter).
-fn strip_line(raw: &str, mut multi: Option<&'static str>) -> (String, i32, Option<&'static str>) {
+fn strip_line(
+    raw: &str,
+    mut multi: Option<&'static str>,
+    first: bool,
+) -> (String, i32, Option<&'static str>) {
     let mut out = String::with_capacity(raw.len());
     let mut depth = 0;
     let chars: Vec<char> = raw.chars().collect();
@@ -730,9 +753,10 @@ fn strip_line(raw: &str, mut multi: Option<&'static str>) -> (String, i32, Optio
         }
         i += 1;
     }
-    // A table header's brackets close on its own line.
+    // A table header's brackets close on its own line (only at the start of
+    // a logical line: `  [` inside an array opens a nested one).
     let t = out.trim_start();
-    if t.starts_with('[') && !t.contains('=') {
+    if first && t.starts_with('[') && !t.contains('=') {
         return (out, 0, multi);
     }
     (out, depth, multi)
@@ -1036,6 +1060,43 @@ default = ["a", "b"]
         assert_eq!(cfg.deps, ["click", "rich"]);
         assert!(PyManifest::parse("[project\n", "pyproject.toml").is_none());
         assert!(PyManifest::parse("<<<<<<< HEAD\nx\n", "requirements.txt").is_none());
+    }
+
+    /// TASK-007 review: nested arrays over several lines, `requirements/`
+    /// directories, `name @ url`, Poetry dependency tables, a blank line in
+    /// `install_requires`, dotted distributions.
+    #[test]
+    fn manifest_reader_coverage() {
+        let nested = CargoManifest::parse(
+            "[package]\nname = \"x\"\n[package.metadata]\nmatrix = [\n  [\n    \"a\",\n  ],\n  [\"c\"],\n]\n[dependencies]\nserde = \"1\"\n",
+            "Cargo.toml",
+        )
+        .expect("nested arrays are read");
+        assert_eq!(nested.deps, ["serde"]);
+        assert_eq!(
+            ManifestKind::of("requirements/base.txt"),
+            Some(ManifestKind::Requirements)
+        );
+        let req = PyManifest::parse(
+            "foo @ https://example.com/foo-1.0.whl\nruamel.yaml\nzope.interface\n",
+            "requirements/base.txt",
+        )
+        .unwrap();
+        for d in ["foo", "ruamel", "zope"] {
+            assert!(req.deps.contains(&d.to_string()), "{d}: {:?}", req.deps);
+        }
+        let poetry = PyManifest::parse(
+            "[tool.poetry.dependencies.bar]\nversion = \"1\"\n",
+            "pyproject.toml",
+        )
+        .unwrap();
+        assert_eq!(poetry.deps, ["bar"]);
+        let cfg = PyManifest::parse(
+            "[options]\ninstall_requires =\n    click\n\n    rich\n",
+            "setup.cfg",
+        )
+        .unwrap();
+        assert_eq!(cfg.deps, ["click", "rich"]);
     }
 
     #[test]

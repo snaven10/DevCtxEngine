@@ -584,3 +584,13 @@ fn bound_functions_and_classes_as_receivers() {
         (None, None, "low", "name_only", false)
     );
 }
+
+/// TASK-007 review: a barrel with `export *` of a package and of a module
+/// that cannot be followed: the name may be either's, so undecided — not
+/// external.
+#[test]
+fn an_unfollowable_branch_is_not_outweighed_by_a_package() {
+    let l = linked();
+    let (dst, _, conf, res, ext) = l.call("useMixed", "mystery");
+    assert_eq!((dst, conf, res, ext), (None, "low", "name_only", false));
+}

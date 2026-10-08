@@ -307,3 +307,11 @@ fn import_forms_and_fallbacks() {
     assert_eq!(l.call("make", "ghost2"), UNDECIDED);
     assert_eq!(l.import("shop/sub/deep.py", "...nothing.ghost2"), UNDECIDED);
 }
+
+/// Review minor: a module re-exporting through a star import of a package
+/// and one that cannot be followed: undecided, not external.
+#[test]
+fn an_unfollowable_star_import_is_not_outweighed_by_a_package() {
+    let l = linked();
+    assert_eq!(l.call("use_mixed", "thing2"), UNDECIDED);
+}

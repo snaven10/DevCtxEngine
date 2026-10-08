@@ -37,6 +37,10 @@ pub(crate) struct Loaded {
     /// What was read but not followed (an `extends` of a package, a base
     /// that does not parse): said once in the run's summary.
     pub notes: Vec<String>,
+    /// A base the chosen `tsconfig` extends does not parse (a merge
+    /// conflict): its aliases are lost, so the last good `tsconfig` is kept
+    /// (TASK-007 review, mi1).
+    pub tsconfig_stale: bool,
 }
 
 /// Load the environment through `read` (a repository path → its text, or
@@ -67,9 +71,11 @@ pub(crate) fn load(read: &dyn Fn(&str) -> Option<String>, files: &[String]) -> L
             };
             match read(&path).map(|t| TsConfig::parse(&t, dir_of(&path))) {
                 Some(Some(base)) => config = config.over(base),
-                Some(None) => out
-                    .notes
-                    .push(format!("{name}: its base {path} does not parse")),
+                Some(None) => {
+                    out.tsconfig_stale = true;
+                    out.notes
+                        .push(format!("{name}: its base {path} does not parse"))
+                }
                 None => out
                     .notes
                     .push(format!("{name}: its base {path} does not exist")),
@@ -113,7 +119,10 @@ pub(crate) fn choose(loaded: Loaded, stored_env: Option<&str>) -> (ScriptEnv, St
             .unreadable
             .iter()
             .any(|f| NAMES.contains(&f.as_str()));
-        if tsconfig_broken {
+        // The stored `tsconfig` only when none could be read fresh (a
+        // readable `tsconfig.json` beside a broken base wins: review mi1), or
+        // when the one read lost a base that does not parse.
+        if (tsconfig_broken && env.tsconfig.is_none()) || loaded.tsconfig_stale {
             env.tsconfig = stored.tsconfig.clone();
         }
         for f in loaded
@@ -353,5 +362,67 @@ mod tests {
             Some("b")
         );
         assert_eq!(l.notes.len(), 2, "{:?}", l.notes);
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn reader(files: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = files
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |p: &str| map.get(p).cloned()
+    }
+
+    /// TASK-007 review (mi1): a broken `tsconfig.base.json` beside a readable
+    /// `tsconfig.json` uses the fresh `tsconfig.json`, not the stored base.
+    #[test]
+    fn a_readable_tsconfig_json_beats_the_stored_base() {
+        let good = load(
+            &reader(&[(
+                "tsconfig.base.json",
+                r#"{ "compilerOptions": { "paths": { "@a/x": ["old"] } } }"#,
+            )]),
+            &[],
+        );
+        let (env, _) = choose(good, None);
+        let json = env.to_json();
+        let later = load(
+            &reader(&[
+                ("tsconfig.base.json", "<<<<<<< ours"),
+                (
+                    "tsconfig.json",
+                    r#"{ "compilerOptions": { "paths": { "@a/x": ["fresh"] } } }"#,
+                ),
+            ]),
+            &[],
+        );
+        let (now, _) = choose(later, Some(&json));
+        assert_eq!(now.tsconfig.unwrap().paths[0].1, ["fresh".to_string()]);
+    }
+
+    /// TASK-007 review (mi1): an `extends` base left in conflict keeps the
+    /// last good configuration (its aliases), not only a note.
+    #[test]
+    fn a_broken_extends_base_keeps_the_last_good_aliases() {
+        let files_good = [
+            ("tsconfig.base.json", r#"{ "extends": "./shared.json" }"#),
+            (
+                "shared.json",
+                r#"{ "compilerOptions": { "paths": { "@a/x": ["libs/x"] } } }"#,
+            ),
+        ];
+        let (env, _) = choose(load(&reader(&files_good), &[]), None);
+        let json = env.to_json();
+        let files_broken = [
+            ("tsconfig.base.json", r#"{ "extends": "./shared.json" }"#),
+            ("shared.json", "<<<<<<< ours\n{"),
+        ];
+        let (now, _) = choose(load(&reader(&files_broken), &[]), Some(&json));
+        assert_eq!(now.tsconfig.unwrap().paths[0].1, ["libs/x".to_string()]);
     }
 }

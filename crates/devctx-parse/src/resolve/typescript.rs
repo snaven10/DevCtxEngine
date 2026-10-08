@@ -578,7 +578,9 @@ enum Imported {
     Sym(usize, bool),
     /// `import * as ns` of a repository module.
     Module(String),
-    /// From a package, and no repository file defines the name (DD-9).
+    /// From a package a manifest declares, or a Node builtin (DD-9): external
+    /// whatever the repository defines under the same name (TASK-006
+    /// second review, mi2).
     External,
     /// Imported, but where to cannot be followed.
     Unknown,
@@ -777,8 +779,10 @@ impl RepoIndex {
         }
         match found.as_slice() {
             [(i, sure)] => Export::Found(*i, *sure && !ext && !unk),
-            [] if ext => Export::External,
+            // A branch that cannot be followed may have it: before a
+            // package's `export *` (TASK-007 review).
             [] if unk => Export::Unknown,
+            [] if ext => Export::External,
             [] => Export::Missing,
             _ => Export::Unknown,
         }
