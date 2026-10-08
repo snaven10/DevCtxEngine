@@ -2886,6 +2886,24 @@ public class Helper {
                 "p/H.java",
                 "package p;\npublic class H { public X item; }\n",
             ),
+            // Only the inheritance rule reaches `m()` in `B2`: its hint is
+            // `bare`, its destination still exists, and `B.java` defines no
+            // `m`.
+            (
+                "p/B2.java",
+                "package p;\npublic class B2 extends B {\n    void go() { m(); }\n}\n",
+            ),
+            // Only the callee token `name` (a word a hint also uses) reaches
+            // `doIt` after `name()`, a static import from `Util.java`.
+            (
+                "p/Util.java",
+                "package p;\npublic class Util { public static X name() { return null; } }\n",
+            ),
+            (
+                "q/V.java",
+                "package q;\nimport static p.Util.name;\nclass V {\n    void go() {\n        \
+                 name().doIt();\n    }\n}\n",
+            ),
             (
                 "q/U.java",
                 "package q;\nimport p.B;\nimport p.R;\nimport p.D;\nimport p.H;\n\
@@ -2900,19 +2918,21 @@ public class Helper {
             ("g3.py", "def g3():\n    pass\n"),
             ("g4.py", "def g4():\n    pass\n"),
         ]);
-        // Each step: the file written, its new text, and the edge of
-        // `U.java` (not written) whose answer must change — so no scenario
-        // passes by changing nothing.
-        let steps: [(&str, &str, &str, i32); 4] = [
+        // Each step: the file written, its new text, and the edge of a file
+        // not written whose answer must change — so no scenario passes by
+        // changing nothing.
+        let steps: [(&str, &str, &str, &str, i32); 6] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
+                "q/U.java",
                 "B.m",
                 8,
             ),
             (
                 "p/R.java",
                 "package p;\npublic class R { public Y find() { return null; } }\n",
+                "q/U.java",
                 "doIt",
                 9,
             ),
@@ -2921,6 +2941,7 @@ public class Helper {
             (
                 "p/D.java",
                 "package p;\npublic class D { private String name; }\n",
+                "q/U.java",
                 "D.getName",
                 10,
             ),
@@ -2928,25 +2949,42 @@ public class Helper {
             (
                 "p/H.java",
                 "package p;\npublic class H { public Y item; }\n",
+                "q/U.java",
                 "doIt",
                 11,
+            ),
+            // A supertype's `extends` changes: a subtype's bare call follows.
+            (
+                "p/B.java",
+                "package p;\npublic class B extends C {}\n",
+                "p/B2.java",
+                "m",
+                3,
+            ),
+            // The return type of a statically imported `name()` changes.
+            (
+                "p/Util.java",
+                "package p;\npublic class Util { public static Y name() { return null; } }\n",
+                "q/V.java",
+                "doIt",
+                5,
             ),
         ];
         // Each scenario on a branch of its own, so every one is judged (and
         // reported) whatever the others do.
         let mut failures: Vec<String> = Vec::new();
-        for (i, (file, text, dst, line)) in steps.into_iter().enumerate() {
+        for (i, (file, text, seen_in, dst, line)) in steps.into_iter().enumerate() {
             let (dir, repo) = graph_repo(&format!("linkeq{i}"), &files);
             let store = Store::open_in_memory(DIM).unwrap();
             index_with(&store, &dir, true, None);
             assert!(full_link_changes(&store, &repo).is_empty());
             let watched = |store: &Store| {
                 store
-                    .file_symbol_edges(&repo, "main", "q/U.java")
+                    .file_symbol_edges(&repo, "main", seen_in)
                     .unwrap()
                     .into_iter()
                     .find(|e| e.kind == "calls" && e.dst_name == dst && e.line == line)
-                    .unwrap_or_else(|| panic!("no {dst} at {line}"))
+                    .unwrap_or_else(|| panic!("no {dst} at {seen_in}:{line}"))
             };
             let before = watched(&store);
             write(&dir, file, text);
@@ -3147,6 +3185,45 @@ public class Helper {
         let inc = index_with(&store, &dir, false, None);
         assert_eq!(inc.files_indexed, 1, "{inc:?}");
         assert_eq!(inc.edges_linked, expected, "{inc:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A call dropped for its arity (an untyped receiver, and no method of
+    /// that name takes those arguments) is reopened when a written file adds
+    /// the overload that does.
+    #[test]
+    fn a_call_discarded_for_its_arity_reopens_with_the_overload() {
+        let caller = "package a;\nimport java.util.List;\npublic class Caller {\n    \
+                      void go(List<String> xs) {\n        xs.forEach(x -> x.vanish(1, 2));\n    }\n}\n";
+        let mut files = vec![
+            ("src/a/Caller.java", caller),
+            (
+                "src/b/Ghost.java",
+                "package b;\npublic class Ghost { public void vanish() {} }\n",
+            ),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkarity", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let vanish = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.dst_name == "vanish")
+                .unwrap()
+        };
+        assert_eq!(vanish(&store).resolution.as_deref(), Some("discarded"));
+        write(
+            &dir,
+            "src/b/Ghost.java",
+            "package b;\npublic class Ghost {\n    public void vanish() {}\n    \
+             public void vanish(int a, int b) {}\n}\n",
+        );
+        commit_all(&dir, "the overload");
+        index_with(&store, &dir, false, None);
+        assert_eq!(vanish(&store).resolution.as_deref(), Some("name_only"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

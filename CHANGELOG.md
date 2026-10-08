@@ -109,6 +109,8 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   re-resolved on every run, and readers get them filtered out through the
   `live_edges` view; a call in an anonymous class that only the enclosing
   class defines resolves to it (`medium`); `Config.INSTANCE.m()` is typed.
+  Link rules version 3: a hint's names are read by position, so a callee
+  called `name()` still reopens the edges after it.
 
 ### Fixed
 

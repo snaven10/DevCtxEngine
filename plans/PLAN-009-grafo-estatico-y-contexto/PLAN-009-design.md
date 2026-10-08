@@ -422,8 +422,9 @@ los símbolos y las aristas salvo `contains`), elige qué re-resolver y escribe:
   no cuenta); (b) las de otros archivos cuyo `dst_id` ya no existe, cuyo último segmento de
   `dst_name` **o algún token de `hint`** (el tipo del receptor, el callee anterior de una cadena) es
   un nombre que define un archivo escrito —métodos, campos **y tipos**—, o cuya fuente está dentro
-  de un tipo que hereda (transitivamente) de un tipo escrito (las palabras del hint —`typed`,
-  `field`, `name`…— no cuentan como tokens); (c) las sin decidir, **sin** las descartadas, que
+  de un tipo que hereda (transitivamente) de un tipo escrito (los nombres del hint se leen por
+  posición —tipo del receptor, nombre, ruta de un `member`, callees de una cadena—, nunca sus
+  palabras `typed`, `field`, `name`…); (c) las sin decidir, **sin** las descartadas, que
   esperan a su nombre por (b). Pase completo si lo escrito supera 1/5 de la rama. Un test fija que el incremental
   deja la rama **igual fila a fila** que un pase completo tras cambiar un `extends`, un tipo de
   retorno, agregar `@Data` y mover un paquete.

@@ -29,7 +29,7 @@ use crate::error::Result;
 /// module): what the branch's edges were resolved under. A build with other
 /// rules relinks the branch in full on its next run, as the extractor
 /// version does for the parse.
-pub(crate) const LINK_VERSION: &str = "2";
+pub(crate) const LINK_VERSION: &str = "3";
 
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
@@ -92,27 +92,45 @@ fn write_batch(
 /// excluded from the counts and the readers, reopened by name.
 pub const DISCARDED: &str = "discarded";
 
-/// The words of a hint (`typed field Foo`, `chain find name Office`): never
-/// names to match against what a written file defines (a field `name` would
-/// reopen every `name X` edge).
-const HINT_WORDS: &[&str] = &[
-    "bare",
-    "this",
-    "super",
-    "typed",
-    "field",
-    "param",
-    "local",
-    "ctor_inject",
-    "static",
-    "name",
-    "member",
-    "anon",
-    "untyped",
-    "expr",
-    "chain",
-    "path",
-];
+/// The names a hint mentions, by position — the receiver's type (`typed
+/// <via> <Type>`), a receiver name (`name <r>`), a member path, an
+/// anonymous class's supertype, each callee back along a chain — never its
+/// words (`typed`, `field`, `name`…), so a callee called `name()` or a type
+/// `Field` still counts and a field `name` reopens nothing by the word.
+fn hint_names(hint: &str) -> Vec<&str> {
+    let mut tokens: Vec<&str> = hint.split_whitespace().collect();
+    if tokens.last().is_some_and(|t| t.starts_with('/')) {
+        tokens.pop();
+    }
+    let mut out = Vec::new();
+    let mut rest: &[&str] = &tokens;
+    loop {
+        match rest {
+            ["typed", _via, ty, ..] => {
+                out.extend(ty.split('.'));
+                break;
+            }
+            ["name", r, ..] => {
+                out.extend(r.split('.'));
+                break;
+            }
+            ["member", path, tail @ ..] => {
+                out.extend(path.split('.'));
+                rest = tail;
+            }
+            ["anon", ty, tail @ ..] => {
+                out.extend(ty.split('.'));
+                rest = tail;
+            }
+            ["chain", callee, tail @ ..] => {
+                out.push(*callee);
+                rest = tail;
+            }
+            _ => break,
+        }
+    }
+    out
+}
 
 /// The fraction of a branch's files over which a run re-resolves every edge.
 const FULL_PASS_DIVISOR: usize = 5;
@@ -207,11 +225,9 @@ pub(crate) fn link_branch(
     }
     let reopened = |e: &StoredSymbolEdge| -> bool {
         fresh.contains(leaf(&e.dst_name))
-            || e.hint.as_deref().is_some_and(|h| {
-                h.split(|c: char| c.is_whitespace() || c == '.')
-                    .filter(|t| !HINT_WORDS.contains(t))
-                    .any(|t| fresh.contains(t))
-            })
+            || e.hint
+                .as_deref()
+                .is_some_and(|h| hint_names(h).iter().any(|t| fresh.contains(t)))
             || (!affected.is_empty() && index.within(e.src_id, &affected))
     };
     let mut pending: Vec<(&str, Vec<StoredSymbolEdge>)> = Vec::new();
@@ -306,4 +322,26 @@ pub(crate) fn link_branch(
     stats.load_ms = loaded;
     stats.write_ms = writing.as_millis();
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hint_names;
+
+    #[test]
+    fn hint_names_are_read_by_position() {
+        assert_eq!(hint_names("typed field Foo /1"), ["Foo"]);
+        assert_eq!(hint_names("name a.b.Office"), ["a", "b", "Office"]);
+        assert_eq!(hint_names("chain name bare /0"), ["name"]);
+        assert_eq!(
+            hint_names("chain find chain path typed param R /1"),
+            ["find", "path", "R"]
+        );
+        assert_eq!(
+            hint_names("member item.owner typed local H"),
+            ["item", "owner", "H"]
+        );
+        assert_eq!(hint_names("anon Runnable bare"), ["Runnable"]);
+        assert!(hint_names("bare /2").is_empty());
+    }
 }

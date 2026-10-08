@@ -312,6 +312,16 @@ generales + Java), DD-8 y DD-9.
     / 4,2 %; link pass completo de backend-a 1,9 s, incremental de un archivo 0,44 s.
   - *Privacidad:* el ejemplo del receptor encadenado de PLAN-003 pasó a nombres genéricos en
     inglés (commit aparte), y el ejemplo de dominio del bloque de re-medición también.
+- **Tercera pasada (APROBADA; MINOR y NIT):** dos escenarios más en
+  `an_incremental_link_pass_equals_a_full_one`, cada uno detectado por una sola regla: `B2 extends
+  B` con `m()` sin receptor al cambiar el `extends` de `B` (falla si se quita la regla de herencia,
+  verificado mutándola) y `name().doIt()` con `name` de un import estático cuyo retorno cambia
+  (fallaba con las palabras del hint filtradas globalmente). Los nombres del hint se leen **por
+  posición** (tipo del receptor, nombre, ruta de un `member`, supertipo de una anónima, callees de
+  una cadena), nunca sus palabras. Quitada la rama de plataforma de `anon_external` (las listas
+  nombran tipos, no métodos); comentado en el test que `cancel` → `Clock.cancel` es una respuesta
+  conocida-incorrecta (Java elige `TimerTask.cancel`); test del descarte por aridad reabierto al
+  agregar la sobrecarga. **`LINK_VERSION` = 3.**
 - **Menores de la revisión de TASK-004 (commits previos a esta task):** 3ad7d54 (m-a `where`/genéricos
   estables ante `rustfmt`, m-c fuente de `graph_edges` por el `qualified` del símbolo, `const x =
   function named()`, `export default foo;` → `EXTRACTOR_VERSION` 4) y c239de2 (comentarios fuera del

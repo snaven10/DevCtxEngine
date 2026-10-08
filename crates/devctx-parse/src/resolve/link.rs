@@ -1186,14 +1186,15 @@ impl RepoIndex {
     /// The anonymous class's external supertype may have the name; if the
     /// enclosing scopes define it too, nothing decides which.
     fn anon_external(&self, c: &Call<'_>) -> Outcome {
-        let platformish = (self.is_java(c.file) && JAVA_OBJECT.contains(&c.callee))
-            || self.platform(c.file, c.callee);
+        // The platform lists name types, not methods: only `Object`'s
+        // methods say a name is surely the supertype's too.
+        let objectish = self.is_java(c.file) && JAVA_OBJECT.contains(&c.callee);
         match self.bare_call(c) {
             // The supertype may have it too: no surer than `medium`, and
-            // undecided for a name every object or the platform has.
+            // undecided for a name every object has.
             out @ Outcome::Resolved(Resolved {
                 dst_id: Some(_), ..
-            }) if !platformish => cap(out, "medium"),
+            }) if !objectish => cap(out, "medium"),
             Outcome::Resolved(Resolved {
                 dst_id: Some(_), ..
             }) => undecided(),

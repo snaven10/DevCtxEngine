@@ -415,6 +415,9 @@ fn an_anonymous_class_scopes_its_bare_calls() {
         "package p;\nimport java.util.TimerTask;\nclass Clock {\n    void cancel() {}\n    \
          void start() {\n        new TimerTask() { public void run() { cancel(); purge(); } };\n    }\n}\n",
     )]);
+    // A known wrong answer, kept `medium` for it: Java resolves this
+    // `cancel()` to `TimerTask.cancel` (the anonymous class's own member
+    // wins), which the link pass cannot see in an external type.
     assert_eq!(
         l.show(&l.call("Clock.start.run", "cancel")),
         (q("Clock.cancel"), "medium", "self", false)
