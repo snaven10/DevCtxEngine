@@ -23,12 +23,10 @@ Implementa DD-7 (TS/JS).
 - `function_kinds` TS: `function_declaration`, `method_definition` (sin `arrow_function`): las
   llamadas dentro de un `export const x = () =>` hoy no tienen fuente y se descartan
   (`crates/devctx-parse/src/parser.rs:125-127`). TASK-004 las hace símbolo y fuente.
-- Caso real: `frontend/lib-auth/src/lib/providers/token.interceptor.ts:78`
-  (`export const tokenInterceptor: HttpInterceptorFn = (…) =>`); hay dos `AuthService`
-  (`lib-auth/src/lib/services/auth.service.ts:60`, `lib-auth-data/src/lib/services/auth.service.ts:26`):
-  el import decide cuál.
-- frontend es un monorepo Nx con micro frontends (shell, landing, registry, templates, admin,
-  calidad) y librerías con alias (`CLAUDE.md` del workspace).
+- Caso real: en una librería de auth de frontend, una función flecha exportada (`export const
+  tokenInterceptor: HttpInterceptorFn = (…) =>`) y dos `AuthService` homónimos en dos librerías del
+  monorepo: el import decide cuál.
+- frontend es un monorepo Nx con micro frontends y librerías con alias (`CLAUDE.md` del workspace).
 
 ## Archivos
 

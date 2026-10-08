@@ -33,9 +33,9 @@ implementación de DD-1: métricas del grafo, precisión contra gold edges, rele
     gold privado).
   - backend-b: `src/main/java/com/example/b/resource/DraftResource.java`
     (clases internas con campo `service`: l.234, l.293, l.352; llamada l.310).
-  - frontend: `lib-auth/src/lib/providers/token.interceptor.ts:78`
-    (`export const tokenInterceptor`), `lib-auth/src/lib/services/auth.service.ts:60` y
-    `lib-auth-data/src/lib/services/auth.service.ts:26` (dos `AuthService`).
+  - frontend: una función flecha exportada (`export const tokenInterceptor`) en una librería de
+    auth y dos `AuthService` homónimos en dos librerías (rutas reales fuera del repo, en el gold
+    privado).
   - legacy-migration: módulos de la raíz y de `src/`, scripts con `if __name__ ==
     "__main__"` (rutas y líneas reales en el gold privado).
   - DevCtxEngine: los 41 casos de `bench-queries.txt` + identificadores (`search_ranked`,

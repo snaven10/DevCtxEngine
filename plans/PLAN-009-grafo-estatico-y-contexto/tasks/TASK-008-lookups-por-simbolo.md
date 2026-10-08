@@ -79,7 +79,7 @@ DD-19.
 - [ ] Tests (a)-(f) verdes; tests de contrato de PLAN-008 verdes sin tocarlos.
 - [ ] Anclaje: definición primero en ≥ 7/8 de las consultas de PLAN-008 TASK-016 (igual o mejor).
 - [ ] `read_symbol("tokenInterceptor")` en frontend reindexado → definición en
-      `lib-auth/src/lib/providers/token.interceptor.ts:78` (o en fixture equivalente si el
+      el archivo del interceptor de la librería de auth (o en fixture equivalente si el
       reindex de FrontEnd no está aprobado todavía; se dice).
 - [ ] Rama v1 sin reindexar: respuestas iguales a 0.9.0 + aviso.
 
