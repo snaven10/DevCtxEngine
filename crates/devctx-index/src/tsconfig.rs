@@ -1,63 +1,108 @@
-//! The workspace's `tsconfig` for the link pass (PLAN-009 TASK-006, DD-7):
-//! TypeScript/JavaScript imports through `paths` aliases (an Nx workspace's
-//! `@acme/...`) and `baseUrl` resolve only with it.
+//! What the link pass reads of a TypeScript/JavaScript workspace besides its
+//! sources (PLAN-009 TASK-006, DD-7, DD-9): the root `tsconfig` (`paths`
+//! aliases of an Nx workspace, `baseUrl`) and every `package.json` (what a
+//! package is: a specifier is external only if a manifest declares it).
 //!
-//! Best effort: `tsconfig.base.json` at the repository root, else
-//! `tsconfig.json`; JSON with comments and trailing commas; one level of a
-//! relative `extends` (what the file sets wins). A file that does not parse
-//! leaves only relative imports, and the run says so once.
+//! Best effort: `tsconfig.base.json` at the repository root, else (missing or
+//! unreadable) `tsconfig.json`; JSON with comments, trailing commas and a
+//! byte-order mark; one level of relative `extends` (a string or an array,
+//! later entries over earlier ones, the file over all). A file that cannot be
+//! read is reported, and the caller keeps the last environment that could
+//! (a merge conflict in `tsconfig.base.json` must not relink the branch
+//! without its aliases).
 
-use devctx_parse::resolve::typescript::{dir_of, join, TsConfig};
+use devctx_parse::resolve::typescript::{dir_of, join, Manifest, ScriptEnv, TsConfig};
 
 /// The candidates, in the order they are tried.
 const NAMES: &[&str] = &["tsconfig.base.json", "tsconfig.json"];
 
-/// What was found: the config (`None` when no file exists or none parses)
-/// and, when a file exists but could not be read as a `tsconfig`, which.
+/// What was found.
 #[derive(Debug, Default)]
 pub(crate) struct Loaded {
-    pub config: Option<TsConfig>,
-    pub unreadable: Option<String>,
+    /// The environment as read (a broken file left out).
+    pub env: ScriptEnv,
+    /// Files that exist but could not be read (a `tsconfig`, a
+    /// `package.json`): the environment is not trustworthy.
+    pub unreadable: Vec<String>,
+    /// What was read but not followed (an `extends` of a package, a base
+    /// that does not parse): said once in the run's summary.
+    pub notes: Vec<String>,
 }
 
-/// Load the root `tsconfig` through `read` (a repository path → its text, or
-/// `None` when it does not exist on the branch being indexed).
-pub(crate) fn load(read: &dyn Fn(&str) -> Option<String>) -> Loaded {
+/// Load the environment through `read` (a repository path → its text, or
+/// `None` when it does not exist on the branch being indexed); `files`: the
+/// branch's paths, where its `package.json` files are found.
+pub(crate) fn load(read: &dyn Fn(&str) -> Option<String>, files: &[String]) -> Loaded {
+    let mut out = Loaded::default();
     for name in NAMES {
         let Some(text) = read(name) else { continue };
         let Some(own) = TsConfig::parse(&text, dir_of(name)) else {
-            return Loaded {
-                config: None,
-                unreadable: Some((*name).to_string()),
+            out.unreadable.push((*name).to_string());
+            continue;
+        };
+        let (bases, packages) = TsConfig::extends_of(&text);
+        for p in packages {
+            out.notes
+                .push(format!("{name}: `extends` of a package ({p}) not followed"));
+        }
+        let mut config = own;
+        // Later entries of an `extends` array override earlier ones; the
+        // file overrides them all.
+        for e in bases.iter().rev() {
+            let path = join(dir_of(name), e);
+            let path = if path.ends_with(".json") {
+                path
+            } else {
+                format!("{path}.json")
             };
-        };
-        let base = TsConfig::extends_of(&text)
-            .map(|e| join(dir_of(name), &e))
-            .and_then(|path| {
-                let path = if path.ends_with(".json") {
-                    path
-                } else {
-                    format!("{path}.json")
-                };
-                let text = read(&path)?;
-                TsConfig::parse(&text, dir_of(&path))
-            });
-        let config = match base {
-            Some(b) => own.over(b),
-            None => own,
-        };
-        return Loaded {
-            config: Some(config),
-            unreadable: None,
-        };
+            match read(&path).map(|t| TsConfig::parse(&t, dir_of(&path))) {
+                Some(Some(base)) => config = config.over(base),
+                Some(None) => out
+                    .notes
+                    .push(format!("{name}: its base {path} does not parse")),
+                None => out
+                    .notes
+                    .push(format!("{name}: its base {path} does not exist")),
+            }
+        }
+        out.env.tsconfig = Some(config);
+        break;
     }
-    Loaded::default()
+    for f in files {
+        let is_manifest = f == "package.json" || f.ends_with("/package.json");
+        if !is_manifest || f.split('/').any(|seg| seg == "node_modules") {
+            continue;
+        }
+        let Some(text) = read(f) else { continue };
+        match Manifest::parse(&text, dir_of(f)) {
+            Some(m) => out.env.manifests.push(m),
+            None => out.unreadable.push(f.clone()),
+        }
+    }
+    out.env.manifests.sort_by(|a, b| a.dir.cmp(&b.dir));
+    out
 }
 
-/// The `index_meta` value a branch was linked under: the config's
-/// fingerprint, or `none`.
-pub(crate) fn fingerprint(config: Option<&TsConfig>) -> String {
-    config.map_or_else(|| "none".to_string(), TsConfig::fingerprint)
+/// The environment the link pass runs under, its fingerprint, and whether it
+/// is the one just read (to store as the last good one). When something could
+/// not be read and the branch has a last good environment, that one, with its
+/// fingerprint: an unreadable file relinks nothing and loses no alias.
+pub(crate) fn choose(
+    loaded: Loaded,
+    stored_fingerprint: Option<&str>,
+    stored_env: Option<&str>,
+) -> (ScriptEnv, String, bool) {
+    if !loaded.unreadable.is_empty() {
+        if let (Some(fp), Some(env)) = (
+            stored_fingerprint,
+            stored_env.and_then(ScriptEnv::from_json),
+        ) {
+            return (env, fp.to_string(), false);
+        }
+    }
+    let fresh = loaded.unreadable.is_empty();
+    let fp = loaded.env.fingerprint();
+    (loaded.env, fp, fresh)
 }
 
 #[cfg(test)]
@@ -90,20 +135,86 @@ mod tests {
                 r#"{ "compilerOptions": { "baseUrl": "src" } }"#,
             ),
         ]);
-        let c = load(&read).config.unwrap();
+        let l = load(&read, &[]);
+        let c = l.env.tsconfig.unwrap();
         assert_eq!(c.base_url.as_deref(), Some(""));
         assert_eq!(c.paths.len(), 1, "own paths win whole: {c:?}");
         assert_eq!(c.paths[0].0, "@a/x");
+        assert!(l.unreadable.is_empty() && l.notes.is_empty());
     }
 
+    /// TASK-006 review, M4: a broken base falls back to `tsconfig.json` and
+    /// is reported; so is a broken `package.json`.
     #[test]
-    fn a_broken_file_is_reported_and_none_is_none() {
-        let read = reader(&[("tsconfig.json", "{ nope")]);
-        let l = load(&read);
-        assert!(l.config.is_none());
-        assert_eq!(l.unreadable.as_deref(), Some("tsconfig.json"));
-        let l = load(&reader(&[]));
-        assert!(l.config.is_none() && l.unreadable.is_none());
-        assert_eq!(fingerprint(None), "none");
+    fn a_broken_file_is_reported_and_the_next_one_read() {
+        let read = reader(&[
+            ("tsconfig.base.json", "<<<<<<< HEAD\n{ nope"),
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "baseUrl": "src" } }"#,
+            ),
+            ("package.json", r#"{ "dependencies": { "rxjs": "7" } }"#),
+            ("libs/x/package.json", "{ broken"),
+            ("node_modules/y/package.json", "{ ignored"),
+        ]);
+        let files = [
+            "package.json".to_string(),
+            "libs/x/package.json".to_string(),
+            "node_modules/y/package.json".to_string(),
+        ];
+        let l = load(&read, &files);
+        assert_eq!(
+            l.env.tsconfig.and_then(|c| c.base_url).as_deref(),
+            Some("src")
+        );
+        assert_eq!(l.unreadable, ["tsconfig.base.json", "libs/x/package.json"]);
+        assert_eq!(l.env.manifests.len(), 1);
+        assert_eq!(l.env.manifests[0].deps, ["rxjs"]);
+        let none = load(&reader(&[]), &[]);
+        assert!(none.env.tsconfig.is_none() && none.unreadable.is_empty());
+    }
+
+    /// TASK-006 review, M4: an unreadable file keeps the last good
+    /// environment and its fingerprint; a readable one replaces it.
+    #[test]
+    fn an_unreadable_file_keeps_the_last_good_environment() {
+        let good = load(
+            &reader(&[(
+                "tsconfig.base.json",
+                r#"{ "compilerOptions": { "paths": { "@a/x": ["x"] } } }"#,
+            )]),
+            &[],
+        );
+        let (env, fp, fresh) = choose(good, None, None);
+        assert!(fresh);
+        let json = env.to_json();
+        let broken = load(&reader(&[("tsconfig.base.json", "<<<<<<< ours")]), &[]);
+        let (kept, kept_fp, fresh) = choose(broken, Some(&fp), Some(&json));
+        assert!(!fresh);
+        assert_eq!((kept, kept_fp.as_str()), (env.clone(), fp.as_str()));
+        // Nothing stored yet: what could be read, not stored as good.
+        let broken = load(&reader(&[("tsconfig.base.json", "<<<<<<< ours")]), &[]);
+        let (none, _, fresh) = choose(broken, None, None);
+        assert!(none.tsconfig.is_none() && !fresh);
+    }
+
+    /// An `extends` array (TypeScript 5): later entries over earlier ones;
+    /// a package entry and a missing base are noted.
+    #[test]
+    fn an_extends_array_is_followed_and_what_is_not_is_noted() {
+        let read = reader(&[
+            (
+                "tsconfig.base.json",
+                r#"{ "extends": ["./a.json", "./b.json", "@tsconfig/node20", "./gone.json"] }"#,
+            ),
+            ("a.json", r#"{ "compilerOptions": { "baseUrl": "a" } }"#),
+            ("b.json", r#"{ "compilerOptions": { "baseUrl": "b" } }"#),
+        ]);
+        let l = load(&read, &[]);
+        assert_eq!(
+            l.env.tsconfig.and_then(|c| c.base_url).as_deref(),
+            Some("b")
+        );
+        assert_eq!(l.notes.len(), 2, "{:?}", l.notes);
     }
 }

@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use devctx_parse::resolve::link::{LinkEdge, LinkSymbol, Outcome, RepoIndex};
-use devctx_parse::resolve::typescript::TsConfig;
+use devctx_parse::resolve::typescript::ScriptEnv;
 use devctx_store::{Store, StoredSymbolEdge};
 
 use crate::error::Result;
@@ -34,15 +34,20 @@ use crate::error::Result;
 /// module): what the branch's edges were resolved under. A build with other
 /// rules relinks the branch in full on its next run, as the extractor
 /// version does for the parse.
-pub(crate) const LINK_VERSION: &str = "4";
+pub(crate) const LINK_VERSION: &str = "5";
 
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
 
-/// `index_meta` key of the `tsconfig` fingerprint the branch was linked
-/// under ([`crate::tsconfig::fingerprint`]): a changed alias relinks it in
-/// full, though no source file changed.
+/// `index_meta` key of the fingerprint of the TypeScript/JavaScript
+/// environment (`tsconfig`, `package.json` files) the branch was linked
+/// under: a changed alias or dependency relinks it in full, though no source
+/// file changed.
 pub(crate) const LINK_CONFIG_META_KEY: &str = "link_tsconfig";
+
+/// `index_meta` key of that environment itself, the last one that could be
+/// read: a run that cannot read it (a merge conflict) links under this one.
+pub(crate) const LINK_ENV_META_KEY: &str = "link_script_env";
 
 /// `index_meta` key set while a run owes the branch a link pass (from before
 /// its first file to the end of the pass): a run cut short leaves it, and the
@@ -150,6 +155,17 @@ fn leaf(name: &str) -> &str {
     after.rsplit('.').next().unwrap_or(after)
 }
 
+/// The name an edge's destination ends in: a TypeScript/JavaScript import
+/// row's imported name (`rxjs#map` → `map`), else the last segment.
+fn dst_key(e: &StoredSymbolEdge) -> &str {
+    if e.kind == "imports" {
+        if let Some((_, name)) = e.dst_name.rsplit_once('#') {
+            return name;
+        }
+    }
+    leaf(&e.dst_name)
+}
+
 fn to_link(e: &StoredSymbolEdge) -> LinkEdge {
     LinkEdge {
         kind: e.kind.clone(),
@@ -163,28 +179,28 @@ fn to_link(e: &StoredSymbolEdge) -> LinkEdge {
 
 /// Run the link pass over `branch`. `written`: the files whose graph rows
 /// this run wrote or deleted; `full`: re-resolve every edge regardless;
-/// `ts`: the workspace's `tsconfig` (TypeScript aliases).
+/// `env`: the TypeScript/JavaScript workspace (`tsconfig`, `package.json`).
 pub(crate) fn link_branch(
     store: &Store,
     repo: &str,
     branch: &str,
     written: &HashSet<String>,
     full: bool,
-    ts: Option<&TsConfig>,
+    env: &ScriptEnv,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LinkStats> {
     let started = Instant::now();
     let symbols = store.branch_symbols(repo, branch)?;
     let edges = store.branch_linkable_edges(repo, branch)?;
     let files: HashSet<&str> = symbols.iter().map(|s| s.file.as_str()).collect();
-    let full = full || written.len() * FULL_PASS_DIVISOR > files.len();
+    let mut full = full || written.len() * FULL_PASS_DIVISOR > files.len();
     let ids: HashSet<u64> = symbols.iter().map(|s| s.id).collect();
     let facts: Vec<LinkEdge> = edges
         .iter()
         .filter(|e| matches!(e.kind.as_str(), "imports" | "inherits" | "implements"))
         .map(to_link)
         .collect();
-    let index = RepoIndex::with_ts_config(
+    let index = RepoIndex::with_script_env(
         symbols
             .iter()
             .map(|s| LinkSymbol {
@@ -196,10 +212,11 @@ pub(crate) fn link_branch(
                 qualified: s.qualified.clone(),
                 package: s.package.clone(),
                 signature: s.signature.clone(),
+                exported: s.exported,
             })
             .collect(),
         &facts,
-        ts.cloned(),
+        env.clone(),
     );
     drop(facts);
     // What a written file changed that other files' edges may depend on
@@ -208,6 +225,19 @@ pub(crate) fn link_branch(
     // their members inherit). An edge is reopened when its `dst_name` or a
     // token of its `hint` (the receiver's type, a chain's previous callee)
     // is one of those names, or when its source sits in one of those types.
+    // (d) TypeScript/JavaScript files importing a written one (or a barrel
+    // re-exporting it): every edge, since what an import binds can change
+    // without any name of the written file changing. With them the
+    // selection can exceed the full-pass threshold: then the full pass.
+    let mut importers = if full {
+        HashSet::new()
+    } else {
+        index.importers_of(written)
+    };
+    if !full && (written.len() + importers.len()) * FULL_PASS_DIVISOR > files.len() {
+        full = true;
+        importers.clear();
+    }
     let written_ids: HashSet<u64> = symbols
         .iter()
         .filter(|s| written.contains(&s.file))
@@ -220,14 +250,15 @@ pub(crate) fn link_branch(
         .map(|s| s.name.as_str())
         .collect();
     fresh.extend(affected.iter().filter_map(|&id| index.name_of(id)));
-    // (d) TypeScript/JavaScript files importing a written one (or a barrel
-    // re-exporting it): every edge, since what an import binds can change
-    // without any name of the written file changing.
-    let importers = if full {
-        HashSet::new()
-    } else {
-        index.importers_of(written)
-    };
+    // An importer's own names too: what its symbols return or hold may now
+    // be another type (`a.f().g()` in a third file, with `f` of an importer
+    // returning a type the written barrel re-exports).
+    fresh.extend(
+        symbols
+            .iter()
+            .filter(|s| importers.contains(&s.file))
+            .map(|s| s.name.as_str()),
+    );
     let loaded = started.elapsed().as_millis();
     let mut writing = std::time::Duration::ZERO;
 
@@ -245,7 +276,7 @@ pub(crate) fn link_branch(
         list.push(e);
     }
     let reopened = |e: &StoredSymbolEdge| -> bool {
-        fresh.contains(leaf(&e.dst_name))
+        fresh.contains(dst_key(e))
             || e.hint
                 .as_deref()
                 .is_some_and(|h| hint_names(h).iter().any(|t| fresh.contains(t)))

@@ -202,6 +202,11 @@ const SOURCES: &[&str] = &[
 /// shadow fields, a bare name is never a member (no implicit `this`), `this`
 /// outside a declared class is untyped; an import records whether it is a
 /// re-export.
+/// 10: TASK-006 review — only Angular's `inject` (imported from
+/// `@angular/core`) injects; a TS/JS function in scope is a binding
+/// (`function f` hoisted, `const f = () => …`), and a bare call no scope
+/// binds, or bound to the module's own function, is `free` (a function bound
+/// in a sibling block is not in scope).
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -209,7 +214,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 9;
+pub const EXTRACTOR_VERSION: u32 = 10;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
@@ -319,6 +324,7 @@ mod tests {
         "bind.local",
         "bind.assign",
         "bind.inject",
+        "bind.func",
     ];
     const IMPORT_CAPTURES: &[&str] = &[
         "import",

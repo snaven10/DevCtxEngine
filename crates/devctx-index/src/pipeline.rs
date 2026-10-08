@@ -491,25 +491,43 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         .get_index_meta(&repo_path, &branch, crate::link::LINK_VERSION_META_KEY)?
         .as_deref()
         != Some(crate::link::LINK_VERSION);
-    // The workspace's `tsconfig` (TypeScript aliases, PLAN-009 TASK-006),
-    // from the branch being indexed: another one than the branch was linked
-    // under relinks it in full, though no source file changed.
-    let ts = crate::tsconfig::load(&|rel: &str| match &read_from {
+    // The TypeScript/JavaScript environment (root `tsconfig` aliases and the
+    // `package.json` files, PLAN-009 TASK-006), from the branch being
+    // indexed: another one than the branch was linked under relinks it in
+    // full, though no source file changed. A file that cannot be read (a
+    // merge conflict) keeps the last good environment: no relink, no alias
+    // lost.
+    let read_env = |rel: &str| match &read_from {
         Some(b) => git.read_file_at(b, rel).ok(),
         None => git.read_file(rel).ok(),
-    });
-    if let Some(file) = &ts.unreadable {
+    };
+    let branch_files: Vec<String> = match &read_from {
+        Some(b) => git.changes_at(b, None)?,
+        None => git.changes(None)?,
+    }
+    .iter()
+    .map(|c| change_path(c).to_string())
+    .filter(|f| f == "package.json" || f.ends_with("/package.json"))
+    .collect();
+    let loaded = crate::tsconfig::load(&read_env, &branch_files);
+    for f in &loaded.unreadable {
         eprintln!(
-            "· {file} could not be read as a tsconfig: TypeScript aliases are not resolved, \
-             relative imports are"
+            "· {f} could not be read: the link pass keeps the last environment it could read \
+             (TypeScript aliases, packages)"
         );
     }
-    let ts_fingerprint = crate::tsconfig::fingerprint(ts.config.as_ref());
-    let link_config_changed = req
-        .store
-        .get_index_meta(&repo_path, &branch, crate::link::LINK_CONFIG_META_KEY)?
-        .as_deref()
-        != Some(ts_fingerprint.as_str());
+    for n in &loaded.notes {
+        eprintln!("· {n}");
+    }
+    let stored_env_fp =
+        req.store
+            .get_index_meta(&repo_path, &branch, crate::link::LINK_CONFIG_META_KEY)?;
+    let stored_env =
+        req.store
+            .get_index_meta(&repo_path, &branch, crate::link::LINK_ENV_META_KEY)?;
+    let (script_env, env_fingerprint, env_fresh) =
+        crate::tsconfig::choose(loaded, stored_env_fp.as_deref(), stored_env.as_deref());
+    let link_config_changed = stored_env_fp.as_deref() != Some(env_fingerprint.as_str());
     let link_stale = link_stale || link_config_changed;
     if !link_owed {
         req.store
@@ -609,7 +627,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 &branch,
                 &ctx.graph_written,
                 link_full,
-                ts.config.as_ref(),
+                &script_env,
                 &cancelled,
             )
         })?;
@@ -626,8 +644,16 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 &repo_path,
                 &branch,
                 crate::link::LINK_CONFIG_META_KEY,
-                &ts_fingerprint,
+                &env_fingerprint,
             )?;
+            if env_fresh {
+                req.store.set_index_meta(
+                    &repo_path,
+                    &branch,
+                    crate::link::LINK_ENV_META_KEY,
+                    &script_env.to_json(),
+                )?;
+            }
             req.store
                 .delete_index_meta(&repo_path, &branch, crate::link::LINK_PENDING_META_KEY)?;
         }

@@ -73,12 +73,18 @@ impl LanguageParser {
 
         let (symbols, bound) = self.extract_symbols(root, bytes);
         let (imports, import_facts) = self.extract_imports(root, bytes);
+        // Angular's `inject(T)` injects; a local helper of that name does
+        // not (TASK-006 review, m5).
+        let injects = import_facts.iter().any(|i| {
+            i.path == "@angular/core" && i.name.as_deref() == Some("inject") && i.alias.is_none()
+        });
         let scopes = Scopes::build(
             root,
             bytes,
             self.lang,
             self.type_query.as_ref(),
             self.resolver,
+            injects,
         );
         let (edges, module_edges, refs) = self.extract_references(root, bytes, &scopes, &bound);
         let file_symbol = Symbol {
@@ -771,6 +777,9 @@ fn binding_of(func: Node<'_>) -> Option<Node<'_>> {
 enum Recv {
     /// No receiver: `foo()`.
     Bare,
+    /// TypeScript/JavaScript: no receiver, and no scope binds the name (an
+    /// import, a global, an undeclared name).
+    Free,
     /// `this`/`self`/`Self`/`cls`.
     This,
     /// `super`.
@@ -827,6 +836,7 @@ impl Recv {
     fn hint(&self) -> String {
         match self {
             Recv::Bare => "bare".into(),
+            Recv::Free => "free".into(),
             Recv::This => "this".into(),
             Recv::Super => "super".into(),
             Recv::Typed(ty, via) => format!("typed {} {ty}", via.as_str()),
@@ -853,14 +863,23 @@ fn classify(callee: Node<'_>, bytes: &[u8], scopes: &Scopes, depth: u8) -> Recv 
     let recv = match receiver_node(callee) {
         Some(recv) => classify_receiver(recv, bytes, scopes, depth),
         // TypeScript/JavaScript: `next(req)` with `next` a parameter or a
-        // local holds a value nothing types, never a function of that name
-        // (a function bound to a `const` is a symbol, not a binding).
-        None if !scopes.implicit_this()
-            && callee
+        // local holds a value nothing types, never a function of that name;
+        // a function in scope is `bare`; a name no scope binds (an import, a
+        // global) is `free`, so a function bound in a sibling block is not
+        // taken for it.
+        None if !scopes.implicit_this() => {
+            match callee
                 .utf8_text(bytes)
-                .is_ok_and(|n| scopes.lookup(callee, n).is_some()) =>
-        {
-            Recv::Untyped
+                .ok()
+                .and_then(|n| scopes.lookup(callee, n))
+            {
+                // The module's own function: looked up as such, never as a
+                // homonym bound in an enclosing function's block.
+                Some(b) if b.func && scopes.at_top_level(b) => Recv::Free,
+                Some(b) if b.func => Recv::Bare,
+                Some(_) => Recv::Untyped,
+                None => Recv::Free,
+            }
         }
         None => Recv::Bare,
     };

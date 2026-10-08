@@ -1,4 +1,4 @@
-version 9
+version 10
 == src/main/java/com/example/shop/OrderService.java (java) package=com.example.shop
 sym	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7	parent=-	container=-	-	L1-43	
 sym	class	OrderService	dc29a699ee8c525b	parent=src/main/java/com/example/shop/OrderService.java	container=-	pub	L9-38	public class OrderService extends BaseService implements Auditable, Serializable
@@ -64,13 +64,13 @@ L3	import	rxjs#*	path=rxjs name=- alias=rx wildcard=true reexport=false
 L4	import	./auth.store#default	path=./auth.store name=default alias=AuthStore wildcard=false reexport=false
 L5	import	./polyfills	path=./polyfills name=- alias=- wildcard=false reexport=false
 L7	references	tokenInterceptor -> Fn
-L8	call	tokenInterceptor -> inject	graph=tokenInterceptor	hint=bare /1
+L8	call	tokenInterceptor -> inject	graph=tokenInterceptor	hint=free /1
 L9	call	tokenInterceptor -> AuthStore.headers	graph=tokenInterceptor	hint=typed ctor_inject AuthStore /0
 L9	call	tokenInterceptor -> clone	graph=tokenInterceptor	hint=untyped /1
 L9	call	tokenInterceptor -> next	graph=tokenInterceptor	hint=untyped /1
-L13	call	helper -> log	graph=helper	hint=bare /1
+L13	call	helper -> log	graph=helper	hint=free /1
 L16	inherits	Session -> Base
-L24	call	libs/auth/src/token.interceptor.ts -> Injectable	graph=-	hint=bare /0
+L24	call	libs/auth/src/token.interceptor.ts -> Injectable	graph=-	hint=free /0
 L25	implements	AuthService -> Auditable
 L25	implements	AuthService -> OnInit
 L25	inherits	AuthService -> BaseService
@@ -81,7 +81,7 @@ L28	references	AuthService.constructor -> AuthStore
 L28	references	AuthService.constructor -> HttpClient
 L30	call	AuthService.constructor -> AuthService.tick	graph=AuthService.constructor	hint=this /0
 L34	call	AuthService.ngOnInit -> AuthService.load	graph=AuthService.ngOnInit	hint=this /0
-L35	call	AuthService.ngOnInit -> audit	graph=AuthService.ngOnInit	hint=bare /1
+L35	call	AuthService.ngOnInit -> audit	graph=AuthService.ngOnInit	hint=free /1
 L35	call	AuthService.ngOnInit -> map	graph=AuthService.ngOnInit	hint=expr /1
 L36	call	AuthService.ngOnInit -> AuthService.process	graph=AuthService.ngOnInit	hint=this /1
 L36	call	AuthService.ngOnInit -> HttpClient.get	graph=AuthService.ngOnInit	hint=typed ctor_inject HttpClient /1
@@ -92,7 +92,7 @@ L41	references	AuthService.handle -> Event
 L42	call	AuthService.handle -> AuthService.load	graph=AuthService.handle	hint=this /0
 L45	references	AuthService.load -> Session
 L46	instantiates	AuthService.load -> SessionImpl
-L50	call	libs/auth/src/token.interceptor.ts -> register	graph=-	hint=bare /1
+L50	call	libs/auth/src/token.interceptor.ts -> register	graph=-	hint=free /1
 L54	import	./barrel#Other	path=./barrel name=Other alias=- wildcard=false reexport=true
 L54	import	./barrel#Thing	path=./barrel name=Thing alias=Alias wildcard=false reexport=true
 L55	import	./all#*	path=./all name=- alias=- wildcard=true reexport=true
@@ -103,7 +103,7 @@ sym	function	Button.onClick	56580debb4e80180	parent=Button	container=-	priv	L4-4
 sym	function	Panel	5cf3006b7d7ef18d	parent=web/Button.tsx	container=-	pub	L8-10	function Panel(): JSX.Element
 L1	import	react#default	path=react name=default alias=React wildcard=false reexport=false
 L3	references	Button -> Props
-L4	call	Button.onClick -> track	graph=Button.onClick	hint=bare /1
+L4	call	Button.onClick -> track	graph=Button.onClick	hint=free /1
 L8	references	Panel -> JSX.Element
 == web/app.js (javascript) package=web/app
 sym	file	web/app.js	7333a95984a851a7	parent=-	container=-	-	L1-39	
@@ -117,15 +117,15 @@ sym	method	App.stop	a35e54b476e4e23d	parent=App	container=App	pub	L25-27	stop = 
 sym	function	onDone	0e374261e243a43b	parent=web/app.js	container=-	priv	L34-36	const onDone = function finish()
 L1	import	express#default	path=express name=default alias=express wildcard=false reexport=false
 L2	import	./routes.js#route	path=./routes.js name=route alias=- wildcard=false reexport=false
-L5	call	start -> listen	graph=start	hint=bare /1
-L9	call	boot -> start	graph=boot	hint=bare /1
+L5	call	start -> listen	graph=start	hint=free /1
+L9	call	boot -> start	graph=boot	hint=free /1
 L12	inherits	App -> Base
 L15	instantiates	App.constructor -> Server
 L16	call	App.constructor -> App.tick	graph=App.constructor	hint=this /0
-L20	call	App.run -> boot	graph=App.run	hint=bare /0
+L20	call	App.run -> boot	graph=App.run	hint=free /0
 L26	call	App.stop -> close	graph=App.stop	hint=name server /0
-L31	call	web/app.js -> work	graph=-	hint=bare /0
-L35	call	onDone -> notify	graph=onDone	hint=bare /0
+L31	call	web/app.js -> work	graph=-	hint=free /0
+L35	call	onDone -> notify	graph=onDone	hint=free /0
 == shop/orders.py (python) package=shop.orders
 sym	file	shop/orders.py	acd88c655c833ce3	parent=-	container=-	-	L1-34	
 sym	const	LIMIT	a3ec3be8cf532e5c	parent=shop/orders.py	container=-	pub	L6-6	LIMIT = 10

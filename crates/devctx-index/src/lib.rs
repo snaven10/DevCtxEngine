@@ -2805,14 +2805,30 @@ public class Helper {
     /// nothing for it to fix.
     fn full_link_changes(store: &Store, repo: &str, dir: &Path) -> Vec<(String, String)> {
         let before = linked_rows(store, repo);
-        let ts = crate::tsconfig::load(&|rel: &str| std::fs::read_to_string(dir.join(rel)).ok());
+        let files: Vec<String> = crate::git::GitRepo::open(dir)
+            .unwrap()
+            .changes(None)
+            .unwrap()
+            .iter()
+            .map(|c| match c {
+                crate::git::Change::Added(p)
+                | crate::git::Change::Modified(p)
+                | crate::git::Change::Deleted(p) => p.clone(),
+                crate::git::Change::Renamed { to, .. } => to.clone(),
+            })
+            .collect();
+        let env = crate::tsconfig::load(
+            &|rel: &str| std::fs::read_to_string(dir.join(rel)).ok(),
+            &files,
+        )
+        .env;
         crate::link::link_branch(
             store,
             repo,
             "main",
             &std::collections::HashSet::new(),
             true,
-            ts.config.as_ref(),
+            &env,
             &|| false,
         )
         .unwrap();
@@ -2939,6 +2955,30 @@ public class Helper {
                 "web/libs/deep/inner.ts",
                 "export { Svc } from '../a/svc';\n",
             ),
+            // TASK-006 review: a package import whose name a written file
+            // starts to define (M3), and a chain typed by an importer's
+            // return type (m1).
+            (
+                "package.json",
+                "{ \"dependencies\": { \"rxjs\": \"7\" } }\n",
+            ),
+            (
+                "web/m3/f.ts",
+                "import { map } from 'rxjs';\nexport function useMap(): void {\n  map();\n}\n",
+            ),
+            ("web/m3/util.ts", "export function other(): void {}\n"),
+            ("web/m1/x.ts", TS_FOO),
+            ("web/m1/y.ts", TS_FOO),
+            ("web/m1/w.ts", "export { Foo } from './x';\n"),
+            (
+                "web/m1/a.ts",
+                "import { Foo } from './w';\nexport class A {\n  f(): Foo {\n    \
+                 return new Foo();\n  }\n}\n",
+            ),
+            (
+                "web/m1/c.ts",
+                "import { A } from './a';\nexport function go(a: A): void {\n  a.f().g();\n}\n",
+            ),
             (
                 "web/app/e.ts",
                 "import { Svc } from '../libs/deep';\nexport function go(s: Svc): void {\n  \
@@ -2955,7 +2995,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 9] = [
+        let steps: [(&str, &str, &str, &str, i32); 11] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -3030,6 +3070,26 @@ public class Helper {
                 "Svc.run",
                 3,
             ),
+            // A file starts defining `map`: the import row `rxjs#map` of a
+            // file not written stops being external (DD-9). Only the
+            // import-row key (the name after `#`) reaches it.
+            (
+                "web/m3/util.ts",
+                "export function other(): void {}\nexport function map(): void {}\n",
+                "web/m3/f.ts",
+                "rxjs#map",
+                1,
+            ),
+            // The barrel behind `A.f()`'s return type moves: `c.ts` imports
+            // only `A` (an importer of the barrel), and only an importer's
+            // names (`f`) reach its `a.f().g()`.
+            (
+                "web/m1/w.ts",
+                "export { Foo } from './y';\n",
+                "web/m1/c.ts",
+                "g",
+                3,
+            ),
         ];
         // Each scenario on a branch of its own, so every one is judged (and
         // reported) whatever the others do.
@@ -3044,7 +3104,11 @@ public class Helper {
                     .file_symbol_edges(&repo, "main", seen_in)
                     .unwrap()
                     .into_iter()
-                    .find(|e| e.kind == "calls" && e.dst_name == dst && e.line == line)
+                    .find(|e| {
+                        (e.kind == "calls" || e.kind == "imports")
+                            && e.dst_name == dst
+                            && e.line == line
+                    })
                     .unwrap_or_else(|| panic!("no {dst} at {seen_in}:{line}"))
             };
             let before = watched(&store);
@@ -3067,11 +3131,62 @@ public class Helper {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
+    const TS_FOO: &str = "export class Foo {\n  g(): void {}\n}\n";
     const TS_SVC: &str = "export class Svc {\n  run(): void {}\n}\n";
     const TS_CONFIG_A: &str =
         "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@acme/svc\": [\"web/libs/a/svc.ts\"] } } }\n";
     const TS_CONFIG_B: &str =
         "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@acme/svc\": [\"web/libs/b/svc.ts\"] } } }\n";
+
+    /// TASK-006 review, M4: a `tsconfig.base.json` left unreadable (a merge
+    /// conflict) relinks nothing and loses no alias; a readable one again is
+    /// a changed environment, relinked in full.
+    #[test]
+    fn an_unreadable_tsconfig_keeps_the_last_good_one() {
+        let mut files = vec![
+            ("web/libs/a/svc.ts", TS_SVC),
+            ("web/libs/b/svc.ts", TS_SVC),
+            ("tsconfig.base.json", TS_CONFIG_A),
+            (
+                "web/app/d.ts",
+                "import { Svc } from '@acme/svc';\nexport function go(s: Svc): void {\n  \
+                 s.run();\n}\n",
+            ),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkenv", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let watched = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "web/app/d.ts")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.kind == "calls" && e.dst_name == "Svc.run")
+                .unwrap()
+        };
+        let good = watched(&store);
+        assert_eq!(good.confidence.as_deref(), Some("high"), "{good:?}");
+        write(
+            &dir,
+            "tsconfig.base.json",
+            &format!("<<<<<<< HEAD\n{TS_CONFIG_A}=======\n{TS_CONFIG_B}>>>>>>> other\n"),
+        );
+        commit_all(&dir, "conflict");
+        let inc = index_with(&store, &dir, false, None);
+        assert_eq!(inc.edges_linked, 0, "no relink: {inc:?}");
+        assert_eq!(watched(&store), good, "the alias is kept");
+        write(&dir, "tsconfig.base.json", TS_CONFIG_B);
+        commit_all(&dir, "resolved");
+        index_with(&store, &dir, false, None);
+        let moved = watched(&store);
+        assert_ne!(
+            moved.dst_id, good.dst_id,
+            "the new alias relinks: {moved:?}"
+        );
+        assert_eq!(moved.confidence.as_deref(), Some("high"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A link pass cut short (a stop, a crash) is owed: the next run does it
     /// in full, though its files are unchanged and it writes none (MAJOR 5).

@@ -12,14 +12,85 @@ use super::scope::{TypeText, Via};
 /// What the link pass needs of a workspace's `tsconfig`: where non-relative
 /// specifiers start (`baseUrl`) and its aliases (`paths`), as repository
 /// paths (`""` is the root).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TsConfig {
     /// `compilerOptions.baseUrl`, joined to the file's directory.
     pub base_url: Option<String>,
-    /// `compilerOptions.paths`, in file order: pattern (`@acme/auth`,
-    /// `@acme/ui/*`) → targets, joined to the directory `paths` are relative
-    /// to (`baseUrl`, else the file's).
+    /// `compilerOptions.paths`, sorted by pattern (the JSON map is read
+    /// without its order): pattern (`@acme/auth`, `@acme/ui/*`) → targets,
+    /// joined to the directory `paths` are relative to (`baseUrl`, else the
+    /// file's). Resolution takes the longest match, so order only breaks a
+    /// tie between two wildcard patterns of equal prefix (the first by
+    /// pattern wins; TypeScript takes the first in the file).
     pub paths: Vec<(String, Vec<String>)>,
+}
+
+/// A `package.json` of the repository: the evidence that a specifier names a
+/// package (DD-9), and the name a workspace package takes (`@acme/ui` of
+/// `libs/ui/package.json` is the repository's, not npm's).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Manifest {
+    /// Its directory (`""` for the root).
+    pub dir: String,
+    /// `name`.
+    pub name: Option<String>,
+    /// `dependencies`, `devDependencies`, `peerDependencies` and
+    /// `optionalDependencies`, sorted.
+    pub deps: Vec<String>,
+}
+
+impl Manifest {
+    /// Read a `package.json` in the repository directory `dir`; `None` when
+    /// it does not parse.
+    pub fn parse(text: &str, dir: &str) -> Option<Self> {
+        let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+        let mut deps: Vec<String> = [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ]
+        .iter()
+        .filter_map(|k| v.get(*k).and_then(Value::as_object))
+        .flat_map(|m| m.keys().cloned())
+        .collect();
+        deps.sort();
+        deps.dedup();
+        Some(Self {
+            dir: dir.to_string(),
+            name: v.get("name").and_then(Value::as_str).map(str::to_string),
+            deps,
+        })
+    }
+}
+
+/// What the link pass reads of a TypeScript/JavaScript workspace besides its
+/// sources: the root `tsconfig` and the `package.json` files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScriptEnv {
+    /// The root `tsconfig` (aliases, `baseUrl`).
+    pub tsconfig: Option<TsConfig>,
+    /// Every `package.json` of the branch, by directory.
+    pub manifests: Vec<Manifest>,
+}
+
+impl ScriptEnv {
+    /// A stable digest of what resolution reads: a change re-links the
+    /// branch in full (DD-6).
+    pub fn fingerprint(&self) -> String {
+        let text = self.to_json();
+        format!("{:016x}", devctx_core::symbol_id::fnv1a64(&[&text]))
+    }
+
+    /// As stored in `index_meta` (the last one that could be read).
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Back from [`ScriptEnv::to_json`].
+    pub fn from_json(text: &str) -> Option<Self> {
+        serde_json::from_str(text).ok()
+    }
 }
 
 impl TsConfig {
@@ -50,12 +121,24 @@ impl TsConfig {
         Some(Self { base_url, paths })
     }
 
-    /// The `extends` of a `tsconfig` text, when it names a file (`./base.json`,
-    /// `../tsconfig.base.json`); a package (`@tsconfig/node20`) is not followed.
-    pub fn extends_of(text: &str) -> Option<String> {
-        let v: Value = serde_json::from_str(&strip_jsonc(text)).ok()?;
-        let e = v.get("extends")?.as_str()?;
-        e.starts_with('.').then(|| e.to_string())
+    /// The `extends` of a `tsconfig` text, in order: a string or (TypeScript
+    /// 5) an array; entries naming a file (`./base.json`,
+    /// `../tsconfig.base.json`) as written, a package (`@tsconfig/node20`)
+    /// apart — not followed.
+    pub fn extends_of(text: &str) -> (Vec<String>, Vec<String>) {
+        let Ok(v) = serde_json::from_str::<Value>(&strip_jsonc(text)) else {
+            return (Vec::new(), Vec::new());
+        };
+        let list: Vec<String> = match v.get("extends") {
+            Some(Value::String(e)) => vec![e.clone()],
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        list.into_iter().partition(|e| e.starts_with('.'))
     }
 
     /// `self` over `base` (an `extends`): what `self` sets wins, whole.
@@ -87,6 +170,8 @@ impl TsConfig {
 /// JSON with comments (`//`, `/* */`) and trailing commas, as `tsconfig`
 /// allows, made plain JSON. Strings are left alone.
 fn strip_jsonc(text: &str) -> String {
+    // A UTF-8 byte-order mark (editors on Windows write one) is no JSON.
+    let text = text.trim_start_matches('\u{feff}');
     let b: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -392,7 +477,7 @@ use std::sync::Mutex;
 
 use super::link::{
     cap, external, hi, is_callable, is_type, leaf, medium, undecided, Call, LinkEdge, Outcome,
-    RepoIndex, Resolved, TypeRef,
+    RepoIndex, Resolved, TypeRef, IMPORT_WEAK,
 };
 
 /// Where a specifier leads.
@@ -400,10 +485,75 @@ use super::link::{
 pub(super) enum Module {
     /// A file of the repository.
     Repo(String),
-    /// A package: from outside the repository.
+    /// A package a `package.json` declares, or a Node builtin: from
+    /// outside the repository (DD-9).
     External,
-    /// The repository's (relative, or a `paths` alias) but no file found.
+    /// No file found and no evidence of a package: a relative path or an
+    /// alias with no file, an alias of a `tsconfig` that is not read (an
+    /// app's own), a module no manifest declares.
     Unknown,
+}
+
+/// Node's builtin modules (also as `node:x`): packages without a manifest.
+const NODE_BUILTINS: &[&str] = &[
+    "assert",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "domain",
+    "events",
+    "fs",
+    "fs/promises",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "repl",
+    "stream",
+    "string_decoder",
+    "test",
+    "timers",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
+
+/// The package a bare specifier names: `@scope/name/sub` → `@scope/name`,
+/// `name/sub` → `name`.
+pub fn package_name(spec: &str) -> &str {
+    let mut parts = spec.splitn(3, '/');
+    let first = parts.next().unwrap_or(spec);
+    if first.starts_with('@') {
+        match parts.next() {
+            Some(second) => &spec[..first.len() + 1 + second.len()],
+            None => first,
+        }
+    } else {
+        first
+    }
 }
 
 /// What a module exports under a name.
@@ -440,8 +590,8 @@ enum Imported {
 pub(super) struct TsCache {
     /// (directory of the importing file, specifier) → module.
     modules: Mutex<HashMap<(String, String), Module>>,
-    /// (file, name) → what it exports under it, walked from the top.
-    exports: Mutex<HashMap<(String, String), Export>>,
+    /// (file, name, depth) → what it exports under it, from that depth.
+    exports: Mutex<HashMap<(String, String, u8), Export>>,
 }
 
 /// How many re-exports deep a barrel is followed (`index.ts` → `lib/index.ts`
@@ -469,23 +619,63 @@ impl RepoIndex {
     }
 
     fn module_uncached(&self, from: &str, spec: &str) -> Module {
+        let package = || {
+            if self.is_package(from, spec) {
+                Module::External
+            } else {
+                Module::Unknown
+            }
+        };
         match TsConfig::specifier(self.ts.as_ref(), from, spec) {
-            Specifier::Package => Module::External,
+            Specifier::Package => package(),
             Specifier::Paths { bases, alias } => {
                 for b in &bases {
                     if let Some(p) = probes(b).into_iter().find(|p| self.files.contains_key(p)) {
                         return Module::Repo(p);
                     }
                 }
-                // A miss under `baseUrl` is a package; a relative path or an
-                // alias is the repository's, just not found.
+                // A relative path or an alias is the repository's, just not
+                // found; a miss under `baseUrl` may be a package.
                 if alias || spec.starts_with('.') {
                     Module::Unknown
                 } else {
-                    Module::External
+                    package()
                 }
             }
         }
+    }
+
+    /// Whether a bare specifier written in `from` names a package, with
+    /// evidence (DD-9): a Node builtin, or a dependency of the root
+    /// `package.json` or of the nearest one above `from` — and no workspace
+    /// package of the repository has that name.
+    fn is_package(&self, from: &str, spec: &str) -> bool {
+        if let Some(rest) = spec.strip_prefix("node:") {
+            return !rest.is_empty();
+        }
+        let name = package_name(spec);
+        if NODE_BUILTINS.contains(&spec) || NODE_BUILTINS.contains(&name) {
+            return true;
+        }
+        if self
+            .manifests
+            .iter()
+            .any(|m| m.name.as_deref() == Some(name))
+        {
+            return false;
+        }
+        let dir = dir_of(from);
+        let nearest = self
+            .manifests
+            .iter()
+            .filter(|m| m.dir.is_empty() || dir == m.dir || dir.starts_with(&format!("{}/", m.dir)))
+            .max_by_key(|m| m.dir.len());
+        let declares = |m: &Manifest| m.deps.binary_search_by(|d| d.as_str().cmp(name)).is_ok();
+        self.manifests
+            .iter()
+            .filter(|m| m.dir.is_empty())
+            .chain(nearest)
+            .any(declares)
     }
 
     /// Every path a specifier may name (for the incremental selection).
@@ -516,7 +706,10 @@ impl RepoIndex {
     fn defined_in_repo(&self, name: &str) -> bool {
         self.by_name.get(name).into_iter().flatten().any(|&i| {
             let s = &self.syms[i];
-            self.is_script(&s.file) && self.files.get(&s.file).and_then(|f| f.id) == s.parent_id
+            // Not exported: no import, from anywhere, can be it.
+            s.exported != Some(false)
+                && self.is_script(&s.file)
+                && self.files.get(&s.file).and_then(|f| f.id) == s.parent_id
         })
     }
 
@@ -524,12 +717,10 @@ impl RepoIndex {
     /// re-export, or one of its `export *` (TypeScript's rules: a name two
     /// `export *` give is not exported).
     fn export_of(&self, file: &str, name: &str, depth: u8) -> Export {
-        // Only a walk from the top is memoised: one cut by the depth cap
-        // answers for its depth.
-        if depth > 0 {
-            return self.export_walk(file, name, depth);
-        }
-        let key = (file.to_string(), name.to_string());
+        // Memoised by depth too: a walk cut by the depth cap answers only
+        // for its depth, and with it a fan-out of `export *` costs each
+        // (file, name, depth) once instead of F^depth.
+        let key = (file.to_string(), name.to_string(), depth);
         if let Some(e) = self
             .ts_cache
             .exports
@@ -539,7 +730,7 @@ impl RepoIndex {
         {
             return e;
         }
-        let e = self.export_walk(file, name, 0);
+        let e = self.export_walk(file, name, depth);
         if let Ok(mut c) = self.ts_cache.exports.lock() {
             c.insert(key, e);
         }
@@ -652,7 +843,7 @@ impl RepoIndex {
             return match self.imported(file, first) {
                 Some(Imported::Module(f)) => match self.export_of(&f, leaf(rest), 0) {
                     Export::Found(i, sure) if is_type(&self.syms[i].kind) => {
-                        TypeRef::Repo(i, if sure { "import" } else { "unique_name" })
+                        TypeRef::Repo(i, if sure { "import" } else { IMPORT_WEAK })
                     }
                     Export::External => TypeRef::External,
                     _ => TypeRef::Unknown,
@@ -667,7 +858,7 @@ impl RepoIndex {
         }
         match self.imported(file, name) {
             Some(Imported::Sym(i, sure)) if is_type(&self.syms[i].kind) => {
-                return TypeRef::Repo(i, if sure { "import" } else { "unique_name" });
+                return TypeRef::Repo(i, if sure { "import" } else { IMPORT_WEAK });
             }
             Some(Imported::External) => return TypeRef::External,
             _ => {}
@@ -691,9 +882,17 @@ impl RepoIndex {
 
     /// `f()` in TypeScript/JavaScript: a function of an enclosing scope of
     /// the file (never a class member: there is no implicit `this`), an
-    /// import, a platform global; then by name (rules 7-9).
-    pub(super) fn script_bare(&self, c: &Call<'_>) -> Outcome {
-        for anc in self.chain(c.src) {
+    /// import, a platform global; then by name (rules 7-9). `scoped`: the
+    /// parse saw a function of that name in scope (hint `bare`); without it
+    /// (hint `free`) no enclosing function's own is looked at — a function
+    /// bound in a sibling block is not in scope.
+    pub(super) fn script_bare(&self, c: &Call<'_>, scoped: bool) -> Outcome {
+        let ancestors = if scoped {
+            self.chain(c.src)
+        } else {
+            Vec::new()
+        };
+        for anc in ancestors {
             let s = &self.syms[anc];
             if is_type(&s.kind) {
                 continue;
@@ -719,7 +918,7 @@ impl RepoIndex {
                 return self.member_hit(m, false, exact, "same_file");
             }
         }
-        if c.src.is_none() {
+        if c.src.is_none() || !scoped {
             if let Some(&t) = self
                 .top_level(c.file, c.callee)
                 .iter()
@@ -737,8 +936,13 @@ impl RepoIndex {
                 };
             }
             Some(Imported::External) => return external("external_known"),
-            Some(Imported::Sym(..)) | Some(Imported::Module(_)) => return undecided(),
-            Some(Imported::Unknown) | None => {}
+            // Imported from somewhere that cannot be followed (or from a
+            // package, of a name a repository file also defines): never a
+            // guess by name (TASK-006 review, M1).
+            Some(Imported::Sym(..)) | Some(Imported::Module(_)) | Some(Imported::Unknown) => {
+                return undecided()
+            }
+            None => {}
         }
         self.by_name_only(c.callee, c.file, c.args)
     }
@@ -862,22 +1066,34 @@ impl RepoIndex {
         if written.is_empty() {
             return out;
         }
+        // Every path each file's specifiers may name, computed once: the
+        // rounds below only look them up.
+        let reach: Vec<(&String, Vec<String>, bool)> = self
+            .files
+            .iter()
+            .filter(|(_, info)| !info.script.is_empty())
+            .map(|(file, info)| {
+                let mut paths: Vec<String> = info
+                    .script
+                    .iter()
+                    .flat_map(|imp| self.spec_paths(file, &imp.spec))
+                    .collect();
+                paths.sort();
+                paths.dedup();
+                (file, paths, info.script.iter().any(|i| i.reexport))
+            })
+            .collect();
         let mut frontier: HashSet<String> = written.clone();
         for _ in 0..=BARREL_DEPTH {
             let mut next = HashSet::new();
-            for (file, info) in &self.files {
-                if info.script.is_empty() || out.contains(file) {
+            for (file, paths, reexports) in &reach {
+                if out.contains(*file) {
                     continue;
                 }
-                let hit = info.script.iter().any(|imp| {
-                    self.spec_paths(file, &imp.spec)
-                        .iter()
-                        .any(|p| frontier.contains(p))
-                });
-                if hit {
-                    out.insert(file.clone());
-                    if info.script.iter().any(|i| i.reexport) {
-                        next.insert(file.clone());
+                if paths.iter().any(|p| frontier.contains(p)) {
+                    out.insert((*file).clone());
+                    if *reexports {
+                        next.insert((*file).clone());
                     }
                 }
             }
@@ -893,6 +1109,22 @@ impl RepoIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bom_and_an_extends_array_are_read() {
+        let cfg = TsConfig::parse(
+            "\u{feff}{ \"compilerOptions\": { \"baseUrl\": \".\" } }",
+            "",
+        )
+        .expect("a BOM is skipped");
+        assert_eq!(cfg.base_url.as_deref(), Some(""));
+        let (files, packages) =
+            TsConfig::extends_of(r#"{ "extends": ["./a.json", "@tsconfig/node20", "../b"] }"#);
+        assert_eq!(files, ["./a.json", "../b"]);
+        assert_eq!(packages, ["@tsconfig/node20"]);
+        assert_eq!(package_name("@scope/name/sub"), "@scope/name");
+        assert_eq!(package_name("rxjs/operators"), "rxjs");
+    }
 
     #[test]
     fn jsonc_is_made_json() {

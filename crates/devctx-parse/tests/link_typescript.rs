@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use devctx_parse::resolve::link::{link_rows, LinkEdge, Outcome, RepoIndex, Resolved};
-use devctx_parse::resolve::typescript::TsConfig;
+use devctx_parse::resolve::typescript::{Manifest, ScriptEnv, TsConfig};
 use devctx_parse::{detect_lang, parse};
 
 const ROOT: &str = "tests/fixtures/ts";
@@ -41,6 +41,11 @@ fn config() -> Option<TsConfig> {
     TsConfig::parse(&text, "")
 }
 
+fn manifest() -> Manifest {
+    let text = std::fs::read_to_string(root().join("package.json")).unwrap();
+    Manifest::parse(&text, "").unwrap()
+}
+
 fn linked_with(cfg: Option<TsConfig>) -> Linked {
     let root = root();
     let mut files = Vec::new();
@@ -65,7 +70,14 @@ fn linked_with(cfg: Option<TsConfig>) -> Linked {
         .map(|s| (s.id, (s.qualified.clone(), s.file.clone())))
         .collect();
     Linked {
-        index: RepoIndex::with_ts_config(symbols.clone(), &edges, cfg),
+        index: RepoIndex::with_script_env(
+            symbols.clone(),
+            &edges,
+            ScriptEnv {
+                tsconfig: cfg,
+                manifests: vec![manifest()],
+            },
+        ),
         edges,
         names,
         symbols,
@@ -465,4 +477,75 @@ fn a_tsconfig_with_comments_is_read() {
     assert_eq!(nested.base_url.as_deref(), Some("web/src"));
     assert_eq!(nested.fingerprint(), nested.clone().fingerprint());
     assert_ne!(nested.fingerprint(), cfg.fingerprint());
+}
+
+/// TASK-006 review, M1: a name imported from a package that a repository file
+/// also defines is not that file's (no `unique_name` guess): undecided.
+#[test]
+fn a_package_import_is_never_a_repository_homonym() {
+    let l = linked();
+    assert_eq!(
+        l.call("usePackage", "formatName"),
+        (None, None, "low", "name_only", false)
+    );
+}
+
+/// TASK-006 review, M2: a package is external only with evidence — a
+/// dependency of a `package.json`, or a Node builtin. An unmapped alias
+/// (`@app/...`, an app's own `tsconfig` that is not read) or a module no
+/// manifest declares is undecided, never external.
+#[test]
+fn a_package_needs_a_manifest_or_a_node_builtin() {
+    let l = linked();
+    assert_eq!(
+        l.call("usePackage", "selectUser"),
+        (None, None, "low", "name_only", false)
+    );
+    assert_eq!(
+        l.call("usePackage", "Widget.render"),
+        (None, None, "low", "name_only", false)
+    );
+    assert_eq!(
+        l.call("usePackage", "readFileSync"),
+        (None, None, "high", "external_known", true)
+    );
+    assert_eq!(
+        l.call("usePackage", "of"),
+        (None, None, "high", "external_known", true)
+    );
+    assert_eq!(
+        l.import("apps/shell/src/app/use-package.ts", "@app/auth/reducers#*"),
+        (None, None, "low", "name_only", false)
+    );
+}
+
+/// TASK-006 review, m5: only Angular's `inject` injects; a local helper of
+/// that name types nothing.
+#[test]
+fn only_angulars_inject_injects() {
+    let l = linked();
+    assert_eq!(
+        l.call("useLocal", "token"),
+        (None, None, "low", "name_only", false)
+    );
+}
+
+/// TASK-006 review (NIT): a function bound in a block is not in scope in a
+/// sibling block or after it: the module's function of that name is.
+#[test]
+fn a_block_local_function_does_not_shadow_outside_its_block() {
+    let l = linked();
+    let calls: Vec<Shown> = l
+        .all("calls", "outer", "cb")
+        .iter()
+        .map(|o| l.show(o))
+        .collect();
+    let blocks = "apps/shell/src/app/blocks.ts";
+    assert_eq!(
+        calls,
+        [
+            (s("outer.cb"), s(blocks), "high", "same_file", false),
+            (s("cb"), s(blocks), "high", "same_file", false),
+        ]
+    );
 }

@@ -157,6 +157,10 @@ pub struct Binding {
     /// property, a field assigned from a constructor parameter): what `this.x`
     /// reads, and — in a language with an implicit `this` (Java) — a bare `x`.
     pub member: bool,
+    /// A function of the file bound to the name (TypeScript/JavaScript: a
+    /// `function f` — hoisted, so in scope from the start of its scope — or
+    /// a `const f = () => …`): calling the name calls that symbol.
+    pub func: bool,
 }
 
 /// The bindings of a file, by scope.
@@ -193,6 +197,7 @@ impl Scopes {
         lang: Lang,
         query: Option<&Query>,
         resolver: &dyn LangResolver,
+        injects: bool,
     ) -> Self {
         let mut out = Self {
             by_scope: HashMap::new(),
@@ -232,14 +237,40 @@ impl Scopes {
                 _ => Via::Local,
             };
             let member = matches!(role, Some("field") | Some("inject"));
-            // A function or class value is a symbol of its own (`const f =
-            // () => …`), not a variable whose type something says.
-            if init.is_some_and(|i| {
+            // A function bound to the name: a `function f` (hoisted: in scope
+            // from the start of the scope around its declaration) or a
+            // `const f = () => …` (from its declaration; anywhere in the
+            // module's own scope, which closures read later). Its type is
+            // no type: the name is a symbol of its own.
+            let func_value = init.is_some_and(|i| {
                 matches!(
                     i.kind(),
                     "arrow_function" | "function_expression" | "generator_function" | "class"
                 )
-            }) {
+            });
+            if role == Some("func") || func_value {
+                let scope = match name_node.parent() {
+                    Some(def) if role == Some("func") => out.scope_of(def, lang),
+                    _ => out.scope_of(name_node, lang),
+                };
+                let at = if role == Some("func") || scope == out.root {
+                    0
+                } else {
+                    name_node
+                        .parent()
+                        .map_or(name_node.start_byte(), |p| p.start_byte())
+                };
+                out.push(
+                    scope,
+                    Binding {
+                        name: text.to_string(),
+                        ty: None,
+                        via,
+                        at,
+                        member,
+                        func: true,
+                    },
+                );
                 continue;
             }
             let at = name_node
@@ -268,6 +299,7 @@ impl Scopes {
                         via,
                         at,
                         member,
+                        func: false,
                     },
                 );
                 continue;
@@ -300,8 +332,11 @@ impl Scopes {
                 });
             let (ty, via) = match inferred {
                 Some((t, Via::Static)) => (Some(t), Via::Static),
-                // `inject(T)` (Angular): injected, a field or a local.
-                Some((t, Via::CtorInject)) => (Some(t), Via::CtorInject),
+                // `inject(T)`: injected, a field or a local — only when the
+                // file imports Angular's `inject` (a local helper of that
+                // name injects nothing).
+                Some((t, Via::CtorInject)) if injects => (Some(t), Via::CtorInject),
+                Some((_, Via::CtorInject)) => (None, p.via),
                 Some((t, _)) => (Some(t), p.via),
                 None => (None, p.via),
             };
@@ -313,6 +348,7 @@ impl Scopes {
                     via,
                     at: p.at,
                     member: p.member,
+                    func: false,
                 },
             );
         }
@@ -361,6 +397,7 @@ impl Scopes {
                 via: Via::CtorInject,
                 at: p.at,
                 member: true,
+                func: false,
             },
         );
     }
@@ -406,6 +443,13 @@ impl Scopes {
         self.by_scope
             .get(&self.root)
             .and_then(|bs| pick(bs, name, use_at, self.implicit_this))
+    }
+
+    /// Whether `b` is bound in the file's own scope (the module).
+    pub fn at_top_level(&self, b: &Binding) -> bool {
+        self.by_scope
+            .get(&self.root)
+            .is_some_and(|v| v.iter().any(|x| std::ptr::eq(x, b)))
     }
 
     /// Whether a bare name can be a member of the enclosing class (Java).

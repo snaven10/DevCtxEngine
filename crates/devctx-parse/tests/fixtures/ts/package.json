@@ -1,0 +1,14 @@
+{
+  "name": "acme-workspace",
+  "private": true,
+  "dependencies": {
+    "@angular/core": "^18.0.0",
+    "@angular/common": "^18.0.0",
+    "acme-sdk": "^1.0.0",
+    "express": "^4.0.0",
+    "rxjs": "^7.8.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  }
+}

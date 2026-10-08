@@ -41,6 +41,9 @@ pub struct LinkSymbol {
     pub package: Option<String>,
     /// The head of the definition (a return type, a field's type, an arity).
     pub signature: Option<String>,
+    /// Visible outside its module (`export`, `public`…); `None` when the
+    /// language says nothing.
+    pub exported: Option<bool>,
 }
 
 /// One occurrence to resolve.
@@ -194,6 +197,8 @@ pub struct RepoIndex {
     ambiguous: HashSet<usize>,
     /// The workspace's `tsconfig` (TypeScript `baseUrl`/`paths`).
     pub(super) ts: Option<TsConfig>,
+    /// The workspace's `package.json` files: what a package is (DD-9).
+    pub(super) manifests: Vec<crate::resolve::typescript::Manifest>,
     pub(super) ts_cache: crate::resolve::typescript::TsCache,
 }
 
@@ -219,6 +224,11 @@ pub(super) fn is_callable(kind: &str) -> bool {
     kind_class(kind) == "callable"
 }
 
+/// How a TypeScript type found through an import that could not be followed
+/// for sure (a default import by its local name, a barrel branch not
+/// followed) is labelled: `import`, never surer than `medium`.
+pub(super) const IMPORT_WEAK: &str = "import_weak";
+
 /// The last segment of a destination (`a.b.C.m` → `m`, `x::y` → `y`).
 pub(super) fn leaf(name: &str) -> &str {
     let after_colons = name.rsplit("::").next().unwrap_or(name);
@@ -229,16 +239,32 @@ impl RepoIndex {
     /// Index `symbols`; `facts` brings each file's `imports` and each type's
     /// `inherits`/`implements` (every other edge in it is ignored).
     pub fn new(symbols: Vec<LinkSymbol>, facts: &[LinkEdge]) -> Self {
-        Self::with_ts_config(symbols, facts, None)
+        Self::with_script_env(symbols, facts, Default::default())
     }
 
-    /// [`RepoIndex::new`] with a workspace's `tsconfig`, which TypeScript
-    /// and JavaScript imports resolve aliases and `baseUrl` paths through
-    /// (PLAN-009 TASK-006); `None`: relative imports only.
+    /// [`RepoIndex::new`] with only a `tsconfig` (no `package.json`: no
+    /// package has evidence, DD-9).
     pub fn with_ts_config(
         symbols: Vec<LinkSymbol>,
         facts: &[LinkEdge],
         ts: Option<TsConfig>,
+    ) -> Self {
+        Self::with_script_env(
+            symbols,
+            facts,
+            crate::resolve::typescript::ScriptEnv {
+                tsconfig: ts,
+                manifests: Vec::new(),
+            },
+        )
+    }
+
+    /// [`RepoIndex::new`] with a TypeScript/JavaScript workspace's
+    /// `tsconfig` and `package.json` files (PLAN-009 TASK-006).
+    pub fn with_script_env(
+        symbols: Vec<LinkSymbol>,
+        facts: &[LinkEdge],
+        env: crate::resolve::typescript::ScriptEnv,
     ) -> Self {
         let mut idx = Self {
             syms: symbols,
@@ -251,7 +277,8 @@ impl RepoIndex {
             fq_types: HashMap::new(),
             supers: HashMap::new(),
             ambiguous: HashSet::new(),
-            ts,
+            ts: env.tsconfig,
+            manifests: env.manifests,
             ts_cache: Default::default(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
@@ -635,7 +662,7 @@ impl RepoIndex {
     /// (`unique_name`) or when two types share its fully qualified name
     /// (two modules), else `high`.
     pub(super) fn type_conf(&self, t: usize, how: &str) -> &'static str {
-        if how == "unique_name" || self.ambiguous.contains(&t) {
+        if how == "unique_name" || how == IMPORT_WEAK || self.ambiguous.contains(&t) {
             "medium"
         } else {
             "high"
@@ -810,7 +837,10 @@ impl RepoIndex {
 
     fn resolve_type_edge(&self, e: &LinkEdge, src: Option<usize>) -> Outcome {
         match self.resolve_type(&e.dst_name, &e.file, src) {
-            TypeRef::Repo(t, how) => cap(hi(t, self, how), self.type_conf(t, how)),
+            TypeRef::Repo(t, how) => {
+                let res = if how == IMPORT_WEAK { "import" } else { how };
+                cap(hi(t, self, res), self.type_conf(t, how))
+            }
             TypeRef::External => external("external_known"),
             TypeRef::Unknown => {
                 let simple = leaf(&e.dst_name);
@@ -914,6 +944,7 @@ impl RepoIndex {
             ["chain", ..] => self.untyped(c),
             ["path"] => self.path_call(c, e),
             ["bare"] => self.any_bare(c),
+            ["free"] => self.script_bare(c, false),
             // A row with no hint (written before hints): qualified → as a
             // name, bare → as a bare call.
             _ => match e.dst_name.rsplit_once('.') {
@@ -996,7 +1027,7 @@ impl RepoIndex {
     /// A call without a receiver, by the file's language.
     fn any_bare(&self, c: &Call<'_>) -> Outcome {
         if self.is_script(c.file) {
-            self.script_bare(c)
+            self.script_bare(c, true)
         } else {
             self.bare_call(c)
         }
@@ -1517,6 +1548,7 @@ pub fn link_rows(file: &str, pf: &ParsedFile) -> (Vec<LinkSymbol>, Vec<LinkEdge>
             qualified: s.qualified.clone(),
             package: package.clone(),
             signature: (!s.signature.is_empty()).then(|| s.signature.clone()),
+            exported: s.exported,
         })
         .collect();
     let edge = |kind: &str, src_id: u64, dst: &str, hint: Option<String>, line: u32| LinkEdge {
