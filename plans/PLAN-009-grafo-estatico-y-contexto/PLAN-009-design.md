@@ -453,6 +453,31 @@ los símbolos y las aristas salvo `contains`), elige qué re-resolver y escribe:
   dura el pase (por archivo, transacción + scan costaban 10 ms: 14,1 → 2,5 s en backend-a).
 - Medido en backend-a: pase completo 2,6 s, incremental de un archivo 0,47 s, `VmHWM` +114 MiB.
 
+**Implementado en TASK-007** (Python, Rust, Go):
+- *Entorno:* el fingerprint de `index_meta.link_tsconfig` y el entorno guardado en
+  `index_meta.link_script_env` (las claves conservan su nombre de TASK-006) cubren ahora todo el
+  `LinkEnv` (`resolve/env.rs`): el entorno TS/JS, cada `Cargo.toml` (crate del workspace por `[lib]
+  name` o `[package] name`, claves de sus tablas de dependencias), cada `go.mod` (`module`,
+  `require`, `replace` local) y cada `pyproject.toml`/`setup.cfg`/`requirements*.txt` (nombres de
+  import de lo declarado, best effort). Un manifest cambiado relinkea la rama entera; uno ilegible
+  toma su última versión buena **por ruta** y nada más (`devctx-index/src/env.rs`); los de
+  `target/`, `vendor/`, `dist/`, `.venv/` y similares no cuentan. Un entorno solo TS/JS da el mismo
+  JSON y el mismo fingerprint que antes, y el guardado de TASK-006 se lee como `LinkEnv`.
+- *Modo (d)* también para Python (todo módulo reexporta lo que importa: los importadores de un
+  importador, hasta 4 niveles) y Rust (archivos cuyo `use` nombra el módulo de un archivo escrito,
+  propagando por los que tienen `pub use`). Go no lo necesita: un import nombra un directorio, y lo
+  que cambia en él lo ven los nombres (modo b) y el `go.mod` (entorno).
+- *Escenarios* nuevos en `an_incremental_link_pass_equals_a_full_one`, cada uno verificado fallando
+  sin su regla: un `__init__.py` que reexporta, un `requirements.txt` que declara un paquete, un
+  `pub use` de la raíz del crate, un `Cargo.toml` que agrega un crate al workspace y un `go.mod` que
+  renombra el `module`.
+- *La clave `#` del modo (b)* para las filas `imports` de script (`dst_key`) queda como defensa;
+  desde que un paquete declarado es siempre external (mi2 de TASK-006), ningún escenario la detecta
+  sola, porque la respuesta de una fila de import depende solo del módulo, y eso ya lo cubren el
+  modo (d) y el fingerprint del entorno. No quitarla.
+- Medido: ver el Resultado de TASK-007 (pase completo de este repo ~0,2-0,3 s; incremental de un
+  archivo muy nombrado, del mismo orden, porque `new`/`get`/`open` reabren media rama por nombre).
+
 **Memoria.** `RepoIndex` de frontend (2133 archivos): estimación < 100 MB (strings +
 `HashMap`s); TASK-005 lo mide con el método de PLAN-010 y es criterio de aceptación (master §6).
 
@@ -586,6 +611,44 @@ revisión):
   `implements` de una interfaz externa no vuelve externo a un miembro ausente. Sin tipar campo por
   campo los receptores `member`. Medido: ver el Resultado de TASK-006.
 
+**Implementado en TASK-007** (Python, Rust y Go; `resolve/{python,rust,go}.rs`, el entorno en
+`resolve/env.rs`):
+- *Común:* `scopes` y `types` con roles en los tres; un nombre pelado nunca es miembro
+  (`implicit_this` falso) y un atributo de `self` que ningún scope liga es `member x this`, tipado
+  por la declaración del campo en Rust y Go (`fields_by_link`). Un binding cuyo valor es una llamada
+  guarda lo que devuelve (`typed <via> make()`, `Store.open()?` en Rust): el link lo tipa por el
+  símbolo llamado — una clase o struct (su instancia), una función con tipo de retorno declarado
+  (`Self` es el tipo de su `impl`, `?`/`.unwrap()` desenvuelven `Result`/`Option`), algo de afuera
+  (`FromExternalCall`: como tras una llamada externa, `chain_external` `medium` si el nombre no
+  está en el repo; el `T::new()` de un tipo externo, `medium`). De varios patrones que capturan un
+  mismo nombre en un mismo scope gana el primero del JSON. Un import que no se puede seguir, o un
+  nombre que el lenguaje no ve, queda sin decidir: **nunca** `unique_name` contra un homónimo; un
+  paquete o crate declarado es externo aunque el repo tenga un homónimo.
+- *Python:* módulos por ruta (`x.py`, `x/__init__.py`, `x.pyi`, directorio sin `__init__`),
+  relativos al paquete; absolutos desde la carpeta del script (si no es paquete), la raíz, `src/` y
+  la de cada manifest; un nombre de un módulo es lo que define o lo que importa (reexporte, 4
+  niveles), o su submódulo si es paquete; `import *`. Llamada pelada: función anidada en scope, del
+  módulo, importada, de un `import *`, builtin; una clase llamada es su instanciación (destino: la
+  clase). `self.x = v` en un método tipa el atributo (`ctor_inject` desde un parámetro tipado de
+  `__init__`); dos asignaciones que no coinciden lo dejan sin tipo. Externo: `platform_modules`
+  (stdlib), `builtins`, o un paquete declarado. Una cadena se tipa por la anotación de retorno.
+  Python no declara campos: `self.a.b()` sin tipo.
+- *Rust:* crates por `Cargo.toml`; módulos por ruta bajo `src/` (`lib.rs`, `main.rs`, `mod.rs`
+  nombran su directorio; tests, ejemplos y `src/bin/` son raíz propia) y por `mod` inline; `use`
+  con su scope de módulo (el `use super::*` de un `mod tests` es de ese `mod`); `crate::`, `self::`,
+  `super::`, `Self::`; `pub use` hasta 4 niveles; globs. Los `impl` de un tipo, en cualquier archivo
+  de su crate, son sus hijos (dueño por resolución del nombre del `impl`, o el único tipo homónimo
+  del crate) e `impl Trait for T` le da el supertipo; un método de trait sin cuerpo es símbolo. Una
+  llamada por path (`path <prefijo>`): función asociada de un tipo (una variante de enum: el enum),
+  función de un módulo. Externo: `std`/`core`/`alloc` (`platform_modules`), el prelude (`builtins`)
+  o un crate que declara el `Cargo.toml` del archivo (o el del workspace). Un método derivable que
+  falta en un tipo del repo (`clone`, `default`, `to_string`…) es externo `medium` (`inherited`).
+  Macros (`format!`, `vec!`, `#[tokio::main]`) no son llamadas.
+- *Go:* paquete = directorio (y su cláusula `package`); un import bajo el `module` de un `go.mod`
+  (o un `replace` local) es del repo; uno cuyo primer segmento no tiene punto, la stdlib; cualquier
+  otro, otro módulo cuando hay `go.mod` (sin `go.mod`, sin decidir). El receptor es `this`; un
+  método en otro archivo del paquete tiene el tipo como dueño.
+
 ## DD-8 — `confidence` y `resolution`
 
 - `confidence` es **ordinal y de tres valores** (high/medium/low), no un float: nadie sabe calibrar
@@ -600,6 +663,12 @@ revisión):
   al **campo** (kind `field`) desde una arista `calls`, `medium`: quien lea aristas `calls` no debe
   suponer que el destino es invocable. Externos con evidencia indirecta y todo lo derivado de un
   `unique_name` o de un tipo ambiguo salen `medium`.
+- TASK-007: una llamada a una clase de Python (o a una variante de enum de Rust) se resuelve con
+  `dst_id` apuntando a la **clase** (o al enum) desde una arista `calls`; un método derivable de
+  Rust que falta en el tipo es `inherited` + `external` `medium`; un receptor que vale lo que
+  devuelve una llamada externa sigue las reglas de la cadena tras una externa (`chain_external`
+  `medium`), y el de una llamada a una función del repo con retorno declarado sale `return_type`
+  o con la etiqueta del binding (`local`, `field`).
 - `structural` es el valor de `contains` (DD-6), escrito al parsear: no es una regla de DD-7 y no
   pisa `same_file`, que es de la regla 6. El arnés no lo cuenta: `calls_por_confianza` filtra
   `kind = 'calls'` y `score.py` lee `graph_edges` (solo llamadas).
@@ -615,7 +684,11 @@ revisión):
   criterio que ya usa la penalización de PLAN-008. `symbols.is_test` igual.
 - Las listas de plataforma (JDK, builtins de Python, `std`/`core` de Rust, `fmt`/stdlib de Go,
   globals de JS/DOM) viven en el JSON del lenguaje (`platform_prefixes`, `builtins`) para que las
-  cubra el fingerprint.
+  cubra el fingerprint. TASK-007 agrega `platform_modules` (módulos de primer nivel de la plataforma:
+  la stdlib de Python, `std`/`core`/`alloc`/`proc_macro`/`test` de Rust); la stdlib de Go se
+  reconoce por la regla del lenguaje (primer segmento sin punto). La evidencia de los paquetes de
+  terceros viene de los manifests (`Cargo.toml`, `go.mod`, `pyproject.toml`/`setup.cfg`/
+  `requirements*.txt`), que entran al fingerprint del entorno (DD-6).
 
 ## DD-10 — Los lookups por nombre pasan a la tabla `symbols` (mismos contratos)
 

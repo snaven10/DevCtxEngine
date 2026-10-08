@@ -150,6 +150,48 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   class {…}`) is read as that name: `fn.call()` is now undecided instead of
   discarded, and `Klass.make()` resolves to the method. Two same-named
   functions in sibling blocks resolve at `medium`.
+- **Link environment** (PLAN-009 TASK-007): besides `tsconfig` and
+  `package.json`, every `Cargo.toml`, `go.mod`, `pyproject.toml`, `setup.cfg`
+  and `requirements*.txt` of the branch is read; changing one relinks the
+  branch in full, an unreadable one keeps its last good version (per file)
+  and relinks nothing. Manifests under `target/`, `vendor/`, `dist/`, `.venv/`
+  and similar are ignored.
+- **Python resolution** (PLAN-009 TASK-007, **extractor version 12**, link
+  rules version 7): modules by path and package (`__init__.py`, the
+  repository root, `src/`, a script's own directory), relative imports,
+  re-exports through a package or any module, `import *`; a call to a class
+  is its instantiation; `self.x = …` in a method types the attribute
+  (`ctor_inject` from a typed parameter of `__init__`); `x = Foo()` and
+  `x = make()` type `x` by the class or the return annotation. Parameters,
+  lambda and comprehension variables and loop targets shadow attributes.
+  External only with evidence: the standard library, builtins, or a
+  distribution a manifest declares (also when the repository has a module of
+  that name); a name Python cannot see, or an import that cannot be followed,
+  is undecided — never a guess by name, so some calls that used to resolve by
+  their unique name are now undecided. Calls on untyped receivers to names the
+  repository lacks are discarded (more of them, now that parameters no longer
+  borrow an attribute's type). Measured on a small worker repository: 1.6 % of
+  calls undecided (was 49.2 %), 24 of 25 hand-labelled call sites correct, all
+  of them `high`.
+- **Rust resolution** (PLAN-009 TASK-007, **extractor version 13**, link
+  rules version 8): crates by their `Cargo.toml`, modules by path and inline
+  `mod`, `use` (groups, `self`, aliases, globs) scoped to its module,
+  `crate::`/`self::`/`super::`/`Self::`, `pub use` re-exports; a type's
+  `impl`s in any file of its crate; `impl Trait for T`; fields typed by their
+  declaration (`self.store.open()`), `let x = T::new()?` by the return type;
+  trait methods without a body are symbols. External: `std`/`core`/`alloc`,
+  the prelude, and the crates a manifest declares; a missing derivable method
+  (`clone`, `default`…) is external at `medium`. Macros are not calls. A path
+  call's target drops generic arguments (`Vec::<u8>::new` → `Vec.new`).
+  Measured on this repository: 19.8 % of Rust calls undecided (was 54.1 %),
+  21 of 21 hand-labelled call sites correct, all `high`.
+- **Go resolution** (PLAN-009 TASK-007, **extractor version 14**, link rules
+  version 9): an import under the `module` of `go.mod` (or a local
+  `replace`) is the repository's, the standard library and other modules are
+  external; a method's receiver is `self` (also for a method in another file of
+  the package) and `s.m()` writes `Type.m` to `graph_edges`; fields are typed
+  by their declaration, `x := New()` by the declared result; interface methods
+  are symbols. Covered by fixtures only (no Go repository was measured).
 
 ### Fixed
 

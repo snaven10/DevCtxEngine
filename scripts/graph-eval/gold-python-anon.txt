@@ -1,0 +1,41 @@
+# Gold edges de Python de PLAN-009 TASK-007, ANONIMIZADOS para auditoría (no se pueden correr).
+#
+# Los sitios reales viven fuera del repo (DEVCTX_EVAL_GOLD, Q-5) porque nombran código de un
+# cliente. Esta copia los lista con alias opacos —archivo (FileA, FileB…), clase (ClassA), método
+# (m1, m2…) y función de módulo (f1, f2…), sin rutas ni números de línea—, el caso que muestrea cada
+# uno y el resultado medido sobre la tabla `edges` (línea exacta) con `graph_bench` en un snapshot de
+# `legacy-migration` (23 archivos .py, un paquete con imports relativos, scripts en la raíz y en
+# `scripts/` que importan el paquete, `requirements.txt`): antes = c1922d0 (TASK-006 cerrada),
+# ahora = TASK-007 (EXTRACTOR_VERSION 14, LINK_VERSION 9). Los 6 primeros son los de TASK-001
+# re-anclados al commit medido; los otros 19 se etiquetaron en TASK-007 leyendo el código ANTES de
+# medir. Los nombres de librerías públicas (logging, PyYAML, la stdlib) se dejan tal cual. FileF
+# tiene el MISMO nombre que un módulo de la stdlib: decide el import relativo.
+#
+# Formato: repo | sitio (alias) | destino esperado (alias) | external? | caso | antes | ahora
+#   resultado: correct / undecided (sin destino ni marca) / missing (sin arista: descartada) +
+#   confidence/resolution de la arista elegida.
+legacy-migration|FileA|f1|-|función del mismo archivo|correct high/same_file|correct high/same_file
+legacy-migration|FileA|FileB.f2|-|`from . import mod` y `mod.f()`|undecided low/name_only|correct high/import
+legacy-migration|FileA|FileC.f3|-|`from .mod import f` (relativo)|correct medium/unique_name|correct high/import
+legacy-migration|FileA|logging.Logger.debug|external|`x = f(...)` a nivel de módulo, con `f` anotada `-> logging.Logger`|undecided low/name_only|correct high/external_known
+legacy-migration|FileA|FileD.f4|-|`from .mod import f`|correct medium/unique_name|correct high/import
+legacy-migration|FileA|FileE.f5|-|`from . import mod` y `mod.f()`|undecided low/name_only|correct high/import
+legacy-migration|FileA|FileF.f6|-|`from . import mod` de un módulo homónimo de la stdlib|undecided low/name_only|correct high/import
+legacy-migration|FileA|ClassA.m1|-|parámetro sin tipo que recibe una instancia de ClassA|undecided low/name_only|undecided low/name_only
+legacy-migration|FileA|dict.get|external|constante de módulo inicializada con un dict literal|undecided low/name_only|correct high/external_known
+legacy-migration|FileA|f7|-|función del mismo archivo|correct high/same_file|correct high/same_file
+legacy-migration|FileA|dict.get|external|parámetro anotado `dict`|correct high/external_known|correct high/external_known
+legacy-migration|FileG|ClassA|-|llamada a una clase importada (instanciación)|undecided low/name_only|correct high/import
+legacy-migration|FileG|ClassA.m2|-|`x = ClassA(...)` y `x.m()`|undecided low/name_only|correct high/local
+legacy-migration|FileG|sys.exit|external|llamada a nivel de módulo bajo `if __name__ == "__main__"`|correct high/external_known|correct high/external_known
+legacy-migration|FileG|f8|-|ídem, función del mismo archivo|correct high/same_file|correct high/same_file
+legacy-migration|FileG|yaml.safe_load|external|paquete declarado en requirements.txt (PyYAML → yaml)|undecided low/name_only|correct high/external_known
+legacy-migration|FileG|FileA.f9|-|`from .mod import f`|correct medium/unique_name|correct high/import
+legacy-migration|FileC|ClassA.m3|-|`self.m()`|correct high/self|correct high/self
+legacy-migration|FileC|f10|-|función del mismo archivo|correct high/same_file|correct high/same_file
+legacy-migration|FileC|dict.get|external|`self.x = param` en `__init__` con `param: dict` (ctor_inject)|correct high/external_known|correct high/external_known
+legacy-migration|FileG|socket.gethostname|external|módulo de la stdlib|undecided low/name_only|correct high/external_known
+legacy-migration|FileG|FileF.f11|-|`from . import mod` (homónimo de la stdlib)|undecided low/name_only|correct high/import
+legacy-migration|FileH|ClassA.m2|-|script en la raíz: `x = ClassA(...)` a nivel de módulo y `x.m()`|undecided low/name_only|correct high/local
+legacy-migration|FileH|FileA.f9|-|script en la raíz: import absoluto del paquete|correct medium/unique_name|correct high/import
+legacy-migration|FileH|FileG.f12|-|ídem, otra función|correct medium/unique_name|correct high/import

@@ -1,4 +1,7 @@
-# Gold edges de Rust (PLAN-009 TASK-001, DD-1). Etiquetados a mano contra ecce342, antes de medir.
+# Gold edges de Rust (PLAN-009 TASK-001, DD-1). Los 6 primeros, etiquetados a mano contra ecce342 antes
+# de medir; re-anclados a c1922d0 (TASK-007, mismas llamadas) y ampliados a 21 con 15 sitios de
+# TASK-007 (use entre crates y pub use, Self::, impl en otro archivo, campo y valor tipados, trait
+# por dyn/Arc, super:: desde mod tests, cadena con ?, crates declarados y std), etiquetados antes de medir.
 #
 # Formato:  repo | archivo:línea | destino calificado esperado | external? | archivo del destino (opcional)
 #   - destino: `Tipo.metodo` (el `::` de Rust se escribe `.`), o la función suelta si no tiene tipo.
@@ -11,3 +14,18 @@ DevCtxEngine|crates/devctx-core/src/fallback.rs:49|CudaFallback.switch_to_cpu|-|
 DevCtxEngine|crates/devctx-mcp/src/state.rs:294|Store.open|-|crates/devctx-store/src/store.rs
 DevCtxEngine|crates/devctx-summarize/src/extractive.rs:85|EmbeddingProvider.embed|-|crates/devctx-embed/src/provider.rs
 DevCtxEngine|crates/devctx-summarize/src/extractive.rs:73|split_sentences|-|crates/devctx-summarize/src/extractive.rs
+DevCtxEngine|crates/devctx-cli/src/watch.rs:154|from_str|external|
+DevCtxEngine|crates/devctx-api/src/central.rs:118|spawn|external|
+DevCtxEngine|crates/devctx-cli/src/models.rs:223|select|-|crates/devctx-cli/src/prompt_ui.rs
+DevCtxEngine|crates/devctx-core/src/modelload.rs:96|model_cache_dir|-|crates/devctx-core/src/dirs.rs
+DevCtxEngine|crates/devctx-embed/src/local.rs:296|embed_in_series|-|crates/devctx-embed/src/local.rs
+DevCtxEngine|crates/devctx-parse/src/symbol_id.rs:49|resolver_for|-|crates/devctx-parse/src/resolve/mod.rs
+DevCtxEngine|crates/devctx-parse/src/symbol_id.rs:49|LangResolver.package_from_path|-|crates/devctx-parse/src/resolve/mod.rs
+DevCtxEngine|crates/devctx-index/src/link.rs:215|Store.branch_symbols|-|crates/devctx-store/src/symbols.rs
+DevCtxEngine|crates/devctx-index/src/link.rs:332|RepoIndex.resolve|-|crates/devctx-parse/src/resolve/link.rs
+DevCtxEngine|crates/devctx-index/src/link.rs:292|HashMap.new|external|
+DevCtxEngine|crates/devctx-index/src/pipeline.rs:1207|Store.save_file_state|-|crates/devctx-store/src/state.rs
+DevCtxEngine|crates/devctx-index/src/pipeline.rs:513|load|-|crates/devctx-index/src/tsconfig.rs
+DevCtxEngine|crates/devctx-index/src/pipeline.rs:624|link_branch|-|crates/devctx-index/src/link.rs
+DevCtxEngine|crates/devctx-embed/src/provider.rs:16|EmbeddingProvider.embed|-|crates/devctx-embed/src/provider.rs
+DevCtxEngine|crates/devctx-embed/src/provider.rs:79|EmbeddingProvider.embed|-|crates/devctx-embed/src/provider.rs
