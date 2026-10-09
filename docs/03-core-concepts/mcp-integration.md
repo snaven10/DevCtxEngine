@@ -162,7 +162,7 @@ and delete the file).
 | `search` | *Where is the code about X?* Modes: `vector` (default), `keyword` (BM25), `hybrid` (RRF). Filters: `language`, `kind`, `include_tests`; see [Search](search.md) |
 | `read_file` | The file, optionally a 1-based inclusive line range |
 | `read_symbol` | A symbol's definition, code, file, line range and kind — when you know the name. A miss answers with `suggestions` and, for library calls, `external: true` |
-| `get_references` | Every call site of a symbol |
+| `get_references` | Every reference to a symbol, one per occurrence, with `confidence` and `via`; `min_confidence: "low"` adds the ambiguous ones (see [Symbol graph](symbol-graph.md#get_referencessymbol--who-calls-this)) |
 | `impact_analysis` | Transitive callers (blast radius) and callees |
 | `summarize` | Text down to roughly `max_tokens`, extractive by default so identifiers survive |
 

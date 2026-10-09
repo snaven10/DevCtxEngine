@@ -95,8 +95,30 @@ duplica.
 
 ### `get_references(símbolo)` — ¿quién llama a esto?
 
-Cada sitio de llamada de un símbolo en el código indexado. La respuesta directa
-a *"¿es seguro cambiar esto?"* a un salto.
+Cada referencia a un símbolo en el código indexado — una por ocurrencia, así que
+dos llamadas desde el mismo método son dos referencias. La respuesta directa a
+*"¿es seguro cambiar esto?"* a un salto. `símbolo` es un nombre pelado (`charge`),
+uno calificado (`Card.charge`, `Card::charge`) o `archivo::nombre`
+(`src/pay.rs::charge`).
+
+En un índice hecho por 0.10 o posterior, cada referencia conserva `file`, `line` y
+`source` y agrega:
+
+| Campo | Significado |
+|---|---|
+| `confidence` | `high`, `medium` o `low`: qué tan seguro está el índice de que esta ocurrencia es *esta* definición |
+| `via` | La relación: `calls`, `instantiates`, `references` (un uso de tipo), `imports`, `inherits`, `implements` |
+| `sym` | El id (16 dígitos hex) de la definición referida, cuando resolvió a una |
+| `external` / `test` / `undecided` | Presentes (y `true`) solo cuando la ocurrencia es una llamada a una librería, está en un archivo de test o no se pudo decidir |
+
+**`min_confidence`** (`"high"`, `"medium"` —el default— o `"low"`) fija la
+confianza más baja que se lista. Por defecto se listan `high` y `medium`, y la
+`medium` va marcada por su campo; las referencias ambiguas y las llamadas que el
+índice no pudo decidir quedan afuera y se cuentan en
+`below_confidence: {count, min_confidence, hint}`, nunca se pierden en silencio.
+Con `min_confidence: "low"` se listan, cada una marcada. Para un nombre sin
+definición en el repositorio (una función de librería), la respuesta lista sus
+sitios de llamada externos.
 
 ### `impact_analysis(símbolo)` — radio de impacto
 
@@ -112,6 +134,14 @@ la gente olvida que existe y después lamenta no haber corrido.
 Código, archivo, rango de líneas y tipo. Usalo cuando sabés el nombre y querés
 la cosa misma; usá `search` cuando querés código *sobre una idea*. `limit`
 (default 5) acota las definiciones — un nombre puede estar definido muchas veces.
+El nombre puede ser pelado, calificado (`Card.charge`, `Card::charge`, con su
+paquete o crate adelante) o `archivo::nombre`; `Foo.Bar::baz` es el miembro `baz`
+de `Foo.Bar`, no un archivo.
+
+En un índice hecho por 0.10 o posterior cada definición trae además `sym` (su id,
+16 dígitos hex, el mismo en todas las ramas), `kind` (`function`, `method`,
+`class`, `field`…) y `qualified`. Una definición a la que el chunker no le da
+código propio (un campo, una constante) responde con su firma como `code`.
 
 **Un fallo se explica, no solo viene vacío.** Cuando no se encuentra ninguna
 definición, `read_symbol` agrega:
@@ -126,10 +156,19 @@ definición, `read_symbol` agrega:
   Un nombre calificado (`serde_json::from_str`, `Panache.withTransaction`) se busca
   tal cual y después por su último segmento, porque el grafo suele guardar solo el
   callee pelado. Un externo no recibe `suggestions` difusas (`with_context` no es
-  un typo de `build_context`), solo las formas calificadas del mismo nombre.
+  un typo de `build_context`), solo las formas calificadas del mismo nombre. En un
+  índice 0.10 `external` sale de la evidencia del propio índice (una dependencia
+  declarada, la plataforma), y el último segmento solo se prueba cuando el
+  repositorio no define nada con ese nombre: un `Foo::new` que no existe no es
+  "externo" porque se llame algún `new` — recibe `suggestions` (`Thing.new`).
 
 Las funciones chicas que el chunker agrupó en un solo fragmento (`a, b, c`) se
 encuentran dentro de él, así que no se reportan como externas por error.
+
+**Un índice hecho antes de 0.10** (o por otro extractor) no tiene tabla de
+símbolos: `read_symbol`, `get_references`, el anclaje de `search` y la vista web
+del grafo responden como 0.9, por nombre sobre el grafo de llamadas, y lo dicen en
+`warning` — reindexá con `devctx index --full` para tener los campos de arriba.
 
 ## De qué rama responde
 

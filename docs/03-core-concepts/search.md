@@ -245,7 +245,9 @@ half the answer (never fewer than one), and a matching test copy or mock never
 outranks the production definition. File names (`state.rs`, `README.md`),
 versions (`v0.8.4`) and abbreviations (`e.g`) are not identifiers; neither is a
 plain word. Anchored definitions are not demoted, but a hard `kind` filter still
-removes them.
+removes them. On a 0.10 index the definitions come from the symbol table, one
+per definition (a large function split in blocks pins its first block), and an
+anchored hit also carries `sym`, the id of the definition it is.
 
 ## What the index leaves out
 

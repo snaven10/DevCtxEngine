@@ -92,8 +92,28 @@ call from two different files is two edges, and re-indexing does not duplicate.
 
 ### `get_references(symbol)` — who calls this?
 
-Every call site of a symbol across the indexed code. The direct answer to *"is
-this safe to change?"* at one hop.
+Every reference to a symbol across the indexed code — one per occurrence, so two
+calls from the same method are two references. The direct answer to *"is this
+safe to change?"* at one hop. `symbol` is a bare name (`charge`), a qualified one
+(`Card.charge`, `Card::charge`) or `file::name` (`src/pay.rs::charge`).
+
+On an index made by 0.10 or later, each reference keeps `file`, `line` and
+`source` and adds:
+
+| Field | Meaning |
+|---|---|
+| `confidence` | `high`, `medium` or `low`: how sure the index is that this occurrence means *this* definition |
+| `via` | The relation: `calls`, `instantiates`, `references` (a type use), `imports`, `inherits`, `implements` |
+| `sym` | The id (16 hex digits) of the definition referenced, when it resolved to one |
+| `external` / `test` / `undecided` | Present (and `true`) only when the occurrence is a library call, sits in a test file, or could not be decided |
+
+**`min_confidence`** (`"high"`, `"medium"` — the default — or `"low"`) sets the
+lowest confidence listed. By default `high` and `medium` are listed, `medium`
+marked by its field; ambiguous references and calls the index could not decide
+are left out and counted in `below_confidence: {count, min_confidence, hint}`,
+never dropped in silence. Pass `min_confidence: "low"` to list them, each marked.
+For a name with no definition in the repository (a library function), the answer
+lists its external call sites.
 
 ### `impact_analysis(symbol)` — blast radius
 
@@ -107,7 +127,14 @@ exists and then regret not running.
 
 Code, file, line range and kind. Use this when you know the name and want the
 thing itself; use `search` when you want code *about an idea*. `limit` (default
-5) caps the definitions — a name can be defined many times.
+5) caps the definitions — a name can be defined many times. The name can be bare,
+qualified (`Card.charge`, `Card::charge`, with its package or crate in front) or
+`file::name`; `Foo.Bar::baz` is the member `baz` of `Foo.Bar`, not a file.
+
+On an index made by 0.10 or later each definition also carries `sym` (its id, 16
+hex digits, the same on every branch), `kind` (`function`, `method`, `class`,
+`field`…) and `qualified`. A definition the chunker gives no code of its own (a
+field, a constant) answers with its signature as `code`.
 
 **A miss is explained, not just empty.** When no definition is found,
 `read_symbol` adds:
@@ -121,10 +148,19 @@ thing itself; use `search` when you want code *about an idea*. `limit` (default
   (`serde_json::from_str`, `Panache.withTransaction`) is looked up as written and
   then by its last segment, since the graph often holds only the bare callee. An
   external gets no fuzzy `suggestions` (`with_context` is not a typo of
-  `build_context`), only the qualified forms of the same name.
+  `build_context`), only the qualified forms of the same name. On a 0.10 index
+  `external` comes from the index's own evidence (a declared dependency, the
+  platform), and the last segment is only tried when the repository defines
+  nothing by that name: `Foo::new` that does not exist is not "external" because
+  some `new` is called — it gets `suggestions` (`Thing.new`).
 
 Small functions that the chunker grouped into one chunk (`a, b, c`) are found
 inside it, so they are not misreported as external.
+
+**An index made before 0.10** (or by another extractor) has no symbol table:
+`read_symbol`, `get_references`, the anchoring of `search` and the web graph view
+answer as 0.9 did, by name over the call graph, and say so in `warning` — reindex
+with `devctx index --full` to get the fields above.
 
 ## Which branch it answers from
 

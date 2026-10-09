@@ -217,8 +217,30 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   `__init__.py` through `import pkg.sub`. Measured: 17.5 % of Rust calls
   undecided (was 19.8 %), 26 of 26 hand-labelled Rust sites and 26 of 27
   Python sites correct.
+- **Lookups by symbol** (PLAN-009 TASK-008): on a branch with a current symbol
+  graph, `read_symbol`, `get_references`, the identifier anchoring of `search`
+  and the web graph view read the `symbols` table and the resolved edges by id
+  instead of matching names and suffixes. Contracts only grow: definitions add
+  `sym` (16 hex digits), `kind` and `qualified`; anchored hits add `sym`;
+  references add `confidence`, `via` (the relation) and `sym`, plus `external`,
+  `test` and `undecided` when true. `get_references` lists one reference per
+  occurrence (two calls from one method are two) of every relation but
+  `contains`, and takes **`min_confidence`** (`high`, `medium` — default —,
+  `low`): what the default leaves out is counted in `below_confidence`.
+  `external` comes from the link pass's evidence, and a qualified name falls
+  back to its last segment only when the repository defines nothing by that
+  name (`Foo::new` that does not exist is no longer external because some
+  `new` is called; it gets `suggestions`). The graph view marks a node
+  external by that evidence (not "never calls anything") and an edge from a
+  test file `test`. A call the link pass discarded reaches no answer. An index
+  from an older extractor, or a branch with no symbol rows, answers as 0.9.0
+  did and says so in `warning`.
 
 ### Fixed
+
+- `file::symbol` subjects (`memories_by_symbol`, `read_symbol`) take the left
+  part as a file only with a `/` or a known language extension: `Foo.Bar::baz`
+  is the member `baz` of `Foo.Bar`, no longer the file `Foo.Bar`.
 
 - A `--full` over several indexed branches no longer copies and rewrites every
   file another branch holds; and a branch made by another embedding setup is no

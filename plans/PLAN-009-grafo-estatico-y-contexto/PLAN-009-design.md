@@ -698,8 +698,11 @@ revisión):
 - `structural` es el valor de `contains` (DD-6), escrito al parsear: no es una regla de DD-7 y no
   pisa `same_file`, que es de la regla 6. El arnés no lo cuenta: `calls_por_confianza` filtra
   `kind = 'calls'` y `score.py` lee `graph_edges` (solo llamadas).
-- Las tools exponen `min_confidence` (default: `medium` en `impact`/`traverse`, `low` en
-  `get_references`, porque "dónde se nombra esto" tolera ambigüedad si se la marca).
+- Las tools exponen `min_confidence` (default: `medium` en `impact`/`traverse` y también en
+  `get_references`). **TASK-008 (pedido de la revisión):** `get_references` lista por defecto `high`
+  y `medium`, cada referencia con su `confidence`; `low` y las filas sin decidir solo con
+  `min_confidence: "low"` (marcadas `undecided: true`), y lo que el default dejó afuera se cuenta en
+  `below_confidence` — el borrador decía `low` por defecto.
 
 ## DD-9 — `external` y `from_test`
 
@@ -737,6 +740,20 @@ revisión):
 Contratos que **no** cambian: campos y semántica de `anchored`, `suggestions`, `external`,
 `called_from`, `next_step`, `resolved_symbols`, `branch_fallback`, `omitted`/`next_offset`. Se
 agregan (aditivos) `sym` (id hex) y `confidence` donde corresponda.
+
+**Implementado en TASK-008, con estas diferencias:** las lecturas nuevas son funciones propias del
+store (`crates/devctx-store/src/lookup.rs`: `lookup_symbols`, `symbol_code_chunks`,
+`lookup_definitions`, `lookup_anchors`, `lookup_external`, `lookup_references`,
+`lookup_graph_view`…) y no un reemplazo en sitio: `symbol_definitions`, `symbol_matches`,
+`resolve_symbol`, `find_references`, `external_call_sites` y `graph_edges` quedan como el camino
+viejo (DD-19) y `impact_analysis` los sigue usando hasta TASK-009. Toda lectura de aristas pasa por
+`live_edges`. El MCP elige el camino por rama (`Reader::of`: vigente y con filas en `symbols`). El
+anclaje fija **un chunk por definición** (`search_anchored` + `AnchorLookup::Symbols`) y marca
+`anchored` por el id del chunk de una definición encontrada (con `sym`); un identificador que el
+grafo no define se sigue buscando por nombre. `get_references` lista una fila por ocurrencia de toda
+relación menos `contains`, con `via`. `split_file_symbol` exige `/` o una extensión de lenguaje
+conocida (no consulta el índice). `read_symbol` sigue con un entry por chunk; campos e `impl` van
+después del resto. Se agregan `kind`, `qualified`, `via`, `below_confidence`.
 
 ## DD-11 — `impact_analysis` por lotes, con tope y marcas
 
@@ -874,7 +891,9 @@ romper.
   (`pipeline.rs:542-562`).
 - **Lecturas sobre una rama no reindexada** (sin filas en `symbols`): las tools existentes
   (`read_symbol`, `get_references`, `impact_analysis`, anclaje) usan el camino viejo sobre
-  `graph_edges`/`vectors` y lo dicen (`extractor_stale` ya está en la respuesta); las tools nuevas
+  `graph_edges`/`vectors` y lo dicen (`extractor_stale` ya está en la respuesta; TASK-008: una rama
+  vigente pero sin filas en `symbols` —un repo sin lenguajes parseables— también, con un `warning`
+  propio); las tools nuevas
   (`traverse`, `repo_map`, `skeleton`) contestan un error con la acción: "corré `devctx index
   --full`". Se borra el camino viejo en el plan siguiente, junto con `graph_edges`.
 - **Downgrade** a 0.9.0: las tablas nuevas quedan huérfanas e inocuas; `graph_edges` está al día

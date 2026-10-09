@@ -256,7 +256,10 @@ como máximo la mitad de la respuesta (nunca menos de uno), y una copia de test 
 un mock que coincida nunca le gana a la definición de producción. Los nombres de
 archivo (`state.rs`, `README.md`), las versiones (`v0.8.4`) y las abreviaturas
 (`e.g`) no son identificadores; una palabra común tampoco. Las definiciones
-ancladas no se degradan, pero un filtro duro de `kind` igual las quita.
+ancladas no se degradan, pero un filtro duro de `kind` igual las quita. En un
+índice 0.10 las definiciones salen de la tabla de símbolos, una por definición
+(una función grande partida en bloques fija su primer bloque), y un resultado
+anclado trae además `sym`, el id de la definición que es.
 
 ## Qué deja afuera el índice
 

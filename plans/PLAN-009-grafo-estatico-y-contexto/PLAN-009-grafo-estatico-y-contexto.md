@@ -245,7 +245,7 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-005 | Motor de resolución y link pass + resolver Java (scopes, campos, inyección, `var`, imports, fluent) | general-purpose (Rust) | TASK-004 | `done` |
 | TASK-006 | Resolver TypeScript/JavaScript (imports relativos y alias, DI, arrow-const) | general-purpose (Rust) | TASK-005 | `done` |
 | TASK-007 | Resolvers Python, Rust y Go | general-purpose (Rust) | TASK-005 | `done` |
-| TASK-008 | Lookups por símbolo: `read_symbol`, anclaje, `get_references`, `external`, sugerencias, vista web; pendientes 1 y 2 de PLAN-008 | general-purpose (Rust) | TASK-005 | `pending` |
+| TASK-008 | Lookups por símbolo: `read_symbol`, anclaje, `get_references`, `external`, sugerencias, vista web; pendientes 1 y 2 de PLAN-008 | general-purpose (Rust) | TASK-005 | `done` |
 | TASK-009 | `impact_analysis` por lotes, con tope, confianza y marcas | general-purpose (Rust) | TASK-008 | `pending` |
 | TASK-010 | PageRank global al indexar y centralidad como señal en `search` híbrido | general-purpose (Rust) | TASK-006, TASK-007, TASK-008 | `pending` |
 | TASK-011 | Tool `repo_map` con PageRank personalizado bajo presupuesto | general-purpose (Rust) | TASK-010 | `pending` |
