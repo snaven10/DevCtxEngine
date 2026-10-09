@@ -105,7 +105,7 @@ impl MemScope {
 fn rank_options(cfg: &ProjectConfig) -> RankOptions {
     RankOptions {
         penalty: cfg.search.penalty,
-        centrality: cfg.search.centrality_weight,
+        centrality: cfg.search.centrality(),
         ..Default::default()
     }
 }
@@ -157,13 +157,23 @@ impl Engine {
             cfg.project.name.clone()
         };
         Ok(Engine::Local {
-            store,
             embedder,
             filter: SearchFilter {
                 exclude_deletions: true,
                 ..Default::default()
             },
-            rank: rank_options(cfg),
+            rank: RankOptions {
+                // Under the MCP's rule: a current symbol graph (review of
+                // TASK-010, MINOR 1).
+                centrality: devctx_mcp::state::local_centrality(
+                    &store,
+                    &root,
+                    cfg.indexing.default_branch(),
+                    cfg.search.centrality(),
+                ),
+                ..rank_options(cfg)
+            },
+            store,
             default_branch: cfg.indexing.default_branch().map(str::to_string),
             root,
             project,

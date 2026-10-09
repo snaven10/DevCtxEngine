@@ -744,6 +744,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// Review of TASK-010, MINOR 1: a search without a server applies
+    /// centrality under the MCP's rule — a current symbol graph — so a branch
+    /// stamped by another extractor gets none, whatever ranks survive in it.
+    #[test]
+    fn local_centrality_follows_the_symbol_graph_rule() {
+        let (state, repo) = indexed_files("centrality_local", JAVA);
+        let store = state.open_store().unwrap();
+        assert_eq!(local_centrality(&store, &repo, None, 0.4), 0.4);
+        let (_, b) = state.repo_branch().unwrap();
+        store
+            .set_index_meta(
+                &state.repo_path(),
+                &b,
+                devctx_store::EXTRACTOR_META_KEY,
+                "v0-old",
+            )
+            .unwrap();
+        assert_eq!(local_centrality(&store, &repo, None, 0.4), 0.0);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// The fallback of `a_branch_nobody_indexed_answers_the_graph_from_the_indexed_one`
     /// over the symbol graph: an unindexed branch answers from `main`, by
     /// id, and says so.

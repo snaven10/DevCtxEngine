@@ -3901,9 +3901,6 @@ fn cmd_search(
     let mut rank = sel
         .options(cfg.search.penalty)
         .map_err(|e| anyhow::anyhow!(e))?;
-    // Hybrid centrality (PLAN-009 TASK-010): a chunk of an index whose link
-    // pass never ranked it has no rank, and the signal is off for it.
-    rank.centrality = cfg.search.centrality_weight;
     if let Some(r) = remote::ensure_cli(&cfg)? {
         let mode = if hybrid {
             "hybrid"
@@ -3941,6 +3938,16 @@ fn cmd_search(
         .map(|e| e.dimension())
         .unwrap_or_else(|| configured_dimension(&cfg));
     let store = open_store(&cfg, dim)?;
+    // Hybrid centrality (PLAN-009 TASK-010) under the MCP's rule: only from
+    // a current symbol graph (review of TASK-010, MINOR 1).
+    if mode == SearchMode::Hybrid {
+        rank.centrality = devctx_mcp::state::local_centrality(
+            &store,
+            &project_root(&cfg)?,
+            cfg.indexing.default_branch(),
+            cfg.search.centrality(),
+        );
+    }
 
     // Rerank vector/hybrid results when enabled; keep keyword lightweight.
     let reranker = if !no_rerank && cfg.reranking.enabled && mode != SearchMode::Keyword {

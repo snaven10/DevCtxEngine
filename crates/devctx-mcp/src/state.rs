@@ -777,7 +777,7 @@ fn search_items_with(
     // rows has no rank worth trusting, and hybrid search there fuses vector
     // and keyword alone.
     opts.centrality = if by_symbol {
-        state.cfg.search.centrality_weight
+        state.cfg.search.centrality()
     } else {
         0.0
     };
@@ -4298,6 +4298,34 @@ pub fn impact_at(
     .ready()?;
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     impact::impact_on(store, &chosen, symbol, depth, q, budget)
+}
+
+/// The centrality weight a search without a server (the CLI's local path,
+/// the TUI's local engine) applies: `weight`, only when the branch it would
+/// answer from has a current symbol graph — the rule the MCP's `search` and
+/// `build_context` follow (review of TASK-010, MINOR 1) —, else 0.
+pub fn local_centrality(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    weight: f32,
+) -> f32 {
+    let Ok(git) = GitRepo::open(root) else {
+        return 0.0;
+    };
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    );
+    if chosen.indexed && lookup::Reader::of(&chosen, store) == lookup::Reader::SymbolGraph {
+        weight
+    } else {
+        0.0
+    }
 }
 
 /// The declarations a bare name was expanded into, when that is worth telling

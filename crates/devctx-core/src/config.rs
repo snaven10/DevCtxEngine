@@ -300,8 +300,11 @@ impl Indexing {
     }
 }
 
-/// Default of `search.centrality_weight` (PLAN-009 TASK-010).
-pub const DEFAULT_CENTRALITY_WEIGHT: f32 = 0.3;
+/// Default of `search.centrality_weight` (PLAN-009 TASK-010): off in 0.10.0.
+/// Calibrated on 12 of the 30 cases of the harness, raising it was within
+/// the noise (review of TASK-010, MAJOR 1); TASK-016 re-evaluates it on all
+/// of them, by language.
+pub const DEFAULT_CENTRALITY_WEIGHT: f32 = 0.0;
 
 fn default_centrality_weight() -> f32 {
     DEFAULT_CENTRALITY_WEIGHT
@@ -325,10 +328,42 @@ pub struct SearchCfg {
     /// innermost symbol of each, adding `w / (60 + position + 1)` to each
     /// hit's fused score. It only reorders: nothing a retriever did not
     /// bring is added. `0` turns it off; vector search never uses it. With
-    /// `w ≤ 1` it can only overturn a vector+keyword lead smaller than the
-    /// one it adds, so it decides near-ties, not the ranking.
+    /// `w ≤ 1` the bonus it adds is at most `w / 61`, but against fusion
+    /// scores a few thousandths apart that moves hits several places (on one
+    /// measured case, from 7th to 1st). Read through [`SearchCfg::centrality`]:
+    /// a value outside `[0, 1]`, or not a number, is bounded and warned about.
+    /// Off by default (see [`DEFAULT_CENTRALITY_WEIGHT`]).
     #[serde(default = "default_centrality_weight")]
     pub centrality_weight: f32,
+}
+
+impl SearchCfg {
+    /// The centrality weight to apply: `centrality_weight` within `[0, 1]`,
+    /// `0` when it is not a finite number (review of TASK-010, MINOR 4: a
+    /// NaN made every hybrid score NaN, and a weight far above 1 replaced
+    /// the retrievers' order by centrality).
+    pub fn centrality(&self) -> f32 {
+        let w = self.centrality_weight;
+        if w.is_finite() {
+            w.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// What the config gets wrong in this section: a penalty above 1, a
+    /// centrality weight outside `[0, 1]` or not a number.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = self.penalty.warnings();
+        let w = self.centrality_weight;
+        if !(0.0..=1.0).contains(&w) {
+            out.push(format!(
+                "search.centrality_weight = {w} is outside [0, 1]: it is used as {}",
+                self.centrality()
+            ));
+        }
+        out
+    }
 }
 
 impl Default for SearchCfg {
@@ -501,7 +536,7 @@ impl ProjectConfig {
         let raw =
             std::fs::read_to_string(path).map_err(|e| Error::ConfigRead(path.to_path_buf(), e))?;
         let cfg = Self::from_yaml(&raw).map_err(|e| Error::ConfigParse(path.to_path_buf(), e))?;
-        for w in cfg.search.penalty.warnings() {
+        for w in cfg.search.warnings() {
             if first_warning(path, &w) {
                 eprintln!("warning: {}: {w}", path.display());
             }
@@ -759,6 +794,8 @@ mod tests {
     /// and takes the configured value, `0` included.
     #[test]
     fn centrality_weight_defaults_and_parses() {
+        // Off by default in 0.10.0 (review of TASK-010, MAJOR 1).
+        assert_eq!(DEFAULT_CENTRALITY_WEIGHT, 0.0);
         let cfg = ProjectConfig::from_yaml("search:\n  penalty:\n    test: 0.3\n").unwrap();
         assert_eq!(cfg.search.centrality_weight, DEFAULT_CENTRALITY_WEIGHT);
         assert_eq!(
@@ -769,6 +806,27 @@ mod tests {
         assert_eq!(cfg.search.centrality_weight, 0.0);
         let cfg = ProjectConfig::from_yaml("search:\n  centrality_weight: 0.15\n").unwrap();
         assert_eq!(cfg.search.centrality_weight, 0.15);
+    }
+
+    /// Review of TASK-010, MINOR 4: a weight that is not a number, is
+    /// negative or above 1 is warned about and used as 0 (not finite,
+    /// negative) or 1.
+    #[test]
+    fn a_centrality_weight_out_of_range_is_bounded_and_warned_about() {
+        for (yaml, used) in [
+            (".nan", 0.0),
+            (".inf", 0.0),
+            ("-0.5", 0.0),
+            ("50", 1.0),
+            ("0.3", 0.3),
+            ("0", 0.0),
+        ] {
+            let cfg = ProjectConfig::from_yaml(&format!("search:\n  centrality_weight: {yaml}\n"))
+                .unwrap();
+            assert_eq!(cfg.search.centrality(), used, "{yaml}");
+            let warned = !cfg.search.warnings().is_empty();
+            assert_eq!(warned, !matches!(yaml, "0.3" | "0"), "{yaml}");
+        }
     }
 
     #[test]
