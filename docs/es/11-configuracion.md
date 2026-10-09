@@ -45,7 +45,7 @@ search:
     test: 0.6
     doc: 0.6
     config: 0.6
-  centrality_weight: 0.3       # peso de la centralidad de símbolos en la búsqueda híbrida; 0 = apagada
+  centrality_weight: 0         # peso de la centralidad en la búsqueda híbrida, 0-1; 0 = apagada (default)
 
 reranking:
   enabled: false               # opt-in; ver docs/08 ADR-15 para las mediciones
@@ -102,7 +102,8 @@ marcha se queda con la config con la que arrancó: primero `devctx serve --stop`
 un factor mayor que `1.0` genera un aviso al cargar la config.
 `search.centrality_weight` (solo búsqueda híbrida y `build_context`, nunca la
 vectorial) se explica en
-[Búsqueda](03-conceptos-fundamentales/busqueda.md#centralidad-solo-híbrida).
+[Búsqueda](03-conceptos-fundamentales/busqueda.md#centralidad-solo-híbrida-opt-in);
+un valor fuera de `[0, 1]`, o que no es un número, se acota y se avisa.
 
 **Cambiar el modelo de embedding** cambia el ancho de los vectores, que queda
 fijado al crear la base de datos. El indexado detecta el desajuste y reindexa

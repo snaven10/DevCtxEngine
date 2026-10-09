@@ -130,33 +130,47 @@ necesita calibrar entre dos sistemas cuyos números significan cosas distintas.
 Si el índice FTS no fue construido, la híbrida degrada en silencio a solo
 vectorial en vez de fallar.
 
-### Centralidad (solo híbrida)
+### Centralidad (solo híbrida, opt-in)
 
 En un índice hecho por 0.10 o posterior, cada símbolo tiene un **rank** global:
 un PageRank sobre el grafo de símbolos, calculado al final de cada corrida de
 `index` (las llamadas y las instanciaciones cuentan entero, la herencia un poco
-menos, los usos de tipo la mitad, los imports menos; una llamada desde un test o
-de confianza baja transmite menos, y un helper llamado 300 veces por un mismo
-llamador no cuenta 300 veces). La búsqueda híbrida lo suma como una **tercera
-lista de la fusión**: los candidatos que ya trajeron los dos recuperadores,
-ordenados por el rank del símbolo más interno que contiene cada chunk, cada uno
-sumando `w / (k + posición)` a su puntaje fusionado.
+menos, los usos de tipo la mitad, los imports menos; una llamada desde un test
+—un archivo de test, o en Rust un módulo `#[cfg(test)]`, un `mod tests` o una
+función `#[test]`— o de confianza baja transmite menos, y un helper llamado 300
+veces por un mismo llamador no cuenta 300 veces). La búsqueda híbrida puede
+sumarlo como una **tercera lista de la fusión**: los candidatos que ya trajeron
+los dos recuperadores (después de los filtros duros), ordenados por el rank del
+símbolo más interno que contiene cada chunk —leído como su percentil dentro de
+la rama—, cada uno sumando `w / (k + posición)` a su puntaje fusionado.
 
-- Solo reordena: nunca agrega un chunk que ningún recuperador trajo. Un chunk
-  de ningún símbolo (el resumen de un archivo, un doc) va al final de esa lista.
-- `w` es `search.centrality_weight` (default `0.3`; `0` la apaga). Con `w ≤ 1`
-  solo puede dar vuelta una ventaja menor que la que suma: decide casi-empates,
-  no el ranking.
+- **Apagada por default en 0.10** (`search.centrality_weight: 0`). Medida con
+  12 de los 30 casos del arnés de evaluación, encenderla quedó dentro del ruido,
+  y el único caso en español que se movió empeoró; se re-evalúa con todos, por
+  idioma, antes de encenderla por default.
+- `w` es `search.centrality_weight`, de `0` (apagada) a `1`; un valor fuera de
+  ese rango, o que no es un número, se acota (`0` o `1`) y se avisa.
+- Solo reordena: nunca agrega un chunk que ningún recuperador trajo. Un chunk de
+  ningún símbolo (el resumen de un archivo, un doc, un archivo de config, una
+  memoria) no recibe bonus.
+- El bonus es como mucho `w / 61`, pero los puntajes fusionados están a unas
+  milésimas, así que mueve hits varios puestos, no solo casi-empates: en un caso
+  medido, con `w = 0.3`, el archivo esperado pasó del puesto 7 al 1.
 - La búsqueda vectorial nunca la usa; la penalización por tipo, la
   deduplicación y el anclaje por identificador van después, así que una
   definición que la consulta nombra sigue primero.
-- `raw_score` sigue siendo la fusión de vectorial + palabra clave, sin
-  centralidad.
-- Un índice anterior a los ranks de 0.10, o de un extractor viejo, no tiene
-  rank que usar: la híbrida fusiona solo vectorial y palabra clave. El primer
-  `devctx index` de la versión nueva calcula los ranks sin volver a embeber.
+- **Qué cambia al encenderla:** el orden de los resultados híbridos y su `score`
+  (el de cada hit con rank sube su bonus), y ese hit lleva un `raw_score` —la
+  fusión de vectorial + palabra clave, sin centralidad, que es lo que compara
+  una búsqueda de grupo entre miembros—. Apagada, no cambia nada.
+- Solo se aplica donde la rama tiene un grafo de símbolos vigente, con la misma
+  regla en las tools del MCP, el CLI sin servidor y la TUI: en un índice de un
+  extractor viejo, o cuyos ranks nunca se calcularon, la híbrida fusiona solo
+  vectorial y palabra clave. El primer `devctx index` de la versión nueva
+  calcula los ranks sin volver a embeber.
 
-`build_context` busca en modo híbrido, así que el brief también la usa.
+`build_context` busca en modo híbrido, así que el brief también la usa cuando
+está encendida.
 
 ## Reranking
 

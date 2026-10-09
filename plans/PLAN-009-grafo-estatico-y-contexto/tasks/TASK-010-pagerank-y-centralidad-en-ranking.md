@@ -76,7 +76,8 @@ TASK-005…008 (basura 0, externos/tests marcados, precisión de gold edges ≥ 
 ## Resultado
 
 <!-- Contrato: PLAN-009 §11 -->
-- **Estado final:** `done`. La calibración de `w` se hizo con DevCtxEngine y backend-b (12 casos);
+- **Estado final:** `done`. **Tras la revisión, `search.centrality_weight` = 0 por default
+  (opt-in)**; ver "Revisión" al final. La calibración de `w` se hizo con DevCtxEngine y backend-b (12 casos);
   backend-a con modelo quedó **sin indexar** (el permiso de la sesión lo bloqueó): confirmar `w`
   con sus 8 casos queda pendiente, junto con TASK-016.
 - **Paso 0 — compuerta de ruido (master §5), verificada contra los Resultados de TASK-005…009:**
@@ -94,7 +95,7 @@ TASK-005…008 (basura 0, externos/tests marcados, precisión de gold edges ≥ 
 - **Resumen:** cada link pass que completa calcula el **PageRank global** de los símbolos de la
   rama sobre `live_edges` y lo escribe en `symbols.rank`, con `in_degree`; la búsqueda **híbrida**
   (y con ella `build_context`) lo usa como **tercera lista de la RRF**, ponderada por
-  `search.centrality_weight` (default 0,3), solo sobre los candidatos que trajeron los
+  `search.centrality_weight` (default 0,3; **0 tras la revisión**, opt-in), solo sobre los candidatos que trajeron los
   retrievers. `Vector` no cambia, el anclaje sigue ganando y `raw_score` sigue siendo la fusión de
   vector + keyword. Primer commit: el MINOR m-a y los tres NITs de la revisión de TASK-009.
 - **Commits** (rama `feat/plan-009-grafo`, sin push): 59fa285 (m-a y NITs), 0fdcad6 (PageRank y
@@ -116,8 +117,8 @@ TASK-005…008 (basura 0, externos/tests marcados, precisión de gold edges ≥ 
     Vectorial idéntico en los cuatro valores (8/10 · 0,642 y 1/2 · 0,125). Por caso: en backend-b
     los dos casos suben en el híbrido (9 → 6, 7 → 1) y el primero entra al brief desde 0,3; en
     DevCtxEngine solo se mueven los de español 6 (fuera del top 20 → 18-20) y 7 (8 → 9 / 11 / 14
-    con 0,15 / 0,3 / 0,5: sale del top 10, nunca estuvo en el top 5). **Elegido `w` = 0,3** (el
-    default de DD-13): el menor valor que maximiza el brief, sin bajar Hit@5 ni MRR híbrido más de
+    con 0,15 / 0,3 / 0,5: sale del top 10, nunca estuvo en el top 5). ~~**Elegido `w` = 0,3**~~
+    (revisión: **0**, ver abajo) (el default de DD-13): el menor valor que maximiza el brief, sin bajar Hit@5 ni MRR híbrido más de
     2 % en ningún repo (DevCtxEngine 0,662 → 0,659-0,664, el ruido entre corridas de TASK-001).
     0,5 no suma nada y empuja más el caso 7. **Evidencia fina:** el brief mejora por un caso de
     backend-b; confirmar con backend-a (8 casos, pendiente de indexar con modelo) y en TASK-016.
@@ -212,3 +213,66 @@ TASK-005…008 (basura 0, externos/tests marcados, precisión de gold edges ≥ 
   referenciados (`Result`) encabezan el rank: si ensucian el repo-map de TASK-011, bajar el peso
   de `references` o excluir alias de tipos genéricos. (4) Funciones de `mod tests` en línea (Rust)
   no son `is_test`. (5) No verificado en macOS/Windows (solo CI), ni en frontend.
+- **Revisión (REQUEST CHANGES, sin BLOCKER), resuelta en commits encima de 7264d4b:**
+  - *MAJOR 1 (decisión de la revisora):* **default `w` = 0, opt-in en 0.10.0.** 12 de 30 casos sin
+    backend-a; el brief +1 está dentro del ruido de ±1; el MRR sube solo por backend-b; Hit@10 de
+    DevCtxEngine 9 → 8. La tabla de calibración de arriba queda como evidencia; la subida se
+    re-evalúa en TASK-016 (paso 3b nuevo) con los 30 casos y el corte por idioma.
+  - *MAJOR 2 — corte por idioma de la calibración* (de los mismos reportes; español 4 casos = 3 de
+    DevCtxEngine + 1 de backend-b, inglés 8 = 7 + 1):
+
+    | `w` | es: híbrido Hit@5 · MRR · brief archivo | en: híbrido Hit@5 · MRR · brief archivo |
+    |---|---|---|
+    | 0 | 1/4 · 0,309 · 3/4 | 7/8 · 0,706 · 8/8 |
+    | 0,15 | 1/4 · 0,313 · 3/4 | 8/8 · 0,729 · 8/8 |
+    | 0,3 | 1/4 · 0,315-0,327 · 4/4 | 8/8 · 0,813 · 8/8 |
+    | 0,5 | 1/4 · 0,324 · 4/4 | 8/8 · 0,813 · 8/8 |
+
+    En español el Hit@10 de DevCtxEngine baja 2/3 → 1/3 desde 0,3 (caso 7: 8 → 11) y el brief
+    sube por el caso de backend-b: con 4 casos no se concluye nada. Pendiente explícito de TASK-016
+    (y en DD-13): encenderla exige no empeorar el corte en español.
+  - *MAJOR 3:* un hit sin rank no recibe bonus (antes quedaba al final de la lista con
+    `w / (K + pos + 1)`, una degradación sistemática de docs, config, chunks de archivo y
+    memorias). La doc ya no dice "decide casi-empates": con `w` = 0,3 un caso de backend-b pasó
+    del puesto 7 al 1.
+  - *MAJOR 4:* en Rust, `#[cfg(test)]`, `mod tests` y `#[test]` dentro de un archivo de código son
+    test (`FileFacts.test_lines`; símbolos `is_test`, llamadas `from_test`); **`EXTRACTOR_VERSION`
+    18**, golden regenerado con un fixture nuevo (`rust/inline_tests.rs`), sin tocar el de
+    `cache.rs` (el outline de `facts_rust` lo fija).
+  - *MINOR 1:* `local_centrality` (MCP `state`): el CLI local y la TUI aplican la centralidad solo
+    con un grafo de símbolos vigente, como el MCP. *MINOR 2:* sin centralidad aplicada, el hit
+    anclado tiene el score de siempre (sin `raw_score` propio), también con reranker. *MINOR 4:*
+    `SearchCfg::centrality` acota a `[0, 1]` (no finito → 0) y `SearchCfg::warnings` lo avisa.
+    *MINOR 3:* documentado qué cambia al encenderla (orden, `score`, `raw_score` presente).
+    *MINOR 5:* solo se escriben los ranks que cambiaron. *MINOR 6:* lectura por percentil dentro
+    de la rama. *MINOR 7:* el test de `sqrt` compara la razón 2:1 (4:1 sin `sqrt`). *MINOR 8:*
+    tope de 100 iteraciones; `LinkStats.{rank_iterations, rank_converged}` y la línea del link
+    pass. *MINOR 9:* la lista se arma después de los filtros duros. *MINOR 10:*
+    `penalty_and_dedup_hold_under_centrality` con ranks reales. NITs: `three` → `mixed`, assert de
+    `below_confidence` sumado en el test de llamadas sin decidir.
+  - *No hecho (para TASK-011):* NIT de `RankEdge` con dos `String` por fila (enum o interning): el
+    costo medido (69-165 ms en backend-a) no lo pide todavía; lo revisa repo_map, que relee la
+    adyacencia.
+  - **Commits:** e1e11f3 (MAJOR 4), d60f8e0 (MAJOR 3, MINOR 2, 9, 10), c8a65cc (MAJOR 1, MINOR 1,
+    4), 9d40ed8 (MINOR 5-8, NIT) y el de esta documentación (MAJOR 2, MINOR 3, docs).
+  - *Tests que fallaban antes del fix* (escritos y corridos primero): `rust_inline_tests_are_test_symbols`
+    (`checks.helper` no era test), el golden (`subí EXTRACTOR_VERSION`),
+    `centrality_breaks_a_fusion_tie_and_keeps_the_retriever_score` (el hit sin rank tenía 0,5048),
+    `without_centrality_an_anchored_hit_keeps_its_old_score` (`raw_score` 0,0328 con reranker y
+    `w` 0), `centrality_weight_defaults_and_parses` (0,3) y
+    `a_centrality_weight_out_of_range_is_bounded_and_warned_about` (NaN), con stubs de
+    `centrality`/`warnings`; `local_centrality_follows_the_symbol_graph_rule` (stub que devolvía el
+    peso: 0,4 con un extractor viejo); `chunk_ranks_are_percentiles_within_the_branch`;
+    `a_pass_over_the_same_graph_writes_no_rank` (escribía 20) y `a_six_node_graph_ranks_as_expected`
+    (convergencia, con stubs); `weights_shape_the_ranking` verificado por mutación (sin `sqrt`
+    falla). `penalty_and_dedup_hold_under_centrality` pasó de entrada (cobertura, MINOR 10); MINOR 9
+    no tiene un test que lo distinga (un filtro que saca un hit no cambia el orden relativo de los
+    que quedan, solo el tamaño del bonus).
+  - **Gate** antes de cada commit de código (`fmt --check`, `clippy -D warnings` con y sin
+    `--features gpu`, `cargo test --workspace --locked`): 1 070, 1 072, 1 074 y 1 076 pasan, 0
+    fallan. En 9d40ed8 la primera corrida tuvo dos fallos de `devctx-cli` ajenos al cambio y de
+    carrera con la máquina a carga 18 (`connection_refused_recognises_a_real_ureq_error`: el
+    puerto cerrado devolvió `Connection reset`; `the_autospawn_mark_is_read_from_the_environment`:
+    `/proc/<pid>/environ` leído antes del `exec`); la corrida repetida del workspace entero dio
+    1 076 / 0.
+

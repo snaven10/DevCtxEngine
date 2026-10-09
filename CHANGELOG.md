@@ -282,22 +282,33 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   outside, the `impl`'s own method is `medium` too, no longer `high`: an
   inherent method of `T` of that name wins in Rust (`self.len()` in an
   `impl Counted for String` calls `String::len`).
-- **Symbol centrality in hybrid search** (PLAN-009 TASK-010): every link pass
-  that completes ends by computing a global PageRank of the branch's symbols
-  (`symbols.rank`) and their `in_degree` (incoming non-test calls of `high` or
-  `medium` confidence), over `live_edges` (a discarded call never counts):
-  calls and instantiations weigh 1, inheritance 0.8, type uses 0.5, imports
-  0.3, `contains` 0; confidence and tests decide how much a symbol passes on
-  (`high` 1, `medium` 0.6, `low` 0.2, from a test × 0.1) and `sqrt(n)` tames
-  repeated calls; damping 0.85, at most 50 iterations, deterministic. Hybrid
-  search — and so `build_context` — adds it as a third list of the rank
-  fusion over the candidates the retrievers brought, ordered by the rank of the
-  innermost symbol of each chunk, with weight `search.centrality_weight`
-  (default 0.3, `0` turns it off). Vector search is unchanged, an anchored
-  definition still comes first, and `raw_score` stays the vector + keyword
-  fusion (an anchored hit's too). Off on an index without ranks or from an
-  older extractor. Cost: about 0.1-0.2 s per pass on a 1 250-file Java
-  repository (22 876 symbols); hybrid search p50 within a few ms.
+- **Symbol centrality in hybrid search, opt-in** (PLAN-009 TASK-010): every
+  link pass that completes ends by computing a global PageRank of the branch's
+  symbols (`symbols.rank`, written only where it changed) and their
+  `in_degree` (incoming non-test calls of `high` or `medium` confidence), over
+  `live_edges` (a discarded call never counts): calls and instantiations weigh
+  1, inheritance 0.8, type uses 0.5, imports 0.3, `contains` 0; confidence and
+  tests decide how much a symbol passes on (`high` 1, `medium` 0.6, `low` 0.2,
+  from a test × 0.1) and `sqrt(n)` tames repeated calls; damping 0.85, at most
+  100 iterations (the link pass line says how many, and whether it
+  converged), deterministic. Hybrid search — and so `build_context` — can add
+  it as a third list of the rank fusion over the candidates the retrievers
+  brought (after the hard filters), ordered by the rank of the innermost symbol
+  of each chunk as a percentile within its branch; a chunk of no symbol gets
+  nothing. **Off by default** (`search.centrality_weight: 0`; `0`-`1`, a value
+  outside or not a number is bounded and warned about): on 12 of the 30
+  evaluation cases turning it on was within the noise, and it is re-evaluated
+  on all of them, by language. When on, hybrid `score`s and order change and a
+  ranked hit carries `raw_score` (the vector + keyword fusion); vector search
+  is unchanged and an anchored definition still comes first. It applies only
+  where the branch has a current symbol graph, alike in the MCP, the CLI
+  without a server and the TUI. Cost: about 0.1-0.2 s per pass on a 1 250-file
+  Java repository (22 876 symbols); hybrid search p50 within a few ms.
+- **Rust test code inside a source file is test code** (extractor version 18):
+  symbols under `#[cfg(test)]`, in a `mod tests` or marked `#[test]` are test
+  symbols and their calls `from_test`, as a test file's are — in
+  `get_references`, `impact_analysis` and the rank. Existing indexes report
+  `extractor_stale` until `devctx index --full` (vectors are reused).
 - **Link rules version 21:** an existing index is relinked — and ranked — by
   its next `devctx index`, with nothing re-embedded.
 

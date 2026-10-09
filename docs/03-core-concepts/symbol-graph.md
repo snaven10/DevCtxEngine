@@ -137,7 +137,7 @@ carries `confidence` (of the call that reached it), `via` (`calls` or
 `instantiates`), `sym`, `file` and `line` (of its definition), and `test`,
 `external` or `undecided` when true. Within a depth, symbols are ordered by
 confidence, then by rank (the global PageRank each index run computes; see
-[Search](search.md#centrality-hybrid-only)), then by name.
+[Search](search.md#centrality-hybrid-only-opt-in)), then by name.
 
 What the defaults leave out is **counted, never dropped in silence**, and not
 walked:

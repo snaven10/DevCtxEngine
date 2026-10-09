@@ -710,7 +710,9 @@ revisión):
   paquete de afuera). Un nombre sin definición y sin evidencia queda `external = false`,
   `dst_id = NULL`, `low`: "no sé" no es "es de una librería".
 - `from_test` = `path_kind(file) == PathKind::Test` (`devctx-core/src/kind.rs:98`), el mismo
-  criterio que ya usa la penalización de PLAN-008. `symbols.is_test` igual.
+  criterio que ya usa la penalización de PLAN-008. `symbols.is_test` igual. **Revisión de
+  TASK-010:** además, en Rust, el código bajo `#[cfg(test)]`, en un `mod tests` o marcado
+  `#[test]` dentro de un archivo que no es de test (`FileFacts.test_lines`).
 - Las listas de plataforma (JDK, builtins de Python, `std`/`core` de Rust, `fmt`/stdlib de Go,
   globals de JS/DOM) viven en el JSON del lenguaje (`platform_prefixes`, `builtins`) para que las
   cubra el fingerprint. TASK-007 agrega `platform_modules` (módulos de primer nivel de la plataforma:
@@ -872,6 +874,15 @@ símbolo y agregar a archivo sumando; al revés no.
   que falla si se quita el orden).
 - Costo medido (Resultado de TASK-010): backend-a, 22 876 símbolos, 69-165 ms por pase (cálculo y
   escritura); DevCtxEngine 58 ms; backend-b 21 ms.
+- **Revisión de TASK-010:** (MAJOR 4) en Rust, el código de test dentro de un archivo que no es de
+  test —`#[cfg(test)]`, `mod tests`, `#[test]`— es test: `FileFacts.test_lines`, sus símbolos
+  `is_test` y sus llamadas `from_test` (DD-9 se extiende; `EXTRACTOR_VERSION` 18). Antes un helper
+  usado solo desde tests en línea (`Store.open_in_memory`, 182 llamadas) entraba al top del rank.
+  (MINOR 5) solo se escriben los símbolos cuyo `rank`/`in_degree` cambió: un pase sobre el mismo
+  grafo no escribe nada. (MINOR 6) la lectura por chunk es el **percentil dentro de la rama**,
+  no la probabilidad (que favorecía a la rama chica en un pool de varias ramas). (MINOR 8) tope
+  de **100** iteraciones (no 50): `LinkStats.{rank_iterations, rank_converged}` y la línea del
+  link pass lo dicen.
 
 ## DD-13 — Cómo compone con el ranking actual
 
@@ -898,8 +909,8 @@ retrievers (vector, keyword) ─▶ RRF ─[+ lista de centralidad, peso w]─�
 **Implementado en TASK-010, con estas diferencias:**
 - `RankOptions.centrality` (`search.centrality_weight`); `with_centrality` corre sobre la salida de
   la RRF, reescribe `score` (la fusión + la centralidad, para que el orden y los scores sigan
-  monótonos) y deja la fusión de vector + keyword en `raw_score`. Un hit sin rank va al final de
-  la lista de centralidad, en el orden que traía. Sin ningún rank en el pool (índice anterior,
+  monótonos) y deja la fusión de vector + keyword en `raw_score`. ~~Un hit sin rank va al final de
+  la lista de centralidad~~ — revisión: un hit sin rank no recibe bonus (abajo). Sin ningún rank en el pool (índice anterior,
   rama sin rankear, chunks de ningún símbolo) es la misma lista, sin tocar.
 - **Hit anclado:** el anclaje le daba el score más alto de la respuesta, que con centralidad ya no
   es de un retriever. Ahora su retriever score es el mejor retriever score de la respuesta (y su
@@ -908,13 +919,29 @@ retrievers (vector, keyword) ─▶ RRF ─[+ lista de centralidad, peso w]─�
   degradado arriba, es el mismo número que antes.
 - El MCP (`search`, `build_context`) usa la centralidad **solo con un grafo de símbolos vigente**
   (`Reader::SymbolGraph`): una rama de otro extractor, fuera de paso o sin filas fusiona solo
-  vector + keyword. El CLI local y la TUI toman el peso de la config (un índice sin ranks la
-  apaga sola).
-- **Calibración** (Resultado de TASK-010; arnés de TASK-001, modelo real, DevCtxEngine y backend-b,
-  12 casos): `w` = **0,3** se queda. Es el menor que maximiza el brief (archivo 11/12 → 12/12, por
-  un caso de backend-b) sin bajar Hit@5 ni MRR híbrido (Hit@5 8/12 → 9/12; MRR de DevCtxEngine
-  0,662 → 0,659-0,664, dentro del ruido). Evidencia fina: confirmar con backend-a (8 casos) cuando
-  haya OK para indexarlo con modelo, y en TASK-016.
+  vector + keyword. ~~El CLI local y la TUI toman el peso de la config~~ — revisión: la misma
+  regla (`local_centrality`).
+- ~~**Calibración**: `w` = 0,3 se queda~~ — **revisión de TASK-010 (MAJOR 1, decisión de la
+  revisora): default `w` = 0, opt-in en 0.10.0.** Con 12 de 30 casos (sin backend-a, el de MRR
+  híbrido más alto), el brief pasa 11 → 12 por un solo caso (el ruido es ±1), el MRR sube solo por
+  backend-b y Hit@10 de DevCtxEngine baja 9 → 8. La infraestructura queda para repo_map y el
+  ego-graph. La tabla de calibración queda en el Resultado como evidencia.
+- **Pendiente explícito de TASK-016 (MAJOR 2):** re-evaluar `w` con los 30 casos **y el corte por
+  idioma**. TASK-001 midió híbrido < vectorial en español (Hit@5 6/13 contra 8/13). En la
+  calibración, español (4 casos: 3 de DevCtxEngine, 1 de backend-b): Hit@5 híbrido 1/4 en los
+  cuatro `w`; MRR 0,309 / 0,313 / 0,315-0,327 / 0,324 (`w` 0 / 0,15 / 0,3 / 0,5); brief 3/4 →
+  4/4 desde 0,3 (el caso de backend-b); Hit@10 de DevCtxEngine 2/3 → 1/3 desde 0,3 (el caso 7 baja
+  8 → 11). Inglés (8 casos): Hit@5 7/8 → 8/8, MRR 0,706 → 0,813, brief 8/8. Con 4 casos en
+  español no se puede concluir; encender la centralidad exige no empeorar el corte en español.
+- **Revisión de TASK-010:** (MAJOR 3) un hit sin rank no recibe bonus (antes quedaba al final de
+  la lista con `w / (K + pos + 1)`, lo que degradaba de forma sistemática docs, config, chunks de
+  archivo y memorias, ~13 puestos en un pool de 80). (MINOR 9) la lista se arma después de los
+  filtros duros. (MINOR 2) si la centralidad no se aplicó, el hit anclado tiene el score de
+  siempre (sin `raw_score` propio), también con reranker. (MINOR 1) el CLI local y la TUI aplican
+  la misma regla que el MCP (`local_centrality`: grafo de símbolos vigente). (MINOR 4)
+  `SearchCfg::centrality` acota a `[0, 1]` y usa 0 si no es finito, con aviso al cargar. (MINOR 3)
+  encendida, el `score` híbrido de un hit con rank sube su bonus y aparece `raw_score`: no es
+  aditivo, por eso es opt-in y está documentado.
 
 ## DD-14 — Tool `repo_map`
 

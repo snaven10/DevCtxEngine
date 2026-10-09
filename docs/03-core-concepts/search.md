@@ -125,30 +125,43 @@ between two systems whose numbers mean different things.
 If the FTS index has not been built, hybrid degrades silently to vector-only
 rather than failing.
 
-### Centrality (hybrid only)
+### Centrality (hybrid only, opt-in)
 
 On an index made by 0.10 or later, every symbol has a global **rank**: a
 PageRank over the symbol graph, computed at the end of each index run (calls
 and instantiations count fully, inheritance a little less, type uses half,
-imports less; a call from a test or of low confidence passes on less, and a
-helper called 300 times by one caller does not count 300 times). Hybrid search
-adds it as a **third list of the fusion**: the candidates the two retrievers
-already brought, ordered by the rank of the innermost symbol containing each
-chunk, each adding `w / (k + position)` to its fused score.
+imports less; a call from a test — a test file, or a Rust `#[cfg(test)]`
+module, `mod tests` or `#[test]` function — or of low confidence passes on
+less, and a helper called 300 times by one caller does not count 300 times).
+Hybrid search can add it as a **third list of the fusion**: the candidates the
+two retrievers already brought (after the hard filters), ordered by the rank of
+the innermost symbol containing each chunk — read as its percentile within its
+branch —, each adding `w / (k + position)` to its fused score.
 
+- **Off by default in 0.10** (`search.centrality_weight: 0`). Measured on 12 of
+  the 30 cases of the evaluation harness, turning it on was within the noise,
+  and the one Spanish case that moved got worse; it is re-evaluated on all of
+  them, by language, before it is turned on by default.
+- `w` is `search.centrality_weight`, from `0` (off) to `1`; a value outside
+  that range, or not a number, is bounded (`0` or `1`) and warned about.
 - It only reorders: a chunk no retriever brought is never added. A chunk of no
-  symbol (a whole-file summary, a doc) goes to the end of that list.
-- `w` is `search.centrality_weight` (default `0.3`; `0` turns it off). With
-  `w ≤ 1` it can only overturn a smaller lead than the one it adds — it decides
-  near-ties, not the ranking.
+  symbol (a whole-file summary, a doc, a config file, a memory) gets no bonus.
+- The bonus is at most `w / 61`, but fused scores sit a few thousandths apart,
+  so it moves hits several places, not just near-ties: on one measured case,
+  with `w = 0.3`, the expected file went from 7th to 1st.
 - Vector search never uses it; the kind penalty, the dedup and identifier
   anchoring come after it, so a definition the query names still comes first.
-- `raw_score` stays the vector + keyword fusion, without centrality.
-- An index from before 0.10's ranks, or an index from an older extractor,
-  has no rank to use: hybrid fuses vector and keyword alone. The first
-  `devctx index` of the new version computes the ranks without re-embedding.
+- **What changes when it is on:** the order of hybrid results and their
+  `score` (each ranked hit's goes up by its bonus), and such a hit carries a
+  `raw_score` — the vector + keyword fusion, without centrality, which is what
+  a group search compares members on. With it off, nothing changes.
+- It applies only where the branch has a current symbol graph — the same rule
+  for the MCP tools, the CLI without a server and the TUI: on an index from an
+  older extractor, or one whose ranks were never computed, hybrid fuses vector
+  and keyword alone. The first `devctx index` of the new version computes the
+  ranks without re-embedding.
 
-`build_context` searches in hybrid mode, so the brief uses it too.
+`build_context` searches in hybrid mode, so the brief uses it too when it is on.
 
 ## Reranking
 

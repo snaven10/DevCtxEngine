@@ -37,6 +37,11 @@ verificó y qué no, antes del cross-check y del tag.
 - [ ] **Paso 2 — reindex** con el candidato (en copias o en sitio, según lo aprobado),
       cronometrando y midiendo tamaño y `VmHWM`.
 - [ ] **Paso 3 — arnés completo** y tabla de §6 fila por fila (Antes / Meta / Medido / Veredicto).
+- [ ] **Paso 3b — centralidad (pendiente de TASK-010, revisión MAJOR 1 y 2).** Correr el arnés
+      híbrido y el brief con `search.centrality_weight` 0, 0.15, 0.3 y 0.5 sobre los 30 casos,
+      **con el corte por idioma** (TASK-001 midió híbrido < vectorial en español). Encenderla por
+      default solo si mejora el brief sin bajar Hit@5/MRR híbrido > 2 % relativo **ni empeorar el
+      corte en español**; si no, sigue en 0 (opt-in).
 - [ ] **Paso 4 — casos de campo** uno por uno con la salida real de la tool.
 - [ ] **Paso 5 — contratos.** Respuestas de `search` (vector), `read_symbol`, `get_references`,
       `impact_analysis`, `build_context` de 0.9.0 vs candidato sobre los mismos casos: solo
