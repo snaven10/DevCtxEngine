@@ -102,9 +102,11 @@ de TASK-009.
   cadena; downstream, tampoco más que la arista que alcanzó al método de origen: nunca `high`, un
   `low` sigue `low`. El nodo lleva `via: "dispatch"` y `through` (el método por el que pasó); a
   igual confianza gana la arista directa. Tope de `DISPATCH_MAX_PER_NODE` (16) equivalentes por
-  nodo, por rank y nombre; lo recortado va a `omitted_by_limit.dispatch`. `dispatch: false` lo
-  apaga (tool, `GET /impact?dispatch=false`, `devctx impact --no-dispatch`); `min_confidence:
-  high` lo deja afuera y lo cuenta en `below_confidence`.
+  nodo, producción antes que tests y después por rank y nombre; lo recortado va solo a
+  `omitted_by_limit.dispatch`. Entre sobrecargas de igual aridad en un supertipo gana la que
+  coincide exacto en tipos simples. `dispatch: false` lo apaga (tool, `GET /impact?dispatch=false`,
+  `devctx impact --no-dispatch`); `min_confidence: high` lo deja afuera **sin leerlo** (revisión,
+  MAJOR 2: no se cuenta). *(Texto actualizado tras la revisión; ver "Revisión" al final.)*
 - **Primer commit (necesario para TS):** en TypeScript el método que declara una interfaz no era
   símbolo (Java, Rust y Go sí), así que `this.svc.update()` con `svc: IService` quedaba
   `name_only` `low` sin destino y el dispatch no tenía de dónde partir. `typescript.json`/`tsx.json`
@@ -243,26 +245,88 @@ de TASK-009.
     falló antes**: no hay fix, la expansión se lee en la consulta (lo anticipaba la spec); el paso
     verifica que la arista vigilada cambia.
 - **Contrato JSON** (aditivo): nodo con `via: "dispatch"` y `through`; `filters.dispatch`;
-  `omitted_by_limit.dispatch: {count, max_per_node}` (sumado a `omitted_by_limit.count` y a
-  `omitted.count`; el `hint` de arriba es el del dispatch si solo cortó el dispatch). Parámetro nuevo
+  `omitted_by_limit.dispatch: {count, max_per_node}`, **solo ahí** (revisión, desviación 6: no se
+  suma a `omitted_by_limit.count` ni a `omitted.count`, que cuentan nodos; si solo cortó el
+  dispatch, `omitted_by_limit` aparece con `count: 0` y el `hint` del dispatch). Parámetro nuevo
   `dispatch` (tool, `GET /impact`, `--no-dispatch`); la nota de filtros no aplicados lo nombra.
 - **Desviaciones:**
   1. **Extracción de TS** (primer commit, `EXTRACTOR_VERSION` 20): la spec no lo listaba, pero sin
      él el dispatch de TS no tenía de dónde partir. Pide `index --full` (reusa vectores).
   2. **Parámetro `dispatch` y campo `through`**, no pedidos: `min_confidence: high` como única forma
      de excluirlo deja afuera también toda llamada `medium`; `through` dice por qué aparece un nodo.
-  3. **Cero sentencias por nivel** en vez de "a lo sumo una": la versión de una por nivel duplicaba
-     el p95; el grafo de supertipos se lee una vez por llamada (dos sentencias constantes).
+  3. *(Reemplazada en la revisión, MAJOR 2.)* Primero un CTE por nivel, después todo el grafo de
+     métodos leído por llamada; quedó: aristas como pares de ids una vez por llamada y **a lo sumo
+     una sentencia por nivel**, solo si la frontera tiene un método de un tipo con jerarquía.
   4. Downstream la implementación aparece **un nivel debajo** del método de interfaz (es la
      expansión de ese nodo); upstream, el llamador por la interfaz a la profundidad de un llamador
      directo (la interfaz no se lista: lo dice `through`).
   5. La confianza también se acota por la arista de herencia más débil de la cadena.
   6. Go excluido explícitamente; Python funciona (test (d)) como mejor esfuerzo.
-  7. `omitted_by_limit.dispatch` cuenta métodos equivalentes no seguidos (upstream son métodos de
-     supertipos, no nodos); se suma a `omitted.count`.
-- **Riesgos abiertos / siguiente:** (1) TASK-013 (`traverse`) reusa `DispatchIndex`. (2) En un repo
-  con miles de tipos con supertipos, `dispatch_index` lee todos sus métodos por llamada (en los
-  medidos, ~10-15 ms): si crece, cachearlo por rama y versión del link pass. (3) Sobrecargas con la
-  misma aridad y tipos distintos quedan como candidatos `medium` (sin tipos resueltos de
-  parámetros). (4) No verificado: macOS/Windows (solo CI), frontend (TS) y legacy-migration
-  (Python) no reindexados con el extractor 20.
+  7. ~~Se suma a `omitted.count`~~: **no aceptada en la revisión** y corregida (`fb6e82c`).
+     `omitted_by_limit.dispatch` cuenta métodos equivalentes no seguidos (upstream son métodos de
+     supertipos, no nodos), solo en su campo.
+  8. Downstream también despacha desde un método concreto a sus overrides (`Office.persist` →
+     `OfficeDraft.persist`): es dispatch virtual correcto, no solo desde interfaces o abstractos
+     (anotado por la revisión, punto 9).
+  9. `min_confidence: high` ya no cuenta el dispatch que excluye (la spec decía "las excluye y las
+     cuenta"): la revisión pidió no leer nada cuando ningún dispatch puede mostrarse.
+- **Riesgos abiertos / siguiente:** (1) TASK-013 (`traverse`) reusa `DispatchIndex` y
+  `override_equivalents`. (2) Sobrecargas de igual aridad sin coincidencia exacta de tipos (un
+  genérico) quedan todas como candidatos `medium`. (3) No verificado: macOS/Windows (solo CI),
+  frontend (TS) y legacy-migration (Python) no reindexados con el extractor 20. (4) Pendientes de la
+  revisión para TASK-013, abajo.
+- **Revisión (REQUEST CHANGES liviano, sin BLOCKER), resuelta en commits encima de `ffa5574`:**
+  - *MAJOR 1* (`1a51c77`): `'static` de Rust (`-> &'static str`, `T: 'static`) apagaba el dispatch
+    porque `never_overrides` partía toda la firma; ahora solo cuentan los modificadores antes del
+    nombre y un token precedido por `'` no es modificador. Test
+    `a_static_lifetime_does_not_turn_dispatch_off` (**fallaba antes**: upstream vacío).
+  - *MAJOR 2* (`bab2542`, opción a): las aristas de supertipo se leen una vez por llamada como
+    pares de ids; por nivel, a lo sumo una sentencia y solo si la frontera tiene un método de un
+    tipo con jerarquía (la consulta de nivel trae `parent_id`), que lee solo los métodos con su
+    nombre en tipos del grafo; nada se lee con `dispatch: false`, `min_confidence: high` o sin
+    semillas. Tests: `dispatch_costs_at_most_one_statement_per_level` amplía el de sentencias (una
+    lectura del grafo por llamada; ninguna sentencia de dispatch para un recorrido sin jerarquía;
+    ninguna lectura apagado, con `high` o sin semillas) — **fallaba antes** (`high` leía el grafo);
+    las ramas sin filtro por `parent` o sin las guardas, verificadas por mutación. Medido con
+    `dispatch_bench` (`#[ignore]`, release; 500 entidades que heredan de `BaseEntity` e implementan
+    `IEntity` e `IAudited`, 1 500 aristas de supertipo, 40 accessors cada una, 20 120 métodos; 30
+    corridas, carga 13), p50 / p95 ms, antes → después:
+
+    | Caso | antes (`d7fa1f8`) | después | sin dispatch |
+    |---|---|---|---|
+    | implementación con dispatch upstream (4 nodos) | 40,5 / 43,6 | 25,5 / 27,4 | 7,9 / 10,1 |
+    | método de interfaz con 500 implementaciones (16 + tope) | 34,7 / 39,1 | 37,5 / 43,8 | — |
+    | semilla sin jerarquía | 30,6 / 34,0 | 14,0 / 18,1 | 11,6 / 14,2 |
+    | implementación con `min_confidence: high` | 34,1 / 38,2 | 8,3 / 9,9 | — |
+
+    En los repos reales, re-medido con todos los fixes (`fb6e82c`, mismo método que arriba), ronda
+    2 (carga 4-7), p95 con / sin dispatch: backend-a `get` 28,0 / 25,9, `map` 80,3 / 77,2, interfaz
+    con 7 implementaciones 117,9 / 47,5, una implementación 110,6 / 68,1; backend-b `get` 28,5 /
+    29,3, `map` 36,6 / 38,6, los tres casos del gold 52,7-58,0 / 26,0-40,6. La ronda 1 de backend-b
+    tuvo picos con carga 14 (hasta 242 ms con dispatch y 148 sin él en `get`/`map`/el método de
+    actualización); el peor p95 de todo, 242 ms, sigue ≤ 300. Los casos con equivalentes pagan
+    ahora la sentencia de nivel (+40-70 ms en la interfaz de backend-a contra la versión en
+    memoria) a cambio de no leer nada en el resto.
+  - *MINOR 3* (`b293bae`): entre sobrecargas de igual aridad en un tipo, la que coincide exacto en
+    tipos simples (`parameter_types`); sin coincidencia, la aridad. Test
+    `an_exact_overload_wins_over_its_same_arity_siblings` (**fallaba antes**: `save(Order)` también).
+  - *MINOR 5* (`22b6089`): producción antes que tests bajo el tope, y con tests excluidos estos no
+    entran al tope. Test `the_dispatch_cap_keeps_production_before_tests` (**fallaba antes**: 0
+    implementaciones reales listadas).
+  - *MINOR 7* (`22b6089`): un id cortado por el tope de un nodo y dejado afuera por otro (test,
+    externo, `low`) se cuenta una vez, donde quedó afuera. Test
+    `a_method_cut_by_the_cap_and_left_out_elsewhere_is_counted_once` (**fallaba antes**: contado en
+    los dos).
+  - *Desviación 6* (`fb6e82c`): el dispatch solo en `omitted_by_limit.dispatch`. Test de la tool
+    actualizado (**fallaba con el código anterior**), docs y CHANGELOG (`a500b7a`).
+  - Mutaciones de la revisión, todas atrapadas: guardas de `high` y de semillas, filtro por
+    `parent`, orden producción-primero, tope de tests, dedupe.
+  - Gate completo antes de cada commit de código: 1 100, 1 100, 1 102, 1 104, 1 104 y 1 104 pasan,
+    0 fallan.
+  - **Para TASK-013 (anotados, no hechos):** (4) en TS/JS un implementador con menos parámetros no
+    despacha: la regla debería ser aridad del impl ≤ aridad del super; (6) lo que corta el tope de
+    profundidad 4 no se cuenta: contarlo o declararlo; (8) el escenario (e) prueba el link pass, no
+    el dispatch: falta un `impact_graph` antes y después del cambio de `implements`; (9) el dispatch
+    downstream desde métodos concretos queda declarado (desviación 8). NITs no hechos:
+    `check_impact_bfs_upstream_and_downstream` corre sin aristas de supertipo (índice `None`);
+    faltan tests de diamante, ciclo, TS con varios `implements` y blanket impl.

@@ -850,15 +850,25 @@ viejo, sin filtros ni tope, para que una rama vieja conteste igual que 0.9.0 má
   un método de interfaz o abstracto alcanza a sus implementaciones un nivel debajo de él. El nodo
   lleva `via: "dispatch"` y `through`; confianza `min(medium, arista original, arista de herencia
   más débil)` (downstream, tampoco más que lo que alcanzó al origen): nunca `high`, un `low` no
-  sube; a igual confianza gana la directa. Tope de 16 equivalentes por nodo, lo demás en
-  `omitted_by_limit.dispatch: {count, max_per_node}` (sumado a `omitted_by_limit.count` y
-  `omitted.count`). Activo por defecto; `dispatch: false` lo apaga, `min_confidence: high` lo deja
-  afuera contado, y `filters.dispatch` dice si aplicó. **Costo:** el grafo de supertipos se lee una
-  vez por llamada (`DispatchIndex`, dos sentencias constantes) y cada nivel se expande en memoria:
-  ningún nivel paga una sentencia más (la primera versión, un CTE recursivo por nivel, duplicaba el
-  p95 de backend-a). Medido: p95 con dispatch 26-106 ms en backend-a y backend-b (Resultado de
-  TASK-017). Para TS hizo falta que el método de una interfaz sea símbolo (`EXTRACTOR_VERSION` 20).
-  `traverse` (TASK-013) usa la misma expansión.
+  sube; a igual confianza gana la directa; entre sobrecargas de igual aridad en un tipo, la de
+  tipos simples exactos. Tope de 16 equivalentes por nodo (producción antes que tests; con tests
+  excluidos, estos no entran al tope), lo demás **solo** en `omitted_by_limit.dispatch: {count,
+  max_per_node}` (no en `omitted_by_limit.count` ni en `omitted.count`, que cuentan nodos), una vez
+  por método. Activo por defecto; `dispatch: false` lo apaga, `min_confidence: high` lo deja afuera
+  sin leerlo, y `filters.dispatch` dice si aplicó. **Costo (revisión, MAJOR 2):** las aristas de
+  supertipo se leen una vez por llamada como pares de ids; por nivel, a lo sumo una sentencia y solo
+  si la frontera tiene un método de un tipo con jerarquía, que lee los métodos con su nombre en tipos
+  del grafo; nada se lee apagado, con `high` o sin semillas. Medido en un fixture sintético de 1 500
+  aristas de supertipo y 20 120 métodos (`dispatch_bench`, p50 / p95 ms, antes → después): con
+  dispatch upstream 40,5 / 43,6 → 25,5 / 27,4; semilla sin jerarquía 30,6 / 34,0 → 14,0 / 18,1 (sin
+  dispatch 11,6 / 14,2); `min_confidence: high` 34,1 / 38,2 → 8,3 / 9,9; interfaz con 500
+  implementaciones 34,7 / 39,1 → 37,5 / 43,8. En backend-a/b, p95 ≤ 118 ms en ronda limpia y ≤ 242
+  con picos de carga (Resultado de TASK-017). Para TS hizo falta que el método de una interfaz sea
+  símbolo (`EXTRACTOR_VERSION` 20). Downstream también despacha desde un método concreto a sus
+  overrides (dispatch virtual). **Pendiente para TASK-013** (`traverse` usa la misma expansión):
+  aridad ≤ en TS/JS para implementadores con menos parámetros; contar o declarar lo que corta el
+  tope de profundidad 4; un `impact_graph` antes y después de cambiar un `implements` en el escenario
+  incremental; tests de diamante, ciclo, TS con varios `implements` y blanket impl.
 
 ## DD-12 — PageRank: global al indexar, personalizado al consultar
 
