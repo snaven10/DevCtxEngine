@@ -1166,23 +1166,20 @@ fn note_unapplied_filters(raw: String) -> String {
     v.to_string()
 }
 
-/// [`note_unapplied_filters`] for `impact_analysis`: a server (or an index)
-/// older than the filters answers nodes without `confidence`.
-fn note_unapplied_impact_filters(raw: String) -> String {
+/// [`note_unapplied_filters`] for `impact_analysis`, for an answer to a
+/// request that passed filters: a server that applied them says which in
+/// `filters`; one older than them (or answering from an index older than
+/// the symbol graph) does not, also with empty lists (review m2).
+pub fn note_unapplied_impact_filters(raw: String) -> String {
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return raw;
     };
-    let nodes: Vec<&serde_json::Value> = ["upstream", "downstream"]
-        .iter()
-        .filter_map(|k| v.get(*k).and_then(|a| a.as_array()))
-        .flatten()
-        .collect();
-    let unfiltered = !nodes.is_empty() && nodes.iter().all(|n| n.get("confidence").is_none());
-    if !unfiltered {
+    if v.get("filters").is_some() {
         return raw;
     }
     const NOTE: &str = "min_confidence/include_tests/include_external/max_nodes were not \
-        applied: the server (or its index) predates them, so this is its unfiltered answer";
+        applied: the server, or the index it answered from, predates them, so this is its \
+        unfiltered answer";
     let warning = match v.get("warning").and_then(|w| w.as_str()) {
         Some(w) => format!("{w}; {NOTE}"),
         None => NOTE.to_string(),
@@ -1217,9 +1214,14 @@ mod filter_note_tests {
             v["warning"].as_str().unwrap().contains("not applied"),
             "{v}"
         );
-        let new = r#"{"symbol":"f","upstream":[{"symbol":"g","depth":1,"confidence":"high"}],"downstream":[]}"#;
+        let new = r#"{"symbol":"f","upstream":[{"symbol":"g","depth":1,"confidence":"high"}],"downstream":[],"filters":{"max_nodes":200}}"#;
         assert_eq!(note(new.into()), new);
+        // m2: an old server with nothing to list says nothing either.
         let empty = r#"{"symbol":"f","upstream":[],"downstream":[]}"#;
-        assert_eq!(note(empty.into()), empty);
+        let v: serde_json::Value = serde_json::from_str(&note(empty.into())).unwrap();
+        assert!(
+            v["warning"].as_str().unwrap().contains("not applied"),
+            "{v}"
+        );
     }
 }

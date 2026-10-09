@@ -1567,9 +1567,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Fixup H (M-2): `/health` says which project root this server serves,
-    /// so a client holding a stale `serve.json` can tell another repository's
-    /// server on a reused port from this one's.
     /// PLAN-009 TASK-009: `GET /impact` takes the filters of
     /// `impact_analysis` from the query string; a bad one is refused, named
     /// (as every tool error, a 500 with `error`), before any store is read.
@@ -1596,6 +1593,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Fixup H (M-2): `/health` says which project root this server serves,
+    /// so a client holding a stale `serve.json` can tell another repository's
+    /// server on a reused port from this one's.
     #[tokio::test]
     async fn health_reports_the_project_root() {
         let dir =

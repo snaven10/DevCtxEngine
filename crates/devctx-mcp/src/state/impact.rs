@@ -86,6 +86,14 @@ const CAPPED_HINT: &str =
      walked, and no deeper level was read; raise max_nodes (0 = no cap) or ask about a \
      narrower symbol";
 
+fn confidence_name(m: MinConfidence) -> &'static str {
+    match m {
+        MinConfidence::High => "high",
+        MinConfidence::Medium => "medium",
+        MinConfidence::Low => "low",
+    }
+}
+
 /// One node of the answer: 0.9.0's `{symbol, depth}` plus `confidence`,
 /// `via`, and `sym`/`file`/`line` when it has a definition here and
 /// `test`/`external`/`undecided` when true.
@@ -144,8 +152,12 @@ pub(super) fn impact_on(
             .map_err(|e| e.to_string())?;
         let up = im.upstream.nodes.iter().map(node_json).collect();
         let down = im.downstream.nodes.iter().map(node_json).collect();
+        // What the name became is compared with the name itself, without
+        // the file of `file::name` and with `::` folded (review m6).
+        let asked = bare.trim().replace("::", ".");
         let mut out = answer(
             symbol,
+            &asked,
             up,
             down,
             &im.resolved,
@@ -176,6 +188,7 @@ pub(super) fn impact_on(
     };
     Ok(answer(
         symbol,
+        symbol,
         to_json(&impact.upstream),
         to_json(&impact.downstream),
         &resolved,
@@ -196,6 +209,7 @@ pub(super) fn impact_on(
 #[allow(clippy::too_many_arguments)]
 fn answer(
     symbol: &str,
+    asked: &str,
     up: Vec<Value>,
     down: Vec<Value>,
     resolved: &[String],
@@ -221,23 +235,27 @@ fn answer(
     // A bare name can stand for several methods, and the radius merges
     // them. Say so: an unannounced merge reads as one method with a wide
     // blast radius, which is a different and much more alarming fact.
-    if let Some(names) = super::merged_declarations(symbol, resolved) {
+    if let Some(names) = super::merged_declarations(asked, resolved) {
         out["resolved_symbols"] = json!(names);
     }
     chosen.annotate(&mut out);
     reader.annotate(&mut out);
     let mut by_limit = 0;
     if let Some((im, opts)) = graph {
+        // The filters this answer applied: a client that asked for them
+        // and finds none knows the server (or its index) ignored them.
+        out["filters"] = json!({
+            "min_confidence": confidence_name(opts.min_confidence),
+            "include_tests": opts.include_tests,
+            "include_external": opts.include_external,
+            "max_nodes": opts.max_nodes,
+        });
         let (u, d) = (&im.upstream, &im.downstream);
         let below = u.below_confidence + d.below_confidence;
         if below > 0 {
             out["below_confidence"] = json!({
                 "count": below,
-                "min_confidence": match opts.min_confidence {
-                    MinConfidence::High => "high",
-                    MinConfidence::Medium => "medium",
-                    MinConfidence::Low => "low",
-                },
+                "min_confidence": confidence_name(opts.min_confidence),
                 "hint": BELOW_CONFIDENCE_HINT,
             });
         }
@@ -439,11 +457,13 @@ mod tests {
             }
         }
         assert_eq!(old["resolved_symbols"], new["resolved_symbols"]);
-        for n in old["upstream"].as_array().unwrap() {
-            let m = node(&new, "upstream", n["symbol"].as_str().unwrap());
-            assert_eq!(m["depth"], n["depth"], "{old} vs {new}");
+        for side in ["upstream", "downstream"] {
+            for n in old[side].as_array().unwrap() {
+                let m = node(&new, side, n["symbol"].as_str().unwrap());
+                assert_eq!(m["depth"], n["depth"], "{side}: {old} vs {new}");
+            }
+            assert!(!old[side].as_array().unwrap().is_empty(), "{side}: {old}");
         }
-        assert!(!old["upstream"].as_array().unwrap().is_empty(), "{old}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -497,6 +517,27 @@ mod tests {
         assert_eq!(n["undecided"], true, "{v}");
         assert_eq!(n["confidence"], "low", "{v}");
         assert_eq!(n["depth"], 1, "{v}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review m6: `file::name` that designates exactly the name is no
+    /// expansion, and neither is `Type::m` for `Type.m`; the answer of the
+    /// symbol graph says which filters it applied.
+    #[test]
+    fn a_file_qualified_name_is_no_expansion() {
+        let (state, repo) = indexed("impact_m6", &[]);
+        let v = impact(&state, "py/app/svc.py::helper", &ImpactQuery::default());
+        assert!(v.get("resolved_symbols").is_none(), "{v}");
+        assert!(!v["upstream"].as_array().unwrap().is_empty(), "{v}");
+        let v = impact(&state, "Thing::new", &ImpactQuery::default());
+        assert!(v.get("resolved_symbols").is_none(), "{v}");
+        let v = impact(&state, "new", &ImpactQuery::default());
+        assert!(
+            v["resolved_symbols"].is_array(),
+            "a bare name still expands: {v}"
+        );
+        assert_eq!(v["filters"]["min_confidence"], "medium", "{v}");
+        assert_eq!(v["filters"]["max_nodes"], 200, "{v}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -677,6 +718,7 @@ mod tests {
         };
         let opts = ImpactOptions::default();
         let v = answer(
+            "Core.run",
             "Core.run",
             up,
             down,

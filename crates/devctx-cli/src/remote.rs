@@ -1208,7 +1208,7 @@ impl Remote {
         for (k, v) in q.query_pairs() {
             path.push_str(&format!("&{k}={}", urlencode(&v)));
         }
-        self.get(&path)
+        Ok(impact_answer(self.get(&path)?, q))
     }
 
     pub fn backfill_links(&self, dry_run: bool, from_text: bool) -> Result<String> {
@@ -1321,6 +1321,17 @@ fn describe_transport_failure(e: ureq::Error) -> anyhow::Error {
 }
 
 /// Minimal percent-encoding for a path/query segment.
+/// The `impact` answer as the CLI shows it: when filters were passed and
+/// the server did not apply them (a 0.9 server, or an index older than the
+/// symbol graph), a `warning` says so (review m1).
+fn impact_answer(raw: String, q: &devctx_mcp::state::ImpactQuery) -> String {
+    if q.query_pairs().is_empty() {
+        raw
+    } else {
+        devctx_mcp::backend::note_unapplied_impact_filters(raw)
+    }
+}
+
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -1336,6 +1347,25 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Review m1: `devctx impact --include-tests` against a server that
+    /// ignores the filters says so; without filters, the answer as is.
+    #[test]
+    fn an_impact_with_unapplied_filters_says_so() {
+        let old = r#"{"symbol":"f","upstream":[],"downstream":[]}"#.to_string();
+        let q = devctx_mcp::state::ImpactQuery {
+            include_tests: Some(true),
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&super::impact_answer(old.clone(), &q)).unwrap();
+        assert!(
+            v["warning"].as_str().unwrap().contains("not applied"),
+            "{v}"
+        );
+        let plain = devctx_mcp::state::ImpactQuery::default();
+        assert_eq!(super::impact_answer(old.clone(), &plain), old);
+    }
+
     #[test]
     fn the_failure_hint_skips_a_backtrace_and_keeps_the_cause() {
         let dir = std::env::temp_dir().join(format!("devctx-hint-bt-{}", std::process::id()));
