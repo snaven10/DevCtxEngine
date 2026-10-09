@@ -42,6 +42,9 @@ const SEED_LIMIT: usize = 10_000;
 /// `get_references` lists by default.
 const IMPACT_KINDS: &str = "('calls', 'instantiates')";
 
+/// [`IMPACT_KINDS`] as a list.
+const IMPACT_KIND_LIST: &[&str] = &["calls", "instantiates"];
+
 /// What `impact_analysis` shows and how far it walks (DD-11, Q-2 of the
 /// plan): by default `high` and `medium`, no tests, no externals, 200 nodes
 /// per direction.
@@ -120,12 +123,17 @@ pub struct ImpactNode {
     pub external: bool,
     /// Global rank (PageRank), once the link pass computes it.
     pub rank: Option<f64>,
+    /// Reached only through a call the link pass could not decide (an
+    /// upstream caller of the name, review of TASK-009 M1): listed with
+    /// `low`, never walked.
+    pub unsure: bool,
 }
 
 impl ImpactNode {
-    /// Neither resolved nor external: the link pass could not decide.
+    /// The link pass could not decide: a destination neither resolved nor
+    /// external, or a caller reached only through such a call.
     pub fn undecided(&self) -> bool {
-        self.id.is_none() && !self.external
+        self.unsure || (self.id.is_none() && !self.external)
     }
 }
 
@@ -187,6 +195,8 @@ pub struct LevelRow {
     pub test: bool,
     /// The node's rank.
     pub rank: Option<f64>,
+    /// The edge is an undecided call to the name (the node is its caller).
+    pub unsure: bool,
 }
 
 #[cfg(test)]
@@ -212,6 +222,7 @@ fn row_to_level(r: &duckdb::Row<'_>) -> duckdb::Result<LevelRow> {
         external: r.get(7)?,
         test: r.get(8)?,
         rank: r.get(9)?,
+        unsure: false,
     })
 }
 
@@ -273,9 +284,9 @@ fn level_order(a: &LevelRow, b: &LevelRow) -> std::cmp::Ordering {
 /// name asked about); any other seed is reported when reached from another
 /// node (`Resource.update → Service.update`, both answering to `update`).
 ///
-/// With `from_sites`, the first level is read with an empty frontier: the
-/// callers of a name the repository does not define (its external call
-/// sites), as `get_references` lists them.
+/// With `from_sites`, the first level is read even with an empty frontier:
+/// the callers of a name the repository does not define (its external call
+/// sites), or of undecided calls to it, as `get_references` lists them.
 pub(crate) fn walk(
     seeds: &[u64],
     itself: &HashSet<u64>,
@@ -343,7 +354,7 @@ pub(crate) fn walk(
         let mut next = Vec::new();
         for (key, r) in admitted {
             reported.insert(key);
-            if let Some(id) = r.id {
+            if let Some(id) = r.id.filter(|_| !r.unsure) {
                 if walked.insert(id) {
                     next.push(id);
                 }
@@ -359,6 +370,7 @@ pub(crate) fn walk(
                 test: r.test,
                 external: r.external,
                 rank: r.rank,
+                unsure: r.unsure,
             });
         }
         if over {
@@ -406,9 +418,14 @@ impl Store {
         let syms = self.lookup_symbols(repo, branch, name, file, SEED_LIMIT)?;
         let asked = dotted(name.trim());
         let seeds: Vec<u64> = syms.iter().map(|s| s.id).collect();
+        // The name asked about is never reported as reached: a qualified
+        // name designates every definition it matched (`Inner.m` is
+        // `Outer.Inner.m`, review m4); a bare one only a definition whose
+        // qualified name is the name itself (a top-level function), so a
+        // `Resource.update → Service.update` pair still shows.
         let itself: HashSet<u64> = syms
             .iter()
-            .filter(|s| s.qualified == asked)
+            .filter(|s| asked.contains('.') || s.qualified == asked)
             .map(|s| s.id)
             .collect();
         // A name with no definition here stands for its external call
@@ -419,17 +436,40 @@ impl Store {
         } else {
             None
         };
+        // Calls to the name the link pass left undecided are callers 0.9.0
+        // listed (review M1): with `low` their callers join the first
+        // upstream level, marked and not walked; otherwise they are counted
+        // as `get_references` counts them. Never under `file::name`: an
+        // undecided row names a name, not a file.
+        let undecided = file.is_none();
+        let list_undecided = undecided && opts.min_confidence == MinConfidence::Low;
         let side = |dir: Direction| {
-            let from_sites = dir == Direction::Upstream && sites.is_some();
-            walk(&seeds, &itself, opts, from_sites, |f| match (&sites, f) {
-                (Some(t), []) => self.impact_site_callers(repo, branch, t),
-                _ => self.impact_level(repo, branch, f, dir, mode),
+            let up = dir == Direction::Upstream;
+            let extra = up && (sites.is_some() || list_undecided);
+            let mut first = true;
+            walk(&seeds, &itself, opts, extra, |f| {
+                if !(up && std::mem::take(&mut first)) {
+                    return self.impact_level(repo, branch, f, dir, mode);
+                }
+                let mut rows = self.impact_level(repo, branch, f, dir, mode)?;
+                if let Some(t) = &sites {
+                    rows.extend(self.impact_site_callers(repo, branch, t)?);
+                }
+                if list_undecided {
+                    rows.extend(self.impact_undecided_callers(repo, branch, &asked)?);
+                }
+                Ok(rows)
             })
         };
+        let mut upstream = side(Direction::Upstream)?;
+        if undecided && !list_undecided {
+            upstream.below_confidence +=
+                self.count_undecided_references(repo, branch, &asked, IMPACT_KIND_LIST)?;
+        }
         Ok(SymbolImpact {
             resolved: Store::qualified_names(&syms),
             external_target: sites.clone(),
-            upstream: side(Direction::Upstream)?,
+            upstream,
             downstream: side(Direction::Downstream)?,
         })
     }
@@ -474,6 +514,38 @@ impl Store {
         let rows = stmt.query_map(duckdb::params![repo, branch, target, target], row_to_level)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// The callers of the calls to `name` (dotted) the link pass left
+    /// undecided: written `name` or ending in `.name`, as
+    /// [`count_undecided_references`](Self::count_undecided_references)
+    /// counts them. Each row is `unsure`.
+    fn impact_undecided_callers(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+    ) -> Result<Vec<LevelRow>> {
+        let d = "replace(e.dst_name, '::', '.')";
+        count_statement();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT 0, e.src_id, s.qualified, s.file, s.start_line, e.kind, e.confidence,
+                    false, coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank
+               FROM live_edges e
+               JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
+              WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
+                AND e.dst_id IS NULL AND NOT coalesce(e.external, false)
+                AND ({d} = ? OR ends_with({d}, '.' || ?))"
+        ))?;
+        let rows = stmt.query_map(duckdb::params![repo, branch, name, name], row_to_level)?;
+        rows.map(|r| {
+            r.map(|mut l| {
+                l.unsure = true;
+                l
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
     }
 
     /// One level of the walk: every `calls`/`instantiates` edge of
@@ -1037,5 +1109,87 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(im.external_target.is_none() && im.upstream.nodes.is_empty());
+    }
+
+    /// Review of TASK-009, M1: a call to the name that the link pass left
+    /// undecided (`svc.update()` on an untyped receiver) is a caller 0.9.0
+    /// listed. By default it is counted in `below_confidence`; with `low` its
+    /// caller is listed, marked undecided, and not walked. Under
+    /// `file::name` it is neither (it names a name, not a file).
+    #[test]
+    fn undecided_calls_to_the_name_are_counted_or_listed_upstream() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut unsure = call("Api.handle", "update");
+        unsure.resolved = false;
+        unsure.confidence = None;
+        unsure.resolution = None;
+        let edges = vec![
+            call("Web.go", "Svc.update"),
+            unsure,
+            call("Top.t", "Api.handle"),
+        ];
+        symbol_graph(&store, &edges, &[]);
+        let im = store
+            .impact_graph("repo", "main", "update", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Web.go"]);
+        assert_eq!(im.upstream.below_confidence, 1);
+        let low = ImpactOptions {
+            min_confidence: MinConfidence::Low,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "update", None, &low)
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Web.go", "Api.handle"]);
+        let n = &im.upstream.nodes[1];
+        assert!(n.undecided() && n.id.is_some() && n.depth == 1, "{n:?}");
+        assert!(
+            !names(&im.upstream).contains(&"Top.t"),
+            "an undecided caller is not walked"
+        );
+        assert_eq!(im.upstream.below_confidence, 0);
+        // A qualified name counts only the undecided calls written that way.
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "Svc.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(im.upstream.below_confidence, 0);
+        // `file::name`: neither listed nor counted.
+        for opts in [ImpactOptions::default(), low] {
+            let im = store
+                .impact_graph("repo", "main", "update", Some("src/main/Main.java"), &opts)
+                .unwrap();
+            assert_eq!(names(&im.upstream), ["Web.go"]);
+            assert_eq!(im.upstream.below_confidence, 0);
+        }
+    }
+
+    /// Review of TASK-009, m4: a qualified name names its definitions, all
+    /// of them: `Inner.m` for `Outer.Inner.m` in a mutual recursion is not
+    /// its own caller.
+    #[test]
+    fn a_qualified_name_is_never_its_own_caller() {
+        let store = Store::open_in_memory(3).unwrap();
+        symbol_graph(
+            &store,
+            &[
+                call("Outer.Inner.m", "Outer.Inner.n"),
+                call("Outer.Inner.n", "Outer.Inner.m"),
+            ],
+            &[],
+        );
+        for name in ["Inner.m", "Outer.Inner.m"] {
+            let im = store
+                .impact_graph("repo", "main", name, None, &ImpactOptions::default())
+                .unwrap();
+            assert_eq!(names(&im.upstream), ["Outer.Inner.n"], "{name}");
+            assert_eq!(names(&im.downstream), ["Outer.Inner.n"], "{name}");
+        }
     }
 }

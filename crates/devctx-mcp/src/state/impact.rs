@@ -71,9 +71,9 @@ impl ImpactQuery {
 
 /// The line the answer adds when `min_confidence` left nodes out.
 const BELOW_CONFIDENCE_HINT: &str =
-    "symbols reached only through calls below the confidence shown were left out and not \
-     walked (ambiguous names or calls the index could not decide); pass min_confidence: \
-     \"low\" to include them, marked";
+    "symbols reached only through calls below the confidence shown, and calls to the name \
+     the index could not decide, were left out and not walked (counted: symbols, and those \
+     calls one by one); pass min_confidence: \"low\" to include them, marked";
 
 /// The line the answer adds when tests or externals were left out.
 const EXCLUDED_HINT: &str =
@@ -470,6 +470,33 @@ mod tests {
                 .any(|s| s == "Service.update"),
             "{v}"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review M1: an undecided call to the name (`s.flush()` on an untyped
+    /// receiver, two `flush` in the repo) is counted by default and its
+    /// caller listed with `low`, marked, as `get_references` does.
+    #[test]
+    fn an_undecided_call_to_the_name_is_counted_or_listed() {
+        let (state, repo) = indexed("impact_undecided", &[]);
+        let v = impact(&state, "flush", &ImpactQuery::default());
+        assert!(
+            !syms(&v, "upstream").iter().any(|s| s == "Repo.walk"),
+            "{v}"
+        );
+        assert!(v["below_confidence"]["count"].as_u64().unwrap() >= 1, "{v}");
+        let v = impact(
+            &state,
+            "flush",
+            &ImpactQuery {
+                min_confidence: Some("low".into()),
+                ..Default::default()
+            },
+        );
+        let n = node(&v, "upstream", "Repo.walk");
+        assert_eq!(n["undecided"], true, "{v}");
+        assert_eq!(n["confidence"], "low", "{v}");
+        assert_eq!(n["depth"], 1, "{v}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
