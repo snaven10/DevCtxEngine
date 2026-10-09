@@ -75,24 +75,41 @@ impl Default for ImpactOptions {
     }
 }
 
-/// How a level query names its frontier. Measured on a copy of a Java
-/// repository and of this one (TASK-009): see [`FrontierSql::default`].
-#[doc(hidden)]
+/// Frontiers up to this many ids go as an `IN` list under
+/// [`FrontierSql::Auto`]; larger ones as one `UBIGINT[]` parameter.
+const AUTO_IN_MAX: usize = 1024;
+
+/// How a level query names its frontier: the default, [`Auto`](Self::Auto),
+/// was chosen by measuring them all on copies of two Java repositories and
+/// of this one (TASK-009 and its review); the others stay for measuring
+/// (feature `bench`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(not(any(test, feature = "bench")), allow(dead_code))]
 pub enum FrontierSql {
-    /// `IN (1, 2, …)`, the ids written into the statement (they are
-    /// integers: nothing to escape). One statement per level.
-    #[default]
+    /// `IN (1, 2, …)`, the ids written into the statement (integers:
+    /// nothing to escape). An id above `i64::MAX` types the whole list as
+    /// `HUGEINT`, so `dst_id` is cast on every row (review m3).
     InList,
+    /// `IN (1::UBIGINT, …)`: the same list, typed as the column.
+    InListTyped,
     /// A temporary table refilled per level (delete, append, join).
     TempTable,
     /// One `UBIGINT[]` parameter, unnested.
     ListParam,
+    /// [`InList`](Self::InList) up to [`AUTO_IN_MAX`] ids,
+    /// [`ListParam`](Self::ListParam) above. Measured on a copy of a Java
+    /// repository of 1 250 files (review of TASK-009, m3): in real walks
+    /// (frontiers up to ~400 ids) the `IN` list is 10-40 ms faster per walk
+    /// than the parameter; over synthetic frontiers of 2 000-20 000 ids the
+    /// parameter is 1.5-3× faster than the `IN` list (and the typed list
+    /// slower than both), and no statement grows with the frontier.
+    #[default]
+    Auto,
 }
 
 /// A direction of the walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
+pub(crate) enum Direction {
     /// Callers: who is affected if the symbol changes.
     Upstream,
     /// Callees: what the symbol depends on.
@@ -155,6 +172,8 @@ pub struct ImpactSide {
     pub external: usize,
     /// Level queries run.
     pub levels: usize,
+    /// The largest frontier a level query read (ids).
+    pub widest: usize,
 }
 
 /// The blast radius of a name over the symbol graph.
@@ -172,9 +191,8 @@ pub struct SymbolImpact {
 }
 
 /// One edge of a level, as a level query reads it.
-#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq)]
-pub struct LevelRow {
+pub(crate) struct LevelRow {
     /// The frontier id the edge leaves from (upstream: its destination).
     pub from: u64,
     /// The node reached.
@@ -314,6 +332,7 @@ pub(crate) fn walk(
         }
         let rows = level(&frontier)?;
         side.levels += 1;
+        side.widest = side.widest.max(frontier.len());
         let mut best: HashMap<Key, LevelRow> = HashMap::new();
         for r in rows {
             // A recursive call reaches nothing new.
@@ -403,10 +422,43 @@ impl Store {
         self.impact_graph_with(repo, branch, name, file, opts, FrontierSql::default())
     }
 
-    /// [`impact_graph`](Self::impact_graph) with an explicit frontier form
-    /// (the measurement of TASK-009 compares them).
-    #[doc(hidden)]
-    pub fn impact_graph_with(
+    /// [`impact_graph`](Self::impact_graph) with an explicit frontier form,
+    /// for measuring them (feature `bench`).
+    #[cfg(feature = "bench")]
+    pub fn impact_graph_bench(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+        file: Option<&str>,
+        opts: &ImpactOptions,
+        mode: FrontierSql,
+    ) -> Result<SymbolImpact> {
+        self.impact_graph_with(repo, branch, name, file, opts, mode)
+    }
+
+    /// One level query over an arbitrary `frontier` with an explicit form:
+    /// the rows it read (feature `bench`, to measure frontiers wider than a
+    /// real walk reaches).
+    #[cfg(feature = "bench")]
+    pub fn impact_level_bench(
+        &self,
+        repo: &str,
+        branch: &str,
+        frontier: &[u64],
+        upstream: bool,
+        mode: FrontierSql,
+    ) -> Result<usize> {
+        let dir = if upstream {
+            Direction::Upstream
+        } else {
+            Direction::Downstream
+        };
+        Ok(self.impact_level(repo, branch, frontier, dir, mode)?.len())
+    }
+
+    /// [`impact_graph`](Self::impact_graph) with an explicit frontier form.
+    pub(crate) fn impact_graph_with(
         &self,
         repo: &str,
         branch: &str,
@@ -476,7 +528,7 @@ impl Store {
 
     /// The `n` symbols with the most resolved incoming calls on a branch,
     /// by bare name (what a measurement picks its cases from).
-    #[doc(hidden)]
+    #[cfg(feature = "bench")]
     pub fn impact_top_called(
         &self,
         repo: &str,
@@ -551,8 +603,7 @@ impl Store {
     /// One level of the walk: every `calls`/`instantiates` edge of
     /// `live_edges` into (upstream) or out of (downstream) the ids of
     /// `frontier`, with the node at its other end.
-    #[doc(hidden)]
-    pub fn impact_level(
+    pub(crate) fn impact_level(
         &self,
         repo: &str,
         branch: &str,
@@ -565,7 +616,20 @@ impl Store {
         }
         let mut args: Vec<duckdb::types::Value> =
             vec![repo.to_string().into(), branch.to_string().into()];
+        let ids = |suffix: &str| {
+            frontier
+                .iter()
+                .map(|id| format!("{id}{suffix}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mode = match mode {
+            FrontierSql::Auto if frontier.len() <= AUTO_IN_MAX => FrontierSql::InList,
+            FrontierSql::Auto => FrontierSql::ListParam,
+            m => m,
+        };
         let set = match mode {
+            FrontierSql::InListTyped => format!("({})", ids("::UBIGINT")),
             FrontierSql::InList => format!(
                 "({})",
                 frontier
@@ -602,6 +666,7 @@ impl Store {
                 count_statement();
                 "(SELECT id FROM impact_frontier)".to_string()
             }
+            FrontierSql::Auto => unreachable!("resolved above"),
         };
         let sql = match dir {
             Direction::Upstream => format!(
@@ -684,12 +749,22 @@ pub(crate) mod tests {
         edges: &[E],
         ranks: &[(&str, f64)],
     ) -> BTreeMap<String, u64> {
+        symbol_graph_from(store, edges, ranks, 1000)
+    }
+
+    /// [`symbol_graph`] with ids counted up from `base`.
+    pub(crate) fn symbol_graph_from(
+        store: &Store,
+        edges: &[E],
+        ranks: &[(&str, f64)],
+        base: u64,
+    ) -> BTreeMap<String, u64> {
         let mut ids: BTreeMap<String, u64> = BTreeMap::new();
         let mut order: Vec<String> = Vec::new();
         for e in edges {
             for (q, is_sym) in [(&e.src, true), (&e.dst, e.resolved)] {
                 if is_sym && !ids.contains_key(q) {
-                    ids.insert(q.clone(), 1000 + ids.len() as u64);
+                    ids.insert(q.clone(), base + ids.len() as u64);
                     order.push(q.clone());
                 }
             }
@@ -773,7 +848,12 @@ pub(crate) mod tests {
         }
         edges.push(call("Core.run", "Dep.x"));
         symbol_graph(&store, &edges, &[]);
-        for mode in [FrontierSql::InList, FrontierSql::ListParam] {
+        for mode in [
+            FrontierSql::InList,
+            FrontierSql::InListTyped,
+            FrontierSql::ListParam,
+            FrontierSql::Auto,
+        ] {
             LEVEL_STATEMENTS.with(|c| c.set(0));
             let opts = ImpactOptions {
                 max_nodes: 0,
@@ -1191,5 +1271,42 @@ pub(crate) mod tests {
             assert_eq!(names(&im.upstream), ["Outer.Inner.n"], "{name}");
             assert_eq!(names(&im.downstream), ["Outer.Inner.n"], "{name}");
         }
+    }
+
+    /// Review m3: every frontier form reads the same rows, also over a
+    /// frontier wider than the `IN` list of `Auto` takes and over ids above
+    /// `i64::MAX` (which type a bare `IN` list as `HUGEINT`).
+    #[test]
+    fn every_frontier_form_reads_the_same_wide_frontier_of_huge_ids() {
+        let store = Store::open_in_memory(3).unwrap();
+        let n = AUTO_IN_MAX + 476;
+        let mut edges = Vec::new();
+        for i in 0..n {
+            edges.push(call(&format!("C{i:04}.c"), "Core.run"));
+            edges.push(call(&format!("D{i:04}.d"), &format!("C{i:04}.c")));
+        }
+        let ids = symbol_graph_from(&store, &edges, &[], u64::MAX - 10 * n as u64);
+        assert!(ids.values().all(|&i| i > i64::MAX as u64));
+        let opts = ImpactOptions {
+            depth: 2,
+            max_nodes: 0,
+            ..Default::default()
+        };
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        for mode in [
+            FrontierSql::InList,
+            FrontierSql::InListTyped,
+            FrontierSql::ListParam,
+            FrontierSql::TempTable,
+            FrontierSql::Auto,
+        ] {
+            let im = store
+                .impact_graph_with("repo", "main", "Core.run", None, &opts, mode)
+                .unwrap();
+            assert_eq!(im.upstream.nodes.len(), 2 * n, "{mode:?}");
+            assert_eq!(im.upstream.widest, n, "{mode:?}");
+            seen.push(names(&im.upstream).iter().map(|s| s.to_string()).collect());
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]));
     }
 }

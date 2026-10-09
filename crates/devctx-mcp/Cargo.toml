@@ -33,3 +33,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 [target.'cfg(target_env = "gnu")'.dependencies]
 # Only for `malloc_trim`: see `AppState::release_idle_models`.
 libc = "0.2"
+
+[dev-dependencies]
+# The measurement harness of `impact_analysis` (`impact_bench`, ignored).
+devctx-store = { path = "../devctx-store", features = ["bench"] }

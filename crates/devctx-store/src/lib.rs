@@ -21,9 +21,11 @@ mod symbols;
 
 pub use error::{Result, StoreError};
 pub use graph::{GraphEdge, ImpactResult, Reference, StoredEdge};
+#[cfg(feature = "bench")]
+pub use impact::FrontierSql;
 pub use impact::{
-    Direction, FrontierSql, ImpactNode, ImpactOptions, ImpactSide, LevelRow, SymbolImpact,
-    DEFAULT_IMPACT_DEPTH, DEFAULT_IMPACT_MAX_NODES,
+    ImpactNode, ImpactOptions, ImpactSide, SymbolImpact, DEFAULT_IMPACT_DEPTH,
+    DEFAULT_IMPACT_MAX_NODES,
 };
 pub use lookup::{
     sym_hex, ExternalSites, MinConfidence, SymbolDefinition, SymbolReference, ViewEdge,

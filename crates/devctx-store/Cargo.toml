@@ -7,6 +7,11 @@ repository.workspace = true
 rust-version.workspace = true
 description = "DuckDB-backed storage for DevCtxEngine: vectors + graph + memories."
 
+[features]
+# Measurement hooks of `impact_analysis` (TASK-009): the frontier forms and
+# the most-called symbols. Off in every release build.
+bench = []
+
 [dependencies]
 serde = { workspace = true }
 devctx-core.workspace = true

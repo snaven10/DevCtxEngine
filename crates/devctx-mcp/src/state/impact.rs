@@ -783,6 +783,10 @@ mod tests {
         let runs: usize = var("DEVCTX_IMPACT_BENCH_RUNS")
             .and_then(|r| r.parse().ok())
             .unwrap_or(30);
+        // Depth of the uncapped walk (wider frontiers than the default 3).
+        let wide: usize = var("DEVCTX_IMPACT_BENCH_DEPTH")
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(3);
         let mut cfg = ProjectConfig::default();
         cfg.project.path = repo;
         cfg.state_dir = state_dir;
@@ -830,6 +834,51 @@ mod tests {
             v["upstream"].as_array().map_or(0, |a| a.len())
                 + v["downstream"].as_array().map_or(0, |a| a.len())
         };
+        // Level queries over synthetic frontiers of `$DEVCTX_IMPACT_BENCH_FRONTIER`
+        // ids (comma-separated sizes), the branch's symbols in id order: the
+        // widths a real walk rarely reaches.
+        if let Some(sizes) = var("DEVCTX_IMPACT_BENCH_FRONTIER") {
+            let store = state.open_store().unwrap();
+            let mut ids: Vec<u64> = store
+                .branch_symbols(&r, &b)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            ids.sort_unstable();
+            for n in sizes
+                .split(',')
+                .filter_map(|n| n.trim().parse::<usize>().ok())
+            {
+                let f = &ids[..n.min(ids.len())];
+                let above = f.iter().filter(|&&i| i > i64::MAX as u64).count();
+                for upstream in [true, false] {
+                    let mut out = serde_json::Map::new();
+                    for mode in [
+                        FrontierSql::InList,
+                        FrontierSql::InListTyped,
+                        FrontierSql::ListParam,
+                        FrontierSql::TempTable,
+                        FrontierSql::Auto,
+                    ] {
+                        let (p50, p95, rows) = time(&mut || {
+                            store.impact_level_bench(&r, &b, f, upstream, mode).unwrap()
+                        });
+                        out.insert(
+                            format!("{mode:?}"),
+                            json!({ "p50_ms": p50, "p95_ms": p95, "rows": rows }),
+                        );
+                    }
+                    println!(
+                        "{}",
+                        json!({
+                            "frontier": f.len(), "above_i64": above,
+                            "upstream": upstream, "modes": out,
+                        })
+                    );
+                }
+            }
+        }
         let text = std::fs::read_to_string(cases).unwrap();
         let symbols: Vec<&str> = text
             .lines()
@@ -849,35 +898,45 @@ mod tests {
             });
             let store = state.open_store().unwrap();
             let mut walks = serde_json::Map::new();
+            let tool_only = var("DEVCTX_IMPACT_BENCH_TOOL_ONLY").is_some();
             for (label, opts) in [
                 ("default", devctx_store::ImpactOptions::default()),
                 (
                     "uncapped_all",
                     devctx_store::ImpactOptions {
+                        depth: wide,
                         min_confidence: devctx_store::MinConfidence::Low,
                         include_tests: true,
                         include_external: true,
                         max_nodes: 0,
-                        ..Default::default()
                     },
                 ),
             ] {
+                if tool_only {
+                    break;
+                }
                 for mode in [
                     FrontierSql::InList,
+                    FrontierSql::InListTyped,
                     FrontierSql::ListParam,
                     FrontierSql::TempTable,
+                    FrontierSql::Auto,
                 ] {
-                    let mut levels = 0;
+                    let (mut levels, mut widest) = (0, 0);
                     let (p50, p95, n) = time(&mut || {
                         let im = store
-                            .impact_graph_with(&r, &b, sym, None, &opts, mode)
+                            .impact_graph_bench(&r, &b, sym, None, &opts, mode)
                             .unwrap();
                         levels = im.upstream.levels + im.downstream.levels;
+                        widest = im.upstream.widest.max(im.downstream.widest);
                         im.upstream.nodes.len() + im.downstream.nodes.len()
                     });
                     walks.insert(
                         format!("{label}/{mode:?}"),
-                        json!({ "p50_ms": p50, "p95_ms": p95, "nodes": n, "levels": levels }),
+                        json!({
+                            "p50_ms": p50, "p95_ms": p95, "nodes": n,
+                            "levels": levels, "widest": widest,
+                        }),
                     );
                 }
             }
@@ -895,6 +954,9 @@ mod tests {
                     "walks": walks,
                 })
             );
+        }
+        if var("DEVCTX_IMPACT_BENCH_TOOL_ONLY").is_some() {
+            return;
         }
         // The 0.9.0 walk on the same rows.
         stamp("v0-old");

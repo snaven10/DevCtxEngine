@@ -1261,7 +1261,7 @@ dependencies = [
  "devctx-central",
  "devctx-core",
  "devctx-embed",
- "devctx-index",
+ "devctx-mcp",
  "devctx-memory",
  "devctx-search",
  "devctx-store",

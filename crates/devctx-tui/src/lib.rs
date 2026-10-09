@@ -21,7 +21,6 @@ use std::time::Duration;
 use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult, VectorMetadata, VectorPoint};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
-use devctx_index::GitRepo;
 use devctx_search::{search_ranked, RankOptions, SearchMode};
 use devctx_store::Store;
 use serde_json::Value;
@@ -130,10 +129,10 @@ enum Engine {
         filter: SearchFilter,
         /// The project's `search.penalty`, as the CLI and MCP apply it.
         rank: RankOptions,
-        repo: String,
-        branch: String,
-        /// The repository root, as `index_meta` keys it.
-        repo_path: String,
+        /// The repository root, for `impact_analysis`'s choice of branch.
+        root: PathBuf,
+        /// The configured default branch.
+        default_branch: Option<String>,
         project: String,
     },
     Remote {
@@ -151,14 +150,6 @@ impl Engine {
         } else {
             PathBuf::from(&cfg.project.path)
         };
-        let (repo, branch, repo_path) = match GitRepo::open(&root) {
-            Ok(git) => (
-                git.short_name(),
-                git.state().branch,
-                git.root().to_string_lossy().into_owned(),
-            ),
-            Err(_) => (String::new(), String::new(), String::new()),
-        };
         let project = if cfg.project.name.is_empty() {
             "default".to_string()
         } else {
@@ -172,9 +163,8 @@ impl Engine {
                 ..Default::default()
             },
             rank: rank_options(cfg),
-            repo,
-            branch,
-            repo_path,
+            default_branch: cfg.indexing.default_branch().map(str::to_string),
+            root,
             project,
         })
     }
@@ -230,40 +220,22 @@ impl Engine {
         match self {
             Engine::Local {
                 store,
-                repo,
-                branch,
-                repo_path,
+                root,
+                default_branch,
                 ..
             } => {
-                // The symbol graph when the index is current (as the tool
-                // decides, PLAN-009 TASK-009), else the 0.9.0 walk.
-                let current = !store
-                    .extractor_stale(
-                        repo,
-                        repo_path,
-                        branch,
-                        &devctx_index::extractor_fingerprint(),
-                    )
-                    .unwrap_or(true)
-                    && store.has_symbol_graph(repo, branch).unwrap_or(false);
-                if current {
-                    let im = store.impact_graph(
-                        repo,
-                        branch,
-                        symbol,
-                        None,
-                        &devctx_store::ImpactOptions::default(),
-                    )?;
-                    let pairs = |side: &devctx_store::ImpactSide| {
-                        side.nodes
-                            .iter()
-                            .map(|n| (n.symbol.clone(), n.depth))
-                            .collect()
-                    };
-                    return Ok((pairs(&im.upstream), pairs(&im.downstream)));
-                }
-                let im = store.impact_analysis(repo, branch, symbol, 3)?;
-                Ok((im.upstream, im.downstream))
+                // The tool's own answer (symbol graph or 0.9.0 walk: the
+                // same choice of reader and branch), with its defaults.
+                let v = devctx_mcp::state::impact_at(
+                    store,
+                    root,
+                    default_branch.as_deref(),
+                    symbol,
+                    3,
+                    &devctx_mcp::state::ImpactQuery::default(),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
+                Ok((json_pairs(&v["upstream"]), json_pairs(&v["downstream"])))
             }
             Engine::Remote { base, token } => {
                 let v = http_get(
