@@ -154,7 +154,7 @@ se recorre:
 | `include_tests` (`--include-tests`) | `false` | símbolos de archivos de test → `excluded.tests` |
 | `include_external` (`--include-external`) | `false` | llamados de librerías → `excluded.external` |
 | `max_nodes` (`--max-nodes`) | `200` por dirección (`0` = sin tope) | los símbolos de la profundidad que lo desborda → `omitted: {count, reason: "limit"}` y `omitted_by_limit: {count, max_nodes, upstream/downstream: {count, depth}}`; no se lee ningún nivel más profundo |
-| `dispatch` (`--no-dispatch`) | `true` | nada: se sigue el dispatch por interfaces, clases abstractas y traits (abajo); `false` sigue solo llamadas directas. Un nodo con más métodos override-equivalentes de los que se expande (16) → `omitted_by_limit.dispatch: {count, max_per_node}`, sumado a `omitted_by_limit.count` y a `omitted.count` |
+| `dispatch` (`--no-dispatch`) | `true` | nada: se sigue el dispatch por interfaces, clases abstractas y traits (abajo); `false` sigue solo llamadas directas. Un nodo con más métodos override-equivalentes de los que se expande (16) → `omitted_by_limit.dispatch: {count, max_per_node}` y solo ahí (cuenta métodos; `omitted_by_limit.count` y `omitted.count` siguen contando nodos) |
 
 **Dispatch.** Un llamador que tiene un servicio por su interfaz (un campo
 inyectado como `IService`, un parámetro tipado por un trait) llama a
@@ -170,13 +170,15 @@ solo desde el símbolo pedido):
 
 Un método es override-equivalente si tiene el mismo nombre y una aridad que puede
 coincidir (los parámetros con default, opcionales o variádicos la amplían); un
-método private o static no sobrescribe nada. La cadena de supertipos se sigue
+método private o static no sobrescribe nada; entre sobrecargas de igual aridad en
+un supertipo gana la que coincide exacto en los tipos simples de sus parámetros. La cadena de supertipos se sigue
 hasta cuatro niveles (`ServiceImpl` → `BaseService` → `IService` → su
 super-interfaz). Ese nodo lleva `via: "dispatch"` y `through` (el método por el que
 pasó), y su confianza es `min(medium, la arista que representa)`: nunca `high`, y
 una llamada `low` sigue `low` (contada en `below_confidence` por defecto). Para
 dejar el dispatch afuera: `dispatch: false` (`--no-dispatch`, `?dispatch=false`), o
-`min_confidence: "high"`, que deja afuera también toda llamada `medium`. Cubre
+`min_confidence: "high"`, que deja afuera también toda llamada `medium` (y no lee
+ni cuenta ningún dispatch). Cubre
 Java, TypeScript (`implements`, clases abstractas) y traits de Rust; las clases
 base de Python como mejor esfuerzo; Go no (embeber promueve métodos, no los
 sobrescribe, y una interfaz se satisface sin una arista que seguir).

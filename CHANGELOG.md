@@ -326,14 +326,18 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   static method, not in Go (embedding is no override). Such a node has `via:
   "dispatch"` and `through` (the method it went through), and confidence
   `min(medium, the edge it stands for)` — never `high`, a `low` call stays
-  `low`. At most 16 equivalents per node; the rest are counted in
-  `omitted_by_limit.dispatch` (and in `omitted.count`). `dispatch: false` (tool,
+  `low`. Among same-arity overloads in one supertype, the one whose simple
+  parameter types match exactly. At most 16 equivalents per node, production
+  before tests; the rest are counted in `omitted_by_limit.dispatch` only (not
+  in its `count` nor in `omitted`, which count nodes). `dispatch: false` (tool,
   `GET /impact?dispatch=false`, `devctx impact --no-dispatch`) follows direct
-  calls only, `min_confidence: "high"` leaves it out and counts it, and
+  calls only, `min_confidence: "high"` leaves it out without reading it, and
   `filters` says whether it applied. The supertype graph is read once per call
-  and each level expanded in memory (no statement per level); measured on two
-  Java repositories (1 250 and 216 files), p95 of the tool 26-106 ms with
-  dispatch against 21-89 ms without it.
+  as id pairs, and a level pays one statement only when its frontier holds a
+  method of a type with a supertype or a subtype; nothing is read when no
+  dispatch could show. Measured on two Java repositories (1 250 and 216 files)
+  and on a synthetic hierarchy of 1 500 supertype edges (Resultado of TASK-017
+  in the plan).
 - **A method a TypeScript interface declares, and an abstract method of an
   abstract class, are symbols** (extractor version 20), as a Java interface's or
   a Rust trait's already were: a call through a receiver typed by the interface

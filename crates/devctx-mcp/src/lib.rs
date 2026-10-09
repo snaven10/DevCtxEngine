@@ -226,7 +226,7 @@ struct ImpactReq {
     /// implementations of an interface or abstract method, as `via:
     /// "dispatch"` with `through` (the method it went through), never surer
     /// than `medium`. `false` follows direct calls only; `min_confidence:
-    /// "high"` also leaves them out (counted in `below_confidence`).
+    /// "high"` also leaves them out, without reading them (not counted).
     #[serde(default)]
     dispatch: Option<bool>,
 }

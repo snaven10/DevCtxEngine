@@ -148,7 +148,7 @@ walked:
 | `include_tests` (`--include-tests`) | `false` | symbols of test files → `excluded.tests` |
 | `include_external` (`--include-external`) | `false` | library callees → `excluded.external` |
 | `max_nodes` (`--max-nodes`) | `200` per direction (`0` = no cap) | the symbols of the depth that overflows it → `omitted: {count, reason: "limit"}` and `omitted_by_limit: {count, max_nodes, upstream/downstream: {count, depth}}`; no deeper level is read |
-| `dispatch` (`--no-dispatch`) | `true` | nothing: dispatch through interfaces, abstract classes and traits is followed (below); `false` follows direct calls only. A node with more override-equivalent methods than it is expanded into (16) → `omitted_by_limit.dispatch: {count, max_per_node}`, added to `omitted_by_limit.count` and `omitted.count` |
+| `dispatch` (`--no-dispatch`) | `true` | nothing: dispatch through interfaces, abstract classes and traits is followed (below); `false` follows direct calls only. A node with more override-equivalent methods than it is expanded into (16) → `omitted_by_limit.dispatch: {count, max_per_node}` only (it counts methods; `omitted_by_limit.count` and `omitted.count` keep counting nodes) |
 
 **Dispatch.** A caller that holds a service by its interface (a field injected as
 `IService`, a parameter typed by a trait) calls `IService.update`, never
@@ -164,13 +164,15 @@ about):
 
 A method is override-equivalent when it has the same name and an arity that can
 match (defaults, optional and variadic parameters widen it); a private or static
-method overrides nothing. The chain of supertypes is followed up to four levels
+method overrides nothing; among same-arity overloads in one supertype, the one
+whose simple parameter types match exactly wins. The chain of supertypes is followed up to four levels
 (`ServiceImpl` → `BaseService` → `IService` → its super-interface). Such a node
 has `via: "dispatch"` and `through` (the method it went through), and its
 confidence is `min(medium, the edge it stands for)` — never `high`, and a `low`
 call stays `low` (counted in `below_confidence` by default). To leave dispatch
 out: `dispatch: false` (`--no-dispatch`, `?dispatch=false`), or
-`min_confidence: "high"`, which also leaves out every `medium` call. Java,
+`min_confidence: "high"`, which also leaves out every `medium` call (and does
+not read, nor count, any dispatch). Java,
 TypeScript (`implements`, abstract classes) and Rust traits are covered; Python
 base classes on a best-effort basis; Go not at all (embedding promotes methods, it
 does not override them, and an interface is satisfied without an edge to follow).
