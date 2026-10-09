@@ -486,17 +486,33 @@ fn self_in_an_impl_of_a_repo_trait_reaches_the_trait() {
             false
         )
     );
-    // ... and a method of the `impl` itself (an override) wins, `high`.
+    // ... and a method of the `impl` itself (an override) wins, but only
+    // `medium` too: an inherent `u32::bow` would win over it (MINOR of the
+    // review of TASK-008).
     assert_eq!(
         l.call("u32.greet", "u32.bow"),
         (
             s("u32.bow"),
             s("crates/app/src/review.rs"),
-            "high",
+            "medium",
             "same_file",
             false
         )
     );
     // The outside type's own method stays undecided.
     assert_eq!(l.call("Vec.size", "Vec.tidy_up"), UNDECIDED);
+}
+
+/// Review of TASK-008 (MINOR): in an `impl Trait for T` with `T` from
+/// outside, an inherent method of `T` wins over the `impl`'s own method of
+/// the same name (`String::len` over `Counted::len` for `String`), and the
+/// repository cannot know `T`'s inherent methods: the `impl`'s method is
+/// only `medium`.
+#[test]
+fn an_impl_method_for_an_outside_type_is_no_surer_than_medium() {
+    let l = linked();
+    assert_eq!(
+        l.call("String.total", "String.len"),
+        (s("String.len"), s(REVIEW_SRC), "medium", "same_file", false)
+    );
 }

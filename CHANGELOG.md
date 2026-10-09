@@ -247,6 +247,10 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   (an override), else to the repository trait's method (a default one
   included) at `medium` — an inherent method of the outside type would win
   and cannot be known — instead of staying undecided.
+- **Link rules version 20:** in that same `impl Trait for T` with `T` from
+  outside, the `impl`'s own method is `medium` too, no longer `high`: an
+  inherent method of `T` of that name wins in Rust (`self.len()` in an
+  `impl Counted for String` calls `String::len`).
 
 ### Fixed
 

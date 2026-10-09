@@ -179,3 +179,20 @@ impl Polite for u32 {
         self.bow();
     }
 }
+
+/// An `impl` method named like an inherent method of the outside type:
+/// `self.len()` here calls `String::len`, not the `impl`'s `len`, and
+/// nothing in the repository can tell which outside methods exist.
+pub trait Counted {
+    fn len(&self) -> usize;
+    fn total(&self) -> usize;
+}
+
+impl Counted for String {
+    fn len(&self) -> usize {
+        1
+    }
+    fn total(&self) -> usize {
+        self.len()
+    }
+}

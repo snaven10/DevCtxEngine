@@ -1305,7 +1305,9 @@ impl RepoIndex {
     /// name (review of TASK-008, m6):
     ///
     /// - a method of the `impl` itself (an override of a default) is the
-    ///   answer, `same_file`, as before 47b3f3c;
+    ///   answer, `same_file`, but at most `medium` too: an inherent method
+    ///   of `T` of that name would win (`String::len` over the `impl`'s
+    ///   `len`; MINOR of the review of TASK-008);
     /// - else the repository trait the `impl` implements, as the type's
     ///   supertype (a default method included), but at most `medium`: an
     ///   inherent method of the outside type would win (`String::len` over a
@@ -1327,7 +1329,10 @@ impl RepoIndex {
             .collect();
         if !own.is_empty() {
             let (m, exact) = self.pick_overload(&own, c.args);
-            return Some(self.member_hit(m, false, exact, "same_file"));
+            // `T` is from outside (no container in the repository): an
+            // inherent method of `T` of that name wins over the `impl`'s
+            // (`String::len` over `Counted::len`), and cannot be known.
+            return Some(cap(self.member_hit(m, false, exact, "same_file"), "medium"));
         }
         for r in self.supers.get(&self.syms[imp].id).into_iter().flatten() {
             if let TypeRef::Repo(s, how) = *r {
