@@ -1066,7 +1066,9 @@ mod tests {
     /// store, as the serve does), of the store walk with each frontier form
     /// (store open once), and of the 0.9.0 walk on the same rows (the branch
     /// stamped by another extractor), with the sizes of each answer. With
-    /// `$DEVCTX_IMPACT_BENCH_TOP`, first the most called symbols.
+    /// `$DEVCTX_IMPACT_BENCH_TOP`, first the most called symbols; with
+    /// `$DEVCTX_IMPACT_BENCH_DUMP`, each case's whole answer. The tool is
+    /// timed with dispatch (the default) and without it (TASK-017).
     ///
     /// `cargo test --release -p devctx-mcp --lib impact_bench -- --ignored --nocapture`
     #[test]
@@ -1267,6 +1269,10 @@ mod tests {
                 }
             }
             drop(store);
+            // The whole answer, to check a case by hand (the gold of TASK-017).
+            if var("DEVCTX_IMPACT_BENCH_DUMP").is_some() {
+                println!("{}", json!({ "symbol": sym, "answer": first }));
+            }
             println!(
                 "{}",
                 json!({

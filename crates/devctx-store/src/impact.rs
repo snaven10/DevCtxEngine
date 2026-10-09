@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 
 use duckdb::params_from_iter;
 
-use crate::dispatch::{dispatch_confidence, Equivalent};
+use crate::dispatch::{dispatch_confidence, DispatchIndex, Equivalent};
 use crate::error::Result;
 use crate::lookup::{dotted, MinConfidence};
 use crate::store::Store;
@@ -582,16 +582,21 @@ impl Store {
         // undecided row names a name, not a file.
         let undecided = file.is_none();
         let list_undecided = undecided && opts.min_confidence == MinConfidence::Low;
-        // Dispatch through supertypes (TASK-017): one more statement per
-        // level, and none on a branch with no supertype edge to follow.
-        let dispatch = opts.dispatch && self.has_supertype_edges(repo, branch)?;
+        // Dispatch through supertypes (TASK-017): the supertype graph is
+        // read once (two statements), and each level is expanded in memory;
+        // a branch with no supertype edge pays for one statement.
+        let dispatch = if opts.dispatch {
+            self.dispatch_index(repo, branch)?
+        } else {
+            None
+        };
         let side = |dir: Direction| {
             let up = dir == Direction::Upstream;
             let extra = up && (sites.is_some() || list_undecided);
             let mut first = true;
             walk(&seeds, &itself, opts, extra, |f| {
-                let mut read = if dispatch {
-                    self.dispatch_level(repo, branch, f, dir, mode)?
+                let mut read = if let Some(index) = &dispatch {
+                    self.dispatch_level(repo, branch, f, dir, mode, index)?
                 } else {
                     self.impact_level(repo, branch, f, dir, mode)?.into()
                 };
@@ -718,7 +723,8 @@ impl Store {
     }
 
     /// One level of the walk with dispatch (TASK-017): the override-
-    /// equivalents of the frontier (one statement), then the level query.
+    /// equivalents of the frontier (in memory, from `index`), then the level
+    /// query — one statement, as without dispatch.
     /// Upstream, the level reads the callers of the frontier and of the
     /// methods it overrides, the latter as `dispatch` rows of the method
     /// that overrides them; downstream, the frontier's own callees plus its
@@ -731,8 +737,9 @@ impl Store {
         frontier: &[u64],
         dir: Direction,
         mode: FrontierSql,
+        index: &DispatchIndex,
     ) -> Result<Level> {
-        let eq = self.override_equivalents(repo, branch, frontier, dir, mode)?;
+        let eq = index.equivalents(frontier, dir);
         let mut out = Level {
             rows: Vec::new(),
             cut: eq.cut,
@@ -2058,11 +2065,12 @@ pub(crate) mod tests {
         assert_eq!(up("ServiceImpl.find"), ["Api.c"]);
     }
 
-    /// TASK-017, lesson 6: at most one more statement per level and
-    /// direction (the dispatch query), whatever the frontier; with no
-    /// supertype edge on the branch, none.
+    /// TASK-017, lesson 6: dispatch adds no statement per level — the
+    /// supertype graph is read once per call (two statements, like the seed
+    /// lookup: constant) and each level is expanded in memory, whatever the
+    /// frontier.
     #[test]
-    fn dispatch_costs_at_most_one_statement_per_level() {
+    fn dispatch_adds_no_statement_per_level() {
         let store = Store::open_in_memory(3).unwrap();
         let mut calls = Vec::new();
         for i in 0..300 {
@@ -2071,6 +2079,7 @@ pub(crate) mod tests {
         }
         di_graph(&store, &calls);
         LEVEL_STATEMENTS.with(|c| c.set(0));
+        crate::dispatch::INDEX_READS.with(|c| c.set(0));
         let opts = ImpactOptions {
             max_nodes: 0,
             ..Default::default()
@@ -2081,7 +2090,8 @@ pub(crate) mod tests {
         assert_eq!(im.upstream.nodes.len(), 601);
         let n = LEVEL_STATEMENTS.with(|c| c.get());
         let levels = im.upstream.levels + im.downstream.levels;
-        assert!(n <= 2 * levels, "{n} statements for {levels} levels");
+        assert_eq!(n, levels, "{n} statements for {levels} levels");
+        assert_eq!(crate::dispatch::INDEX_READS.with(|c| c.get()), 1);
     }
 
     /// TASK-017: downstream, an implementation is no surer than the edge

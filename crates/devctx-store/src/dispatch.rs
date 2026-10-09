@@ -21,10 +21,8 @@
 
 use std::collections::HashMap;
 
-use duckdb::params_from_iter;
-
 use crate::error::Result;
-use crate::impact::{count_statement, Direction, FrontierSql};
+use crate::impact::Direction;
 use crate::store::Store;
 
 /// Supertype levels a dispatch climbs (upstream) or descends (downstream):
@@ -241,141 +239,96 @@ fn top_level_contains(p: &str, ch: char) -> bool {
     false
 }
 
-impl Store {
-    /// Whether `branch` has any resolved `inherits`/`implements` edge: when it
-    /// has none, no level pays for the dispatch query. One statement per
-    /// walk, not per level.
-    pub(crate) fn has_supertype_edges(&self, repo: &str, branch: &str) -> Result<bool> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT EXISTS (SELECT 1 FROM live_edges
-                             WHERE repo = ? AND branch = ? AND kind IN {SUPER_KINDS}
-                               AND dst_id IS NOT NULL)"
-        ))?;
-        Ok(stmt.query_row(duckdb::params![repo, branch], |r| r.get(0))?)
-    }
+/// A method of a type that has a supertype or a subtype on the branch: what
+/// a dispatch can start from or arrive at.
+#[derive(Debug, Clone, PartialEq)]
+struct Method {
+    parent: u64,
+    name: String,
+    symbol: String,
+    file: Option<String>,
+    line: Option<i32>,
+    signature: String,
+    rank: Option<f64>,
+    test: bool,
+}
 
-    /// The override-equivalent methods of the methods of `frontier` (one
-    /// statement): of their supertypes upstream, of their subtypes
-    /// downstream, transitively up to [`DISPATCH_DEPTH`] levels, over
-    /// `live_edges`. At most [`DISPATCH_MAX_PER_NODE`] per node, by rank and
-    /// name; the rest are returned as `cut`.
-    pub(crate) fn override_equivalents(
-        &self,
-        repo: &str,
-        branch: &str,
-        frontier: &[u64],
-        dir: Direction,
-        mode: FrontierSql,
-    ) -> Result<Equivalents> {
-        if frontier.is_empty() {
-            return Ok(Equivalents::default());
-        }
-        let mut args: Vec<duckdb::types::Value> =
-            vec![repo.to_string().into(), branch.to_string().into()];
-        let set = self.frontier_set(frontier, mode, &mut args)?;
-        args.extend([
-            repo.to_string().into(),
-            branch.to_string().into(),
-            repo.to_string().into(),
-            branch.to_string().into(),
-        ]);
-        // Upstream climbs from a type to its supertypes (`src` → `dst`),
-        // downstream descends from a type to its subtypes.
-        let (this, next) = match dir {
-            Direction::Upstream => ("src_id", "dst_id"),
-            Direction::Downstream => ("dst_id", "src_id"),
+/// The supertype graph of a branch, read once per walk (two statements,
+/// whatever the depth and the frontier): every resolved `inherits`/
+/// `implements` edge of `live_edges`, and the methods of the types at
+/// either end. Each level is then expanded in memory.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct DispatchIndex {
+    /// Type → its supertypes, with the edge's confidence (3 high, 2
+    /// medium, 1 anything else).
+    supers: HashMap<u64, Vec<(u64, u8)>>,
+    /// Type → its subtypes.
+    subs: HashMap<u64, Vec<(u64, u8)>>,
+    /// Method id → the method.
+    methods: HashMap<u64, Method>,
+    /// Type → its methods.
+    by_type: HashMap<u64, Vec<u64>>,
+}
+
+impl DispatchIndex {
+    /// The override-equivalent methods of the methods of `frontier`: of
+    /// their supertypes upstream, of their subtypes downstream, transitively
+    /// up to [`DISPATCH_DEPTH`] levels. At most [`DISPATCH_MAX_PER_NODE`]
+    /// per node, by rank and name; the rest are returned as `cut`.
+    pub(crate) fn equivalents(&self, frontier: &[u64], dir: Direction) -> Equivalents {
+        let graph = match dir {
+            Direction::Upstream => &self.supers,
+            Direction::Downstream => &self.subs,
         };
-        let sql = format!(
-            "WITH RECURSIVE
-             f AS (
-               SELECT s.id, s.name, s.parent_id, s.qualified, s.signature FROM symbols s
-                WHERE s.repo = ? AND s.branch = ? AND s.id IN {set}
-                  AND s.parent_id IS NOT NULL AND s.kind IN {CALLABLE_KINDS}
-                  AND NOT ends_with(s.file, '.go')
-             ),
-             chain(origin, name, t, d, conf) AS (
-               SELECT id, name, parent_id, 0, 3 FROM f
-               UNION ALL
-               SELECT c.origin, c.name, e.{next}, c.d + 1,
-                      least(c.conf, CASE e.confidence WHEN 'high' THEN 3
-                                                      WHEN 'medium' THEN 2 ELSE 1 END)
-                 FROM chain c
-                 JOIN live_edges e ON e.repo = ? AND e.branch = ? AND e.{this} = c.t
-                                  AND e.kind IN {SUPER_KINDS} AND e.dst_id IS NOT NULL
-                WHERE c.d < {DISPATCH_DEPTH}
-             )
-             SELECT c.origin, f.qualified, f.signature, m.id, m.qualified, m.file,
-                    m.start_line, m.signature, m.rank, coalesce(m.is_test, false), max(c.conf)
-               FROM chain c
-               JOIN f ON f.id = c.origin
-               JOIN symbols m ON m.repo = ? AND m.branch = ? AND m.parent_id = c.t
-                             AND m.name = c.name AND m.kind IN {CALLABLE_KINDS}
-              WHERE c.d > 0 AND m.id <> c.origin
-              GROUP BY ALL"
-        );
-        count_statement();
-        let mut stmt = self.conn.prepare(&sql)?;
-        type Row = (
-            u64,
-            String,
-            Option<String>,
-            u64,
-            String,
-            Option<String>,
-            Option<i32>,
-            Option<String>,
-            Option<f64>,
-            bool,
-            i32,
-        );
-        let rows = stmt.query_map(params_from_iter(args), |r| -> duckdb::Result<Row> {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
-            ))
-        })?;
-        let mut by_origin: HashMap<u64, Vec<Equivalent>> = HashMap::new();
-        for row in rows {
-            let (origin, oq, osig, id, q, file, line, sig, rank, test, conf) = row?;
-            let name = q.rsplit(['.', ':']).next().unwrap_or(&q).to_string();
-            let (osig, sig) = (osig.unwrap_or_default(), sig.unwrap_or_default());
-            if never_overrides(&osig) || never_overrides(&sig) {
-                continue;
-            }
-            if !arities_meet(arity(&osig, &name), arity(&sig, &name)) {
-                continue;
-            }
-            let list = by_origin.entry(origin).or_default();
-            // Two chains to the same method (a diamond): the surer one.
-            match list.iter_mut().find(|e| e.id == id) {
-                Some(e) => e.chain = e.chain.max(conf.clamp(1, 3) as u8),
-                None => list.push(Equivalent {
-                    origin,
-                    origin_symbol: oq,
-                    id,
-                    symbol: q,
-                    file,
-                    line,
-                    rank,
-                    test,
-                    chain: conf.clamp(1, 3) as u8,
-                }),
-            }
-        }
-        let mut origins: Vec<u64> = by_origin.keys().copied().collect();
-        origins.sort_unstable();
         let mut out = Equivalents::default();
-        for o in origins {
-            let mut list = by_origin.remove(&o).unwrap_or_default();
+        for &origin in frontier {
+            let Some(m) = self.methods.get(&origin) else {
+                continue;
+            };
+            if never_overrides(&m.signature) {
+                continue;
+            }
+            // The surest chain to each type within the depth.
+            let mut best: HashMap<u64, u8> = HashMap::new();
+            let mut layer: Vec<(u64, u8)> = vec![(m.parent, 3)];
+            for _ in 0..DISPATCH_DEPTH {
+                let mut next = Vec::new();
+                for (t, conf) in layer {
+                    for &(s, c) in graph.get(&t).into_iter().flatten() {
+                        let c = conf.min(c);
+                        if s != m.parent && best.get(&s).is_none_or(|&b| c > b) {
+                            best.insert(s, c);
+                            next.push((s, c));
+                        }
+                    }
+                }
+                layer = next;
+            }
+            let mine = arity(&m.signature, &m.name);
+            let mut list: Vec<Equivalent> = Vec::new();
+            for (t, chain) in best {
+                for id in self.by_type.get(&t).into_iter().flatten() {
+                    let e = &self.methods[id];
+                    if *id == origin
+                        || e.name != m.name
+                        || never_overrides(&e.signature)
+                        || !arities_meet(mine, arity(&e.signature, &e.name))
+                    {
+                        continue;
+                    }
+                    list.push(Equivalent {
+                        origin,
+                        origin_symbol: m.symbol.clone(),
+                        id: *id,
+                        symbol: e.symbol.clone(),
+                        file: e.file.clone(),
+                        line: e.line,
+                        rank: e.rank,
+                        test: e.test,
+                        chain,
+                    });
+                }
+            }
             list.sort_by(|a, b| {
                 b.rank
                     .unwrap_or(f64::NEG_INFINITY)
@@ -390,7 +343,95 @@ impl Store {
             }
             out.kept.extend(list);
         }
-        Ok(out)
+        out
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Times the supertype graph was read on this thread (once per walk).
+    pub(crate) static INDEX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 3 high, 2 medium, 1 anything else.
+fn confidence_rank(c: Option<&str>) -> u8 {
+    match c {
+        Some("high") => 3,
+        Some("medium") => 2,
+        _ => 1,
+    }
+}
+
+impl Store {
+    /// The supertype graph of `branch` ([`DispatchIndex`]); `None` when the
+    /// branch has no resolved supertype edge (then no level pays for
+    /// dispatch). Two statements, once per walk; Go's files are left out
+    /// (embedding promotes, it does not override).
+    pub(crate) fn dispatch_index(&self, repo: &str, branch: &str) -> Result<Option<DispatchIndex>> {
+        #[cfg(test)]
+        INDEX_READS.with(|c| c.set(c.get() + 1));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT e.src_id, e.dst_id, e.confidence FROM live_edges e
+              WHERE e.repo = ? AND e.branch = ? AND e.kind IN {SUPER_KINDS}
+                AND e.dst_id IS NOT NULL AND NOT ends_with(e.file, '.go')"
+        ))?;
+        let edges = stmt
+            .query_map(duckdb::params![repo, branch], |r| {
+                Ok((
+                    r.get::<_, u64>(0)?,
+                    r.get::<_, u64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if edges.is_empty() {
+            return Ok(None);
+        }
+        let mut idx = DispatchIndex::default();
+        for (src, dst, conf) in edges {
+            let c = confidence_rank(conf.as_deref());
+            idx.supers.entry(src).or_default().push((dst, c));
+            idx.subs.entry(dst).or_default().push((src, c));
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT m.id, m.parent_id, m.name, m.qualified, m.file, m.start_line,
+                    m.signature, m.rank, coalesce(m.is_test, false)
+               FROM symbols m
+              WHERE m.repo = ? AND m.branch = ? AND m.kind IN {CALLABLE_KINDS}
+                AND NOT ends_with(m.file, '.go')
+                AND m.parent_id IN (
+                    SELECT src_id FROM live_edges
+                     WHERE repo = ? AND branch = ? AND kind IN {SUPER_KINDS}
+                       AND dst_id IS NOT NULL
+                    UNION
+                    SELECT dst_id FROM live_edges
+                     WHERE repo = ? AND branch = ? AND kind IN {SUPER_KINDS}
+                       AND dst_id IS NOT NULL)"
+        ))?;
+        let rows = stmt.query_map(
+            duckdb::params![repo, branch, repo, branch, repo, branch],
+            |r| {
+                Ok((
+                    r.get::<_, u64>(0)?,
+                    Method {
+                        parent: r.get(1)?,
+                        name: r.get(2)?,
+                        symbol: r.get(3)?,
+                        file: r.get(4)?,
+                        line: r.get(5)?,
+                        signature: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                        rank: r.get(7)?,
+                        test: r.get(8)?,
+                    },
+                ))
+            },
+        )?;
+        for row in rows {
+            let (id, m) = row?;
+            idx.by_type.entry(m.parent).or_default().push(id);
+            idx.methods.insert(id, m);
+        }
+        Ok(Some(idx))
     }
 }
 
