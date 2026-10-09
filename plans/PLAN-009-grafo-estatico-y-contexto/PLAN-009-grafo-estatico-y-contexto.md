@@ -250,10 +250,11 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-010 | PageRank global al indexar y centralidad como señal en `search` híbrido | general-purpose (Rust) | TASK-006, TASK-007, TASK-008 | `pending` |
 | TASK-011 | Tool `repo_map` con PageRank personalizado bajo presupuesto | general-purpose (Rust) | TASK-010 | `pending` |
 | TASK-012 | Ego-graph en `build_context` y evaluación de la selección de grupo | general-purpose (Rust) | TASK-009, TASK-010 | `pending` |
-| TASK-013 | Tool `traverse` | general-purpose (Rust) | TASK-009 | `pending` |
+| TASK-013 | Tool `traverse` | general-purpose (Rust) | TASK-009, TASK-017 | `pending` |
 | TASK-014 | Tool `skeleton` por archivo | general-purpose (Rust) | TASK-004 | `pending` |
 | TASK-015 | Docs EN + ES y guía de reindex | general-purpose (Rust) | TASK-002, TASK-011, TASK-012, TASK-013, TASK-014 | `pending` |
 | TASK-016 | Verificación de campo contra §6 | — (orquestador, con aprobación del usuario) | TASK-015 | `pending` |
+| TASK-017 | Dispatch por interfaz en `impact_analysis` (y `traverse`): override-equivalentes vía `implements`/`inherits`, `medium`, `via: "dispatch"` | general-purpose (Rust) | TASK-009 | `pending` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
 
@@ -409,6 +410,14 @@ Cada TASK llena su `## Resultado` con:
 - Q-4 → ego-graph **por defecto solo si el arnés lo justifica**; si no, apagado.
 - Q-5 → casos de ACME **fuera del repo** (`/home/you/acme/scripts/devctx-eval/`, `$DEVCTX_EVAL_CASES`).
 - Q-6 → Go **básico con fixtures**.
+
+**Decidido por el usuario el 2026-10-08:**
+- **Dispatch por interfaz → TASK-017**, antes de TASK-013. Propuesta de la revisión de TASK-009:
+  `impact("ServiceImpl.update")` no veía a quien llama por `IService.update`, el falso negativo más
+  caro en Java con DI. La semilla se expande a los override-equivalentes vía `implements`/`inherits`
+  como `medium` con `via: "dispatch"`, incluido por defecto; `traverse` (TASK-013) pasa a depender
+  de TASK-017.
+- **Merge a `main` por squash** (§10).
 
 Texto original de las preguntas:
 
