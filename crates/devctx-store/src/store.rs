@@ -2001,7 +2001,7 @@ mod bench {
 }
 
 /// Rank candidate symbols against a name that matched nothing. Pure.
-fn rank_suggestions(name: &str, cands: Vec<String>, n: usize) -> Vec<String> {
+pub(crate) fn rank_suggestions(name: &str, cands: Vec<String>, n: usize) -> Vec<String> {
     let lname = name.to_lowercase();
     let threshold = (lname.chars().count() / 3).max(2);
     let mut scored: Vec<(u8, usize, String)> = Vec::new();

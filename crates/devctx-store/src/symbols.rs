@@ -128,7 +128,7 @@ const EDGE_COLS: &[&str] = &[
     "hint",
 ];
 
-fn row_to_symbol(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbol> {
+pub(crate) fn row_to_symbol(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbol> {
     Ok(StoredSymbol {
         id: r.get(0)?,
         parent_id: r.get(1)?,
@@ -151,7 +151,8 @@ fn row_to_symbol(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbol> {
     })
 }
 
-const SYMBOL_SELECT: &str = "SELECT id, parent_id, file, kind, name, qualified, container, \
+pub(crate) const SYMBOL_SELECT: &str =
+    "SELECT id, parent_id, file, kind, name, qualified, container, \
      package, signature, start_line, end_line, start_byte, end_byte, exported, rank, \
      in_degree, is_test, content_hash FROM symbols";
 

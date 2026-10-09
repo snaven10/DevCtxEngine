@@ -265,6 +265,8 @@ pub fn search(
 ///
 /// `embedder` is required for `Vector`/`Hybrid`. `reranker` (if `Some`) reorders
 /// the candidate pool down to `limit`; otherwise the retriever order is truncated.
+/// Identifiers are anchored by name (the 0.9.0 lookup over `vectors.symbol`);
+/// see [`search_anchored`] for the symbol-graph lookup.
 #[allow(clippy::too_many_arguments)]
 pub fn search_ranked(
     store: &Store,
@@ -276,6 +278,58 @@ pub fn search_ranked(
     reranker: Option<&dyn Reranker>,
     opts: &RankOptions,
 ) -> Result<Vec<SearchResult>> {
+    search_anchored(
+        store,
+        query,
+        filter,
+        limit,
+        mode,
+        embedder,
+        reranker,
+        opts,
+        AnchorLookup::Names,
+    )
+    .map(|a| a.hits)
+}
+
+/// How anchoring finds the definition of an identifier of the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorLookup {
+    /// By name and suffix over `vectors.symbol` (0.9.0; the path for a
+    /// branch without a current symbol graph).
+    Names,
+    /// Through the `symbols` table and the chunks of each definition by line
+    /// range (PLAN-009 DD-10). Needs the filter's repo and branch; a token
+    /// the symbol graph does not define (a raw-text file, a language
+    /// without a grammar) is still looked up by name.
+    Symbols,
+}
+
+/// A ranked answer and the definitions anchoring found for it.
+#[derive(Debug, Clone, Default)]
+pub struct Anchored {
+    /// The hits, as [`search_ranked`] returns them.
+    pub hits: Vec<SearchResult>,
+    /// Point id → symbol id of every definition chunk anchoring found for
+    /// the query's identifiers (`None` for one found by name). A hit is the
+    /// definition of what the query named exactly when its id is here.
+    pub definitions: HashMap<String, Option<u64>>,
+}
+
+/// [`search_ranked`], choosing how identifiers are anchored and returning
+/// the definitions found, so the caller can mark hits `anchored` by id.
+#[allow(clippy::too_many_arguments)]
+pub fn search_anchored(
+    store: &Store,
+    query: &str,
+    filter: &SearchFilter,
+    limit: usize,
+    mode: SearchMode,
+    embedder: Option<&dyn EmbeddingProvider>,
+    reranker: Option<&dyn Reranker>,
+    opts: &RankOptions,
+    lookup: AnchorLookup,
+) -> Result<Anchored> {
     // A reranker asks for the pool it can afford; everything else takes the
     // shallow one, since without reordering a deeper fetch is thrown away.
     //
@@ -349,10 +403,13 @@ pub fn search_ranked(
     };
 
     if mode == SearchMode::Vector {
-        return Ok(ranked);
+        return Ok(Anchored {
+            hits: ranked,
+            definitions: HashMap::new(),
+        });
     }
     Ok(anchor_identifiers(
-        store, query, filter, limit, ranked, opts,
+        store, query, filter, limit, ranked, opts, lookup,
     ))
 }
 
@@ -668,16 +725,46 @@ fn anchor_identifiers(
     limit: usize,
     ranked: Vec<SearchResult>,
     opts: &RankOptions,
-) -> Vec<SearchResult> {
+    lookup: AnchorLookup,
+) -> Anchored {
     let tokens = anchor_tokens(query);
+    let mut definitions: HashMap<String, Option<u64>> = HashMap::new();
     if tokens.is_empty() {
-        return ranked;
+        return Anchored {
+            hits: ranked,
+            definitions,
+        };
     }
     let mut pinned: Vec<VectorPoint> = Vec::new();
     for t in &tokens {
-        let found = store
-            .symbol_matches(filter, t, ANCHOR_FETCH)
-            .unwrap_or_default();
+        let by_symbol = match lookup {
+            AnchorLookup::Symbols => store
+                .lookup_anchors(filter, t, ANCHOR_FETCH)
+                .unwrap_or_default(),
+            AnchorLookup::Names => Vec::new(),
+        };
+        let found = if by_symbol.is_empty() {
+            let found = store
+                .symbol_matches(filter, t, ANCHOR_FETCH)
+                .unwrap_or_default();
+            for p in &found {
+                definitions.entry(p.id.clone()).or_insert(None);
+            }
+            found
+        } else {
+            // One chunk per definition competes for a pin (a large function
+            // is several block chunks); every chunk of it counts as the
+            // definition when marking.
+            let mut seen = std::collections::HashSet::new();
+            let mut first = Vec::new();
+            for (sym, p) in by_symbol {
+                definitions.insert(p.id.clone(), Some(sym));
+                if seen.insert(sym) {
+                    first.push(p);
+                }
+            }
+            first
+        };
         for p in rank_definitions(found, opts) {
             if !pinned.iter().any(|q| q.id == p.id) {
                 pinned.push(p);
@@ -686,7 +773,10 @@ fn anchor_identifiers(
     }
     pinned.truncate((limit / 2).max(1));
     if pinned.is_empty() {
-        return ranked;
+        return Anchored {
+            hits: ranked,
+            definitions,
+        };
     }
     let top = ranked
         .iter()
@@ -700,7 +790,10 @@ fn anchor_identifiers(
     out.extend(ranked);
     let mut out = dedup_hits(out);
     out.truncate(limit);
-    out
+    Anchored {
+        hits: out,
+        definitions,
+    }
 }
 
 /// The [`ANCHOR_MAX`] definitions of one identifier worth pinning, out of what

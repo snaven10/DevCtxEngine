@@ -8,6 +8,7 @@
 
 mod error;
 mod graph;
+mod lookup;
 mod memory;
 mod memory_refs;
 mod projects;
@@ -19,6 +20,9 @@ mod symbols;
 
 pub use error::{Result, StoreError};
 pub use graph::{GraphEdge, ImpactResult, Reference, StoredEdge};
+pub use lookup::{
+    sym_hex, ExternalSites, MinConfidence, SymbolDefinition, SymbolReference, ViewEdge,
+};
 pub use memory::{Memory, MemoryStats};
 pub use memory_refs::{short_label, FileIndex, LinkedMemory, SymbolRef};
 pub use projects::{ProjectIndexStats, ProjectRecord};

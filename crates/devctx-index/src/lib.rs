@@ -15,7 +15,7 @@ mod link;
 pub mod pipeline;
 mod tsconfig;
 
-pub use devctx_parse::extractor_fingerprint;
+pub use devctx_parse::{extractor_fingerprint, lang_for_extension, raw_text_language};
 pub use error::{IndexError, Result};
 pub use git::{Change, GitRepo, GitState};
 pub use id::chunk_id;
