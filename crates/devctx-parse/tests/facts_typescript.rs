@@ -167,3 +167,41 @@ fn an_export_clause_exports_its_names() {
     let pf = facts(Lang::typescript(), "typescript/token.interceptor.ts", PATH);
     assert_eq!(sym(&pf, "function", "helper").exported, Some(true));
 }
+
+/// PLAN-009 TASK-017: a method an interface declares (and an abstract
+/// method of an abstract class) is a symbol, as a Java interface's or a
+/// Rust trait's is: without it a call through a field typed by the
+/// interface had no destination (`name_only`, `low`), and dispatch to the
+/// classes that `implements` it had nothing to start from. A property of
+/// an interface and an overload signature of a class are still no symbol.
+#[test]
+fn an_interface_method_is_a_symbol() {
+    let src = "export interface IService {\n  name: string;\n  update(id: string): void;\n}\n\n\
+               export abstract class Base implements IService {\n  name = 'x';\n  abstract update(id: string): void;\n  \
+               run(): void {}\n}\n\nexport class Impl extends Base {\n  over(a: string): void;\n  over(a: number): void;\n  \
+               over(a: unknown): void {}\n  update(id: string): void {}\n}\n";
+    let mut pf = devctx_parse::parse(Lang::typescript(), src).unwrap();
+    pf.assign_ids("repo", "web/svc.ts");
+    let out = outline(&pf);
+    for s in [
+        "method IService.update",
+        "method Base.update",
+        "method Impl.update",
+    ] {
+        assert!(out.iter().any(|o| o == s), "{s}: {out:?}");
+    }
+    assert_eq!(
+        out.iter().filter(|o| *o == "method Impl.over").count(),
+        1,
+        "{out:?}"
+    );
+    assert!(!out.iter().any(|o| o.ends_with("IService.name")), "{out:?}");
+    assert_eq!(
+        sym(&pf, "method", "IService.update").signature,
+        "update(id: string): void"
+    );
+    assert_eq!(
+        parent_of(&pf, sym(&pf, "method", "IService.update")),
+        "IService"
+    );
+}

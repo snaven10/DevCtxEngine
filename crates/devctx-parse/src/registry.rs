@@ -258,6 +258,10 @@ const SOURCES: &[&str] = &[
 /// required (alone or in an `all(…)`), never under `any`/`not` nor as a
 /// feature name; `#[tokio::test(…)]`, `#[rstest]`, a comment after the
 /// attribute and an inner `#![cfg(test)]` are recognised.
+/// 20: TASK-017 — a method a TypeScript interface declares and an abstract
+/// method of an abstract class are symbols (as a Java interface's or a Rust
+/// trait's): a call through a receiver typed by the interface resolves to
+/// it, and dispatch reaches the classes that implement it.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -265,7 +269,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 19;
+pub const EXTRACTOR_VERSION: u32 = 20;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

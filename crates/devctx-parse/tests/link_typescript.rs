@@ -4,6 +4,8 @@
 //! `inject(T)`, exported arrow functions, npm packages — parsed and linked as
 //! the indexer does, without a store.
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -593,4 +595,27 @@ fn an_unfollowable_branch_is_not_outweighed_by_a_package() {
     let l = linked();
     let (dst, _, conf, res, ext) = l.call("useMixed", "mystery");
     assert_eq!((dst, conf, res, ext), (None, "low", "name_only", false));
+}
+
+/// PLAN-009 TASK-017: a call through a constructor parameter typed by an
+/// interface (or an abstract class) reaches the method it declares, `high`
+/// by the injection, now that the declaration is a symbol: before it was a
+/// `name_only` row with no destination, `low`, and dispatch to the classes
+/// implementing it had nowhere to start from.
+#[test]
+fn a_call_through_an_interface_reaches_its_declared_method() {
+    let l = common::linked::link_dir("ts-dispatch");
+    for (dst, want) in [
+        ("IService.update", "IService.update"),
+        ("BaseService.update", "BaseService.update"),
+    ] {
+        let (to, file, confidence, resolution, external) = l.call("Api.handle", dst);
+        assert_eq!(to.as_deref(), Some(want), "{dst}");
+        assert_eq!(file.as_deref(), Some("svc.ts"), "{dst}");
+        assert_eq!(
+            (confidence, resolution, external),
+            ("high", "ctor_inject", false),
+            "{dst}"
+        );
+    }
 }
