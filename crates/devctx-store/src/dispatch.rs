@@ -120,15 +120,37 @@ fn arities_meet(a: Option<(usize, Option<usize>)>, b: Option<(usize, Option<usiz
 }
 
 /// A method that overrides nothing and nothing overrides: private or static.
-fn never_overrides(signature: &str) -> bool {
-    signature
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .any(|w| w == "private" || w == "static")
+/// Only the modifiers before the name count, and a lifetime is none: a Rust
+/// `-> &'static str` or `T: 'static` is no `static` method (review MAJOR 1).
+fn never_overrides(signature: &str, name: &str) -> bool {
+    let head = name_in(signature, name).map_or(signature, |(start, _)| &signature[..start]);
+    let bytes = head.as_bytes();
+    let mut start = 0;
+    let mut words = Vec::new();
+    for (i, &b) in bytes
+        .iter()
+        .enumerate()
+        .chain(std::iter::once((bytes.len(), &b' ')))
+    {
+        if !(b.is_ascii_alphanumeric() || b == b'_') {
+            if i > start && (start == 0 || bytes[start - 1] != b'\'') {
+                words.push(&head[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    words.iter().any(|w| *w == "private" || *w == "static")
 }
 
 /// The text between the parentheses that follow `name` in `signature` (as a
 /// whole word, past generic parameters): `fn m<T>(a: T, b: u8)` → `a: T, b: u8`.
 fn parameter_list<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
+    name_in(signature, name).map(|(_, params)| params)
+}
+
+/// Where `name` starts in `signature` as the name of what the parameter list
+/// after it belongs to, and that list's text.
+fn name_in<'a>(signature: &'a str, name: &str) -> Option<(usize, &'a str)> {
     let bytes = signature.as_bytes();
     let mut from = 0;
     while let Some(at) = signature[from..].find(name) {
@@ -152,7 +174,7 @@ fn parameter_list<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
         }
         if i < bytes.len() && bytes[i] == b'(' {
             let close = close_of(bytes, i, b'(', b')')?;
-            return Some(&signature[i + 1..close]);
+            return Some((start, &signature[i + 1..close]));
         }
     }
     None
@@ -285,7 +307,7 @@ impl DispatchIndex {
             let Some(m) = self.methods.get(&origin) else {
                 continue;
             };
-            if never_overrides(&m.signature) {
+            if never_overrides(&m.signature, &m.name) {
                 continue;
             }
             // The surest chain to each type within the depth.
@@ -311,7 +333,7 @@ impl DispatchIndex {
                     let e = &self.methods[id];
                     if *id == origin
                         || e.name != m.name
-                        || never_overrides(&e.signature)
+                        || never_overrides(&e.signature, &e.name)
                         || !arities_meet(mine, arity(&e.signature, &e.name))
                     {
                         continue;
@@ -509,8 +531,20 @@ mod tests {
 
     #[test]
     fn private_and_static_methods_override_nothing() {
-        assert!(never_overrides("private void update(String id)"));
-        assert!(never_overrides("public static Foo of(String s)"));
-        assert!(!never_overrides("public void update(String staticId)"));
+        assert!(never_overrides("private void update(String id)", "update"));
+        assert!(never_overrides("public static Foo of(String s)", "of"));
+        assert!(!never_overrides(
+            "public void update(String staticId)",
+            "update"
+        ));
+        assert!(!never_overrides("fn name(&self) -> &'static str", "name"));
+        assert!(!never_overrides(
+            "fn spawn<T: 'static>(&self, t: T)",
+            "spawn"
+        ));
+        assert!(!never_overrides(
+            "public void run(@Named(\"static\") String s)",
+            "run"
+        ));
     }
 }

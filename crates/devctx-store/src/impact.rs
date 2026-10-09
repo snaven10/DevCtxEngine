@@ -1577,7 +1577,9 @@ pub(crate) mod tests {
     /// `calls` or `methods` (`Type.m`) is a `method` of its type, whose kind
     /// is `interface` for a name like `IService` and `class` otherwise;
     /// `supers` are `(sub, super, kind, confidence)` edges between types.
-    /// A method's signature is `methods`' or `public void m(String id)`.
+    /// A method's signature is `methods`' or `public void m(String id)`. A
+    /// key may carry `@tag` (`IRepo.save@User`): another symbol with the same
+    /// qualified name, an overload.
     pub(crate) fn typed_graph(
         store: &Store,
         supers: &[(&str, &str, &str, &str)],
@@ -1592,7 +1594,9 @@ pub(crate) mod tests {
                 order.push((q.to_string(), is_type));
             }
         };
-        let type_of = |q: &str| q.rsplit_once('.').map(|(t, _)| t.to_string());
+        let untag = |q: &str| q.split('@').next().unwrap_or(q).to_string();
+        let type_of = |q: &str| untag(q).rsplit_once('.').map(|(t, _)| t.to_string());
+        let sigs: HashMap<&str, &str> = methods.iter().copied().collect();
         let mut named: Vec<String> = methods.iter().map(|(q, _)| q.to_string()).collect();
         for e in calls {
             named.push(e.src.clone());
@@ -1613,7 +1617,8 @@ pub(crate) mod tests {
         let mut by_file: BTreeMap<String, Vec<StoredSymbol>> = BTreeMap::new();
         for (i, (q, is_type)) in order.iter().enumerate() {
             let file = file_of(q);
-            let name = q.rsplit('.').next().unwrap().to_string();
+            let qualified = untag(q);
+            let name = qualified.rsplit('.').next().unwrap().to_string();
             let interface = name.len() > 1
                 && name.starts_with('I')
                 && name[1..2].chars().all(char::is_uppercase);
@@ -1621,10 +1626,9 @@ pub(crate) mod tests {
                 let kind = if interface { "interface" } else { "class" };
                 (kind, None, format!("public {kind} {name}"))
             } else {
-                let sig = methods
-                    .iter()
-                    .find(|(m, _)| m == q)
-                    .map(|(_, s)| s.to_string())
+                let sig = sigs
+                    .get(q.as_str())
+                    .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("public void {name}(String id)"));
                 ("method", type_of(q).map(|t| ids[&t]), sig)
             };
@@ -1634,7 +1638,7 @@ pub(crate) mod tests {
                 file: file.clone(),
                 kind: kind.into(),
                 name,
-                qualified: q.clone(),
+                qualified,
                 signature: Some(signature),
                 start_line: 10 + i as i32,
                 end_line: 12 + i as i32,
@@ -2269,5 +2273,139 @@ pub(crate) mod tests {
             assert_eq!((n.via.as_str(), n.depth), (DISPATCH_VIA, 2));
         }
         old::check_traversal_does_not_re_expand_the_names_it_walks(&as_0_9_0(&store, all_in()));
+    }
+
+    /// Review of TASK-017, MAJOR 1: a Rust `'static` lifetime (`-> &'static
+    /// str`, `T: 'static`) is no `static` modifier — the trait method still
+    /// dispatches, both ways; only a modifier before the name counts.
+    #[test]
+    fn a_static_lifetime_does_not_turn_dispatch_off() {
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[("FileSink", "Sink", "implements", "high")],
+            &[
+                ("Sink.name", "fn name(&self) -> &'static str;"),
+                ("FileSink.name", "fn name(&self) -> &'static str"),
+                ("Sink.spawn", "fn spawn<T: 'static + Send>(&self, t: T);"),
+                ("FileSink.spawn", "fn spawn<T: 'static + Send>(&self, t: T)"),
+            ],
+            &[
+                call("App.label", "Sink.name"),
+                call("App.run", "Sink.spawn"),
+            ],
+        );
+        for (imp, caller, through) in [
+            ("FileSink.name", "App.label", "Sink.name"),
+            ("FileSink.spawn", "App.run", "Sink.spawn"),
+        ] {
+            let im = store
+                .impact_graph("repo", "main", imp, None, &ImpactOptions::default())
+                .unwrap();
+            assert_eq!(names(&im.upstream), [caller], "{imp}");
+            let im = store
+                .impact_graph("repo", "main", through, None, &ImpactOptions::default())
+                .unwrap();
+            assert_eq!(names(&im.downstream), [imp], "{through}");
+        }
+    }
+
+    /// Measurement (PLAN-009 TASK-017 review, MAJOR 2; not a test): a
+    /// synthetic hierarchy far wider than the measured Java repositories —
+    /// 500 entities extending `BaseEntity` and implementing `IEntity` and
+    /// `IAudited` (1 500 supertype edges), 40 accessors each (20 000
+    /// methods) — and the time of `impact_graph` for a seed with dispatch,
+    /// an interface method with 500 implementations, a seed with no
+    /// hierarchy, and the same seeds with `min_confidence: high` and with
+    /// `dispatch: false`. p50 / p95 over `$DEVCTX_DISPATCH_BENCH_RUNS` (30).
+    ///
+    /// `cargo test --release -p devctx-store --lib dispatch_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn dispatch_bench() {
+        let runs: usize = std::env::var("DEVCTX_DISPATCH_BENCH_RUNS")
+            .ok()
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(30);
+        let store = Store::open_in_memory(3).unwrap();
+        let entities: Vec<String> = (0..500).map(|i| format!("Entity{i:03}")).collect();
+        let mut supers: Vec<(&str, &str, &str, &str)> = Vec::new();
+        for e in &entities {
+            supers.push((e.as_str(), "BaseEntity", "inherits", "high"));
+            supers.push((e.as_str(), "IEntity", "implements", "high"));
+            supers.push((e.as_str(), "IAudited", "implements", "high"));
+        }
+        let mut keys: Vec<String> = Vec::new();
+        for t in entities
+            .iter()
+            .map(String::as_str)
+            .chain(["BaseEntity", "IEntity", "IAudited"])
+        {
+            for a in 0..40 {
+                keys.push(format!("{t}.get{a:02}"));
+            }
+        }
+        let methods: Vec<(&str, &str)> = keys
+            .iter()
+            .map(|k| (k.as_str(), "public String getX()"))
+            .collect();
+        let mut calls = vec![
+            call("Api.a", "IEntity.get00"),
+            call("Api.b", "BaseEntity.get00"),
+            call("Api.c", "IAudited.get00"),
+            call("Top.t", "Api.a"),
+            call("Plain.run", "Plain.helper"),
+            call("Plain.caller", "Plain.run"),
+        ];
+        for (i, e) in entities.iter().enumerate().take(50) {
+            calls.push(call(&format!("Svc{i:03}.use"), &format!("{e}.get01")));
+        }
+        let t = std::time::Instant::now();
+        typed_graph(&store, &supers, &methods, &calls);
+        eprintln!("graph: {:.1} s", t.elapsed().as_secs_f64());
+        let high = ImpactOptions {
+            min_confidence: MinConfidence::High,
+            ..Default::default()
+        };
+        let off = ImpactOptions {
+            dispatch: false,
+            ..Default::default()
+        };
+        for (label, seed, opts) in [
+            (
+                "impl, dispatch up",
+                "Entity000.get00",
+                ImpactOptions::default(),
+            ),
+            (
+                "interface, 500 impls",
+                "IEntity.get05",
+                ImpactOptions::default(),
+            ),
+            ("no hierarchy", "Plain.run", ImpactOptions::default()),
+            ("impl, min high", "Entity000.get00", high),
+            ("impl, dispatch off", "Entity000.get00", off),
+            ("no hierarchy, dispatch off", "Plain.run", off),
+        ] {
+            let mut n = 0;
+            let mut ms: Vec<f64> = (0..runs + 1)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let im = store
+                        .impact_graph("repo", "main", seed, None, &opts)
+                        .unwrap();
+                    n = im.upstream.nodes.len() + im.downstream.nodes.len();
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+                .skip(1)
+                .collect();
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |p: f64| ms[((ms.len() as f64 - 1.0) * p).round() as usize];
+            println!(
+                "dispatch_bench | {label} | {seed} | p50 {:.1} ms | p95 {:.1} ms | nodes {n}",
+                pct(0.5),
+                pct(0.95)
+            );
+        }
     }
 }
