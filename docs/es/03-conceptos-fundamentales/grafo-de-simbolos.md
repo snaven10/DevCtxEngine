@@ -175,7 +175,9 @@ el que implementa); un
 método private o static no sobrescribe nada; entre sobrecargas de igual aridad en
 un supertipo gana la que coincide exacto en los tipos simples de sus parámetros. La cadena de supertipos se sigue
 hasta cuatro niveles (`ServiceImpl` → `BaseService` → `IService` → su
-super-interfaz). Ese nodo lleva `via: "dispatch"` y `through` (el método por el que
+super-interfaz); un método override-equivalente más lejos se cuenta en
+`omitted_by_limit.dispatch` (en su `count`, y aparte en `beyond_depth`, con
+`max_depth: 4`), sin seguirlo. Ese nodo lleva `via: "dispatch"` y `through` (el método por el que
 pasó), y su confianza es `min(medium, la arista que representa)`: nunca `high`, y
 una llamada `low` sigue `low` (contada en `below_confidence` por defecto). Para
 dejar el dispatch afuera: `dispatch: false` (`--no-dispatch`, `?dispatch=false`), o

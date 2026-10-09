@@ -168,7 +168,10 @@ JavaScript the implementing method may take fewer parameters than the one it
 implements); a private or static
 method overrides nothing; among same-arity overloads in one supertype, the one
 whose simple parameter types match exactly wins. The chain of supertypes is followed up to four levels
-(`ServiceImpl` → `BaseService` → `IService` → its super-interface). Such a node
+(`ServiceImpl` → `BaseService` → `IService` → its super-interface); an
+override-equivalent method further away is counted in
+`omitted_by_limit.dispatch` (its `count`, and apart in `beyond_depth`, with
+`max_depth: 4`), not followed. Such a node
 has `via: "dispatch"` and `through` (the method it went through), and its
 confidence is `min(medium, the edge it stands for)` — never `high`, and a `low`
 call stays `low` (counted in `below_confidence` by default). To leave dispatch

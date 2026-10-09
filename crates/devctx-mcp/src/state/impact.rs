@@ -102,9 +102,10 @@ const EXCLUDED_HINT: &str =
 
 /// The line `omitted_by_limit.dispatch` carries.
 const DISPATCH_CAPPED_HINT: &str =
-    "a method implemented (or overridden) by more methods than a node is expanded into: \
-     the ones past the cap were counted, not listed or walked; ask about one implementation, \
-     or pass dispatch: false to follow direct calls only";
+    "a method implemented (or overridden) by more methods than a node is expanded into, or \
+     in a type more supertype levels away than dispatch climbs (beyond_depth): those were \
+     counted, not listed or walked; ask about one implementation, or pass dispatch: false to \
+     follow direct calls only";
 
 /// The line the answer adds when `max_nodes` stopped the walk.
 const CAPPED_HINT: &str =
@@ -330,7 +331,10 @@ fn answer(
         }
         // The dispatch cap counts methods, not nodes: only in its own field
         // (review of TASK-017, deviation 6), never in `count` nor `omitted`.
-        let dispatch = u.dispatch_capped + d.dispatch_capped;
+        // Methods not followed: past the per-node cap, or in a type past the
+        // depth cap of the supertype chain (review of TASK-017, point 6).
+        let beyond = u.dispatch_beyond_depth + d.dispatch_beyond_depth;
+        let dispatch = u.dispatch_capped + d.dispatch_capped + beyond;
         by_limit = u.capped + d.capped;
         if by_limit + dispatch > 0 {
             // The hint of what cut: `max_nodes`, or only the dispatch cap.
@@ -355,6 +359,10 @@ fn answer(
                     "count": dispatch,
                     "max_per_node": devctx_store::DISPATCH_MAX_PER_NODE,
                 });
+                if beyond > 0 {
+                    note["dispatch"]["beyond_depth"] = json!(beyond);
+                    note["dispatch"]["max_depth"] = json!(devctx_store::DISPATCH_DEPTH);
+                }
             }
             out["omitted_by_limit"] = note;
         }
@@ -887,6 +895,46 @@ mod tests {
         assert_eq!(v["omitted_by_limit"]["count"], 3, "{v}");
         assert_eq!(v["downstream"].as_array().unwrap().len(), 1, "{v}");
         assert!(v.get("resolved_symbols").is_none(), "{v}");
+    }
+
+    /// Review of TASK-017, point 6: what the depth cap of the supertype chain
+    /// left out is in `omitted_by_limit.dispatch` (its `count`, and apart in
+    /// `beyond_depth`), never in `omitted`, which counts nodes.
+    #[test]
+    fn the_dispatch_depth_cap_is_in_omitted_by_limit() {
+        let chosen = BranchChoice {
+            repo: "demo".into(),
+            branch: "main".into(),
+            fallback: None,
+            indexed: true,
+            extractor_stale: false,
+        };
+        let im = SymbolImpact {
+            upstream: ImpactSide {
+                dispatch_beyond_depth: 2,
+                dispatch_capped: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = ImpactOptions::default();
+        let v = answer(
+            "Impl.m",
+            "Impl.m",
+            Vec::new(),
+            Vec::new(),
+            &["Impl.m".to_string()],
+            &chosen,
+            super::super::lookup::Reader::SymbolGraph,
+            Some((&im, &opts)),
+            200,
+        );
+        let d = &v["omitted_by_limit"]["dispatch"];
+        assert_eq!(d["count"], 3, "{v}");
+        assert_eq!(d["beyond_depth"], 2, "{v}");
+        assert_eq!(d["max_depth"], devctx_store::DISPATCH_DEPTH, "{v}");
+        assert_eq!(v["omitted_by_limit"]["count"], 0, "{v}");
+        assert!(v.get("omitted").is_none(), "{v}");
     }
 
     #[test]

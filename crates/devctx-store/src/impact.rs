@@ -189,6 +189,9 @@ pub struct ImpactSide {
     /// Override-equivalent methods past the dispatch cap of a node
     /// (`DISPATCH_MAX_PER_NODE`): counted, not followed (TASK-017).
     pub dispatch_capped: usize,
+    /// Override-equivalent methods in a type past `DISPATCH_DEPTH` supertype
+    /// levels: counted, not followed (review of TASK-017, point 6).
+    pub dispatch_beyond_depth: usize,
     /// Level queries run.
     pub levels: usize,
     /// The largest frontier a level query read (ids).
@@ -288,6 +291,8 @@ pub(crate) struct Level {
     pub rows: Vec<LevelRow>,
     /// Ids of the equivalents past the cap of their node.
     pub cut: Vec<u64>,
+    /// Ids of the equivalents past the depth cap of the supertype chain.
+    pub beyond: Vec<u64>,
 }
 
 impl From<Vec<LevelRow>> for Level {
@@ -295,6 +300,7 @@ impl From<Vec<LevelRow>> for Level {
         Level {
             rows,
             cut: Vec::new(),
+            beyond: Vec::new(),
         }
     }
 }
@@ -385,6 +391,7 @@ pub(crate) fn walk(
     // Equivalents the dispatch cap left out, and the confidence each walked
     // node was reached with (a seed: none, so `high` caps nothing).
     let mut cut: HashSet<Key> = HashSet::new();
+    let mut beyond: HashSet<Key> = HashSet::new();
     let mut reach: HashMap<u64, Option<String>> = HashMap::new();
     let cap = if opts.max_nodes == 0 {
         usize::MAX
@@ -399,6 +406,7 @@ pub(crate) fn walk(
         side.levels += 1;
         side.widest = side.widest.max(frontier.len());
         cut.extend(read.cut.into_iter().map(Key::Id));
+        beyond.extend(read.beyond.into_iter().map(Key::Id));
         let mut best: HashMap<Key, LevelRow> = HashMap::new();
         for mut r in read.rows {
             // Downstream dispatch: no surer than the edge that reached the
@@ -493,6 +501,10 @@ pub(crate) fn walk(
     // A method one node's cap cut and another node reached and left out (a
     // test, `low`) is counted where it was left out, once (review MINOR 7).
     cut.retain(|k| !below.contains(k) && !tests.contains(k) && !external.contains(k));
+    beyond.retain(|k| {
+        !below.contains(k) && !tests.contains(k) && !external.contains(k) && !cut.contains(k)
+    });
+    side.dispatch_beyond_depth = left_out(beyond);
     side.dispatch_capped = left_out(cut);
     side.below_confidence = left_out(below);
     side.tests = left_out(tests);
@@ -788,6 +800,7 @@ impl Store {
         let mut out = Level {
             rows: Vec::new(),
             cut: eq.cut,
+            beyond: eq.beyond,
         };
         match dir {
             Direction::Upstream => {
@@ -1978,6 +1991,91 @@ pub(crate) mod tests {
             names(&im.downstream),
             ["BaseService.update", "ServiceImpl.update"]
         );
+    }
+
+    /// Review of TASK-017, point 6: what the depth cap of the supertype
+    /// chain leaves out is counted, not dropped in silence — `ITop.update`,
+    /// five levels above, upstream; `ServiceImpl.update`, five below,
+    /// downstream — and never followed.
+    #[test]
+    fn the_dispatch_depth_cap_is_counted() {
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[
+                ("ServiceImpl", "BaseService", "inherits", "high"),
+                ("BaseService", "IService", "implements", "high"),
+                ("IService", "IBase", "inherits", "high"),
+                ("IBase", "IRoot", "inherits", "high"),
+                ("IRoot", "ITop", "inherits", "high"),
+            ],
+            &[
+                (
+                    "BaseService.update",
+                    "public abstract void update(String id);",
+                ),
+                ("ServiceImpl.update", "public void update(String id)"),
+                ("IService.update", "void update(String id);"),
+                ("IBase.update", "void update(String id);"),
+                ("IRoot.update", "void update(String id);"),
+                ("ITop.update", "void update(String id);"),
+                ("ITop.other", "void other(String id);"),
+            ],
+            &[call("Api.viaTop", "ITop.update")],
+        );
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "ServiceImpl.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert!(!names(&im.upstream).contains(&"Api.viaTop"));
+        assert_eq!(im.upstream.dispatch_beyond_depth, 1);
+        assert_eq!(im.upstream.dispatch_capped, 0);
+        // Downstream at depth 1 (at depth 2 `IRoot.update` would reach it
+        // within its own cap, and then it is listed, not counted).
+        let one = ImpactOptions {
+            depth: 1,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "ITop.update", None, &one)
+            .unwrap();
+        assert_eq!(
+            names(&im.downstream),
+            [
+                "BaseService.update",
+                "IBase.update",
+                "IRoot.update",
+                "IService.update"
+            ]
+        );
+        assert_eq!(im.downstream.dispatch_beyond_depth, 1);
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "ITop.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert!(names(&im.downstream).contains(&"ServiceImpl.update"));
+        assert_eq!(im.downstream.dispatch_beyond_depth, 0);
+        // Within the cap nothing is counted.
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "IService.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(im.downstream.dispatch_beyond_depth, 0);
     }
 
     /// TASK-017 (c): an interface with many implementations does not explode:

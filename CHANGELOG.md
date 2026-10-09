@@ -330,7 +330,8 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   parameters than the method it implements. Among same-arity overloads in one supertype, the one whose simple
   parameter types match exactly. At most 16 equivalents per node, production
   before tests; the rest are counted in `omitted_by_limit.dispatch` only (not
-  in its `count` nor in `omitted`, which count nodes). `dispatch: false` (tool,
+  in its `count` nor in `omitted`, which count nodes), as is an equivalent
+  method past the four supertype levels (`beyond_depth`, `max_depth`). `dispatch: false` (tool,
   `GET /impact?dispatch=false`, `devctx impact --no-dispatch`) follows direct
   calls only, `min_confidence: "high"` leaves it out without reading it, and
   `filters` says whether it applied; when it was not evaluated the answer

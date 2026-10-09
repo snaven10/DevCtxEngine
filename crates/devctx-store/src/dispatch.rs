@@ -76,6 +76,9 @@ pub(crate) struct Equivalents {
     pub kept: Vec<Equivalent>,
     /// Ids of the ones past [`DISPATCH_MAX_PER_NODE`] for some origin.
     pub cut: Vec<u64>,
+    /// Ids of the ones in a type past [`DISPATCH_DEPTH`] supertype levels:
+    /// counted, not followed.
+    pub beyond: Vec<u64>,
 }
 
 /// `min(medium, c)`, and no surer than the chain: a dispatch is never
@@ -391,8 +394,11 @@ impl DispatchIndex {
     }
 
     /// The types reachable from `from` in direction `dir` within
-    /// [`DISPATCH_DEPTH`] levels, each with its surest chain.
-    fn reach(&self, from: u64, dir: Direction) -> HashMap<u64, u8> {
+    /// [`DISPATCH_DEPTH`] levels, each with its surest chain, and the types
+    /// reachable only past that cap (counted, never followed: review of
+    /// TASK-017, point 6). A cycle ends: no type is visited twice for the
+    /// same chain.
+    fn reach(&self, from: u64, dir: Direction) -> (HashMap<u64, u8>, HashSet<u64>) {
         let graph = match dir {
             Direction::Upstream => &self.supers,
             Direction::Downstream => &self.subs,
@@ -412,7 +418,21 @@ impl DispatchIndex {
             }
             layer = next;
         }
-        best
+        // Past the cap: the rest of the hierarchy, by plain reachability.
+        let mut past: HashSet<u64> = HashSet::new();
+        let mut layer: Vec<u64> = layer.into_iter().map(|(t, _)| t).collect();
+        while !layer.is_empty() {
+            let mut next = Vec::new();
+            for t in layer {
+                for &(s, _) in graph.get(&t).into_iter().flatten() {
+                    if s != from && !best.contains_key(&s) && past.insert(s) {
+                        next.push(s);
+                    }
+                }
+            }
+            layer = next;
+        }
+        (best, past)
     }
 }
 
@@ -424,8 +444,14 @@ struct Origin {
     signature: String,
 }
 
-/// An origin, the types it reaches (with their chain) and its candidates there.
-type OriginFound = (Origin, HashMap<u64, u8>, Vec<(Candidate, u8)>);
+/// An origin, the types it reaches (with their chain) and past the depth cap,
+/// and its candidates in each.
+type OriginFound = (
+    Origin,
+    (HashMap<u64, u8>, HashSet<u64>),
+    Vec<(Candidate, u8)>,
+    Vec<Candidate>,
+);
 
 /// A method of the same name in a type of the supertype graph.
 struct Candidate {
@@ -456,10 +482,12 @@ fn confidence_rank(c: Option<&str>) -> u8 {
 
 /// The equivalents of one origin among its candidates (already reachable,
 /// with their chain): override-equivalent ones, ordered and capped.
+#[allow(clippy::too_many_arguments)]
 fn select(
     origin: u64,
     o: &Origin,
     found: Vec<(Candidate, u8)>,
+    past: Vec<Candidate>,
     dir: Direction,
     include_tests: bool,
     out: &mut Equivalents,
@@ -468,18 +496,24 @@ fn select(
         return;
     }
     let mine = arity(&o.signature, &o.name);
-    let mut found: Vec<(Candidate, u8)> = found
-        .into_iter()
-        .filter(|(c, _)| {
-            !never_overrides(&c.signature, &o.name)
-                && arities_fit(
-                    mine,
-                    arity(&c.signature, &o.name),
-                    dir,
-                    lax_arity(c.file.as_deref()),
-                )
-        })
-        .collect();
+    let equivalent = |c: &Candidate| {
+        !never_overrides(&c.signature, &o.name)
+            && arities_fit(
+                mine,
+                arity(&c.signature, &o.name),
+                dir,
+                lax_arity(c.file.as_deref()),
+            )
+    };
+    // Past the depth cap: counted (not tests the walk leaves out anyway),
+    // never followed.
+    out.beyond.extend(
+        past.iter()
+            .filter(|c| (include_tests || !c.test) && equivalent(c))
+            .map(|c| c.id),
+    );
+    let mut found: Vec<(Candidate, u8)> =
+        found.into_iter().filter(|(c, _)| equivalent(c)).collect();
     // Overloads of one arity in one type (`save(User)`, `save(Order)`): the
     // one whose simple parameter types match exactly, when there is one;
     // otherwise (a generic parameter) the arity decides (review MINOR 3).
@@ -669,17 +703,19 @@ impl Store {
             let (id, o, c) = row?;
             let entry = origins.entry(id).or_insert_with(|| {
                 let reach = index.reach(o.parent, dir);
-                (o, reach, Vec::new())
+                (o, reach, Vec::new(), Vec::new())
             });
-            if let Some(&chain) = entry.1.get(&c.parent) {
+            if let Some(&chain) = entry.1 .0.get(&c.parent) {
                 entry.2.push((c, chain));
+            } else if entry.1 .1.contains(&c.parent) {
+                entry.3.push(c);
             }
         }
         let mut ids: Vec<u64> = origins.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
-            let (o, _, found) = origins.remove(&id).expect("listed");
-            select(id, &o, found, dir, include_tests, &mut out);
+            let (o, _, found, past) = origins.remove(&id).expect("listed");
+            select(id, &o, found, past, dir, include_tests, &mut out);
         }
         Ok(out)
     }
