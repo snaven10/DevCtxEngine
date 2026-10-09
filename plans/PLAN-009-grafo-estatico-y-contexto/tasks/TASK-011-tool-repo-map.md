@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-009 — Grafo estático preciso y contexto por grafo
 - **Especialista:** general-purpose (Rust)
-- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-009-grafo`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama local `feat/plan-009-grafo`, remota `fix/plan-009-grafo`
 - **Depende de:** TASK-010
 - **Estado:** `pending`
 

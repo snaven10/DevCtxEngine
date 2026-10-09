@@ -2,7 +2,7 @@
 
 - **Plan:** PLAN-009 — Grafo estático preciso y contexto por grafo
 - **Especialista:** general-purpose (Rust)
-- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-009-grafo`
+- **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama local `feat/plan-009-grafo`, remota `fix/plan-009-grafo`
 - **Depende de:** TASK-009
 - **Estado:** `pending`
 
@@ -13,8 +13,9 @@
 Que `impact_analysis` no pierda a quien llama a una implementación a través de su interfaz, su clase
 abstracta o su trait: hoy `impact("ServiceImpl.update")` no ve las llamadas a `IService.update`, y
 en Java con inyección de dependencias ese es el falso negativo más caro (el llamador tiene el campo
-tipado por la interfaz). La semilla se expande a los métodos override-equivalentes de supertipos y
-subtipos, con aristas `medium` y `via: "dispatch"`, nunca `high`. `traverse` (TASK-013) usa la misma
+tipado por la interfaz). Cada nodo del recorrido (no solo la semilla) se expande a los métodos
+override-equivalentes de supertipos y subtipos, con confianza `min(medium, la de la arista
+original)` y `via: "dispatch"`, nunca `high`. `traverse` (TASK-013) usa la misma
 expansión. Agregada a PLAN-009 por decisión del usuario (2026-10-08, §12), a propuesta de la revisión
 de TASK-009.
 
@@ -39,15 +40,29 @@ de TASK-009.
 ## Pasos
 
 - [ ] **Paso 1 — tests que fallan.** (a) `impact("ServiceImpl.update")` ve a quien llama por
-      `IService.update` (Java, campo tipado por la interfaz e inyectado); (b) `impact("IService.update")`
-      ve las implementaciones y sus llamadores; (c) una interfaz con muchas implementaciones no explota:
-      tope por semilla, con el resto contado en `omitted`/`excluded`; (d) TS `implements` y Rust
-      trait → impls; (e) escenario en `an_incremental_link_pass_equals_a_full_one` si cambia un
-      `implements` (la expansión se lee en la consulta, pero el escenario fija que las aristas de
-      herencia del incremental igualan al completo).
-- [ ] **Paso 2 — override-equivalencia.** Mismo nombre y aridad o firma compatible, en supertipos y
-      subtipos vía `implements`/`inherits` resueltos (`dst_id`). Las aristas sumadas son `medium`
-      con `via: "dispatch"`, nunca `high`; un `min_confidence: high` las excluye y las cuenta.
+      `IService.update` (Java, campo tipado por la interfaz e inyectado); (b-up) upstream:
+      `impl.m` → override-equivalentes de sus supertipos → sus llamadores; (b-down) downstream:
+      `impact("IService.update")` → sus implementaciones; (b-deep) dispatch en profundidad ≥ 2
+      (un llamador de nivel 1 que a su vez se llama por interfaz); (b-chain) cadena transitiva
+      abstracta → interfaz; (c) una interfaz con muchas implementaciones no explota: tope, con lo
+      recortado en `omitted_by_limit.dispatch`; (c') una arista `low` sigue `low` tras dispatch;
+      (d) TS `implements` y Rust trait → impls; (e) escenario en
+      `an_incremental_link_pass_equals_a_full_one` si cambia un `implements` (la expansión se lee en
+      la consulta, pero el escenario fija que las aristas de herencia del incremental igualan al
+      completo).
+- [ ] **Paso 2 — override-equivalencia, por nodo.** Mismo nombre y aridad o firma compatible, en
+      supertipos y subtipos vía `implements`/`inherits` resueltos (`dst_id`). La expansión se hace
+      **por cada nodo de cada nivel, no solo en la semilla** (si no, se pierde el dispatch en
+      profundidad ≥ 2), con **a lo sumo UNA consulta extra por nivel** (por lote de la frontera, no
+      por nodo). Semántica por dirección:
+      - **upstream:** `impl.m` → métodos override-equivalentes de sus supertipos → sus llamadores;
+      - **downstream:** método de interfaz o abstracto → sus implementaciones.
+      La cadena de supertipos es **transitiva** (abstracta → interfaz) con tope de profundidad.
+      La confianza de una arista por dispatch es **`min(medium, confianza de la arista original)`**:
+      tope `medium`, nunca `high`, y un `low` no sube. `via: "dispatch"`; un `min_confidence: high`
+      las excluye y las cuenta.
+- [ ] **Contrato:** lo recortado por el tope de dispatch se cuenta en **un solo campo,
+      `omitted_by_limit.dispatch`** (aditivo).
 - [ ] **Paso 3 — lenguajes.** Java (interfaces y clases abstractas con DI), TS (`implements`), Rust
       (trait → impls). Python y Go como best-effort documentado.
 - [ ] **Paso 4 — default.** Incluido por defecto en `impact`, con conteo cuando se recorta. Contrato
@@ -58,7 +73,7 @@ de TASK-009.
 ## Criterios de aceptación
 
 - [ ] Tests (a)-(e) verdes, cada uno fallando antes del fix.
-- [ ] Ninguna arista de dispatch sale `high`.
+- [ ] Ninguna arista de dispatch sale `high` ni sube la confianza de la arista original (`min(medium, original)`).
 - [ ] Gold de DI en backend-b correcto; p95 de `impact` ≤ 300 ms en backend-a.
 - [ ] Docs EN + ES y descripción del tool explican `via: "dispatch"` y cómo excluirlo.
 
