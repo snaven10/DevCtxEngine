@@ -2494,9 +2494,8 @@ fn print_traverse_answer(json: &serde_json::Value) {
         }
         println!("{line}");
     }
-    let total = json["total"].as_u64().unwrap_or(0);
-    if let Some(next) = json["next_offset"].as_u64() {
-        eprintln!("· {total} node(s) in all; --offset {next} shows the next page");
+    if let Some(note) = traverse_page_note(json) {
+        eprintln!("{note}");
     }
     if let Some(d) = json["partial"]["from_depth"].as_u64() {
         eprintln!("· depth {d} and below were not read: the page was already full");
@@ -2520,6 +2519,21 @@ fn print_traverse_answer(json: &serde_json::Value) {
     if let Some(n) = json["omitted_for_budget"]["count"].as_u64() {
         eprintln!("· {n} node(s) did not fit the output budget");
     }
+}
+
+/// The paging line of a `traverse` answer, when there is a next page: with
+/// `partial` the total is a floor (`>= N`, review of TASK-013, MINOR 3).
+fn traverse_page_note(json: &serde_json::Value) -> Option<String> {
+    let next = json["next_offset"].as_u64()?;
+    let total = json["total"].as_u64().unwrap_or(0);
+    let at_least = if json["total_is_lower_bound"].as_bool() == Some(true) {
+        ">= "
+    } else {
+        ""
+    };
+    Some(format!(
+        "· {at_least}{total} node(s) in all; --offset {next} shows the next page"
+    ))
 }
 
 /// Human output of an `impact_analysis` answer: notes on stderr, the two
@@ -4379,6 +4393,20 @@ fn render_table(hits: &[SearchResult]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Review of TASK-013, MINOR 3: a lower-bound total reads `>= N`.
+    #[test]
+    fn a_partial_traverse_total_reads_as_a_floor() {
+        let v = serde_json::json!({ "total": 300, "next_offset": 50 });
+        assert_eq!(
+            traverse_page_note(&v).unwrap(),
+            "· 300 node(s) in all; --offset 50 shows the next page"
+        );
+        let v =
+            serde_json::json!({ "total": 300, "next_offset": 50, "total_is_lower_bound": true });
+        assert!(traverse_page_note(&v).unwrap().contains(">= 300"));
+        assert!(traverse_page_note(&serde_json::json!({ "total": 3 })).is_none());
+    }
     /// TASK-017 item 6: the rule for the `model_dir` `init` records.
     #[test]
     fn a_model_that_needs_files_never_gets_an_empty_model_dir() {

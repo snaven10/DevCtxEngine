@@ -6,7 +6,7 @@
 //! DD-11's filters, dispatch when `calls` is followed), paged.
 //!
 //! The answer: `{root, candidates?, nodes, edges, total, next_offset?,
-//! omitted?, partial?, filters, below_confidence?, excluded?,
+//! omitted?, partial?, total_is_lower_bound?, filters, below_confidence?, excluded?,
 //! omitted_by_limit?, dispatch?, omitted_for_budget?, branch_fallback?}`.
 //! Nodes carry `sym` (hex) when they have a definition; an edge's `from` and
 //! `to` are the `sym` of its ends (the name, for an end with no definition).
@@ -454,6 +454,8 @@ pub(super) fn traverse_on(
     }
     if let Some(d) = t.unread_from {
         out["partial"] = json!({ "from_depth": d, "hint": PARTIAL_HINT });
+        // Review of TASK-013, MINOR 3: what was not read is not counted.
+        out["total_is_lower_bound"] = json!(true);
     }
     out["filters"] = json!({
         "kinds": opts.kinds,
@@ -915,9 +917,13 @@ mod tests {
             "{}",
             v["total"]
         );
+        assert!(v.get("total_is_lower_bound").is_none());
         let v = page(None, 2);
         assert_eq!(v["partial"]["from_depth"], 2, "{}", v["partial"]);
         assert_eq!(v["total"], 300);
+        // Review of TASK-013, MINOR 3: with `partial`, `total` (and
+        // `omitted.count`) only count what was read.
+        assert_eq!(v["total_is_lower_bound"], true, "{}", v["partial"]);
         let _ = std::fs::remove_dir_all(&repo);
     }
 

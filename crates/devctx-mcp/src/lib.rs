@@ -1316,7 +1316,8 @@ impl DevctxServer {
         the calls to the name the index could not decide counted in `undecided_calls` (min_confidence \
         low lists their callers, `undecided: true`, not walked). A hub (a DTO \
         used in hundreds of files) is paged: `limit` (50) and `offset`; once a page is full no \
-        deeper level is read (`partial`). Needs an index made by 0.10 (else: devctx index --full)."
+        deeper level is read (`partial`, and then `total_is_lower_bound: true`: `total` and \
+        `omitted.count` count only what was read). Needs an index made by 0.10 (else: devctx index --full)."
     )]
     async fn traverse(
         &self,

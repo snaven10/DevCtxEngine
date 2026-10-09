@@ -241,7 +241,7 @@ resto nombrado en `omitted_for_budget.candidates`; hasta 10 000 definiciones, co
 lleva un nodo o un candidato) arranca desde exactamente una.
 
 La respuesta es `{root, candidates?, nodes, edges, total, next_offset?, omitted?,
-partial?, filters, below_confidence?, excluded?, omitted_by_limit?, dispatch?,
+partial?, total_is_lower_bound?, filters, below_confidence?, excluded?, omitted_by_limit?, dispatch?,
 omitted_for_budget?, branch_fallback?}`:
 
 - `nodes`: `{sym, symbol, kind, file, line, depth, confidence, via}` (`via` es la
@@ -268,8 +268,9 @@ omitted_for_budget?, branch_fallback?}`:
   `total`, `next_offset` y `omitted: {count, reason, next_offset}`. Un hub — un
   DTO referenciado desde cientos de archivos — se pagina, no se vuelca: cuando el
   recorrido ya tiene más nodos de los que la página necesita no lee ningún nivel
-  más profundo, `partial: {from_depth}` lo dice, y `total` cuenta entonces lo que
-  se leyó (la página siguiente sigue leyendo).
+  más profundo, `partial: {from_depth}` lo dice, y `total` y `omitted.count`
+  cuentan entonces solo lo que se leyó — `total_is_lower_bound: true` (la página
+  siguiente sigue leyendo; el CLI imprime `>= N`).
 - El presupuesto de salida (`DEVCTX_MAX_OUTPUT_TOKENS`) se reparte por mitades
   entre nodos y aristas; lo que no entra se nombra en `omitted_for_budget`.
 

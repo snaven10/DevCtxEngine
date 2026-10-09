@@ -236,7 +236,7 @@ and `candidates_truncated` past that); `sym` (the hex id a node or a candidate
 carries) starts from exactly one.
 
 The answer is `{root, candidates?, nodes, edges, total, next_offset?, omitted?,
-partial?, filters, below_confidence?, excluded?, omitted_by_limit?, dispatch?,
+partial?, total_is_lower_bound?, filters, below_confidence?, excluded?, omitted_by_limit?, dispatch?,
 omitted_for_budget?, branch_fallback?}`:
 
 - `nodes`: `{sym, symbol, kind, file, line, depth, confidence, via}` (`via` is
@@ -263,8 +263,9 @@ omitted_for_budget?, branch_fallback?}`:
   `total`, `next_offset`, and `omitted: {count, reason, next_offset}`. A hub —
   a DTO referenced from hundreds of files — is paged, not dumped: once the walk
   holds more nodes than the page needs, no deeper level is read, `partial:
-  {from_depth}` says so, and `total` then counts what was read (the next page
-  reads on).
+  {from_depth}` says so, and `total` and `omitted.count` then count only what
+  was read — `total_is_lower_bound: true` (the next page reads on; the CLI
+  prints `>= N`).
 - The output budget (`DEVCTX_MAX_OUTPUT_TOKENS`) halves between nodes and
   edges; what does not fit is named in `omitted_for_budget`.
 
