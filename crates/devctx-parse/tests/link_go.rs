@@ -138,3 +138,11 @@ fn modules_are_matched_by_ancestor_and_longest_prefix() {
     let news = l.all("calls", "Server.Handle", "New");
     assert_eq!(news[0], UNDECIDED);
 }
+
+/// Third review: `s.m()` in a method whose receiver type no indexed file
+/// declares is undecided, never `unique_name`.
+#[test]
+fn a_receiver_without_a_container_is_no_guess() {
+    let l = linked();
+    assert_eq!(l.call("Set.Add", "Set.helper"), UNDECIDED);
+}

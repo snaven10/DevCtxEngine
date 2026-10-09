@@ -430,3 +430,30 @@ fn a_glob_past_the_file_blocks_the_importer_filter() {
     assert!(l.index.rs_use_names(UTIL).is_none());
     assert!(l.index.rs_use_names(MAIN).is_some());
 }
+
+/// Third review: `self.m()` in an `impl` for a type from outside (no
+/// container in the repository) is undecided, never `unique_name`.
+#[test]
+fn self_in_an_impl_for_an_outside_type_is_no_guess() {
+    let l = linked();
+    assert_eq!(l.call("Vec.size", "Vec.tidy_up"), UNDECIDED);
+}
+
+/// Third review (NIT): a receiver named by a `use` inside a closure is
+/// resolved by the call's line too, as a bare call is.
+#[test]
+fn a_receiver_use_in_a_block_is_scoped_to_it() {
+    let l = linked();
+    let calls = l.all("calls", "closure_receiver", "P.shine");
+    assert_eq!(
+        calls[0],
+        (
+            s("Polisher.shine"),
+            s("crates/app/src/extra.rs"),
+            "high",
+            "import",
+            false
+        )
+    );
+    assert_eq!(calls[1], UNDECIDED);
+}

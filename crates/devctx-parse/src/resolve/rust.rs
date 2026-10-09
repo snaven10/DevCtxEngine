@@ -1015,7 +1015,7 @@ impl RepoIndex {
                 glob,
                 reexport: tokens.first() == Some(&"export"),
                 scope,
-                func: func.filter(|_| span.is_some()).or(func),
+                func,
                 span,
             });
         }
@@ -1506,7 +1506,7 @@ impl RepoIndex {
     /// declared type), a unit struct, something from outside.
     pub(super) fn rs_name(&self, c: &Call<'_>, recv: &str) -> Outcome {
         let segs = split_path(recv);
-        match self.rs_path(&segs, c.file, c.src) {
+        match self.rs_path_at(&segs, c.file, c.src, Some(c.line)) {
             RsRes::Item(t, sure) if is_type(&self.syms[t].kind) => {
                 let how = self.rs_how(t, c.file, false);
                 self.in_type(c, t, how, if sure { "high" } else { "medium" })

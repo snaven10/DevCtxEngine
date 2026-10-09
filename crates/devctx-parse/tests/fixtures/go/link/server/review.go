@@ -15,3 +15,9 @@ func Review() {
 	z := NewServer()
 	z.helper()
 }
+
+// Add is a method of a type declared in no indexed file (a generated
+// one): its receiver has no container in the repository.
+func (s *Set[T]) Add() {
+	s.helper()
+}

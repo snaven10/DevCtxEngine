@@ -116,3 +116,24 @@ pub fn closure_use() {
     c();
     polish();
 }
+
+/// A trait implemented for a type from outside the repository.
+pub trait Sizable {
+    fn size(&self);
+}
+
+impl Sizable for Vec<u8> {
+    fn size(&self) {
+        self.tidy_up();
+    }
+}
+
+/// A receiver named by a `use` inside a closure is the closure's.
+pub fn closure_receiver() {
+    let c = || {
+        use crate::extra::Polisher as P;
+        P.shine();
+    };
+    c();
+    P.shine();
+}

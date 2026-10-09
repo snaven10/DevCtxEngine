@@ -1394,6 +1394,12 @@ impl RepoIndex {
                 return external("external_known");
             }
         }
+        // Rust and Go reach here only from `self.m()`/`s.m()` with no
+        // container (an `impl` for an outside type, a receiver no indexed
+        // file declares): never a guess by name (third review, N3).
+        if matches!(self.lang_key(file), Some("rust" | "go")) {
+            return self.untyped(c);
+        }
         self.by_name_only(callee, file, args)
     }
 
