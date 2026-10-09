@@ -275,4 +275,25 @@ TASK-005…008 (basura 0, externos/tests marcados, precisión de gold edges ≥ 
     puerto cerrado devolvió `Connection reset`; `the_autospawn_mark_is_read_from_the_environment`:
     `/proc/<pid>/environ` leído antes del `exec`); la corrida repetida del workspace entero dio
     1 076 / 0.
+- **Segunda revisión (APROBADA salvo un MAJOR), resuelto en un commit encima de 57d150f:**
+  - *MAJOR:* `is_cfg_test` buscaba la subcadena `test` y marcaba como test código de producción
+    (`any(test, feature = "x")`, `not(feature = "test-utils")`, `feature = "test-utils"`,
+    `attest`). Ahora `cfg_requires_test` parsea el predicado y marca solo si `test` es obligatorio
+    (solo o dentro de un `all(…)`); bajo `any`/`not`, nunca. **`EXTRACTOR_VERSION` 19**; el
+    fixture de tests en línea suma `#[cfg(any(test, feature = "mock"))] pub fn fake_client()`, que
+    el golden muestra sin rango de test.
+  - *Test que fallaba antes del fix:* `facts_rust::only_a_required_test_cfg_marks_test_code` (una
+    forma por caso: `test`, `all(test, x)`, `all` anidado, `any(test, x)`, `not(test)`,
+    `feature = "test-utils"`, `not(feature = "test-utils")`, `attest`, `any` dentro de `all`,
+    `not(all(test, …))`, más `#[test]`, `#[tokio::test(flavor = …)]`, `#[rstest]`, comentario tras
+    el atributo, `#[inline]` y `#![cfg(test)]`): falló en `any(test, feature = "x")` (marcado
+    `[(4, 6)]`).
+  - *Falsos negativos arreglados (baratos):* `#[tokio::test(…)]`, `#[rstest]`, comentario entre el
+    atributo y el ítem, `#![cfg(test)]` interno. *Quedan (del lado seguro, DD-9):* `#[cfg(test)]
+    mod tests;` con el cuerpo en otro archivo, tests generados por macros.
+  - *Además:* comentario de `with_centrality` corregido (un hit sin rank no recibe bonus pero queda
+    relativamente degradado frente a los rankeados; DD-13 y `search.md` EN/ES lo dicen);
+    `penalty_and_dedup_hold_under_centrality` exige ahora un reorden (`b` pasa a `a` con `w` = 1
+    y no con `w` = 0). Pendientes anotados en TASK-016 (paso 3b): bonus promedio en empates de
+    percentil, latencia de la CTE de percentil con `w` > 0, caché de `local_centrality` en la TUI.
 

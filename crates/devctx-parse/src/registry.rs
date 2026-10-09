@@ -254,6 +254,10 @@ const SOURCES: &[&str] = &[
 /// 18: TASK-010 review, MAJOR 4 — Rust test code inside a source file
 /// (`#[cfg(test)]`, `mod tests`, `#[test]`) is reported as `test_lines`:
 /// its symbols are tests and its calls `from_test`.
+/// 19: TASK-010 second review — a `cfg` is test code only when `test` is
+/// required (alone or in an `all(…)`), never under `any`/`not` nor as a
+/// feature name; `#[tokio::test(…)]`, `#[rstest]`, a comment after the
+/// attribute and an inner `#![cfg(test)]` are recognised.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -261,7 +265,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 18;
+pub const EXTRACTOR_VERSION: u32 = 19;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

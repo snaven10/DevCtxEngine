@@ -145,7 +145,9 @@ branch —, each adding `w / (k + position)` to its fused score.
 - `w` is `search.centrality_weight`, from `0` (off) to `1`; a value outside
   that range, or not a number, is bounded (`0` or `1`) and warned about.
 - It only reorders: a chunk no retriever brought is never added. A chunk of no
-  symbol (a whole-file summary, a doc, a config file, a memory) gets no bonus.
+  symbol (a whole-file summary, a doc, a config file, a memory) gets no bonus —
+  so, next to code that does, it loses ground: with centrality on, docs, config
+  and memories rank relatively lower.
 - The bonus is at most `w / 61`, but fused scores sit a few thousandths apart,
   so it moves hits several places, not just near-ties: on one measured case,
   with `w = 0.3`, the expected file went from 7th to 1st.

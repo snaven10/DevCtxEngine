@@ -1,4 +1,4 @@
-version 18
+version 19
 == src/main/java/com/example/shop/OrderService.java (java) package=com.example.shop
 sym	file	src/main/java/com/example/shop/OrderService.java	ad11412489306fb7	parent=-	container=-	-	L1-43	
 sym	class	OrderService	dc29a699ee8c525b	parent=src/main/java/com/example/shop/OrderService.java	container=-	pub	L9-38	public class OrderService extends BaseService implements Auditable, Serializable
@@ -188,14 +188,16 @@ L35	call	Cached.name -> Foo.bar	graph=Cached.name	hint=path Foo /0
 L36	call	Cached.name -> store::open	graph=Cached.name	hint=path store /0
 L37	call	Cached.name -> String.new	graph=Cached.name	hint=path String /0
 == crates/demo/src/inline.rs (rust) package=demo::inline
-sym	file	crates/demo/src/inline.rs	b9b6bdc58e5f1473	parent=-	container=-	-	L1-15	
+sym	file	crates/demo/src/inline.rs	b9b6bdc58e5f1473	parent=-	container=-	-	L1-20	
 sym	function	mark	4b42cfab4c9c57b8	parent=crates/demo/src/inline.rs	container=-	pub	L1-1	pub fn mark()
 sym	module	tests	a382bea4ab80f05c	parent=crates/demo/src/inline.rs	container=-	priv	L4-9	mod tests
 sym	function	tests.marks	e154717e3d267a18	parent=tests	container=-	priv	L6-8	fn marks()
 sym	function	shipped	e7f143eed62d2a1e	parent=crates/demo/src/inline.rs	container=-	pub	L12-14	pub fn shipped()
+sym	function	fake_client	f12f9a3da4761bd8	parent=crates/demo/src/inline.rs	container=-	pub	L17-19	pub fn fake_client()
 L4	test	L4-9
 L7	call	tests.marks -> super::mark	graph=tests.marks	hint=path super /0
 L13	call	shipped -> mark	graph=shipped	hint=free /0
+L18	call	fake_client -> mark	graph=fake_client	hint=free /0
 == api/server.go (go) package=api
 sym	file	api/server.go	53b33b78efb910e7	parent=-	container=-	-	L1-32	
 sym	const	Version	cba7bd18a30b70f0	parent=api/server.go	container=-	pub	L10-10	Version = "1"

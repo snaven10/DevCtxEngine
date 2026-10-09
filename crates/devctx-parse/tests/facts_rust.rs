@@ -106,3 +106,50 @@ fn rust_use_trees_are_flattened() {
     );
     assert_eq!(pf.facts.imports[2].alias.as_deref(), Some("S"));
 }
+
+/// Review of TASK-010, second pass: a `cfg` marks test code only when `test`
+/// is required — alone, or inside an `all(…)` — never under `any(…)` or
+/// `not(…)`, nor as part of another word or a feature name. Production code
+/// must never be taken for a test (it would leave `impact` and the rank).
+/// Cheap false negatives fixed too: `#[tokio::test(flavor = …)]`,
+/// `#[rstest]`, a comment between the attribute and the item, `#![cfg(test)]`.
+#[test]
+fn only_a_required_test_cfg_marks_test_code() {
+    let cases: &[(&str, bool)] = &[
+        ("#[cfg(test)]", true),
+        ("#[cfg(all(test, feature = \"x\"))]", true),
+        ("#[cfg(all(unix, all(test, feature = \"x\")))]", true),
+        ("#[cfg(any(test, feature = \"x\"))]", false),
+        ("#[cfg(not(test))]", false),
+        ("#[cfg(feature = \"test-utils\")]", false),
+        ("#[cfg(not(feature = \"test-utils\"))]", false),
+        ("#[cfg(attest)]", false),
+        ("#[cfg(all(unix, any(test, feature = \"x\")))]", false),
+        ("#[cfg(not(all(test, unix)))]", false),
+        ("#[test]", true),
+        ("#[tokio::test(flavor = \"multi_thread\")]", true),
+        ("#[rstest]", true),
+        ("#[cfg(test)]\n// why this exists", true),
+        ("#[inline]", false),
+    ];
+    for (attr, want) in cases {
+        let src =
+            format!("pub fn before() {{}}\n\n{attr}\npub fn target() {{\n    before();\n}}\n");
+        let pf = devctx_parse::parse(Lang::rust(), &src).unwrap();
+        let t = pf.symbols.iter().find(|s| s.qualified == "target").unwrap();
+        let marked = pf
+            .facts
+            .test_lines
+            .iter()
+            .any(|&(a, b)| a <= t.start_line && t.end_line <= b);
+        assert_eq!(marked, *want, "{attr}: {:?}", pf.facts.test_lines);
+    }
+    // An inner `#![cfg(test)]` makes the whole file test code.
+    let pf = devctx_parse::parse(Lang::rust(), "#![cfg(test)]\n\npub fn helper() {}\n").unwrap();
+    assert_eq!(
+        pf.facts.test_lines,
+        [(1, pf.file_symbol.end_line)],
+        "{:?}",
+        pf.facts.test_lines
+    );
+}

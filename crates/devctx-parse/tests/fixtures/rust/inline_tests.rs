@@ -12,3 +12,8 @@ mod tests {
 pub fn shipped() {
     mark();
 }
+
+#[cfg(any(test, feature = "mock"))]
+pub fn fake_client() {
+    mark();
+}

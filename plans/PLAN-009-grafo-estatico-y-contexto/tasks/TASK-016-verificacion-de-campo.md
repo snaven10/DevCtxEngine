@@ -41,7 +41,11 @@ verificó y qué no, antes del cross-check y del tag.
       híbrido y el brief con `search.centrality_weight` 0, 0.15, 0.3 y 0.5 sobre los 30 casos,
       **con el corte por idioma** (TASK-001 midió híbrido < vectorial en español). Encenderla por
       default solo si mejora el brief sin bajar Hit@5/MRR híbrido > 2 % relativo **ni empeorar el
-      corte en español**; si no, sigue en 0 (opt-in).
+      corte en español**; si no, sigue en 0 (opt-in). Pendientes de la segunda revisión de
+      TASK-010: que los empates de percentil compartan el bonus promedio (hoy los desempata el
+      orden de la fusión); re-medir la latencia de la CTE de percentil de `chunk_ranks` con
+      `w` > 0 (la medida de TASK-010 fue con la lectura por probabilidad); cachear
+      `local_centrality` en la TUI (hoy se calcula al abrir el motor local, una vez).
 - [ ] **Paso 4 — casos de campo** uno por uno con la salida real de la tool.
 - [ ] **Paso 5 — contratos.** Respuestas de `search` (vector), `read_symbol`, `get_references`,
       `impact_analysis`, `build_context` de 0.9.0 vs candidato sobre los mismos casos: solo

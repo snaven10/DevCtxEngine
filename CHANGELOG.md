@@ -304,9 +304,12 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   where the branch has a current symbol graph, alike in the MCP, the CLI
   without a server and the TUI. Cost: about 0.1-0.2 s per pass on a 1 250-file
   Java repository (22 876 symbols); hybrid search p50 within a few ms.
-- **Rust test code inside a source file is test code** (extractor version 18):
-  symbols under `#[cfg(test)]`, in a `mod tests` or marked `#[test]` are test
-  symbols and their calls `from_test`, as a test file's are — in
+- **Rust test code inside a source file is test code** (extractor version 19):
+  symbols under a `cfg` that requires `test` (`#[cfg(test)]`, `all(test, …)`;
+  never `any(test, …)`, `not(…)` or a feature named like a test), in a
+  `mod tests`, under an inner `#![cfg(test)]` or marked `#[test]`,
+  `#[tokio::test(…)]` or `#[rstest]` are test symbols and their calls
+  `from_test`, as a test file's are — in
   `get_references`, `impact_analysis` and the rank. Existing indexes report
   `extractor_stale` until `devctx index --full` (vectors are reused).
 - **Link rules version 21:** an existing index is relinked — and ranked — by

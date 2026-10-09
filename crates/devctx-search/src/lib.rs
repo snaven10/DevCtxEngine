@@ -938,9 +938,11 @@ fn finalize(
 /// fused, ordered by the rank of the innermost symbol of each
 /// ([`Store::chunk_ranks`], DD-4), and `w / (RRF_K + position + 1)` added to
 /// the fused score of each hit **with a rank**, then re-sorted. A hit with no
-/// rank (a doc, a config file, a whole-file chunk, a memory) gets nothing:
-/// it is neither promoted nor pushed down by being last (review of
-/// TASK-010, MAJOR 3). Only the candidates the retrievers brought: nothing is
+/// rank (a doc, a config file, a whole-file chunk, a memory) gets nothing
+/// (review of TASK-010, MAJOR 3) — which, next to ranked hits that all get
+/// something, still lowers it relative to them: with centrality on, docs,
+/// config and memories lose ground to code. It is opt-in for that reason
+/// too (DD-13). Only the candidates the retrievers brought: nothing is
 /// added. The fused score of vector + keyword stays the retriever score
 /// (`raw_score`), so a group's member selection never sees centrality.
 ///
@@ -2319,7 +2321,7 @@ mod tests {
                     (1, 9),
                     "a",
                     "database",
-                    [0.0, 0.9, 0.1, 0.0],
+                    [0.0, 0.7, 0.3, 0.0],
                 ),
             ])
             .unwrap();
@@ -2328,24 +2330,32 @@ mod tests {
             &[
                 ("README.md", 1, 9, 0.9),
                 ("src/a.rs", 1, 9, 0.1),
-                ("src/b.rs", 1, 9, 0.2),
+                ("src/b.rs", 1, 9, 0.95),
             ],
         );
-        let hits = search_ranked(
-            &store,
-            "database",
-            &SearchFilter::default(),
-            5,
-            SearchMode::Hybrid,
-            Some(&KwEmbedder),
-            None,
-            &RankOptions {
-                centrality: 1.0,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let got = ids(&hits);
+        let run = |w: f32| {
+            ids(&search_ranked(
+                &store,
+                "database",
+                &SearchFilter::default(),
+                5,
+                SearchMode::Hybrid,
+                Some(&KwEmbedder),
+                None,
+                &RankOptions {
+                    centrality: w,
+                    ..Default::default()
+                },
+            )
+            .unwrap())
+        };
+        // Centrality does reorder here (second review): `b`, the top rank,
+        // passes `a`, which the retrievers put ahead of it.
+        let pos = |v: &[String], id: &str| v.iter().position(|x| x == id).unwrap();
+        let plain = run(0.0);
+        assert!(pos(&plain, "a") < pos(&plain, "b"), "{plain:?}");
+        let got = run(1.0);
+        assert!(pos(&got, "b") < pos(&got, "a"), "{got:?}");
         assert_ne!(got.first().map(String::as_str), Some("doc"), "{got:?}");
         assert!(got.contains(&"doc".to_string()), "{got:?}");
         assert_eq!(

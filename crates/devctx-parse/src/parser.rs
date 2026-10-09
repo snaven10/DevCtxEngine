@@ -1690,11 +1690,15 @@ fn simple_type_name(t: &str) -> String {
 }
 
 /// The attributes written right before `node` (contiguous `attribute_item`
-/// siblings), as text.
+/// siblings, comments between them skipped), as text.
 fn rust_attributes<'a>(node: Node, src: &'a [u8]) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut prev = node.prev_named_sibling();
     while let Some(p) = prev {
+        if matches!(p.kind(), "line_comment" | "block_comment") {
+            prev = p.prev_named_sibling();
+            continue;
+        }
         if p.kind() != "attribute_item" {
             break;
         }
@@ -1704,26 +1708,141 @@ fn rust_attributes<'a>(node: Node, src: &'a [u8]) -> Vec<&'a str> {
     out
 }
 
+/// A test attribute on a function: `#[test]`, a path ending in `::test`
+/// (`#[tokio::test]`, also with arguments: `#[tokio::test(flavor = …)]`),
+/// `#[rstest]`, `#[test_case(…)]`.
+fn is_test_attr(a: &str) -> bool {
+    let body = a
+        .trim()
+        .trim_start_matches("#[")
+        .trim_end_matches(']')
+        .trim();
+    let path: String = body
+        .split('(')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    path == "test" || path.ends_with("::test") || path == "rstest" || path == "test_case"
+}
+
+/// Whether a `#[cfg(…)]` (or `#![cfg(…)]`) attribute makes the item exist
+/// **only** under `cfg(test)` (second review of TASK-010): its predicate is
+/// `test`, or an `all(…)` with a part that requires it. Under `any(…)` or
+/// `not(…)`, `test` is not required (`any(test, feature = "mock")` is
+/// production code with the feature), and a feature named like a test
+/// (`feature = "test-utils"`) or another word (`attest`) is not `test`.
+/// Anything it cannot read is not a test: the safe side.
+fn cfg_requires_test(attr: &str) -> bool {
+    let a = attr.trim();
+    let Some(rest) = a
+        .strip_prefix("#![")
+        .or_else(|| a.strip_prefix("#["))
+        .and_then(|r| r.trim_end().strip_suffix(']'))
+    else {
+        return false;
+    };
+    let rest = rest.trim();
+    let Some(pred) = rest
+        .strip_prefix("cfg")
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix('('))
+        .and_then(|r| r.trim_end().strip_suffix(')'))
+    else {
+        return false;
+    };
+    let tokens = cfg_tokens(pred);
+    let mut pos = 0;
+    let required = cfg_pred(&tokens, &mut pos);
+    required == Some(true) && pos == tokens.len()
+}
+
+/// The tokens of a `cfg` predicate: identifiers, string literals (kept as
+/// `"…"`), and `(`, `)`, `,`, `=`.
+fn cfg_tokens(p: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = p.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {}
+            '(' | ')' | ',' | '=' => out.push(c.to_string()),
+            '"' => {
+                let mut lit = String::from('"');
+                for d in chars.by_ref() {
+                    lit.push(d);
+                    if d == '"' {
+                        break;
+                    }
+                }
+                out.push(lit);
+            }
+            _ => {
+                let mut id = String::from(c);
+                while let Some(&d) = chars.peek() {
+                    if d.is_alphanumeric() || d == '_' || d == ':' {
+                        id.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// One predicate at `pos`: whether it requires `test` (`None` when it cannot
+/// be read).
+fn cfg_pred(t: &[String], pos: &mut usize) -> Option<bool> {
+    let name = t.get(*pos)?.clone();
+    *pos += 1;
+    match t.get(*pos).map(String::as_str) {
+        Some("=") => {
+            *pos += 1;
+            t.get(*pos)?;
+            *pos += 1;
+            Some(false)
+        }
+        Some("(") => {
+            *pos += 1;
+            let mut parts = Vec::new();
+            while t.get(*pos).map(String::as_str) != Some(")") {
+                parts.push(cfg_pred(t, pos)?);
+                if t.get(*pos).map(String::as_str) == Some(",") {
+                    *pos += 1;
+                }
+            }
+            *pos += 1;
+            Some(name == "all" && parts.iter().any(|&p| p))
+        }
+        _ => Some(name == "test"),
+    }
+}
+
 /// Rust test code inside a source file (review of TASK-010, MAJOR 4): the
 /// line ranges of every item under `#[cfg(test)]`, every `mod tests` and
 /// every function marked `#[test]` (also `#[tokio::test]` and the like).
 fn rust_test_lines(root: Node, src: &[u8]) -> Vec<(u32, u32)> {
-    fn is_cfg_test(a: &str) -> bool {
-        let a: String = a.chars().filter(|c| !c.is_whitespace()).collect();
-        a.starts_with("#[cfg(") && a.contains("test") && !a.contains("not(test)")
-    }
-    fn is_test_attr(a: &str) -> bool {
-        let a: String = a.chars().filter(|c| !c.is_whitespace()).collect();
-        a == "#[test]" || a.ends_with("::test]") || a.starts_with("#[test_case")
-    }
     let mut out = Vec::new();
+    // `#![cfg(test)]` at the top: the whole file.
+    let mut c = root.walk();
+    if root
+        .named_children(&mut c)
+        .filter(|n| n.kind() == "inner_attribute_item")
+        .any(|n| cfg_requires_test(n.utf8_text(src).unwrap_or("")))
+    {
+        return vec![(1, root.end_position().row as u32 + 1)];
+    }
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         let attrs = rust_attributes(n, src);
         let name = n
             .child_by_field_name("name")
             .and_then(|x| x.utf8_text(src).ok());
-        let test = attrs.iter().any(|a| is_cfg_test(a))
+        let test = attrs.iter().any(|a| cfg_requires_test(a))
             || (n.kind() == "mod_item" && name == Some("tests"))
             || (n.kind() == "function_item" && attrs.iter().any(|a| is_test_attr(a)));
         if test && n.kind() != "attribute_item" {

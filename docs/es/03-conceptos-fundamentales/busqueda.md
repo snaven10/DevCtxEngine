@@ -152,7 +152,9 @@ la rama—, cada uno sumando `w / (k + posición)` a su puntaje fusionado.
   ese rango, o que no es un número, se acota (`0` o `1`) y se avisa.
 - Solo reordena: nunca agrega un chunk que ningún recuperador trajo. Un chunk de
   ningún símbolo (el resumen de un archivo, un doc, un archivo de config, una
-  memoria) no recibe bonus.
+  memoria) no recibe bonus, así que frente al código que sí lo recibe pierde
+  terreno: con la centralidad encendida, docs, config y memorias quedan
+  relativamente más abajo.
 - El bonus es como mucho `w / 61`, pero los puntajes fusionados están a unas
   milésimas, así que mueve hits varios puestos, no solo casi-empates: en un caso
   medido, con `w = 0.3`, el archivo esperado pasó del puesto 7 al 1.

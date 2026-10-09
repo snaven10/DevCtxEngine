@@ -712,7 +712,15 @@ revisión):
 - `from_test` = `path_kind(file) == PathKind::Test` (`devctx-core/src/kind.rs:98`), el mismo
   criterio que ya usa la penalización de PLAN-008. `symbols.is_test` igual. **Revisión de
   TASK-010:** además, en Rust, el código bajo `#[cfg(test)]`, en un `mod tests` o marcado
-  `#[test]` dentro de un archivo que no es de test (`FileFacts.test_lines`).
+  `#[test]` dentro de un archivo que no es de test (`FileFacts.test_lines`). **Segunda revisión:**
+  un `cfg` marca test solo si `test` es **obligatorio** (solo, o dentro de un `all(…)`): bajo
+  `any(…)` o `not(…)`, como nombre de feature (`feature = "test-utils"`) o dentro de otra palabra
+  (`attest`), nunca (`any(test, feature = "mock")` es producción con la feature). Se reconocen
+  también `#[tokio::test(…)]`, `#[rstest]`, un comentario entre el atributo y el ítem y un
+  `#![cfg(test)]` interno (todo el archivo). Falsos negativos que quedan, del lado seguro (código
+  de test tomado por producción): `#[cfg(test)] mod tests;` cuyo cuerpo vive en otro archivo
+  (`tests.rs` fuera de un directorio de test), macros que generan tests, y atributos de test de
+  otros crates no listados. `EXTRACTOR_VERSION` 19.
 - Las listas de plataforma (JDK, builtins de Python, `std`/`core` de Rust, `fmt`/stdlib de Go,
   globals de JS/DOM) viven en el JSON del lenguaje (`platform_prefixes`, `builtins`) para que las
   cubra el fingerprint. TASK-007 agrega `platform_modules` (módulos de primer nivel de la plataforma:
@@ -935,7 +943,9 @@ retrievers (vector, keyword) ─▶ RRF ─[+ lista de centralidad, peso w]─�
   español no se puede concluir; encender la centralidad exige no empeorar el corte en español.
 - **Revisión de TASK-010:** (MAJOR 3) un hit sin rank no recibe bonus (antes quedaba al final de
   la lista con `w / (K + pos + 1)`, lo que degradaba de forma sistemática docs, config, chunks de
-  archivo y memorias, ~13 puestos en un pool de 80). (MINOR 9) la lista se arma después de los
+  archivo y memorias, ~13 puestos en un pool de 80). Aun con bonus 0 quedan **relativamente**
+  degradados: todo hit con rank recibe algo positivo y ellos nada. Es otra razón para que sea
+  opt-in; TASK-016 lo mide (paso 3b). (MINOR 9) la lista se arma después de los
   filtros duros. (MINOR 2) si la centralidad no se aplicó, el hit anclado tiene el score de
   siempre (sin `raw_score` propio), también con reranker. (MINOR 1) el CLI local y la TUI aplican
   la misma regla que el MCP (`local_centrality`: grafo de símbolos vigente). (MINOR 4)
