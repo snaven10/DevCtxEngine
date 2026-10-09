@@ -163,7 +163,7 @@ and delete the file).
 | `read_file` | The file, optionally a 1-based inclusive line range |
 | `read_symbol` | A symbol's definition, code, file, line range and kind — when you know the name. A miss answers with `suggestions` and, for library calls, `external: true` |
 | `get_references` | Every call site of a symbol, one per occurrence, with `confidence` and `via`; `min_confidence: "low"` adds the ambiguous ones, `kinds` other relations (see [Symbol graph](symbol-graph.md#get_referencessymbol--who-calls-this)) |
-| `impact_analysis` | Transitive callers (blast radius) and callees |
+| `impact_analysis` | Transitive callers (blast radius) and callees, by depth, each with `confidence` and `via`; by default high/medium calls only, no tests, no library callees, 200 per direction — what that leaves out is counted. `min_confidence`, `include_tests`, `include_external`, `max_nodes` (see [Symbol graph](symbol-graph.md#impact_analysissymbol--blast-radius)) |
 | `summarize` | Text down to roughly `max_tokens`, extractive by default so identifiers survive |
 
 The distinction between `search` and `read_symbol` is worth internalising:

@@ -777,6 +777,34 @@ después del resto. Se agregan `kind`, `qualified`, `via`, `below_confidence`.
 - Salida por nodo: `symbol`, `sym`, `file`, `line`, `depth`, `confidence`, `via` (kind de arista);
   `test`/`external` solo cuando son `true`.
 
+**Implementado en TASK-009, con estas diferencias:** `crates/devctx-store/src/impact.rs`
+(`Store::impact_graph`, `walk`) y `crates/devctx-mcp/src/state/impact.rs` (`impact_on`, mismo
+`Reader` de TASK-008). `Store::impact_analysis` (0.9.0 sobre `graph_edges`) queda como camino
+viejo, sin filtros ni tope, para que una rama vieja conteste igual que 0.9.0 más el `warning`.
+- Aristas seguidas: `calls` e `instantiates` (el default de `get_references`), siempre por
+  `live_edges`. La frontera va como lista literal de ids en `IN (…)` (una sentencia por nivel):
+  se midió contra tabla temporal y contra un parámetro `UBIGINT[]` (ver Resultado de TASK-009).
+- Un nodo que un filtro deja afuera (confianza, test, externo) no se recorre; se cuenta una vez
+  por nodo (`below_confidence`, `excluded: {tests, external}`), y si un nivel posterior lo
+  alcanza con una arista mejor, se muestra y deja de contarse. `confidence` y `via` son los de la
+  mejor arista que lo alcanzó en su nivel. Un nodo sin definición (externo o sin decidir) no lleva
+  `sym`/`file`/`line` y nunca se recorre; `file`/`line` son los de la definición.
+- Tope: si un nivel no entra en lo que queda de `max_nodes`, se muestran los primeros (en el
+  orden de DD-11), el resto se cuenta en `omitted` (`reason: "limit"`) y en `omitted_by_limit:
+  {count, max_nodes, upstream|downstream: {count, depth}, hint}`, y no se lee ningún nivel más.
+  Si un nivel llena el tope justo, el siguiente se lee (una consulta) solo para contarlo.
+  `max_nodes = 0` = sin tope. `omitted.count` suma tope y presupuesto; `omitted_for_budget`
+  sigue nombrando lo que cortó el presupuesto (mitad por dirección, como 0.9.0).
+- Un nombre **sin definición** en el repo (que 0.9.0 recorría por nombre) toma como semilla sus
+  sitios externos con la regla de `lookup_external` (como `get_references`): su upstream son los
+  llamadores de esos sitios, no tiene downstream, y la respuesta agrega `external: true` +
+  `called_from` + `next_step`, o `suggestions` si tampoco es externo (como `read_symbol`). Un
+  nombre con definiciones usa solo esas (no suma los sitios externos homónimos), igual que
+  `get_references`.
+- La semilla que es el nombre pedido tal cual (`qualified` igual) no se reporta aunque se
+  alcance por un ciclo; cualquier otra semilla sí (el par `Resource.m → Service.m`), como 0.9.0.
+- La TUI local usa el mismo criterio de camino (vigente y con filas → grafo nuevo con defaults).
+
 ## DD-12 — PageRank: global al indexar, personalizado al consultar
 
 - **Grafo**: nodos = símbolos de la rama (sin externos, que no tienen fila); aristas = `edges` con

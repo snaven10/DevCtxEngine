@@ -242,6 +242,22 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   included, whose identifier anchoring then goes by name); a failed read of
   the symbol table has its own warning, not a reindex hint. Anchoring reads
   the code of every definition of an identifier in one query.
+- **`impact_analysis` walks the symbol graph by levels** (PLAN-009 TASK-009):
+  one query per depth and direction over ids (through `live_edges`: a discarded
+  call reaches no answer), whatever the size of the frontier — measured on this
+  repository, a bare `new` went from 1.4 s to 57 ms p50. **New defaults** (the
+  answer an agent sees changes): only `high`/`medium` calls are followed, symbols
+  of test files and library callees are left out, and 200 symbols per direction
+  are listed; what that leaves out is counted (`below_confidence`, `excluded`,
+  `omitted` + `omitted_by_limit`) and not walked, and `min_confidence`,
+  `include_tests`, `include_external` and `max_nodes` (tool, `GET /impact`
+  query, `devctx impact` flags) change it. Each symbol adds `confidence`, `via`,
+  `sym`, `file`, `line` and `test`/`external`/`undecided` when true, ordered
+  within a depth by confidence, rank and name. A name with no definition answers
+  `external` + `called_from` (its upstream is the callers of its call sites) or
+  `suggestions`, as `read_symbol` does. The 0.9 fields keep their meaning; an
+  index from an older extractor, or without symbol rows, walks as 0.9 did and says
+  so in `warning`. The TUI's local view follows the same rule.
 - **Link rules version 19:** in a Rust `impl Trait for T` with `T` from
   outside the repository, `self.m()` resolves to the `impl`'s own method
   (an override), else to the repository trait's method (a default one

@@ -130,6 +130,35 @@ could break. Callees are what this symbol depends on to work.
 Run it before refactoring anything public. This is the operation people forget
 exists and then regret not running.
 
+Each side is a list of `{symbol, depth}` (depth 1 = direct), deepest last. On an
+index made by 0.10 or later the walk follows the symbol graph **by id** — one
+query per level, whatever the size of the frontier — and each symbol also
+carries `confidence` (of the call that reached it), `via` (`calls` or
+`instantiates`), `sym`, `file` and `line` (of its definition), and `test`,
+`external` or `undecided` when true. Within a depth, symbols are ordered by
+confidence, then by rank (once the index computes it), then by name.
+
+What the defaults leave out is **counted, never dropped in silence**, and not
+walked:
+
+| Parameter (CLI flag) | Default | Left out by default, counted in |
+|---|---|---|
+| `min_confidence` (`--min-confidence`) | `medium` | calls of `low` confidence and calls the index could not decide → `below_confidence: {count, min_confidence, hint}`; `low` lists them, the undecided ones marked |
+| `include_tests` (`--include-tests`) | `false` | symbols of test files → `excluded.tests` |
+| `include_external` (`--include-external`) | `false` | library callees → `excluded.external` |
+| `max_nodes` (`--max-nodes`) | `200` per direction (`0` = no cap) | the symbols of the depth that overflows it → `omitted: {count, reason: "limit"}` and `omitted_by_limit: {count, max_nodes, upstream/downstream: {count, depth}}`; no deeper level is read |
+
+Over HTTP: `GET /impact/<symbol>?depth=3&min_confidence=low&include_tests=true&max_nodes=500`.
+The fields of 0.9 keep their meaning: `resolved_symbols` (a bare name that stood
+for several declarations), `branch_fallback`, `warning`, and `omitted` /
+`omitted_for_budget` (half the output budget per direction; `omitted.count`
+adds what the budget and `max_nodes` cut). A name with no definition in the
+repository answers as `read_symbol` does: `external: true` with `called_from`
+(its upstream is then the callers of its call sites) or `suggestions`. On an
+index made before 0.10 the walk is 0.9's — by name, no confidence, no filters, no
+cap — with the `warning` that says so; a server older than 0.10 ignores the
+parameters, and the client then says so in `warning`.
+
 ### `read_symbol(name)` — the definition
 
 Code, file, line range and kind. Use this when you know the name and want the

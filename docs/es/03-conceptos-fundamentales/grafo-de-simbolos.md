@@ -135,6 +135,36 @@ funcionar.
 Corrélo antes de refactorizar cualquier cosa pública. Esta es la operación que
 la gente olvida que existe y después lamenta no haber corrido.
 
+Cada lado es una lista de `{symbol, depth}` (profundidad 1 = directo), lo más
+profundo al final. En un índice hecho por 0.10 o posterior el recorrido sigue el
+grafo de símbolos **por id** — una consulta por nivel, sin importar el tamaño de
+la frontera — y cada símbolo trae además `confidence` (de la llamada que lo
+alcanzó), `via` (`calls` o `instantiates`), `sym`, `file` y `line` (de su
+definición), y `test`, `external` o `undecided` cuando son verdaderos. Dentro de
+una profundidad, el orden es por confianza, después por rank (cuando el índice lo
+calcule) y después por nombre.
+
+Lo que los defaults dejan afuera **se cuenta, nunca desaparece en silencio**, y no
+se recorre:
+
+| Parámetro (flag del CLI) | Default | Afuera por defecto, contado en |
+|---|---|---|
+| `min_confidence` (`--min-confidence`) | `medium` | llamadas de confianza `low` y las que el índice no pudo decidir → `below_confidence: {count, min_confidence, hint}`; con `low` se listan, las no decididas marcadas |
+| `include_tests` (`--include-tests`) | `false` | símbolos de archivos de test → `excluded.tests` |
+| `include_external` (`--include-external`) | `false` | llamados de librerías → `excluded.external` |
+| `max_nodes` (`--max-nodes`) | `200` por dirección (`0` = sin tope) | los símbolos de la profundidad que lo desborda → `omitted: {count, reason: "limit"}` y `omitted_by_limit: {count, max_nodes, upstream/downstream: {count, depth}}`; no se lee ningún nivel más profundo |
+
+Por HTTP: `GET /impact/<símbolo>?depth=3&min_confidence=low&include_tests=true&max_nodes=500`.
+Los campos de 0.9 conservan su significado: `resolved_symbols` (un nombre pelado
+que representaba varias declaraciones), `branch_fallback`, `warning`, y `omitted`
+/ `omitted_for_budget` (la mitad del presupuesto de salida por dirección;
+`omitted.count` suma lo que cortaron el presupuesto y `max_nodes`). Un nombre sin
+definición en el repositorio responde como `read_symbol`: `external: true` con
+`called_from` (su upstream son entonces los llamadores de sus sitios de llamada) o
+`suggestions`. En un índice anterior a 0.10 el recorrido es el de 0.9 — por
+nombre, sin confianza, sin filtros, sin tope — con el `warning` que lo dice; un
+servidor anterior a 0.10 ignora los parámetros, y el cliente lo dice en `warning`.
+
 ### `read_symbol(nombre)` — la definición
 
 Código, archivo, rango de líneas y tipo. Usalo cuando sabés el nombre y querés
