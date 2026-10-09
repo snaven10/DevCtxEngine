@@ -1218,12 +1218,17 @@ async fn impact(
 
 /// `POST /traverse` (PLAN-009 TASK-013): the `traverse` tool, its parameters
 /// as the JSON body (`symbol` or `sym`, `kinds`, `direction`, `depth`, the
-/// filters, `limit`, `offset`). A bad parameter or an old index is refused
-/// as every tool error (a 500 with `error`).
+/// filters, `limit`, `offset`). A bad parameter is a 400; an old index is
+/// refused as every tool error (a 500 with `error`).
 async fn traverse(
     State(api): State<Api>,
     Json(q): Json<devctx_mcp::state::TraverseQuery>,
 ) -> Response {
+    // A bad parameter is the caller's: 400, before anything is opened
+    // (review of TASK-013, NIT).
+    if let Err(e) = q.options() {
+        return json_err(StatusCode::BAD_REQUEST, e);
+    }
     run(api.state, move |s| devctx_mcp::state::do_traverse(s, &q)).await
 }
 
@@ -1610,7 +1615,8 @@ mod tests {
     }
 
     /// PLAN-009 TASK-013: `POST /traverse` exists and takes the tool's
-    /// parameters as its body; a depth over 4 is refused with its message.
+    /// parameters as its body; a depth over 4 is refused with its message,
+    /// as a 400 (review NIT).
     #[tokio::test]
     async fn traverse_takes_its_parameters_from_the_body() {
         let dir =
@@ -1627,7 +1633,7 @@ mod tests {
             .body(Body::from(r#"{"symbol":"f","kinds":"calls","depth":9}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();

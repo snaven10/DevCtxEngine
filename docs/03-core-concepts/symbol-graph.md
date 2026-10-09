@@ -228,7 +228,8 @@ line — of one symbol.
 | A class's supertypes, two levels up | `{symbol: "ServiceImpl", kinds: "inherits,implements", depth: 2}` |
 
 `symbol` takes a bare, qualified or `file::name` symbol, or a file path (the
-file itself: imports leave from it). A bare name with several definitions is
+file itself: imports leave from it); when a symbol has that name, the symbol
+wins over the path. A bare name with several definitions is
 walked from all of them and listed in `candidates` (`{sym, symbol, kind, file,
 line}`, under a quarter of the output budget, the rest named in
 `omitted_for_budget.candidates`; up to 10 000 definitions, as `impact_analysis`,

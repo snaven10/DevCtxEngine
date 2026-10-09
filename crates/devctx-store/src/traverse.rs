@@ -904,6 +904,30 @@ mod tests {
         assert_eq!(t.nodes.len(), 600);
         assert_eq!(LEVEL_STATEMENTS.with(|c| c.get()), t.levels);
         assert!(t.levels <= 3);
+        // `out` from one end, and `both` (two statements per level).
+        LEVEL_STATEMENTS.with(|c| c.set(0));
+        let t = store
+            .traverse(
+                "repo",
+                "main",
+                &[g["B0.b"].clone()],
+                &opts(&["calls"], TraverseDirection::Out, 3),
+            )
+            .unwrap();
+        assert_eq!(names(&t), ["A0.a", "Core.run"]);
+        assert_eq!(LEVEL_STATEMENTS.with(|c| c.get()), t.levels);
+        LEVEL_STATEMENTS.with(|c| c.set(0));
+        let t = store
+            .traverse(
+                "repo",
+                "main",
+                &[g["Core.run"].clone()],
+                &opts(&["calls"], TraverseDirection::Both, 2),
+            )
+            .unwrap();
+        assert_eq!(t.nodes.len(), 600);
+        assert_eq!(LEVEL_STATEMENTS.with(|c| c.get()), t.levels);
+        assert_eq!(t.levels, 4, "two directions, two levels");
     }
 
     /// The page: once the walk holds more nodes than the page needs, no
@@ -1142,5 +1166,20 @@ mod tests {
             .traverse_roots("repo", "main", "App", None, 10)
             .unwrap();
         assert_eq!(r[0].kind, "class");
+        // A symbol of that name wins over the path (review of TASK-013).
+        let store = Store::open_in_memory(3).unwrap();
+        graph(
+            &store,
+            &[
+                ("src/App.java", "file", None),
+                ("App", "class", None),
+                ("App.java", "field", Some("App")),
+            ],
+            &[],
+        );
+        let r = store
+            .traverse_roots("repo", "main", "App.java", None, 10)
+            .unwrap();
+        assert_eq!((r.len(), r[0].kind.as_str()), (1, "field"));
     }
 }

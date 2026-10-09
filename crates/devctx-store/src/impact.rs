@@ -219,7 +219,7 @@ pub struct SymbolImpact {
 }
 
 /// One edge of a level, as a level query reads it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct LevelRow {
     /// The frontier id the edge leaves from (upstream: its destination).
     pub from: u64,
@@ -343,9 +343,21 @@ pub(crate) fn better(r: &LevelRow, b: &LevelRow) -> bool {
         confidence_rank(b.confidence.as_deref()),
     );
     // A decided edge beats an undecided one of the same confidence, and a
-    // direct one an edge through dispatch.
+    // direct one an edge through dispatch; then the kind by name, and, so
+    // the answer does not hang on the order rows come in (review of
+    // TASK-013, NIT), the method gone through, the source and the line.
     let direct = |x: &LevelRow| x.kind != DISPATCH_VIA;
-    rc > bc || (rc == bc && (!r.unsure, direct(r), &b.kind) > (!b.unsure, direct(b), &r.kind))
+    if rc != bc {
+        return rc > bc;
+    }
+    let (rk, bk) = ((!r.unsure, direct(r)), (!b.unsure, direct(b)));
+    if rk != bk {
+        return rk > bk;
+    }
+    if r.kind != b.kind {
+        return r.kind < b.kind;
+    }
+    (r.through.as_deref(), r.from, r.edge_line) < (b.through.as_deref(), b.from, b.edge_line)
 }
 
 /// DD-11's order within a level: confidence, rank (NULL last), name; then
@@ -364,6 +376,8 @@ pub(crate) fn level_order(a: &LevelRow, b: &LevelRow) -> std::cmp::Ordering {
         .then_with(|| a.file.cmp(&b.file))
         .then_with(|| a.line.cmp(&b.line))
         .then_with(|| a.id.cmp(&b.id))
+        // Two names as written, one external and one not (review NIT).
+        .then_with(|| a.external.cmp(&b.external))
 }
 
 /// The level-by-level walk of one direction from `seeds`, reading each level
@@ -825,8 +839,9 @@ impl Store {
                 let mut set = frontier.to_vec();
                 set.extend(by_id.keys().filter(|id| !direct.contains(id)));
                 for r in self.edge_level(repo, branch, &set, dir, mode, kinds)? {
-                    // Only a call stands for a dispatch: another relation into
-                    // an equivalent (`traverse`) is that method's own.
+                    // Only a call or an instantiation (`DISPATCH_KINDS`)
+                    // stands for a dispatch: another relation into an
+                    // equivalent (`traverse`) is that method's own.
                     let stands = crate::traverse::dispatches(&r.kind);
                     for e in by_id.get(&r.from).into_iter().flatten().filter(|_| stands) {
                         out.rows.push(LevelRow {
@@ -2110,6 +2125,35 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(im.downstream.dispatch_beyond_depth, 0);
+    }
+
+    /// Review of TASK-013, NIT: the best edge to a node and the order of a
+    /// level do not depend on the order rows come in — two dispatch rows of
+    /// the same confidence through different methods, either way round; two
+    /// names as written, external and not.
+    #[test]
+    fn ties_are_broken_the_same_whatever_the_order() {
+        let row = |through: &str, from: u64| LevelRow {
+            from,
+            id: Some(1),
+            symbol: "Api.handle".into(),
+            kind: DISPATCH_VIA.into(),
+            confidence: Some("medium".into()),
+            through: Some(through.into()),
+            ..Default::default()
+        };
+        let (a, b) = (row("IA.run", 7), row("IB.run", 3));
+        assert!(better(&a, &b) && !better(&b, &a));
+        let (c, d) = (row("IA.run", 3), row("IA.run", 7));
+        assert!(better(&c, &d) && !better(&d, &c));
+        let name = |external: bool| LevelRow {
+            symbol: "flush".into(),
+            external,
+            ..Default::default()
+        };
+        use std::cmp::Ordering;
+        assert_eq!(level_order(&name(false), &name(true)), Ordering::Less);
+        assert_eq!(level_order(&name(true), &name(false)), Ordering::Greater);
     }
 
     /// TASK-017 (c): an interface with many implementations does not explode:

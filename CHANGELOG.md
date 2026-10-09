@@ -23,7 +23,12 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   once a page is full no deeper level is read (`partial`), so a type referenced
   from hundreds of files is paged, not dumped. An index made before 0.10 is an
   error that asks for `devctx index --full`; a server older than the tool
-  answers 404, which clients report as "restart it".
+  answers 404, which clients report as "restart it". **After a change of
+  extractor version, `traverse` errors until `devctx index --full`**, while
+  `impact_analysis` and `get_references` degrade to the 0.9 answer with a
+  `warning`. Calls to the name the index could not decide are counted
+  (`undecided_calls`) or, with `min_confidence: "low"`, listed at depth 1; with
+  `partial`, `total_is_lower_bound: true`.
 
 ### Changed
 

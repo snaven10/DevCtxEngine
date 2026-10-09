@@ -506,6 +506,14 @@ pub(super) fn traverse_on(
         out["omitted_by_limit"] = json!({ "dispatch": d, "hint": DISPATCH_CAPPED_HINT });
     }
     chosen.annotate(&mut out);
+    // Both given: `sym` wins, and the answer says so (review NIT).
+    if q.sym.as_deref().is_some_and(|s| !s.trim().is_empty()) && asked.is_some() {
+        const BOTH: &str = "symbol and sym were both given: sym was used, symbol ignored";
+        out["warning"] = json!(match out["warning"].as_str() {
+            Some(w) => format!("{w}; {BOTH}"),
+            None => BOTH.to_string(),
+        });
+    }
     if roots.is_empty() {
         let shown_name = asked.unwrap_or(bare);
         lookup::not_found_hints(store, repo, branch, file, bare, shown_name, &mut out);
@@ -695,9 +703,24 @@ mod tests {
                 assert_eq!(n["sym"].as_str().unwrap().len(), 16, "{v}");
             }
         }
-        // Depth 2 up the hierarchy from the implementation's method's class.
-        let v = run(&state, &q("ServiceImpl", "inherits,implements", "out", 2));
-        assert_eq!(v["filters"]["kinds"], json!(["inherits", "implements"]));
+        // Depth 2: a file contains its class, which contains its members.
+        let v = run(
+            &state,
+            &q(
+                "src/main/java/app/core/ServiceImpl.java",
+                "contains",
+                "out",
+                2,
+            ),
+        );
+        assert_eq!(
+            syms(&v),
+            ["ServiceImpl", "ServiceImpl.repo", "ServiceImpl.update"],
+            "{v}"
+        );
+        assert_eq!(node(&v, "ServiceImpl")["depth"], 1, "{v}");
+        assert_eq!(node(&v, "ServiceImpl.update")["depth"], 2, "{v}");
+        assert_eq!(v["filters"]["kinds"], json!(["contains"]));
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -723,11 +746,25 @@ mod tests {
             },
         );
         assert!(v.get("candidates").is_none(), "{v}");
+        assert!(v.get("warning").is_none(), "{v}");
         assert_eq!(v["root"]["sym"], sym, "{v}");
         assert_eq!(v["root"]["symbol"], "ServiceImpl.update", "{v}");
         let mut got = syms(&v);
         got.sort_unstable();
         assert_eq!(got, ["BaseService.audit", "Repo.save"], "{v}");
+        // Both a symbol and a sym: the sym, said in `warning`.
+        let v = run(
+            &state,
+            &TraverseQuery {
+                sym: Some(sym.clone()),
+                ..q("Repo.save", "calls", "out", 1)
+            },
+        );
+        assert_eq!(v["root"]["symbol"], "ServiceImpl.update", "{v}");
+        assert!(
+            v["warning"].as_str().unwrap().contains("sym was used"),
+            "{v}"
+        );
         // An unknown sym, a bad one, and a name that is nothing here.
         for bad in ["00000000000000ff", "zz"] {
             let e = do_traverse(

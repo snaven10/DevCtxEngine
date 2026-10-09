@@ -300,6 +300,27 @@ impl RemoteClient {
         self.post_timed(path, body, default_timeout())
     }
 
+    /// POST to a route a server older than the client may not have:
+    /// `Ok(None)` when it answered 404 or 405 — read from the status code,
+    /// not from the text of the error (review of TASK-013, MINOR 4).
+    fn post_route(&self, path: &str, body: Value) -> Result<Option<String>, String> {
+        let missing = std::cell::Cell::new(false);
+        let agent = self.agent(default_timeout());
+        let answer = self.request(|base, token| {
+            let r = Self::auth(agent.post(&format!("{base}{path}")), token)
+                .send_json(body.clone())
+                .map_err(Box::new);
+            if let Err(e) = &r {
+                missing.set(matches!(&**e, ureq::Error::Status(404 | 405, _)));
+            }
+            r
+        });
+        match answer {
+            Err(_) if missing.get() => Ok(None),
+            other => other.map(Some),
+        }
+    }
+
     fn post_timed(&self, path: &str, body: Value, timeout: Duration) -> Result<String, String> {
         let agent = self.agent(timeout);
         self.request(|base, token| {
@@ -627,7 +648,8 @@ impl Backend {
             Backend::Local(s) => do_traverse(s, q),
             Backend::Remote(r, _) => {
                 let body = serde_json::to_value(q).map_err(|e| e.to_string())?;
-                r.post("/traverse", body).map_err(traverse_unsupported)
+                r.post_route("/traverse", body)?
+                    .ok_or_else(|| TRAVERSE_OLD_SERVER.to_string())
             }
         }
     }
@@ -1036,8 +1058,19 @@ mod tests {
         let e = backend.traverse(&q).unwrap_err();
         assert!(e.contains("predates traverse"), "{e}");
         assert!(e.contains("devctx serve --stop"), "{e}");
-        // Any other failure is passed through.
-        assert_eq!(super::traverse_unsupported("boom".into()), "boom");
+        // Any other failure is passed through: a 500 with its message.
+        let failing = serve_fixed(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+             Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}",
+        );
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: failing.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        assert_eq!(backend.traverse(&q).unwrap_err(), "boom");
     }
 
     #[test]
@@ -1186,16 +1219,6 @@ mod tests {
 pub const TRAVERSE_OLD_SERVER: &str =
     "the running devctx serve predates traverse (it has no POST /traverse): restart it with \
      devctx serve --stop, and the next call starts the installed binary";
-
-/// [`TRAVERSE_OLD_SERVER`] for a 404 (or 405) of `POST /traverse`; any
-/// other error as it came.
-pub fn traverse_unsupported(err: String) -> String {
-    if err.contains("status 404") || err.contains("status 405") {
-        TRAVERSE_OLD_SERVER.to_string()
-    } else {
-        err
-    }
-}
 
 /// A server older than 0.10 (or one answering from an index without the
 /// symbol graph) ignores `min_confidence` and `kinds` without a word: its

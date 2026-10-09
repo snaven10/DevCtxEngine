@@ -1211,10 +1211,28 @@ impl Remote {
         Ok(impact_answer(self.get(&path)?, q))
     }
 
-    /// `POST /traverse`; a server older than the tool (404) is told as such.
+    /// `POST /traverse`; a server older than the tool answers 404 (405), read
+    /// from the status code, and is told as such (review of TASK-013, MINOR 4).
     pub fn traverse(&self, q: &devctx_mcp::state::TraverseQuery) -> Result<String> {
-        self.post("/traverse", serde_json::to_value(q)?)
-            .map_err(|e| anyhow::anyhow!(devctx_mcp::backend::traverse_unsupported(e.to_string())))
+        let body = serde_json::to_value(q)?;
+        let missing = std::cell::Cell::new(false);
+        self.send(|r| {
+            let res = r
+                .auth(r.agent().post(&format!("{}/traverse", r.base)))
+                .send_json(body.clone())
+                .map_err(Box::new);
+            if let Err(e) = &res {
+                missing.set(matches!(&**e, ureq::Error::Status(404 | 405, _)));
+            }
+            res
+        })
+        .map_err(|e| {
+            if missing.get() {
+                anyhow::anyhow!(devctx_mcp::backend::TRAVERSE_OLD_SERVER)
+            } else {
+                e
+            }
+        })
     }
 
     pub fn backfill_links(&self, dry_run: bool, from_text: bool) -> Result<String> {
@@ -1569,6 +1587,42 @@ mod tests {
         assert!(plain.status().is_err());
         assert!(started.elapsed() < Duration::from_secs(2), "not retried");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of TASK-013, MINOR 4: `devctx traverse` against a server older
+    /// than the tool (404 on the route) says to restart it; a 500 keeps the
+    /// server's own message.
+    #[test]
+    fn traverse_on_an_old_server_says_to_restart_it() {
+        let q = devctx_mcp::state::TraverseQuery {
+            symbol: Some("f".into()),
+            ..Default::default()
+        };
+        let old = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = old.traverse(&q).unwrap_err().to_string();
+        assert!(e.contains("predates traverse"), "{e}");
+        let failing = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                     Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = failing.traverse(&q).unwrap_err().to_string();
+        assert!(e.contains("boom") && !e.contains("predates"), "{e}");
     }
 
     #[test]

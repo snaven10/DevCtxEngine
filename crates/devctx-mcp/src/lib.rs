@@ -197,6 +197,7 @@ struct TraverseReq {
     /// Where to start: a bare name (every definition of it is a root, listed
     /// in `candidates`), a qualified one (`OrderService.place`), `file::name`,
     /// or a file path (the file itself: what it imports, what contains it).
+    /// A symbol of that name wins over a file of that path.
     #[serde(default)]
     symbol: Option<String>,
     /// Start from exactly this definition: the `sym` (hex) a node, a
@@ -1303,7 +1304,8 @@ impl DevctxServer {
         symbol. Examples: callers and their callers {symbol: \"OrderService.place\", kinds: \
         \"calls\", direction: \"in\", depth: 2}; where a type is built {symbol: \"Invoice\", \
         kinds: \"instantiates\", direction: \"in\"}; what a file imports {symbol: \
-        \"src/api/client.ts\", kinds: \"imports\"}, who imports a type (direction in); \
+        \"src/api/client.ts\", kinds: \"imports\"} (a symbol named like the path wins), who \
+        imports a type (direction in); \
         subclasses {symbol: \"BaseRepo\", kinds: \"inherits\", direction: \"in\"}; \
         implementations {symbol: \"PaymentGateway\", kinds: \"implements\", direction: \"in\"}; \
         members {symbol: \"OrderService\", kinds: \"contains\"}; uses of a type {symbol: \

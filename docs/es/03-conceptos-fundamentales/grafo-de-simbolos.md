@@ -233,7 +233,8 @@ transitivos, con tope por dirección); `get_references` para los sitios de llama
 | Los supertipos de una clase, dos niveles arriba | `{symbol: "ServiceImpl", kinds: "inherits,implements", depth: 2}` |
 
 `symbol` acepta un símbolo pelado, calificado o `archivo::nombre`, o la ruta de
-un archivo (el archivo mismo: de él salen los imports). Un nombre pelado con
+un archivo (el archivo mismo: de él salen los imports); si un símbolo tiene ese
+nombre, el símbolo gana sobre la ruta. Un nombre pelado con
 varias definiciones se recorre desde todas y se listan en `candidates`
 (`{sym, symbol, kind, file, line}`, en un cuarto del presupuesto de salida, el
 resto nombrado en `omitted_for_budget.candidates`; hasta 10 000 definiciones, como
