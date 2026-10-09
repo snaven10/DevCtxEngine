@@ -365,8 +365,7 @@ pub fn search_anchored(
             let keyword = store
                 .keyword_search(query, filter, pool)
                 .unwrap_or_default();
-            let fused = reciprocal_rank_fusion(&[vector, keyword], RRF_K);
-            with_centrality(store, fused, opts.centrality)
+            reciprocal_rank_fusion(&[vector, keyword], RRF_K)
         }
     };
 
@@ -383,6 +382,14 @@ pub fn search_anchored(
     if opts.filters() {
         candidates.retain(|h| opts.keeps(hit_kind(h)));
     }
+    // Centrality (PLAN-009 DD-13), hybrid only, over the candidates the hard
+    // filters kept: a hit they drop takes no place in the centrality list
+    // (review of TASK-010, MINOR 9).
+    let (candidates, centrality) = if mode == SearchMode::Hybrid {
+        with_centrality(store, candidates, opts.centrality)
+    } else {
+        (candidates, false)
+    };
     let mut candidates = dedup_hits(apply_penalty(candidates, &opts.penalty, limit));
     let ranked = match reranker {
         Some(r) => {
@@ -416,7 +423,7 @@ pub fn search_anchored(
         });
     }
     Ok(anchor_identifiers(
-        store, query, filter, limit, ranked, opts, lookup,
+        store, query, filter, limit, ranked, opts, lookup, centrality,
     ))
 }
 
@@ -725,6 +732,7 @@ pub fn anchor_tokens(query: &str) -> Vec<String> {
 /// Bounded twice: only the first [`ANCHOR_TOKENS`] identifiers are looked up,
 /// and pinned definitions take at most half of `limit` (at least one), so the
 /// retrievers' own ranking always keeps the rest of the answer.
+#[allow(clippy::too_many_arguments)]
 fn anchor_identifiers(
     store: &Store,
     query: &str,
@@ -733,6 +741,7 @@ fn anchor_identifiers(
     ranked: Vec<SearchResult>,
     opts: &RankOptions,
     lookup: AnchorLookup,
+    centrality: bool,
 ) -> Anchored {
     let tokens = anchor_tokens(query);
     let mut definitions: HashMap<String, Option<u64>> = HashMap::new();
@@ -791,10 +800,11 @@ fn anchor_identifiers(
         .fold(f32::MIN, f32::max)
         .max(0.0);
     // A pinned hit shows the best score of the answer (so scores stay
-    // monotone) and keeps as its retriever score the best retriever score
-    // there: never a score a later stage rewrote — centrality (PLAN-009
-    // TASK-010), the penalty's clamp, a cross-encoder's logit — which a
-    // group's member selection must not compare.
+    // monotone). When centrality reordered the answer (PLAN-009 TASK-010),
+    // that score holds centrality, so the pinned hit keeps as its retriever
+    // score the best retriever score there, which a group's member
+    // selection compares. Without centrality it is what it always was
+    // (review MINOR 2): the answer's best score, nothing more.
     let top_raw = ranked
         .iter()
         .map(SearchResult::retriever_score)
@@ -803,6 +813,9 @@ fn anchor_identifiers(
     let mut out: Vec<SearchResult> = pinned
         .into_iter()
         .map(|point| {
+            if !centrality {
+                return SearchResult::new(point, top);
+            }
             let mut h = SearchResult::new(point, top_raw);
             h.rewrite_score(top);
             h
@@ -922,19 +935,22 @@ fn finalize(
 }
 
 /// The centrality list of hybrid search (PLAN-009 DD-13): `hits`, already
-/// fused, ordered by the global rank of the innermost symbol of each
-/// ([`Store::chunk_ranks`], DD-4) — a hit with no rank after those with one,
-/// in the order it had — and `w / (RRF_K + position + 1)` added to each
-/// fused score, then re-sorted. Only the candidates the retrievers brought:
-/// nothing is added. The fused score of vector + keyword stays the retriever
-/// score (`raw_score`), so a group's member selection never sees centrality.
+/// fused, ordered by the rank of the innermost symbol of each
+/// ([`Store::chunk_ranks`], DD-4), and `w / (RRF_K + position + 1)` added to
+/// the fused score of each hit **with a rank**, then re-sorted. A hit with no
+/// rank (a doc, a config file, a whole-file chunk, a memory) gets nothing:
+/// it is neither promoted nor pushed down by being last (review of
+/// TASK-010, MAJOR 3). Only the candidates the retrievers brought: nothing is
+/// added. The fused score of vector + keyword stays the retriever score
+/// (`raw_score`), so a group's member selection never sees centrality.
 ///
-/// A no-op — the very same list — with `w` 0 (or less), or when no hit has
-/// a rank: an index from before TASK-010, a branch whose link pass has not
-/// ranked it, chunks of no symbol, or a store that cannot answer.
-fn with_centrality(store: &Store, hits: Vec<SearchResult>, w: f32) -> Vec<SearchResult> {
-    if w <= 0.0 || hits.is_empty() {
-        return hits;
+/// A no-op — the very same list, and `false` — with `w` 0 (or less, or not a
+/// number), or when no hit has a rank: an index from before TASK-010, a
+/// branch whose link pass has not ranked it, chunks of no symbol, or a store
+/// that cannot answer. `true` when it applied.
+fn with_centrality(store: &Store, hits: Vec<SearchResult>, w: f32) -> (Vec<SearchResult>, bool) {
+    if !(w > 0.0 && w.is_finite()) || hits.is_empty() {
+        return (hits, false);
     }
     let chunks: Vec<(&str, &str, &str, i32, i32)> = hits
         .iter()
@@ -956,17 +972,16 @@ fn with_centrality(store: &Store, hits: Vec<SearchResult>, w: f32) -> Vec<Search
         .collect();
     let ranks = match store.chunk_ranks(&chunks) {
         Ok(r) if r.iter().any(Option::is_some) => r,
-        _ => return hits,
+        _ => return (hits, false),
     };
-    let mut order: Vec<usize> = (0..hits.len()).collect();
-    order.sort_by(|&a, &b| match (ranks[a], ranks[b]) {
-        (Some(x), Some(y)) => y.total_cmp(&x).then(a.cmp(&b)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.cmp(&b),
-    });
+    let mut order: Vec<(usize, f64)> = ranks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.map(|r| (i, r)))
+        .collect();
+    order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut bonus = vec![0.0f32; hits.len()];
-    for (pos, &i) in order.iter().enumerate() {
+    for (pos, &(i, _)) in order.iter().enumerate() {
         bonus[i] = w / (RRF_K + pos as f32 + 1.0);
     }
     let mut scored: Vec<(usize, SearchResult)> = hits
@@ -979,7 +994,7 @@ fn with_centrality(store: &Store, hits: Vec<SearchResult>, w: f32) -> Vec<Search
         })
         .collect();
     scored.sort_by(|a, b| b.1.score.total_cmp(&a.1.score).then(a.0.cmp(&b.0)));
-    scored.into_iter().map(|(_, h)| h).collect()
+    (scored.into_iter().map(|(_, h)| h).collect(), true)
 }
 
 /// Fuse ranked lists by Reciprocal Rank Fusion: each item scores
@@ -2219,18 +2234,125 @@ mod tests {
             SearchResult::new(code(id, "main", file, (1, 9), "", id, [0.0; DIM]), 0.5)
         };
         let tied = vec![mk("low", "src/low.rs"), mk("high", "src/high.rs")];
-        assert_eq!(with_centrality(&store, tied.clone(), 0.3), tied, "no ranks");
+        assert_eq!(
+            with_centrality(&store, tied.clone(), 0.3).0,
+            tied,
+            "no ranks"
+        );
         rank_symbols(
             &store,
             &[("src/low.rs", 1, 9, 0.01), ("src/high.rs", 1, 9, 0.2)],
         );
-        assert_eq!(with_centrality(&store, tied.clone(), 0.0), tied, "w = 0");
-        let out = with_centrality(&store, tied.clone(), 0.3);
+        assert_eq!(with_centrality(&store, tied.clone(), 0.0).0, tied, "w = 0");
+        let out = with_centrality(&store, tied.clone(), 0.3).0;
         assert_eq!(ids(&out), ["high", "low"]);
         assert!(out.iter().all(|h| h.retriever_score() == 0.5), "{out:?}");
-        // A hit of no symbol goes after the ranked ones, with no other cost.
-        let three = vec![mk("none", "README.md"), mk("low", "src/low.rs")];
-        assert_eq!(ids(&with_centrality(&store, three, 0.3)), ["low", "none"]);
+        // A hit of no symbol gets no bonus at all (review MAJOR 3): its
+        // score is the fusion's, untouched, and the ranked one goes first.
+        let mixed = vec![mk("none", "README.md"), mk("low", "src/low.rs")];
+        let out = with_centrality(&store, mixed, 0.3).0;
+        assert_eq!(ids(&out), ["low", "none"]);
+        let none = out.iter().find(|h| h.point.id == "none").unwrap();
+        assert_eq!((none.score, none.raw_score), (0.5, None), "{none:?}");
+    }
+
+    /// Review of TASK-010, MINOR 2: with centrality off (or nothing to
+    /// rank), a pinned definition keeps the score it had before TASK-010 —
+    /// no `raw_score` of its own — also under a reranker, so a group's
+    /// member selection sees what it saw before.
+    #[test]
+    fn without_centrality_an_anchored_hit_keeps_its_old_score() {
+        for store in [anchoring_store(), ranked_anchoring_store()] {
+            let _ = store.rebuild_fts();
+            let seen = Recording(std::sync::Mutex::new(0));
+            let hits = search_ranked(
+                &store,
+                "do_memories_by_symbol",
+                &SearchFilter::default(),
+                5,
+                SearchMode::Hybrid,
+                Some(&KwEmbedder),
+                Some(&seen),
+                &RankOptions {
+                    centrality: 0.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let def = hits.iter().find(|h| h.point.id == "def").unwrap();
+            assert_eq!(def.raw_score, None, "{def:?}");
+        }
+    }
+
+    /// Review of TASK-010, MINOR 10: with real ranks and the highest weight,
+    /// the kind penalty still demotes a doc that ranks highest, and dedup
+    /// still returns a chunk once.
+    #[test]
+    fn penalty_and_dedup_hold_under_centrality() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let d = [0.0, 1.0, 0.0, 0.0];
+        store
+            .upsert(&[
+                code("doc", "main", "README.md", (1, 9), "", "database", d),
+                code(
+                    "a",
+                    "main",
+                    "src/a.rs",
+                    (1, 9),
+                    "a",
+                    "database",
+                    [0.0, 0.9, 0.1, 0.0],
+                ),
+                code(
+                    "b",
+                    "main",
+                    "src/b.rs",
+                    (1, 9),
+                    "b",
+                    "database",
+                    [0.0, 0.8, 0.2, 0.0],
+                ),
+                code(
+                    "a2",
+                    "dev",
+                    "src/a.rs",
+                    (1, 9),
+                    "a",
+                    "database",
+                    [0.0, 0.9, 0.1, 0.0],
+                ),
+            ])
+            .unwrap();
+        rank_symbols(
+            &store,
+            &[
+                ("README.md", 1, 9, 0.9),
+                ("src/a.rs", 1, 9, 0.1),
+                ("src/b.rs", 1, 9, 0.2),
+            ],
+        );
+        let hits = search_ranked(
+            &store,
+            "database",
+            &SearchFilter::default(),
+            5,
+            SearchMode::Hybrid,
+            Some(&KwEmbedder),
+            None,
+            &RankOptions {
+                centrality: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let got = ids(&hits);
+        assert_ne!(got.first().map(String::as_str), Some("doc"), "{got:?}");
+        assert!(got.contains(&"doc".to_string()), "{got:?}");
+        assert_eq!(
+            got.iter().filter(|i| *i == "a" || *i == "a2").count(),
+            1,
+            "{got:?}"
+        );
     }
 
     /// The store of the hybrid tests below, with a symbol over every chunk:
