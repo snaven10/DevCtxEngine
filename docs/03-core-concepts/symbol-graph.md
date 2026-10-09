@@ -230,8 +230,10 @@ line — of one symbol.
 `symbol` takes a bare, qualified or `file::name` symbol, or a file path (the
 file itself: imports leave from it). A bare name with several definitions is
 walked from all of them and listed in `candidates` (`{sym, symbol, kind, file,
-line}`); `sym` (the hex id a node or a candidate carries) starts from exactly
-one.
+line}`, under a quarter of the output budget, the rest named in
+`omitted_for_budget.candidates`; up to 10 000 definitions, as `impact_analysis`,
+and `candidates_truncated` past that); `sym` (the hex id a node or a candidate
+carries) starts from exactly one.
 
 The answer is `{root, candidates?, nodes, edges, total, next_offset?, omitted?,
 partial?, filters, below_confidence?, excluded?, omitted_by_limit?, dispatch?,

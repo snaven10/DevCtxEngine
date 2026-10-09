@@ -25,8 +25,9 @@ use super::BranchChoice;
 /// Nodes per page when `limit` says nothing.
 pub const DEFAULT_TRAVERSE_LIMIT: usize = 50;
 
-/// Definitions a name may stand for as roots.
-const ROOTS_LIMIT: usize = 100;
+/// Definitions a name may stand for as roots: `impact_analysis`'s seed
+/// limit (review of TASK-013, MINOR 1). Past it, `candidates_truncated`.
+const ROOTS_LIMIT: usize = 10_000;
 
 /// The error of a branch the current extractor has not indexed (DD-19):
 /// `traverse` has no 0.9 path to fall back on.
@@ -259,6 +260,31 @@ fn edge_json(e: &TraverseEdge) -> Value {
     v
 }
 
+/// `items` in order while they fit `budget` tokens (a hard cut, for a list
+/// of many small items such as `candidates`); the rest named by `label`.
+/// 0 = no budget.
+fn fit_prefix(
+    items: Vec<Value>,
+    budget: usize,
+    label: impl Fn(&Value) -> String,
+) -> (Vec<Value>, Vec<String>) {
+    if budget == 0 {
+        return (items, Vec::new());
+    }
+    let room = budget * super::CHARS_PER_TOKEN;
+    let (mut used, mut kept, mut dropped) = (0usize, Vec::new(), Vec::new());
+    for v in items {
+        let len = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+        if dropped.is_empty() && used + len <= room {
+            used += len;
+            kept.push(v);
+        } else {
+            dropped.push(label(&v));
+        }
+    }
+    (kept, dropped)
+}
+
 /// The `traverse` object on a chosen branch, under `budget` tokens.
 pub(super) fn traverse_on(
     store: &Store,
@@ -297,12 +323,17 @@ pub(super) fn traverse_on(
                 Some((f, n)) => (Some(f), n),
                 None => (None, name),
             };
+            // One more than the limit, to know whether it cut.
             let roots = store
-                .traverse_roots(repo, branch, bare, file, ROOTS_LIMIT)
+                .traverse_roots(repo, branch, bare, file, ROOTS_LIMIT + 1)
                 .map_err(|e| e.to_string())?;
             (roots, file, bare)
         }
     };
+    let mut roots = roots;
+    let mut candidates_dropped: Vec<String> = Vec::new();
+    let roots_cut = roots.len() > ROOTS_LIMIT;
+    roots.truncate(ROOTS_LIMIT);
     let mut out = json!({});
     out["root"] = match roots.as_slice() {
         [one] => symbol_json(one),
@@ -311,7 +342,20 @@ pub(super) fn traverse_on(
     if roots.len() > 1 {
         // An ambiguous name: the walk starts from every definition, and
         // `sym` picks one.
-        out["candidates"] = json!(roots.iter().map(symbol_json).collect::<Vec<_>>());
+        // Under a quarter of the budget, in order; the rest named.
+        let all: Vec<Value> = roots.iter().map(symbol_json).collect();
+        let (kept, dropped) = fit_prefix(all, budget / 4, |v| {
+            v["symbol"].as_str().unwrap_or("").to_string()
+        });
+        out["candidates"] = json!(kept);
+        candidates_dropped = dropped;
+    }
+    if roots_cut {
+        out["candidates_truncated"] = json!({
+            "limit": ROOTS_LIMIT,
+            "hint": "the name has more definitions than are walked from: name one (Type.name, \
+                     file::name or sym)",
+        });
     }
     // `impact_analysis`'s rule on roots: one a bare name stood for, reached
     // from another, is listed.
@@ -341,7 +385,7 @@ pub(super) fn traverse_on(
         .filter(|e| shown.contains(&e.reached))
         .map(edge_json)
         .collect();
-    let half = budget / 2;
+    let half = budget.saturating_sub(if roots.len() > 1 { budget / 4 } else { 0 }) / 2;
     let (nodes, nodes_dropped) = super::fit_json_array(nodes, half, None, |v| {
         v.get("symbol")
             .and_then(|s| s.as_str())
@@ -362,12 +406,15 @@ pub(super) fn traverse_on(
     if let Some(note) = super::omitted_note(left, nodes_dropped.len(), next_offset) {
         out["omitted"] = note;
     }
-    if !nodes_dropped.is_empty() || !edges_dropped.is_empty() {
+    if !nodes_dropped.is_empty() || !edges_dropped.is_empty() || !candidates_dropped.is_empty() {
         out["omitted_for_budget"] = json!({
             "count": nodes_dropped.len(),
             "nodes": nodes_dropped,
             "edges": edges_dropped.len(),
         });
+        if !candidates_dropped.is_empty() {
+            out["omitted_for_budget"]["candidates"] = json!(candidates_dropped);
+        }
     }
     if let Some(d) = t.unread_from {
         out["partial"] = json!({ "from_depth": d, "hint": PARTIAL_HINT });
@@ -721,6 +768,52 @@ mod tests {
             assert!(!syms(&v).contains(&"Repo.walk".to_string()), "{v}");
             assert!(v.get("undecided_calls").is_none(), "{v}");
         }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review of TASK-013, MINOR 1: a name with more definitions than a
+    /// handful is walked from all of them (as `impact_analysis`, up to its
+    /// seed limit) — 150 `execute`, the caller of the last one is listed —
+    /// and the candidates go through the output budget, named when dropped.
+    #[test]
+    fn every_definition_of_a_name_is_a_root() {
+        let mut files: Vec<(String, String)> = Vec::new();
+        for i in 0..150 {
+            files.push((
+                format!("src/main/java/many/Job{i:03}.java"),
+                format!("package many;\n\npublic class Job{i:03} {{\n    public void execute() {{\n    }}\n}}\n"),
+            ));
+        }
+        files.push((
+            "src/main/java/many/Runner.java".into(),
+            "package many;\n\npublic class Runner {\n    private final Job149 job = new Job149();\n\n    public void run() {\n        job.execute();\n    }\n}\n".into(),
+        ));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (state, repo) = indexed_files("traverse_many_roots", &refs);
+        let v = run(&state, &q("execute", "calls", "in", 1));
+        assert_eq!(syms(&v), ["Runner.run"], "{}", v["total"]);
+        // Every definition is a candidate: listed, or named past the quarter
+        // of the budget candidates get.
+        let listed = v["candidates"].as_array().unwrap().len();
+        let named = v["omitted_for_budget"]["candidates"]
+            .as_array()
+            .map_or(0, |a| a.len());
+        assert_eq!(listed + named, 150, "{listed} + {named}");
+        assert!(v.get("candidates_truncated").is_none());
+        // Under a small budget the candidates are cut and named, not lost.
+        let store = state.open_store().unwrap();
+        let chosen = graph_branch(&state, &store).unwrap();
+        let v = super::traverse_on(&store, &chosen, &q("execute", "calls", "in", 1), 400).unwrap();
+        let kept = v["candidates"].as_array().unwrap().len();
+        let dropped = v["omitted_for_budget"]["candidates"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert!(kept < 150 && kept + dropped == 150, "{kept} + {dropped}");
+        drop(store);
         let _ = std::fs::remove_dir_all(&repo);
     }
 

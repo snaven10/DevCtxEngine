@@ -235,8 +235,10 @@ transitivos, con tope por dirección); `get_references` para los sitios de llama
 `symbol` acepta un símbolo pelado, calificado o `archivo::nombre`, o la ruta de
 un archivo (el archivo mismo: de él salen los imports). Un nombre pelado con
 varias definiciones se recorre desde todas y se listan en `candidates`
-(`{sym, symbol, kind, file, line}`); `sym` (el id hex que lleva un nodo o un
-candidato) arranca desde exactamente una.
+(`{sym, symbol, kind, file, line}`, en un cuarto del presupuesto de salida, el
+resto nombrado en `omitted_for_budget.candidates`; hasta 10 000 definiciones, como
+`impact_analysis`, y `candidates_truncated` si hay más); `sym` (el id hex que
+lleva un nodo o un candidato) arranca desde exactamente una.
 
 La respuesta es `{root, candidates?, nodes, edges, total, next_offset?, omitted?,
 partial?, filters, below_confidence?, excluded?, omitted_by_limit?, dispatch?,
