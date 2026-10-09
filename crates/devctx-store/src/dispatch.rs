@@ -419,7 +419,13 @@ fn confidence_rank(c: Option<&str>) -> u8 {
 
 /// The equivalents of one origin among its candidates (already reachable,
 /// with their chain): override-equivalent ones, ordered and capped.
-fn select(origin: u64, o: &Origin, found: Vec<(Candidate, u8)>, out: &mut Equivalents) {
+fn select(
+    origin: u64,
+    o: &Origin,
+    found: Vec<(Candidate, u8)>,
+    include_tests: bool,
+    out: &mut Equivalents,
+) {
     if never_overrides(&o.signature, &o.name) {
         return;
     }
@@ -471,19 +477,34 @@ fn select(origin: u64, o: &Origin, found: Vec<(Candidate, u8)>, out: &mut Equiva
             chain,
         })
         .collect();
+    // Production first (review MINOR 5): a fake that ranks higher never
+    // takes the place of a real implementation under the cap.
     list.sort_by(|a, b| {
-        b.rank
-            .unwrap_or(f64::NEG_INFINITY)
-            .partial_cmp(&a.rank.unwrap_or(f64::NEG_INFINITY))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        a.test
+            .cmp(&b.test)
+            .then_with(|| {
+                b.rank
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .partial_cmp(&a.rank.unwrap_or(f64::NEG_INFINITY))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| a.symbol.cmp(&b.symbol))
             .then_with(|| a.id.cmp(&b.id))
     });
+    // Tests the walk leaves out (and counts as tests) are not capped: the cap
+    // is for what is listed.
+    let tests: Vec<Equivalent> = if include_tests {
+        Vec::new()
+    } else {
+        let at = list.iter().position(|e| e.test).unwrap_or(list.len());
+        list.split_off(at)
+    };
     if list.len() > DISPATCH_MAX_PER_NODE {
         out.cut
             .extend(list.drain(DISPATCH_MAX_PER_NODE..).map(|e| e.id));
     }
     out.kept.extend(list);
+    out.kept.extend(tests);
 }
 
 impl Store {
@@ -529,6 +550,7 @@ impl Store {
     /// it; then, in memory, the ones whose type is reachable (supertypes
     /// upstream, subtypes downstream, up to [`DISPATCH_DEPTH`] levels),
     /// override-equivalent, at most [`DISPATCH_MAX_PER_NODE`] per node.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn override_equivalents(
         &self,
         repo: &str,
@@ -537,6 +559,7 @@ impl Store {
         dir: Direction,
         mode: FrontierSql,
         index: &DispatchIndex,
+        include_tests: bool,
     ) -> Result<Equivalents> {
         let mut out = Equivalents::default();
         if frontier.is_empty() {
@@ -613,7 +636,7 @@ impl Store {
         ids.sort_unstable();
         for id in ids {
             let (o, _, found) = origins.remove(&id).expect("listed");
-            select(id, &o, found, &mut out);
+            select(id, &o, found, include_tests, &mut out);
         }
         Ok(out)
     }

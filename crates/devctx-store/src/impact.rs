@@ -490,10 +490,13 @@ pub(crate) fn walk(
     // A node left out at one level and reached at a later one by a better
     // edge is shown, not counted.
     let left_out = |set: HashSet<Key>| set.iter().filter(|k| !reported.contains(k)).count();
+    // A method one node's cap cut and another node reached and left out (a
+    // test, `low`) is counted where it was left out, once (review MINOR 7).
+    cut.retain(|k| !below.contains(k) && !tests.contains(k) && !external.contains(k));
+    side.dispatch_capped = left_out(cut);
     side.below_confidence = left_out(below);
     side.tests = left_out(tests);
     side.external = left_out(external);
-    side.dispatch_capped = left_out(cut);
     Ok(side)
 }
 
@@ -610,7 +613,16 @@ impl Store {
             let mut parents = seed_parents.clone();
             walk(&seeds, &itself, opts, extra, |f| {
                 let mut read = if let Some(index) = &dispatch {
-                    self.dispatch_level(repo, branch, f, dir, mode, index, &parents)?
+                    self.dispatch_level(
+                        repo,
+                        branch,
+                        f,
+                        dir,
+                        mode,
+                        index,
+                        &parents,
+                        opts.include_tests,
+                    )?
                 } else {
                     self.impact_level(repo, branch, f, dir, mode)?.into()
                 };
@@ -762,6 +774,7 @@ impl Store {
         mode: FrontierSql,
         index: &DispatchIndex,
         parents: &HashMap<u64, u64>,
+        include_tests: bool,
     ) -> Result<Level> {
         // Only a method of a type in the supertype graph can dispatch: the
         // others cost no statement.
@@ -770,7 +783,8 @@ impl Store {
             .copied()
             .filter(|id| parents.get(id).is_some_and(|p| index.has_type(*p)))
             .collect();
-        let eq = self.override_equivalents(repo, branch, &methods, dir, mode, index)?;
+        let eq =
+            self.override_equivalents(repo, branch, &methods, dir, mode, index, include_tests)?;
         let mut out = Level {
             rows: Vec::new(),
             cut: eq.cut,
@@ -2418,6 +2432,93 @@ pub(crate) mod tests {
         };
         assert_eq!(up("RepoImpl.save"), ["Api.a"]);
         assert_eq!(up("GenImpl.put"), ["Api.c", "Api.d"]);
+    }
+
+    /// Review of TASK-017, MINOR 5: the per-node cap never cuts a production
+    /// implementation to make room for a test fake that the default leaves
+    /// out anyway — 16 fakes ranked first and 16 real implementations: the
+    /// 16 real ones are listed, the fakes counted as tests, nothing cut.
+    #[test]
+    fn the_dispatch_cap_keeps_production_before_tests() {
+        let store = Store::open_in_memory(3).unwrap();
+        let types: Vec<String> = (0..16)
+            .flat_map(|i| [format!("AaTest{i:02}"), format!("Impl{i:02}")])
+            .collect();
+        let supers: Vec<(&str, &str, &str, &str)> = types
+            .iter()
+            .map(|t| (t.as_str(), "IRepo", "implements", "high"))
+            .collect();
+        let methods: Vec<String> = types.iter().map(|t| format!("{t}.save")).collect();
+        let mut sigs: Vec<(&str, &str)> = methods
+            .iter()
+            .map(|m| (m.as_str(), "public void save(String id)"))
+            .collect();
+        sigs.push(("IRepo.save", "void save(String id);"));
+        typed_graph(&store, &supers, &sigs, &[]);
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "IRepo.save",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(im.downstream.nodes.len(), 16, "{:?}", names(&im.downstream));
+        assert!(im
+            .downstream
+            .nodes
+            .iter()
+            .all(|n| n.symbol.starts_with("Impl")));
+        assert_eq!(im.downstream.tests, 16);
+        assert_eq!(im.downstream.dispatch_capped, 0);
+        // With the tests listed, production still comes first under the cap.
+        let all = ImpactOptions {
+            include_tests: true,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "IRepo.save", None, &all)
+            .unwrap();
+        assert!(im
+            .downstream
+            .nodes
+            .iter()
+            .all(|n| n.symbol.starts_with("Impl")));
+        assert_eq!(im.downstream.dispatch_capped, 16);
+    }
+
+    /// Review of TASK-017, MINOR 7: a method the cap of one node cut and that
+    /// another node reaches as `low` is counted once, in `below_confidence`,
+    /// not also in `dispatch_capped`.
+    #[test]
+    fn a_method_cut_by_the_cap_and_left_out_elsewhere_is_counted_once() {
+        let store = Store::open_in_memory(3).unwrap();
+        let impls: Vec<String> = (0..17).map(|i| format!("Impl{i:02}")).collect();
+        let mut supers: Vec<(&str, &str, &str, &str)> = impls
+            .iter()
+            .map(|t| (t.as_str(), "IBig", "implements", "high"))
+            .collect();
+        supers.push(("Impl16", "ISmall", "implements", "low"));
+        let methods: Vec<String> = impls.iter().map(|t| format!("{t}.run")).collect();
+        let mut sigs: Vec<(&str, &str)> = methods
+            .iter()
+            .map(|m| (m.as_str(), "public void run(String id)"))
+            .collect();
+        sigs.push(("IBig.run", "void run(String id);"));
+        sigs.push(("ISmall.run", "void run(String id);"));
+        typed_graph(
+            &store,
+            &supers,
+            &sigs,
+            &[call("Top.go", "IBig.run"), call("Top.go", "ISmall.run")],
+        );
+        let im = store
+            .impact_graph("repo", "main", "Top.go", None, &ImpactOptions::default())
+            .unwrap();
+        assert!(!names(&im.downstream).contains(&"Impl16.run"));
+        assert_eq!(im.downstream.below_confidence, 1);
+        assert_eq!(im.downstream.dispatch_capped, 0);
     }
 
     /// Measurement (PLAN-009 TASK-017 review, MAJOR 2; not a test): a
