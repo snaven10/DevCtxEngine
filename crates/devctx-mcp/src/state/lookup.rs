@@ -265,14 +265,25 @@ pub(super) fn references(
     let ids: Vec<u64> = syms.iter().map(|s| s.id).collect();
     let resolved = Store::qualified_names(&syms);
     let low = min == MinConfidence::Low;
+    // Undecided rows carry a name, not a file: under `file::name` none of
+    // them can be said to be about that file (second review, n2).
+    let undecided = file.is_none();
     let rows = store
-        .lookup_references(repo, branch, &ids, bare, kinds, file.is_none(), low)
+        .lookup_references(
+            repo,
+            branch,
+            &ids,
+            bare,
+            kinds,
+            file.is_none(),
+            low && undecided,
+        )
         .map_err(|e| e.to_string())?;
     let (shown, hidden): (Vec<&SymbolReference>, Vec<&SymbolReference>) = rows
         .iter()
         .partition(|r| min.admits(r.confidence.as_deref()) && (low || !r.undecided()));
     // Undecided rows are listed only with `low`; otherwise only counted.
-    let undecided_hidden = if low {
+    let undecided_hidden = if low || !undecided {
         0
     } else {
         store
@@ -323,12 +334,14 @@ const REFERENCE_KINDS: &[&str] = &[
 ];
 
 /// Parse `get_references`' `kinds` (comma-separated, or `all`): the
-/// relations to list; `None` is [`DEFAULT_REFERENCE_KINDS`].
+/// relations to list **besides** [`DEFAULT_REFERENCE_KINDS`], which always
+/// stay — asking for type uses must not drop the calls of a symbol someone
+/// is about to change (second review, N1).
 pub(super) fn parse_kinds(s: Option<&str>) -> Result<Vec<&'static str>, String> {
+    let mut out = DEFAULT_REFERENCE_KINDS.to_vec();
     let Some(s) = s.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(DEFAULT_REFERENCE_KINDS.to_vec());
+        return Ok(out);
     };
-    let mut out = Vec::new();
     for k in s.split(',').map(str::trim).filter(|k| !k.is_empty()) {
         if k.eq_ignore_ascii_case("all") {
             return Ok(REFERENCE_KINDS.to_vec());
@@ -803,6 +816,13 @@ mod tests {
         // way (`s.flush()` was written `flush`, not `Left.flush`).
         let v = refs(&state, "Left.flush");
         assert!(v.get("below_confidence").is_none(), "{v}");
+        // n2: under `file::name` the undecided `flush` of another file is
+        // neither counted nor listed.
+        let in_file = "java/src/main/java/com/example/Left.java::flush";
+        let v = refs(&state, in_file);
+        assert!(v.get("below_confidence").is_none(), "{v}");
+        let v = refs_min(&state, in_file, "low");
+        assert!(v["references"].as_array().unwrap().is_empty(), "{v}");
 
         // A `medium` reference is listed by default, marked by its field.
         let v = refs(&state, "with_context");
@@ -1229,7 +1249,35 @@ mod tests {
     /// `kinds`.
     #[test]
     fn references_default_to_calls_and_take_kinds() {
-        let (state, repo) = indexed("kinds", &[]);
+        let (state, repo) = indexed(
+            "kinds",
+            &[(
+                "py/app/use.py",
+                "from app.svc import Runner\n\n\ndef go(r: Runner):\n    Runner().run()\n",
+            )],
+        );
+        // N1: `kinds` adds to the calls, never replaces them.
+        let v: Value = serde_json::from_str(
+            &do_references_with(&state, "Runner", Some("low"), Some("references")).unwrap(),
+        )
+        .unwrap();
+        let vias: Vec<&str> = v["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["via"].as_str())
+            .collect();
+        assert!(vias.contains(&"calls"), "{v}");
+        assert!(vias.contains(&"references"), "{v}");
+        let v = refs(&state, "Runner");
+        assert!(
+            v["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|x| x["via"] != "references"),
+            "{v}"
+        );
         // `thing::Thing` is named (a type use) once; never called itself.
         let v = refs(&state, "Thing");
         assert!(v["references"].as_array().unwrap().is_empty(), "{v}");
@@ -1237,7 +1285,7 @@ mod tests {
             serde_json::from_str(&do_references_with(&state, "Thing", None, Some(kinds)).unwrap())
                 .unwrap()
         };
-        for k in ["references", "all", "calls,references"] {
+        for k in ["references", "all", "imports,references"] {
             let v = with(k);
             let r = v["references"].as_array().unwrap();
             assert!(
@@ -1345,7 +1393,16 @@ mod tests {
     /// lookup, symbol by symbol.
     #[test]
     fn batched_code_chunks_equal_the_per_symbol_lookup() {
-        let (state, repo) = indexed("batch", &[]);
+        // Two `new` in one file, each a chunk of its own: the second's
+        // lines must not take in the first's code (a homonym above).
+        let pair = format!(
+            "pub struct A;\npub struct B;\n\nimpl A {{\n    pub fn new() -> Self {{\n{body}\n        A\n    }}\n}}\n\nimpl B {{\n    pub fn new() -> Self {{\n{body}\n        B\n    }}\n}}\n",
+            body = (0..14)
+                .map(|i| format!("        let value_number_{i} = {i} * 1000 + 7;"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let (state, repo) = indexed("batch", &[("rs/src/pair.rs", pair.as_str())]);
         let store = state.open_store().unwrap();
         let (r, b) = state.repo_branch().unwrap();
         let syms: Vec<_> = store
@@ -1368,6 +1425,18 @@ mod tests {
             with_code += usize::from(!one.is_empty());
         }
         assert!(with_code >= 5, "{with_code}");
+        // The fixture exercises it: each `new` has its own chunk, not a
+        // shared `grouped` one.
+        let news: Vec<Vec<String>> = syms
+            .iter()
+            .filter(|s| s.file == "rs/src/pair.rs" && s.name == "new")
+            .map(|s| all[&s.id].iter().map(|p| p.id.clone()).collect())
+            .collect();
+        assert_eq!(news.len(), 2);
+        assert!(
+            news.iter().all(|c| c.len() == 1) && news[0] != news[1],
+            "{news:?}"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 

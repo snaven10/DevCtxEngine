@@ -309,8 +309,10 @@ impl Store {
             vec![repo.to_string().into(), branch.to_string().into()];
         args.extend(syms.iter().map(|s| duckdb::types::Value::UBigInt(s.id)));
         let mut stmt = self.conn.prepare(&sql)?;
+        // `s.id` follows the `vectors` columns that `row_to_point` reads.
+        let id_col = COLS.split(',').count();
         let rows = stmt.query_map(params_from_iter(args), |r| {
-            Ok((r.get::<_, u64>(19)?, row_to_point(r)?))
+            Ok((r.get::<_, u64>(id_col)?, row_to_point(r)?))
         })?;
         let mut near: HashMap<u64, Vec<VectorPoint>> = HashMap::new();
         for r in rows {
