@@ -1060,8 +1060,16 @@ omitted_by_limit?, dispatch?, omitted_for_budget?, branch_fallback?}`:
   `imports`); `sym` (hex) elige una raíz; un nombre ambiguo recorre desde todas (`candidates`);
 - sin camino 0.9: rama vieja o sin filas → error que pide `devctx index --full`; un `serve`
   anterior responde 404 y el cliente (MCP remoto y CLI) dice que hay que reiniciarlo;
-- no lista los llamadores de llamadas **sin decidir** al nombre (eso es de `impact_analysis` y
-  `get_references`): `traverse` sigue aristas por id.
+- ~~no lista los llamadores de llamadas sin decidir al nombre~~ — **revisión, MAJOR 1:** como
+  `impact`, con `calls` `in`/`both` y raíz por nombre (sin `sym` ni `archivo::nombre`), las llamadas
+  sin decidir al nombre se cuentan en `undecided_calls` o, con `low`, sus llamadores se listan en el
+  nivel 1 `undecided: true` sin recorrerlos (una sentencia, solo en el nivel 1);
+- revisión: raíces hasta el `SEED_LIMIT` de impact (10 000; `candidates_truncated` más allá) y
+  `candidates` en un cuarto del presupuesto; si la página entra en el presupuesto sale entera, y
+  solo van las aristas de los nodos mostrados; con `partial`, `total_is_lower_bound: true`; un
+  símbolo con ese nombre gana sobre una ruta; `sym` gana sobre `symbol` con un `warning`;
+  `POST /traverse` responde 400 a un parámetro inválido; el 404 de un serve viejo se lee del código
+  de estado.
 
 ## DD-17 — Vista `skeleton`
 

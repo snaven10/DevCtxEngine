@@ -211,7 +211,8 @@ paginación y conteo de omitidos. Inspirada en TraverseGraph de LocAgent. Implem
      `occurrences`.
   5. Índice viejo: error que pide `devctx index --full` (como dice la spec, (g)), no `warning`: no
      hay camino 0.9 del que responder.
-  6. No lista llamadores de llamadas sin decidir al nombre (ver hallazgos).
+  6. ~~No lista llamadores de llamadas sin decidir al nombre~~: **no aceptada en la revisión** y
+     corregida (`ed26798`, abajo).
   7. TUI: no aplica — su vista de grafo es la de `impact_analysis`; no se agregó una de `traverse`.
   8. La validación de parámetros corre también en la tool MCP antes de buscar el serve, para que un
      `depth: 9` se responda sin levantar nada.
@@ -222,3 +223,39 @@ paginación y conteo de omitidos. Inspirada en TraverseGraph de LocAgent. Implem
   hace falta ver los llamadores sin decidir en `traverse`, sería un `min_confidence: low` que los
   liste en el primer nivel como hace `impact` (una sentencia más). (3) `total` con `partial` es una
   cota inferior: un cliente que quiera el total exacto pide `limit` grande o recorre las páginas.
+- **Revisión (APROBADA CON CAVEATS), resuelta en commits encima de `5e3ff08`:** desviaciones 1-5,
+  7 y 8 aceptadas (en la 2, el nombre gana sobre la ruta: documentado en la tool y en las docs, y
+  probado en `a_path_is_its_file_symbol`); la 6 no.
+  - *MAJOR 1* (`ed26798`): las llamadas sin decidir al nombre, como en `impact`: con `calls`,
+    dirección `in`/`both` y raíz por nombre sin archivo, `undecided_call_rows` (una sentencia, solo
+    el nivel 1) las cuenta en `undecided_calls: {count, hint}` (ni desde tests, ni desde un llamador
+    listado, ni desde una raíz) o, con `low`, lista sus llamadores en el nivel 1 `undecided: true`,
+    con una arista al nombre, sin recorrerlos. Tests `undecided_calls_to_the_name_are_counted_or_listed`
+    (tool: **fallaba antes**, sin `undecided_calls`; store: sentencias = niveles + 1 con `low`, nada
+    sin `by_name` ni con `out`).
+  - *MINOR 1* (`51c34cd`): raíces hasta 10 000 (el `SEED_LIMIT` de impact; se pide uno más y, si
+    corta, `candidates_truncated`), `candidates` en un cuarto del presupuesto, en orden, con el resto
+    en `omitted_for_budget.candidates`. Test `every_definition_of_a_name_is_a_root` (150 `execute`;
+    **fallaba antes**: el llamador de la última se perdía). `candidates_truncated` no tiene test
+    (haría falta un repo de más de 10 000 definiciones de un nombre).
+  - *MINOR 2* (`6d8b2b1`): `fit_whole_or_share`: si la página entra en su mitad del presupuesto sale
+    entera; si no, cuota pareja como `fit_json_array`; las aristas se filtran por los nodos listados.
+    `the_budget_names_what_it_drops` amplía: ninguna arista cuelga de un nodo descartado
+    (**fallaba antes**) y con presupuesto suficiente para el total sale todo aunque un nodo supere
+    su cuota (**por mutación**: sin la regla del total, falla).
+  - *MINOR 3* (`773025d`): con `partial`, `total_is_lower_bound: true`; el CLI imprime `>= N`
+    (`traverse_page_note`, test `a_partial_traverse_total_reads_as_a_floor`); tool y docs lo dicen.
+    `a_hub_is_paged_and_counted` lo fija (**por mutación**: sin el campo, falla).
+  - *MINOR 4 y NITs* (`d47703f`): el 404/405 de un serve viejo se lee de
+    `ureq::Error::Status` (`RemoteClient::post_route` en el MCP, `Remote::traverse` en el CLI), con
+    test del camino CLI (`remote::tests::traverse_on_an_old_server_says_to_restart_it`) y del MCP
+    con un 500 que conserva su mensaje (no fallaba antes: el texto también decía 404; es el cambio a
+    tipado). NITs: comentario alineado con `DISPATCH_KINDS`; `better()` desempata por `through`,
+    origen y línea, y `level_order` por `external` (test `ties_are_broken_the_same_whatever_the_order`,
+    **fallaba antes**); `one_statement_per_level_and_direction` suma `out` y `both`; el bloque de
+    profundidad 2 de `an_example_per_relation` ahora prueba archivo → clase → miembros; `symbol` y
+    `sym` juntos: gana `sym` con `warning`; `POST /traverse` responde 400 a un parámetro inválido
+    (el test de la API, de esta task, pasa a pedir 400); CHANGELOG: tras un cambio de versión del
+    extractor `traverse` da error hasta `devctx index --full` mientras impact y get_references
+    degradan con `warning`. **Para TASK-015 (guía de reindex):** esa diferencia va en la guía.
+
