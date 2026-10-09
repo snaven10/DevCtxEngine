@@ -124,7 +124,7 @@ todos los chunks del archivo. Implementa DD-20.
   release con TASK-016. Los índices ya creados por el serve sin HNSW lo reciben en la siguiente
   corrida de `index`.
 
-### Fixup (post-review de 7d92cd8)
+### Fixup (post-review de 063bb00)
 
 - **Embedder perezoso.** Nuevo `devctx_embed::LazyEmbedder` (dimensión y nombre salen de la
   config/registro; el modelo se construye en el primer `embed`). Lo usan `cmd_index` (CLI directo)
@@ -151,19 +151,19 @@ todos los chunks del archivo. Implementa DD-20.
   paga la construcción completa en la primera corrida con `storage.hnsw`. **M2:** `load_vss` recuerda
   el fallo en el proceso (flag en `Shared`), no reintenta `INSTALL` por red en cada corrida.
 - **Medición RELEASE** (`cargo build --release -p devctx-cli`, `index --full` directo,
-  `DEVCTX_NO_AUTOSERVE=1`, HOME/DEVCTX_HOME aislados, minilm-l6, memprobe.sh; baseline = 7d92cd8
+  `DEVCTX_NO_AUTOSERVE=1`, HOME/DEVCTX_HOME aislados, minilm-l6, memprobe.sh; baseline = 063bb00
   compilado aparte):
 
   | repo (archivos / chunks) | binario | desde cero | 2.º `--full` | ratio | VmHWM 2.º | chunks reusados / embebidos |
   |---|---|---|---|---|---|---|
-  | DevCtxEngine (279 / 4859) | 7d92cd8 | 306 s | 20.0 s | 6,5 % | 388 MiB | 4859 / 0 |
+  | DevCtxEngine (279 / 4859) | 063bb00 | 306 s | 20.0 s | 6,5 % | 388 MiB | 4859 / 0 |
   | DevCtxEngine | fixup | 240 s | 4,4 s | **1,8 %** | **115 MiB** | 4859 / 0 |
-  | backend-b (216 / 3253), clon de solo lectura | 7d92cd8 | 141 s | 21,0 s | 14,9 % | 387 MiB | 3253 / 0 |
+  | backend-b (216 / 3253), clon de solo lectura | 063bb00 | 141 s | 21,0 s | 14,9 % | 387 MiB | 3253 / 0 |
   | backend-b | fixup | 169 s | 2,4 s | **1,4 %** | **103 MiB** | 3253 / 0 |
 
   VmHWM de la corrida desde cero: 447-472 MiB (ambos binarios). Los tiempos desde cero varían entre
   corridas (otra carga en la máquina); el ratio usa el desde cero de la misma fila. Criterio ≤ 20 %:
-  **cumplido** en ambos repos, en release. En 7d92cd8 ya se cumplía en release; el debug (34 %) lo
+  **cumplido** en ambos repos, en release. En 063bb00 ya se cumplía en release; el debug (34 %) lo
   dominaban parse y carga del modelo en debug.
 - **Pendiente:** equivalencia del top-10 con el arnés de TASK-001 — PENDIENTE hasta que TASK-001
   cierre (hoy solo está probada la igualdad de vectores almacenados antes/después).

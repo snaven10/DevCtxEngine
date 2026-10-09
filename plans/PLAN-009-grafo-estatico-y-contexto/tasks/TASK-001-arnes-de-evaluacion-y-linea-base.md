@@ -87,7 +87,7 @@ implementación de DD-1: métricas del grafo, precisión contra gold edges, rele
   `DEVCTX_HOME`, `HOME` y `DEVCTX_MODEL_CACHE` propios; nada de `~/.local/share/devctx` ni del serve vivo),
   modelo `ml-granite` (el de la máquina), serve del sandbox caliente, `search --no-rerank --limit 20`,
   `context --max-tokens 4096 --no-memories`, `impact` depth 3 × 5 corridas. Repos y commits medidos:
-  DevCtxEngine `ecce342` (clon indexado desde cero), backend-b `<commit-b>` y legacy-migration
+  DevCtxEngine `b009f80` (clon indexado desde cero), backend-b `<commit-b>` y legacy-migration
   `<commit-d>` (clones indexados desde cero con 0.9.0), backend-a `<commit-a>` (rama `development`) y
   frontend `<commit-c>` (rama `development`): **copias del DuckDB vivo** (solo lectura sobre acme) con el
   clon en ese commit, porque reindexarlos con la máquina cargada era inviable (5 índices en paralelo: 312

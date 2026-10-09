@@ -90,7 +90,7 @@ Implementa DD-7 (TS/JS).
   `graph_bench` (vectores constantes) sobre un snapshot de solo lectura de **tres sublibrerías de
   frontend** (lib-auth, la librería de datos de auth y una app: 93 `.ts`, 162 archivos, más
   el `tsconfig.base.json`), sin `.devctx` copiado (verificado con `find`), repo git propio; antes =
-  331ca05, después = esta task; mismos snapshots. **No se indexó frontend entero** (requiere OK del
+  88d7d3e, después = esta task; mismos snapshots. **No se indexó frontend entero** (requiere OK del
   usuario).
 
   | frontend (subconjunto) | antes | después |
@@ -182,8 +182,8 @@ Implementa DD-7 (TS/JS).
   declaraciones ambientales `.d.ts` no se resuelven; (5) el gold TS está sesgado a lib-auth (los
   sitios elegidos en TASK-001) y no hay inyección por constructor real en frontend (cubierta por
   fixtures); (6) sandbox de medición en `/var/tmp/devctx-t006-*`.
-- **Revisión de bf8abde/3dcd6ee (REQUEST CHANGES, sin BLOCKER), resuelta en commits encima de
-  ed417c9:**
+- **Revisión de f830b3d/27141ac (REQUEST CHANGES, sin BLOCKER), resuelta en commits encima de
+  95872b8:**
   - *M1* una llamada pelada a un nombre importado que no se puede seguir (de un paquete, de un
     nombre que también define un archivo del repo) queda **sin decidir**, nunca `unique_name`
     contra el homónimo (`import { map } from 'rxjs/operators'` con un `map` del repo).
@@ -214,12 +214,12 @@ Implementa DD-7 (TS/JS).
     módulo, lleva el hint nuevo **`free`**.
   - *m4 (privacidad)* rutas con número de línea y la lista de micro frontends saneadas en TASK-001,
     TASK-006, TASK-008 y el master (commit aparte).
-  - **`EXTRACTOR_VERSION` = 10, `LINK_VERSION` = 5.** Commits: ec29b32 (privacidad), e0e1a8c (código: parse e index
+  - **`EXTRACTOR_VERSION` = 10, `LINK_VERSION` = 5.** Commits: efc47ed (privacidad), 60fae12 (código: parse e index
     juntos, porque `TsConfig::extends_of` cambia de forma para los dos) y el de esta documentación.
-    Gate sobre e0e1a8c: `fmt --check`, `clippy -D warnings` (y `--features gpu`), `cargo test
+    Gate sobre 60fae12: `fmt --check`, `clippy -D warnings` (y `--features gpu`), `cargo test
     --workspace --locked`: verde.
   - *Tests que fallaban antes del fix:* en `link_typescript` (14 tests), contra el código de
-    ed417c9 con `with_script_env` como envoltorio vacío: `a_package_import_is_never_a_repository_homonym`
+    95872b8 con `with_script_env` como envoltorio vacío: `a_package_import_is_never_a_repository_homonym`
     (M1: daba `medium/unique_name` → `util.formatName`), `a_package_needs_a_manifest_or_a_node_builtin`
     (M2: `fromAuth.selectUser()` daba externo `high`), `only_angulars_inject_injects` (m5),
     `a_block_local_function_does_not_shadow_outside_its_block` (NIT: la segunda llamada iba a
@@ -231,9 +231,9 @@ Implementa DD-7 (TS/JS).
     `tsconfig::tests::an_unreadable_file_keeps_the_last_good_environment` fallan si se ignora el
     entorno guardado (M4: relinkeaba 3 aristas y perdía el alias).
   - *Re-medición* (mismo snapshot más el `package.json` raíz de frontend, que el snapshot original
-    no tenía; antes = 331ca05, ed417c9 = TASK-006 sin la revisión, ahora = con la revisión):
+    no tenía; antes = 88d7d3e, 95872b8 = TASK-006 sin la revisión, ahora = con la revisión):
 
-    | | antes | ed417c9 | ahora | ahora, sin el `package.json` raíz |
+    | | antes | 95872b8 | ahora | ahora, sin el `package.json` raíz |
     |---|---|---|---|---|
     | sin decidir | 73,1 % | 10,8 % | **10,8 %** | 34,1 % |
     | con `dst_id` | 18,3 % | 23,6 % | 23,6 % | 24,2 % |
@@ -256,8 +256,8 @@ Implementa DD-7 (TS/JS).
     default externos el subconjunto tiene **uno solo** (`Swal.close()` de `sweetalert2`, que está en
     `dependencies`): correcto; no hay 20 que auditar en estas librerías (riesgo abierto: frontend
     entero).
-- **Segunda revisión (APROBADA con caveats), resuelta en commits encima de beafcc4:**
-  - *mi1* (2234c91, su propio commit): `choose` cae a lo guardado **por componente**: lo que se
+- **Segunda revisión (APROBADA con caveats), resuelta en commits encima de 18ed513:**
+  - *mi1* (5e01400, su propio commit): `choose` cae a lo guardado **por componente**: lo que se
     pudo leer va fresco; de lo guardado solo el `tsconfig` si el suyo es ilegible, o el manifest del
     mismo directorio; un manifest ilegible que lo guardado no tenía se ignora. Antes un
     `package.json` que no es JSON (la plantilla de un generador Nx) congelaba el entorno viejo para
@@ -281,7 +281,7 @@ Implementa DD-7 (TS/JS).
     nombre (`fn.call()` sin decidir en vez de descartado; `Klass.make()` de `const Klass = class
     {…}` resuelve a `Klass.make`, `same_file`, por ser el único invocable `recv.callee` del
     archivo); dos funciones homónimas de bloques hermanos (`outer.cb` ×2) bajan a `medium`.
-  - **`EXTRACTOR_VERSION` = 11, `LINK_VERSION` = 6.** Commits: 2234c91 (mi1), 7b43503 (mi2, mi3 y
+  - **`EXTRACTOR_VERSION` = 11, `LINK_VERSION` = 6.** Commits: 5e01400 (mi1), d56efe8 (mi2, mi3 y
     NITs) y el de esta documentación. Gate sobre cada uno: `fmt --check`, `clippy -D warnings` (y
     `--features gpu`), `cargo test --workspace --locked`: verde.
   - *Tests que fallaban antes del fix:* `tsconfig::tests::a_broken_manifest_added_later_freezes_nothing_else`

@@ -5,7 +5,7 @@
 # método (m1, m2…) y función de módulo (f1, f2…), sin rutas ni números de línea—, el caso que
 # muestrea cada uno y el resultado medido sobre la tabla `edges` (`score.py gold --new-edges`,
 # línea exacta) en un snapshot de tres sublibrerías de `frontend` (93 archivos .ts, sin indexar el
-# repo entero): antes = 331ca05 (TASK-005 cerrada), ahora = TASK-006 (EXTRACTOR_VERSION 9,
+# repo entero): antes = 88d7d3e (TASK-005 cerrada), ahora = TASK-006 (EXTRACTOR_VERSION 9,
 # LINK_VERSION 4). Los nombres de librerías públicas (Angular, RxJS) se dejan tal cual. ClassA y
 # ClassB tienen el MISMO nombre en el código (dos librerías del monorepo): decide el import. Los 10
 # primeros son los de TASK-001 re-anclados al commit medido; los 10 últimos se etiquetaron en

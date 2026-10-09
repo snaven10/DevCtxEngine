@@ -83,8 +83,8 @@ Implementa DD-7 (Python, Rust, Go).
   métodos en otro archivo del paquete. **`EXTRACTOR_VERSION` 11 → 14, `LINK_VERSION` 6 → 9** (uno
   por resolver; cada commit de resolver sube los dos y regenera el golden).
 - **Números** (sandbox `mktemp -d -p /var/tmp`, 563 MB con tres binarios `graph_bench`, dos índices
-  por repo, los snapshots y el caché de `uv`; `graph_bench` con vectores constantes; antes = c1922d0,
-  después = 8a83a34; mismos snapshots; la máquina con carga alta: tiempos indicativos):
+  por repo, los snapshots y el caché de `uv`; `graph_bench` con vectores constantes; antes = a6c39db,
+  después = 58f6cf0; mismos snapshots; la máquina con carga alta: tiempos indicativos):
 
   | | legacy-migration (Python) antes | después | DevCtxEngine (Rust) antes | después |
   |---|---|---|---|---|
@@ -113,7 +113,7 @@ Implementa DD-7 (Python, Rust, Go).
   (métodos de objetos de librería sobre un parámetro sin anotar o una tupla desestructurada) con nombres
   que el repo no define. En los `.py` de este repo (fixtures y scripts): sin decidir 36,5 % → 4,6 %.
 
-  Gold Rust (`scripts/graph-eval/gold-devctx.txt`): los 6 de TASK-001 re-anclados a c1922d0 más 15
+  Gold Rust (`scripts/graph-eval/gold-devctx.txt`): los 6 de TASK-001 re-anclados a a6c39db más 15
   nuevos, etiquetados leyendo el código antes de medir (`use` entre crates con `pub use`,
   `Self::`, `impl` en otro archivo, campo y valor tipados, trait por `Arc<dyn …>`, `super::` desde
   `mod tests`, cadena con `?`, `crate::` con homónimos, crates declarados y `std`). Gold Python: 25
@@ -200,9 +200,9 @@ Implementa DD-7 (Python, Rust, Go).
   `let x = a.metodo()` queda sin tipo. (4) El incremental de un archivo de Rust muy nombrado
   reabre buena parte de la rama por nombre (modo b), con costo del orden del completo (~0,3 s acá).
   (5) Sandbox de medición en `/var/tmp/devctx-t007-*`.
-- **Revisión de d8cda45 (REQUEST CHANGES, sin BLOCKER; dos revisiones en paralelo), resuelta en
-  commits encima de d8cda45:**
-  - *Rust/Go (eb2b376).* R1: un crate del workspace cuenta solo si es el propio o una dependencia
+- **Revisión de 68d7963 (REQUEST CHANGES, sin BLOCKER; dos revisiones en paralelo), resuelta en
+  commits encima de 68d7963:**
+  - *Rust/Go (e885c3b).* R1: un crate del workspace cuenta solo si es el propio o una dependencia
     por path del `Cargo.toml` del archivo (mapeada por el path, así un `package =` renombrado llega;
     las `workspace = true`, por la entrada de la raíz); una dependencia declarada del registry es
     externa aunque el workspace tenga un homónimo; un crate que nadie declara queda sin decidir
@@ -221,7 +221,7 @@ Implementa DD-7 (Python, Rust, Go).
     solo `a`. Medición (palanca pedida): `let x = a.f()` hace de `x.g()` una cadena tras `a.f()`
     (Rust, Go, Python), `T::default()` sin `impl` vale `T` (`medium`) y un `mod x;` de un crate de
     tests llega a `tests/x/mod.rs`. **`EXTRACTOR_VERSION` 15, `LINK_VERSION` 10.**
-  - *Python (6dd91d4).* P1: `Any`, `object`, un `TypeVar` y una unión de varios tipos no tipan nada
+  - *Python (e84f81e).* P1: `Any`, `object`, un `TypeVar` y una unión de varios tipos no tipan nada
     (antes `Any` daba `external_known` `high` y un tipo que no resuelve caía a `unique_name`);
     `type[X]` es `X`; `-> Self` es la clase. P2: el alcance de un import suma el `__init__.py` de
     cada paquete del camino, y un `__init__.py` escrito reabre su directorio. P3: solo un nombre
@@ -230,7 +230,7 @@ Implementa DD-7 (Python, Rust, Go).
     también tiene queda sin decidir (`PyManifest.guessed`). Menores: dos imports del mismo nombre
     local (`try`/`except ImportError`) dan `medium`; `from ...` más allá del paquete de arriba no es
     módulo. **`EXTRACTOR_VERSION` 16, `LINK_VERSION` 11.**
-  - *Rendimiento (51fb4e1).* Los nombres de un importador que reabren por (d) son solo los que
+  - *Rendimiento (d201181).* Los nombres de un importador que reabren por (d) son solo los que
     pueden tipar una cadena (tipos, campos, invocables con retorno declarado no vacío): reemplaza
     `GENERIC_NAMES`, que dejaba afuera un `pipe(): Repo`. Una llamada por path de Rust resuelta
     externa no se reabre por nombre. En un importador Rust se reabren solo las filas que nombran lo
@@ -239,7 +239,7 @@ Implementa DD-7 (Python, Rust, Go).
     y una rama que no se puede seguir va antes que la externa. **`LINK_VERSION` 12.**
     `store.rs` tocado: **24 307 → 18 179 aristas re-resueltas**; 243 → 230 ms (lo domina cargar la
     rama, ~140 ms, como en el pase completo: no se pudo bajar del orden del completo).
-  - *Menores (90b4d97).* TS y Python: en un barrel o un `import *`, la rama que no se puede seguir
+  - *Menores (4515536).* TS y Python: en un barrel o un `import *`, la rama que no se puede seguir
     va antes que la de un paquete (sin decidir, no externo `high`). TOML: arrays anidados en varias
     líneas. Manifests de Python: `requirements/*.txt`, `nombre @ url`,
     `[tool.poetry.dependencies.foo]`, línea en blanco en `install_requires`, `ruamel.yaml` →
@@ -271,7 +271,7 @@ Implementa DD-7 (Python, Rust, Go).
     evidencia débil de P3 no debe tocar). **No hay en los repos medibles sitios de R2 (varios
     bounds), R3 (dos `impl From`), P1 (`Any`/`Union`/`Self`/`TypeVar`) ni del `try`/`except`:
     quedan cubiertos solo por fixtures.**
-  - *Re-medición* (mismos snapshots; "ronda 1" = 8a83a34, "ahora" = 90b4d97):
+  - *Re-medición* (mismos snapshots; "ronda 1" = 58f6cf0, "ahora" = 4515536):
 
     | | Rust ronda 1 | Rust ahora | Python ronda 1 | Python ahora |
     |---|---|---|---|---|
@@ -302,15 +302,23 @@ Implementa DD-7 (Python, Rust, Go).
     rama; no hay sitios reales de R2/R3/P1; el "Klass anidado sombreado" de TS (NIT) no se tocó.
 
 - **Segunda revisión.**
-  - *Selección incremental (59f586b).* La regla "una llamada por path externa no se reabre por
+  - *Selección incremental (33aa759).* La regla "una llamada por path externa no se reabre por
     nombre" queda solo para `external_known` cuyo primer segmento es la plataforma o un crate de
     afuera declarado, sin ítem, módulo ni `use` del archivo con ese nombre; un `inherited` o un path
     por un módulo del repo vuelven al modo (b). Los `const`/`static` de un importador reabren por (d).
     Escenarios nuevos en la equivalencia incremental = completo (24 pasos). **`LINK_VERSION` 14.**
-  - *Rust (62c66fe).* Un tipo que no resuelve no tipa nada en Rust y Go (nunca `unique_name`); un
+  - *Rust (fcdfb06).* Un tipo que no resuelve no tipa nada en Rust y Go (nunca `unique_name`); un
     `use` dentro de un bloque llega solo a sus líneas; sin manifest gana la declaración del ancestro
     más cercano; `use super::super::*` desde un `mod` de primer nivel bloquea el filtro de
     importadores; `rs_build` indexa por archivo. **`EXTRACTOR_VERSION` 17, `LINK_VERSION` 15.**
-  - *Python (15ad34a).* `requirements/*.txt` declara para el directorio de arriba; un directorio sin
+  - *Python (a3cc43e).* `requirements/*.txt` declara para el directorio de arriba; un directorio sin
     `.py` no sombrea la stdlib; `nombre@url` sin espacios; `-r` documentado como no seguido.
     **`LINK_VERSION` 16.**
+- **Tercera revisión (APROBADA con dos puntos chicos).**
+  - *Resto de N3 (47b3f3c).* `self.m()`/`s.m()` sin contenedor (un `impl` de un trait para un tipo
+    de afuera, un receptor Go que no declara ningún archivo indexado) quedaba en `unique_name`
+    `medium` vía `bare_call`; en Rust y Go termina sin decidir. `rs_name` usa la línea de la llamada.
+    **`LINK_VERSION` 17.** Queda abierto: los tipos y valores de Rust (`rs_type`, `rs_value`) siguen
+    sin línea, así que un `use` de un closure vale para ellos en toda la función.
+  - *Hashes.* La reescritura de la cadena por privacidad cambió los hashes; los que citaban este
+    archivo, las otras tasks de PLAN-009 y el gold se actualizaron a los de la rama publicada.

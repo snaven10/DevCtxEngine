@@ -1,5 +1,5 @@
-# Gold edges de Rust (PLAN-009 TASK-001, DD-1). Los 6 primeros, etiquetados a mano contra ecce342 antes
-# de medir; re-anclados a c1922d0 (TASK-007, mismas llamadas) y ampliados con 14 sitios de TASK-007 y 6
+# Gold edges de Rust (PLAN-009 TASK-001, DD-1). Los 6 primeros, etiquetados a mano contra b009f80 antes
+# de medir; re-anclados a a6c39db (TASK-007, mismas llamadas) y ampliados con 14 sitios de TASK-007 y 6
 # de su revisión (dependencia heredada del workspace, homónimos por #[cfg], use dentro de una fn,
 # método derivable con supertipo externo, Arc::new(T::default())), todos etiquetados antes de medir.
 #

@@ -5,7 +5,7 @@
 # (m1, m2…) y función de módulo (f1, f2…), sin rutas ni números de línea—, el caso que muestrea cada
 # uno y el resultado medido sobre la tabla `edges` (línea exacta) con `graph_bench` en un snapshot de
 # `legacy-migration` (86 archivos versionados, 23 de ellos .py: un paquete con imports relativos, scripts en la raíz y en
-# `scripts/` que importan el paquete, `requirements.txt`): antes = c1922d0 (TASK-006 cerrada),
+# `scripts/` que importan el paquete, `requirements.txt`): antes = a6c39db (TASK-006 cerrada),
 # ahora = TASK-007 (EXTRACTOR_VERSION 14, LINK_VERSION 9). Los 6 primeros son los de TASK-001
 # re-anclados al commit medido; los otros 19 se etiquetaron en TASK-007 leyendo el código ANTES de
 # medir, y los 2 últimos en su revisión (nombre declarado exacto y stdlib sin homónimo en el repo: la

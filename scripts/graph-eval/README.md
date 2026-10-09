@@ -11,7 +11,7 @@ código, la relevancia de `search` y `build_context`, y el costo de indexar. Se 
 | `graph_metrics.sql` | Métricas del grafo (sección `legacy`: `graph_edges` de 0.9.0; sección `new`: `symbols`/`edges`, corre sola cuando existan). |
 | `score.py` | Hit@k, MRR, presencia en el brief, precisión de gold edges, percentiles. Solo stdlib. |
 | `cases-devctx.txt` | 10 casos de este repo. |
-| `gold-devctx.txt` | 26 gold edges de Rust (este repo, contra c1922d0: 6 de TASK-001, 14 de TASK-007 y 6 de su revisión). |
+| `gold-devctx.txt` | 26 gold edges de Rust (este repo, contra a6c39db: 6 de TASK-001, 14 de TASK-007 y 6 de su revisión). |
 | `impact-devctx.txt` | Lista fija de símbolos para la latencia de `impact`. |
 | `gold-java-anon.txt` | Los gold edges de Java de TASK-005 **anonimizados** (alias opacos `ClassA.m1`, sin rutas ni números de línea), con el caso que muestrea cada uno y el resultado medido: para auditar, no para correr. |
 | `gold-ts-anon.txt` | Los gold edges de TypeScript de TASK-006, anonimizados igual (`FileA`, `ClassA.m1`, `f1`), con el caso y el resultado antes/después. |

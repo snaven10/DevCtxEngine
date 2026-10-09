@@ -291,8 +291,8 @@ generales + Java), DD-8 y DD-9.
     `an_incremental_link_pass_equals_a_full_one` ahora corren cada uno en su rama y exigen que la
     arista vigilada de un archivo **no escrito** cambie: `extends`, tipo de retorno, **quitar**
     `@lombok.Data` (medium → sin decidir, una fila que el modo (c) no elige) y cambiar el tipo del
-    campo de un receptor `member`. Contra el código previo (31cf6e0): el de `@Data` falla (el bug
-    de `accessor()`); el de `member` pasa allí porque la selección de 31cf6e0 ya lo cubre por el
+    campo de un receptor `member`. Contra el código previo (97f94ac): el de `@Data` falla (el bug
+    de `accessor()`); el de `member` pasa allí porque la selección de 97f94ac ya lo cubre por el
     token del campo; contra la selección de d9ffc04 (sin tokens ni herencia) fallan los cuatro.
   - *2:* las palabras del hint (`typed`, `field`, `name`, `member`, `chain`…) no son tokens:
     `hint_keywords_do_not_reopen_edges`.
