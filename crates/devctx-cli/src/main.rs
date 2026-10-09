@@ -3898,9 +3898,12 @@ fn cmd_search(
 ) -> Result<()> {
     let cfg = load_project()?;
     // Validate before anything starts a server or loads a model.
-    let rank = sel
+    let mut rank = sel
         .options(cfg.search.penalty)
         .map_err(|e| anyhow::anyhow!(e))?;
+    // Hybrid centrality (PLAN-009 TASK-010): a chunk of an index whose link
+    // pass never ranked it has no rank, and the signal is off for it.
+    rank.centrality = cfg.search.centrality_weight;
     if let Some(r) = remote::ensure_cli(&cfg)? {
         let mode = if hybrid {
             "hybrid"

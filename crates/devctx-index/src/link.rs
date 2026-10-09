@@ -22,6 +22,9 @@
 //! `go.mod`, Python manifests (`crate::env`) — relinks the branch in full. When the written files are
 //! more than a fifth of the branch, every edge is (the full pass). A file is
 //! rewritten only if one of its rows changed.
+//!
+//! A pass that completes ends by ranking the branch (`crate::pagerank`,
+//! DD-12): `symbols.rank` and `in_degree` over the edges as it left them.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -36,7 +39,7 @@ use crate::error::Result;
 /// module): what the branch's edges were resolved under. A build with other
 /// rules relinks the branch in full on its next run, as the extractor
 /// version does for the parse.
-pub(crate) const LINK_VERSION: &str = "20";
+pub(crate) const LINK_VERSION: &str = "21";
 
 /// `index_meta` key of [`LINK_VERSION`].
 pub(crate) const LINK_VERSION_META_KEY: &str = "link_version";
@@ -83,6 +86,11 @@ pub struct LinkStats {
     pub load_ms: u128,
     /// Of which writing the rewritten files.
     pub write_ms: u128,
+    /// Symbols the global PageRank ranked at the end of the pass (DD-12);
+    /// 0 when the pass was cut short.
+    pub ranked: usize,
+    /// Of which computing and writing the ranks.
+    pub rank_ms: u128,
 }
 
 /// Files whose rewritten edges commit together. Each file's rows are written
@@ -478,6 +486,15 @@ pub(crate) fn link_branch(
     let w = Instant::now();
     write_batch(store, repo, branch, &mut pending)?;
     writing += w.elapsed();
+    // The global rank (DD-12), recomputed whole over the edges as the pass
+    // left them: only a pass that completed, since a cut one leaves the pass
+    // owed and the next run ranks.
+    if !stats.cancelled {
+        let r = Instant::now();
+        let ids: Vec<u64> = symbols.iter().map(|s| s.id).collect();
+        stats.ranked = crate::pagerank::rank_branch(store, repo, branch, &ids)?;
+        stats.rank_ms = r.elapsed().as_millis();
+    }
     stats.ms = started.elapsed().as_millis();
     stats.load_ms = loaded;
     stats.write_ms = writing.as_millis();

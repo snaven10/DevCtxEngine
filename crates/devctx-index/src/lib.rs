@@ -12,6 +12,7 @@ pub mod error;
 pub mod git;
 pub mod id;
 mod link;
+mod pagerank;
 pub mod pipeline;
 mod tsconfig;
 
@@ -2676,6 +2677,107 @@ mod tests {
         for c in contains {
             assert_eq!(c.resolution.as_deref(), Some("structural"), "{c:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-010: a pass that completes ranks the branch — every
+    /// symbol gets a rank and an `in_degree` (incoming non-test calls of
+    /// `high`/`medium`), the most called function outranks one nobody calls,
+    /// the same repository indexed twice ranks the same bit for bit, and an
+    /// incremental run that rewrites a file's symbols ranks them again.
+    #[test]
+    fn the_link_pass_ranks_the_branch() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("rank", &files);
+        let ranks = |store: &Store| -> Vec<(u64, Option<u64>, Option<i32>)> {
+            let mut v: Vec<_> = store
+                .branch_symbols(&repo, "main")
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.id, s.rank.map(f64::to_bits), s.in_degree))
+                .collect();
+            v.sort();
+            v
+        };
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let all = store.branch_symbols(&repo, "main").unwrap();
+        assert!(all
+            .iter()
+            .all(|s| s.rank.is_some() && s.in_degree.is_some()));
+        let helper = store
+            .file_symbols(&repo, "main", "src/b/Helper.java")
+            .unwrap();
+        let run = symbol(&helper, "Helper.run");
+        assert_eq!(run.in_degree, Some(1));
+        let f1 = symbol(&all, "f1");
+        assert_eq!(f1.in_degree, Some(0));
+        assert!(run.rank.unwrap() > f1.rank.unwrap(), "{run:?} {f1:?}");
+        let other = Store::open_in_memory(DIM).unwrap();
+        index_branch(&other, &dir, "main", true);
+        assert_eq!(ranks(&store), ranks(&other));
+        // An incremental run rewriting `Helper.java` ranks its symbols again.
+        write(&dir, "src/b/Helper.java", &format!("{LINK_HELPER}\n"));
+        commit_all(&dir, "touch");
+        index_branch(&store, &dir, "main", false);
+        let helper = store
+            .file_symbols(&repo, "main", "src/b/Helper.java")
+            .unwrap();
+        assert!(helper.iter().all(|s| s.rank.is_some()), "{helper:?}");
+        assert_eq!(symbol(&helper, "Helper.run").in_degree, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index from before TASK-010 — no rank anywhere, linked under the
+    /// previous `LINK_VERSION` — is ranked by the next run, with nothing to
+    /// reindex: the new version relinks the branch, and the pass ranks it.
+    #[test]
+    fn an_index_from_before_ranks_gets_them_on_the_next_run() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("rankold", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let repo_path = GitRepo::open(&dir)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .into_owned();
+        // What a 0.10 index before TASK-010 holds: no rank, no in-degree.
+        let mut by_file: std::collections::BTreeMap<String, Vec<devctx_store::StoredSymbol>> =
+            Default::default();
+        for mut s in store.branch_symbols(&repo, "main").unwrap() {
+            (s.rank, s.in_degree) = (None, None);
+            by_file.entry(s.file.clone()).or_default().push(s);
+        }
+        for (file, syms) in &by_file {
+            store
+                .replace_file_symbols(&repo, "main", file, syms)
+                .unwrap();
+        }
+        assert!(store
+            .branch_symbols(&repo, "main")
+            .unwrap()
+            .iter()
+            .all(|s| s.rank.is_none()));
+        store
+            .set_index_meta(&repo_path, "main", crate::link::LINK_VERSION_META_KEY, "20")
+            .unwrap();
+        let res = index_branch(&store, &dir, "main", false);
+        assert_eq!(res.files_indexed, 0, "{res:?}");
+        let all = store.branch_symbols(&repo, "main").unwrap();
+        assert!(
+            all.iter()
+                .all(|s| s.rank.is_some() && s.in_degree.is_some()),
+            "{all:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

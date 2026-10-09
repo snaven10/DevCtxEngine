@@ -722,7 +722,7 @@ fn search_items_with(
     sel: &devctx_search::KindSel,
     build_fts: bool,
 ) -> Result<SearchRows, String> {
-    let opts = sel.options(state.cfg.search.penalty)?;
+    let mut opts = sel.options(state.cfg.search.penalty)?;
     let store = state.open_store()?;
     let (branch_filter, fallback, choice) = search_scope(state, &store);
     let filter = SearchFilter {
@@ -772,6 +772,15 @@ fn search_items_with(
         .filter(|_| mode != SearchMode::Vector)
         .map(|c| lookup::Reader::of(c, &store));
     let by_symbol = reader == Some(lookup::Reader::SymbolGraph);
+    // Centrality (PLAN-009 TASK-010) only from a current symbol graph: a
+    // branch indexed by another extractor, out of step or without symbol
+    // rows has no rank worth trusting, and hybrid search there fuses vector
+    // and keyword alone.
+    opts.centrality = if by_symbol {
+        state.cfg.search.centrality_weight
+    } else {
+        0.0
+    };
     let anchored = devctx_search::search_anchored(
         &store,
         query,

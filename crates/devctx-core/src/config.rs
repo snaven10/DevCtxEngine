@@ -300,8 +300,15 @@ impl Indexing {
     }
 }
 
+/// Default of `search.centrality_weight` (PLAN-009 TASK-010).
+pub const DEFAULT_CENTRALITY_WEIGHT: f32 = 0.3;
+
+fn default_centrality_weight() -> f32 {
+    DEFAULT_CENTRALITY_WEIGHT
+}
+
 /// `search:` section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchCfg {
     /// How far tests / docs / config hits are demoted (`0.6` each by
     /// default). Not a score multiplier: the factor becomes a number of
@@ -312,6 +319,25 @@ pub struct SearchCfg {
     /// the end of the list. See `devctx_core::KindPenalty`.
     #[serde(default)]
     pub penalty: crate::kind::KindPenalty,
+    /// Weight of symbol centrality in hybrid search (PLAN-009 TASK-010,
+    /// DD-13): a third list of the rank fusion, the candidates the
+    /// retrievers already brought ordered by the global PageRank of the
+    /// innermost symbol of each, adding `w / (60 + position + 1)` to each
+    /// hit's fused score. It only reorders: nothing a retriever did not
+    /// bring is added. `0` turns it off; vector search never uses it. With
+    /// `w ≤ 1` it can only overturn a vector+keyword lead smaller than the
+    /// one it adds, so it decides near-ties, not the ranking.
+    #[serde(default = "default_centrality_weight")]
+    pub centrality_weight: f32,
+}
+
+impl Default for SearchCfg {
+    fn default() -> Self {
+        SearchCfg {
+            penalty: crate::kind::KindPenalty::default(),
+            centrality_weight: DEFAULT_CENTRALITY_WEIGHT,
+        }
+    }
 }
 
 /// `reranking:` section.
@@ -726,6 +752,23 @@ mod tests {
             "{w:?}"
         );
         assert!(crate::kind::KindPenalty::default().warnings().is_empty());
+    }
+
+    /// PLAN-009 TASK-010: `search.centrality_weight` has its default when
+    /// absent (also with a `search:` section that only sets the penalty)
+    /// and takes the configured value, `0` included.
+    #[test]
+    fn centrality_weight_defaults_and_parses() {
+        let cfg = ProjectConfig::from_yaml("search:\n  penalty:\n    test: 0.3\n").unwrap();
+        assert_eq!(cfg.search.centrality_weight, DEFAULT_CENTRALITY_WEIGHT);
+        assert_eq!(
+            ProjectConfig::default().search.centrality_weight,
+            DEFAULT_CENTRALITY_WEIGHT
+        );
+        let cfg = ProjectConfig::from_yaml("search:\n  centrality_weight: 0\n").unwrap();
+        assert_eq!(cfg.search.centrality_weight, 0.0);
+        let cfg = ProjectConfig::from_yaml("search:\n  centrality_weight: 0.15\n").unwrap();
+        assert_eq!(cfg.search.centrality_weight, 0.15);
     }
 
     #[test]

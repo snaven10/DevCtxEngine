@@ -105,6 +105,7 @@ impl MemScope {
 fn rank_options(cfg: &ProjectConfig) -> RankOptions {
     RankOptions {
         penalty: cfg.search.penalty,
+        centrality: cfg.search.centrality_weight,
         ..Default::default()
     }
 }

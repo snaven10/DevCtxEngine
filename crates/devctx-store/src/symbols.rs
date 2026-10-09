@@ -173,6 +173,24 @@ fn row_to_edge(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbolEdge> {
     })
 }
 
+/// An aggregated edge of a branch's PageRank graph
+/// ([`Store::branch_rank_edges`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankEdge {
+    /// Source symbol.
+    pub src: u64,
+    /// Destination symbol.
+    pub dst: u64,
+    /// Relation (`calls`, `instantiates`, …; never `contains`).
+    pub kind: String,
+    /// `high`, `medium`, `low`.
+    pub confidence: Option<String>,
+    /// The occurrences are in a test file.
+    pub from_test: bool,
+    /// Occurrences.
+    pub n: u64,
+}
+
 const EDGE_SELECT: &str = "SELECT kind, src_id, dst_id, dst_name, file, line, confidence, \
      resolution, external, from_test, edge_source, hint FROM edges";
 
@@ -447,6 +465,117 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The edges a branch's PageRank runs on (PLAN-009 DD-12): `live_edges`
+    /// with a destination — a call the link pass discarded never counts —
+    /// but `contains`, aggregated per `(src, dst, kind, confidence,
+    /// from_test)` with their number of occurrences, in that order.
+    pub fn branch_rank_edges(&self, repo: &str, branch: &str) -> Result<Vec<RankEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT src_id, dst_id, kind, confidence, coalesce(from_test, false), count(*)
+               FROM live_edges
+              WHERE repo = ? AND branch = ? AND dst_id IS NOT NULL AND kind <> 'contains'
+              GROUP BY ALL
+              ORDER BY 1, 2, 3, 4 NULLS FIRST, 5",
+        )?;
+        let rows = stmt.query_map(params![repo, branch], |r| {
+            Ok(RankEdge {
+                src: r.get(0)?,
+                dst: r.get(1)?,
+                kind: r.get(2)?,
+                confidence: r.get(3)?,
+                from_test: r.get(4)?,
+                n: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Write `symbols.rank` and `symbols.in_degree` of a branch, one
+    /// `(id, rank, in_degree)` per symbol, in one transaction (a temporary
+    /// table and one `UPDATE`). A symbol not in `ranks` keeps its values.
+    pub fn write_branch_ranks(
+        &self,
+        repo: &str,
+        branch: &str,
+        ranks: &[(u64, f64, i32)],
+    ) -> Result<()> {
+        self.in_transaction(|| {
+            let w = self.w()?;
+            w.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS rank_update
+                   (id UBIGINT, rank DOUBLE, in_degree INTEGER);
+                 DELETE FROM rank_update;",
+            )?;
+            let mut app = w.appender("rank_update")?;
+            for &(id, rank, deg) in ranks {
+                app.append_row(params![id, rank, deg])?;
+            }
+            app.flush()?;
+            drop(app);
+            w.execute(
+                "UPDATE symbols SET rank = u.rank, in_degree = u.in_degree
+                   FROM rank_update u
+                  WHERE symbols.repo = ? AND symbols.branch = ? AND symbols.id = u.id",
+                params![repo, branch],
+            )?;
+            w.execute_batch("DELETE FROM rank_update;")?;
+            Ok(())
+        })
+    }
+
+    /// The global rank of the innermost symbol containing each chunk (DD-4:
+    /// by file and line range; never a `file` symbol), or `None`: a chunk of
+    /// no symbol (a whole-file or doc chunk, a memory), or a branch whose link
+    /// pass has not ranked it (an index from before TASK-010). `chunks` are
+    /// `(repo, branch, file, start_line, end_line)`; the answer is in their
+    /// order. One query per `(repo, branch)` among them.
+    pub fn chunk_ranks(&self, chunks: &[(&str, &str, &str, i32, i32)]) -> Result<Vec<Option<f64>>> {
+        let mut out = vec![None; chunks.len()];
+        let mut groups: Vec<((&str, &str), Vec<usize>)> = Vec::new();
+        for (i, c) in chunks.iter().enumerate() {
+            if c.2.is_empty() {
+                continue;
+            }
+            match groups.iter_mut().find(|(k, _)| *k == (c.0, c.1)) {
+                Some((_, v)) => v.push(i),
+                None => groups.push(((c.0, c.1), vec![i])),
+            }
+        }
+        for ((repo, branch), idx) in groups {
+            let values = vec!["(?, ?, ?, ?)"; idx.len()].join(", ");
+            let mut args: Vec<duckdb::types::Value> = Vec::with_capacity(idx.len() * 4 + 2);
+            for &i in &idx {
+                let c = chunks[i];
+                args.push((i as i64).into());
+                args.push(c.2.to_string().into());
+                args.push(c.3.into());
+                args.push(c.4.into());
+            }
+            args.push(repo.to_string().into());
+            args.push(branch.to_string().into());
+            let sql = format!(
+                "SELECT c.i, s.rank
+                   FROM (VALUES {values}) AS c(i, file, lo, hi)
+                   JOIN symbols s ON s.file = c.file
+                    AND s.start_line <= c.lo AND s.end_line >= c.hi
+                  WHERE s.repo = ? AND s.branch = ? AND s.kind <> 'file'
+                QUALIFY row_number() OVER (
+                    PARTITION BY c.i
+                    ORDER BY s.end_line - s.start_line, s.start_line DESC, s.id) = 1"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(duckdb::params_from_iter(args), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?))
+            })?;
+            for r in rows {
+                let (i, rank) = r?;
+                out[i as usize] = rank;
+            }
+        }
+        Ok(out)
+    }
+
     /// `(symbols, edges)` rows of a branch.
     pub fn graph_row_counts(&self, repo: &str, branch: &str) -> Result<(u64, u64)> {
         let n = |table: &str| -> Result<u64> {
@@ -594,6 +723,108 @@ mod tests {
         assert_eq!(live, 1);
         assert_eq!(store.branch_undecided_calls("r", "main").unwrap(), 1);
         assert_eq!(store.branch_discarded_calls("r", "main").unwrap(), 1);
+    }
+
+    /// The PageRank graph reads `live_edges` (TASK-010): a discarded call
+    /// pointed at a symbol never counts; occurrences are aggregated with
+    /// their number, `contains` and undecided rows are left out.
+    #[test]
+    fn the_rank_graph_reads_live_edges_only() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let f = sym("r", "a.py", FILE_KIND, "a.py", None);
+        let run = sym("r", "a.py", "function", "run", Some(f.id));
+        let mut helper = sym("r", "a.py", "function", "helper", Some(f.id));
+        helper.start_line = 5;
+        helper.end_line = 6;
+        let call = |line, dst: Option<u64>| StoredSymbolEdge {
+            kind: "calls".into(),
+            src_id: run.id,
+            dst_id: dst,
+            dst_name: "helper".into(),
+            file: "a.py".into(),
+            line,
+            confidence: Some("high".into()),
+            resolution: Some("same_file".into()),
+            external: Some(false),
+            edge_source: "treesitter".into(),
+            ..Default::default()
+        };
+        let mut discarded = call(5, Some(helper.id));
+        discarded.resolution = Some("discarded".into());
+        let mut contains = call(1, Some(run.id));
+        contains.kind = "contains".into();
+        contains.src_id = f.id;
+        let edges = vec![
+            call(3, Some(helper.id)),
+            call(4, Some(helper.id)),
+            discarded,
+            call(6, None),
+            contains,
+        ];
+        store
+            .replace_file_graph(
+                "r",
+                "main",
+                "a.py",
+                &[f, run.clone(), helper.clone()],
+                &edges,
+            )
+            .unwrap();
+        let got = store.branch_rank_edges("r", "main").unwrap();
+        assert_eq!(
+            got,
+            vec![RankEdge {
+                src: run.id,
+                dst: helper.id,
+                kind: "calls".into(),
+                confidence: Some("high".into()),
+                from_test: false,
+                n: 2,
+            }]
+        );
+    }
+
+    /// Ranks are written per symbol and read back per chunk: the innermost
+    /// symbol containing the chunk's lines, never the file symbol; a chunk
+    /// of no symbol, of another branch or before any rank is `None`.
+    #[test]
+    fn ranks_are_written_and_read_per_chunk() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mut f = sym("r", "a.rs", FILE_KIND, "a.rs", None);
+        f.end_line = 100;
+        let mut outer = sym("r", "a.rs", "impl", "Outer", Some(f.id));
+        (outer.start_line, outer.end_line) = (10, 50);
+        let mut inner = sym("r", "a.rs", "method", "Outer.inner", Some(outer.id));
+        (inner.start_line, inner.end_line) = (20, 30);
+        store
+            .replace_file_symbols(
+                "r",
+                "main",
+                "a.rs",
+                &[f.clone(), outer.clone(), inner.clone()],
+            )
+            .unwrap();
+        let chunks = [
+            ("r", "main", "a.rs", 22, 28),
+            ("r", "main", "a.rs", 12, 18),
+            ("r", "main", "a.rs", 1, 100),
+            ("r", "dev", "a.rs", 22, 28),
+            ("r", "main", "", 0, 0),
+        ];
+        assert_eq!(store.chunk_ranks(&chunks).unwrap(), vec![None; 5]);
+        store
+            .write_branch_ranks(
+                "r",
+                "main",
+                &[(f.id, 0.5, 0), (outer.id, 0.2, 1), (inner.id, 0.3, 7)],
+            )
+            .unwrap();
+        assert_eq!(
+            store.chunk_ranks(&chunks).unwrap(),
+            vec![Some(0.3), Some(0.2), None, None, None]
+        );
+        let back = store.symbol_by_id("r", "main", inner.id).unwrap().unwrap();
+        assert_eq!((back.rank, back.in_degree), (Some(0.3), Some(7)));
     }
 
     /// One row per occurrence: the writer does not fold two calls to the same

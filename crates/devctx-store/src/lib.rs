@@ -37,7 +37,7 @@ pub use routes::StoredRoute;
 pub use schema::init_schema;
 pub use state::{CopySetup, FileState, IndexRecord, EMBED_FP_META_KEY, EXTRACTOR_META_KEY};
 pub use store::{normalize_metric, MemoryReport, Store};
-pub use symbols::{StoredSymbol, StoredSymbolEdge};
+pub use symbols::{RankEdge, StoredSymbol, StoredSymbolEdge};
 
 #[cfg(test)]
 mod tests {
