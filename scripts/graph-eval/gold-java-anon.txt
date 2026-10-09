@@ -40,3 +40,15 @@ backend-a|ClassX|Session.m19|external|parámetro de lambda sin tipo|missing|miss
 # Total: 20/25 correctos en ambos; en `high` 20/20 (d9ffc04) y 19/19 (ahora: el sitio de
 # `Long.equals` pasó a `medium`). No hay en los repos medidos una lambda que sombree un campo: ese
 # caso lo cubre `lambda_parameters_and_patterns_bind_their_names` (link_java.rs).
+#
+# Dispatch por interfaz (PLAN-009 TASK-017), con los mismos alias (ClassA.Inner2..4, m20..m22 y
+# ClassY, ClassZ, ClassAA son nuevos). No es una arista sino un nodo de `impact_analysis`: el
+# símbolo pedido, la dirección y el nodo que tiene que aparecer, medido con la tool (defaults) sobre
+# un índice de cada repo del binario de TASK-017.
+# Formato: repo | símbolo pedido | dirección | nodo esperado | caso | sin dispatch (TASK-009) | con dispatch
+backend-b|ClassA.Inner1.m20|upstream|ClassA.m20 (through ClassA.Inner4.m20, prof. 1)|adaptador elegido en tiempo de ejecución y llamado por su interfaz interna (receptor tipado por el retorno de un método)|ausente|correct medium/dispatch
+backend-b|ClassB.m20|upstream|ClassA.m20 (through ClassA.Inner4.m20, prof. 2)|dispatch en profundidad 2: al servicio lo llama el adaptador, al adaptador su interfaz|ausente (el recorrido se cortaba en ClassA.Inner1.m20)|correct medium/dispatch
+backend-b|ClassA.Inner4.m20|downstream|ClassA.Inner1.m20, ClassA.Inner2.m20, ClassA.Inner3.m20 (prof. 1)|las tres implementaciones de la interfaz interna|ausentes|correct 3/3 medium/dispatch
+backend-a|ClassZ.m21|upstream|ClassAA.m22 (through ClassY.m21, prof. 1)|handler elegido por tipo y llamado por su interfaz|ausente|correct medium/dispatch
+backend-a|ClassY.m21|downstream|sus 7 implementaciones (prof. 1)|interfaz con siete implementaciones|ausentes|correct 7/7 medium/dispatch (5 listadas; 2 en omitted_for_budget, el presupuesto de salida)
+# Total dispatch: 5/5 casos (13/13 nodos esperados), ninguno `high`.

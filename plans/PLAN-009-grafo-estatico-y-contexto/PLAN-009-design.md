@@ -842,6 +842,23 @@ viejo, sin filtros ni tope, para que una rama vieja conteste igual que 0.9.0 má
     agrega a `warning` que no se aplicaron también en `Backend::Local` (y en la API y el CLI
     local, que comparten `impact_on`); el aviso no se duplica si un cliente remoto lo vuelve a
     poner.
+- **Dispatch por interfaz (TASK-017, decisión del usuario del 2026-10-08):** cada nodo de cada
+  nivel se expande a sus métodos override-equivalentes por las aristas `inherits`/`implements`
+  resueltas de `live_edges` (mismo nombre, kind invocable, aridad compatible; `private`/`static`
+  no; transitivo hasta 4 niveles de supertipos; Go afuera). Upstream, `Impl.m` alcanza a los
+  llamadores de los métodos que sobrescribe, a la profundidad de un llamador directo; downstream,
+  un método de interfaz o abstracto alcanza a sus implementaciones un nivel debajo de él. El nodo
+  lleva `via: "dispatch"` y `through`; confianza `min(medium, arista original, arista de herencia
+  más débil)` (downstream, tampoco más que lo que alcanzó al origen): nunca `high`, un `low` no
+  sube; a igual confianza gana la directa. Tope de 16 equivalentes por nodo, lo demás en
+  `omitted_by_limit.dispatch: {count, max_per_node}` (sumado a `omitted_by_limit.count` y
+  `omitted.count`). Activo por defecto; `dispatch: false` lo apaga, `min_confidence: high` lo deja
+  afuera contado, y `filters.dispatch` dice si aplicó. **Costo:** el grafo de supertipos se lee una
+  vez por llamada (`DispatchIndex`, dos sentencias constantes) y cada nivel se expande en memoria:
+  ningún nivel paga una sentencia más (la primera versión, un CTE recursivo por nivel, duplicaba el
+  p95 de backend-a). Medido: p95 con dispatch 26-106 ms en backend-a y backend-b (Resultado de
+  TASK-017). Para TS hizo falta que el método de una interfaz sea símbolo (`EXTRACTOR_VERSION` 20).
+  `traverse` (TASK-013) usa la misma expansión.
 
 ## DD-12 — PageRank: global al indexar, personalizado al consultar
 

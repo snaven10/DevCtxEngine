@@ -13,7 +13,7 @@ código, la relevancia de `search` y `build_context`, y el costo de indexar. Se 
 | `cases-devctx.txt` | 10 casos de este repo. |
 | `gold-devctx.txt` | 26 gold edges de Rust (este repo, contra a6c39db: 6 de TASK-001, 14 de TASK-007 y 6 de su revisión). |
 | `impact-devctx.txt` | Lista fija de símbolos para la latencia de `impact`. |
-| `gold-java-anon.txt` | Los gold edges de Java de TASK-005 **anonimizados** (alias opacos `ClassA.m1`, sin rutas ni números de línea), con el caso que muestrea cada uno y el resultado medido: para auditar, no para correr. |
+| `gold-java-anon.txt` | Los gold edges de Java de TASK-005 **anonimizados** (alias opacos `ClassA.m1`, sin rutas ni números de línea), con el caso que muestrea cada uno y el resultado medido, y los casos de dispatch por interfaz de TASK-017 (nodos de `impact_analysis`): para auditar, no para correr. |
 | `gold-ts-anon.txt` | Los gold edges de TypeScript de TASK-006, anonimizados igual (`FileA`, `ClassA.m1`, `f1`), con el caso y el resultado antes/después. |
 | `gold-python-anon.txt` | Los gold edges de Python de TASK-007 (27 sitios de `legacy-migration`), anonimizados igual, con el caso y el resultado antes/después. |
 

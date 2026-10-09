@@ -254,7 +254,7 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-014 | Tool `skeleton` por archivo | general-purpose (Rust) | TASK-004 | `pending` |
 | TASK-015 | Docs EN + ES y guía de reindex | general-purpose (Rust) | TASK-002, TASK-011, TASK-012, TASK-013, TASK-014 | `pending` |
 | TASK-016 | Verificación de campo contra §6 | — (orquestador, con aprobación del usuario) | TASK-015 | `pending` |
-| TASK-017 | Dispatch por interfaz en `impact_analysis` (y `traverse`): override-equivalentes vía `implements`/`inherits`, `medium`, `via: "dispatch"` | general-purpose (Rust) | TASK-009 | `pending` |
+| TASK-017 | Dispatch por interfaz en `impact_analysis` (y `traverse`): override-equivalentes vía `implements`/`inherits`, `medium`, `via: "dispatch"` | general-purpose (Rust) | TASK-009 | `done` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
 
