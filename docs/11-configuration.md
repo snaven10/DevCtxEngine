@@ -44,6 +44,7 @@ search:
     test: 0.6
     doc: 0.6
     config: 0.6
+  centrality_weight: 0.3       # weight of symbol centrality in hybrid search; 0 = off
 
 reranking:
   enabled: false               # opt-in; see docs/08 ADR-15 for the measurements
@@ -90,7 +91,9 @@ server holds the config it started with: `devctx serve --stop` first (§6).
 
 `search.penalty` is explained in
 [Search](03-core-concepts/search.md#file-kind-and-the-penalty); a factor above
-`1.0` is warned about when the config loads.
+`1.0` is warned about when the config loads. `search.centrality_weight` (hybrid
+search and `build_context` only, never vector search) is explained in
+[Search](03-core-concepts/search.md#centrality-hybrid-only).
 
 **Where the database ends up.** `storage.db_path` wins; then
 `{state_dir}/index.duckdb`; then `.devctx/state/index.duckdb` under the project

@@ -130,6 +130,34 @@ necesita calibrar entre dos sistemas cuyos números significan cosas distintas.
 Si el índice FTS no fue construido, la híbrida degrada en silencio a solo
 vectorial en vez de fallar.
 
+### Centralidad (solo híbrida)
+
+En un índice hecho por 0.10 o posterior, cada símbolo tiene un **rank** global:
+un PageRank sobre el grafo de símbolos, calculado al final de cada corrida de
+`index` (las llamadas y las instanciaciones cuentan entero, la herencia un poco
+menos, los usos de tipo la mitad, los imports menos; una llamada desde un test o
+de confianza baja transmite menos, y un helper llamado 300 veces por un mismo
+llamador no cuenta 300 veces). La búsqueda híbrida lo suma como una **tercera
+lista de la fusión**: los candidatos que ya trajeron los dos recuperadores,
+ordenados por el rank del símbolo más interno que contiene cada chunk, cada uno
+sumando `w / (k + posición)` a su puntaje fusionado.
+
+- Solo reordena: nunca agrega un chunk que ningún recuperador trajo. Un chunk
+  de ningún símbolo (el resumen de un archivo, un doc) va al final de esa lista.
+- `w` es `search.centrality_weight` (default `0.3`; `0` la apaga). Con `w ≤ 1`
+  solo puede dar vuelta una ventaja menor que la que suma: decide casi-empates,
+  no el ranking.
+- La búsqueda vectorial nunca la usa; la penalización por tipo, la
+  deduplicación y el anclaje por identificador van después, así que una
+  definición que la consulta nombra sigue primero.
+- `raw_score` sigue siendo la fusión de vectorial + palabra clave, sin
+  centralidad.
+- Un índice anterior a los ranks de 0.10, o de un extractor viejo, no tiene
+  rank que usar: la híbrida fusiona solo vectorial y palabra clave. El primer
+  `devctx index` de la versión nueva calcula los ranks sin volver a embeber.
+
+`build_context` busca en modo híbrido, así que el brief también la usa.
+
 ## Reranking
 
 Un cross-encoder puede reordenar el pool de candidatos antes de truncarlo a

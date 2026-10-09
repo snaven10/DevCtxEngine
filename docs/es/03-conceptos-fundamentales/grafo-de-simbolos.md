@@ -141,8 +141,9 @@ grafo de símbolos **por id** — una consulta por nivel, sin importar el tamañ
 la frontera — y cada símbolo trae además `confidence` (de la llamada que lo
 alcanzó), `via` (`calls` o `instantiates`), `sym`, `file` y `line` (de su
 definición), y `test`, `external` o `undecided` cuando son verdaderos. Dentro de
-una profundidad, el orden es por confianza, después por rank (cuando el índice lo
-calcule) y después por nombre.
+una profundidad, el orden es por confianza, después por rank (el PageRank global
+que calcula cada corrida de `index`; ver
+[Búsqueda](busqueda.md#centralidad-solo-híbrida)) y después por nombre.
 
 Lo que los defaults dejan afuera **se cuenta, nunca desaparece en silencio**, y no
 se recorre:

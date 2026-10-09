@@ -245,7 +245,7 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
 - **`impact_analysis` walks the symbol graph by levels** (PLAN-009 TASK-009):
   one query per depth and direction over ids (through `live_edges`: a discarded
   call reaches no answer), whatever the size of the frontier; the frontier goes
-  as an `IN` list up to 1 024 ids and as one `UBIGINT[]` parameter above.
+  as an `IN` list up to 512 ids and as one `UBIGINT[]` parameter above.
   **A bare name means the repository's definitions of it**, as in
   `get_references` (0.9 merged every call written with that name, libraries'
   included); a name with no definition stands for its external call sites (its
@@ -253,9 +253,10 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   `suggestions`, as `read_symbol` does. **New defaults** (the answer an agent
   sees changes): only `high`/`medium` calls are followed, symbols of test files
   and library callees are left out, and 200 symbols per direction are listed;
-  what that leaves out is counted (`below_confidence` — calls to the name the
-  index could not decide included —, `excluded`, `omitted` +
-  `omitted_by_limit`) and not walked, and `min_confidence`, `include_tests`,
+  what that leaves out is counted (`below_confidence`, in symbols;
+  `undecided_calls`, the calls to the name the index could not decide, in
+  calls, none from a test or from a caller already listed; `excluded`,
+  `omitted` + `omitted_by_limit`) and not walked, and `min_confidence`, `include_tests`,
   `include_external` and `max_nodes` (tool, `GET /impact` query, `devctx
   impact` flags) change it; `filters` says which applied. Each symbol adds
   `confidence`, `via`, `sym`, `file`, `line` and `test`/`external`/`undecided`
@@ -266,8 +267,11 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   id) in about 50 ms — the batching —, and the defaults list 252 (56 more counted
   past the cap) in about 57 ms — the meaning of a bare name and the defaults. The
   0.9 fields keep their meaning; an index from an older extractor, or without
-  symbol rows, walks as 0.9 did and says so in `warning`, and a client that
-  passed filters to a server that ignored them says so too. The TUI's local view
+  symbol rows, walks as 0.9 did and says so in `warning` (and that the filters
+  passed were not applied, also on a local backend), and a client that passed
+  filters to a server that ignored them says so too. A caller listed only
+  through an undecided call that a later depth reaches by a decided one is
+  shown decided and walked. The TUI's local view
   gives the tool's answer.
 - **Link rules version 19:** in a Rust `impl Trait for T` with `T` from
   outside the repository, `self.m()` resolves to the `impl`'s own method
@@ -278,6 +282,24 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   outside, the `impl`'s own method is `medium` too, no longer `high`: an
   inherent method of `T` of that name wins in Rust (`self.len()` in an
   `impl Counted for String` calls `String::len`).
+- **Symbol centrality in hybrid search** (PLAN-009 TASK-010): every link pass
+  that completes ends by computing a global PageRank of the branch's symbols
+  (`symbols.rank`) and their `in_degree` (incoming non-test calls of `high` or
+  `medium` confidence), over `live_edges` (a discarded call never counts):
+  calls and instantiations weigh 1, inheritance 0.8, type uses 0.5, imports
+  0.3, `contains` 0; confidence and tests decide how much a symbol passes on
+  (`high` 1, `medium` 0.6, `low` 0.2, from a test × 0.1) and `sqrt(n)` tames
+  repeated calls; damping 0.85, at most 50 iterations, deterministic. Hybrid
+  search — and so `build_context` — adds it as a third list of the rank
+  fusion over the candidates the retrievers brought, ordered by the rank of the
+  innermost symbol of each chunk, with weight `search.centrality_weight`
+  (default 0.3, `0` turns it off). Vector search is unchanged, an anchored
+  definition still comes first, and `raw_score` stays the vector + keyword
+  fusion (an anchored hit's too). Off on an index without ranks or from an
+  older extractor. Cost: about 0.1-0.2 s per pass on a 1 250-file Java
+  repository (22 876 symbols); hybrid search p50 within a few ms.
+- **Link rules version 21:** an existing index is relinked — and ranked — by
+  its next `devctx index`, with nothing re-embedded.
 
 ### Fixed
 

@@ -11,8 +11,8 @@
 //!   Calls to the name the link pass left undecided are counted apart, in
 //!   calls (`undecided_calls`), or listed with `low`.
 //! - Within a level nodes are ordered by `confidence`, then `rank` (the
-//!   global PageRank; NULL until TASK-010, when the order falls to the name),
-//!   then the name.
+//!   global PageRank the link pass computes, TASK-010; a NULL rank sorts
+//!   last), then the name.
 //! - The cap (`max_nodes`, per direction) is applied **before** the next
 //!   level is computed: the nodes of the level that overflow it are counted,
 //!   not walked, and no deeper level is read.

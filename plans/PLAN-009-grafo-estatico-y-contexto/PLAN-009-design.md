@@ -782,7 +782,7 @@ después del resto. Se agregan `kind`, `qualified`, `via`, `below_confidence`.
 `Reader` de TASK-008). `Store::impact_analysis` (0.9.0 sobre `graph_edges`) queda como camino
 viejo, sin filtros ni tope, para que una rama vieja conteste igual que 0.9.0 más el `warning`.
 - Aristas seguidas: `calls` e `instantiates` (el default de `get_references`), siempre por
-  `live_edges`. Una sentencia por nivel; la frontera va como lista `IN (…)` hasta 1 024 ids y como
+  `live_edges`. Una sentencia por nivel; la frontera va como lista `IN (…)` hasta 512 ids (1 024 antes del NIT 1, abajo) y como
   un parámetro `UBIGINT[]` por encima (revisión, abajo; números en el Resultado de TASK-009).
 - Un nodo que un filtro deja afuera (confianza, test, externo) no se recorre; se cuenta una vez
   por nodo (`below_confidence`, `excluded: {tests, external}`), y si un nivel posterior lo
@@ -813,6 +813,25 @@ viejo, sin filtros ni tope, para que una rama vieja conteste igual que 0.9.0 má
   (`FrontierSql::Auto`), medido en backend-a (Resultado de TASK-009): el `IN` gana en recorridos
   reales y el parámetro desde 2 000 ids; la lista tipada y la tabla temporal pierden. Los ganchos
   de medición quedan detrás del feature `bench`.
+- **Revisión de TASK-009, segunda ronda (hecha en el primer commit de TASK-010):**
+  - *m-a:* `below_confidence` cuenta **solo símbolos**; las llamadas al nombre sin decidir van a
+    un campo propio, `undecided_calls: {count, hint}`, contadas **en llamadas**, sin las de
+    tests, las de llamadores que ya aparecen por otra arista ni las de la propia definición
+    (antes `get` de backend-a mostraba 370 en `below_confidence`, unidades mezcladas). Con `low`
+    se listan sus llamadores y el campo no aparece. Aditivo.
+  - *NIT 1:* `AUTO_IN_MAX` baja de 1 024 a **512**. Todo recorrido real medido (frontera máxima
+    373 ids) sigue con `IN`; en 1 000 ids el parámetro ya ganaba (24 contra 36 ms). Re-medido en
+    TASK-010 con una consulta de nivel sobre fronteras sintéticas de backend-a (p50 upstream,
+    `IN` / `UBIGINT[]`, máquina con carga): 256 ids 21,4 / 15,2 ms; 373: 25,8 / 17,2; 512:
+    25,7 / 19,0; 768: 26,9 / 18,3; 1 024: 28,2 / 18,6. El parámetro gana en todas, también
+    debajo de 512; el umbral queda en 512 porque los recorridos reales de TASK-009 (que encadenan
+    varios niveles y abren el store) favorecieron al `IN` por debajo de ~400 ids.
+  - *NIT 2:* un llamador listado `undecided` en el nivel 1 que un nivel posterior alcanza con una
+    arista decidida deja su lugar: se muestra decidido, en esa profundidad, y se recorre.
+  - *NIT 3:* en el camino viejo (índice de otro extractor o sin filas), una consulta con filtros
+    agrega a `warning` que no se aplicaron también en `Backend::Local` (y en la API y el CLI
+    local, que comparten `impact_on`); el aviso no se duplica si un cliente remoto lo vuelve a
+    poner.
 
 ## DD-12 — PageRank: global al indexar, personalizado al consultar
 
@@ -835,6 +854,25 @@ viejo, sin filtros ni tope, para que una rama vieja conteste igual que 0.9.0 má
 **Alternativa descartada:** PageRank sobre archivos (Aider). Con `symbols` se puede rankear a nivel
 símbolo y agregar a archivo sumando; al revés no.
 
+**Implementado en TASK-010 (parte global), con estas diferencias:**
+- `crates/devctx-index/src/pagerank.rs` (`pagerank`, `rank_branch`) y, en el store,
+  `branch_rank_edges` (sobre `live_edges`: una descartada nunca cuenta; agregadas por
+  `(src, dst, kind, confidence, from_test)` con su `n`), `write_branch_ranks` (tabla temporal y un
+  `UPDATE`) y `chunk_ranks` (DD-4). El link pass que **completa** rankea la rama al final; uno
+  cortado deja el pase debido y la próxima corrida rankea. **`LINK_VERSION` 21:** un índice
+  existente se relinkea y rankea en su próxima corrida, sin reindexar ni embeber.
+- **Normalización:** un nodo reparte su rank por `peso / Σ kind × sqrt(n)` de sus aristas. Kind y
+  multiplicidad deciden **cómo** reparte; confianza y test deciden **cuánto**: lo que no reparte
+  se redistribuye uniforme, como el de un nodo colgante. Con la normalización clásica (por la
+  suma de los pesos) los factores de confianza y de test se cancelan en un nodo cuyas aristas los
+  comparten todas (un método de test: todas sus aristas son `from_test`), y el ×0.1 no tendría
+  efecto.
+- `in_degree` = ocurrencias de `calls` entrantes, no-test, `high`/`medium`. `rank` es una
+  probabilidad (suma 1 por rama). Determinista: nodos y aristas se ordenan antes de iterar (test
+  que falla si se quita el orden).
+- Costo medido (Resultado de TASK-010): backend-a, 22 876 símbolos, 69-165 ms por pase (cálculo y
+  escritura); DevCtxEngine 58 ms; backend-b 21 ms.
+
 ## DD-13 — Cómo compone con el ranking actual
 
 Orden del pipeline de `search_ranked` (`devctx-search/src/lib.rs:269-357`) con la señal nueva:
@@ -856,6 +894,27 @@ retrievers (vector, keyword) ─▶ RRF ─[+ lista de centralidad, peso w]─�
 - `raw_score` no cambia de semántica: es el del retriever/RRF de vector+keyword, sin la centralidad,
   para que la selección de miembro de grupo (`member_scores`, `state.rs:4557-4572`) siga comparando
   cosenos.
+
+**Implementado en TASK-010, con estas diferencias:**
+- `RankOptions.centrality` (`search.centrality_weight`); `with_centrality` corre sobre la salida de
+  la RRF, reescribe `score` (la fusión + la centralidad, para que el orden y los scores sigan
+  monótonos) y deja la fusión de vector + keyword en `raw_score`. Un hit sin rank va al final de
+  la lista de centralidad, en el orden que traía. Sin ningún rank en el pool (índice anterior,
+  rama sin rankear, chunks de ningún símbolo) es la misma lista, sin tocar.
+- **Hit anclado:** el anclaje le daba el score más alto de la respuesta, que con centralidad ya no
+  es de un retriever. Ahora su retriever score es el mejor retriever score de la respuesta (y su
+  `score`, el más alto, como antes), así la selección de miembro nunca ve centralidad, ni un
+  logit del cross-encoder ni el clamp de la penalización. Sin centralidad, sin rerank y sin un hit
+  degradado arriba, es el mismo número que antes.
+- El MCP (`search`, `build_context`) usa la centralidad **solo con un grafo de símbolos vigente**
+  (`Reader::SymbolGraph`): una rama de otro extractor, fuera de paso o sin filas fusiona solo
+  vector + keyword. El CLI local y la TUI toman el peso de la config (un índice sin ranks la
+  apaga sola).
+- **Calibración** (Resultado de TASK-010; arnés de TASK-001, modelo real, DevCtxEngine y backend-b,
+  12 casos): `w` = **0,3** se queda. Es el menor que maximiza el brief (archivo 11/12 → 12/12, por
+  un caso de backend-b) sin bajar Hit@5 ni MRR híbrido (Hit@5 8/12 → 9/12; MRR de DevCtxEngine
+  0,662 → 0,659-0,664, dentro del ruido). Evidencia fina: confirmar con backend-a (8 casos) cuando
+  haya OK para indexarlo con modelo, y en TASK-016.
 
 ## DD-14 — Tool `repo_map`
 
