@@ -169,7 +169,9 @@ solo desde el símbolo pedido):
   implementan, un nivel debajo de él, y a lo que estos llaman.
 
 Un método es override-equivalente si tiene el mismo nombre y una aridad que puede
-coincidir (los parámetros con default, opcionales o variádicos la amplían); un
+coincidir (los parámetros con default, opcionales o variádicos la amplían; en
+TypeScript y JavaScript el método que implementa puede tomar menos parámetros que
+el que implementa); un
 método private o static no sobrescribe nada; entre sobrecargas de igual aridad en
 un supertipo gana la que coincide exacto en los tipos simples de sus parámetros. La cadena de supertipos se sigue
 hasta cuatro niveles (`ServiceImpl` → `BaseService` → `IService` → su

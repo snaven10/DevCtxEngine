@@ -163,7 +163,9 @@ about):
   implement it, one level below it, and what those call.
 
 A method is override-equivalent when it has the same name and an arity that can
-match (defaults, optional and variadic parameters widen it); a private or static
+match (defaults, optional and variadic parameters widen it; in TypeScript and
+JavaScript the implementing method may take fewer parameters than the one it
+implements); a private or static
 method overrides nothing; among same-arity overloads in one supertype, the one
 whose simple parameter types match exactly wins. The chain of supertypes is followed up to four levels
 (`ServiceImpl` → `BaseService` → `IService` → its super-interface). Such a node

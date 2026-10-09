@@ -326,7 +326,8 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   static method, not in Go (embedding is no override). Such a node has `via:
   "dispatch"` and `through` (the method it went through), and confidence
   `min(medium, the edge it stands for)` — never `high`, a `low` call stays
-  `low`. Among same-arity overloads in one supertype, the one whose simple
+  `low`. In TypeScript and JavaScript an implementation may take fewer
+  parameters than the method it implements. Among same-arity overloads in one supertype, the one whose simple
   parameter types match exactly. At most 16 equivalents per node, production
   before tests; the rest are counted in `omitted_by_limit.dispatch` only (not
   in its `count` nor in `omitted`, which count nodes). `dispatch: false` (tool,

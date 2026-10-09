@@ -9,7 +9,9 @@
 //!
 //! Override-equivalent = the same name, a callable kind, and an arity that can
 //! match (the parameter lists of both signatures, when they can be read; a
-//! default, an optional or a variadic parameter widens the range). The chain
+//! default, an optional or a variadic parameter widens the range; in
+//! TypeScript and JavaScript the subtype's method may take fewer parameters
+//! than the supertype's). The chain
 //! of supertypes is transitive up to [`DISPATCH_DEPTH`] levels. A private or
 //! static method overrides nothing. Go is left out: embedding promotes
 //! methods, it does not override them, and an interface is satisfied without
@@ -188,6 +190,41 @@ fn arities_meet(a: Option<(usize, Option<usize>)>, b: Option<(usize, Option<usiz
         return true;
     };
     amin <= bmax.unwrap_or(usize::MAX) && bmin <= amax.unwrap_or(usize::MAX)
+}
+
+/// A file of TypeScript or JavaScript, where a method with fewer parameters
+/// implements one with more (review of TASK-017, point 4).
+fn lax_arity(file: Option<&str>) -> bool {
+    file.and_then(|f| f.rsplit_once('.')).is_some_and(|(_, e)| {
+        matches!(
+            e,
+            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"
+        )
+    })
+}
+
+/// Whether a method of arity `origin` and one of arity `candidate` can stand
+/// for each other in direction `dir` (upstream the origin is the subtype's
+/// method, downstream the candidate is). Strict languages need the ranges to
+/// meet; with `lax` (TypeScript, JavaScript) the subtype's method only needs
+/// no more required parameters than the supertype's can take.
+fn arities_fit(
+    origin: Option<(usize, Option<usize>)>,
+    candidate: Option<(usize, Option<usize>)>,
+    dir: Direction,
+    lax: bool,
+) -> bool {
+    if !lax {
+        return arities_meet(origin, candidate);
+    }
+    let (sub, sup) = match dir {
+        Direction::Upstream => (origin, candidate),
+        Direction::Downstream => (candidate, origin),
+    };
+    match (sub, sup) {
+        (Some((min, _)), Some((_, max))) => min <= max.unwrap_or(usize::MAX),
+        _ => true,
+    }
 }
 
 /// A method that overrides nothing and nothing overrides: private or static.
@@ -423,6 +460,7 @@ fn select(
     origin: u64,
     o: &Origin,
     found: Vec<(Candidate, u8)>,
+    dir: Direction,
     include_tests: bool,
     out: &mut Equivalents,
 ) {
@@ -434,7 +472,12 @@ fn select(
         .into_iter()
         .filter(|(c, _)| {
             !never_overrides(&c.signature, &o.name)
-                && arities_meet(mine, arity(&c.signature, &o.name))
+                && arities_fit(
+                    mine,
+                    arity(&c.signature, &o.name),
+                    dir,
+                    lax_arity(c.file.as_deref()),
+                )
         })
         .collect();
     // Overloads of one arity in one type (`save(User)`, `save(Order)`): the
@@ -636,7 +679,7 @@ impl Store {
         ids.sort_unstable();
         for id in ids {
             let (o, _, found) = origins.remove(&id).expect("listed");
-            select(id, &o, found, include_tests, &mut out);
+            select(id, &o, found, dir, include_tests, &mut out);
         }
         Ok(out)
     }
@@ -722,6 +765,20 @@ mod tests {
         assert!(!arities_meet(Some((1, Some(1))), Some((2, Some(2)))));
         assert!(arities_meet(Some((1, None)), Some((3, Some(3)))));
         assert!(arities_meet(None, Some((3, Some(3)))));
+    }
+
+    #[test]
+    fn a_typescript_implementation_may_take_fewer_parameters() {
+        let (one, two) = (Some((1, Some(1))), Some((2, Some(2))));
+        // Upstream the origin is the implementation; downstream, the candidate.
+        assert!(arities_fit(one, two, Direction::Upstream, true));
+        assert!(arities_fit(two, one, Direction::Downstream, true));
+        assert!(!arities_fit(two, one, Direction::Upstream, true));
+        assert!(!arities_fit(one, two, Direction::Downstream, true));
+        // Java: the ranges must meet.
+        assert!(!arities_fit(one, two, Direction::Upstream, false));
+        assert!(lax_arity(Some("web/a.ts")) && lax_arity(Some("b.mjs")));
+        assert!(!lax_arity(Some("A.java")) && !lax_arity(None));
     }
 
     #[test]

@@ -1073,6 +1073,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// Review of TASK-017, point 4: in TypeScript (and JavaScript) a method
+    /// with fewer parameters implements one with more (`load(id)` for
+    /// `load(id, opts)`), so it dispatches both ways; one with more required
+    /// parameters than its interface's does not.
+    #[test]
+    fn a_typescript_implementation_with_fewer_parameters_dispatches() {
+        let (state, repo) = indexed_files(
+            "impact_dispatch_ts_arity",
+            &[
+                (
+                    "web/svc.ts",
+                    "export interface IRepo {\n  load(id: string, opts: string): void;\n  save(id: string): void;\n}\n\nexport class Repo implements IRepo {\n  load(id: string): void {}\n  save(id: string, extra: string): void {}\n}\n",
+                ),
+                (
+                    "web/api.ts",
+                    "import { IRepo } from './svc';\n\nexport class Api {\n  constructor(private readonly repo: IRepo) {}\n\n  get(): void {\n    this.repo.load('x', 'y');\n  }\n\n  put(): void {\n    this.repo.save('x');\n  }\n}\n",
+                ),
+            ],
+        );
+        let v = impact(&state, "Repo.load", &ImpactQuery::default());
+        assert_eq!(node(&v, "upstream", "Api.get")["via"], "dispatch", "{v}");
+        let v = impact(&state, "IRepo.load", &ImpactQuery::default());
+        assert_eq!(
+            node(&v, "downstream", "Repo.load")["via"],
+            "dispatch",
+            "{v}"
+        );
+        // More required parameters than the interface's: no implementation.
+        let v = impact(&state, "Repo.save", &ImpactQuery::default());
+        assert!(syms(&v, "upstream").is_empty(), "{v}");
+        let v = impact(&state, "IRepo.save", &ImpactQuery::default());
+        assert!(syms(&v, "downstream").is_empty(), "{v}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// Review of TASK-017, NIT: a TypeScript class with several `implements`
     /// is reached through each interface it implements, upstream; and each
     /// interface method reaches it downstream.
