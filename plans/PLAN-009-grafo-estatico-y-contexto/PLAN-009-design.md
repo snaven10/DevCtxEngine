@@ -865,10 +865,16 @@ viejo, sin filtros ni tope, para que una rama vieja conteste igual que 0.9.0 má
   implementaciones 34,7 / 39,1 → 37,5 / 43,8. En backend-a/b, p95 ≤ 118 ms en ronda limpia y ≤ 242
   con picos de carga (Resultado de TASK-017). Para TS hizo falta que el método de una interfaz sea
   símbolo (`EXTRACTOR_VERSION` 20). Downstream también despacha desde un método concreto a sus
-  overrides (dispatch virtual). **Pendiente para TASK-013** (`traverse` usa la misma expansión):
-  aridad ≤ en TS/JS para implementadores con menos parámetros; contar o declarar lo que corta el
-  tope de profundidad 4; un `impact_graph` antes y después de cambiar un `implements` en el escenario
-  incremental; tests de diamante, ciclo, TS con varios `implements` y blanket impl.
+  overrides (dispatch virtual). ~~Pendiente para TASK-013~~ — **hecho en TASK-013:** en TS/JS un
+  implementador con menos parámetros despacha (aridad del impl ≤ la del supertipo; con más
+  obligatorios, no); lo que corta el tope de profundidad 4 se cuenta en
+  `omitted_by_limit.dispatch` (`beyond_depth`, `max_depth`, y dentro de su `count`), sin sentencias
+  nuevas; el escenario (e) por `impact_graph` (incremental = completo tras cambiar un
+  `implements`); tests de diamante (gana la cadena más segura), ciclo, TS con varios `implements`,
+  blanket impl de Rust y los asserts BFS de 0.9.0 con el índice de supertipos leído. **Revisión de
+  TASK-017 (pedido):** cuando el dispatch no se evaluó, la respuesta lo dice con una nota constante
+  leída de los filtros: `dispatch: {"evaluated": false, "reason": "dispatch:false" |
+  "min_confidence high"}` (aditivo; también en `traverse` cuando sigue `calls`).
 
 ## DD-12 — PageRank: global al indexar, personalizado al consultar
 
@@ -1028,6 +1034,34 @@ total, next_offset?, omitted?, branch_fallback?}`.
 - `edge_types ⊆ {calls, instantiates, imports, inherits, implements, contains, references}`.
 - Implementado con la misma expansión por niveles de DD-11 (una consulta por nivel).
 - Contrato de paginación y omitidos de PLAN-008 TASK-010 (`devctx_core::hits`).
+
+**Implementado en TASK-013, con estas diferencias:** el parámetro es `kinds` (separadas por coma o
+`all`, como en `get_references`; default `calls`) y no `edge_types`; `direction` default `out`.
+`crates/devctx-store/src/traverse.rs` (`Store::traverse`, `traverse_walk`, `traverse_roots`) reusa
+la expansión de DD-11 (`edge_level`: la consulta de nivel de `impact` con las relaciones como
+parámetro; una sentencia por nivel y dirección, `FrontierSql::Auto`, `live_edges`) y, si se sigue
+`calls`, el `DispatchIndex` de TASK-017 (las filas de otras relaciones hacia un equivalente no son
+dispatch). `crates/devctx-mcp/src/state/traverse.rs` (`TraverseQuery`, `traverse_on`), `do_traverse`/
+`traverse_at`, `Backend::traverse`, `POST /traverse`, `devctx traverse`. Salida `{root, candidates?,
+nodes, edges, total, next_offset?, omitted?, partial?, filters, below_confidence?, excluded?,
+omitted_by_limit?, dispatch?, omitted_for_budget?, branch_fallback?}`:
+- nodos `{sym, symbol, kind, file, line, depth, confidence, via, through?}` + `test`/`external`/
+  `undecided` cuando son verdaderos; el nombre pedido nunca se lista y, de las definiciones de un
+  nombre pelado, una alcanzada desde otra sí (la regla de `impact`); orden de DD-11 por profundidad;
+- aristas: las que alcanzaron a cada nodo listado **en su profundidad**, una por par, relación y
+  dispatch (`occurrences` cuando son varias), en su sentido propio, `from`/`to` como `sym` (el
+  nombre para un extremo sin definición); una arista de dispatch es `kind: "calls", via:
+  "dispatch"`;
+- paginación: `limit` (50) desde `offset`; el recorrido **deja de leer niveles** en cuanto tiene
+  más nodos de los que la página necesita (`offset + limit`), y lo dice con `partial: {from_depth}`
+  (`total` cuenta entonces lo leído; la página siguiente lee más). Un nivel siempre se lee entero,
+  así que las páginas son estables;
+- `symbol` acepta además la ruta de un archivo (su símbolo de archivo, de donde salen los
+  `imports`); `sym` (hex) elige una raíz; un nombre ambiguo recorre desde todas (`candidates`);
+- sin camino 0.9: rama vieja o sin filas → error que pide `devctx index --full`; un `serve`
+  anterior responde 404 y el cliente (MCP remoto y CLI) dice que hay que reiniciarlo;
+- no lista los llamadores de llamadas **sin decidir** al nombre (eso es de `impact_analysis` y
+  `get_references`): `traverse` sigue aristas por id.
 
 ## DD-17 — Vista `skeleton`
 

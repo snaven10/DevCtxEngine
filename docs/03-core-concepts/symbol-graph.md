@@ -200,6 +200,75 @@ cap — with the `warning` that says so (and, when filters were passed, that the
 were not applied); a server older than 0.10 ignores the parameters, and the
 client then says so in `warning`.
 
+### `traverse(symbol)` — walk the graph yourself
+
+Hop by hop, along the relations you pick: `calls`, `instantiates`, `imports`,
+`inherits`, `implements`, `contains`, `references` (`kinds`, comma-separated or
+`all`; default `calls`), `out` (default), `in` or `both` (`direction`), 1 to 4
+levels (`depth`, default 1; more is refused). It is the walk of
+`impact_analysis` — one query per level and direction over the whole frontier,
+over live edges only, by id, with the same filters — with other relations, and
+with the edges in the answer.
+
+When to use which: `traverse` to explore structure (what a class contains, its
+hierarchy, who imports or uses a type, a chain of calls hop by hop);
+`impact_analysis` for the blast radius of a change (transitive callers and
+callees, capped per direction); `get_references` for the call sites — file and
+line — of one symbol.
+
+| Question | Call |
+|---|---|
+| Callers, and their callers | `{symbol: "OrderService.place", kinds: "calls", direction: "in", depth: 2}` |
+| Where a type is built | `{symbol: "Invoice", kinds: "instantiates", direction: "in"}` |
+| What a file imports / who imports a type | `{symbol: "src/api/client.ts", kinds: "imports"}` / `{symbol: "OrderDto", kinds: "imports", direction: "in"}` |
+| Subclasses | `{symbol: "BaseRepo", kinds: "inherits", direction: "in"}` |
+| Implementations | `{symbol: "PaymentGateway", kinds: "implements", direction: "in"}` |
+| Members of a class | `{symbol: "OrderService", kinds: "contains"}` |
+| Uses of a type | `{symbol: "OrderDto", kinds: "references", direction: "in"}` |
+| A class's supertypes, two levels up | `{symbol: "ServiceImpl", kinds: "inherits,implements", depth: 2}` |
+
+`symbol` takes a bare, qualified or `file::name` symbol, or a file path (the
+file itself: imports leave from it). A bare name with several definitions is
+walked from all of them and listed in `candidates` (`{sym, symbol, kind, file,
+line}`); `sym` (the hex id a node or a candidate carries) starts from exactly
+one.
+
+The answer is `{root, candidates?, nodes, edges, total, next_offset?, omitted?,
+partial?, filters, below_confidence?, excluded?, omitted_by_limit?, dispatch?,
+omitted_for_budget?, branch_fallback?}`:
+
+- `nodes`: `{sym, symbol, kind, file, line, depth, confidence, via}` (`via` is
+  the relation that reached it, or `dispatch`, with `through`), plus `test`,
+  `external` or `undecided` when true; by depth, then confidence, rank and name.
+  The name asked is never listed (as in `impact_analysis`); of the
+  definitions a bare name stood for, one reached from another is.
+- `edges`: every edge by which a listed node was reached at its depth, one per
+  pair and relation — `{from, to, kind, confidence, line, occurrences?}`, `from`
+  and `to` being `sym`s (the name, for an end with no definition), in the edge's
+  own direction (`from` holds the occurrence).
+- Filters as `impact_analysis`: `min_confidence` (`medium`), `include_tests`
+  and `include_external` (`false`): what they leave out is counted
+  (`below_confidence`, `excluded`) and not walked. With `calls`, dispatch
+  through interfaces, abstract classes and traits is followed (`via:
+  "dispatch"`, never `high`; `dispatch: false` turns it off, and
+  `dispatch: {evaluated: false, reason}` says when it was not followed).
+- Paging (the contract of `search_routes`): `limit` (50) nodes from `offset`;
+  `total`, `next_offset`, and `omitted: {count, reason, next_offset}`. A hub —
+  a DTO referenced from hundreds of files — is paged, not dumped: once the walk
+  holds more nodes than the page needs, no deeper level is read, `partial:
+  {from_depth}` says so, and `total` then counts what was read (the next page
+  reads on).
+- The output budget (`DEVCTX_MAX_OUTPUT_TOKENS`) halves between nodes and
+  edges; what does not fit is named in `omitted_for_budget`.
+
+There is no 0.9 path: on an index made before 0.10 (or without symbol rows)
+`traverse` is an error that asks for `devctx index --full`. Over HTTP: `POST
+/traverse` with the parameters as its JSON body; a server older than the tool
+answers 404, which the client turns into "restart it: `devctx serve --stop`".
+From the shell: `devctx traverse OrderDto --kinds references --dir in --depth 2`
+(`--sym`, `--min-confidence`, `--include-tests`, `--include-external`,
+`--no-dispatch`, `--limit`, `--offset`, `--json`).
+
 ### `read_symbol(name)` — the definition
 
 Code, file, line range and kind. Use this when you know the name and want the

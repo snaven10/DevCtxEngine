@@ -205,6 +205,74 @@ nombre, sin confianza, sin filtros, sin tope — con el `warning` que lo dice (y
 se pasaron filtros, que no se aplicaron); un servidor anterior a 0.10 ignora los
 parámetros, y el cliente lo dice en `warning`.
 
+### `traverse(símbolo)` — recorrer el grafo por tu cuenta
+
+Salto a salto, por las relaciones que elijas: `calls`, `instantiates`,
+`imports`, `inherits`, `implements`, `contains`, `references` (`kinds`, separadas
+por coma o `all`; default `calls`), `out` (default), `in` o `both`
+(`direction`), de 1 a 4 niveles (`depth`, default 1; más se rechaza). Es el
+recorrido de `impact_analysis` — una consulta por nivel y dirección sobre toda la
+frontera, solo sobre aristas vivas, por id, con los mismos filtros — con otras
+relaciones, y con las aristas en la respuesta.
+
+Cuándo usar cuál: `traverse` para explorar estructura (qué contiene una clase, su
+jerarquía, quién importa o usa un tipo, una cadena de llamadas salto a salto);
+`impact_analysis` para el radio de impacto de un cambio (llamadores y llamados
+transitivos, con tope por dirección); `get_references` para los sitios de llamada
+— archivo y línea — de un símbolo.
+
+| Pregunta | Llamada |
+|---|---|
+| Llamadores, y los llamadores de esos | `{symbol: "OrderService.place", kinds: "calls", direction: "in", depth: 2}` |
+| Dónde se construye un tipo | `{symbol: "Invoice", kinds: "instantiates", direction: "in"}` |
+| Qué importa un archivo / quién importa un tipo | `{symbol: "src/api/client.ts", kinds: "imports"}` / `{symbol: "OrderDto", kinds: "imports", direction: "in"}` |
+| Subclases | `{symbol: "BaseRepo", kinds: "inherits", direction: "in"}` |
+| Implementaciones | `{symbol: "PaymentGateway", kinds: "implements", direction: "in"}` |
+| Miembros de una clase | `{symbol: "OrderService", kinds: "contains"}` |
+| Usos de un tipo | `{symbol: "OrderDto", kinds: "references", direction: "in"}` |
+| Los supertipos de una clase, dos niveles arriba | `{symbol: "ServiceImpl", kinds: "inherits,implements", depth: 2}` |
+
+`symbol` acepta un símbolo pelado, calificado o `archivo::nombre`, o la ruta de
+un archivo (el archivo mismo: de él salen los imports). Un nombre pelado con
+varias definiciones se recorre desde todas y se listan en `candidates`
+(`{sym, symbol, kind, file, line}`); `sym` (el id hex que lleva un nodo o un
+candidato) arranca desde exactamente una.
+
+La respuesta es `{root, candidates?, nodes, edges, total, next_offset?, omitted?,
+partial?, filters, below_confidence?, excluded?, omitted_by_limit?, dispatch?,
+omitted_for_budget?, branch_fallback?}`:
+
+- `nodes`: `{sym, symbol, kind, file, line, depth, confidence, via}` (`via` es la
+  relación que lo alcanzó, o `dispatch`, con `through`), más `test`, `external` o
+  `undecided` cuando son verdaderos; por profundidad, después confianza, rank y
+  nombre. El nombre pedido nunca se lista (como en `impact_analysis`); de las
+  definiciones de un nombre pelado, una alcanzada desde otra sí.
+- `edges`: cada arista por la que un nodo listado se alcanzó en su profundidad,
+  una por par y relación — `{from, to, kind, confidence, line, occurrences?}`,
+  con `from` y `to` como `sym` (el nombre, para un extremo sin definición), en el
+  sentido propio de la arista (`from` tiene la ocurrencia).
+- Filtros como `impact_analysis`: `min_confidence` (`medium`), `include_tests` e
+  `include_external` (`false`): lo que dejan afuera se cuenta (`below_confidence`,
+  `excluded`) y no se recorre. Con `calls` se sigue el dispatch por interfaces,
+  clases abstractas y traits (`via: "dispatch"`, nunca `high`; `dispatch: false`
+  lo apaga, y `dispatch: {evaluated: false, reason}` dice cuándo no se siguió).
+- Paginación (el contrato de `search_routes`): `limit` (50) nodos desde `offset`;
+  `total`, `next_offset` y `omitted: {count, reason, next_offset}`. Un hub — un
+  DTO referenciado desde cientos de archivos — se pagina, no se vuelca: cuando el
+  recorrido ya tiene más nodos de los que la página necesita no lee ningún nivel
+  más profundo, `partial: {from_depth}` lo dice, y `total` cuenta entonces lo que
+  se leyó (la página siguiente sigue leyendo).
+- El presupuesto de salida (`DEVCTX_MAX_OUTPUT_TOKENS`) se reparte por mitades
+  entre nodos y aristas; lo que no entra se nombra en `omitted_for_budget`.
+
+No hay camino 0.9: sobre un índice anterior a 0.10 (o sin filas de símbolos)
+`traverse` es un error que pide `devctx index --full`. Por HTTP: `POST /traverse`
+con los parámetros como cuerpo JSON; un servidor más viejo que la tool responde
+404, y el cliente lo traduce a "reinicialo: `devctx serve --stop`". Desde la
+terminal: `devctx traverse OrderDto --kinds references --dir in --depth 2`
+(`--sym`, `--min-confidence`, `--include-tests`, `--include-external`,
+`--no-dispatch`, `--limit`, `--offset`, `--json`).
+
 ### `read_symbol(nombre)` — la definición
 
 Código, archivo, rango de líneas y tipo. Usalo cuando sabés el nombre y querés

@@ -153,7 +153,7 @@ and delete the file).
 
 ## The tools
 
-24 tools, grouped by what they answer.
+25 tools, grouped by what they answer.
 
 ### Code
 
@@ -164,6 +164,7 @@ and delete the file).
 | `read_symbol` | A symbol's definition, code, file, line range and kind — when you know the name. A miss answers with `suggestions` and, for library calls, `external: true` |
 | `get_references` | Every call site of a symbol, one per occurrence, with `confidence` and `via`; `min_confidence: "low"` adds the ambiguous ones, `kinds` other relations (see [Symbol graph](symbol-graph.md#get_referencessymbol--who-calls-this)) |
 | `impact_analysis` | Transitive callers (blast radius) and callees, by depth, each with `confidence` and `via`; by default high/medium calls only, no tests, no library callees, 200 per direction — what that leaves out is counted; calls through an interface, abstract class or trait are followed as `via: "dispatch"` (never `high`). `min_confidence`, `include_tests`, `include_external`, `max_nodes`, `dispatch` (see [Symbol graph](symbol-graph.md#impact_analysissymbol--blast-radius)) |
+| `traverse` | Walk the symbol graph hop by hop from a symbol: `kinds` (calls, instantiates, imports, inherits, implements, contains, references), `direction` in/out/both, `depth` 1-4; nodes with `sym` and the edges that reached them, paged (`limit`, `offset`, `next_offset`, `omitted`), with the filters of `impact_analysis` (see [Symbol graph](symbol-graph.md#traversesymbol--walk-the-graph-yourself)) |
 | `summarize` | Text down to roughly `max_tokens`, extractive by default so identifiers survive |
 
 The distinction between `search` and `read_symbol` is worth internalising:
@@ -285,7 +286,7 @@ the junction row is missing but the memory's `files` names the file.
 
 ## Discovery
 
-On `tools/list` the server returns all 24 definitions with JSON Schema
+On `tools/list` the server returns all 25 definitions with JSON Schema
 parameters, declared upfront. The client validates arguments before each call.
 There is no runtime discovery step.
 

@@ -5,6 +5,26 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
 
 ## Unreleased (0.10.0)
 
+### Added
+
+- **`traverse`** (PLAN-009 TASK-013): a new tool (MCP, `POST /traverse`,
+  `devctx traverse`) to walk the symbol graph hop by hop from a symbol — a bare,
+  qualified or `file::name` symbol, a file path, or one `sym` — along the
+  relations asked (`calls`, `instantiates`, `imports`, `inherits`,
+  `implements`, `contains`, `references`; default `calls`), `in`, `out`
+  (default) or `both`, 1 to 4 levels (more is refused). It is the walk of
+  `impact_analysis` (one query per level and direction, live edges only, by id,
+  the same `min_confidence`/`include_tests`/`include_external` filters with what
+  they leave out counted, dispatch through supertypes on `calls`) and answers
+  `{root, candidates?, nodes, edges, total, next_offset?, omitted?, partial?,
+  filters, …}`: nodes with `sym`, `kind`, `file`, `line`, `depth`,
+  `confidence`, `via`; the edges that reached them (`from`/`to` as `sym`s, one
+  per pair and relation with its occurrences). Paged (`limit` 50, `offset`):
+  once a page is full no deeper level is read (`partial`), so a type referenced
+  from hundreds of files is paged, not dumped. An index made before 0.10 is an
+  error that asks for `devctx index --full`; a server older than the tool
+  answers 404, which clients report as "restart it".
+
 ### Changed
 
 - **Reindex reuses vectors by chunk `content_hash`** (PLAN-009 TASK-002): a
