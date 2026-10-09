@@ -1073,6 +1073,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// Review of TASK-017, NIT: a TypeScript class with several `implements`
+    /// is reached through each interface it implements, upstream; and each
+    /// interface method reaches it downstream.
+    #[test]
+    fn dispatch_follows_every_interface_a_typescript_class_implements() {
+        let (state, repo) = indexed_files(
+            "impact_dispatch_ts_multi",
+            &[
+                (
+                    "web/svc.ts",
+                    "export interface IReader {\n  load(id: string): void;\n}\n\nexport interface IWriter {\n  load(id: string): void;\n}\n\nexport class Store implements IReader, IWriter {\n  load(id: string): void {}\n}\n",
+                ),
+                (
+                    "web/api.ts",
+                    "import { IReader, IWriter } from './svc';\n\nexport class Api {\n  constructor(private readonly r: IReader, private readonly w: IWriter) {}\n\n  read(): void {\n    this.r.load('x');\n  }\n\n  write(): void {\n    this.w.load('y');\n  }\n}\n",
+                ),
+            ],
+        );
+        let v = impact(&state, "Store.load", &ImpactQuery::default());
+        for (caller, through) in [("Api.read", "IReader.load"), ("Api.write", "IWriter.load")] {
+            let n = node(&v, "upstream", caller);
+            assert_eq!(n["via"], "dispatch", "{v}");
+            assert_eq!(n["through"], through, "{v}");
+        }
+        for iface in ["IReader.load", "IWriter.load"] {
+            let v = impact(&state, iface, &ImpactQuery::default());
+            assert_eq!(
+                node(&v, "downstream", "Store.load")["via"],
+                "dispatch",
+                "{v}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review of TASK-017, NIT: a Rust blanket impl (`impl<T: Display> Sink
+    /// for T`) is an `impl` like any other: its method is reached from the
+    /// trait method downstream, and reaches the trait's callers upstream.
+    #[test]
+    fn dispatch_follows_a_rust_blanket_impl() {
+        let (state, repo) = indexed_files(
+            "impact_dispatch_blanket",
+            &[(
+                "rs/src/lib.rs",
+                "use std::fmt::Display;\n\npub trait Sink {\n    fn write(&self, line: &str);\n}\n\nimpl<T: Display> Sink for T {\n    fn write(&self, line: &str) {\n        flush(line);\n    }\n}\n\npub fn flush(_line: &str) {}\n\npub fn emit(s: &dyn Sink) {\n    s.write(\"x\");\n}\n",
+            )],
+        );
+        // The blanket impl's method is qualified by its type parameter.
+        let v = impact(&state, "Sink.write", &ImpactQuery::default());
+        let n = node(&v, "downstream", "T.write");
+        assert_eq!(n["via"], "dispatch", "{v}");
+        assert_eq!(n["confidence"], "medium", "{v}");
+        assert_eq!(node(&v, "downstream", "flush")["depth"], 2, "{v}");
+        let v = impact(&state, "T.write", &ImpactQuery::default());
+        let n = node(&v, "upstream", "emit");
+        assert_eq!(n["via"], "dispatch", "{v}");
+        assert_eq!(n["through"], "Sink.write", "{v}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// Review of TASK-017: when dispatch was not evaluated, the answer says
     /// so — a constant note, read from the filters alone — so an empty
     /// upstream under `min_confidence: high` or `dispatch: false` is not read

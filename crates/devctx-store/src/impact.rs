@@ -2355,6 +2355,119 @@ pub(crate) mod tests {
         old::check_traversal_does_not_re_expand_the_names_it_walks(&as_0_9_0(&store, all_in()));
     }
 
+    /// Review of TASK-017, NIT: the BFS asserts of 0.9.0 hold on a branch
+    /// whose supertype graph is not empty — the walk then goes through
+    /// `dispatch_level` at every level (the index is read), not through the
+    /// plain level query the `seeded_graph` of the other test takes.
+    #[test]
+    fn the_0_9_0_bfs_asserts_hold_with_a_supertype_graph() {
+        use crate::graph::tests as old;
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[("ServiceImpl", "IService", "implements", "high")],
+            &[("IService.update", "void update(String id);")],
+            &[
+                call("a", "b"),
+                call("a", "d"),
+                call("b", "c"),
+                call("Api.handle", "IService.update"),
+            ],
+        );
+        crate::dispatch::INDEX_READS.with(|c| c.set(0));
+        for opts in [ImpactOptions::default(), all_in()] {
+            assert!(opts.dispatch);
+            old::check_impact_bfs_upstream_and_downstream(&as_0_9_0(&store, opts));
+        }
+        assert!(
+            crate::dispatch::INDEX_READS.with(|c| c.get()) > 0,
+            "the supertype graph must be read"
+        );
+    }
+
+    /// Review of TASK-017, NIT: a diamond of supertypes (`Impl` implements
+    /// `ILeft` and `IRight`, both extend `IRoot`) reaches `IRoot.run` by two
+    /// chains: its caller is listed once, by the surest chain, upstream; and
+    /// downstream every method of the diamond is listed (or counted) once.
+    #[test]
+    fn a_diamond_of_supertypes_lists_each_method_once() {
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[
+                ("Impl", "ILeft", "implements", "high"),
+                ("Impl", "IRight", "implements", "high"),
+                ("ILeft", "IRoot", "inherits", "low"),
+                ("IRight", "IRoot", "inherits", "high"),
+            ],
+            &[
+                ("IRoot.run", "void run(String id);"),
+                ("ILeft.run", "void run(String id);"),
+                ("IRight.run", "void run(String id);"),
+                ("Impl.run", "public void run(String id)"),
+            ],
+            &[
+                call("Api.viaRoot", "IRoot.run"),
+                call("Api.viaLeft", "ILeft.run"),
+                call("Api.viaRight", "IRight.run"),
+            ],
+        );
+        let im = store
+            .impact_graph("repo", "main", "Impl.run", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(
+            names(&im.upstream),
+            ["Api.viaLeft", "Api.viaRight", "Api.viaRoot"]
+        );
+        // `IRoot` is reached by its surest chain (through `IRight`, all
+        // `high`): `medium`, the cap of a dispatch, not the `low` of the
+        // `ILeft` edge.
+        let n = node(&im.upstream, "Api.viaRoot");
+        assert_eq!(
+            (n.via.as_str(), n.confidence.as_deref(), n.depth),
+            (DISPATCH_VIA, Some("medium"), 1)
+        );
+        let im = store
+            .impact_graph("repo", "main", "IRoot.run", None, &ImpactOptions::default())
+            .unwrap();
+        // Downstream, `Impl.run` once (by the surest chain); `ILeft.run`
+        // hangs off the `low` edge only: counted, not listed.
+        let mut down = names(&im.downstream);
+        down.sort_unstable();
+        assert_eq!(down, ["IRight.run", "Impl.run"]);
+        assert_eq!(im.downstream.below_confidence, 1);
+        assert_eq!(im.downstream.dispatch_capped, 0);
+    }
+
+    /// Review of TASK-017, NIT: a cycle of supertypes (a broken hierarchy,
+    /// or two generic types the resolver tied together) ends: each method
+    /// of the cycle is reached once, the origin never through itself.
+    #[test]
+    fn a_cycle_of_supertypes_ends_and_lists_each_method_once() {
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[
+                ("CycA", "CycB", "inherits", "high"),
+                ("CycB", "CycC", "inherits", "high"),
+                ("CycC", "CycA", "inherits", "high"),
+            ],
+            &[
+                ("CycA.run", "public void run()"),
+                ("CycB.run", "public void run()"),
+                ("CycC.run", "public void run()"),
+            ],
+            &[call("Api.viaB", "CycB.run"), call("Api.viaC", "CycC.run")],
+        );
+        let im = store
+            .impact_graph("repo", "main", "CycA.run", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Api.viaB", "Api.viaC"]);
+        let mut down = names(&im.downstream);
+        down.sort_unstable();
+        assert_eq!(down, ["CycB.run", "CycC.run"]);
+    }
+
     /// Review of TASK-017, MAJOR 1: a Rust `'static` lifetime (`-> &'static
     /// str`, `T: 'static`) is no `static` modifier — the trait method still
     /// dispatches, both ways; only a modifier before the name counts.
