@@ -25,14 +25,33 @@ const BELOW_CONFIDENCE_HINT: &str =
     "references below the confidence shown were left out (ambiguous names or calls \
      the index could not decide); pass min_confidence: \"low\" to list them, marked";
 
+/// The line an answer from the 0.9.0 readers carries when reading the
+/// symbol graph failed: an error of the database, not a sign the index is
+/// old, so it must not send anyone to an hour-long reindex (review m4).
+pub(super) const SYMBOL_GRAPH_ERROR_WARNING: &str =
+    "could not read the symbol graph of this branch, so this answer comes from the 0.9 \
+     call graph (names and suffixes, no confidence); this is a read error, not a reason \
+     to reindex — retry, and see serve.log if it persists";
+
+/// Why a graph tool took the 0.9.0 path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Legacy {
+    /// Another (or no) extractor stamped the branch, or its graph is out of
+    /// step: `BranchChoice::annotate` already warns.
+    Stale,
+    /// Current, but no rows in `symbols`.
+    NoRows,
+    /// Reading `symbols` failed.
+    Error,
+}
+
 /// How a graph tool reads a branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Reader {
     /// `symbols` + `live_edges`, by id.
     SymbolGraph,
-    /// The 0.9.0 readers over `graph_edges`/`vectors`; `note` when the branch
-    /// is current but has no symbol rows (a stale one is already warned).
-    Legacy { note: bool },
+    /// The 0.9.0 readers over `graph_edges`/`vectors`, and why.
+    Legacy(Legacy),
 }
 
 impl Reader {
@@ -41,21 +60,43 @@ impl Reader {
     /// legacy path, never an empty answer.
     pub(super) fn of(chosen: &BranchChoice, store: &Store) -> Reader {
         if !chosen.indexed || chosen.extractor_stale {
-            return Reader::Legacy { note: false };
+            return Reader::Legacy(Legacy::Stale);
         }
-        match store.has_symbol_graph(&chosen.repo, &chosen.branch) {
+        Reader::from_check(store.has_symbol_graph(&chosen.repo, &chosen.branch))
+    }
+
+    /// The reader for a current branch, from whether it has symbol rows.
+    pub(super) fn from_check<E>(has_rows: Result<bool, E>) -> Reader {
+        match has_rows {
             Ok(true) => Reader::SymbolGraph,
-            _ => Reader::Legacy { note: true },
+            Ok(false) => Reader::Legacy(Legacy::NoRows),
+            Err(_) => Reader::Legacy(Legacy::Error),
         }
     }
 
-    /// Adds the no-symbol-graph line when this answer took the legacy path
-    /// on a current branch, without overwriting a warning already there.
+    /// The line this answer adds for taking the legacy path on a current
+    /// branch (a stale one is warned by `BranchChoice::annotate`), without
+    /// overwriting a warning already there.
     pub(super) fn annotate(self, out: &mut Value) {
-        if let Reader::Legacy { note: true } = self {
-            if out.get("warning").is_none() {
-                out["warning"] = json!(NO_SYMBOL_GRAPH_WARNING);
-            }
+        let line = match self {
+            Reader::Legacy(Legacy::NoRows) => NO_SYMBOL_GRAPH_WARNING,
+            Reader::Legacy(Legacy::Error) => SYMBOL_GRAPH_ERROR_WARNING,
+            _ => return,
+        };
+        if out.get("warning").is_none() {
+            out["warning"] = json!(line);
+        }
+    }
+
+    /// The warning of a `search` whose identifier anchoring took the 0.9.0
+    /// lookup by name (review M2): the stale warning too, which `search`
+    /// otherwise does not carry.
+    pub(super) fn search_warning(self) -> Option<&'static str> {
+        match self {
+            Reader::SymbolGraph => None,
+            Reader::Legacy(Legacy::Stale) => Some(super::STALE_EXTRACTOR_WARNING),
+            Reader::Legacy(Legacy::NoRows) => Some(NO_SYMBOL_GRAPH_WARNING),
+            Reader::Legacy(Legacy::Error) => Some(SYMBOL_GRAPH_ERROR_WARNING),
         }
     }
 }
@@ -131,59 +172,43 @@ pub(super) fn read_symbol(
     let definitions: Vec<Value> = found.iter().flat_map(definition_entries).collect();
     let mut out = json!({ "symbol": name, "definitions": definitions });
     if found.is_empty() {
-        not_found_hints(store, &chosen.repo, &chosen.branch, bare, name, &mut out);
+        not_found_hints(
+            store,
+            &chosen.repo,
+            &chosen.branch,
+            file,
+            bare,
+            name,
+            &mut out,
+        );
     }
     Ok(out)
 }
 
-/// The miss of [`read_symbol`]: `external: true` with `called_from` and
-/// `next_step` only when the link pass marked call sites of the name external
-/// (DD-9; a qualified name falls back to its last segment only when the repo
-/// defines no symbol of that name, pending 2 of PLAN-008); `suggestions` are
-/// the definitions of the same bare name and, for a name that is not
-/// external, the closest names of the repo. A library function gets no near
-/// miss (`with_context` is not a slip for `build_context`, B3), only the
-/// qualified forms its own call sites wrote.
+/// The miss of [`read_symbol`], with 0.9.0's contract: `external: true`
+/// with `called_from` and `next_step` only when the link pass marked call
+/// sites of the name external (DD-9; a qualified name falls back to its last
+/// segment only when the repo defines no symbol of that name, pending 2 of
+/// PLAN-008), and then **no** `suggestions` (a library function has no near
+/// miss here: `with_context` is not a slip for `build_context`, B3);
+/// otherwise `suggestions`, the definitions of the same bare name and then
+/// the closest names of the repo. A `file::name` that matched nothing is
+/// never external: the caller named a file of this repository (review m2).
 fn not_found_hints(
     store: &Store,
     repo: &str,
     branch: &str,
+    file: Option<&str>,
     bare: &str,
     shown: &str,
     out: &mut Value,
 ) {
     const MAX_SUGGESTIONS: usize = 5;
-    let external = store.lookup_external(repo, branch, bare).ok().flatten();
-    let mut suggestions: Vec<String> = Vec::new();
-    let add = |c: String, list: &mut Vec<String>| {
-        if list.len() < MAX_SUGGESTIONS && c != shown && c != bare && !list.contains(&c) {
-            list.push(c);
-        }
+    let external = if file.is_some() {
+        None
+    } else {
+        store.lookup_external(repo, branch, bare).ok().flatten()
     };
-    match &external {
-        Some(sites) => {
-            for n in &sites.names {
-                add(n.clone(), &mut suggestions);
-            }
-        }
-        None => {
-            for c in store
-                .lookup_same_name(repo, branch, bare, MAX_SUGGESTIONS)
-                .unwrap_or_default()
-            {
-                add(c, &mut suggestions);
-            }
-            for c in store
-                .lookup_suggestions(repo, branch, bare, MAX_SUGGESTIONS)
-                .unwrap_or_default()
-            {
-                add(c, &mut suggestions);
-            }
-        }
-    }
-    if external.is_none() || !suggestions.is_empty() {
-        out["suggestions"] = json!(suggestions);
-    }
     if let Some(sites) = external {
         let n = sites.count;
         out["external"] = json!(true);
@@ -193,7 +218,25 @@ fn not_found_hints(
              this branch — likely a library or runtime function, though it may live in a file \
              the index excludes or on another branch; `get_references` lists the call sites"
         ));
+        return;
     }
+    let mut suggestions: Vec<String> = Vec::new();
+    let same = store
+        .lookup_same_name(repo, branch, bare, MAX_SUGGESTIONS)
+        .unwrap_or_default();
+    let close = store
+        .lookup_suggestions(repo, branch, bare, MAX_SUGGESTIONS)
+        .unwrap_or_default();
+    for c in same.into_iter().chain(close) {
+        if suggestions.len() < MAX_SUGGESTIONS
+            && c != shown
+            && c != bare
+            && !suggestions.contains(&c)
+        {
+            suggestions.push(c);
+        }
+    }
+    out["suggestions"] = json!(suggestions);
 }
 
 /// `get_references` over the symbol graph: every occurrence (one row per
@@ -212,20 +255,30 @@ pub(super) fn references(
     chosen: &BranchChoice,
     symbol: &str,
     min: MinConfidence,
+    kinds: &[&str],
 ) -> Result<(Vec<Value>, Vec<String>, usize), String> {
     let (file, bare) = file_and_name(symbol);
+    let (repo, branch) = (chosen.repo.as_str(), chosen.branch.as_str());
     let syms = store
-        .lookup_symbols(&chosen.repo, &chosen.branch, bare, file, 500)
+        .lookup_symbols(repo, branch, bare, file, 500)
         .map_err(|e| e.to_string())?;
     let ids: Vec<u64> = syms.iter().map(|s| s.id).collect();
     let resolved = Store::qualified_names(&syms);
+    let low = min == MinConfidence::Low;
     let rows = store
-        .lookup_references(&chosen.repo, &chosen.branch, &ids, bare, true)
+        .lookup_references(repo, branch, &ids, bare, kinds, file.is_none(), low)
         .map_err(|e| e.to_string())?;
-    let (shown, hidden): (Vec<&SymbolReference>, Vec<&SymbolReference>) =
-        rows.iter().partition(|r| {
-            min.admits(r.confidence.as_deref()) && (min == MinConfidence::Low || !r.undecided())
-        });
+    let (shown, hidden): (Vec<&SymbolReference>, Vec<&SymbolReference>) = rows
+        .iter()
+        .partition(|r| min.admits(r.confidence.as_deref()) && (low || !r.undecided()));
+    // Undecided rows are listed only with `low`; otherwise only counted.
+    let undecided_hidden = if low {
+        0
+    } else {
+        store
+            .count_undecided_references(repo, branch, bare, kinds)
+            .map_err(|e| e.to_string())?
+    };
     let refs = shown
         .into_iter()
         .map(|r| {
@@ -251,7 +304,47 @@ pub(super) fn references(
             v
         })
         .collect();
-    Ok((refs, resolved, hidden.len()))
+    Ok((refs, resolved, hidden.len() + undecided_hidden))
+}
+
+/// What `get_references` lists by default: calls, as 0.9.0 did, and
+/// instantiations (`new Foo()` calls `Foo`'s constructor). The other
+/// relations only on request (`kinds`).
+pub(super) const DEFAULT_REFERENCE_KINDS: &[&str] = &["calls", "instantiates"];
+
+/// Every relation `kinds` may name.
+const REFERENCE_KINDS: &[&str] = &[
+    "calls",
+    "instantiates",
+    "references",
+    "imports",
+    "inherits",
+    "implements",
+];
+
+/// Parse `get_references`' `kinds` (comma-separated, or `all`): the
+/// relations to list; `None` is [`DEFAULT_REFERENCE_KINDS`].
+pub(super) fn parse_kinds(s: Option<&str>) -> Result<Vec<&'static str>, String> {
+    let Some(s) = s.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_REFERENCE_KINDS.to_vec());
+    };
+    let mut out = Vec::new();
+    for k in s.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        if k.eq_ignore_ascii_case("all") {
+            return Ok(REFERENCE_KINDS.to_vec());
+        }
+        match REFERENCE_KINDS.iter().find(|r| r.eq_ignore_ascii_case(k)) {
+            Some(r) if !out.contains(r) => out.push(*r),
+            Some(_) => {}
+            None => {
+                return Err(format!(
+                    "kinds takes {} or \"all\", not {k:?}",
+                    REFERENCE_KINDS.join(", ")
+                ))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `below_confidence` for an answer whose default left `n` references out.
@@ -325,8 +418,10 @@ pub(super) fn graph_view(
             "kind": e.kind,
             "file": e.file,
             "line": e.line,
-            "confidence": e.confidence,
         });
+        if let Some(c) = &e.confidence {
+            data["confidence"] = json!(c);
+        }
         if e.external {
             data["external"] = json!(true);
         }
@@ -360,6 +455,7 @@ pub(super) fn graph_view(
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use super::{Legacy, Reader};
     use std::path::{Path, PathBuf};
 
     struct Fake(usize);
@@ -514,6 +610,39 @@ mod tests {
             split_file_symbol("a/Foo.Bar::baz"),
             Some(("a/Foo.Bar", "baz"))
         );
+        // An npm scope is a package, not a directory (review NIT).
+        assert_eq!(split_file_symbol("@scope/pkg::fn"), None);
+        assert_eq!(
+            split_file_symbol("@scope/pkg/src/a.ts::fn"),
+            Some(("@scope/pkg/src/a.ts", "fn"))
+        );
+    }
+
+    /// m1: `memories_by_symbol("Foo.Bar::baz")` looks up the symbol `baz`
+    /// with no file subject, so a memory whose `files` names `Foo.Bar` is an
+    /// inference, not `files-field` (pending 1). The tool's local half; the
+    /// rest asks the central daemon, which a test must not start.
+    #[test]
+    fn memories_by_symbol_of_a_dotted_type_has_no_file() {
+        let (state, repo) = indexed("memsym", &[]);
+        let store = state.open_store().unwrap();
+        store
+            .upsert_memory(&devctx_store::Memory {
+                id: "m1".into(),
+                title: "baz".into(),
+                content: "baz must stay idempotent".into(),
+                files: "Foo.Bar".into(),
+                updated_at: "2026-10-08T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let (name, subject) = symbol_query(&store, "Foo.Bar::baz");
+        assert_eq!(name, "Foo.Bar::baz");
+        assert!(subject.is_empty(), "{subject:?}");
+        let hits = text_fallback_local(&store, devctx_store::short_label(name), &subject);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0]["link_sources"], "inference", "{hits:?}");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -583,7 +712,7 @@ mod tests {
     }
 
     fn refs_min(state: &AppState, name: &str, min: &str) -> Value {
-        serde_json::from_str(&do_references_with(state, name, Some(min)).unwrap()).unwrap()
+        serde_json::from_str(&do_references_with(state, name, Some(min), None).unwrap()).unwrap()
     }
 
     fn graph(state: &AppState) -> Value {
@@ -609,6 +738,16 @@ mod tests {
         );
         let old = store.find_references(&r, &b, "fetchRows").unwrap();
         assert_eq!(old.len(), 1, "graph_edges keeps it: {old:?}");
+        // The discarded row also says `external` (as no link pass writes,
+        // but a reader of `edges` would count): it must still reach nothing.
+        let file = "java/src/main/java/com/example/Repo.java";
+        let mut rows = store.file_symbol_edges(&r, &b, file).unwrap();
+        for e in rows.iter_mut().filter(|e| e.dst_name == "fetchRows") {
+            e.external = Some(true);
+        }
+        store
+            .replace_file_symbol_edges(&r, &b, file, &rows)
+            .unwrap();
         drop(store);
 
         for min in ["low", "medium"] {
@@ -660,6 +799,10 @@ mod tests {
         assert_eq!(r[0]["confidence"], "low", "{v}");
         assert_eq!(r[0]["undecided"], true, "{v}");
         assert!(v.get("below_confidence").is_none(), "{v}");
+        // m3: a qualified name counts only the undecided rows written that
+        // way (`s.flush()` was written `flush`, not `Left.flush`).
+        let v = refs(&state, "Left.flush");
+        assert!(v.get("below_confidence").is_none(), "{v}");
 
         // A `medium` reference is listed by default, marked by its field.
         let v = refs(&state, "with_context");
@@ -680,7 +823,7 @@ mod tests {
         assert_eq!(r[0]["via"], "calls", "{v}");
         assert_eq!(r[0]["sym"].as_str().unwrap().len(), 16, "{v}");
 
-        assert!(do_references_with(&state, "flush", Some("most")).is_err());
+        assert!(do_references_with(&state, "flush", Some("most"), None).is_err());
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -844,7 +987,7 @@ mod tests {
     /// `$DEVCTX_LOOKUP_BENCH_REPO` into `$DEVCTX_LOOKUP_BENCH_STATE` with the
     /// model-free embedder (parse, symbol graph and link pass are the real
     /// ones), then runs each line `tool|argument` of
-    /// `$DEVCTX_LOOKUP_BENCH_CASES` (`read`, `refs`, `refs_low`, `search`)
+    /// `$DEVCTX_LOOKUP_BENCH_CASES` (`read`, `refs`, `refs_low`, `search`, `context`)
     /// `$DEVCTX_LOOKUP_BENCH_RUNS` times (default 20) and prints one JSON
     /// line per case: the first answer, p50 and p95 in milliseconds. With
     /// `DEVCTX_LOOKUP_BENCH_OLD=1` the branch is stamped by another extractor
@@ -908,7 +1051,7 @@ mod tests {
                 match tool {
                     "read" => do_read_symbol(&state, arg, 5).unwrap(),
                     "refs" => do_references(&state, arg).unwrap(),
-                    "refs_low" => do_references_with(&state, arg, Some("low")).unwrap(),
+                    "refs_low" => do_references_with(&state, arg, Some("low"), None).unwrap(),
                     "search" => {
                         let (items, _) = search_items(
                             &state,
@@ -923,6 +1066,14 @@ mod tests {
                         .unwrap();
                         Value::Array(items).to_string()
                     }
+                    "context" => do_build_context(
+                        &state,
+                        arg,
+                        4096,
+                        false,
+                        &devctx_search::KindSel::default(),
+                    )
+                    .unwrap(),
                     other => panic!("unknown tool {other}"),
                 }
             };
@@ -947,5 +1098,312 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// M1: the PLAN-008 contract tests, with their very asserts, over a real
+    /// index (the symbol graph path). Seeded as those tests seed the 0.9.0
+    /// tables, but written as code: a class and a method, two external
+    /// assertions, a typo.
+    #[test]
+    fn not_found_suggests_and_marks_external_over_the_symbol_graph() {
+        let (state, repo) = indexed_files(
+            "c_rs014",
+            &[
+                (
+                    "src/main/java/app/AuthService.java",
+                    "package app;\n\npublic class AuthService {\n    public void greet() {\n    }\n}\n",
+                ),
+                (
+                    "src/test/java/app/AuthTest.java",
+                    "package app;\n\nimport static org.junit.jupiter.api.Assertions.assertEquals;\nimport org.junit.jupiter.api.Assertions;\n\npublic class AuthTest {\n    void test() {\n        Assertions.assertEquals(1, 1);\n        assertEquals(1, 1);\n    }\n}\n",
+                ),
+            ],
+        );
+        git(&repo, &["checkout", "-q", "-b", "feat/x"]);
+        assert_eq!(symbol_graph_reader(&state), Reader::SymbolGraph);
+        super::super::tests::check_read_symbol_not_found_suggests_and_marks_external(&state);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn qualified_externals_over_the_symbol_graph() {
+        let (state, repo) = indexed_files(
+            "c_l_b2",
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde_json = \"1\"\ntokio = \"1\"\nanyhow = \"1\"\n",
+                ),
+                (
+                    "src/main.rs",
+                    "use anyhow::Context;\n\nfn build_context() -> anyhow::Result<String> {\n    std::fs::read_to_string(\"x\").with_context(|| \"x\")\n}\n\nfn parse(s: &str) -> serde_json::Value {\n    serde_json::from_str(s).unwrap()\n}\n\nfn main() {\n    tokio::spawn(async {});\n    let _ = parse(\"{}\");\n    let _ = build_context();\n}\n",
+                ),
+                (
+                    "java/src/main/java/app/Repo.java",
+                    "package app;\n\nimport io.quarkus.hibernate.reactive.panache.Panache;\n\npublic class Repo {\n    public void save() {\n        Panache.withTransaction(() -> null);\n    }\n}\n",
+                ),
+            ],
+        );
+        assert_eq!(symbol_graph_reader(&state), Reader::SymbolGraph);
+        super::super::tests::check_qualified_externals_are_found_and_get_no_noisy_suggestions(
+            &state,
+        );
+        // 0.9.0 sent no `suggestions` with an external, not even the
+        // qualified forms its call sites wrote (`serde_json::from_str`).
+        for q in ["from_str", "spawn", "serde_json::from_str"] {
+            let v = read(&state, q);
+            assert!(v.get("suggestions").is_none(), "{q}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_grouped_small_function_over_the_symbol_graph() {
+        let (state, repo) = indexed_files(
+            "c_rs014g",
+            &[
+                ("requirements.txt", "somepkg==1.0\n"),
+                (
+                    "app/user.py",
+                    "def get_name():\n    return 1\n\n\ndef get_age():\n    return 2\n\n\nclass User:\n    def hidden_getter(self):\n        return 3\n",
+                ),
+                (
+                    "app/use.py",
+                    "from somepkg import get_a\n\nfrom app.user import get_age\n\n\ndef run():\n    get_age()\n    get_a()\n",
+                ),
+            ],
+        );
+        assert_eq!(symbol_graph_reader(&state), Reader::SymbolGraph);
+        super::super::tests::check_a_grouped_small_function_is_found_not_external(&state);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn symbol_graph_reader(state: &AppState) -> Reader {
+        let store = state.open_store().unwrap();
+        let chosen = graph_branch(state, &store).unwrap();
+        Reader::of(&chosen, &store)
+    }
+
+    /// M1: `get_references`' budget handling is the same on both paths — one
+    /// answer builder, unpaged (no `next_offset`): a reference too long for
+    /// its share keeps its place and has `source` cut, so `omitted` stays
+    /// absent, as in 0.9.0.
+    #[test]
+    fn references_report_what_the_budget_cut_on_both_paths() {
+        let (state, repo) = indexed("budget", &[]);
+        let store = state.open_store().unwrap();
+        let chosen = graph_branch(&state, &store).unwrap();
+        let long = "x".repeat(400);
+        let rows = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| json!({ "file": format!("f{i}.rs"), "line": i, "source": long }))
+                .collect()
+        };
+        for reader in [Reader::SymbolGraph, Reader::Legacy(Legacy::Stale)] {
+            let raw = references_answer("f", rows(4), &[], &chosen, reader, None, 64).unwrap();
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            // 0.9.0's behaviour, kept: a reference over its share keeps its
+            // place (file, line) and has its `source` cut, marked.
+            let r = v["references"].as_array().unwrap();
+            assert_eq!(r.len(), 4, "{reader:?}: {v}");
+            assert!(
+                r.iter()
+                    .all(|x| x["source"].as_str().unwrap().contains("truncated")
+                        && x["file"].is_string()),
+                "{reader:?}: {v}"
+            );
+            assert!(v.get("next_offset").is_none(), "{v}");
+            let raw = references_answer("f", rows(1)[..0].to_vec(), &[], &chosen, reader, None, 64)
+                .unwrap();
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            assert!(v.get("omitted").is_none(), "{v}");
+        }
+        // And through the tool, with the real budget, nothing is cut.
+        let v = refs(&state, "helper");
+        assert!(v.get("omitted").is_none(), "{v}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review, deviation 3: by default `references` is what 0.9.0 listed —
+    /// calls (and instantiations) — and the other relations come with
+    /// `kinds`.
+    #[test]
+    fn references_default_to_calls_and_take_kinds() {
+        let (state, repo) = indexed("kinds", &[]);
+        // `thing::Thing` is named (a type use) once; never called itself.
+        let v = refs(&state, "Thing");
+        assert!(v["references"].as_array().unwrap().is_empty(), "{v}");
+        let with = |kinds: &str| -> Value {
+            serde_json::from_str(&do_references_with(&state, "Thing", None, Some(kinds)).unwrap())
+                .unwrap()
+        };
+        for k in ["references", "all", "calls,references"] {
+            let v = with(k);
+            let r = v["references"].as_array().unwrap();
+            assert!(
+                r.iter()
+                    .any(|x| x["via"] == "references" && x["file"] == "rs/src/main.rs"),
+                "{k}: {v}"
+            );
+        }
+        let v = refs(&state, "Thing.new");
+        assert!(
+            v["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|x| x["via"] == "calls"),
+            "{v}"
+        );
+        assert!(do_references_with(&state, "Thing", None, Some("bogus")).is_err());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// m2: `file::name` that matches nothing in that file is not external,
+    /// even when a library function of that name is called (`PathBuf::new`).
+    #[test]
+    fn a_file_qualified_miss_is_never_external() {
+        let (state, repo) = indexed("filemiss", &[]);
+        let v = read(&state, "rs/src/wrong.rs::new");
+        assert!(v["definitions"].as_array().unwrap().is_empty(), "{v}");
+        assert!(v.get("external").is_none(), "{v}");
+        let v = refs(&state, "rs/src/wrong.rs::new");
+        assert!(
+            v["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|x| x.get("external").is_none()),
+            "{v}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// m4: a failed read of the symbol graph is reported as such, never as
+    /// "no rows, reindex" (an hour of reindexing for a read error).
+    #[test]
+    fn a_failed_symbol_graph_read_is_not_a_reindex_hint() {
+        let r = Reader::from_check::<&str>(Err("io error"));
+        assert_eq!(r, Reader::Legacy(Legacy::Error));
+        let mut out = json!({});
+        r.annotate(&mut out);
+        let w = out["warning"].as_str().unwrap();
+        assert!(w.contains("read error"), "{w}");
+        assert!(!w.contains("index --full"), "{w}");
+        assert_eq!(
+            Reader::from_check::<&str>(Ok(false)),
+            Reader::Legacy(Legacy::NoRows)
+        );
+        let mut out = json!({});
+        Reader::from_check::<&str>(Ok(false)).annotate(&mut out);
+        assert!(out["warning"].as_str().unwrap().contains("index --full"));
+    }
+
+    /// M2: a search whose identifier anchoring took the 0.9.0 lookup says
+    /// so; a current symbol graph and a vector search add nothing.
+    #[test]
+    fn a_search_anchored_by_name_warns() {
+        let (state, repo) = indexed("searchwarn", &[]);
+        let search = |mode: SearchMode| -> Value {
+            serde_json::from_str(
+                &do_search(
+                    &state,
+                    "tokenInterceptor",
+                    5,
+                    None,
+                    mode,
+                    false,
+                    &devctx_search::KindSel::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(search(SearchMode::Hybrid).get("warning").is_none());
+        {
+            let store = state.open_store().unwrap();
+            let (_, b) = state.repo_branch().unwrap();
+            store
+                .set_index_meta(
+                    &state.repo_path(),
+                    &b,
+                    devctx_store::EXTRACTOR_META_KEY,
+                    "v0-old",
+                )
+                .unwrap();
+        }
+        let v = search(SearchMode::Hybrid);
+        assert!(
+            v["warning"].as_str().unwrap().contains("older extractor"),
+            "{v}"
+        );
+        assert!(search(SearchMode::Vector).get("warning").is_none());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// M3: the chunks of every definition in one query equal the per-symbol
+    /// lookup, symbol by symbol.
+    #[test]
+    fn batched_code_chunks_equal_the_per_symbol_lookup() {
+        let (state, repo) = indexed("batch", &[]);
+        let store = state.open_store().unwrap();
+        let (r, b) = state.repo_branch().unwrap();
+        let syms: Vec<_> = store
+            .branch_symbols(&r, &b)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.kind != "file")
+            .collect();
+        let all = store.code_chunks_of(&r, &b, &syms).unwrap();
+        let mut with_code = 0;
+        for s in &syms {
+            let one: Vec<String> = store
+                .symbol_code_chunks(&r, &b, s)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect();
+            let many: Vec<String> = all[&s.id].iter().map(|p| p.id.clone()).collect();
+            assert_eq!(one, many, "{}", s.qualified);
+            with_code += usize::from(!one.is_empty());
+        }
+        assert!(with_code >= 5, "{with_code}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// m5: `devctx symbol` without a serve answers what the tool answers:
+    /// suggestions on a miss, external sites, the no-symbol-graph warning.
+    #[test]
+    fn the_local_cli_answer_is_the_tool_answer() {
+        let (state, repo) = indexed("cli", &[]);
+        let store = state.open_store().unwrap();
+        let at = |name: &str| read_symbol_at(&store, &repo, None, name, 5).unwrap();
+        assert!(at("Foo::new")["suggestions"]
+            .to_string()
+            .contains("Thing.new"));
+        assert_eq!(at("serde_json::from_str")["external"], true);
+        assert_eq!(
+            at("tokenInterceptor")["definitions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&repo);
+        let (state, repo) = indexed_files(
+            "cli_norows",
+            &[("db/schema.sql", "CREATE TABLE t (id INT);\n")],
+        );
+        let store = state.open_store().unwrap();
+        let v = read_symbol_at(&store, &repo, None, "t", 5).unwrap();
+        assert!(
+            v["warning"]
+                .as_str()
+                .unwrap()
+                .contains("no rows in the symbol graph"),
+            "{v}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

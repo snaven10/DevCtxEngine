@@ -695,15 +695,33 @@ impl Backend {
         }
     }
 
-    pub fn references(&self, symbol: &str, min_confidence: Option<&str>) -> Result<String, String> {
+    pub fn references(
+        &self,
+        symbol: &str,
+        min_confidence: Option<&str>,
+        kinds: Option<&str>,
+    ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_references_with(s, symbol, min_confidence),
+            Backend::Local(s) => do_references_with(s, symbol, min_confidence, kinds),
             Backend::Remote(r, _) => {
-                let mut path = format!("/references/{}", urlencode(symbol));
+                let mut query = Vec::new();
                 if let Some(m) = min_confidence {
-                    path.push_str(&format!("?min_confidence={}", urlencode(m)));
+                    query.push(format!("min_confidence={}", urlencode(m)));
                 }
-                r.get(&path)
+                if let Some(k) = kinds {
+                    query.push(format!("kinds={}", urlencode(k)));
+                }
+                let mut path = format!("/references/{}", urlencode(symbol));
+                if !query.is_empty() {
+                    path.push('?');
+                    path.push_str(&query.join("&"));
+                }
+                let raw = r.get(&path)?;
+                Ok(if query.is_empty() {
+                    raw
+                } else {
+                    note_unapplied_filters(raw)
+                })
             }
         }
     }
@@ -1104,5 +1122,47 @@ mod tests {
         // 30 s request deadline. A few seconds of slack for a loaded machine.
         assert!(CONNECT_TIMEOUT <= Duration::from_secs(2));
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+}
+
+/// A server older than 0.10 (or one answering from an index without the
+/// symbol graph) ignores `min_confidence` and `kinds` without a word: its
+/// references carry no `confidence`. Say so in `warning` instead of letting
+/// the caller believe the filter applied.
+fn note_unapplied_filters(raw: String) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+    let refs = v.get("references").and_then(|r| r.as_array());
+    let unfiltered =
+        refs.is_some_and(|r| !r.is_empty() && r.iter().all(|x| x.get("confidence").is_none()));
+    if !unfiltered {
+        return raw;
+    }
+    const NOTE: &str = "min_confidence/kinds were not applied: the server (or its index) \
+        predates confidence on references, so this is its unfiltered answer";
+    let warning = match v.get("warning").and_then(|w| w.as_str()) {
+        Some(w) => format!("{w}; {NOTE}"),
+        None => NOTE.to_string(),
+    };
+    v["warning"] = serde_json::Value::String(warning);
+    v.to_string()
+}
+
+#[cfg(test)]
+mod filter_note_tests {
+    use super::note_unapplied_filters;
+
+    #[test]
+    fn an_answer_without_confidence_says_the_filter_was_not_applied() {
+        let old = r#"{"symbol":"f","references":[{"file":"a.rs","line":1,"source":"g"}]}"#;
+        let v: serde_json::Value =
+            serde_json::from_str(&note_unapplied_filters(old.into())).unwrap();
+        assert!(
+            v["warning"].as_str().unwrap().contains("not applied"),
+            "{v}"
+        );
+        let new = r#"{"symbol":"f","references":[{"file":"a.rs","line":1,"source":"g","confidence":"high"}]}"#;
+        assert_eq!(note_unapplied_filters(new.into()), new);
     }
 }

@@ -1299,6 +1299,8 @@ async fn memory_move(State(api): State<Api>, Json(b): Json<MemoryMoveBody>) -> R
 struct ReferencesQuery {
     #[serde(default)]
     min_confidence: Option<String>,
+    #[serde(default)]
+    kinds: Option<String>,
 }
 
 async fn references(
@@ -1307,7 +1309,7 @@ async fn references(
     Query(q): Query<ReferencesQuery>,
 ) -> Response {
     run(api.state, move |s| {
-        do_references_with(s, &symbol, q.min_confidence.as_deref())
+        do_references_with(s, &symbol, q.min_confidence.as_deref(), q.kinds.as_deref())
     })
     .await
 }

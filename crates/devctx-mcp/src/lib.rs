@@ -367,6 +367,12 @@ struct ReferencesReq {
     /// is counted in `below_confidence`.
     #[serde(default)]
     min_confidence: Option<String>,
+    /// Relations to list besides the default calls and instantiations
+    /// (`new Foo()`): any of `"references"` (type uses), `"imports"`,
+    /// `"inherits"`, `"implements"`, or `"all"`. Each reference says which in
+    /// `via`.
+    #[serde(default)]
+    kinds: Option<Vec<String>>,
 }
 
 /// Parameters for the `search_routes` tool.
@@ -1353,20 +1359,25 @@ impl DevctxServer {
     }
 
     /// All call sites (references) of a symbol.
-    #[tool(description = "Find all references (call sites, instantiations, type \
-        uses, imports) of a symbol across the indexed code, one per occurrence. \
-        Each carries `confidence` (high/medium/low) and `via` (the relation); by \
-        default high and medium are listed and anything lower is only counted \
-        in `below_confidence` — pass `min_confidence: \"low\"` to list it. \
-        Returns JSON.")]
+    #[tool(
+        description = "Find all call sites of a symbol across the indexed code \
+        (calls and instantiations), one per occurrence. Each carries `confidence` \
+        (high/medium/low) and `via` (the relation); by default high and medium are \
+        listed and anything lower is only counted in `below_confidence` — pass \
+        `min_confidence: \"low\"` to list it. `kinds` adds type uses, imports and \
+        inherits/implements (or `all`). Returns JSON."
+    )]
     async fn get_references(
         &self,
         Parameters(req): Parameters<ReferencesReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.references(&req.symbol, req.min_confidence.as_deref()))
-            .await
-            .map(|out| Self::annotate(out, resolved))
+        run_blocking(move || {
+            let kinds = req.kinds.as_ref().map(|k| k.join(","));
+            backend.references(&req.symbol, req.min_confidence.as_deref(), kinds.as_deref())
+        })
+        .await
+        .map(|out| Self::annotate(out, resolved))
     }
 
     /// Find HTTP routes (framework-aware) by method and/or path.

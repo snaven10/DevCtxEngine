@@ -2186,67 +2186,83 @@ fn cmd_symbol(name: String, limit: usize) -> Result<()> {
         Some(r) => r.read_symbol(&name, limit)?,
         None => {
             let store = open_store(&cfg, configured_dimension(&cfg))?;
-            let (repo, branch, fallback, stale) = devctx_mcp::state::graph_target(
+            // The same answer as the tool (symbol graph or 0.9.0 path,
+            // branch fallback, warnings, suggestions/external on a miss).
+            let v = devctx_mcp::state::read_symbol_at(
                 &store,
                 &project_root(&cfg)?,
                 cfg.indexing.default_branch(),
+                &name,
+                limit,
             )
             .map_err(|e| anyhow!(e))?;
-            if let Some(f) = &fallback {
-                let why = f.get("why").and_then(|w| w.as_str()).unwrap_or_default();
-                eprintln!("· branch_fallback: {why}");
-            }
-            // The symbol graph when this branch has a current one (PLAN-009
-            // DD-10); the 0.9.0 lookup by name otherwise, saying why.
-            if !stale && store.has_symbol_graph(&repo, &branch)? {
-                let (file, bare) = match devctx_mcp::state::split_file_symbol(&name) {
-                    Some((f, n)) => (Some(f), n),
-                    None => (None, name.as_str()),
-                };
-                let found = store.lookup_definitions(&repo, &branch, bare, file, limit)?;
-                if found.is_empty() {
-                    println!("No definition of `{name}` is indexed.");
-                    return Ok(());
-                }
-                for d in &found {
-                    let s = &d.symbol;
-                    println!(
-                        "\n{} ({}) — {}:{}-{}",
-                        s.qualified, s.kind, s.file, s.start_line, s.end_line
-                    );
-                    if d.chunks.is_empty() {
-                        println!("{}", s.signature.as_deref().unwrap_or_default());
-                    }
-                    for p in &d.chunks {
-                        println!("{}", p.text);
-                    }
-                }
-                return Ok(());
-            }
-            if stale {
-                eprintln!("· warning: {}", devctx_mcp::state::STALE_EXTRACTOR_WARNING);
-            }
-            let found = store.symbol_definitions(&repo, &branch, &name, limit)?;
-            if found.is_empty() {
-                println!("No definition of `{name}` is indexed.");
-                return Ok(());
-            }
-            for p in &found {
-                println!(
-                    "\n{} ({}) — {}:{}-{}",
-                    p.metadata.symbol,
-                    p.metadata.symbol_type,
-                    p.metadata.file,
-                    p.metadata.start_line,
-                    p.metadata.end_line
-                );
-                println!("{}", p.text);
-            }
+            print_read_symbol(&name, &v);
             return Ok(());
         }
     };
     println!("{raw}");
     Ok(())
+}
+
+/// Human output of a `read_symbol` answer: notes on stderr, definitions (or
+/// the miss with its suggestions or external call sites) on stdout.
+fn print_read_symbol(name: &str, v: &serde_json::Value) {
+    let s = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    if let Some(why) = v
+        .get("branch_fallback")
+        .and_then(|f| f.get("why"))
+        .and_then(|w| w.as_str())
+    {
+        eprintln!("· branch_fallback: {why}");
+    }
+    if let Some(w) = v.get("warning").and_then(|w| w.as_str()) {
+        eprintln!("· warning: {w}");
+    }
+    let defs = v
+        .get("definitions")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if defs.is_empty() {
+        println!("No definition of `{name}` is indexed.");
+        if v.get("external").and_then(|e| e.as_bool()) == Some(true) {
+            println!("{}", s(v, "next_step"));
+        }
+        let sugg: Vec<String> = v
+            .get("suggestions")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !sugg.is_empty() {
+            println!("Did you mean: {}", sugg.join(", "));
+        }
+        return;
+    }
+    for d in &defs {
+        let shown = d
+            .get("qualified")
+            .and_then(|q| q.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| s(d, "symbol"));
+        println!(
+            "\n{} ({}) — {}:{}-{}",
+            shown,
+            s(d, "type"),
+            s(d, "file"),
+            d.get("start_line").and_then(|x| x.as_i64()).unwrap_or(0),
+            d.get("end_line").and_then(|x| x.as_i64()).unwrap_or(0),
+        );
+        println!("{}", s(d, "code"));
+    }
 }
 
 /// `devctx context` — one budgeted brief for a question.

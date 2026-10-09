@@ -13,7 +13,7 @@
 //! path for a branch the current extractor has not indexed (DD-19), and
 //! `impact_analysis` still walks `graph_edges` until TASK-009.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use devctx_core::{SearchFilter, VectorPoint};
 use duckdb::{params, params_from_iter};
@@ -271,36 +271,57 @@ impl Store {
             params![repo, branch, sym.file, sym.end_line, sym.start_line],
             row_to_point,
         )?;
-        let near: Vec<VectorPoint> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-        let named = |p: &VectorPoint| p.metadata.symbol == sym.name;
-        if CONTAINER_KINDS.contains(&sym.kind.as_str()) {
-            return Ok(near
-                .into_iter()
-                .filter(|p| p.metadata.chunk_level == "class" && named(p))
-                .collect());
+        let near = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(pick_code_chunks(sym, near))
+    }
+
+    /// [`symbol_code_chunks`](Self::symbol_code_chunks) of every symbol of
+    /// `syms` in **one** query (`symbols` joined to `vectors` by file and
+    /// line overlap), by symbol id: what anchoring and `read_symbol` ask for
+    /// on every call, so it must not cost a scan of `vectors` per definition
+    /// (review of TASK-008, M3).
+    pub fn code_chunks_of(
+        &self,
+        repo: &str,
+        branch: &str,
+        syms: &[StoredSymbol],
+    ) -> Result<HashMap<u64, Vec<VectorPoint>>> {
+        let mut out: HashMap<u64, Vec<VectorPoint>> = HashMap::new();
+        if syms.is_empty() {
+            return Ok(out);
         }
-        let own: Vec<VectorPoint> = near
-            .iter()
-            .filter(|p| {
-                p.metadata.chunk_level != "class" && p.metadata.symbol_type != "grouped" && named(p)
-            })
-            .cloned()
-            .collect();
-        if !own.is_empty() {
-            return Ok(own);
+        let cols = COLS
+            .split(',')
+            .map(|c| format!("v.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let holes = vec!["?"; syms.len()].join(", ");
+        let sql = format!(
+            "SELECT {cols}, s.id FROM symbols s
+               JOIN vectors v ON v.repo = s.repo AND v.branch = s.branch AND v.file = s.file
+                AND v.start_line <= s.end_line AND v.end_line >= s.start_line
+              WHERE s.repo = ? AND s.branch = ? AND s.id IN ({holes})
+                AND NOT v.is_deletion
+                AND v.chunk_level NOT IN ('memory', 'memory_chunk', 'file', 'doc')
+              ORDER BY s.id, v.start_line, v.end_line"
+        );
+        let mut args: Vec<duckdb::types::Value> =
+            vec![repo.to_string().into(), branch.to_string().into()];
+        args.extend(syms.iter().map(|s| duckdb::types::Value::UBigInt(s.id)));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((r.get::<_, u64>(19)?, row_to_point(r)?))
+        })?;
+        let mut near: HashMap<u64, Vec<VectorPoint>> = HashMap::new();
+        for r in rows {
+            let (id, p) = r?;
+            near.entry(id).or_default().push(p);
         }
-        let header = format!("> {}", sym.name);
-        Ok(near
-            .into_iter()
-            .filter(|p| {
-                p.metadata.symbol_type == "grouped"
-                    && (grouped_names(&p.metadata.symbol).any(|n| n == sym.name)
-                        || p.text
-                            .lines()
-                            .any(|l| l.starts_with("# ") && l.ends_with(&header)))
-            })
-            .take(1)
-            .collect())
+        for sym in syms {
+            let chunks = pick_code_chunks(sym, near.remove(&sym.id).unwrap_or_default());
+            out.insert(sym.id, chunks);
+        }
+        Ok(out)
     }
 
     /// `read_symbol` over the symbol graph: the definitions of `name` with
@@ -313,13 +334,15 @@ impl Store {
         file: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SymbolDefinition>> {
-        self.lookup_symbols(repo, branch, name, file, limit)?
+        let syms = self.lookup_symbols(repo, branch, name, file, limit)?;
+        let mut chunks = self.code_chunks_of(repo, branch, &syms)?;
+        Ok(syms
             .into_iter()
-            .map(|symbol| {
-                let chunks = self.symbol_code_chunks(repo, branch, &symbol)?;
-                Ok(SymbolDefinition { symbol, chunks })
+            .map(|symbol| SymbolDefinition {
+                chunks: chunks.remove(&symbol.id).unwrap_or_default(),
+                symbol,
             })
-            .collect()
+            .collect())
     }
 
     /// Definitions of `name` for anchoring a search (the symbol-graph
@@ -336,9 +359,11 @@ impl Store {
         let (Some(repo), Some(branch)) = (filter.repo.as_deref(), filter.branch.as_deref()) else {
             return Ok(Vec::new());
         };
+        let syms = self.lookup_symbols(repo, branch, name, None, limit)?;
+        let mut chunks = self.code_chunks_of(repo, branch, &syms)?;
         let mut out = Vec::new();
-        for sym in self.lookup_symbols(repo, branch, name, None, limit)? {
-            for p in self.symbol_code_chunks(repo, branch, &sym)? {
+        for sym in &syms {
+            for p in chunks.remove(&sym.id).unwrap_or_default() {
                 if !filter.languages.is_empty() && !filter.languages.contains(&p.metadata.language)
                 {
                     continue;
@@ -470,19 +495,25 @@ impl Store {
     }
 
     /// Every reference to the symbols `ids` (one row per occurrence, by
-    /// file and line), over `live_edges`, every kind but `contains`.
+    /// file and line), over `live_edges`, of the relations `kinds` (empty:
+    /// every kind but `contains`).
     ///
     /// With `ids` empty, the external sites of `name` instead (the same
-    /// match as [`lookup_external`](Self::lookup_external)). With
+    /// match as [`lookup_external`](Self::lookup_external)); `external`
+    /// false skips them (a `file::name` lookup is never a library's). With
     /// `undecided`, also the rows the link pass could not decide whose
-    /// destination is `name` or ends in its last segment (`name_only`), so
-    /// the caller can show them marked.
+    /// destination is `name` as written or ends in it
+    /// ([`count_undecided_references`](Self::count_undecided_references)
+    /// counts the same rows), so the caller can show them marked.
+    #[allow(clippy::too_many_arguments)]
     pub fn lookup_references(
         &self,
         repo: &str,
         branch: &str,
         ids: &[u64],
         name: &str,
+        kinds: &[&str],
+        external: bool,
         undecided: bool,
     ) -> Result<Vec<SymbolReference>> {
         let q = dotted(name.trim());
@@ -490,13 +521,14 @@ impl Store {
         let mut conds: Vec<String> = Vec::new();
         let mut args: Vec<duckdb::types::Value> =
             vec![repo.to_string().into(), branch.to_string().into()];
+        let kind_clause = kinds_clause(kinds, &mut args);
         if !ids.is_empty() {
             conds.push(format!(
                 "e.dst_id IN ({})",
                 ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
             ));
             args.extend(ids.iter().map(|&i| duckdb::types::Value::UBigInt(i)));
-        } else {
+        } else if external {
             let target = if self.external_sites(repo, branch, &q)?.is_some() {
                 Some(q.clone())
             } else {
@@ -514,14 +546,12 @@ impl Store {
             }
         }
         if undecided {
-            let last = last_segment(&q).to_string();
             conds.push(format!(
                 "(e.dst_id IS NULL AND NOT coalesce(e.external, false)
-                  AND ({d} = ? OR {d} = ? OR ends_with({d}, '.' || ?)))"
+                  AND ({d} = ? OR ends_with({d}, '.' || ?)))"
             ));
             args.push(q.clone().into());
-            args.push(last.clone().into());
-            args.push(last.into());
+            args.push(q.into());
         }
         if conds.is_empty() {
             return Ok(Vec::new());
@@ -532,7 +562,7 @@ impl Store {
                     coalesce(e.from_test, false)
                FROM live_edges e
                LEFT JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
-              WHERE e.repo = ? AND e.branch = ? AND e.kind <> 'contains' AND ({})
+              WHERE e.repo = ? AND e.branch = ? AND {kind_clause} AND ({})
               ORDER BY e.file, e.line, source, e.kind",
             conds.join(" OR ")
         );
@@ -552,6 +582,39 @@ impl Store {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// How many rows of the relations `kinds` the link pass left undecided
+    /// (no destination, not external) whose destination is `name` as
+    /// written (`::` and `.` alike) or ends in `.name`: a `count(*)`, for an
+    /// answer that does not list them (review of TASK-008, m3). A bare name
+    /// counts every undecided call of that name; a qualified one only those
+    /// written that way.
+    pub fn count_undecided_references(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+        kinds: &[&str],
+    ) -> Result<usize> {
+        let q = dotted(name.trim());
+        let d = dotted_sql("dst_name");
+        let mut args: Vec<duckdb::types::Value> =
+            vec![repo.to_string().into(), branch.to_string().into()];
+        let kind_clause = kinds_clause(kinds, &mut args).replace("e.kind", "kind");
+        args.push(q.clone().into());
+        args.push(q.into());
+        let n: i64 = self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM live_edges
+                  WHERE repo = ? AND branch = ? AND {kind_clause}
+                    AND dst_id IS NULL AND NOT coalesce(external, false)
+                    AND ({d} = ? OR ends_with({d}, '.' || ?))"
+            ),
+            params_from_iter(args),
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// The web graph view over the symbol graph: `live_edges` but
@@ -619,6 +682,53 @@ impl Store {
             .into_iter()
             .collect()
     }
+}
+
+/// Of the chunks overlapping `sym`'s lines (in line order), the ones that
+/// hold its code: see [`Store::symbol_code_chunks`].
+fn pick_code_chunks(sym: &StoredSymbol, near: Vec<VectorPoint>) -> Vec<VectorPoint> {
+    let named = |p: &VectorPoint| p.metadata.symbol == sym.name;
+    if CONTAINER_KINDS.contains(&sym.kind.as_str()) {
+        return near
+            .into_iter()
+            .filter(|p| p.metadata.chunk_level == "class" && named(p))
+            .collect();
+    }
+    let own: Vec<VectorPoint> = near
+        .iter()
+        .filter(|p| {
+            p.metadata.chunk_level != "class" && p.metadata.symbol_type != "grouped" && named(p)
+        })
+        .cloned()
+        .collect();
+    if !own.is_empty() {
+        return own;
+    }
+    let header = format!("> {}", sym.name);
+    near.into_iter()
+        .filter(|p| {
+            p.metadata.symbol_type == "grouped"
+                && (grouped_names(&p.metadata.symbol).any(|n| n == sym.name)
+                    || p.text
+                        .lines()
+                        .any(|l| l.starts_with("# ") && l.ends_with(&header)))
+        })
+        .take(1)
+        .collect()
+}
+
+/// SQL condition on `e.kind` for `kinds` (empty: every kind but
+/// `contains`), pushing its parameters.
+fn kinds_clause(kinds: &[&str], args: &mut Vec<duckdb::types::Value>) -> String {
+    if kinds.is_empty() {
+        return "e.kind <> 'contains'".to_string();
+    }
+    args.extend(
+        kinds
+            .iter()
+            .map(|k| duckdb::types::Value::from(k.to_string())),
+    );
+    format!("e.kind IN ({})", vec!["?"; kinds.len()].join(", "))
 }
 
 /// The names a `grouped` chunk lists (`a, b, c` or `a, b, c, d +2`).

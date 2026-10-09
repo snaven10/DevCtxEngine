@@ -651,7 +651,8 @@ pub fn do_search(
     rerank: bool,
     sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
-    let (items, fallback) = search_items(state, query, limit, language, mode, rerank, sel, true)?;
+    let (items, fallback, reader) =
+        search_items_with(state, query, limit, language, mode, rerank, sel, true)?;
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
@@ -668,6 +669,11 @@ pub fn do_search(
     }
     if let Some(f) = &fallback {
         out["branch_fallback"] = f.to_json();
+    }
+    // Identifiers anchored by name, not through the symbol graph (DD-19):
+    // say why, as the graph tools do.
+    if let Some(w) = reader.and_then(lookup::Reader::search_warning) {
+        out["warning"] = json!(w);
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
@@ -692,9 +698,30 @@ fn search_items(
     sel: &devctx_search::KindSel,
     build_fts: bool,
 ) -> Result<(Vec<Value>, Option<BranchFallback>), String> {
+    search_items_with(state, query, limit, language, mode, rerank, sel, build_fts)
+        .map(|(items, fallback, _)| (items, fallback))
+}
+
+/// Rows of a search, its branch fallback and how it anchored identifiers.
+type SearchRows = (Vec<Value>, Option<BranchFallback>, Option<lookup::Reader>);
+
+/// [`search_items`], plus how identifiers were anchored: the reader of the
+/// searched branch in `keyword`/`hybrid` (`None` in `vector`, which does not
+/// anchor, or with no branch indexed).
+#[allow(clippy::too_many_arguments)]
+fn search_items_with(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    language: Option<String>,
+    mode: SearchMode,
+    rerank: bool,
+    sel: &devctx_search::KindSel,
+    build_fts: bool,
+) -> Result<SearchRows, String> {
     let opts = sel.options(state.cfg.search.penalty)?;
     let store = state.open_store()?;
-    let (branch_filter, fallback) = search_branch(state, &store);
+    let (branch_filter, fallback, choice) = search_scope(state, &store);
     let filter = SearchFilter {
         languages: language.into_iter().collect(),
         exclude_deletions: true,
@@ -737,12 +764,11 @@ fn search_items(
     };
     // Identifiers are anchored through the symbol graph when the searched
     // branch has a current one (PLAN-009 DD-10), by name otherwise.
-    let by_symbol = mode != SearchMode::Vector
-        && filter.repo.is_some()
-        && filter.branch.is_some()
-        && pick_branch(state, &store)
-            .map(|c| lookup::Reader::of(&c, &store) == lookup::Reader::SymbolGraph)
-            .unwrap_or(false);
+    let reader = choice
+        .as_ref()
+        .filter(|_| mode != SearchMode::Vector)
+        .map(|c| lookup::Reader::of(c, &store));
+    let by_symbol = reader == Some(lookup::Reader::SymbolGraph);
     let anchored = devctx_search::search_anchored(
         &store,
         query,
@@ -786,7 +812,7 @@ fn search_items(
             }
         }
     }
-    Ok((items, fallback))
+    Ok((items, fallback, reader))
 }
 
 /// Whether a hit is the definition of one of the identifiers anchoring looked
@@ -842,21 +868,33 @@ fn prune_untracked_branches(state: &AppState, store: &devctx_store::Store) -> us
 /// has rows, else the most recently indexed branch with rows (the same rule as
 /// the graph tools, via `pick_graph_branch`), else no filter — which is exactly
 /// the behaviour of every version before branches were tracked.
+#[cfg(test)]
 fn search_branch(
     state: &AppState,
     store: &devctx_store::Store,
 ) -> (SearchFilter, Option<BranchFallback>) {
+    let (filter, fallback, _) = search_scope(state, store);
+    (filter, fallback)
+}
+
+/// [`search_branch`] plus the branch choice it was made from (when a branch
+/// has rows), so a search decides how to anchor identifiers without picking
+/// the branch a second time (review of TASK-008, M3).
+fn search_scope(
+    state: &AppState,
+    store: &devctx_store::Store,
+) -> (SearchFilter, Option<BranchFallback>, Option<BranchChoice>) {
     // One rule for search and graph: see `pick_graph_branch`.
     match pick_branch(state, store) {
         Ok(c) if c.indexed => {
             let filter = SearchFilter {
-                repo: Some(c.repo),
-                branch: Some(c.branch),
+                repo: Some(c.repo.clone()),
+                branch: Some(c.branch.clone()),
                 ..SearchFilter::default()
             };
-            (filter, c.fallback)
+            (filter, c.fallback.clone(), Some(c))
         }
-        _ => (SearchFilter::default(), None),
+        _ => (SearchFilter::default(), None, None),
     }
 }
 
@@ -5720,11 +5758,45 @@ fn parse_memories(raw: &str) -> Vec<Value> {
 pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<String, String> {
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
-    let reader = lookup::Reader::of(&chosen, &store);
+    read_symbol_on(&store, &chosen, name, limit).map(|v| v.to_string())
+}
+
+/// `read_symbol` for the repository at `root`, for callers that hold a store
+/// but no [`AppState`] (the local CLI): the same answer the tool gives —
+/// symbol graph or 0.9.0 path, `branch_fallback`, `warning`, and on a miss
+/// `suggestions`/`external`.
+pub fn read_symbol_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    name: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    read_symbol_on(store, &chosen, name, limit)
+}
+
+/// The `read_symbol` answer on a chosen branch.
+fn read_symbol_on(
+    store: &devctx_store::Store,
+    chosen: &BranchChoice,
+    name: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    let reader = lookup::Reader::of(chosen, store);
     if reader == lookup::Reader::SymbolGraph {
-        let mut out = lookup::read_symbol(&store, &chosen, name, limit)?;
+        let mut out = lookup::read_symbol(store, chosen, name, limit)?;
         chosen.annotate(&mut out);
-        return Ok(out.to_string());
+        return Ok(out);
     }
     let found = store
         .symbol_definitions(&chosen.repo, &chosen.branch, name, limit)
@@ -5744,11 +5816,11 @@ pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<Stri
     if found.is_empty() {
         // Nothing to read is not the end of the answer: say what the name was
         // probably meant to be, and whether it is code this repo does not own.
-        not_found_hints(&store, &chosen.repo, &chosen.branch, name, &mut out);
+        not_found_hints(store, &chosen.repo, &chosen.branch, name, &mut out);
     }
     chosen.annotate(&mut out);
     reader.annotate(&mut out);
-    Ok(out.to_string())
+    Ok(out)
 }
 
 /// Fields for a `read_symbol` that found no definition: `suggestions` (up to 5 —
@@ -5806,7 +5878,9 @@ pub fn split_file_symbol(subject: &str) -> Option<(&str, &str)> {
     if file.is_empty() || name.is_empty() || file.contains("::") && !file.contains('/') {
         return None;
     }
-    (file.contains('/') || has_file_extension(file)).then_some((file, name))
+    // `@scope/pkg::fn` names a package's export, not a file.
+    let path = file.contains('/') && !file.starts_with('@');
+    (path || has_file_extension(file)).then_some((file, name))
 }
 
 /// Whether `file` ends in the extension of a language the index knows
@@ -6286,7 +6360,7 @@ fn value_json(v: Value, sources: &str) -> Value {
 /// `get_references` tool: all call sites of a symbol, with the default
 /// confidence filter (see [`do_references_with`]).
 pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
-    do_references_with(state, symbol, None)
+    do_references_with(state, symbol, None, None)
 }
 
 /// `get_references` tool: all references of a symbol.
@@ -6294,19 +6368,34 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
 /// On a branch with a current symbol graph, one row per occurrence over
 /// `live_edges` by id, each with `confidence` and `via`; `min_confidence`
 /// (`high`/`medium`/`low`, default `medium`) decides what is listed and
-/// `below_confidence` counts what it left out. Otherwise the 0.9.0 answer
+/// `below_confidence` counts what it left out; `kinds` (comma-separated, or
+/// `all`) adds relations to the default calls and instantiations. Otherwise the 0.9.0 answer
 /// from `graph_edges`, with the warning that says why.
 pub fn do_references_with(
     state: &AppState,
     symbol: &str,
     min_confidence: Option<&str>,
+    kinds: Option<&str>,
+) -> Result<String, String> {
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    references_budgeted(state, symbol, min_confidence, kinds, budget)
+}
+
+/// [`do_references_with`] under an explicit token budget.
+fn references_budgeted(
+    state: &AppState,
+    symbol: &str,
+    min_confidence: Option<&str>,
+    kinds: Option<&str>,
+    budget: usize,
 ) -> Result<String, String> {
     let min = lookup::parse_min_confidence(min_confidence)?;
+    let kinds = lookup::parse_kinds(kinds)?;
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
     let reader = lookup::Reader::of(&chosen, &store);
     if reader == lookup::Reader::SymbolGraph {
-        let (arr, resolved, hidden) = lookup::references(&store, &chosen, symbol, min)?;
+        let (arr, resolved, hidden) = lookup::references(&store, &chosen, symbol, min, &kinds)?;
         return references_answer(
             symbol,
             arr,
@@ -6314,6 +6403,7 @@ pub fn do_references_with(
             &chosen,
             reader,
             lookup::below_confidence(hidden, min),
+            budget,
         );
     }
     let resolved = store
@@ -6326,7 +6416,7 @@ pub fn do_references_with(
         .iter()
         .map(|r| json!({ "file": r.file, "line": r.line, "source": r.source }))
         .collect();
-    references_answer(symbol, arr, &resolved, &chosen, reader, None)
+    references_answer(symbol, arr, &resolved, &chosen, reader, None, budget)
 }
 
 /// The `get_references` object, budgeted: `{symbol, references,
@@ -6338,8 +6428,8 @@ fn references_answer(
     chosen: &BranchChoice,
     reader: lookup::Reader,
     below: Option<Value>,
+    budget: usize,
 ) -> Result<String, String> {
-    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     let (kept, dropped) = fit_json_array(arr, budget, Some("source"), |v| {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
         let line = v.get("line").and_then(|l| l.as_i64()).unwrap_or(0);
@@ -9719,6 +9809,14 @@ mod tests {
                 )
                 .unwrap();
         }
+        check_read_symbol_not_found_suggests_and_marks_external(&state);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The asserts of [`read_symbol_not_found_suggests_and_marks_external`], shared with the variant over a real
+    /// index (`state::lookup::tests`): the 0.9.0 contract on both paths.
+    #[allow(clippy::needless_borrow)] // the asserts are the original ones, verbatim
+    pub(super) fn check_read_symbol_not_found_suggests_and_marks_external(state: &AppState) {
         let typo: Value =
             serde_json::from_str(&do_read_symbol(&state, "AuthServce", 5).unwrap()).unwrap();
         assert!(typo["definitions"].as_array().unwrap().is_empty());
@@ -9740,7 +9838,6 @@ mod tests {
         let found: Value =
             serde_json::from_str(&do_read_symbol(&state, "greet", 5).unwrap()).unwrap();
         assert!(found.get("suggestions").is_none() && found.get("external").is_none());
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// Fixup L (B2/B3): a qualified library call is external too (the edge may
@@ -9792,6 +9889,16 @@ mod tests {
                 )
                 .unwrap();
         }
+        check_qualified_externals_are_found_and_get_no_noisy_suggestions(&state);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The asserts of [`qualified_externals_are_found_and_get_no_noisy_suggestions`], shared with the variant over a real
+    /// index (`state::lookup::tests`): the 0.9.0 contract on both paths.
+    #[allow(clippy::needless_borrow)] // the asserts are the original ones, verbatim
+    pub(super) fn check_qualified_externals_are_found_and_get_no_noisy_suggestions(
+        state: &AppState,
+    ) {
         let read = |n: &str| -> Value {
             serde_json::from_str(&do_read_symbol(&state, n, 5).unwrap()).unwrap()
         };
@@ -9820,7 +9927,6 @@ mod tests {
             v["suggestions"].to_string().contains("build_context"),
             "{v}"
         );
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// Small functions are indexed together, under a symbol that lists them
@@ -9886,6 +9992,14 @@ mod tests {
                 )
                 .unwrap();
         }
+        check_a_grouped_small_function_is_found_not_external(&state);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The asserts of [`a_grouped_small_function_is_found_not_external`], shared with the variant over a real
+    /// index (`state::lookup::tests`): the 0.9.0 contract on both paths.
+    #[allow(clippy::needless_borrow)] // the asserts are the original ones, verbatim
+    pub(super) fn check_a_grouped_small_function_is_found_not_external(state: &AppState) {
         for name in ["get_age", "hidden_getter"] {
             let v: Value = serde_json::from_str(&do_read_symbol(&state, name, 5).unwrap()).unwrap();
             assert!(v.get("external").is_none(), "{name}: {v}");
@@ -9897,7 +10011,6 @@ mod tests {
         assert_eq!(v["external"], true, "{v}");
         let step = v["next_step"].as_str().unwrap();
         assert!(step.contains("no indexed definition"), "{step}");
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     fn choice(branch: &str, indexed: bool) -> BranchChoice {
