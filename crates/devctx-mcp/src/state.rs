@@ -24,6 +24,8 @@ use devctx_store::Store;
 use devctx_summarize::{create_summarizer, SummarizeSettings};
 use serde_json::{json, Value};
 
+mod lookup;
+
 /// How far an indexing run has got, for anyone who asks while it runs.
 ///
 /// The work happens inside the server, so the client that asked for it sees
@@ -733,7 +735,15 @@ fn search_items(
     } else {
         None
     };
-    let hits = devctx_search::search_ranked(
+    // Identifiers are anchored through the symbol graph when the searched
+    // branch has a current one (PLAN-009 DD-10), by name otherwise.
+    let by_symbol = mode != SearchMode::Vector
+        && filter.repo.is_some()
+        && filter.branch.is_some()
+        && pick_branch(state, &store)
+            .map(|c| lookup::Reader::of(&c, &store) == lookup::Reader::SymbolGraph)
+            .unwrap_or(false);
+    let anchored = devctx_search::search_anchored(
         &store,
         query,
         &filter,
@@ -742,15 +752,33 @@ fn search_items(
         embedder.as_deref(),
         reranker.as_deref(),
         &opts,
+        if by_symbol {
+            devctx_search::AnchorLookup::Symbols
+        } else {
+            devctx_search::AnchorLookup::Names
+        },
     )
     .map_err(|e| e.to_string())?;
+    let hits = anchored.hits;
     let mut items = match hits_to_json(&hits) {
         Value::Array(a) => a,
         _ => Vec::new(),
     };
     // Hits pinned because the query named their symbol say so, so an agent can
-    // tell "ranked first" from "is the definition of what you typed".
-    if mode != SearchMode::Vector {
+    // tell "ranked first" from "is the definition of what you typed". Over the
+    // symbol graph a hit is anchored when it is a chunk of a definition the
+    // lookup found (by id, `sym` says which); by name, when its symbol is the
+    // identifier or ends in it.
+    if by_symbol {
+        for (item, hit) in items.iter_mut().zip(&hits) {
+            if let Some(sym) = anchored.definitions.get(&hit.point.id) {
+                item["anchored"] = json!(true);
+                if let Some(id) = sym {
+                    item["sym"] = json!(devctx_store::sym_hex(*id));
+                }
+            }
+        }
+    } else if mode != SearchMode::Vector {
         let idents = devctx_search::anchor_tokens(query);
         for (item, hit) in items.iter_mut().zip(&hits) {
             if is_anchored_definition(&hit.point.metadata, &idents) {
@@ -1992,8 +2020,12 @@ pub fn do_recall(state: &AppState, query: &str, limit: usize) -> Result<String, 
 
 /// `graph` tool: cytoscape-shaped `{nodes, edges}` for the call-graph.
 ///
-/// A node is *external* when it is called but never defined locally (never a
-/// source). `hide_external`/`hide_synthetic` drop those before assembly.
+/// On a branch with a current symbol graph, every relation but `contains`
+/// (or only `kind`) from `live_edges`, and a node is *external* when the link
+/// pass marked an edge to it external (DD-9); edges carry `confidence` and
+/// `test`. Otherwise the 0.9.0 view over `graph_edges`, where a node is
+/// *external* when it is called but never defined locally (never a source).
+/// `hide_external`/`hide_synthetic` drop those before assembly.
 pub fn do_graph(
     state: &AppState,
     kind: Option<String>,
@@ -2004,6 +2036,21 @@ pub fn do_graph(
 ) -> Result<String, String> {
     let store = state.open_store()?;
     let chosen = pick_branch(state, &store)?;
+    let reader = lookup::Reader::of(&chosen, &store);
+    if reader == lookup::Reader::SymbolGraph {
+        let edges = store
+            .lookup_graph_view(
+                &chosen.repo,
+                &chosen.branch,
+                kind.as_deref(),
+                file.as_deref(),
+                limit,
+            )
+            .map_err(|e| e.to_string())?;
+        let mut out = lookup::graph_view(&chosen, &edges, hide_external, hide_synthetic);
+        chosen.annotate(&mut out);
+        return Ok(out.to_string());
+    }
     let (repo, branch) = (chosen.repo.clone(), chosen.branch.clone());
     let edges = store
         .graph_edges(&repo, &branch, kind.as_deref(), file.as_deref(), limit)
@@ -2074,6 +2121,9 @@ pub fn do_graph(
         "edges": out_edges,
     });
     chosen.annotate(&mut out);
+    if chosen.indexed {
+        reader.annotate(&mut out);
+    }
     Ok(out.to_string())
 }
 
@@ -5670,6 +5720,12 @@ fn parse_memories(raw: &str) -> Vec<Value> {
 pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<String, String> {
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
+    let reader = lookup::Reader::of(&chosen, &store);
+    if reader == lookup::Reader::SymbolGraph {
+        let mut out = lookup::read_symbol(&store, &chosen, name, limit)?;
+        chosen.annotate(&mut out);
+        return Ok(out.to_string());
+    }
     let found = store
         .symbol_definitions(&chosen.repo, &chosen.branch, name, limit)
         .map_err(|e| e.to_string())?;
@@ -5691,6 +5747,7 @@ pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<Stri
         not_found_hints(&store, &chosen.repo, &chosen.branch, name, &mut out);
     }
     chosen.annotate(&mut out);
+    reader.annotate(&mut out);
     Ok(out.to_string())
 }
 
@@ -5742,16 +5799,31 @@ fn not_found_hints(
 }
 
 /// `file::symbol` split into its two halves when the left one is a file (it has a
-/// `/`, or an extension: `links.rs`), not a module path (`devctx_store::Store`).
-fn split_file_symbol(subject: &str) -> Option<(&str, &str)> {
+/// `/`, or a language's extension: `links.rs`), not a module path
+/// (`devctx_store::Store`) nor a qualified type (`Foo.Bar::baz`).
+pub fn split_file_symbol(subject: &str) -> Option<(&str, &str)> {
     let (file, name) = subject.rsplit_once("::")?;
     if file.is_empty() || name.is_empty() || file.contains("::") && !file.contains('/') {
         return None;
     }
-    let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    let has_ext =
-        !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric());
-    (file.contains('/') || has_ext).then_some((file, name))
+    (file.contains('/') || has_file_extension(file)).then_some((file, name))
+}
+
+/// Whether `file` ends in the extension of a language the index knows
+/// (`links.rs`, `app.component.ts`, `schema.sql`), written in lowercase as
+/// files are. `Foo.Bar` is a type and its member, not the file `Foo.Bar`
+/// (pending 1 of PLAN-008): any short alphanumeric "extension" used to do.
+fn has_file_extension(file: &str) -> bool {
+    let Some((stem, ext)) = file.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !ext.is_empty()
+        && ext
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && (devctx_index::lang_for_extension(ext).is_some()
+            || devctx_index::raw_text_language(ext).is_some())
 }
 
 /// What a `memories_by_symbol` subject looks up: the name the junction holds and
@@ -6211,10 +6283,39 @@ fn value_json(v: Value, sources: &str) -> Value {
     })
 }
 
-/// `get_references` tool: all call sites of a symbol.
+/// `get_references` tool: all call sites of a symbol, with the default
+/// confidence filter (see [`do_references_with`]).
 pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
+    do_references_with(state, symbol, None)
+}
+
+/// `get_references` tool: all references of a symbol.
+///
+/// On a branch with a current symbol graph, one row per occurrence over
+/// `live_edges` by id, each with `confidence` and `via`; `min_confidence`
+/// (`high`/`medium`/`low`, default `medium`) decides what is listed and
+/// `below_confidence` counts what it left out. Otherwise the 0.9.0 answer
+/// from `graph_edges`, with the warning that says why.
+pub fn do_references_with(
+    state: &AppState,
+    symbol: &str,
+    min_confidence: Option<&str>,
+) -> Result<String, String> {
+    let min = lookup::parse_min_confidence(min_confidence)?;
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
+    let reader = lookup::Reader::of(&chosen, &store);
+    if reader == lookup::Reader::SymbolGraph {
+        let (arr, resolved, hidden) = lookup::references(&store, &chosen, symbol, min)?;
+        return references_answer(
+            symbol,
+            arr,
+            &resolved,
+            &chosen,
+            reader,
+            lookup::below_confidence(hidden, min),
+        );
+    }
     let resolved = store
         .resolve_symbol(&chosen.repo, &chosen.branch, symbol)
         .map_err(|e| e.to_string())?;
@@ -6225,6 +6326,19 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
         .iter()
         .map(|r| json!({ "file": r.file, "line": r.line, "source": r.source }))
         .collect();
+    references_answer(symbol, arr, &resolved, &chosen, reader, None)
+}
+
+/// The `get_references` object, budgeted: `{symbol, references,
+/// resolved_symbols?, below_confidence?, branch_fallback?, warning?, omitted?}`.
+fn references_answer(
+    symbol: &str,
+    arr: Vec<Value>,
+    resolved: &[String],
+    chosen: &BranchChoice,
+    reader: lookup::Reader,
+    below: Option<Value>,
+) -> Result<String, String> {
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     let (kept, dropped) = fit_json_array(arr, budget, Some("source"), |v| {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
@@ -6232,10 +6346,14 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
         format!("{file}:{line}")
     });
     let mut out = json!({ "symbol": symbol, "references": kept });
-    if let Some(names) = merged_declarations(symbol, &resolved) {
+    if let Some(names) = merged_declarations(symbol, resolved) {
         out["resolved_symbols"] = json!(names);
     }
+    if let Some(b) = below {
+        out["below_confidence"] = b;
+    }
     chosen.annotate(&mut out);
+    reader.annotate(&mut out);
     if !dropped.is_empty() {
         set_budget_omitted(
             &mut out,

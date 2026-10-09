@@ -2186,9 +2186,47 @@ fn cmd_symbol(name: String, limit: usize) -> Result<()> {
         Some(r) => r.read_symbol(&name, limit)?,
         None => {
             let store = open_store(&cfg, configured_dimension(&cfg))?;
-            let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
-            let branch = git.state().branch;
-            let found = store.symbol_definitions(&git.short_name(), &branch, &name, limit)?;
+            let (repo, branch, fallback, stale) = devctx_mcp::state::graph_target(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+            )
+            .map_err(|e| anyhow!(e))?;
+            if let Some(f) = &fallback {
+                let why = f.get("why").and_then(|w| w.as_str()).unwrap_or_default();
+                eprintln!("· branch_fallback: {why}");
+            }
+            // The symbol graph when this branch has a current one (PLAN-009
+            // DD-10); the 0.9.0 lookup by name otherwise, saying why.
+            if !stale && store.has_symbol_graph(&repo, &branch)? {
+                let (file, bare) = match devctx_mcp::state::split_file_symbol(&name) {
+                    Some((f, n)) => (Some(f), n),
+                    None => (None, name.as_str()),
+                };
+                let found = store.lookup_definitions(&repo, &branch, bare, file, limit)?;
+                if found.is_empty() {
+                    println!("No definition of `{name}` is indexed.");
+                    return Ok(());
+                }
+                for d in &found {
+                    let s = &d.symbol;
+                    println!(
+                        "\n{} ({}) — {}:{}-{}",
+                        s.qualified, s.kind, s.file, s.start_line, s.end_line
+                    );
+                    if d.chunks.is_empty() {
+                        println!("{}", s.signature.as_deref().unwrap_or_default());
+                    }
+                    for p in &d.chunks {
+                        println!("{}", p.text);
+                    }
+                }
+                return Ok(());
+            }
+            if stale {
+                eprintln!("· warning: {}", devctx_mcp::state::STALE_EXTRACTOR_WARNING);
+            }
+            let found = store.symbol_definitions(&repo, &branch, &name, limit)?;
             if found.is_empty() {
                 println!("No definition of `{name}` is indexed.");
                 return Ok(());

@@ -11,7 +11,7 @@ use crate::state::{
     do_backfill_links, do_build_context, do_impact, do_index, do_index_status, do_list_projects,
     do_memories_by_file, do_memories_by_symbol, do_memory_context, do_memory_forget,
     do_memory_move, do_memory_refs, do_memory_stats, do_plan_status, do_read_file, do_read_symbol,
-    do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
+    do_recall_scoped, do_references_with, do_remember, do_remember_shared, do_routes_for_handler,
     do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
     MemoriesOpts, Page, PlanListOpts,
 };
@@ -695,10 +695,16 @@ impl Backend {
         }
     }
 
-    pub fn references(&self, symbol: &str) -> Result<String, String> {
+    pub fn references(&self, symbol: &str, min_confidence: Option<&str>) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_references(s, symbol),
-            Backend::Remote(r, _) => r.get(&format!("/references/{}", urlencode(symbol))),
+            Backend::Local(s) => do_references_with(s, symbol, min_confidence),
+            Backend::Remote(r, _) => {
+                let mut path = format!("/references/{}", urlencode(symbol));
+                if let Some(m) = min_confidence {
+                    path.push_str(&format!("?min_confidence={}", urlencode(m)));
+                }
+                r.get(&path)
+            }
         }
     }
 

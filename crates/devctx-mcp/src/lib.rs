@@ -358,8 +358,15 @@ struct ReferencesReq {
     /// Answer this call from a different project than the one bound (this call only).
     #[serde(default)]
     project: Option<String>,
-    /// The symbol whose call sites to list.
+    /// The symbol whose references to list: a bare name (`charge`), a
+    /// qualified one (`Card.charge`, `Card::charge`) or `file::name`.
     symbol: String,
+    /// Lowest confidence listed: `"high"`, `"medium"` (default) or `"low"`.
+    /// `low` adds the ambiguous references and the calls the index could not
+    /// decide, each marked `undecided: true`; whatever the default leaves out
+    /// is counted in `below_confidence`.
+    #[serde(default)]
+    min_confidence: Option<String>,
 }
 
 /// Parameters for the `search_routes` tool.
@@ -1346,16 +1353,18 @@ impl DevctxServer {
     }
 
     /// All call sites (references) of a symbol.
-    #[tool(
-        description = "Find all call sites (references) of a symbol across the \
-        indexed code. Returns JSON."
-    )]
+    #[tool(description = "Find all references (call sites, instantiations, type \
+        uses, imports) of a symbol across the indexed code, one per occurrence. \
+        Each carries `confidence` (high/medium/low) and `via` (the relation); by \
+        default high and medium are listed and anything lower is only counted \
+        in `below_confidence` — pass `min_confidence: \"low\"` to list it. \
+        Returns JSON.")]
     async fn get_references(
         &self,
         Parameters(req): Parameters<ReferencesReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.references(&req.symbol))
+        run_blocking(move || backend.references(&req.symbol, req.min_confidence.as_deref()))
             .await
             .map(|out| Self::annotate(out, resolved))
     }

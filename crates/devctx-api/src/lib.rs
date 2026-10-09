@@ -21,7 +21,7 @@ use devctx_mcp::state::{
     do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
     do_memories_by_symbol, do_memory_context, do_memory_forget, do_memory_move, do_memory_refs,
     do_memory_stats, do_plan_graph, do_plan_status, do_read_file, do_read_symbol, do_recall_scoped,
-    do_references, do_remember, do_remember_shared, do_routes_for_handler, do_search,
+    do_references_with, do_remember, do_remember_shared, do_routes_for_handler, do_search,
     do_search_routes, do_summarize, parse_mode, AppState, MemoriesOpts, Page, PlanListOpts,
 };
 use serde::Deserialize;
@@ -1295,8 +1295,21 @@ async fn memory_move(State(api): State<Api>, Json(b): Json<MemoryMoveBody>) -> R
     run(api.state, move |s| do_memory_move(s, &b.id, &b.to)).await
 }
 
-async fn references(State(api): State<Api>, Path(symbol): Path<String>) -> Response {
-    run(api.state, move |s| do_references(s, &symbol)).await
+#[derive(Deserialize)]
+struct ReferencesQuery {
+    #[serde(default)]
+    min_confidence: Option<String>,
+}
+
+async fn references(
+    State(api): State<Api>,
+    Path(symbol): Path<String>,
+    Query(q): Query<ReferencesQuery>,
+) -> Response {
+    run(api.state, move |s| {
+        do_references_with(s, &symbol, q.min_confidence.as_deref())
+    })
+    .await
 }
 
 async fn routes(State(api): State<Api>, Query(q): Query<RoutesQuery>) -> Response {
