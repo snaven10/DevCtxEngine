@@ -1271,6 +1271,9 @@ impl RepoIndex {
     /// `this.m()` / `super.m()` (rule 1).
     fn this_call(&self, c: &Call<'_>, sup: bool) -> Outcome {
         let Some(&k) = self.containers(c.src).first() else {
+            if let Some(out) = self.impl_trait_member(c) {
+                return out;
+            }
             return self.any_bare(c);
         };
         if !sup {
@@ -1295,6 +1298,28 @@ impl RepoIndex {
         } else {
             undecided()
         }
+    }
+
+    /// `self.m()` inside a Rust `impl Trait for T` whose `T` has no
+    /// definition in the repository (`impl Greeter for String`): the
+    /// repository trait the `impl` implements is the type's supertype, so a
+    /// method it declares (a default one included) is the answer, by the
+    /// trait and never by name (review of TASK-008, m6). `None` when no
+    /// repository supertype of the `impl` has it.
+    fn impl_trait_member(&self, c: &Call<'_>) -> Option<Outcome> {
+        let imp = self
+            .chain(c.src)
+            .into_iter()
+            .find(|&a| self.syms[a].kind == "impl")?;
+        for r in self.supers.get(&self.syms[imp].id).into_iter().flatten() {
+            if let TypeRef::Repo(s, how) = *r {
+                if let Member::Found(m, _, exact) = self.find_member(s, c.callee, true, c.args) {
+                    let out = self.member_hit(m, true, exact, "inherited");
+                    return Some(cap(out, self.type_conf(s, how)));
+                }
+            }
+        }
+        None
     }
 
     /// A call without a receiver, by the file's language.

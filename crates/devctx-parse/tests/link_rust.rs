@@ -457,3 +457,23 @@ fn a_receiver_use_in_a_block_is_scoped_to_it() {
     );
     assert_eq!(calls[1], UNDECIDED);
 }
+
+/// Review of TASK-008 (m6): in an `impl` of a repository trait for a type
+/// from outside, `self.m()` is the trait's method (its supertype), not a
+/// guess by name and not undecided.
+#[test]
+fn self_in_an_impl_of_a_repo_trait_reaches_the_trait() {
+    let l = linked();
+    assert_eq!(
+        l.call("String.wave", "String.hello"),
+        (
+            s("Greeter.hello"),
+            s("crates/app/src/review.rs"),
+            "high",
+            "inherited",
+            false
+        )
+    );
+    // The outside type's own method stays undecided.
+    assert_eq!(l.call("Vec.size", "Vec.tidy_up"), UNDECIDED);
+}

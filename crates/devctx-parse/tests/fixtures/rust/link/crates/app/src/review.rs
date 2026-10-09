@@ -137,3 +137,16 @@ pub fn closure_receiver() {
     c();
     P.shine();
 }
+
+/// A trait of the repository with a default method, implemented for a type
+/// from outside: `self.hello()` is the trait's default.
+pub trait Greeter {
+    fn hello(&self) {}
+    fn wave(&self);
+}
+
+impl Greeter for String {
+    fn wave(&self) {
+        self.hello();
+    }
+}
