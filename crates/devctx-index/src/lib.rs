@@ -3034,6 +3034,77 @@ public class Helper {
         .unwrap()
     }
 
+    /// Review of TASK-017, point 8: scenario (e) through `impact_graph`, not
+    /// only the link pass — a class that changes its `implements` in an
+    /// incremental run is reached through the new interface and no longer
+    /// through the old one, exactly as a full index of the same tree answers.
+    #[test]
+    fn dispatch_follows_an_incremental_implements_change() {
+        let files = [
+            (
+                "p/IFirst.java",
+                "package p;\npublic interface IFirst { void run(String id); }\n",
+            ),
+            (
+                "p/ISecond.java",
+                "package p;\npublic interface ISecond { void run(String id); }\n",
+            ),
+            (
+                "p/Worker.java",
+                "package p;\npublic class Worker implements IFirst {\n    public void run(String id) {}\n}\n",
+            ),
+            (
+                "p/UsesFirst.java",
+                "package p;\npublic class UsesFirst {\n    void go(IFirst f) {\n        f.run(\"a\");\n    }\n}\n",
+            ),
+            (
+                "p/UsesSecond.java",
+                "package p;\npublic class UsesSecond {\n    void go(ISecond s) {\n        s.run(\"b\");\n    }\n}\n",
+            ),
+        ];
+        let callers = |store: &Store, repo: &str| -> Vec<(String, String)> {
+            let im = store
+                .impact_graph(
+                    repo,
+                    "main",
+                    "Worker.run",
+                    None,
+                    &devctx_store::ImpactOptions::default(),
+                )
+                .unwrap();
+            im.upstream
+                .nodes
+                .iter()
+                .map(|n| (n.symbol.clone(), n.via.clone()))
+                .collect()
+        };
+        let (dir, repo) = graph_repo("dispatch_impl_change", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        assert_eq!(
+            callers(&store, &repo),
+            [("UsesFirst.go".to_string(), "dispatch".to_string())]
+        );
+        write(
+            &dir,
+            "p/Worker.java",
+            "package p;\npublic class Worker implements ISecond {\n    public void run(String id) {}\n}\n",
+        );
+        commit_all(&dir, "p/Worker.java");
+        let inc = index_with(&store, &dir, false, None);
+        assert_eq!(inc.files_indexed, 1, "{inc:?}");
+        let after = callers(&store, &repo);
+        assert_eq!(
+            after,
+            [("UsesSecond.go".to_string(), "dispatch".to_string())]
+        );
+        // A full index of the same tree answers the same.
+        let fresh = Store::open_in_memory(DIM).unwrap();
+        index_with(&fresh, &dir, true, None);
+        assert_eq!(callers(&fresh, &repo), after);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The incremental link pass leaves the branch exactly as a full one
     /// would (TASK-005 review, MAJOR 4): after a supertype changes, a return
     /// type changes, `@Data` is added and a package moves — each a write of
