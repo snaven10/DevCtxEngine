@@ -664,7 +664,7 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
             eprintln!(
                 "· link pass ({}): {} edges resolved, {} files rewritten, {} calls discarded in the branch \
                  (untypable receiver, name not in the repository), {} calls undecided, {} ms \
-                 (load {} ms, write {} ms, rank {} symbols {} ms)",
+                 (load {} ms, write {} ms, rank {} symbols {} ms, {} written, {} iterations{})",
                 if stats.full { "full" } else { "incremental" },
                 stats.resolved,
                 stats.files_written,
@@ -674,7 +674,14 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
                 stats.load_ms,
                 stats.write_ms,
                 stats.ranked,
-                stats.rank_ms
+                stats.rank_ms,
+                stats.ranks_written,
+                stats.rank_iterations,
+                if stats.rank_converged {
+                    ""
+                } else {
+                    ", not converged"
+                }
             );
         }
     }

@@ -27,8 +27,10 @@ pub(crate) const DAMPING: f64 = 0.85;
 /// L1 change between two iterations under which the iteration stops.
 pub(crate) const TOLERANCE: f64 = 1e-6;
 
-/// Iterations at most.
-pub(crate) const MAX_ITERATIONS: usize = 50;
+/// Iterations at most. 100, not DD-12's 50 (review of TASK-010, MINOR 8):
+/// a slow-mixing graph can need ~90 to reach the tolerance; a run that
+/// stops on the cap says so (`LinkStats::rank_converged`).
+pub(crate) const MAX_ITERATIONS: usize = 100;
 
 /// What a relation contributes to centrality (DD-12): a call or an
 /// instantiation fully, inheritance a little less, a type use half, an
@@ -64,13 +66,17 @@ pub(crate) fn edge_weight(e: &RankEdge) -> f64 {
 /// The global rank of each of `nodes` (returned in the order of `nodes`),
 /// over `edges`; an edge whose end is not a node, a self-loop or one of
 /// weight 0 is ignored. The ranks sum to 1.
-pub(crate) fn pagerank(nodes: &[u64], edges: &[RankEdge]) -> Vec<f64> {
+pub(crate) fn pagerank_run(nodes: &[u64], edges: &[RankEdge]) -> PageRankRun {
     let mut sorted: Vec<u64> = nodes.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     let n = sorted.len();
     if n == 0 {
-        return Vec::new();
+        return PageRankRun {
+            ranks: Vec::new(),
+            iterations: 0,
+            converged: true,
+        };
     }
     let index: HashMap<u64, usize> = sorted.iter().enumerate().map(|(i, &id)| (id, i)).collect();
     // One (weight, share) per (src, dst), summed in a fixed order: the
@@ -113,7 +119,9 @@ pub(crate) fn pagerank(nodes: &[u64], edges: &[RankEdge]) -> Vec<f64> {
     }
     let nf = n as f64;
     let mut rank = vec![1.0 / nf; n];
+    let (mut iterations, mut converged) = (0, false);
     for _ in 0..MAX_ITERATIONS {
+        iterations += 1;
         let leaked: f64 = (0..n).map(|i| rank[i] * (1.0 - kept[i]).max(0.0)).sum();
         let base = (1.0 - DAMPING) / nf + DAMPING * leaked / nf;
         let mut next = vec![base; n];
@@ -123,25 +131,62 @@ pub(crate) fn pagerank(nodes: &[u64], edges: &[RankEdge]) -> Vec<f64> {
         let delta: f64 = next.iter().zip(&rank).map(|(a, b)| (a - b).abs()).sum();
         rank = next;
         if delta < TOLERANCE {
+            converged = true;
             break;
         }
     }
-    nodes.iter().map(|id| rank[index[id]]).collect()
+    PageRankRun {
+        ranks: nodes.iter().map(|id| rank[index[id]]).collect(),
+        iterations,
+        converged,
+    }
 }
 
-/// Rank a branch: the PageRank of `ids` (its symbols) over its
+/// A PageRank run: the ranks, the iterations it took and whether it
+/// converged under [`TOLERANCE`] before [`MAX_ITERATIONS`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PageRankRun {
+    pub ranks: Vec<f64>,
+    pub iterations: usize,
+    pub converged: bool,
+}
+
+/// [`pagerank_run`]'s ranks.
+#[cfg(test)]
+pub(crate) fn pagerank(nodes: &[u64], edges: &[RankEdge]) -> Vec<f64> {
+    pagerank_run(nodes, edges).ranks
+}
+
+/// What [`rank_branch`] did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct BranchRanks {
+    /// Symbols ranked.
+    pub ranked: usize,
+    /// Of which written: their rank or in-degree changed (review of
+    /// TASK-010, MINOR 5: rewriting every row of an unchanged graph left
+    /// free blocks for nothing, DD-21).
+    pub written: usize,
+    /// Power iterations.
+    pub iterations: usize,
+    /// Converged under the tolerance.
+    pub converged: bool,
+}
+
+/// Rank a branch: the PageRank of `symbols` (its symbols, with the rank and
+/// in-degree they hold now) over its
 /// [`branch_rank_edges`](devctx_store::Store::branch_rank_edges), and each
 /// symbol's `in_degree` — incoming `calls` occurrences, not from a test, of
-/// `high` or `medium` confidence — written to `symbols`. How many symbols it
-/// ranked.
+/// `high` or `medium` confidence —; only the symbols whose values changed
+/// are written to `symbols`.
 pub(crate) fn rank_branch(
     store: &devctx_store::Store,
     repo: &str,
     branch: &str,
-    ids: &[u64],
-) -> crate::error::Result<usize> {
+    symbols: &[devctx_store::StoredSymbol],
+) -> crate::error::Result<BranchRanks> {
     let edges = store.branch_rank_edges(repo, branch)?;
-    let ranks = pagerank(ids, &edges);
+    let ids: Vec<u64> = symbols.iter().map(|s| s.id).collect();
+    let run = pagerank_run(&ids, &edges);
     let mut in_degree: HashMap<u64, i64> = HashMap::new();
     for e in &edges {
         if e.kind == "calls"
@@ -151,16 +196,25 @@ pub(crate) fn rank_branch(
             *in_degree.entry(e.dst).or_default() += e.n as i64;
         }
     }
-    let rows: Vec<(u64, f64, i32)> = ids
+    let rows: Vec<(u64, f64, i32)> = symbols
         .iter()
-        .zip(&ranks)
-        .map(|(&id, &r)| {
-            let d = in_degree.get(&id).copied().unwrap_or(0);
-            (id, r, i32::try_from(d).unwrap_or(i32::MAX))
+        .zip(&run.ranks)
+        .filter_map(|(s, &r)| {
+            let d = in_degree.get(&s.id).copied().unwrap_or(0);
+            let d = i32::try_from(d).unwrap_or(i32::MAX);
+            let same = s.rank.map(f64::to_bits) == Some(r.to_bits()) && s.in_degree == Some(d);
+            (!same).then_some((s.id, r, d))
         })
         .collect();
-    store.write_branch_ranks(repo, branch, &rows)?;
-    Ok(rows.len())
+    if !rows.is_empty() {
+        store.write_branch_ranks(repo, branch, &rows)?;
+    }
+    Ok(BranchRanks {
+        ranked: symbols.len(),
+        written: rows.len(),
+        iterations: run.iterations,
+        converged: run.converged,
+    })
 }
 
 #[cfg(test)]
@@ -192,6 +246,10 @@ mod tests {
             assert!((r[i] - r[1]).abs() < 1e-12, "{r:?}");
         }
         assert!((r.iter().sum::<f64>() - 1.0).abs() < 1e-6, "{r:?}");
+        // Review MINOR 8: how many iterations it took, and that it converged.
+        let run = pagerank_run(&nodes, &edges);
+        assert!(run.converged && run.iterations <= MAX_ITERATIONS, "{run:?}");
+        assert_eq!(run.ranks, r);
     }
 
     /// (a) A dangling node (no way out) hands its rank to everyone: the
@@ -265,12 +323,16 @@ mod tests {
         from_test.from_test = true;
         let r = pagerank(&[1, 2, 3, 4], &[e(1, 3), from_test]);
         assert!(r[2] > r[3], "{r:?}");
-        // `a` (1) calls 5 a hundred times and 6 once; 2 and 3 call 6 once
-        // each: sqrt keeps 5 from taking all of 1's rank.
+        // 1 calls 5 a hundred times and 6 twenty-five times: what it passes
+        // on splits sqrt(100) : sqrt(25) = 2 : 1 (it would be 4 : 1 by the
+        // raw count, review MINOR 7). 7, called by nobody, is the floor.
         let mut hundred = e(1, 5);
         hundred.n = 100;
-        let r = pagerank(&[1, 2, 3, 5, 6], &[hundred, e(1, 6), e(2, 6), e(3, 6)]);
-        assert!(r[4] > r[3], "{r:?}");
+        let mut quarter = e(1, 6);
+        quarter.n = 25;
+        let r = pagerank(&[1, 5, 6, 7], &[hundred, quarter]);
+        let ratio = (r[1] - r[3]) / (r[2] - r[3]);
+        assert!((ratio - 2.0).abs() < 1e-6, "{ratio} {r:?}");
     }
 
     /// A self-loop, an edge to a node that is not there and an empty graph

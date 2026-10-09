@@ -2763,6 +2763,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Review of TASK-010, MINOR 5: a pass writes only the ranks that
+    /// changed; a second full pass over the same graph writes none.
+    #[test]
+    fn a_pass_over_the_same_graph_writes_no_rank() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("rankagain", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let pass = || {
+            crate::link::link_branch(
+                &store,
+                &repo,
+                "main",
+                &std::collections::HashSet::new(),
+                true,
+                &devctx_parse::resolve::env::LinkEnv::default(),
+                &|| false,
+            )
+            .unwrap()
+        };
+        let again = pass();
+        assert_eq!(again.files_written, 0, "{again:?}");
+        assert_eq!(again.ranks_written, 0, "{again:?}");
+        assert!(again.rank_converged, "{again:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An index from before TASK-010 — no rank anywhere, linked under the
     /// previous `LINK_VERSION` — is ranked by the next run, with nothing to
     /// reindex: the new version relinks the branch, and the pass ranks it.

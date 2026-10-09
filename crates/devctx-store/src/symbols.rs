@@ -524,7 +524,8 @@ impl Store {
         })
     }
 
-    /// The global rank of the innermost symbol containing each chunk (DD-4:
+    /// The rank of the innermost symbol containing each chunk, as its
+    /// percentile within the branch (0 the lowest, 1 the highest) (DD-4:
     /// by file and line range; never a `file` symbol), or `None`: a chunk of
     /// no symbol (a whole-file or doc chunk, a memory), or a branch whose link
     /// pass has not ranked it (an index from before TASK-010). `chunks` are
@@ -545,6 +546,8 @@ impl Store {
         for ((repo, branch), idx) in groups {
             let values = vec!["(?, ?, ?, ?)"; idx.len()].join(", ");
             let mut args: Vec<duckdb::types::Value> = Vec::with_capacity(idx.len() * 4 + 2);
+            args.push(repo.to_string().into());
+            args.push(branch.to_string().into());
             for &i in &idx {
                 let c = chunks[i];
                 args.push((i as i64).into());
@@ -552,14 +555,21 @@ impl Store {
                 args.push(c.3.into());
                 args.push(c.4.into());
             }
-            args.push(repo.to_string().into());
-            args.push(branch.to_string().into());
+            // The percentile within the branch, not the probability: a
+            // rank sums to 1 per branch, so a small branch's symbols would
+            // outrank a large one's in a pool that mixes them (review of
+            // TASK-010, MINOR 6).
             let sql = format!(
-                "SELECT c.i, s.rank
+                "WITH s AS (
+                   SELECT file, start_line, end_line, id, kind,
+                          CASE WHEN rank IS NULL THEN NULL
+                               ELSE percent_rank() OVER (
+                                   PARTITION BY rank IS NULL ORDER BY rank) END AS pct
+                     FROM symbols
+                    WHERE repo = ? AND branch = ? AND kind <> 'file')
+                 SELECT c.i, s.pct
                    FROM (VALUES {values}) AS c(i, file, lo, hi)
-                   JOIN symbols s ON s.file = c.file
-                    AND s.start_line <= c.lo AND s.end_line >= c.hi
-                  WHERE s.repo = ? AND s.branch = ? AND s.kind <> 'file'
+                   JOIN s ON s.file = c.file AND s.start_line <= c.lo AND s.end_line >= c.hi
                 QUALIFY row_number() OVER (
                     PARTITION BY c.i
                     ORDER BY s.end_line - s.start_line, s.start_line DESC, s.id) = 1"
@@ -819,12 +829,53 @@ mod tests {
                 &[(f.id, 0.5, 0), (outer.id, 0.2, 1), (inner.id, 0.3, 7)],
             )
             .unwrap();
+        // Read as the percentile within the branch (review MINOR 6): of the
+        // two ranked symbols that are not the file's, the inner one is the top.
         assert_eq!(
             store.chunk_ranks(&chunks).unwrap(),
-            vec![Some(0.3), Some(0.2), None, None, None]
+            vec![Some(1.0), Some(0.0), None, None, None]
         );
         let back = store.symbol_by_id("r", "main", inner.id).unwrap().unwrap();
         assert_eq!((back.rank, back.in_degree), (Some(0.3), Some(7)));
+    }
+
+    /// Review of TASK-010, MINOR 6: a rank is a probability within its
+    /// branch, so a small branch's symbols score higher than a large one's.
+    /// Read per chunk it is the percentile within the branch: the top of
+    /// either branch reads the same.
+    #[test]
+    fn chunk_ranks_are_percentiles_within_the_branch() {
+        let store = Store::open_in_memory(DIM).unwrap();
+        let mk = |branch: &str, ranks: &[f64]| {
+            let syms: Vec<StoredSymbol> = ranks
+                .iter()
+                .enumerate()
+                .map(|(i, &r)| StoredSymbol {
+                    id: 100 + i as u64,
+                    file: "a.rs".into(),
+                    kind: "function".into(),
+                    name: format!("f{i}"),
+                    qualified: format!("f{i}"),
+                    start_line: 10 * i as i32 + 1,
+                    end_line: 10 * i as i32 + 9,
+                    rank: Some(r),
+                    ..Default::default()
+                })
+                .collect();
+            store
+                .replace_file_symbols("r", branch, "a.rs", &syms)
+                .unwrap();
+        };
+        mk("small", &[0.6, 0.4]);
+        mk("large", &[0.1, 0.4, 0.3, 0.2]);
+        let got = store
+            .chunk_ranks(&[
+                ("r", "small", "a.rs", 1, 9),
+                ("r", "large", "a.rs", 11, 19),
+                ("r", "large", "a.rs", 1, 9),
+            ])
+            .unwrap();
+        assert_eq!(got, vec![Some(1.0), Some(1.0), Some(0.0)]);
     }
 
     /// One row per occurrence: the writer does not fold two calls to the same

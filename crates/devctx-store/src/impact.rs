@@ -1262,6 +1262,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(names(&im.upstream), ["Web.go"]);
         assert_eq!(im.undecided_calls, 1);
+        assert_eq!(im.upstream.below_confidence, 0, "symbols only (m-a)");
         let low = ImpactOptions {
             min_confidence: MinConfidence::Low,
             ..Default::default()

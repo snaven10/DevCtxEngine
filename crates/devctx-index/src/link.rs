@@ -91,6 +91,12 @@ pub struct LinkStats {
     pub ranked: usize,
     /// Of which computing and writing the ranks.
     pub rank_ms: u128,
+    /// Symbols whose rank or in-degree changed and were written.
+    pub ranks_written: usize,
+    /// Power iterations the PageRank took.
+    pub rank_iterations: usize,
+    /// It converged under the tolerance before the iteration cap.
+    pub rank_converged: bool,
 }
 
 /// Files whose rewritten edges commit together. Each file's rows are written
@@ -491,8 +497,11 @@ pub(crate) fn link_branch(
     // owed and the next run ranks.
     if !stats.cancelled {
         let r = Instant::now();
-        let ids: Vec<u64> = symbols.iter().map(|s| s.id).collect();
-        stats.ranked = crate::pagerank::rank_branch(store, repo, branch, &ids)?;
+        let ranks = crate::pagerank::rank_branch(store, repo, branch, &symbols)?;
+        stats.ranked = ranks.ranked;
+        stats.ranks_written = ranks.written;
+        stats.rank_iterations = ranks.iterations;
+        stats.rank_converged = ranks.converged;
         stats.rank_ms = r.elapsed().as_millis();
     }
     stats.ms = started.elapsed().as_millis();
