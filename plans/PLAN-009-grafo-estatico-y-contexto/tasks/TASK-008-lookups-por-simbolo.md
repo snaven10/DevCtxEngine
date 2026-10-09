@@ -316,4 +316,25 @@ DD-19.
     `the_local_cli_answer_is_the_tool_answer`. Los helpers `check_*` sobre el índice real pasaron
     a la primera: el camino nuevo ya cumplía esos asserts salvo las sugerencias de un externo, que
     los asserts de PLAN-008 no miraban para `from_str`.
+- **Segunda revisión (REQUEST CHANGES acotado), resuelta en commits encima de 6f05206:**
+  - *N1:* `kinds` **se suma** a `calls`/`instantiates` (`all` sigue siendo todo); antes los
+    reemplazaba, en contra de lo que decían la tool y las docs. `references_default_to_calls_and_take_kinds`
+    exige que con `kinds: ["references"]` también vengan las llamadas (falla si `parse_kinds`
+    arranca vacío).
+  - *N2 (m6 daba `high` equivocado):* en un `impl Trait for T` con `T` de afuera, primero el método
+    del propio `impl` (un override de un default: `same_file`, `high`, como antes de 47b3f3c); si
+    no, el trait como supertipo con **cap a `medium`** (un método inherente del tipo de afuera
+    ganaría y no se puede conocer). Fixtures nuevas: un `len` por defecto en un trait para
+    `PathBuf` y un override en `impl Polite for u32`. `self_in_an_impl_of_a_repo_trait_reaches_the_trait`
+    ahora espera `medium` para el trait y `same_file` para el override (fallaba: daba `high`, y el
+    override se resolvía a la declaración del trait, verificado por mutación).
+    `self_in_an_impl_for_an_outside_type_is_no_guess` y su par de Go siguen verdes.
+    **`LINK_VERSION` 19.**
+  - *n1:* el fixture de `batched_code_chunks_equal_the_per_symbol_lookup` suma un archivo con dos
+    `new` de chunk propio; quitar `v.end_line >= s.start_line` ahora lo hace fallar.
+  - *n2:* con `archivo::nombre` las filas sin decidir no se cuentan ni se listan (tienen un nombre,
+    no un archivo); verificado en `references_show_high_and_medium_unless_asked_for_low`.
+  - *n3:* `code_chunks_of` deriva el índice de `s.id` del número de columnas de `COLS`.
+  - Gate completo antes de cada commit de código (`fmt --check`, `clippy -D warnings` con y sin
+    `--features gpu`, `cargo test --workspace --locked`): 1026 pasan, 0 fallan, en los dos.
 

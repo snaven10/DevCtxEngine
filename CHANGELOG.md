@@ -226,7 +226,7 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   `test` and `undecided` when true. `get_references` lists one reference per
   occurrence (two calls from one method are two) of calls and instantiations,
   as 0.9.0 listed calls; **`kinds`** adds type uses, imports and
-  inherits/implements (or `all`). It takes **`min_confidence`** (`high`,
+  inherits/implements (or `all`) to them — the calls always stay. It takes **`min_confidence`** (`high`,
   `medium` — default —, `low`): what the default leaves out is counted in
   `below_confidence`. A server older than 0.10 ignores both, and the client
   says so in `warning`.
@@ -242,9 +242,11 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   included, whose identifier anchoring then goes by name); a failed read of
   the symbol table has its own warning, not a reindex hint. Anchoring reads
   the code of every definition of an identifier in one query.
-- **Link rules version 18:** in a Rust `impl Trait for T` with `T` from
-  outside the repository, `self.m()` resolves to the repository trait's
-  method (a default one included) instead of staying undecided.
+- **Link rules version 19:** in a Rust `impl Trait for T` with `T` from
+  outside the repository, `self.m()` resolves to the `impl`'s own method
+  (an override), else to the repository trait's method (a default one
+  included) at `medium` — an inherent method of the outside type would win
+  and cannot be known — instead of staying undecided.
 
 ### Fixed
 

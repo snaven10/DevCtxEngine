@@ -754,7 +754,7 @@ grafo no define se sigue buscando por nombre. `get_references` lista una fila po
 ~~relación menos `contains`~~ — **revisión:** por defecto `calls` e `instantiates` (la semántica
 de 0.9.0 era "llamadas", y `new Foo()` llama al constructor de `Foo`), con `via`; las demás
 relaciones (`references`, `imports`, `inherits`, `implements`, o `all`) con el parámetro opt-in
-`kinds`. Un externo no lleva `suggestions` (como 0.9.0) y un `archivo::nombre` sin resultado nunca
+`kinds`, que se **suma** al default (segunda revisión: pedir usos de tipo no saca las llamadas). Un externo no lleva `suggestions` (como 0.9.0) y un `archivo::nombre` sin resultado nunca
 es externo. El anclaje lee el código de todas las definiciones de un identificador en **una**
 consulta (`code_chunks_of`, `symbols` ⋈ `vectors` por archivo y rango) y reusa la elección de rama
 del search. `split_file_symbol` exige `/` (que no empiece con `@`, un scope de npm) o una extensión
