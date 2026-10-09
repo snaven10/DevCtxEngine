@@ -133,9 +133,9 @@ exists and then regret not running.
 Each side is a list of `{symbol, depth}` (depth 1 = direct), deepest last. On an
 index made by 0.10 or later the walk follows the symbol graph **by id** — one
 query per level, whatever the size of the frontier — and each symbol also
-carries `confidence` (of the call that reached it), `via` (`calls` or
-`instantiates`), `sym`, `file` and `line` (of its definition), and `test`,
-`external` or `undecided` when true. Within a depth, symbols are ordered by
+carries `confidence` (of the call that reached it), `via` (`calls`,
+`instantiates` or `dispatch`), `sym`, `file` and `line` (of its definition), and
+`test`, `external` or `undecided` when true. Within a depth, symbols are ordered by
 confidence, then by rank (the global PageRank each index run computes; see
 [Search](search.md#centrality-hybrid-only-opt-in)), then by name.
 
@@ -148,8 +148,34 @@ walked:
 | `include_tests` (`--include-tests`) | `false` | symbols of test files → `excluded.tests` |
 | `include_external` (`--include-external`) | `false` | library callees → `excluded.external` |
 | `max_nodes` (`--max-nodes`) | `200` per direction (`0` = no cap) | the symbols of the depth that overflows it → `omitted: {count, reason: "limit"}` and `omitted_by_limit: {count, max_nodes, upstream/downstream: {count, depth}}`; no deeper level is read |
+| `dispatch` (`--no-dispatch`) | `true` | nothing: dispatch through interfaces, abstract classes and traits is followed (below); `false` follows direct calls only. A node with more override-equivalent methods than it is expanded into (16) → `omitted_by_limit.dispatch: {count, max_per_node}`, added to `omitted_by_limit.count` and `omitted.count` |
 
-Over HTTP: `GET /impact/<symbol>?depth=3&min_confidence=low&include_tests=true&max_nodes=500`.
+**Dispatch.** A caller that holds a service by its interface (a field injected as
+`IService`, a parameter typed by a trait) calls `IService.update`, never
+`ServiceImpl.update`; the walk follows that call anyway, through the resolved
+`inherits`/`implements` edges, at every depth (not only from the symbol asked
+about):
+
+- **upstream**, `ServiceImpl.update` reaches the callers of the methods it
+  overrides in its supertypes (`IService.update`, `BaseService.update`), at the
+  depth of a direct caller;
+- **downstream**, an interface or abstract method reaches the methods that
+  implement it, one level below it, and what those call.
+
+A method is override-equivalent when it has the same name and an arity that can
+match (defaults, optional and variadic parameters widen it); a private or static
+method overrides nothing. The chain of supertypes is followed up to four levels
+(`ServiceImpl` → `BaseService` → `IService` → its super-interface). Such a node
+has `via: "dispatch"` and `through` (the method it went through), and its
+confidence is `min(medium, the edge it stands for)` — never `high`, and a `low`
+call stays `low` (counted in `below_confidence` by default). To leave dispatch
+out: `dispatch: false` (`--no-dispatch`, `?dispatch=false`), or
+`min_confidence: "high"`, which also leaves out every `medium` call. Java,
+TypeScript (`implements`, abstract classes) and Rust traits are covered; Python
+base classes on a best-effort basis; Go not at all (embedding promotes methods, it
+does not override them, and an interface is satisfied without an edge to follow).
+
+Over HTTP: `GET /impact/<symbol>?depth=3&min_confidence=low&include_tests=true&max_nodes=500&dispatch=false`.
 The answer says which filters it applied in `filters`. A bare name means the
 repository's definitions of it (as in `get_references`), not every call written
 with that name.

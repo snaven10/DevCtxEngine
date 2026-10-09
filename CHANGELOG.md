@@ -314,6 +314,33 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   `extractor_stale` until `devctx index --full` (vectors are reused).
 - **Link rules version 21:** an existing index is relinked — and ranked — by
   its next `devctx index`, with nothing re-embedded.
+- **`impact_analysis` follows dispatch through interfaces, abstract classes and
+  traits** (PLAN-009 TASK-017), on by default: a caller that holds a service by
+  its interface (an injected field, a parameter typed by a trait) is in the
+  blast radius of the implementation. At every depth, upstream, a method
+  reaches the callers of the methods it overrides in its supertypes (at the
+  depth of a direct caller), and downstream an interface or abstract method
+  reaches the methods that implement it (one level below) and what they call;
+  through the resolved `inherits`/`implements` edges of `live_edges`, up to four
+  supertype levels, same name and an arity that can match, never a private or
+  static method, not in Go (embedding is no override). Such a node has `via:
+  "dispatch"` and `through` (the method it went through), and confidence
+  `min(medium, the edge it stands for)` — never `high`, a `low` call stays
+  `low`. At most 16 equivalents per node; the rest are counted in
+  `omitted_by_limit.dispatch` (and in `omitted.count`). `dispatch: false` (tool,
+  `GET /impact?dispatch=false`, `devctx impact --no-dispatch`) follows direct
+  calls only, `min_confidence: "high"` leaves it out and counts it, and
+  `filters` says whether it applied. The supertype graph is read once per call
+  and each level expanded in memory (no statement per level); measured on two
+  Java repositories (1 250 and 216 files), p95 of the tool 26-106 ms with
+  dispatch against 21-89 ms without it.
+- **A method a TypeScript interface declares, and an abstract method of an
+  abstract class, are symbols** (extractor version 20), as a Java interface's or
+  a Rust trait's already were: a call through a receiver typed by the interface
+  resolves to it (`ctor_inject`/`field`, `high`) instead of staying a `low`
+  name-only row, and dispatch reaches the classes that implement it. Existing
+  indexes report `extractor_stale` until `devctx index --full` (vectors are
+  reused).
 
 ### Fixed
 

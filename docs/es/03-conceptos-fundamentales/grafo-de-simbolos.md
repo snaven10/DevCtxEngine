@@ -139,8 +139,8 @@ Cada lado es una lista de `{symbol, depth}` (profundidad 1 = directo), lo más
 profundo al final. En un índice hecho por 0.10 o posterior el recorrido sigue el
 grafo de símbolos **por id** — una consulta por nivel, sin importar el tamaño de
 la frontera — y cada símbolo trae además `confidence` (de la llamada que lo
-alcanzó), `via` (`calls` o `instantiates`), `sym`, `file` y `line` (de su
-definición), y `test`, `external` o `undecided` cuando son verdaderos. Dentro de
+alcanzó), `via` (`calls`, `instantiates` o `dispatch`), `sym`, `file` y `line`
+(de su definición), y `test`, `external` o `undecided` cuando son verdaderos. Dentro de
 una profundidad, el orden es por confianza, después por rank (el PageRank global
 que calcula cada corrida de `index`; ver
 [Búsqueda](busqueda.md#centralidad-solo-híbrida-opt-in)) y después por nombre.
@@ -154,8 +154,34 @@ se recorre:
 | `include_tests` (`--include-tests`) | `false` | símbolos de archivos de test → `excluded.tests` |
 | `include_external` (`--include-external`) | `false` | llamados de librerías → `excluded.external` |
 | `max_nodes` (`--max-nodes`) | `200` por dirección (`0` = sin tope) | los símbolos de la profundidad que lo desborda → `omitted: {count, reason: "limit"}` y `omitted_by_limit: {count, max_nodes, upstream/downstream: {count, depth}}`; no se lee ningún nivel más profundo |
+| `dispatch` (`--no-dispatch`) | `true` | nada: se sigue el dispatch por interfaces, clases abstractas y traits (abajo); `false` sigue solo llamadas directas. Un nodo con más métodos override-equivalentes de los que se expande (16) → `omitted_by_limit.dispatch: {count, max_per_node}`, sumado a `omitted_by_limit.count` y a `omitted.count` |
 
-Por HTTP: `GET /impact/<símbolo>?depth=3&min_confidence=low&include_tests=true&max_nodes=500`.
+**Dispatch.** Un llamador que tiene un servicio por su interfaz (un campo
+inyectado como `IService`, un parámetro tipado por un trait) llama a
+`IService.update`, nunca a `ServiceImpl.update`; el recorrido sigue esa llamada
+igual, por las aristas `inherits`/`implements` resueltas, en cada profundidad (no
+solo desde el símbolo pedido):
+
+- **upstream**, `ServiceImpl.update` alcanza a los llamadores de los métodos que
+  sobrescribe en sus supertipos (`IService.update`, `BaseService.update`), a la
+  profundidad de un llamador directo;
+- **downstream**, un método de interfaz o abstracto alcanza a los métodos que lo
+  implementan, un nivel debajo de él, y a lo que estos llaman.
+
+Un método es override-equivalente si tiene el mismo nombre y una aridad que puede
+coincidir (los parámetros con default, opcionales o variádicos la amplían); un
+método private o static no sobrescribe nada. La cadena de supertipos se sigue
+hasta cuatro niveles (`ServiceImpl` → `BaseService` → `IService` → su
+super-interfaz). Ese nodo lleva `via: "dispatch"` y `through` (el método por el que
+pasó), y su confianza es `min(medium, la arista que representa)`: nunca `high`, y
+una llamada `low` sigue `low` (contada en `below_confidence` por defecto). Para
+dejar el dispatch afuera: `dispatch: false` (`--no-dispatch`, `?dispatch=false`), o
+`min_confidence: "high"`, que deja afuera también toda llamada `medium`. Cubre
+Java, TypeScript (`implements`, clases abstractas) y traits de Rust; las clases
+base de Python como mejor esfuerzo; Go no (embeber promueve métodos, no los
+sobrescribe, y una interfaz se satisface sin una arista que seguir).
+
+Por HTTP: `GET /impact/<símbolo>?depth=3&min_confidence=low&include_tests=true&max_nodes=500&dispatch=false`.
 La respuesta dice en `filters` qué filtros aplicó. Un nombre pelado significa las
 definiciones del repositorio con ese nombre (como en `get_references`), no toda
 llamada escrita con ese nombre.
