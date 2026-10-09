@@ -199,6 +199,25 @@ struct ImpactReq {
     /// Traversal depth (default 3).
     #[serde(default)]
     depth: Option<usize>,
+    /// Lowest confidence of the call that reaches a symbol: `"high"`,
+    /// `"medium"` (default) or `"low"`. Whatever it leaves out is counted in
+    /// `below_confidence` and not walked; `low` lists the ambiguous calls and
+    /// the ones the index could not decide, marked `undecided: true`.
+    #[serde(default)]
+    min_confidence: Option<String>,
+    /// List symbols of test files (default false: counted in
+    /// `excluded.tests`, not walked). Listed ones carry `test: true`.
+    #[serde(default)]
+    include_tests: Option<bool>,
+    /// List external (library) callees (default false: counted in
+    /// `excluded.external`). Listed ones carry `external: true`.
+    #[serde(default)]
+    include_external: Option<bool>,
+    /// Symbols per direction (default 200; 0 = no cap). The ones of the depth
+    /// that overflows are counted in `omitted`/`omitted_by_limit`, and no
+    /// deeper level is read.
+    #[serde(default)]
+    max_nodes: Option<usize>,
 }
 
 /// Parameters for the `plan_status` tool.
@@ -1178,14 +1197,25 @@ impl DevctxServer {
     /// Blast radius of a symbol (transitive callers + callees).
     #[tool(
         description = "Impact analysis: transitive callers (blast radius) and \
-        callees of a symbol from the call graph. Returns JSON."
+        callees of a symbol, by depth. Each symbol carries `confidence` and `via`; by \
+        default only high/medium calls are followed, test files and library callees are \
+        left out, and 200 symbols per direction are listed — whatever that leaves out is \
+        counted (`below_confidence`, `excluded`, `omitted`), never dropped silently. \
+        `min_confidence`, `include_tests`, `include_external` and `max_nodes` change \
+        that. Returns JSON."
     )]
     async fn impact_analysis(
         &self,
         Parameters(req): Parameters<ImpactReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3)))
+        let q = state::ImpactQuery {
+            min_confidence: req.min_confidence.clone(),
+            include_tests: req.include_tests,
+            include_external: req.include_external,
+            max_nodes: req.max_nodes,
+        };
+        run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3), &q))
             .await
             .map(|out| Self::annotate(out, resolved))
     }

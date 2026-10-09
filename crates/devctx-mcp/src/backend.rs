@@ -8,12 +8,12 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::state::{
-    do_backfill_links, do_build_context, do_impact, do_index, do_index_status, do_list_projects,
-    do_memories_by_file, do_memories_by_symbol, do_memory_context, do_memory_forget,
-    do_memory_move, do_memory_refs, do_memory_stats, do_plan_status, do_read_file, do_read_symbol,
-    do_recall_scoped, do_references_with, do_remember, do_remember_shared, do_routes_for_handler,
-    do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
-    MemoriesOpts, Page, PlanListOpts,
+    do_backfill_links, do_build_context, do_impact_with, do_index, do_index_status,
+    do_list_projects, do_memories_by_file, do_memories_by_symbol, do_memory_context,
+    do_memory_forget, do_memory_move, do_memory_refs, do_memory_stats, do_plan_status,
+    do_read_file, do_read_symbol, do_recall_scoped, do_references_with, do_remember,
+    do_remember_shared, do_routes_for_handler, do_search, do_search_project, do_search_routes,
+    do_summarize, parse_mode, AppState, MemoriesOpts, Page, PlanListOpts,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -594,10 +594,27 @@ impl Backend {
         }
     }
 
-    pub fn impact(&self, symbol: &str, depth: usize) -> Result<String, String> {
+    pub fn impact(
+        &self,
+        symbol: &str,
+        depth: usize,
+        q: &crate::state::ImpactQuery,
+    ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_impact(s, symbol, depth),
-            Backend::Remote(r, _) => r.get(&format!("/impact/{}?depth={depth}", urlencode(symbol))),
+            Backend::Local(s) => do_impact_with(s, symbol, depth, q),
+            Backend::Remote(r, _) => {
+                let mut path = format!("/impact/{}?depth={depth}", urlencode(symbol));
+                let pairs = q.query_pairs();
+                for (k, v) in &pairs {
+                    path.push_str(&format!("&{k}={}", urlencode(v)));
+                }
+                let raw = r.get(&path)?;
+                Ok(if pairs.is_empty() {
+                    raw
+                } else {
+                    note_unapplied_impact_filters(raw)
+                })
+            }
         }
     }
 
@@ -1149,6 +1166,31 @@ fn note_unapplied_filters(raw: String) -> String {
     v.to_string()
 }
 
+/// [`note_unapplied_filters`] for `impact_analysis`: a server (or an index)
+/// older than the filters answers nodes without `confidence`.
+fn note_unapplied_impact_filters(raw: String) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+    let nodes: Vec<&serde_json::Value> = ["upstream", "downstream"]
+        .iter()
+        .filter_map(|k| v.get(*k).and_then(|a| a.as_array()))
+        .flatten()
+        .collect();
+    let unfiltered = !nodes.is_empty() && nodes.iter().all(|n| n.get("confidence").is_none());
+    if !unfiltered {
+        return raw;
+    }
+    const NOTE: &str = "min_confidence/include_tests/include_external/max_nodes were not \
+        applied: the server (or its index) predates them, so this is its unfiltered answer";
+    let warning = match v.get("warning").and_then(|w| w.as_str()) {
+        Some(w) => format!("{w}; {NOTE}"),
+        None => NOTE.to_string(),
+    };
+    v["warning"] = serde_json::Value::String(warning);
+    v.to_string()
+}
+
 #[cfg(test)]
 mod filter_note_tests {
     use super::note_unapplied_filters;
@@ -1164,5 +1206,20 @@ mod filter_note_tests {
         );
         let new = r#"{"symbol":"f","references":[{"file":"a.rs","line":1,"source":"g","confidence":"high"}]}"#;
         assert_eq!(note_unapplied_filters(new.into()), new);
+    }
+
+    #[test]
+    fn an_impact_without_confidence_says_the_filters_were_not_applied() {
+        use super::note_unapplied_impact_filters as note;
+        let old = r#"{"symbol":"f","upstream":[{"symbol":"g","depth":1}],"downstream":[]}"#;
+        let v: serde_json::Value = serde_json::from_str(&note(old.into())).unwrap();
+        assert!(
+            v["warning"].as_str().unwrap().contains("not applied"),
+            "{v}"
+        );
+        let new = r#"{"symbol":"f","upstream":[{"symbol":"g","depth":1,"confidence":"high"}],"downstream":[]}"#;
+        assert_eq!(note(new.into()), new);
+        let empty = r#"{"symbol":"f","upstream":[],"downstream":[]}"#;
+        assert_eq!(note(empty.into()), empty);
     }
 }

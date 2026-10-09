@@ -24,7 +24,10 @@ use devctx_store::Store;
 use devctx_summarize::{create_summarizer, SummarizeSettings};
 use serde_json::{json, Value};
 
+mod impact;
 mod lookup;
+
+pub use impact::ImpactQuery;
 
 /// How far an indexing run has got, for anyone who asks while it runs.
 ///
@@ -4239,59 +4242,53 @@ pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<
     Ok(resp.to_string())
 }
 
-/// `impact_analysis` tool: blast radius (transitive callers/callees) of a symbol.
+/// `impact_analysis` tool: blast radius (transitive callers/callees) of a
+/// symbol, with the default filters (see [`do_impact_with`]).
 pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String, String> {
+    do_impact_with(state, symbol, depth, &ImpactQuery::default())
+}
+
+/// `impact_analysis` with its filters (PLAN-009 TASK-009, DD-11): over the
+/// symbol graph by id — `high`/`medium`, no tests, no externals, 200 nodes
+/// per direction unless `q` says otherwise, what was left out counted — or,
+/// on a branch the current extractor has not indexed, the 0.9.0 walk with a
+/// warning.
+pub fn do_impact_with(
+    state: &AppState,
+    symbol: &str,
+    depth: usize,
+    q: &ImpactQuery,
+) -> Result<String, String> {
+    // A bad filter is the caller's error, before anything is opened.
+    q.options(depth)?;
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
-    let (repo, branch) = (&chosen.repo, &chosen.branch);
-    let resolved = store
-        .resolve_symbol(repo, branch, symbol)
-        .map_err(|e| e.to_string())?;
-    let impact = store
-        .impact_analysis(repo, branch, symbol, depth)
-        .map_err(|e| e.to_string())?;
-    let to_json = |v: &[(String, usize)]| -> Vec<Value> {
-        v.iter()
-            .map(|(s, d)| json!({ "symbol": s, "depth": d }))
-            .collect()
-    };
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
-    // Each direction gets half the budget: a symbol with a huge upstream and a
-    // tiny downstream (or the reverse) is common, and a single shared pool
-    // would let one side starve the other silently.
-    let half = budget / 2;
-    let label = |v: &Value| {
-        v.get("symbol")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let (upstream, up_dropped) = fit_json_array(to_json(&impact.upstream), half, None, label);
-    let (downstream, down_dropped) = fit_json_array(to_json(&impact.downstream), half, None, label);
-    let mut out = json!({
-        "symbol": symbol,
-        "upstream": upstream,
-        "downstream": downstream,
-    });
-    // A bare name can stand for several methods, and the radius below merges
-    // them. Say so: an unannounced merge reads as one method with a wide blast
-    // radius, which is a different and much more alarming fact.
-    if let Some(names) = merged_declarations(symbol, &resolved) {
-        out["resolved_symbols"] = json!(names);
-    }
-    chosen.annotate(&mut out);
-    let dropped_total = up_dropped.len() + down_dropped.len();
-    if dropped_total > 0 {
-        set_budget_omitted(
-            &mut out,
-            json!({
-                "count": dropped_total,
-                "upstream": up_dropped,
-                "downstream": down_dropped,
-            }),
-        );
-    }
-    Ok(out.to_string())
+    impact::impact_on(&store, &chosen, symbol, depth, q, budget).map(|v| v.to_string())
+}
+
+/// [`do_impact_with`] for a caller that holds a store but no [`AppState`]
+/// (the local CLI): the same answer, branch fallback and warnings included.
+pub fn impact_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    symbol: &str,
+    depth: usize,
+    q: &ImpactQuery,
+) -> Result<Value, String> {
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    impact::impact_on(store, &chosen, symbol, depth, q, budget)
 }
 
 /// The declarations a bare name was expanded into, when that is worth telling

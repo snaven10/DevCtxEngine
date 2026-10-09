@@ -194,7 +194,7 @@ pub(super) fn read_symbol(
 /// otherwise `suggestions`, the definitions of the same bare name and then
 /// the closest names of the repo. A `file::name` that matched nothing is
 /// never external: the caller named a file of this repository (review m2).
-fn not_found_hints(
+pub(super) fn not_found_hints(
     store: &Store,
     repo: &str,
     branch: &str,
@@ -466,12 +466,12 @@ pub(super) fn graph_view(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::*;
     use super::{Legacy, Reader};
     use std::path::{Path, PathBuf};
 
-    struct Fake(usize);
+    pub(crate) struct Fake(pub(crate) usize);
     impl EmbeddingProvider for Fake {
         fn embed(&self, texts: &[String]) -> devctx_embed::Result<Vec<Vec<f32>>> {
             Ok(texts

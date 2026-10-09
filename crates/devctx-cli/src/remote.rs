@@ -1198,8 +1198,17 @@ impl Remote {
         self.get("/memory/stats")
     }
 
-    pub fn impact(&self, symbol: &str, depth: usize) -> Result<String> {
-        self.get(&format!("/impact/{}?depth={depth}", urlencode(symbol)))
+    pub fn impact(
+        &self,
+        symbol: &str,
+        depth: usize,
+        q: &devctx_mcp::state::ImpactQuery,
+    ) -> Result<String> {
+        let mut path = format!("/impact/{}?depth={depth}", urlencode(symbol));
+        for (k, v) in q.query_pairs() {
+            path.push_str(&format!("&{k}={}", urlencode(&v)));
+        }
+        self.get(&path)
     }
 
     pub fn backfill_links(&self, dry_run: bool, from_text: bool) -> Result<String> {

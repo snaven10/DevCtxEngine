@@ -132,6 +132,8 @@ enum Engine {
         rank: RankOptions,
         repo: String,
         branch: String,
+        /// The repository root, as `index_meta` keys it.
+        repo_path: String,
         project: String,
     },
     Remote {
@@ -149,9 +151,13 @@ impl Engine {
         } else {
             PathBuf::from(&cfg.project.path)
         };
-        let (repo, branch) = match GitRepo::open(&root) {
-            Ok(git) => (git.short_name(), git.state().branch),
-            Err(_) => (String::new(), String::new()),
+        let (repo, branch, repo_path) = match GitRepo::open(&root) {
+            Ok(git) => (
+                git.short_name(),
+                git.state().branch,
+                git.root().to_string_lossy().into_owned(),
+            ),
+            Err(_) => (String::new(), String::new(), String::new()),
         };
         let project = if cfg.project.name.is_empty() {
             "default".to_string()
@@ -168,6 +174,7 @@ impl Engine {
             rank: rank_options(cfg),
             repo,
             branch,
+            repo_path,
             project,
         })
     }
@@ -225,8 +232,36 @@ impl Engine {
                 store,
                 repo,
                 branch,
+                repo_path,
                 ..
             } => {
+                // The symbol graph when the index is current (as the tool
+                // decides, PLAN-009 TASK-009), else the 0.9.0 walk.
+                let current = !store
+                    .extractor_stale(
+                        repo,
+                        repo_path,
+                        branch,
+                        &devctx_index::extractor_fingerprint(),
+                    )
+                    .unwrap_or(true)
+                    && store.has_symbol_graph(repo, branch).unwrap_or(false);
+                if current {
+                    let im = store.impact_graph(
+                        repo,
+                        branch,
+                        symbol,
+                        None,
+                        &devctx_store::ImpactOptions::default(),
+                    )?;
+                    let pairs = |side: &devctx_store::ImpactSide| {
+                        side.nodes
+                            .iter()
+                            .map(|n| (n.symbol.clone(), n.depth))
+                            .collect()
+                    };
+                    return Ok((pairs(&im.upstream), pairs(&im.downstream)));
+                }
                 let im = store.impact_analysis(repo, branch, symbol, 3)?;
                 Ok((im.upstream, im.downstream))
             }

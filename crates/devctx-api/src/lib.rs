@@ -17,7 +17,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_backfill_links, do_build_context, do_graph, do_impact, do_index_on, do_index_paths,
+    do_backfill_links, do_build_context, do_graph, do_impact_with, do_index_on, do_index_paths,
     do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
     do_memories_by_symbol, do_memory_context, do_memory_forget, do_memory_move, do_memory_refs,
     do_memory_stats, do_plan_graph, do_plan_status, do_read_file, do_read_symbol, do_recall_scoped,
@@ -924,10 +924,21 @@ struct RoutesQuery {
     offset: Option<usize>,
 }
 
+/// `GET /impact/:symbol` (PLAN-009 TASK-009): `depth` (3), and the filters
+/// of `impact_analysis` — `min_confidence` (`medium`), `include_tests`
+/// (false), `include_external` (false), `max_nodes` (200; 0 = no cap).
 #[derive(Deserialize)]
 struct ImpactQuery {
     #[serde(default)]
     depth: Option<usize>,
+    #[serde(default)]
+    min_confidence: Option<String>,
+    #[serde(default)]
+    include_tests: Option<bool>,
+    #[serde(default)]
+    include_external: Option<bool>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1189,7 +1200,13 @@ async fn impact(
     Query(q): Query<ImpactQuery>,
 ) -> Response {
     run(api.state, move |s| {
-        do_impact(s, &symbol, q.depth.unwrap_or(3))
+        let filters = devctx_mcp::state::ImpactQuery {
+            min_confidence: q.min_confidence,
+            include_tests: q.include_tests,
+            include_external: q.include_external,
+            max_nodes: q.max_nodes,
+        };
+        do_impact_with(s, &symbol, q.depth.unwrap_or(3), &filters)
     })
     .await
 }
@@ -1553,6 +1570,32 @@ mod tests {
     /// Fixup H (M-2): `/health` says which project root this server serves,
     /// so a client holding a stale `serve.json` can tell another repository's
     /// server on a reused port from this one's.
+    /// PLAN-009 TASK-009: `GET /impact` takes the filters of
+    /// `impact_analysis` from the query string; a bad one is refused, named
+    /// (as every tool error, a 500 with `error`), before any store is read.
+    #[tokio::test]
+    async fn impact_takes_its_filters_from_the_query_string() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_impact_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .uri("/impact/f?depth=2&min_confidence=most&include_tests=true&max_nodes=5")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("min_confidence"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn health_reports_the_project_root() {
         let dir =

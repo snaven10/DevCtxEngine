@@ -246,6 +246,19 @@ enum Command {
         /// Traversal depth.
         #[arg(long, default_value_t = 3)]
         depth: usize,
+        /// Lowest confidence of the calls followed: high, medium (default) or low.
+        /// What it leaves out is counted, not listed.
+        #[arg(long)]
+        min_confidence: Option<String>,
+        /// List symbols of test files too (by default they are counted only).
+        #[arg(long)]
+        include_tests: bool,
+        /// List external (library) callees too (by default they are counted only).
+        #[arg(long)]
+        include_external: bool,
+        /// Symbols per direction (default 200; 0 = no cap).
+        #[arg(long)]
+        max_nodes: Option<usize>,
     },
     /// Progress on the plans under `plans/` (markdown, source of truth). No daemon, no store:
     /// reads markdown from disk. Fast enough for a shell-startup hook.
@@ -599,7 +612,23 @@ fn main() -> Result<()> {
             max_tokens,
             no_memories,
         } => cmd_context(query, max_tokens, !no_memories),
-        Command::Impact { symbol, depth } => cmd_impact(symbol, depth),
+        Command::Impact {
+            symbol,
+            depth,
+            min_confidence,
+            include_tests,
+            include_external,
+            max_nodes,
+        } => cmd_impact(
+            symbol,
+            depth,
+            devctx_mcp::state::ImpactQuery {
+                min_confidence,
+                include_tests: include_tests.then_some(true),
+                include_external: include_external.then_some(true),
+                max_nodes,
+            },
+        ),
         Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),
         Command::Routes { method, path } => cmd_routes(method, path),
         Command::Summarize {
@@ -2290,42 +2319,80 @@ fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Resu
     Ok(())
 }
 
-fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
+fn cmd_impact(symbol: String, depth: usize, q: devctx_mcp::state::ImpactQuery) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure_cli(&cfg)? {
-        let json: serde_json::Value = serde_json::from_str(&r.impact(&symbol, depth)?)?;
-        println!("Impact of `{symbol}` (depth {depth}):");
-        let merged: Vec<String> = json["resolved_symbols"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        print_expansion(&symbol, &merged);
-        print_impact("callers (upstream)", &json_depth_pairs(&json["upstream"]));
-        print_impact(
-            "callees (downstream)",
-            &json_depth_pairs(&json["downstream"]),
-        );
-        return Ok(());
-    }
-    let store = open_store(&cfg, configured_dimension(&cfg))?;
-    let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
-    let branch = git.state().branch;
-    let repo = git.short_name();
-    let resolved = store.resolve_symbol(&repo, &branch, &symbol)?;
-    let impact = store.impact_analysis(&repo, &branch, &symbol, depth)?;
-
-    println!("Impact of `{symbol}` (depth {depth}):");
-    print_expansion(
-        &symbol,
-        &devctx_mcp::state::merged_declarations(&symbol, &resolved).unwrap_or_default(),
-    );
-    print_impact("callers (upstream)", &impact.upstream);
-    print_impact("callees (downstream)", &impact.downstream);
+    let json: serde_json::Value = match remote::ensure_cli(&cfg)? {
+        Some(r) => serde_json::from_str(&r.impact(&symbol, depth, &q)?)?,
+        None => {
+            let store = open_store(&cfg, configured_dimension(&cfg))?;
+            // The same answer as the tool: symbol graph or 0.9.0 path,
+            // branch fallback, warnings, filters and what they left out.
+            devctx_mcp::state::impact_at(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+                &symbol,
+                depth,
+                &q,
+            )
+            .map_err(|e| anyhow!(e))?
+        }
+    };
+    print_impact_answer(&symbol, depth, &json);
     Ok(())
+}
+
+/// Human output of an `impact_analysis` answer: notes on stderr, the two
+/// directions on stdout, each symbol with its confidence and marks.
+fn print_impact_answer(symbol: &str, depth: usize, json: &serde_json::Value) {
+    let note = |k: &str, sub: &str| {
+        json.get(k)
+            .and_then(|v| v.get(sub))
+            .and_then(|w| w.as_str())
+            .map(str::to_string)
+    };
+    if let Some(why) = note("branch_fallback", "why") {
+        eprintln!("· branch_fallback: {why}");
+    }
+    if let Some(w) = json.get("warning").and_then(|w| w.as_str()) {
+        eprintln!("· warning: {w}");
+    }
+    println!("Impact of `{symbol}` (depth {depth}):");
+    let merged: Vec<String> = json["resolved_symbols"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    print_expansion(symbol, &merged);
+    print_impact("callers (upstream)", &json["upstream"]);
+    print_impact("callees (downstream)", &json["downstream"]);
+    let count = |k: &str, sub: &str| {
+        json.get(k)
+            .and_then(|v| v.get(sub))
+            .and_then(|c| c.as_u64())
+    };
+    if let Some(n) = count("below_confidence", "count") {
+        eprintln!("· {n} symbol(s) below the confidence shown (--min-confidence low lists them)");
+    }
+    let (tests, external) = (
+        count("excluded", "tests").unwrap_or(0),
+        count("excluded", "external").unwrap_or(0),
+    );
+    if tests + external > 0 {
+        eprintln!(
+            "· left out: {tests} test symbol(s), {external} external callee(s) \
+             (--include-tests / --include-external list them)"
+        );
+    }
+    if let Some(n) = count("omitted_by_limit", "count") {
+        eprintln!("· {n} symbol(s) past --max-nodes were counted, not listed or walked");
+    }
+    if let Some(n) = count("omitted_for_budget", "count") {
+        eprintln!("· {n} symbol(s) did not fit the output budget");
+    }
 }
 
 /// Root to read `plans/` from (PLAN-007 DD-2): inside a DevCtxEngine project, its own root — or,
@@ -2504,31 +2571,36 @@ fn print_expansion(symbol: &str, merged: &[String]) {
 }
 
 /// Extract `[{symbol, depth}]` from a server JSON array into `(symbol, depth)`.
-fn json_depth_pairs(v: &serde_json::Value) -> Vec<(String, usize)> {
-    v.as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|e| {
-                    (
-                        e["symbol"].as_str().unwrap_or("").to_string(),
-                        e["depth"].as_u64().unwrap_or(0) as usize,
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn print_impact(label: &str, items: &[(String, usize)]) {
+fn print_impact(label: &str, items: &serde_json::Value) {
     println!("  {label}:");
+    let items = items.as_array().cloned().unwrap_or_default();
     if items.is_empty() {
         println!("    (none)");
         return;
     }
-    let mut sorted = items.to_vec();
-    sorted.sort_by_key(|(_, d)| *d);
-    for (sym, d) in &sorted {
-        println!("    {sym} (depth {d})");
+    // The answer is already by depth (and within a depth by confidence,
+    // rank and name); a stable sort keeps that order.
+    let mut sorted = items;
+    sorted.sort_by_key(|e| e["depth"].as_u64().unwrap_or(0));
+    for e in &sorted {
+        let mut line = format!(
+            "    {} (depth {}",
+            e["symbol"].as_str().unwrap_or(""),
+            e["depth"].as_u64().unwrap_or(0)
+        );
+        if let Some(c) = e.get("confidence").and_then(|c| c.as_str()) {
+            line.push_str(&format!(", {c}"));
+        }
+        line.push(')');
+        for mark in ["test", "external", "undecided"] {
+            if e.get(mark).and_then(|m| m.as_bool()) == Some(true) {
+                line.push_str(&format!(" [{mark}]"));
+            }
+        }
+        if let (Some(f), Some(l)) = (e.get("file").and_then(|f| f.as_str()), e.get("line")) {
+            line.push_str(&format!(" — {f}:{l}"));
+        }
+        println!("{line}");
     }
 }
 
