@@ -1301,21 +1301,39 @@ impl RepoIndex {
     }
 
     /// `self.m()` inside a Rust `impl Trait for T` whose `T` has no
-    /// definition in the repository (`impl Greeter for String`): the
-    /// repository trait the `impl` implements is the type's supertype, so a
-    /// method it declares (a default one included) is the answer, by the
-    /// trait and never by name (review of TASK-008, m6). `None` when no
-    /// repository supertype of the `impl` has it.
+    /// definition in the repository (`impl Greeter for String`), never by
+    /// name (review of TASK-008, m6):
+    ///
+    /// - a method of the `impl` itself (an override of a default) is the
+    ///   answer, `same_file`, as before 47b3f3c;
+    /// - else the repository trait the `impl` implements, as the type's
+    ///   supertype (a default method included), but at most `medium`: an
+    ///   inherent method of the outside type would win (`String::len` over a
+    ///   trait's `len`), and those cannot be known (second review, N2).
+    ///
+    /// `None` when neither has it.
     fn impl_trait_member(&self, c: &Call<'_>) -> Option<Outcome> {
         let imp = self
             .chain(c.src)
             .into_iter()
             .find(|&a| self.syms[a].kind == "impl")?;
+        let own: Vec<usize> = self
+            .children
+            .get(&self.syms[imp].id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&k| self.syms[k].name == c.callee && is_callable(&self.syms[k].kind))
+            .collect();
+        if !own.is_empty() {
+            let (m, exact) = self.pick_overload(&own, c.args);
+            return Some(self.member_hit(m, false, exact, "same_file"));
+        }
         for r in self.supers.get(&self.syms[imp].id).into_iter().flatten() {
             if let TypeRef::Repo(s, how) = *r {
                 if let Member::Found(m, _, exact) = self.find_member(s, c.callee, true, c.args) {
                     let out = self.member_hit(m, true, exact, "inherited");
-                    return Some(cap(out, self.type_conf(s, how)));
+                    return Some(cap(cap(out, self.type_conf(s, how)), "medium"));
                 }
             }
         }

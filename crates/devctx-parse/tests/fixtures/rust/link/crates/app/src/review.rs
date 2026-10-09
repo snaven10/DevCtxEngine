@@ -150,3 +150,32 @@ impl Greeter for String {
         self.hello();
     }
 }
+
+/// A trait default whose name a type from outside may also have as an
+/// inherent method (`PathBuf` has no `len`, but nothing here can know which
+/// outside types do): the trait is only `medium`.
+pub trait Measured {
+    fn len(&self) -> usize {
+        0
+    }
+    fn report(&self);
+}
+
+impl Measured for std::path::PathBuf {
+    fn report(&self) {
+        self.len();
+    }
+}
+
+/// An `impl` that overrides a default: `self.bow()` is the `impl`'s own.
+pub trait Polite {
+    fn bow(&self) {}
+    fn greet(&self);
+}
+
+impl Polite for u32 {
+    fn bow(&self) {}
+    fn greet(&self) {
+        self.bow();
+    }
+}

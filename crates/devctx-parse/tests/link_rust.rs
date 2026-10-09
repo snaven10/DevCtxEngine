@@ -469,8 +469,31 @@ fn self_in_an_impl_of_a_repo_trait_reaches_the_trait() {
         (
             s("Greeter.hello"),
             s("crates/app/src/review.rs"),
-            "high",
+            "medium",
             "inherited",
+            false
+        )
+    );
+    // Second review (N2): an inherent method of the outside type would win,
+    // and none can be known, so the trait is `medium` ...
+    assert_eq!(
+        l.call("PathBuf.report", "PathBuf.len"),
+        (
+            s("Measured.len"),
+            s("crates/app/src/review.rs"),
+            "medium",
+            "inherited",
+            false
+        )
+    );
+    // ... and a method of the `impl` itself (an override) wins, `high`.
+    assert_eq!(
+        l.call("u32.greet", "u32.bow"),
+        (
+            s("u32.bow"),
+            s("crates/app/src/review.rs"),
+            "high",
+            "same_file",
             false
         )
     );
