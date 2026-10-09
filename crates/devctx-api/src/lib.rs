@@ -926,7 +926,8 @@ struct RoutesQuery {
 
 /// `GET /impact/:symbol` (PLAN-009 TASK-009): `depth` (3), and the filters
 /// of `impact_analysis` — `min_confidence` (`medium`), `include_tests`
-/// (false), `include_external` (false), `max_nodes` (200; 0 = no cap).
+/// (false), `include_external` (false), `max_nodes` (200; 0 = no cap),
+/// `dispatch` (true: through supertypes, TASK-017).
 #[derive(Deserialize)]
 struct ImpactQuery {
     #[serde(default)]
@@ -939,6 +940,8 @@ struct ImpactQuery {
     include_external: Option<bool>,
     #[serde(default)]
     max_nodes: Option<usize>,
+    #[serde(default)]
+    dispatch: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1205,6 +1208,7 @@ async fn impact(
             include_tests: q.include_tests,
             include_external: q.include_external,
             max_nodes: q.max_nodes,
+            dispatch: q.dispatch,
         };
         do_impact_with(s, &symbol, q.depth.unwrap_or(3), &filters)
     })

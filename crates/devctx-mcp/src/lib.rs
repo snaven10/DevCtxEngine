@@ -221,6 +221,14 @@ struct ImpactReq {
     /// deeper level is read.
     #[serde(default)]
     max_nodes: Option<usize>,
+    /// Follow dispatch through interfaces, abstract classes and traits
+    /// (default true): the callers of a method the symbol overrides, and the
+    /// implementations of an interface or abstract method, as `via:
+    /// "dispatch"` with `through` (the method it went through), never surer
+    /// than `medium`. `false` follows direct calls only; `min_confidence:
+    /// "high"` also leaves them out (counted in `below_confidence`).
+    #[serde(default)]
+    dispatch: Option<bool>,
 }
 
 /// Parameters for the `plan_status` tool.
@@ -1204,9 +1212,12 @@ impl DevctxServer {
         default only high/medium calls are followed, test files and library callees are \
         left out, and 200 symbols per direction are listed — whatever that leaves out is \
         counted (`below_confidence` in symbols, `undecided_calls` in calls to the name the \
-        index could not decide, `excluded`, `omitted`), never dropped silently. \
-        `min_confidence`, `include_tests`, `include_external` and `max_nodes` change \
-        that. Returns JSON."
+        index could not decide, `excluded`, `omitted`), never dropped silently. A call \
+        through an interface, abstract class or trait is followed by dispatch: \
+        `via: \"dispatch\"` with `through`, never `high` (`dispatch: false` turns it off; \
+        what a node's cap cut is in `omitted_by_limit.dispatch`). \
+        `min_confidence`, `include_tests`, `include_external`, `max_nodes` and `dispatch` \
+        change that. Returns JSON."
     )]
     async fn impact_analysis(
         &self,
@@ -1218,6 +1229,7 @@ impl DevctxServer {
             include_tests: req.include_tests,
             include_external: req.include_external,
             max_nodes: req.max_nodes,
+            dispatch: req.dispatch,
         };
         run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3), &q))
             .await

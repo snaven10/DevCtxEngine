@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 
 use duckdb::params_from_iter;
 
+use crate::dispatch::{dispatch_confidence, Equivalent};
 use crate::error::Result;
 use crate::lookup::{dotted, MinConfidence};
 use crate::store::Store;
@@ -60,6 +61,10 @@ pub struct ImpactOptions {
     pub include_external: bool,
     /// Nodes per direction; 0 = no cap.
     pub max_nodes: usize,
+    /// Follow dispatch through supertypes (TASK-017): callers of the methods
+    /// a method overrides, implementations of an interface or abstract
+    /// method; `via: "dispatch"`, never surer than `medium`.
+    pub dispatch: bool,
 }
 
 impl Default for ImpactOptions {
@@ -70,6 +75,7 @@ impl Default for ImpactOptions {
             include_tests: false,
             include_external: false,
             max_nodes: DEFAULT_IMPACT_MAX_NODES,
+            dispatch: true,
         }
     }
 }
@@ -110,6 +116,9 @@ pub enum FrontierSql {
     Auto,
 }
 
+/// The `via` of a node reached through dispatch (TASK-017).
+pub const DISPATCH_VIA: &str = "dispatch";
+
 /// A direction of the walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
@@ -135,8 +144,12 @@ pub struct ImpactNode {
     pub depth: usize,
     /// Confidence of the best edge that reached it; `None` = undecided.
     pub confidence: Option<String>,
-    /// Kind of that edge (`calls`, `instantiates`).
+    /// Kind of that edge (`calls`, `instantiates`), or `dispatch`.
     pub via: String,
+    /// Reached through dispatch: the method the edge went through (upstream:
+    /// the supertype method its caller calls; downstream: the method it
+    /// overrides).
+    pub through: Option<String>,
     /// A symbol of a test file (upstream: the occurrence is in one).
     pub test: bool,
     /// Defined outside the repository, with evidence (DD-9).
@@ -173,6 +186,9 @@ pub struct ImpactSide {
     pub tests: usize,
     /// External destinations left out (`include_external` false).
     pub external: usize,
+    /// Override-equivalent methods past the dispatch cap of a node
+    /// (`DISPATCH_MAX_PER_NODE`): counted, not followed (TASK-017).
+    pub dispatch_capped: usize,
     /// Level queries run.
     pub levels: usize,
     /// The largest frontier a level query read (ids).
@@ -224,6 +240,11 @@ pub(crate) struct LevelRow {
     pub rank: Option<f64>,
     /// The edge is an undecided call to the name (the node is its caller).
     pub unsure: bool,
+    /// Reached through dispatch: the method it went through.
+    pub through: Option<String>,
+    /// A downstream dispatch row: no surer than the edge that reached
+    /// `from` (`min(medium, original)`).
+    pub from_reach: bool,
 }
 
 #[cfg(test)]
@@ -232,7 +253,7 @@ thread_local! {
     pub(crate) static LEVEL_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn count_statement() {
+pub(crate) fn count_statement() {
     #[cfg(test)]
     LEVEL_STATEMENTS.with(|c| c.set(c.get() + 1));
 }
@@ -250,7 +271,28 @@ fn row_to_level(r: &duckdb::Row<'_>) -> duckdb::Result<LevelRow> {
         test: r.get(8)?,
         rank: r.get(9)?,
         unsure: false,
+        through: None,
+        from_reach: false,
     })
+}
+
+/// What one level query of a walk read: its rows, and the
+/// override-equivalent methods the dispatch cap left out (TASK-017).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Level {
+    /// The edges of the level.
+    pub rows: Vec<LevelRow>,
+    /// Ids of the equivalents past the cap of their node.
+    pub cut: Vec<u64>,
+}
+
+impl From<Vec<LevelRow>> for Level {
+    fn from(rows: Vec<LevelRow>) -> Self {
+        Level {
+            rows,
+            cut: Vec::new(),
+        }
+    }
 }
 
 /// A node, for deduplication within a direction.
@@ -284,8 +326,10 @@ fn better(r: &LevelRow, b: &LevelRow) -> bool {
         confidence_rank(r.confidence.as_deref()),
         confidence_rank(b.confidence.as_deref()),
     );
-    // A decided edge beats an undecided one of the same confidence.
-    rc > bc || (rc == bc && (!r.unsure, &b.kind) > (!b.unsure, &r.kind))
+    // A decided edge beats an undecided one of the same confidence, and a
+    // direct one an edge through dispatch.
+    let direct = |x: &LevelRow| x.kind != DISPATCH_VIA;
+    rc > bc || (rc == bc && (!r.unsure, direct(r), &b.kind) > (!b.unsure, direct(b), &r.kind))
 }
 
 /// DD-11's order within a level: confidence, rank (NULL last), name; then
@@ -320,7 +364,7 @@ pub(crate) fn walk(
     itself: &HashSet<u64>,
     opts: &ImpactOptions,
     from_sites: bool,
-    mut level: impl FnMut(&[u64]) -> Result<Vec<LevelRow>>,
+    mut level: impl FnMut(&[u64]) -> Result<Level>,
 ) -> Result<ImpactSide> {
     let mut side = ImpactSide::default();
     let mut walked: HashSet<u64> = HashSet::new();
@@ -334,6 +378,10 @@ pub(crate) fn walk(
     // edge at a later level replaces them and walks them (review NIT 2).
     let mut unsure_shown: HashSet<Key> = HashSet::new();
     let (mut below, mut tests, mut external) = (HashSet::new(), HashSet::new(), HashSet::new());
+    // Equivalents the dispatch cap left out, and the confidence each walked
+    // node was reached with (a seed: none, so `high` caps nothing).
+    let mut cut: HashSet<Key> = HashSet::new();
+    let mut reach: HashMap<u64, Option<String>> = HashMap::new();
     let cap = if opts.max_nodes == 0 {
         usize::MAX
     } else {
@@ -343,11 +391,21 @@ pub(crate) fn walk(
         if frontier.is_empty() && !(from_sites && depth == 1) {
             break;
         }
-        let rows = level(&frontier)?;
+        let read = level(&frontier)?;
         side.levels += 1;
         side.widest = side.widest.max(frontier.len());
+        cut.extend(read.cut.into_iter().map(Key::Id));
         let mut best: HashMap<Key, LevelRow> = HashMap::new();
-        for r in rows {
+        for mut r in read.rows {
+            // Downstream dispatch: no surer than the edge that reached the
+            // method it was dispatched from (`min(medium, original)`).
+            if r.from_reach {
+                if let Some(Some(c)) = reach.get(&r.from) {
+                    if confidence_rank(Some(c)) < confidence_rank(r.confidence.as_deref()) {
+                        r.confidence = Some(c.clone());
+                    }
+                }
+            }
             // A recursive call reaches nothing new.
             if r.id == Some(r.from) {
                 continue;
@@ -402,6 +460,7 @@ pub(crate) fn walk(
             if let Some(id) = r.id.filter(|_| !r.unsure) {
                 if walked.insert(id) {
                     next.push(id);
+                    reach.insert(id, r.confidence.clone());
                 }
             }
             side.nodes.push(ImpactNode {
@@ -412,6 +471,7 @@ pub(crate) fn walk(
                 depth,
                 confidence: r.confidence,
                 via: r.kind,
+                through: r.through,
                 test: r.test,
                 external: r.external,
                 rank: r.rank,
@@ -429,6 +489,7 @@ pub(crate) fn walk(
     side.below_confidence = left_out(below);
     side.tests = left_out(tests);
     side.external = left_out(external);
+    side.dispatch_capped = left_out(cut);
     Ok(side)
 }
 
@@ -521,22 +582,30 @@ impl Store {
         // undecided row names a name, not a file.
         let undecided = file.is_none();
         let list_undecided = undecided && opts.min_confidence == MinConfidence::Low;
+        // Dispatch through supertypes (TASK-017): one more statement per
+        // level, and none on a branch with no supertype edge to follow.
+        let dispatch = opts.dispatch && self.has_supertype_edges(repo, branch)?;
         let side = |dir: Direction| {
             let up = dir == Direction::Upstream;
             let extra = up && (sites.is_some() || list_undecided);
             let mut first = true;
             walk(&seeds, &itself, opts, extra, |f| {
+                let mut read = if dispatch {
+                    self.dispatch_level(repo, branch, f, dir, mode)?
+                } else {
+                    self.impact_level(repo, branch, f, dir, mode)?.into()
+                };
                 if !(up && std::mem::take(&mut first)) {
-                    return self.impact_level(repo, branch, f, dir, mode);
+                    return Ok(read);
                 }
-                let mut rows = self.impact_level(repo, branch, f, dir, mode)?;
+                let rows: &mut Vec<LevelRow> = &mut read.rows;
                 if let Some(t) = &sites {
                     rows.extend(self.impact_site_callers(repo, branch, t)?);
                 }
                 if list_undecided {
                     rows.extend(self.impact_undecided_callers(repo, branch, &asked)?);
                 }
-                Ok(rows)
+                Ok(read)
             })
         };
         let upstream = side(Direction::Upstream)?;
@@ -648,22 +717,81 @@ impl Store {
         .map_err(Into::into)
     }
 
-    /// One level of the walk: every `calls`/`instantiates` edge of
-    /// `live_edges` into (upstream) or out of (downstream) the ids of
-    /// `frontier`, with the node at its other end.
-    pub(crate) fn impact_level(
+    /// One level of the walk with dispatch (TASK-017): the override-
+    /// equivalents of the frontier (one statement), then the level query.
+    /// Upstream, the level reads the callers of the frontier and of the
+    /// methods it overrides, the latter as `dispatch` rows of the method
+    /// that overrides them; downstream, the frontier's own callees plus its
+    /// overriding methods as `dispatch` rows. Never surer than `medium`, nor
+    /// than the edge they stand for.
+    pub(crate) fn dispatch_level(
         &self,
         repo: &str,
         branch: &str,
         frontier: &[u64],
         dir: Direction,
         mode: FrontierSql,
-    ) -> Result<Vec<LevelRow>> {
-        if frontier.is_empty() {
-            return Ok(Vec::new());
+    ) -> Result<Level> {
+        let eq = self.override_equivalents(repo, branch, frontier, dir, mode)?;
+        let mut out = Level {
+            rows: Vec::new(),
+            cut: eq.cut,
+        };
+        match dir {
+            Direction::Upstream => {
+                let direct: HashSet<u64> = frontier.iter().copied().collect();
+                let mut by_id: HashMap<u64, Vec<&Equivalent>> = HashMap::new();
+                for e in &eq.kept {
+                    by_id.entry(e.id).or_default().push(e);
+                }
+                let mut set = frontier.to_vec();
+                set.extend(by_id.keys().filter(|id| !direct.contains(id)));
+                for r in self.impact_level(repo, branch, &set, dir, mode)? {
+                    for e in by_id.get(&r.from).into_iter().flatten() {
+                        out.rows.push(LevelRow {
+                            from: e.origin,
+                            kind: DISPATCH_VIA.to_string(),
+                            confidence: dispatch_confidence(r.confidence.as_deref(), e.chain),
+                            through: Some(e.symbol.clone()),
+                            ..r.clone()
+                        });
+                    }
+                    if direct.contains(&r.from) {
+                        out.rows.push(r);
+                    }
+                }
+            }
+            Direction::Downstream => {
+                out.rows = self.impact_level(repo, branch, frontier, dir, mode)?;
+                out.rows.extend(eq.kept.into_iter().map(|e| LevelRow {
+                    from: e.origin,
+                    id: Some(e.id),
+                    symbol: e.symbol,
+                    file: e.file,
+                    line: e.line,
+                    kind: DISPATCH_VIA.to_string(),
+                    confidence: dispatch_confidence(Some("high"), e.chain),
+                    external: false,
+                    test: e.test,
+                    rank: e.rank,
+                    unsure: false,
+                    through: Some(e.origin_symbol),
+                    from_reach: true,
+                }));
+            }
         }
-        let mut args: Vec<duckdb::types::Value> =
-            vec![repo.to_string().into(), branch.to_string().into()];
+        Ok(out)
+    }
+
+    /// The SQL set `frontier` is read as (`IN {set}`), in the form `mode`
+    /// says ([`FrontierSql::Auto`] by width); a list parameter is pushed onto
+    /// `args`, so the set goes where its `?` is in the statement's order.
+    pub(crate) fn frontier_set(
+        &self,
+        frontier: &[u64],
+        mode: FrontierSql,
+        args: &mut Vec<duckdb::types::Value>,
+    ) -> Result<String> {
         let ids = |suffix: &str| {
             frontier
                 .iter()
@@ -676,28 +804,11 @@ impl Store {
             FrontierSql::Auto => FrontierSql::ListParam,
             m => m,
         };
-        let set = match mode {
+        Ok(match mode {
             FrontierSql::InListTyped => format!("({})", ids("::UBIGINT")),
-            FrontierSql::InList => format!(
-                "({})",
-                frontier
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            FrontierSql::InList => format!("({})", ids("")),
             FrontierSql::ListParam => {
-                args.push(
-                    format!(
-                        "[{}]",
-                        frontier
-                            .iter()
-                            .map(u64::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                    .into(),
-                );
+                args.push(format!("[{}]", ids("")).into());
                 "(SELECT unnest(CAST(? AS UBIGINT[])))".to_string()
             }
             FrontierSql::TempTable => {
@@ -715,7 +826,26 @@ impl Store {
                 "(SELECT id FROM impact_frontier)".to_string()
             }
             FrontierSql::Auto => unreachable!("resolved above"),
-        };
+        })
+    }
+
+    /// One level of the walk: every `calls`/`instantiates` edge of
+    /// `live_edges` into (upstream) or out of (downstream) the ids of
+    /// `frontier`, with the node at its other end.
+    pub(crate) fn impact_level(
+        &self,
+        repo: &str,
+        branch: &str,
+        frontier: &[u64],
+        dir: Direction,
+        mode: FrontierSql,
+    ) -> Result<Vec<LevelRow>> {
+        if frontier.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args: Vec<duckdb::types::Value> =
+            vec![repo.to_string().into(), branch.to_string().into()];
+        let set = self.frontier_set(frontier, mode, &mut args)?;
         let sql = match dir {
             Direction::Upstream => format!(
                 "SELECT e.dst_id, e.src_id, s.qualified, s.file, s.start_line, e.kind,
@@ -1434,5 +1564,700 @@ pub(crate) mod tests {
             seen.push(names(&im.upstream).iter().map(|s| s.to_string()).collect());
         }
         assert!(seen.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    /// A symbol graph with types (PLAN-009 TASK-017): every method named in
+    /// `calls` or `methods` (`Type.m`) is a `method` of its type, whose kind
+    /// is `interface` for a name like `IService` and `class` otherwise;
+    /// `supers` are `(sub, super, kind, confidence)` edges between types.
+    /// A method's signature is `methods`' or `public void m(String id)`.
+    pub(crate) fn typed_graph(
+        store: &Store,
+        supers: &[(&str, &str, &str, &str)],
+        methods: &[(&str, &str)],
+        calls: &[E],
+    ) -> BTreeMap<String, u64> {
+        let mut ids: BTreeMap<String, u64> = BTreeMap::new();
+        let mut order: Vec<(String, bool)> = Vec::new();
+        let mut add = |q: &str, is_type: bool, ids: &mut BTreeMap<String, u64>| {
+            if !ids.contains_key(q) {
+                ids.insert(q.to_string(), 5000 + ids.len() as u64);
+                order.push((q.to_string(), is_type));
+            }
+        };
+        let type_of = |q: &str| q.rsplit_once('.').map(|(t, _)| t.to_string());
+        let mut named: Vec<String> = methods.iter().map(|(q, _)| q.to_string()).collect();
+        for e in calls {
+            named.push(e.src.clone());
+            if e.resolved {
+                named.push(e.dst.clone());
+            }
+        }
+        for (sub, sup, _, _) in supers {
+            add(sub, true, &mut ids);
+            add(sup, true, &mut ids);
+        }
+        for q in &named {
+            if let Some(t) = type_of(q) {
+                add(&t, true, &mut ids);
+            }
+            add(q, false, &mut ids);
+        }
+        let mut by_file: BTreeMap<String, Vec<StoredSymbol>> = BTreeMap::new();
+        for (i, (q, is_type)) in order.iter().enumerate() {
+            let file = file_of(q);
+            let name = q.rsplit('.').next().unwrap().to_string();
+            let interface = name.len() > 1
+                && name.starts_with('I')
+                && name[1..2].chars().all(char::is_uppercase);
+            let (kind, parent, signature) = if *is_type {
+                let kind = if interface { "interface" } else { "class" };
+                (kind, None, format!("public {kind} {name}"))
+            } else {
+                let sig = methods
+                    .iter()
+                    .find(|(m, _)| m == q)
+                    .map(|(_, s)| s.to_string())
+                    .unwrap_or_else(|| format!("public void {name}(String id)"));
+                ("method", type_of(q).map(|t| ids[&t]), sig)
+            };
+            by_file.entry(file.clone()).or_default().push(StoredSymbol {
+                id: ids[q],
+                parent_id: parent,
+                file: file.clone(),
+                kind: kind.into(),
+                name,
+                qualified: q.clone(),
+                signature: Some(signature),
+                start_line: 10 + i as i32,
+                end_line: 12 + i as i32,
+                is_test: file.contains("/test/"),
+                ..Default::default()
+            });
+        }
+        for (file, syms) in &by_file {
+            store
+                .replace_file_symbols("repo", "main", file, syms)
+                .unwrap();
+        }
+        let mut edges_by_file: BTreeMap<String, Vec<StoredSymbolEdge>> = BTreeMap::new();
+        for e in calls {
+            let file = file_of(&e.src);
+            edges_by_file
+                .entry(file.clone())
+                .or_default()
+                .push(StoredSymbolEdge {
+                    kind: "calls".into(),
+                    src_id: ids[&e.src],
+                    dst_id: e.resolved.then(|| ids[&e.dst]),
+                    dst_name: e.dst.clone(),
+                    file: file.clone(),
+                    line: e.line,
+                    confidence: e.confidence.map(str::to_string),
+                    resolution: e.resolution.map(str::to_string),
+                    external: Some(e.external),
+                    from_test: file.contains("/test/"),
+                    edge_source: "treesitter".into(),
+                    hint: None,
+                });
+        }
+        for (sub, sup, kind, conf) in supers {
+            let file = file_of(sub);
+            edges_by_file
+                .entry(file.clone())
+                .or_default()
+                .push(StoredSymbolEdge {
+                    kind: kind.to_string(),
+                    src_id: ids[*sub],
+                    dst_id: Some(ids[*sup]),
+                    dst_name: sup.to_string(),
+                    file: file.clone(),
+                    line: 1,
+                    confidence: Some(conf.to_string()),
+                    resolution: Some("same_package".into()),
+                    external: Some(false),
+                    from_test: file.contains("/test/"),
+                    edge_source: "treesitter".into(),
+                    hint: None,
+                });
+        }
+        for (file, rows) in &edges_by_file {
+            store
+                .replace_file_symbol_edges("repo", "main", file, rows)
+                .unwrap();
+        }
+        ids
+    }
+
+    fn node<'a>(side: &'a ImpactSide, symbol: &str) -> &'a ImpactNode {
+        side.nodes
+            .iter()
+            .find(|n| n.symbol == symbol)
+            .unwrap_or_else(|| panic!("no {symbol} in {:?}", names(side)))
+    }
+
+    /// `IService` ← `ServiceImpl`; `Api.handle` calls `IService.update`
+    /// (a field typed by the interface), `ServiceImpl.update` calls
+    /// `Repo.save`.
+    fn di_graph(store: &Store, extra: &[E]) -> BTreeMap<String, u64> {
+        let mut calls = vec![
+            call("Api.handle", "IService.update"),
+            call("ServiceImpl.update", "Repo.save"),
+        ];
+        calls.extend_from_slice(extra);
+        typed_graph(
+            store,
+            &[("ServiceImpl", "IService", "implements", "high")],
+            &[("IService.update", "void update(String id);")],
+            &calls,
+        )
+    }
+
+    /// TASK-017 (b-up): upstream, `Impl.m` reaches the callers of the
+    /// methods it overrides, through dispatch: `medium`, never `high`, at the
+    /// depth of a direct caller, with the method it went through.
+    #[test]
+    fn upstream_dispatch_reaches_the_callers_of_the_overridden_method() {
+        let store = Store::open_in_memory(3).unwrap();
+        di_graph(&store, &[]);
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "ServiceImpl.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Api.handle"]);
+        let n = node(&im.upstream, "Api.handle");
+        assert_eq!(n.via, DISPATCH_VIA);
+        assert_eq!(n.confidence.as_deref(), Some("medium"));
+        assert_eq!(n.depth, 1);
+        assert_eq!(n.through.as_deref(), Some("IService.update"));
+        // Its callees are what they were.
+        assert_eq!(names(&im.downstream), ["Repo.save"]);
+        // `dispatch: false` is the walk of TASK-009.
+        let off = ImpactOptions {
+            dispatch: false,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "ServiceImpl.update", None, &off)
+            .unwrap();
+        assert!(im.upstream.nodes.is_empty());
+    }
+
+    /// TASK-017 (b-down): downstream, an interface method reaches its
+    /// implementations (one level below it), and their callees after them.
+    #[test]
+    fn downstream_dispatch_reaches_the_implementations() {
+        let store = Store::open_in_memory(3).unwrap();
+        di_graph(&store, &[]);
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "IService.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(names(&im.downstream), ["ServiceImpl.update", "Repo.save"]);
+        let n = node(&im.downstream, "ServiceImpl.update");
+        assert_eq!((n.via.as_str(), n.depth), (DISPATCH_VIA, 1));
+        assert_eq!(n.confidence.as_deref(), Some("medium"));
+        assert_eq!(n.through.as_deref(), Some("IService.update"));
+        assert_eq!(node(&im.downstream, "Repo.save").depth, 2);
+        // The direct caller of the interface method is upstream, as before.
+        assert_eq!(names(&im.upstream), ["Api.handle"]);
+        assert_eq!(im.upstream.nodes[0].via, "calls");
+        // From a caller: `Api.handle` → `IService.update` (1) → the
+        // implementation (2), no surer than the call that reached it.
+        let mut weak = call("Web.go", "IService.update");
+        weak.confidence = Some("medium");
+        let store = Store::open_in_memory(3).unwrap();
+        di_graph(&store, &[weak]);
+        let im = store
+            .impact_graph("repo", "main", "Web.go", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(
+            names(&im.downstream),
+            ["IService.update", "ServiceImpl.update", "Repo.save"]
+        );
+        assert_eq!(node(&im.downstream, "ServiceImpl.update").depth, 2);
+    }
+
+    /// TASK-017 (b-deep): every node of every level is expanded, not only the
+    /// seed: a direct caller of `ServiceImpl.update` that is itself called
+    /// through its interface brings that caller at depth 2.
+    #[test]
+    fn dispatch_expands_every_level_not_only_the_seed() {
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[
+                ("ServiceImpl", "IService", "implements", "high"),
+                ("FacadeImpl", "IFacade", "implements", "high"),
+            ],
+            &[
+                ("IService.update", "void update(String id);"),
+                ("IFacade.run", "void run(String id);"),
+            ],
+            &[
+                call("FacadeImpl.run", "ServiceImpl.update"),
+                call("Api.handle", "IFacade.run"),
+                call("Top.go", "Api.handle"),
+            ],
+        );
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "ServiceImpl.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            names(&im.upstream),
+            ["FacadeImpl.run", "Api.handle", "Top.go"]
+        );
+        let n = node(&im.upstream, "Api.handle");
+        assert_eq!((n.via.as_str(), n.depth), (DISPATCH_VIA, 2));
+        assert_eq!(n.through.as_deref(), Some("IFacade.run"));
+        // After the dispatch, a direct edge is what it is.
+        let t = node(&im.upstream, "Top.go");
+        assert_eq!((t.via.as_str(), t.depth), ("calls", 3));
+        // Downstream, at depth 2: `Api.handle` → `IFacade.run` →
+        // `FacadeImpl.run` → `ServiceImpl.update`.
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "Api.handle",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            names(&im.downstream),
+            ["IFacade.run", "FacadeImpl.run", "ServiceImpl.update"]
+        );
+        assert_eq!(node(&im.downstream, "FacadeImpl.run").depth, 2);
+    }
+
+    /// TASK-017 (b-chain): the chain of supertypes is transitive — an
+    /// implementation of an abstract class that implements an interface is
+    /// reached through the interface — and capped at `DISPATCH_DEPTH`
+    /// levels.
+    #[test]
+    fn dispatch_climbs_a_chain_of_supertypes_up_to_its_cap() {
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[
+                ("ServiceImpl", "BaseService", "inherits", "high"),
+                ("BaseService", "IService", "implements", "high"),
+                ("IService", "IBase", "inherits", "high"),
+                ("IBase", "IRoot", "inherits", "high"),
+                ("IRoot", "ITop", "inherits", "high"),
+            ],
+            &[
+                (
+                    "BaseService.update",
+                    "public abstract void update(String id);",
+                ),
+                ("ServiceImpl.update", "public void update(String id)"),
+                ("IService.update", "void update(String id);"),
+                ("IBase.update", "void update(String id);"),
+                ("IRoot.update", "void update(String id);"),
+                ("ITop.update", "void update(String id);"),
+            ],
+            &[
+                call("Api.viaBase", "BaseService.update"),
+                call("Api.viaInterface", "IService.update"),
+                call("Api.viaRoot", "IRoot.update"),
+                call("Api.viaTop", "ITop.update"),
+            ],
+        );
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "ServiceImpl.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        // `ITop` is five levels up: past `DISPATCH_DEPTH` (4).
+        assert_eq!(crate::DISPATCH_DEPTH, 4);
+        assert_eq!(
+            names(&im.upstream),
+            ["Api.viaBase", "Api.viaInterface", "Api.viaRoot"]
+        );
+        assert!(im
+            .upstream
+            .nodes
+            .iter()
+            .all(|n| n.via == DISPATCH_VIA && n.depth == 1));
+        assert_eq!(
+            node(&im.upstream, "Api.viaInterface").through.as_deref(),
+            Some("IService.update")
+        );
+        // Downstream the other way: the interface reaches the abstract
+        // method and the implementation.
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "IService.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            names(&im.downstream),
+            ["BaseService.update", "ServiceImpl.update"]
+        );
+    }
+
+    /// TASK-017 (c): an interface with many implementations does not explode:
+    /// `DISPATCH_MAX_PER_NODE` per node, by rank and then name, the rest
+    /// counted in `dispatch_capped` and not followed.
+    #[test]
+    fn many_implementations_are_capped_and_counted() {
+        let store = Store::open_in_memory(3).unwrap();
+        let impls: Vec<String> = (0..40).map(|i| format!("Impl{i:02}")).collect();
+        let supers: Vec<(&str, &str, &str, &str)> = impls
+            .iter()
+            .map(|i| (i.as_str(), "IRepo", "implements", "high"))
+            .collect();
+        let methods: Vec<String> = impls.iter().map(|i| format!("{i}.save")).collect();
+        let mut sigs: Vec<(&str, &str)> = methods
+            .iter()
+            .map(|m| (m.as_str(), "public void save(String id)"))
+            .collect();
+        sigs.push(("IRepo.save", "void save(String id);"));
+        typed_graph(&store, &supers, &sigs, &[call("Impl39.save", "Deep.x")]);
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "IRepo.save",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        let cap = crate::DISPATCH_MAX_PER_NODE;
+        assert_eq!(
+            im.downstream.nodes.len(),
+            cap,
+            "{:?}",
+            names(&im.downstream)
+        );
+        assert_eq!(im.downstream.nodes[0].symbol, "Impl00.save");
+        assert_eq!(im.downstream.dispatch_capped, 40 - cap);
+        assert!(
+            !names(&im.downstream).contains(&"Deep.x"),
+            "a cut implementation is not followed"
+        );
+        // `max_nodes` is not what cut them.
+        assert_eq!(im.downstream.capped, 0);
+    }
+
+    /// TASK-017 (c'): `min(medium, original)` — a `low` call stays `low`
+    /// through dispatch (counted by default, listed with `low`), and
+    /// `min_confidence: high` leaves every dispatch out and counts it.
+    #[test]
+    fn a_low_edge_stays_low_through_dispatch_and_high_excludes_it() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut weak = call("Weak.w", "IService.update");
+        weak.confidence = Some("low");
+        di_graph(&store, &[weak]);
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "ServiceImpl.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Api.handle"]);
+        assert_eq!(im.upstream.below_confidence, 1);
+        let low = ImpactOptions {
+            min_confidence: MinConfidence::Low,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "ServiceImpl.update", None, &low)
+            .unwrap();
+        let w = node(&im.upstream, "Weak.w");
+        assert_eq!(
+            (w.via.as_str(), w.confidence.as_deref()),
+            (DISPATCH_VIA, Some("low"))
+        );
+        let high = ImpactOptions {
+            min_confidence: MinConfidence::High,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "ServiceImpl.update", None, &high)
+            .unwrap();
+        assert!(im.upstream.nodes.is_empty());
+        assert_eq!(im.upstream.below_confidence, 2);
+        // No edge through dispatch is ever `high`, whatever the filters.
+        for opts in [ImpactOptions::default(), all_in()] {
+            for name in ["ServiceImpl.update", "IService.update", "Api.handle"] {
+                let im = store
+                    .impact_graph("repo", "main", name, None, &opts)
+                    .unwrap();
+                for n in im.upstream.nodes.iter().chain(&im.downstream.nodes) {
+                    if n.via == DISPATCH_VIA {
+                        assert_ne!(n.confidence.as_deref(), Some("high"), "{name}: {n:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// TASK-017: an override-equivalent has the same name and an arity that
+    /// can match; a private or static method overrides nothing.
+    #[test]
+    fn only_override_equivalent_methods_are_dispatched_to() {
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[("ServiceImpl", "IService", "implements", "high")],
+            &[
+                ("IService.update", "void update(String id);"),
+                ("ServiceImpl.update", "public void update(String id, int n)"),
+                ("IService.load", "void load(String id);"),
+                ("ServiceImpl.load", "private void load(String id)"),
+                ("IService.find", "void find(String id);"),
+                ("ServiceImpl.find", "public Item find(String id)"),
+            ],
+            &[
+                call("Api.a", "IService.update"),
+                call("Api.b", "IService.load"),
+                call("Api.c", "IService.find"),
+            ],
+        );
+        let up = |s: &str| {
+            let im = store
+                .impact_graph("repo", "main", s, None, &ImpactOptions::default())
+                .unwrap();
+            names(&im.upstream)
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(up("ServiceImpl.update").is_empty(), "another arity");
+        assert!(up("ServiceImpl.load").is_empty(), "private");
+        assert_eq!(up("ServiceImpl.find"), ["Api.c"]);
+    }
+
+    /// TASK-017, lesson 6: at most one more statement per level and
+    /// direction (the dispatch query), whatever the frontier; with no
+    /// supertype edge on the branch, none.
+    #[test]
+    fn dispatch_costs_at_most_one_statement_per_level() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut calls = Vec::new();
+        for i in 0..300 {
+            calls.push(call(&format!("A{i}.a"), "IService.update"));
+            calls.push(call(&format!("B{i}.b"), &format!("A{i}.a")));
+        }
+        di_graph(&store, &calls);
+        LEVEL_STATEMENTS.with(|c| c.set(0));
+        let opts = ImpactOptions {
+            max_nodes: 0,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "ServiceImpl.update", None, &opts)
+            .unwrap();
+        assert_eq!(im.upstream.nodes.len(), 601);
+        let n = LEVEL_STATEMENTS.with(|c| c.get());
+        let levels = im.upstream.levels + im.downstream.levels;
+        assert!(n <= 2 * levels, "{n} statements for {levels} levels");
+    }
+
+    /// TASK-017: downstream, an implementation is no surer than the edge
+    /// that reached the method it was dispatched from — a `low` call to the
+    /// interface gives a `low` implementation, never `medium`.
+    #[test]
+    fn a_downstream_dispatch_is_no_surer_than_what_reached_its_method() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut weak = call("Weak.w", "IService.update");
+        weak.confidence = Some("low");
+        di_graph(&store, &[weak]);
+        let low = ImpactOptions {
+            min_confidence: MinConfidence::Low,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "Weak.w", None, &low)
+            .unwrap();
+        let n = node(&im.downstream, "ServiceImpl.update");
+        assert_eq!((n.via.as_str(), n.depth), (DISPATCH_VIA, 2));
+        assert_eq!(n.confidence.as_deref(), Some("low"));
+        // By default the interface method is counted, and nothing below it
+        // is read.
+        let im = store
+            .impact_graph("repo", "main", "Weak.w", None, &ImpactOptions::default())
+            .unwrap();
+        assert!(im.downstream.nodes.is_empty());
+        assert_eq!(im.downstream.below_confidence, 1);
+    }
+
+    /// TASK-017, lesson 4: a supertype edge the link pass discarded is never
+    /// followed (only `live_edges`).
+    #[test]
+    fn a_discarded_supertype_edge_dispatches_nothing() {
+        let store = Store::open_in_memory(3).unwrap();
+        // Another, live, supertype edge: the branch has dispatch to follow.
+        typed_graph(
+            &store,
+            &[
+                ("ServiceImpl", "IService", "implements", "high"),
+                ("OtherImpl", "IOther", "implements", "high"),
+            ],
+            &[("IService.update", "void update(String id);")],
+            &[
+                call("Api.handle", "IService.update"),
+                call("ServiceImpl.update", "Repo.save"),
+            ],
+        );
+        let file = "src/main/Main.java";
+        let mut rows = store.file_symbol_edges("repo", "main", file).unwrap();
+        for e in rows
+            .iter_mut()
+            .filter(|e| e.kind == "implements" && e.dst_name == "IService")
+        {
+            e.resolution = Some("discarded".into());
+        }
+        store
+            .replace_file_symbol_edges("repo", "main", file, &rows)
+            .unwrap();
+        let im = store
+            .impact_graph("repo", "main", "ServiceImpl.update", None, &all_in())
+            .unwrap();
+        assert!(im.upstream.nodes.is_empty(), "{:?}", names(&im.upstream));
+        let im = store
+            .impact_graph("repo", "main", "IService.update", None, &all_in())
+            .unwrap();
+        assert!(!names(&im.downstream).contains(&"ServiceImpl.update"));
+        // With every supertype edge discarded, the branch has no dispatch
+        // to follow: no level pays for the dispatch statement.
+        let mut rows = store.file_symbol_edges("repo", "main", file).unwrap();
+        for e in rows.iter_mut().filter(|e| e.kind == "implements") {
+            e.resolution = Some("discarded".into());
+        }
+        store
+            .replace_file_symbol_edges("repo", "main", file, &rows)
+            .unwrap();
+        LEVEL_STATEMENTS.with(|c| c.set(0));
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "ServiceImpl.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        let levels = im.upstream.levels + im.downstream.levels;
+        assert_eq!(LEVEL_STATEMENTS.with(|c| c.get()), levels);
+    }
+
+    /// TASK-017: a caller reached both directly and through dispatch with
+    /// the same confidence is the direct one, whatever its kind (an
+    /// `instantiates` sorts after `dispatch` by name).
+    #[test]
+    fn a_direct_edge_beats_a_dispatch_of_the_same_confidence() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut direct = call("Api.handle", "ServiceImpl.update");
+        direct.confidence = Some("medium");
+        direct.line = 7;
+        di_graph(&store, &[direct]);
+        let file = "src/main/Main.java";
+        let mut rows = store.file_symbol_edges("repo", "main", file).unwrap();
+        for e in rows.iter_mut().filter(|e| e.line == 7) {
+            e.kind = "instantiates".into();
+        }
+        store
+            .replace_file_symbol_edges("repo", "main", file, &rows)
+            .unwrap();
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "ServiceImpl.update",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        let n = node(&im.upstream, "Api.handle");
+        assert_eq!(
+            (n.via.as_str(), n.through.as_deref()),
+            ("instantiates", None)
+        );
+        assert_eq!(n.confidence.as_deref(), Some("medium"));
+    }
+
+    /// TASK-017, lesson 2: the asserts of the 0.9.0 impact tests hold with
+    /// dispatch on, over a graph where it reaches something (`Office` has a
+    /// subclass overriding `persist`): dispatch only adds.
+    #[test]
+    fn the_0_9_0_impact_asserts_hold_with_dispatch() {
+        use crate::graph::tests as old;
+        let mut flush = call("Office.persist", "flush");
+        flush.resolved = false;
+        flush.confidence = None;
+        flush.resolution = None;
+        let mut deeper = call("Repo.flush", "noDebeAparecer");
+        deeper.resolved = false;
+        let calls = vec![
+            call("OfficeResource.actualizar", "OfficeService.actualizar"),
+            call("TicketResource.actualizar", "TicketService.actualizar"),
+            call("OfficeService.actualizar", "Office.persist"),
+            flush,
+            deeper,
+        ];
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[("OfficeDraft", "Office", "inherits", "high")],
+            &[
+                ("Office.persist", "public void persist()"),
+                ("OfficeDraft.persist", "public void persist()"),
+            ],
+            &calls,
+        );
+        for opts in [ImpactOptions::default(), all_in()] {
+            assert!(opts.dispatch);
+            old::check_impact_seeds_from_every_form_of_a_bare_name(&as_0_9_0(&store, opts));
+            let resolve = |s: &str| {
+                store
+                    .impact_graph("repo", "main", s, None, &opts)
+                    .unwrap()
+                    .resolved
+            };
+            old::check_resolving_a_bare_name_lists_every_declaration_it_could_mean(&resolve);
+            let callers = |s: &str| -> Vec<String> {
+                let walk = as_0_9_0(&store, opts);
+                walk(s, 1).upstream.into_iter().map(|(n, _)| n).collect()
+            };
+            old::check_a_qualified_name_does_not_collect_its_homonyms(&resolve, &callers);
+            // Dispatch did reach something here.
+            let im = store
+                .impact_graph("repo", "main", "OfficeService.actualizar", None, &opts)
+                .unwrap();
+            let n = node(&im.downstream, "OfficeDraft.persist");
+            assert_eq!((n.via.as_str(), n.depth), (DISPATCH_VIA, 2));
+        }
+        old::check_traversal_does_not_re_expand_the_names_it_walks(&as_0_9_0(&store, all_in()));
     }
 }

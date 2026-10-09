@@ -259,6 +259,11 @@ enum Command {
         /// Symbols per direction (default 200; 0 = no cap).
         #[arg(long)]
         max_nodes: Option<usize>,
+        /// Follow direct calls only: no dispatch through interfaces, abstract
+        /// classes or traits (callers of the method an implementation
+        /// overrides, implementations of an interface method).
+        #[arg(long)]
+        no_dispatch: bool,
     },
     /// Progress on the plans under `plans/` (markdown, source of truth). No daemon, no store:
     /// reads markdown from disk. Fast enough for a shell-startup hook.
@@ -619,6 +624,7 @@ fn main() -> Result<()> {
             include_tests,
             include_external,
             max_nodes,
+            no_dispatch,
         } => cmd_impact(
             symbol,
             depth,
@@ -627,6 +633,7 @@ fn main() -> Result<()> {
                 include_tests: include_tests.then_some(true),
                 include_external: include_external.then_some(true),
                 max_nodes,
+                dispatch: no_dispatch.then_some(false),
             },
         ),
         Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),

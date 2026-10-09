@@ -12,7 +12,11 @@
 //! `line`, `confidence`, `via` and `test`/`external`/`undecided` when true,
 //! and the answer adds `below_confidence` (symbols), `undecided_calls`
 //! (calls to the name the index could not decide), `excluded` and
-//! `omitted_by_limit`;
+//! `omitted_by_limit`. A node reached through dispatch (TASK-017: the
+//! callers of a method an implementation overrides, the implementations of
+//! an interface method) has `via: "dispatch"`, never `high`, and `through`
+//! (the method it went through); the methods past the dispatch cap of a node
+//! are counted in `omitted_by_limit.dispatch`;
 //! for a name with no definition here, `read_symbol`'s `external` +
 //! `called_from` + `next_step` (its upstream is the callers of its external
 //! call sites) or `suggestions`.
@@ -35,6 +39,8 @@ pub struct ImpactQuery {
     pub include_external: Option<bool>,
     /// Nodes per direction (default 200; 0 = no cap).
     pub max_nodes: Option<usize>,
+    /// Follow dispatch through supertypes (default true, TASK-017).
+    pub dispatch: Option<bool>,
 }
 
 impl ImpactQuery {
@@ -48,6 +54,7 @@ impl ImpactQuery {
             max_nodes: self
                 .max_nodes
                 .unwrap_or(devctx_store::DEFAULT_IMPACT_MAX_NODES),
+            dispatch: self.dispatch.unwrap_or(true),
         })
     }
 
@@ -66,6 +73,9 @@ impl ImpactQuery {
         }
         if let Some(n) = self.max_nodes {
             out.push(("max_nodes", n.to_string()));
+        }
+        if let Some(d) = self.dispatch {
+            out.push(("dispatch", d.to_string()));
         }
         out
     }
@@ -86,6 +96,12 @@ const UNDECIDED_CALLS_HINT: &str =
 const EXCLUDED_HINT: &str =
     "symbols of test files and external (library) callees are left out by default and \
      not walked; pass include_tests / include_external to list them, marked";
+
+/// The line `omitted_by_limit.dispatch` carries.
+const DISPATCH_CAPPED_HINT: &str =
+    "a method implemented (or overridden) by more methods than a node is expanded into: \
+     the ones past the cap were counted, not listed or walked; ask about one implementation, \
+     or pass dispatch: false to follow direct calls only";
 
 /// The line the answer adds when `max_nodes` stopped the walk.
 const CAPPED_HINT: &str =
@@ -128,6 +144,9 @@ fn node_json(n: &ImpactNode) -> Value {
     }
     if n.undecided() {
         v["undecided"] = json!(true);
+    }
+    if let Some(t) = &n.through {
+        v["through"] = json!(t);
     }
     v
 }
@@ -262,6 +281,7 @@ fn answer(
             "include_tests": opts.include_tests,
             "include_external": opts.include_external,
             "max_nodes": opts.max_nodes,
+            "dispatch": opts.dispatch,
         });
         let (u, d) = (&im.upstream, &im.downstream);
         let below = u.below_confidence + d.below_confidence;
@@ -286,17 +306,31 @@ fn answer(
                 "hint": EXCLUDED_HINT,
             });
         }
-        by_limit = u.capped + d.capped;
+        let dispatch = u.dispatch_capped + d.dispatch_capped;
+        by_limit = u.capped + d.capped + dispatch;
         if by_limit > 0 {
+            // The hint of what cut: `max_nodes`, or only the dispatch cap.
+            let hint = if u.capped + d.capped > 0 {
+                CAPPED_HINT
+            } else {
+                DISPATCH_CAPPED_HINT
+            };
             let mut note = json!({
                 "count": by_limit,
                 "max_nodes": opts.max_nodes,
-                "hint": CAPPED_HINT,
+                "hint": hint,
             });
             for (name, side) in [("upstream", u), ("downstream", d)] {
                 if let Some(at) = side.capped_at {
                     note[name] = json!({ "count": side.capped, "depth": at });
                 }
+            }
+            // The dispatch cap, apart: methods a node was not expanded into.
+            if dispatch > 0 {
+                note["dispatch"] = json!({
+                    "count": dispatch,
+                    "max_per_node": devctx_store::DISPATCH_MAX_PER_NODE,
+                });
             }
             out["omitted_by_limit"] = note;
         }
@@ -346,6 +380,7 @@ mod tests {
             include_tests: Some(true),
             include_external: Some(true),
             max_nodes: Some(0),
+            ..Default::default()
         }
     }
 
@@ -848,6 +883,180 @@ mod tests {
         );
     }
 
+    /// TASK-017 fixtures: a Java service injected by its interface.
+    const JAVA_DI: &[(&str, &str)] = &[
+        (
+            "src/main/java/app/IService.java",
+            "package app;\n\npublic interface IService {\n    void update(String id);\n}\n",
+        ),
+        (
+            "src/main/java/app/ServiceImpl.java",
+            "package app;\n\npublic class ServiceImpl implements IService {\n    private final Repo repo = new Repo();\n\n    @Override\n    public void update(String id) {\n        repo.save(id);\n    }\n}\n",
+        ),
+        (
+            "src/main/java/app/Repo.java",
+            "package app;\n\npublic class Repo {\n    public void save(String id) {\n    }\n}\n",
+        ),
+        (
+            "src/main/java/app/Api.java",
+            "package app;\n\nimport jakarta.inject.Inject;\n\npublic class Api {\n    @Inject\n    IService service;\n\n    public void handle() {\n        service.update(\"x\");\n    }\n}\n",
+        ),
+    ];
+
+    /// TS `implements`, a Rust trait, a Python base class and Go embedding.
+    const POLY: &[(&str, &str)] = &[
+        (
+            "web/svc.ts",
+            "export interface IService {\n  update(id: string): void;\n}\n\nexport class ServiceImpl implements IService {\n  update(id: string): void {\n    helper(id);\n  }\n}\n\nexport function helper(id: string): void {}\n",
+        ),
+        (
+            "web/api.ts",
+            "import { IService } from './svc';\n\nexport class Api {\n  constructor(private readonly service: IService) {}\n\n  handle(): void {\n    this.service.update('x');\n  }\n}\n",
+        ),
+        (
+            "rs/src/lib.rs",
+            "pub trait Sink {\n    fn write(&self, line: &str);\n}\n\npub struct FileSink;\n\nimpl Sink for FileSink {\n    fn write(&self, line: &str) {\n        flush(line);\n    }\n}\n\npub fn flush(_line: &str) {}\n\npub fn emit(s: &dyn Sink) {\n    s.write(\"x\");\n}\n",
+        ),
+        (
+            "py/app/jobs.py",
+            "class Job:\n    def run(self, x):\n        pass\n\n\nclass Nightly(Job):\n    def run(self, x):\n        tidy()\n\n\ndef tidy():\n    pass\n\n\ndef launch(job: Job):\n    job.run(1)\n",
+        ),
+        (
+            "go/app/embed.go",
+            "package app\n\ntype Inner struct{}\n\nfunc (i *Inner) Ping() {}\n\ntype Outer struct {\n\tInner\n}\n\nfunc (o *Outer) Ping() {}\n\nfunc Use(i *Inner) {\n\ti.Ping()\n}\n",
+        ),
+    ];
+
+    /// TASK-017 (a): `impact("ServiceImpl.update")` sees who calls it
+    /// through the interface its field is typed by (Java, injected):
+    /// `via: "dispatch"`, `medium`, with the method it went through; with
+    /// `dispatch: false` it is the answer of TASK-009, which is a subset.
+    #[test]
+    fn impact_sees_a_caller_through_an_injected_interface() {
+        let (state, repo) = indexed_files("impact_dispatch_java", JAVA_DI);
+        let v = impact(&state, "ServiceImpl.update", &ImpactQuery::default());
+        let n = node(&v, "upstream", "Api.handle");
+        assert_eq!(n["via"], "dispatch", "{v}");
+        assert_eq!(n["confidence"], "medium", "{v}");
+        assert_eq!(n["through"], "IService.update", "{v}");
+        assert_eq!(n["depth"], 1, "{v}");
+        assert_eq!(syms(&v, "downstream"), ["Repo.save"], "{v}");
+        assert_eq!(v["filters"]["dispatch"], true, "{v}");
+        let off = ImpactQuery {
+            dispatch: Some(false),
+            ..Default::default()
+        };
+        let plain = impact(&state, "ServiceImpl.update", &off);
+        assert!(syms(&plain, "upstream").is_empty(), "{plain}");
+        assert_eq!(plain["filters"]["dispatch"], false, "{plain}");
+        // The answer without dispatch is a subset of the one with it.
+        for side in ["upstream", "downstream"] {
+            for n in plain[side].as_array().unwrap() {
+                let m = node(&v, side, n["symbol"].as_str().unwrap());
+                assert_eq!(m["depth"], n["depth"], "{side}: {plain} vs {v}");
+            }
+        }
+        // Downstream from the interface: its implementation, then what that
+        // calls; never `high`.
+        let v = impact(&state, "IService.update", &ImpactQuery::default());
+        assert_eq!(
+            syms(&v, "downstream"),
+            ["ServiceImpl.update", "Repo.save"],
+            "{v}"
+        );
+        assert_eq!(
+            node(&v, "downstream", "ServiceImpl.update")["confidence"],
+            "medium"
+        );
+        // `min_confidence: high` leaves it out and counts it.
+        let high = ImpactQuery {
+            min_confidence: Some("high".into()),
+            ..Default::default()
+        };
+        let v = impact(&state, "ServiceImpl.update", &high);
+        assert!(syms(&v, "upstream").is_empty(), "{v}");
+        assert_eq!(v["below_confidence"]["count"], 1, "{v}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// TASK-017 (d): TypeScript `implements` and a Rust trait, both ways;
+    /// a Python base class too (best effort); Go embedding is no dispatch
+    /// (a promoted method is not overridden).
+    #[test]
+    fn dispatch_follows_typescript_rust_and_python_but_not_go_embedding() {
+        let (state, repo) = indexed_files("impact_dispatch_poly", POLY);
+        for (imp, caller, through) in [
+            ("ServiceImpl.update", "Api.handle", "IService.update"),
+            ("FileSink.write", "emit", "Sink.write"),
+            ("Nightly.run", "launch", "Job.run"),
+        ] {
+            let v = impact(&state, imp, &ImpactQuery::default());
+            let n = node(&v, "upstream", caller);
+            assert_eq!(n["via"], "dispatch", "{imp}: {v}");
+            assert_eq!(n["through"], through, "{imp}: {v}");
+            assert_ne!(n["confidence"], "high", "{imp}: {v}");
+            let v = impact(&state, through, &ImpactQuery::default());
+            let n = node(&v, "downstream", imp);
+            assert_eq!(n["via"], "dispatch", "{through}: {v}");
+            assert_eq!(n["through"], through, "{through}: {v}");
+        }
+        let v = impact(&state, "Outer.Ping", &all_in());
+        assert!(
+            !syms(&v, "upstream").iter().any(|s| s == "Use"),
+            "embedding is no dispatch: {v}"
+        );
+        let v = impact(&state, "Inner.Ping", &all_in());
+        assert!(
+            !syms(&v, "downstream").iter().any(|s| s == "Outer.Ping"),
+            "{v}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// TASK-017 (c) through the tool: a base class with more subclasses than
+    /// a node is expanded into lists the cap and counts the rest in
+    /// `omitted_by_limit.dispatch`, which `omitted.count` adds.
+    #[test]
+    fn the_dispatch_cap_is_counted_in_omitted_by_limit() {
+        let mut py = String::from("class Base:\n    def run(self):\n        pass\n");
+        for i in 0..20 {
+            py.push_str(&format!(
+                "\n\nclass Sub{i:02}(Base):\n    def run(self):\n        pass\n"
+            ));
+        }
+        let (state, repo) = indexed_files("impact_dispatch_cap", &[("app/subs.py", py.as_str())]);
+        let v = impact(&state, "Base.run", &ImpactQuery::default());
+        let cap = devctx_store::DISPATCH_MAX_PER_NODE;
+        assert_eq!(v["downstream"].as_array().unwrap().len(), cap, "{v}");
+        assert_eq!(v["omitted_by_limit"]["dispatch"]["count"], 20 - cap, "{v}");
+        assert_eq!(
+            v["omitted_by_limit"]["dispatch"]["max_per_node"], cap,
+            "{v}"
+        );
+        assert_eq!(v["omitted_by_limit"]["count"], 20 - cap, "{v}");
+        assert!(v["omitted_by_limit"].get("downstream").is_none(), "{v}");
+        assert!(
+            v["omitted_by_limit"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("dispatch: false"),
+            "{v}"
+        );
+        assert_eq!(v["omitted"]["count"], 20 - cap, "{v}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn dispatch_is_a_filter_of_the_query() {
+        let q = ImpactQuery {
+            dispatch: Some(false),
+            ..Default::default()
+        };
+        assert!(!q.options(3).unwrap().dispatch);
+        assert!(ImpactQuery::default().options(3).unwrap().dispatch);
+        assert_eq!(q.query_pairs(), [("dispatch", "false".to_string())]);
+    }
+
     /// Measurement harness (PLAN-009 TASK-009, not a test): indexes
     /// `$DEVCTX_IMPACT_BENCH_REPO` into `$DEVCTX_IMPACT_BENCH_STATE` with the
     /// model-free embedder (parse, symbol graph and link pass are the real
@@ -990,6 +1199,28 @@ mod tests {
                 first = v;
                 n
             });
+            // The same tool call without dispatch (TASK-017): its cost.
+            let no_dispatch = ImpactQuery {
+                dispatch: Some(false),
+                ..Default::default()
+            };
+            let mut plain = Value::Null;
+            let tool_plain = time(&mut || {
+                let v: Value =
+                    serde_json::from_str(&do_impact_with(&state, sym, 3, &no_dispatch).unwrap())
+                        .unwrap();
+                let n = count(&v);
+                plain = v;
+                n
+            });
+            let dispatched = |v: &Value| -> usize {
+                ["upstream", "downstream"]
+                    .iter()
+                    .filter_map(|s| v[*s].as_array())
+                    .flatten()
+                    .filter(|n| n["via"] == "dispatch")
+                    .count()
+            };
             let store = state.open_store().unwrap();
             let mut walks = serde_json::Map::new();
             let tool_only = var("DEVCTX_IMPACT_BENCH_TOOL_ONLY").is_some();
@@ -1003,6 +1234,7 @@ mod tests {
                         include_tests: true,
                         include_external: true,
                         max_nodes: 0,
+                        dispatch: true,
                     },
                 ),
             ] {
@@ -1040,6 +1272,11 @@ mod tests {
                 json!({
                     "symbol": sym,
                     "tool": { "p50_ms": tool.0, "p95_ms": tool.1, "nodes": tool.2 },
+                    "dispatch_nodes": dispatched(&first),
+                    "tool_no_dispatch": {
+                        "p50_ms": tool_plain.0, "p95_ms": tool_plain.1, "nodes": tool_plain.2,
+                        "dispatch_nodes": dispatched(&plain),
+                    },
                     "omitted": first.get("omitted"),
                     "omitted_by_limit": first.get("omitted_by_limit"),
                     "below_confidence": first["below_confidence"].get("count"),

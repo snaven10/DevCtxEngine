@@ -3095,6 +3095,27 @@ public class Helper {
                  r.find().doIt();\n        d.getName();\n        h.item.doIt();\n    }\n}\n",
             ),
         ];
+        // TASK-017: what a class `implements` decides which interface's
+        // default method a caller of another file reaches (and where
+        // dispatch climbs from).
+        files.extend([
+            (
+                "p/I1.java",
+                "package p;\npublic interface I1 { default void helper() {} }\n",
+            ),
+            (
+                "p/I2.java",
+                "package p;\npublic interface I2 { default void helper() {} }\n",
+            ),
+            (
+                "p/K.java",
+                "package p;\npublic class K implements I1 { public void work() {} }\n",
+            ),
+            (
+                "q/W.java",
+                "package q;\nimport p.K;\nclass W {\n    void go(K k) {\n        k.helper();\n    }\n}\n",
+            ),
+        ]);
         // TypeScript (TASK-006): a barrel's named re-export, an alias of the
         // `tsconfig`, a barrel re-exporting through another barrel.
         files.extend([
@@ -3279,7 +3300,7 @@ public class Helper {
         // Each step: the file written, its new text, and the edge of a file
         // not written whose answer must change — so no scenario passes by
         // changing nothing.
-        let steps: [(&str, &str, &str, &str, i32); 24] = [
+        let steps: [(&str, &str, &str, &str, i32); 25] = [
             (
                 "p/B.java",
                 "package p;\npublic class B extends C {}\n",
@@ -3310,6 +3331,15 @@ public class Helper {
                 "q/U.java",
                 "doIt",
                 11,
+            ),
+            // TASK-017 (e): a class's `implements` changes: a call of another
+            // file to an inherited default method follows it.
+            (
+                "p/K.java",
+                "package p;\npublic class K implements I2 { public void work() {} }\n",
+                "q/W.java",
+                "K.helper",
+                5,
             ),
             // A supertype's `extends` changes: a subtype's bare call follows.
             (

@@ -6,6 +6,7 @@
 //! (FTS) indexes are opt-in accelerators, dropped before a bulk load and
 //! rebuilt after.
 
+mod dispatch;
 mod error;
 mod graph;
 mod impact;
@@ -19,13 +20,14 @@ mod state;
 mod store;
 mod symbols;
 
+pub use dispatch::{DISPATCH_DEPTH, DISPATCH_MAX_PER_NODE};
 pub use error::{Result, StoreError};
 pub use graph::{GraphEdge, ImpactResult, Reference, StoredEdge};
 #[cfg(feature = "bench")]
 pub use impact::FrontierSql;
 pub use impact::{
     ImpactNode, ImpactOptions, ImpactSide, SymbolImpact, DEFAULT_IMPACT_DEPTH,
-    DEFAULT_IMPACT_MAX_NODES,
+    DEFAULT_IMPACT_MAX_NODES, DISPATCH_VIA,
 };
 pub use lookup::{
     sym_hex, ExternalSites, MinConfidence, SymbolDefinition, SymbolReference, ViewEdge,

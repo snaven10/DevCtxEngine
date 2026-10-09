@@ -1186,7 +1186,7 @@ pub fn note_unapplied_impact_filters(raw: String) -> String {
 /// to an answer that does not say which filters it applied. Whether it was
 /// added.
 pub fn add_unapplied_impact_note(v: &mut serde_json::Value) -> bool {
-    const NOTE: &str = "min_confidence/include_tests/include_external/max_nodes were not \
+    const NOTE: &str = "min_confidence/include_tests/include_external/max_nodes/dispatch were not \
         applied: the server, or the index it answered from, predates them, so this is its \
         unfiltered answer";
     let current = v.get("warning").and_then(|w| w.as_str());
