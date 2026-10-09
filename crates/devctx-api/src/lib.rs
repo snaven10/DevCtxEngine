@@ -61,6 +61,7 @@ fn router(api: Api) -> Router {
         .route("/plans/graph", get(plans_graph))
         .route("/impact/:symbol", get(impact))
         .route("/references/:symbol", get(references))
+        .route("/traverse", post(traverse))
         .route("/memories/by-symbol/:symbol", get(memories_by_symbol))
         .route("/memories/by-file/:file", get(memories_by_file))
         .route("/memory/:id/refs", get(memory_refs))
@@ -1215,6 +1216,17 @@ async fn impact(
     .await
 }
 
+/// `POST /traverse` (PLAN-009 TASK-013): the `traverse` tool, its parameters
+/// as the JSON body (`symbol` or `sym`, `kinds`, `direction`, `depth`, the
+/// filters, `limit`, `offset`). A bad parameter or an old index is refused
+/// as every tool error (a 500 with `error`).
+async fn traverse(
+    State(api): State<Api>,
+    Json(q): Json<devctx_mcp::state::TraverseQuery>,
+) -> Response {
+    run(api.state, move |s| devctx_mcp::state::do_traverse(s, &q)).await
+}
+
 /// Link memories saved before the junction existed.
 async fn backfill_links(State(api): State<Api>, Json(b): Json<BackfillBody>) -> Response {
     run(api.state, move |s| {
@@ -1594,6 +1606,33 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("min_confidence"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-013: `POST /traverse` exists and takes the tool's
+    /// parameters as its body; a depth over 4 is refused with its message.
+    #[tokio::test]
+    async fn traverse_takes_its_parameters_from_the_body() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_traverse_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/traverse")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"symbol":"f","kinds":"calls","depth":9}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("between 1 and 4"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

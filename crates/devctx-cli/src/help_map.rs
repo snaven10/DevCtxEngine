@@ -51,13 +51,15 @@ const EN: &str = "\
 Commands by job:
   Set up        init · models · mcp configure · projects add
   Index         index · reindex · watch · hooks install · status · repair
-  Read code     search · symbol · context · impact · routes · summarize
+  Read code     search · symbol · context · impact · traverse · routes · summarize
   Memory        remember · recall · memory-stats · memory-forget · memories export|import
   Interfaces    tui · web · api · mcp · serve
 
 Easy to miss:
   impact <symbol>   Everything a change to that symbol would reach, transitively —
                     what other tools call impact analysis.
+  traverse <symbol> Walk the symbol graph hop by hop: calls, imports, hierarchy,
+                    members, type uses (--kinds, --dir in|out|both, --depth).
   context <query>   One budgeted brief: what is already known, the code that
                     ranks highest, and the memories recorded against those files.
   symbol <name>     A symbol's definition and code, by name.
@@ -72,13 +74,15 @@ const ES: &str = "\
 Comandos por tarea:
   Configurar    init · models · mcp configure · projects add
   Indexar       index · reindex · watch · hooks install · status · repair
-  Leer código   search · symbol · context · impact · routes · summarize
+  Leer código   search · symbol · context · impact · traverse · routes · summarize
   Memoria       remember · recall · memory-stats · memory-forget · memories export|import
   Interfaces    tui · web · api · mcp · serve
 
 Fáciles de pasar por alto:
   impact <símbolo>  Todo lo que alcanzaría un cambio en ese símbolo, de forma
                     transitiva — el análisis de impacto.
+  traverse <símbolo> Recorrer el grafo de símbolos salto a salto: llamadas,
+                    imports, jerarquía, miembros, usos de tipo (--kinds, --dir, --depth).
   context <query>   Un brief con presupuesto: lo que ya se sabe, el código que
                     mejor rankea, y las memorias registradas sobre esos archivos.
   symbol <nombre>   La definición y el código de un símbolo, por nombre.

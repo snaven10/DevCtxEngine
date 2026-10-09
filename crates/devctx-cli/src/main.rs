@@ -265,6 +265,46 @@ enum Command {
         #[arg(long)]
         no_dispatch: bool,
     },
+    /// Walk the symbol graph from a symbol, along the relations asked (calls,
+    /// instantiates, imports, inherits, implements, contains, references).
+    Traverse {
+        /// Where to start: a bare, qualified or `file::name` symbol, or a file
+        /// path. Omit it to start from `--sym`.
+        symbol: Option<String>,
+        /// Start from exactly this definition (the hex `sym` of a node).
+        #[arg(long)]
+        sym: Option<String>,
+        /// Relations, comma-separated, or `all` (default calls).
+        #[arg(long)]
+        kinds: Option<String>,
+        /// in, out (default) or both.
+        #[arg(long = "dir", alias = "direction")]
+        direction: Option<String>,
+        /// Levels, 1 to 4.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Lowest confidence of the edges followed: high, medium (default) or low.
+        #[arg(long)]
+        min_confidence: Option<String>,
+        /// List symbols of test files too (by default they are counted only).
+        #[arg(long)]
+        include_tests: bool,
+        /// List external (library) destinations too (by default they are counted only).
+        #[arg(long)]
+        include_external: bool,
+        /// With calls: no dispatch through interfaces, abstract classes or traits.
+        #[arg(long)]
+        no_dispatch: bool,
+        /// Nodes per page (default 50).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Skip this many nodes (the next_offset of the previous page).
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Print the tool's JSON answer instead of the listing.
+        #[arg(long)]
+        json: bool,
+    },
     /// Progress on the plans under `plans/` (markdown, source of truth). No daemon, no store:
     /// reads markdown from disk. Fast enough for a shell-startup hook.
     PlanStatus {
@@ -635,6 +675,35 @@ fn main() -> Result<()> {
                 max_nodes,
                 dispatch: no_dispatch.then_some(false),
             },
+        ),
+        Command::Traverse {
+            symbol,
+            sym,
+            kinds,
+            direction,
+            depth,
+            min_confidence,
+            include_tests,
+            include_external,
+            no_dispatch,
+            limit,
+            offset,
+            json,
+        } => cmd_traverse(
+            devctx_mcp::state::TraverseQuery {
+                symbol,
+                sym,
+                kinds,
+                direction,
+                depth: Some(depth),
+                min_confidence,
+                include_tests: include_tests.then_some(true),
+                include_external: include_external.then_some(true),
+                dispatch: no_dispatch.then_some(false),
+                limit,
+                offset,
+            },
+            json,
         ),
         Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),
         Command::Routes { method, path } => cmd_routes(method, path),
@@ -2347,6 +2416,110 @@ fn cmd_impact(symbol: String, depth: usize, q: devctx_mcp::state::ImpactQuery) -
     };
     print_impact_answer(&symbol, depth, &json);
     Ok(())
+}
+
+/// `devctx traverse` — walk the symbol graph from a symbol.
+fn cmd_traverse(q: devctx_mcp::state::TraverseQuery, as_json: bool) -> Result<()> {
+    // A bad parameter is refused before a server or a store is touched.
+    q.options().map_err(|e| anyhow!(e))?;
+    let cfg = load_project()?;
+    let json: serde_json::Value = match remote::ensure_cli(&cfg)? {
+        Some(r) => serde_json::from_str(&r.traverse(&q)?)?,
+        None => {
+            let store = open_store(&cfg, configured_dimension(&cfg))?;
+            devctx_mcp::state::traverse_at(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+                &q,
+            )
+            .map_err(|e| anyhow!(e))?
+        }
+    };
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&json)?);
+    } else {
+        print_traverse_answer(&json);
+    }
+    Ok(())
+}
+
+/// Human output of a `traverse` answer: the root (or the candidates), each
+/// node by depth with the relation that reached it, and the notes on stderr.
+fn print_traverse_answer(json: &serde_json::Value) {
+    if let Some(why) = json["branch_fallback"]["why"].as_str() {
+        eprintln!("· branch_fallback: {why}");
+    }
+    let root = &json["root"];
+    println!(
+        "Traverse from `{}`{}:",
+        root["symbol"].as_str().unwrap_or(""),
+        root["file"]
+            .as_str()
+            .map(|f| format!(" ({f}:{})", root["line"]))
+            .unwrap_or_default()
+    );
+    if let Some(c) = json["candidates"].as_array() {
+        println!("  {} definitions (pass --sym to start from one):", c.len());
+        for c in c {
+            println!(
+                "    {} {} — {}:{}",
+                c["sym"].as_str().unwrap_or(""),
+                c["symbol"].as_str().unwrap_or(""),
+                c["file"].as_str().unwrap_or(""),
+                c["line"]
+            );
+        }
+    }
+    let nodes = json["nodes"].as_array().cloned().unwrap_or_default();
+    if nodes.is_empty() {
+        println!("  (none)");
+    }
+    for n in &nodes {
+        let mut line = format!(
+            "  [{}] {} ({}, {}, {})",
+            n["depth"],
+            n["symbol"].as_str().unwrap_or(""),
+            n["kind"].as_str().unwrap_or("?"),
+            n["via"].as_str().unwrap_or(""),
+            n["confidence"].as_str().unwrap_or("")
+        );
+        for mark in ["test", "external", "undecided"] {
+            if n[mark].as_bool() == Some(true) {
+                line.push_str(&format!(" [{mark}]"));
+            }
+        }
+        if let (Some(f), Some(l)) = (n["file"].as_str(), n["line"].as_i64()) {
+            line.push_str(&format!(" — {f}:{l}"));
+        }
+        println!("{line}");
+    }
+    let total = json["total"].as_u64().unwrap_or(0);
+    if let Some(next) = json["next_offset"].as_u64() {
+        eprintln!("· {total} node(s) in all; --offset {next} shows the next page");
+    }
+    if let Some(d) = json["partial"]["from_depth"].as_u64() {
+        eprintln!("· depth {d} and below were not read: the page was already full");
+    }
+    if let Some(n) = json["below_confidence"]["count"].as_u64() {
+        eprintln!("· {n} symbol(s) below the confidence shown (--min-confidence low lists them)");
+    }
+    let (tests, external) = (
+        json["excluded"]["tests"].as_u64().unwrap_or(0),
+        json["excluded"]["external"].as_u64().unwrap_or(0),
+    );
+    if tests + external > 0 {
+        eprintln!(
+            "· left out: {tests} test symbol(s), {external} external destination(s) \
+             (--include-tests / --include-external list them)"
+        );
+    }
+    if let Some(r) = json["dispatch"]["reason"].as_str() {
+        eprintln!("· dispatch was not followed ({r})");
+    }
+    if let Some(n) = json["omitted_for_budget"]["count"].as_u64() {
+        eprintln!("· {n} node(s) did not fit the output budget");
+    }
 }
 
 /// Human output of an `impact_analysis` answer: notes on stderr, the two

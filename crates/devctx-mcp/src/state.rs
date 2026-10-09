@@ -26,8 +26,10 @@ use serde_json::{json, Value};
 
 mod impact;
 mod lookup;
+mod traverse;
 
 pub use impact::ImpactQuery;
+pub use traverse::{TraverseQuery, DEFAULT_TRAVERSE_LIMIT, TRAVERSE_NEEDS_REINDEX};
 
 /// How far an indexing run has got, for anyone who asks while it runs.
 ///
@@ -4298,6 +4300,42 @@ pub fn impact_at(
     .ready()?;
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     impact::impact_on(store, &chosen, symbol, depth, q, budget)
+}
+
+/// `traverse` tool (PLAN-009 TASK-013, DD-16): walk the symbol graph from a
+/// symbol along the relations, direction and depth `q` asks, paged; see
+/// [`TraverseQuery`]. A bad parameter is the caller's error before anything
+/// is opened; a branch without a current symbol graph is an error that asks
+/// for `devctx index --full`.
+pub fn do_traverse(state: &AppState, q: &TraverseQuery) -> Result<String, String> {
+    q.options()?;
+    let store = state.open_store()?;
+    let chosen = graph_branch(state, &store)?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    traverse::traverse_on(&store, &chosen, q, budget).map(|v| v.to_string())
+}
+
+/// [`do_traverse`] for a caller that holds a store but no [`AppState`] (the
+/// local CLI): the same answer, branch fallback included.
+pub fn traverse_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    q: &TraverseQuery,
+) -> Result<Value, String> {
+    q.options()?;
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    traverse::traverse_on(store, &chosen, q, budget)
 }
 
 /// The centrality weight a search without a server (the CLI's local path,

@@ -13,7 +13,8 @@ use crate::state::{
     do_memory_forget, do_memory_move, do_memory_refs, do_memory_stats, do_plan_status,
     do_read_file, do_read_symbol, do_recall_scoped, do_references_with, do_remember,
     do_remember_shared, do_routes_for_handler, do_search, do_search_project, do_search_routes,
-    do_summarize, parse_mode, AppState, MemoriesOpts, Page, PlanListOpts,
+    do_summarize, do_traverse, parse_mode, AppState, MemoriesOpts, Page, PlanListOpts,
+    TraverseQuery,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -618,6 +619,19 @@ impl Backend {
         }
     }
 
+    /// Walk the symbol graph from a symbol (`traverse`, PLAN-009 TASK-013).
+    /// A server older than the tool has no `POST /traverse`: its 404 is told
+    /// as such, with what to do, never as a bare status.
+    pub fn traverse(&self, q: &TraverseQuery) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_traverse(s, q),
+            Backend::Remote(r, _) => {
+                let body = serde_json::to_value(q).map_err(|e| e.to_string())?;
+                r.post("/traverse", body).map_err(traverse_unsupported)
+            }
+        }
+    }
+
     /// Delete one memory for good, wherever it lives.
     pub fn memory_forget(&self, id: &str) -> Result<String, String> {
         match self {
@@ -1002,6 +1016,30 @@ mod tests {
         assert_eq!(client.get("/status").unwrap(), "ok");
     }
 
+    /// PLAN-009 TASK-013: a server older than `traverse` answers its route
+    /// with a 404; the client says the server is old and how to restart it.
+    #[test]
+    fn traverse_on_an_old_server_says_to_restart_it() {
+        let old =
+            serve_fixed("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: old.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        let q = crate::state::TraverseQuery {
+            symbol: Some("f".into()),
+            ..Default::default()
+        };
+        let e = backend.traverse(&q).unwrap_err();
+        assert!(e.contains("predates traverse"), "{e}");
+        assert!(e.contains("devctx serve --stop"), "{e}");
+        // Any other failure is passed through.
+        assert_eq!(super::traverse_unsupported("boom".into()), "boom");
+    }
+
     #[test]
     fn a_plain_503_is_a_final_answer() {
         let plain = serve_fixed(PLAIN_503);
@@ -1139,6 +1177,23 @@ mod tests {
         // 30 s request deadline. A few seconds of slack for a loaded machine.
         assert!(CONNECT_TIMEOUT <= Duration::from_secs(2));
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+}
+
+/// What a routed `traverse` says when the server answered 404: it predates
+/// the tool (the route does not exist), so the agent learns how to get one
+/// that has it rather than "status 404".
+pub const TRAVERSE_OLD_SERVER: &str =
+    "the running devctx serve predates traverse (it has no POST /traverse): restart it with \
+     devctx serve --stop, and the next call starts the installed binary";
+
+/// [`TRAVERSE_OLD_SERVER`] for a 404 (or 405) of `POST /traverse`; any
+/// other error as it came.
+pub fn traverse_unsupported(err: String) -> String {
+    if err.contains("status 404") || err.contains("status 405") {
+        TRAVERSE_OLD_SERVER.to_string()
+    } else {
+        err
     }
 }
 

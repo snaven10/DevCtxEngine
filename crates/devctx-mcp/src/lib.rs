@@ -1,7 +1,7 @@
 //! `devctx-mcp` — Model Context Protocol server (stdio) exposing DevCtxEngine to agents.
 //!
-//! 23 tools over the indexing pipeline: code (`search`, `read_file`,
-//! `read_symbol`, `get_references`, `impact_analysis`, `summarize`), routes,
+//! 25 tools over the indexing pipeline: code (`search`, `read_file`,
+//! `read_symbol`, `get_references`, `impact_analysis`, `traverse`, `summarize`), routes,
 //! memory, and project/index management. Built on the official `rmcp` SDK.
 //! See `docs/architecture-spec.md` §8 for the process model.
 
@@ -185,6 +185,58 @@ struct ListProjectsReq {
 struct UseProjectReq {
     /// Project name (as reported by list_projects) or a path to its root.
     project: String,
+}
+
+/// Parameters for the `traverse` tool (PLAN-009 TASK-013, DD-16).
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct TraverseReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
+    /// Where to start: a bare name (every definition of it is a root, listed
+    /// in `candidates`), a qualified one (`OrderService.place`), `file::name`,
+    /// or a file path (the file itself: what it imports, what contains it).
+    #[serde(default)]
+    symbol: Option<String>,
+    /// Start from exactly this definition: the `sym` (hex) a node, a
+    /// candidate or another tool gave. Instead of `symbol`.
+    #[serde(default)]
+    sym: Option<String>,
+    /// Relations to follow, comma-separated, or `"all"`: `calls`,
+    /// `instantiates`, `imports`, `inherits`, `implements`, `contains`,
+    /// `references` (default `"calls"`).
+    #[serde(default)]
+    kinds: Option<String>,
+    /// `"out"` (default: callees, imported, supertypes, members, used types),
+    /// `"in"` (callers, importers, subtypes, container, users) or `"both"`.
+    #[serde(default)]
+    direction: Option<String>,
+    /// Levels, 1 (default) to 4; more is refused.
+    #[serde(default)]
+    depth: Option<usize>,
+    /// Lowest confidence of the edge that reaches a node: `"high"`,
+    /// `"medium"` (default) or `"low"`; what it leaves out is counted in
+    /// `below_confidence` and not walked.
+    #[serde(default)]
+    min_confidence: Option<String>,
+    /// List symbols of test files (default false: counted in `excluded.tests`).
+    #[serde(default)]
+    include_tests: Option<bool>,
+    /// List external (library) destinations (default false: counted in
+    /// `excluded.external`); never walked.
+    #[serde(default)]
+    include_external: Option<bool>,
+    /// With `calls`: follow dispatch through interfaces, abstract classes and
+    /// traits (default true), as `via: "dispatch"`, never `high`.
+    #[serde(default)]
+    dispatch: Option<bool>,
+    /// Nodes per page (default 50).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip this many nodes: the `next_offset` of the previous page.
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 /// Parameters for the `impact_analysis` tool.
@@ -1235,6 +1287,57 @@ impl DevctxServer {
             dispatch: req.dispatch,
         };
         run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3), &q))
+            .await
+            .map(|out| Self::annotate(out, resolved))
+    }
+
+    /// Walk the symbol graph from a symbol, along the relations asked.
+    #[tool(
+        description = "Traverse the symbol graph from a symbol (multi-hop), along the relations \
+        you pick: `kinds` among calls, instantiates, imports, inherits, implements, contains, \
+        references (default calls), `direction` in/out/both (default out), `depth` 1-4 (default \
+        1). Use it to explore structure the other tools do not answer: what a class contains, \
+        its hierarchy, who imports or references a type, a chain of calls hop by hop. Use \
+        impact_analysis for the blast radius of a change (transitive callers and callees, \
+        capped per direction), and get_references for the call sites (file and line) of one \
+        symbol. Examples: callers and their callers {symbol: \"OrderService.place\", kinds: \
+        \"calls\", direction: \"in\", depth: 2}; where a type is built {symbol: \"Invoice\", \
+        kinds: \"instantiates\", direction: \"in\"}; what a file imports {symbol: \
+        \"src/api/client.ts\", kinds: \"imports\"}, who imports a type (direction in); \
+        subclasses {symbol: \"BaseRepo\", kinds: \"inherits\", direction: \"in\"}; \
+        implementations {symbol: \"PaymentGateway\", kinds: \"implements\", direction: \"in\"}; \
+        members {symbol: \"OrderService\", kinds: \"contains\"}; uses of a type {symbol: \
+        \"OrderDto\", kinds: \"references\", direction: \"in\"}. Returns JSON {root, \
+        candidates? (an ambiguous name: walked from all, pass `sym` to pick one), nodes \
+        [{sym, symbol, kind, file, line, depth, confidence, via}], edges [{from, to, kind, \
+        confidence, line}] (from/to are `sym`s), total, next_offset?, omitted?}. Defaults as \
+        impact_analysis: high/medium edges, no tests, no library destinations, all counted when \
+        left out; with calls, dispatch through interfaces as `via: \"dispatch\"`. A hub (a DTO \
+        used in hundreds of files) is paged: `limit` (50) and `offset`; once a page is full no \
+        deeper level is read (`partial`). Needs an index made by 0.10 (else: devctx index --full)."
+    )]
+    async fn traverse(
+        &self,
+        Parameters(req): Parameters<TraverseReq>,
+    ) -> Result<String, ErrorData> {
+        let q = state::TraverseQuery {
+            symbol: req.symbol,
+            sym: req.sym,
+            kinds: req.kinds,
+            direction: req.direction,
+            depth: req.depth,
+            min_confidence: req.min_confidence,
+            include_tests: req.include_tests,
+            include_external: req.include_external,
+            dispatch: req.dispatch,
+            limit: req.limit,
+            offset: req.offset,
+        };
+        // A bad parameter is the caller's, said before a server is reached.
+        q.options()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        run_blocking(move || backend.traverse(&q))
             .await
             .map(|out| Self::annotate(out, resolved))
     }

@@ -1211,6 +1211,12 @@ impl Remote {
         Ok(impact_answer(self.get(&path)?, q))
     }
 
+    /// `POST /traverse`; a server older than the tool (404) is told as such.
+    pub fn traverse(&self, q: &devctx_mcp::state::TraverseQuery) -> Result<String> {
+        self.post("/traverse", serde_json::to_value(q)?)
+            .map_err(|e| anyhow::anyhow!(devctx_mcp::backend::traverse_unsupported(e.to_string())))
+    }
+
     pub fn backfill_links(&self, dry_run: bool, from_text: bool) -> Result<String> {
         self.post(
             "/memories/backfill-links",

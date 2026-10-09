@@ -808,3 +808,20 @@ fn lists_the_memory_protocol_prompt() {
         "expected the memory-protocol prompt, got: {names:?}"
     );
 }
+
+/// PLAN-009 TASK-013: `traverse` is a tool of the MCP, and a depth over 4 is
+/// refused with its message before any server is reached.
+#[test]
+fn traverse_refuses_a_depth_over_four() {
+    let tmp = Tmp::new("traverse_depth");
+    let home = tmp.home();
+    let repo = tmp.repo("proj");
+    devctx(&home, &repo, &["projects", "add", ".", "--init"]);
+    let message = call_tool_error(
+        &home,
+        &repo,
+        "traverse",
+        serde_json::json!({ "symbol": "f", "depth": 9 }),
+    );
+    assert!(message.contains("between 1 and 4"), "{message}");
+}
