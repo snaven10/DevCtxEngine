@@ -16,7 +16,8 @@
 //! callers of a method an implementation overrides, the implementations of
 //! an interface method) has `via: "dispatch"`, never `high`, and `through`
 //! (the method it went through); the methods past the dispatch cap of a node
-//! are counted in `omitted_by_limit.dispatch`;
+//! are counted in `omitted_by_limit.dispatch` only (not in its `count`
+//! nor in `omitted`, which count nodes);
 //! for a name with no definition here, `read_symbol`'s `external` +
 //! `called_from` + `next_step` (its upstream is the callers of its external
 //! call sites) or `suggestions`.
@@ -306,9 +307,11 @@ fn answer(
                 "hint": EXCLUDED_HINT,
             });
         }
+        // The dispatch cap counts methods, not nodes: only in its own field
+        // (review of TASK-017, deviation 6), never in `count` nor `omitted`.
         let dispatch = u.dispatch_capped + d.dispatch_capped;
-        by_limit = u.capped + d.capped + dispatch;
-        if by_limit > 0 {
+        by_limit = u.capped + d.capped;
+        if by_limit + dispatch > 0 {
             // The hint of what cut: `max_nodes`, or only the dispatch cap.
             let hint = if u.capped + d.capped > 0 {
                 CAPPED_HINT
@@ -1016,7 +1019,9 @@ mod tests {
 
     /// TASK-017 (c) through the tool: a base class with more subclasses than
     /// a node is expanded into lists the cap and counts the rest in
-    /// `omitted_by_limit.dispatch`, which `omitted.count` adds.
+    /// `omitted_by_limit.dispatch`, and only there (review of TASK-017,
+    /// deviation 6): `omitted_by_limit.count` and `omitted.count` keep
+    /// counting nodes `max_nodes` and the budget cut.
     #[test]
     fn the_dispatch_cap_is_counted_in_omitted_by_limit() {
         let mut py = String::from("class Base:\n    def run(self):\n        pass\n");
@@ -1034,7 +1039,7 @@ mod tests {
             v["omitted_by_limit"]["dispatch"]["max_per_node"], cap,
             "{v}"
         );
-        assert_eq!(v["omitted_by_limit"]["count"], 20 - cap, "{v}");
+        assert_eq!(v["omitted_by_limit"]["count"], 0, "{v}");
         assert!(v["omitted_by_limit"].get("downstream").is_none(), "{v}");
         assert!(
             v["omitted_by_limit"]["hint"]
@@ -1043,7 +1048,7 @@ mod tests {
                 .contains("dispatch: false"),
             "{v}"
         );
-        assert_eq!(v["omitted"]["count"], 20 - cap, "{v}");
+        assert!(v.get("omitted").is_none(), "{v}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
