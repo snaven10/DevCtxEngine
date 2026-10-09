@@ -149,12 +149,15 @@ se recorre:
 
 | Parámetro (flag del CLI) | Default | Afuera por defecto, contado en |
 |---|---|---|
-| `min_confidence` (`--min-confidence`) | `medium` | llamadas de confianza `low` y las que el índice no pudo decidir → `below_confidence: {count, min_confidence, hint}`; con `low` se listan, las no decididas marcadas |
+| `min_confidence` (`--min-confidence`) | `medium` | llamadas de confianza `low`, y llamadas al nombre que el índice no pudo decidir (`svc.update()` con un receptor sin tipo) → `below_confidence: {count, min_confidence, hint}`; con `low` se listan, sus llamadores marcados `undecided` y sin recorrerlos |
 | `include_tests` (`--include-tests`) | `false` | símbolos de archivos de test → `excluded.tests` |
 | `include_external` (`--include-external`) | `false` | llamados de librerías → `excluded.external` |
 | `max_nodes` (`--max-nodes`) | `200` por dirección (`0` = sin tope) | los símbolos de la profundidad que lo desborda → `omitted: {count, reason: "limit"}` y `omitted_by_limit: {count, max_nodes, upstream/downstream: {count, depth}}`; no se lee ningún nivel más profundo |
 
 Por HTTP: `GET /impact/<símbolo>?depth=3&min_confidence=low&include_tests=true&max_nodes=500`.
+La respuesta dice en `filters` qué filtros aplicó. Un nombre pelado significa las
+definiciones del repositorio con ese nombre (como en `get_references`), no toda
+llamada escrita con ese nombre.
 Los campos de 0.9 conservan su significado: `resolved_symbols` (un nombre pelado
 que representaba varias declaraciones), `branch_fallback`, `warning`, y `omitted`
 / `omitted_for_budget` (la mitad del presupuesto de salida por dirección;

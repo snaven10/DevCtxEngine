@@ -143,12 +143,15 @@ walked:
 
 | Parameter (CLI flag) | Default | Left out by default, counted in |
 |---|---|---|
-| `min_confidence` (`--min-confidence`) | `medium` | calls of `low` confidence and calls the index could not decide → `below_confidence: {count, min_confidence, hint}`; `low` lists them, the undecided ones marked |
+| `min_confidence` (`--min-confidence`) | `medium` | calls of `low` confidence, and calls to the name the index could not decide (`svc.update()` on an untyped receiver) → `below_confidence: {count, min_confidence, hint}`; `low` lists them, their callers marked `undecided` and not walked |
 | `include_tests` (`--include-tests`) | `false` | symbols of test files → `excluded.tests` |
 | `include_external` (`--include-external`) | `false` | library callees → `excluded.external` |
 | `max_nodes` (`--max-nodes`) | `200` per direction (`0` = no cap) | the symbols of the depth that overflows it → `omitted: {count, reason: "limit"}` and `omitted_by_limit: {count, max_nodes, upstream/downstream: {count, depth}}`; no deeper level is read |
 
 Over HTTP: `GET /impact/<symbol>?depth=3&min_confidence=low&include_tests=true&max_nodes=500`.
+The answer says which filters it applied in `filters`. A bare name means the
+repository's definitions of it (as in `get_references`), not every call written
+with that name.
 The fields of 0.9 keep their meaning: `resolved_symbols` (a bare name that stood
 for several declarations), `branch_fallback`, `warning`, and `omitted` /
 `omitted_for_budget` (half the output budget per direction; `omitted.count`

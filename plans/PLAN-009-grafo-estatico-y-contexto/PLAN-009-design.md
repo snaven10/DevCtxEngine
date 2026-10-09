@@ -782,8 +782,8 @@ después del resto. Se agregan `kind`, `qualified`, `via`, `below_confidence`.
 `Reader` de TASK-008). `Store::impact_analysis` (0.9.0 sobre `graph_edges`) queda como camino
 viejo, sin filtros ni tope, para que una rama vieja conteste igual que 0.9.0 más el `warning`.
 - Aristas seguidas: `calls` e `instantiates` (el default de `get_references`), siempre por
-  `live_edges`. La frontera va como lista literal de ids en `IN (…)` (una sentencia por nivel):
-  se midió contra tabla temporal y contra un parámetro `UBIGINT[]` (ver Resultado de TASK-009).
+  `live_edges`. Una sentencia por nivel; la frontera va como lista `IN (…)` hasta 1 024 ids y como
+  un parámetro `UBIGINT[]` por encima (revisión, abajo; números en el Resultado de TASK-009).
 - Un nodo que un filtro deja afuera (confianza, test, externo) no se recorre; se cuenta una vez
   por nodo (`below_confidence`, `excluded: {tests, external}`), y si un nivel posterior lo
   alcanza con una arista mejor, se muestra y deja de contarse. `confidence` y `via` son los de la
@@ -803,7 +803,16 @@ viejo, sin filtros ni tope, para que una rama vieja conteste igual que 0.9.0 má
   `get_references`.
 - La semilla que es el nombre pedido tal cual (`qualified` igual) no se reporta aunque se
   alcance por un ciclo; cualquier otra semilla sí (el par `Resource.m → Service.m`), como 0.9.0.
-- La TUI local usa el mismo criterio de camino (vigente y con filas → grafo nuevo con defaults).
+- La TUI local da la respuesta de la tool (`impact_at`): mismo lector, misma rama.
+- **Revisión de TASK-009:** las llamadas **sin decidir** al nombre cuentan en upstream (por
+  defecto en `below_confidence`, con `count_undecided_references`; con `low`, sus llamadores en el
+  primer nivel, `undecided`, sin recorrerlos; nunca con `archivo::nombre`); con un nombre
+  calificado toda semilla es el nombre pedido; `resolved_symbols` se compara con el nombre sin
+  archivo; la respuesta trae `filters` (lo aplicado) para que un cliente sepa si un servidor viejo
+  los ignoró. **Frontera:** lista `IN` hasta 1 024 ids y un parámetro `UBIGINT[]` por encima
+  (`FrontierSql::Auto`), medido en backend-a (Resultado de TASK-009): el `IN` gana en recorridos
+  reales y el parámetro desde 2 000 ids; la lista tipada y la tabla temporal pierden. Los ganchos
+  de medición quedan detrás del feature `bench`.
 
 ## DD-12 — PageRank: global al indexar, personalizado al consultar
 

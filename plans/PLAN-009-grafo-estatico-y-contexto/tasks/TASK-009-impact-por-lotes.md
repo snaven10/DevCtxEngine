@@ -48,15 +48,17 @@ y que por defecto excluya tests y externos sin esconder que existen. Implementa 
 - [x] **Paso 3 — salida.** Por nodo: `symbol`, `sym`, `file`, `line`, `depth`, `confidence`, `via`;
       `test`/`external` solo cuando son `true`. `resolved_symbols` y `branch_fallback` como hoy.
 - [x] **Paso 4 — parámetros** en MCP/API/CLI con defaults de DD-11 (Q-2 del master).
-- [x] **Paso 5 — medir** (backend-b y DevCtxEngine; backend-a pendiente de OK, ver Resultado) p50/p95 de `get`, `map`, `actualizar`, `OfficeService.actualizar` en
+- [x] **Paso 5 — medir** (backend-b y DevCtxEngine; backend-a tras la revisión, ver Resultado) p50/p95 de `get`, `map`, `actualizar`, `OfficeService.actualizar` en
       backend-a (serve caliente) con el arnés.
 
 ## Criterios de aceptación
 
 - [x] Tests (a)-(d) verdes; tests existentes de `impact` (`graph.rs` tests, `state.rs` tests) verdes
       o adaptados solo en lo aditivo.
-- [ ] backend-a: `impact("get")` y `impact("map")` p95 ≤ 300 ms. **Pendiente** (sin OK para
-      indexar backend-a); en backend-b y DevCtxEngine p95 ≤ 68 ms en todos los casos.
+- [x] backend-a: `impact("get")` y `impact("map")` p95 ≤ 300 ms. Medido tras la revisión (copia
+      nueva, con OK del usuario): peor ronda `get` 48,8 ms y `map` 135,8 ms con todas las formas
+      de frontera corriendo al lado; 24,5 y 57,1 ms con el código final solo; contra 4 165 y
+      5 724 ms del camino viejo. Ver "Revisión".
 - [x] La salida JSON de 0.9.0 sigue siendo un subconjunto de la nueva (campos viejos con el mismo
       significado).
 
@@ -70,11 +72,10 @@ y que por defecto excluya tests y externos sin esconder que existen. Implementa 
 ## Resultado
 
 <!-- Contrato: PLAN-009 §11 -->
-- **Estado final:** `done`, con el p95 de backend-a **pendiente**: indexar la copia completa de
-  backend-a necesita el OK del usuario, que no llegó durante la task (ajuste de alcance del
-  orquestador). Se desarrolló y midió con backend-b y DevCtxEngine; no se copió ni indexó
-  backend-a, y la base de backend-a que dejó TASK-005 en su sandbox no se abrió (schema y
-  `LINK_VERSION` viejos).
+- **Estado final:** `done`. El p95 de backend-a quedó pendiente en la primera entrega (el OK del
+  usuario para indexar la copia completa llegó después) y se midió con la revisión: ver
+  "Revisión". La base de backend-a que dejó TASK-005 en su sandbox no se usó (schema y
+  `LINK_VERSION` viejos); se hizo una copia nueva de solo lectura.
 - **Resumen:** en una rama con grafo de símbolos vigente, `impact_analysis` recorre `live_edges`
   **por id y por niveles**: una consulta por profundidad y dirección, sea cual sea el tamaño de la
   frontera; el tope (`max_nodes`, 200 por dirección) se aplica antes de leer el nivel siguiente;
@@ -153,7 +154,8 @@ y que por defecto excluya tests y externos sin esconder que existen. Implementa 
   | backend-b, defaults | 12,9-23,4 | 20,4-28,4 | 25,4-41,9 |
   | backend-b, sin filtros ni tope | 17,7-28,5 | 22,2-30,4 | 31,0-44,5 |
 
-  Se eligió **`IN` literal** (ids enteros escritos en la sentencia: nada que escapar; una sentencia
+  (Primera entrega; **la revisión lo cambió**: `IN` hasta 1 024 ids y `UBIGINT[]` por encima,
+  medido en backend-a con fronteras de miles, ver "Revisión".) Se eligió **`IN` literal** (ids enteros escritos en la sentencia: nada que escapar; una sentencia
   por nivel): es el más rápido o empata en todos los casos; la tabla temporal es la más lenta
   (vaciar + appender + join: tres sentencias por nivel) en todos. Las tres quedan en
   `FrontierSql` (oculto) para volver a medir con fronteras de miles en backend-a.
@@ -256,3 +258,89 @@ y que por defecto excluya tests y externos sin esconder que existen. Implementa 
   llama a la implementación por la interfaz ni al revés (candidato para `traverse`, TASK-013).
   (4) El cambio de defaults cambia lo que ve un agente: está en la descripción de la tool, el
   CHANGELOG y las docs.
+- **Revisión (REQUEST CHANGES menor, sin BLOCKER), resuelta en commits encima de 453d69b:**
+  - *M1 (llamadas sin decidir al nombre):* en upstream, las llamadas al nombre que el link pass
+    dejó sin decidir (`svc.update()` con receptor sin tipo; 0.9.0 las listaba) se cuentan en
+    `below_confidence` por defecto (`count_undecided_references`, la misma regla que
+    `get_references`: escritas como el nombre o terminadas en `.nombre`) y con
+    `min_confidence: "low"` se listan sus llamadores en el primer nivel, `undecided: true`, sin
+    recorrerlos; nunca con `archivo::nombre`. Tests `undecided_calls_to_the_name_are_counted_or_listed_upstream`
+    (store) y `an_undecided_call_to_the_name_is_counted_or_listed` (tool, el `s.flush()` del
+    fixture). El del store **fallaba antes** (`below_confidence` 0); el de la tool, por mutación.
+  - *m4:* con un nombre calificado toda semilla es el nombre pedido: `Inner.m` contra
+    `Outer.Inner.m` en una recursión mutua ya no es su propio llamador
+    (`a_qualified_name_is_never_its_own_caller`, **fallaba antes**).
+  - *m6:* `resolved_symbols` se compara con el nombre sin archivo y con `::` plegado
+    (`py/app/svc.py::helper` y `Thing::new` no lo emiten; un nombre pelado sí):
+    `a_file_qualified_name_is_no_expansion`, verificado por mutación.
+  - *m1/m2:* la respuesta del grafo de símbolos trae **`filters`** (los filtros aplicados); el
+    aviso de filtros no aplicados mira su ausencia, así que avisa también con listas vacías (m2),
+    y `devctx impact` contra un serve remoto lo aplica (m1). Tests
+    `an_impact_without_confidence_says_the_filters_were_not_applied` (backend) y
+    `an_impact_with_unapplied_filters_says_so` (CLI), verificados por mutación.
+  - *m3 (frontera):* `FrontierSql::Auto` (el default) usa lista `IN` hasta 1 024 ids y un solo
+    parámetro `UBIGINT[]` por encima. Con números en backend-a (abajo); test
+    `every_frontier_form_reads_the_same_wide_frontier_of_huge_ids` (1 500 ids, todos por encima de
+    `i64::MAX`; las cinco formas leen las mismas filas). No hay un test que falle antes: es una
+    elección de rendimiento, y el test fija que no cambia la respuesta.
+  - *m5:* el criterio de backend-a quedó marcado recién con su medición.
+  - *NITs:* el doc comment de Fixup H vuelve a su test; la TUI local da la respuesta de la tool
+    (`impact_at`, mismo lector y rama), sin duplicar `Reader::of`; `FrontierSql`,
+    `impact_graph_bench`, `impact_level_bench` e `impact_top_called` quedan detrás del feature
+    `bench` de `devctx-store` (lo activa solo la dev-dependency del arnés); el CHANGELOG separa
+    las dos causas de la mejora (batching contra semántica); el test del subconjunto 0.9.0 ⊂
+    nuevo mira también downstream.
+  - *Fuera de alcance, no hecho:* el dispatch por interfaz (TASK-017).
+  - *Públicos tras la revisión:* `FrontierSql`, `Store::{impact_graph_bench, impact_level_bench,
+    impact_top_called}` solo con el feature `bench`; `Direction`, `LevelRow` e `impact_level` ya
+    no son públicos; `ImpactSide` agrega `widest`, `ImpactNode` agrega `unsure`, y la respuesta
+    JSON agrega `filters`. `devctx-tui` depende de `devctx-mcp` (y ya no de `devctx-index`).
+  - **Mediciones en backend-a** (copia nueva de solo lectura, 1 250 archivos Java, `find` sin
+    `.devctx` antes del índice; índice con el embedder sin modelo en 182 s; binario `--release`;
+    40 corridas por caso, dos rondas; carga 6-9). p50 / p95 en ms, peor ronda:
+
+    | Caso | tool (defaults), con las 5 formas al lado | tool, código final solo | camino viejo (0.9.0) |
+    |---|---|---|---|
+    | `get` (1 definición sin llamadores; 370 llamadas sin decidir contadas) | 42,1 / 48,8 | 21,1 / 24,5 | 3 875 / 4 165 (1 855 nodos) |
+    | `map` (3 definiciones; 18 nodos, 906 sin decidir contadas) | 121,5 / 135,8 | 48,6 / 57,1 | 5 370 / 5 724 (2 571) |
+    | método de actualización pelado (21 definiciones, 202 nodos) | 119,1 / 135,3 | 55,7 / 74,8 | 507 / 568 (232) |
+    | el de un servicio, calificado (el `OfficeService.actualizar` del plan; 17 nodos) | 101,0 / 116,2 | 50,2 / 64,7 | 86 / 112 (41) |
+    | un `emit` muy llamado (234 nodos, 23 por presupuesto) | 135,5 / 161,8 | 71,8 / 93,7 | 1 303 / 1 492 (607) |
+    | `toJson` (200 + 27 por tope) | 127,7 / 141,3 | 65,0 / 79,3 | 760 / 845 (357) |
+
+    **Criterio p95 ≤ 300 ms en `get`/`map`: cumplido** (peor p95 de todos los casos 161,8 ms).
+    El 0.9.0 era lento por consultar una vez por nodo y porque un nombre pelado mezclaba toda
+    llamada escrita así (`get` 1 855 nodos); el grafo nuevo usa las definiciones del repo, cuenta
+    lo sin decidir y lo filtrado.
+
+    **Frontera** (p50 / p95, peor ronda). Recorridos reales sin filtros ni tope a profundidad 6
+    (la frontera más ancha que alcanza un recorrido real en backend-a: 373 ids):
+
+    | | `IN` | `IN` tipado | `UBIGINT[]` | tabla temporal |
+    |---|---|---|---|---|
+    | `emit` (1 084 nodos, frontera 373) | 277 / 319 | 290 / 318 | 316 / 351 | 406 / 478 |
+    | `toJson` (741, 270) | 195 / 217 | 205 / 229 | 184 / 203 | 297 / 330 |
+    | método de actualización (435, 94) | 199 / 260 | 192 / 204 | 221 / 267 | 294 / 334 |
+    | `get` con defaults (frontera 1) | 30 / 37 | 29 / 35 | 42 / 51 | 46 / 51 |
+
+    Una consulta de nivel sobre fronteras sintéticas (ids de la rama en orden; en 20 000, 8 553
+    por encima de `i64::MAX`), upstream / downstream, p95:
+
+    | ids | `IN` | `IN` tipado | `UBIGINT[]` | tabla temporal |
+    |---|---|---|---|---|
+    | 1 000 | 36 / 39 | 44 / 52 | 24 / 30 | 60 / 66 |
+    | 2 000 | 43 / 57 | 63 / 77 | 28 / 42 | 75 / 78 |
+    | 5 000 | 74 / 104 | 126 / 148 | 42 / 66 | 94 / 96 |
+    | 10 000 | 133 / 178 | 227 / 277 | 53 / 103 | 94 / 127 |
+    | 20 000 | 229 / 305 | 461 / 488 | 86 / 151 | 101 / 181 |
+
+    Elección: **`IN` hasta 1 024 ids, `UBIGINT[]` por encima** (`Auto`). En recorridos reales
+    (fronteras ≤ 373) el `IN` gana por 10-40 ms por recorrido. Desde 2 000 ids el parámetro es de
+    1,5 a 3 veces más rápido y no crece la sentencia. La lista tipada (`id::UBIGINT`, para evitar
+    el `HUGEINT`) es la más lenta en todas las anchuras, así que no se usa. La tabla temporal pierde
+    siempre. Entre 400 y 1 024 ids no hay recorridos reales para comparar: la consulta sintética
+    favorece al parámetro (24 contra 36 ms en 1 000), así que el umbral es conservador y queda
+    en una constante (`AUTO_IN_MAX`).
+  - Gate completo antes de cada commit de código (`fmt --check`, `clippy -D warnings` con y sin
+    `--features gpu`, `cargo test --workspace --locked`): 1049, 1051 y 1052 pasan, 0 fallan.
+

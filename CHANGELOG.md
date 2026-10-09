@@ -244,20 +244,31 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   the code of every definition of an identifier in one query.
 - **`impact_analysis` walks the symbol graph by levels** (PLAN-009 TASK-009):
   one query per depth and direction over ids (through `live_edges`: a discarded
-  call reaches no answer), whatever the size of the frontier — measured on this
-  repository, a bare `new` went from 1.4 s to 57 ms p50. **New defaults** (the
-  answer an agent sees changes): only `high`/`medium` calls are followed, symbols
-  of test files and library callees are left out, and 200 symbols per direction
-  are listed; what that leaves out is counted (`below_confidence`, `excluded`,
-  `omitted` + `omitted_by_limit`) and not walked, and `min_confidence`,
-  `include_tests`, `include_external` and `max_nodes` (tool, `GET /impact`
-  query, `devctx impact` flags) change it. Each symbol adds `confidence`, `via`,
-  `sym`, `file`, `line` and `test`/`external`/`undecided` when true, ordered
-  within a depth by confidence, rank and name. A name with no definition answers
-  `external` + `called_from` (its upstream is the callers of its call sites) or
-  `suggestions`, as `read_symbol` does. The 0.9 fields keep their meaning; an
-  index from an older extractor, or without symbol rows, walks as 0.9 did and says
-  so in `warning`. The TUI's local view follows the same rule.
+  call reaches no answer), whatever the size of the frontier; the frontier goes
+  as an `IN` list up to 1 024 ids and as one `UBIGINT[]` parameter above.
+  **A bare name means the repository's definitions of it**, as in
+  `get_references` (0.9 merged every call written with that name, libraries'
+  included); a name with no definition stands for its external call sites (its
+  upstream is their callers) and answers `external` + `called_from`, or
+  `suggestions`, as `read_symbol` does. **New defaults** (the answer an agent
+  sees changes): only `high`/`medium` calls are followed, symbols of test files
+  and library callees are left out, and 200 symbols per direction are listed;
+  what that leaves out is counted (`below_confidence` — calls to the name the
+  index could not decide included —, `excluded`, `omitted` +
+  `omitted_by_limit`) and not walked, and `min_confidence`, `include_tests`,
+  `include_external` and `max_nodes` (tool, `GET /impact` query, `devctx
+  impact` flags) change it; `filters` says which applied. Each symbol adds
+  `confidence`, `via`, `sym`, `file`, `line` and `test`/`external`/`undecided`
+  when true, ordered within a depth by confidence, rank and name. Two causes of
+  the speed-up, measured apart on this repository for a bare `new`: 0.9 walked
+  1 853 names, one query per name, in 1.4 s p50; the new walk with every filter
+  and the cap off reaches 547 symbols (the repository's definitions of `new`, by
+  id) in about 50 ms — the batching —, and the defaults list 252 (56 more counted
+  past the cap) in about 57 ms — the meaning of a bare name and the defaults. The
+  0.9 fields keep their meaning; an index from an older extractor, or without
+  symbol rows, walks as 0.9 did and says so in `warning`, and a client that
+  passed filters to a server that ignored them says so too. The TUI's local view
+  gives the tool's answer.
 - **Link rules version 19:** in a Rust `impl Trait for T` with `T` from
   outside the repository, `self.m()` resolves to the `impl`'s own method
   (an override), else to the repository trait's method (a default one
