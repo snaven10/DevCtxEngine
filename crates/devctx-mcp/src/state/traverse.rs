@@ -142,6 +142,8 @@ impl TraverseQuery {
             include_external: self.include_external.unwrap_or(false),
             dispatch: self.dispatch.unwrap_or(true),
             need: offset.saturating_add(limit),
+            // Set from the root's name once it is resolved (`traverse_on`).
+            asked: String::new(),
         })
     }
 }
@@ -307,6 +309,12 @@ pub(super) fn traverse_on(
         // `sym` picks one.
         out["candidates"] = json!(roots.iter().map(symbol_json).collect::<Vec<_>>());
     }
+    // `impact_analysis`'s rule on roots: one a bare name stood for, reached
+    // from another, is listed.
+    let opts = TraverseOptions {
+        asked: bare.trim().replace("::", "."),
+        ..opts
+    };
     let t = if roots.is_empty() {
         Traversal::default()
     } else {
@@ -830,5 +838,100 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Measurement harness (PLAN-009 TASK-013, not a test): indexes
+    /// `$DEVCTX_TRAVERSE_BENCH_REPO` into `$DEVCTX_TRAVERSE_BENCH_STATE` with
+    /// the model-free embedder, then times the tool (each call opens the
+    /// store, as the serve does) at depth 1 and 2 for each line of
+    /// `$DEVCTX_TRAVERSE_BENCH_CASES` (`symbol|kinds|direction`), over
+    /// `$DEVCTX_TRAVERSE_BENCH_RUNS` runs (40) in `$DEVCTX_TRAVERSE_BENCH_ROUNDS`
+    /// interleaved rounds (2): every case and depth once per run, so load
+    /// spreads over all of them. One JSON line per round, case and depth.
+    ///
+    /// `cargo test --release -p devctx-mcp --lib traverse_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn traverse_bench() {
+        use super::super::lookup::tests::Fake;
+        let var = |k: &str| std::env::var(k).ok();
+        let (Some(repo), Some(state_dir), Some(cases)) = (
+            var("DEVCTX_TRAVERSE_BENCH_REPO"),
+            var("DEVCTX_TRAVERSE_BENCH_STATE"),
+            var("DEVCTX_TRAVERSE_BENCH_CASES"),
+        ) else {
+            eprintln!("set DEVCTX_TRAVERSE_BENCH_REPO, _STATE and _CASES");
+            return;
+        };
+        let num = |k: &str, d: usize| var(k).and_then(|r| r.parse().ok()).unwrap_or(d);
+        let runs = num("DEVCTX_TRAVERSE_BENCH_RUNS", 40);
+        let rounds = num("DEVCTX_TRAVERSE_BENCH_ROUNDS", 2);
+        let mut cfg = ProjectConfig::default();
+        cfg.project.path = repo;
+        cfg.state_dir = state_dir;
+        cfg.storage.hnsw = false;
+        let state = AppState::build(cfg).unwrap();
+        let dim = configured_dimension(&state.cfg);
+        *state.embedder.lock().unwrap() = Some(Cached {
+            value: Arc::new(Fake(dim)),
+            last_used: Instant::now(),
+            key: "fake/fake".into(),
+            loaded_at: procmem::unix_now(),
+        });
+        let t = Instant::now();
+        do_index(&state, false).unwrap();
+        eprintln!("index: {:.1} s", t.elapsed().as_secs_f64());
+        let text = std::fs::read_to_string(cases).unwrap();
+        let mut queries: Vec<(String, TraverseQuery)> = Vec::new();
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut f = line.split('|').map(str::trim);
+            let (symbol, kinds, dir) = (f.next().unwrap(), f.next(), f.next());
+            for depth in [1, 2] {
+                queries.push((
+                    format!("{line}|d{depth}"),
+                    TraverseQuery {
+                        symbol: Some(symbol.into()),
+                        kinds: kinds.map(str::to_string),
+                        direction: dir.map(str::to_string),
+                        depth: Some(depth),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+        // Warm the store and the OS cache, and keep each answer's size.
+        let sizes: Vec<Value> = queries
+            .iter()
+            .map(|(_, q)| {
+                let v = run(&state, q);
+                json!({ "total": v["total"], "nodes": v["nodes"].as_array().map(|a| a.len()),
+                        "edges": v["edges"].as_array().map(|a| a.len()),
+                        "partial": v.get("partial").is_some(),
+                        "candidates": v["candidates"].as_array().map(|a| a.len()) })
+            })
+            .collect();
+        for round in 1..=rounds {
+            let mut ms: Vec<Vec<f64>> = vec![Vec::new(); queries.len()];
+            for _ in 0..runs {
+                for (i, (_, q)) in queries.iter().enumerate() {
+                    let t = Instant::now();
+                    do_traverse(&state, q).unwrap();
+                    ms[i].push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            for (i, (label, _)) in queries.iter().enumerate() {
+                let m = &mut ms[i];
+                m.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let pct = |p: f64| m[((m.len() as f64 - 1.0) * p).round() as usize];
+                println!(
+                    "{}",
+                    json!({ "round": round, "case": label, "p50_ms": pct(0.5),
+                            "p95_ms": pct(0.95), "size": sizes[i] })
+                );
+            }
+        }
     }
 }

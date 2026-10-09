@@ -16,7 +16,9 @@
 //! listed node was reached at its depth, one per pair and relation with the
 //! number of occurrences), there is no `max_nodes` but a page — the walk stops
 //! reading deeper levels once it holds more nodes than the page needs
-//! ([`TraverseOptions::need`]) — and the roots are never listed as nodes.
+//! ([`TraverseOptions::need`]) — and the roots follow `impact_analysis`'s
+//! rule: the name asked is never listed, but of the definitions a bare name
+//! stood for, one reached from another is.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -110,6 +112,12 @@ pub struct TraverseOptions {
     /// Nodes the caller will show (`offset + limit`): once the walk holds
     /// more, no deeper level is read. 0 = walk every level.
     pub need: usize,
+    /// The name asked about (dotted), for `impact_analysis`'s rule on roots:
+    /// a root is never listed when it is that name — every root of a
+    /// qualified name, or of a single definition — but one root a bare name
+    /// stood for, reached from another (`Resource.update` →
+    /// `Service.update`), is. Empty: no root is listed.
+    pub asked: String,
 }
 
 impl Default for TraverseOptions {
@@ -123,6 +131,7 @@ impl Default for TraverseOptions {
             include_external: false,
             dispatch: true,
             need: 0,
+            asked: String::new(),
         }
     }
 }
@@ -256,8 +265,17 @@ pub(crate) fn traverse_walk(
         .map(|s| s.id)
         .filter(|&id| walked.insert(id))
         .collect();
-    // The roots are the question, never part of the answer.
-    let mut reported: HashSet<Key> = frontier.iter().map(|&i| Key::Id(i)).collect();
+    // The roots that are the name asked are the question, never part of the
+    // answer; another root a bare name stood for is listed when reached
+    // (walked once, as a root).
+    let asked = opts.asked.as_str();
+    let mut reported: HashSet<Key> = roots
+        .iter()
+        .filter(|s| {
+            roots.len() == 1 || asked.is_empty() || asked.contains('.') || s.qualified == asked
+        })
+        .map(|s| Key::Id(s.id))
+        .collect();
     let (mut below, mut tests, mut external) = (HashSet::new(), HashSet::new(), HashSet::new());
     let (mut cut, mut beyond): (HashSet<Key>, HashSet<Key>) = (HashSet::new(), HashSet::new());
     let mut reach: HashMap<u64, Option<String>> = HashMap::new();
@@ -944,6 +962,31 @@ mod tests {
             .unwrap();
         assert_eq!(names(&t), ["ServiceImpl.update", "Repo.save"]);
         assert_eq!(t.nodes[0].via, DISPATCH_VIA);
+    }
+
+    /// `impact_analysis`'s rule on roots: of the definitions a bare name
+    /// stood for, one reached from another is listed (`A.run` → `B.run`);
+    /// none is when the name was qualified, or a single definition.
+    #[test]
+    fn a_root_reached_from_another_is_listed_for_a_bare_name() {
+        let store = Store::open_in_memory(3).unwrap();
+        let g = graph(
+            &store,
+            &[("A.run", "method", None), ("B.run", "method", None)],
+            &[("A.run", "calls", "B.run", "high", 3)],
+        );
+        let roots = [g["A.run"].clone(), g["B.run"].clone()];
+        let o = |asked: &str| TraverseOptions {
+            asked: asked.into(),
+            ..opts(&["calls"], TraverseDirection::Out, 1)
+        };
+        let t = store.traverse("repo", "main", &roots, &o("run")).unwrap();
+        assert_eq!(names(&t), ["B.run"]);
+        assert_eq!(t.edges[0].from.symbol, "A.run");
+        for asked in ["", "X.run"] {
+            let t = store.traverse("repo", "main", &roots, &o(asked)).unwrap();
+            assert!(t.nodes.is_empty(), "{asked}");
+        }
     }
 
     /// A path names its file's symbol, what `imports` leaves from.
