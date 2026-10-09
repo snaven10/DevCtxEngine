@@ -92,8 +92,9 @@ call from two different files is two edges, and re-indexing does not duplicate.
 
 ### `get_references(symbol)` — who calls this?
 
-Every reference to a symbol across the indexed code — one per occurrence, so two
-calls from the same method are two references. The direct answer to *"is this
+Every call site of a symbol across the indexed code — calls and instantiations
+(`new Foo()`), one per occurrence, so two calls from the same method are two
+references. The direct answer to *"is this
 safe to change?"* at one hop. `symbol` is a bare name (`charge`), a qualified one
 (`Card.charge`, `Card::charge`) or `file::name` (`src/pay.rs::charge`).
 
@@ -103,7 +104,7 @@ On an index made by 0.10 or later, each reference keeps `file`, `line` and
 | Field | Meaning |
 |---|---|
 | `confidence` | `high`, `medium` or `low`: how sure the index is that this occurrence means *this* definition |
-| `via` | The relation: `calls`, `instantiates`, `references` (a type use), `imports`, `inherits`, `implements` |
+| `via` | The relation: `calls` or `instantiates` by default; with `kinds`, also `references` (a type use), `imports`, `inherits`, `implements` |
 | `sym` | The id (16 hex digits) of the definition referenced, when it resolved to one |
 | `external` / `test` / `undecided` | Present (and `true`) only when the occurrence is a library call, sits in a test file, or could not be decided |
 
@@ -114,6 +115,12 @@ are left out and counted in `below_confidence: {count, min_confidence, hint}`,
 never dropped in silence. Pass `min_confidence: "low"` to list them, each marked.
 For a name with no definition in the repository (a library function), the answer
 lists its external call sites.
+
+**`kinds`** adds relations to the default calls and instantiations: any of
+`references` (type uses), `imports`, `inherits`, `implements`, or `all`
+(`GET /references/<symbol>?kinds=references,imports` over HTTP). A server older
+than 0.10 ignores `min_confidence` and `kinds`; the client then says so in
+`warning`.
 
 ### `impact_analysis(symbol)` — blast radius
 
@@ -148,11 +155,13 @@ field, a constant) answers with its signature as `code`.
   (`serde_json::from_str`, `Panache.withTransaction`) is looked up as written and
   then by its last segment, since the graph often holds only the bare callee. An
   external gets no fuzzy `suggestions` (`with_context` is not a typo of
-  `build_context`), only the qualified forms of the same name. On a 0.10 index
+  `build_context`). On a 0.10 index an external answers no `suggestions` at all,
+  as 0.9 did; and on a 0.10 index
   `external` comes from the index's own evidence (a declared dependency, the
   platform), and the last segment is only tried when the repository defines
   nothing by that name: `Foo::new` that does not exist is not "external" because
-  some `new` is called — it gets `suggestions` (`Thing.new`).
+  some `new` is called — it gets `suggestions` (`Thing.new`). A `file::name` that
+  matches nothing in that file is never external either.
 
 Small functions that the chunker grouped into one chunk (`a, b, c`) are found
 inside it, so they are not misreported as external.
@@ -160,7 +169,9 @@ inside it, so they are not misreported as external.
 **An index made before 0.10** (or by another extractor) has no symbol table:
 `read_symbol`, `get_references`, the anchoring of `search` and the web graph view
 answer as 0.9 did, by name over the call graph, and say so in `warning` — reindex
-with `devctx index --full` to get the fields above.
+with `devctx index --full` to get the fields above. `search` in `keyword`/`hybrid`
+says it too: its identifier anchoring went by name. A failed read of the symbol
+table gets its own `warning` (a read error, not a reason to reindex).
 
 ## Which branch it answers from
 

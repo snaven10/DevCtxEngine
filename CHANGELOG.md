@@ -224,23 +224,36 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   `sym` (16 hex digits), `kind` and `qualified`; anchored hits add `sym`;
   references add `confidence`, `via` (the relation) and `sym`, plus `external`,
   `test` and `undecided` when true. `get_references` lists one reference per
-  occurrence (two calls from one method are two) of every relation but
-  `contains`, and takes **`min_confidence`** (`high`, `medium` — default —,
-  `low`): what the default leaves out is counted in `below_confidence`.
+  occurrence (two calls from one method are two) of calls and instantiations,
+  as 0.9.0 listed calls; **`kinds`** adds type uses, imports and
+  inherits/implements (or `all`). It takes **`min_confidence`** (`high`,
+  `medium` — default —, `low`): what the default leaves out is counted in
+  `below_confidence`. A server older than 0.10 ignores both, and the client
+  says so in `warning`.
   `external` comes from the link pass's evidence, and a qualified name falls
   back to its last segment only when the repository defines nothing by that
   name (`Foo::new` that does not exist is no longer external because some
   `new` is called; it gets `suggestions`). The graph view marks a node
   external by that evidence (not "never calls anything") and an edge from a
-  test file `test`. A call the link pass discarded reaches no answer. An index
-  from an older extractor, or a branch with no symbol rows, answers as 0.9.0
-  did and says so in `warning`.
+  test file `test`. A call the link pass discarded reaches no answer. An
+  external answers no `suggestions`, as in 0.9.0, and a `file::name` miss is
+  never external. An index from an older extractor, or a branch with no
+  symbol rows, answers as 0.9.0 did and says so in `warning` (`search`
+  included, whose identifier anchoring then goes by name); a failed read of
+  the symbol table has its own warning, not a reindex hint. Anchoring reads
+  the code of every definition of an identifier in one query.
+- **Link rules version 18:** in a Rust `impl Trait for T` with `T` from
+  outside the repository, `self.m()` resolves to the repository trait's
+  method (a default one included) instead of staying undecided.
 
 ### Fixed
 
 - `file::symbol` subjects (`memories_by_symbol`, `read_symbol`) take the left
   part as a file only with a `/` or a known language extension: `Foo.Bar::baz`
-  is the member `baz` of `Foo.Bar`, no longer the file `Foo.Bar`.
+  is the member `baz` of `Foo.Bar`, no longer the file `Foo.Bar`; an npm scope
+  (`@scope/pkg::fn`) is not a directory.
+- `devctx symbol` without a server answers as the tool does: branch fallback,
+  warnings, and on a miss its suggestions or external call sites.
 
 - A `--full` over several indexed branches no longer copies and rewrites every
   file another branch holds; and a branch made by another embedding setup is no

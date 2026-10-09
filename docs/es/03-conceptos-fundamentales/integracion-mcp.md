@@ -169,7 +169,7 @@ manuales (`kill <pid>` y borrar el archivo).
 | `search` | *¿Dónde está el código sobre X?* Modos: `vector` (default), `keyword` (BM25), `hybrid` (RRF). Filtros: `language`, `kind`, `include_tests`; ver [Búsqueda](busqueda.md) |
 | `read_file` | El archivo, opcionalmente un rango de líneas inclusivo desde 1 |
 | `read_symbol` | La definición de un símbolo, su código, archivo, rango y tipo — cuando sabés el nombre. Si no la encuentra responde con `suggestions` y, para llamadas a librerías, `external: true` |
-| `get_references` | Cada referencia a un símbolo, una por ocurrencia, con `confidence` y `via`; `min_confidence: "low"` agrega las ambiguas (ver [Grafo de símbolos](grafo-de-simbolos.md#get_referencessímbolo--quién-llama-a-esto)) |
+| `get_references` | Cada sitio de llamada de un símbolo, uno por ocurrencia, con `confidence` y `via`; `min_confidence: "low"` agrega las ambiguas, `kinds` otras relaciones (ver [Grafo de símbolos](grafo-de-simbolos.md#get_referencessímbolo--quién-llama-a-esto)) |
 | `impact_analysis` | Llamadores transitivos (radio de impacto) y llamados |
 | `summarize` | Texto reducido a ~`max_tokens`, extractivo por defecto para que sobrevivan los identificadores |
 

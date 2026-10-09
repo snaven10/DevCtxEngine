@@ -113,8 +113,8 @@ DD-19.
     contestan con su firma. `lookup_external` cuenta solo filas `calls`/`instantiates` con
     `external` del link pass cuyo destino es el nombre o termina en `.nombre` (`::` y `.` igual), y
     cae al último segmento solo si ninguna definición de la rama tiene ese nombre (pendiente 2).
-    `lookup_references` lista una fila por ocurrencia de toda relación menos `contains` hacia los
-    ids, o los sitios externos de un nombre sin definición, más las filas sin decidir del mismo
+    `lookup_references` lista una fila por ocurrencia de las relaciones pedidas (por defecto
+    `calls`/`instantiates`, revisión) hacia los ids, o los sitios externos de un nombre sin definición, más las filas sin decidir del mismo
     nombre (para marcarlas). `lookup_graph_view` arma la vista desde `live_edges`.
   - *Search*: `search_anchored(.., AnchorLookup::{Names, Symbols})` devuelve además los chunks
     anclados con su id; sobre el grafo compite **un chunk por definición** por un lugar fijado
@@ -132,7 +132,7 @@ DD-19.
     `below_confidence: {count, min_confidence, hint}`, nunca vacío en silencio. Documentado en la
     descripción de la tool y en `docs/03-core-concepts/symbol-graph.md` (EN) /
     `docs/es/03-conceptos-fundamentales/grafo-de-simbolos.md` (ES).
-- **Números** (sandbox `/var/tmp/devctx-t008-aeJ5`; índices hechos con el pipeline real y un
+- **Números** (sandbox `mktemp -d -p /var/tmp`; índices hechos con el pipeline real y un
   embedder sin modelo —parse, `symbols`/`edges` y link pass reales, vectores constantes— por un arnés
   `#[ignore]` nuevo, `state::lookup::tests::lookup_bench`, binario `--release`; "camino viejo" = el
   mismo índice sellado por otro extractor, o sea los lectores de 0.9.0 sobre las mismas filas; 30
@@ -224,8 +224,8 @@ DD-19.
   2. Las lecturas nuevas son **funciones nuevas** (`lookup_*`) y no un reemplazo en sitio de
      `symbol_definitions`/`resolve_symbol`/…: esas siguen siendo el camino viejo y las usa
      `impact_analysis` (sobre `graph_edges`) hasta TASK-009. DD-10 actualizado.
-  3. `get_references` lista **todas las relaciones menos `contains`** (`calls`, `instantiates`,
-     `references`, `imports`, `inherits`, `implements`) con `via`; antes solo había `calls`.
+  3. ~~`get_references` lista todas las relaciones menos `contains`~~ — **no aceptada en la
+     revisión**: por defecto `calls` e `instantiates` (ver abajo), las demás con `kinds`.
   4. `read_symbol` sigue contestando un entry por chunk (como 0.9.0), con el `limit` sobre
      definiciones; campos e `impl` van después del resto (no solo `(archivo, línea)`).
   5. `split_file_symbol` acepta `archivo::nombre` con `/` o con una extensión de lenguaje conocida
@@ -242,4 +242,78 @@ DD-19.
   `devctx-api` antes que la implementación de `memories_by_symbol` (el 1/8 del anclaje); un juez por
   `rank` (PageRank, TASK-010) es el candidato. (3) No medido sobre frontend entero ni backend-a/b
   (sin OK de reindex), ni macOS/Windows (solo CI). (4) `impact_analysis` y la TUI siguen leyendo
-  `graph_edges` (TASK-009). (5) El sandbox de medición vive en `/var/tmp/devctx-t008-aeJ5`.
+  `graph_edges` (TASK-009). (5) El sandbox de medición es un `mktemp -d` local, fuera del repo.
+- **Revisión (REQUEST CHANGES, sin BLOCKER), resuelta en commits encima de 6199ea4:**
+  - *M1 (contrato vacuo en el camino nuevo):* los asserts de
+    `read_symbol_not_found_suggests_and_marks_external`,
+    `qualified_externals_are_found_and_get_no_noisy_suggestions` y
+    `a_grouped_small_function_is_found_not_external` pasaron, **sin cambiar una línea**, a
+    helpers `check_*` que el test original sigue llamando sobre su índice sembrado (camino viejo) y
+    que tres tests nuevos llaman sobre un índice real (`*_over_the_symbol_graph`, que además
+    verifican que el lector es el grafo de símbolos): clase y método Java, dos aserciones externas
+    con import estático, un typo; Rust con `serde_json`, `tokio` y `anyhow` declarados más Java
+    con Panache; Python con funciones chicas agrupadas y un `get_a` importado de un paquete
+    declarado. Un externo **no lleva `suggestions`**, como 0.9.0 (antes del fix
+    `read_symbol("from_str")` daba `["serde_json::from_str", …]`; el test indexado lo exige para
+    `from_str`, `spawn` y `serde_json::from_str`). El presupuesto de `get_references` es el mismo
+    constructor en los dos caminos: sin paginado (no hay `next_offset`), una referencia que no
+    entra en su parte se queda con `file`/`line` y su `source` se corta marcado, así que `omitted`
+    no aparece — como en 0.9.0 (`references_report_what_the_budget_cut_on_both_paths`).
+  - *M2:* `search` en `keyword`/`hybrid` sobre una rama vieja (o sin filas, o con error de lectura)
+    trae `warning`: su anclaje fue por nombre (`a_search_anchored_by_name_warns`).
+  - *M3:* el anclaje y `read_symbol` leen el código de todas las definiciones en **una** consulta
+    (`Store::code_chunks_of`, `symbols` ⋈ `vectors` por archivo y rango; antes una por definición,
+    hasta ~48 por identificador) y el search elige la rama una sola vez. Medido en la copia de
+    **DevCtxEngine** del sandbox (438 archivos; backend-a no está en el sandbox), embedder sin
+    modelo, binario `--release`, 40 corridas, dos rondas intercaladas antes/después/camino viejo,
+    carga 3-9, 6 consultas (5 de identificador y 1 de comportamiento) por tool:
+
+    | | antes (6199ea4) p50 / p95 máx | después p50 / p95 máx | camino viejo (por nombre) |
+    |---|---|---|---|
+    | `search --hybrid` (media de p50) | 27,0 y 25,2 / 43,2 ms | **23,1 y 22,4 / 32,3 ms** | 17,7 y 19,7 / 34,6 ms |
+    | `build_context` 4096 tokens | 27,6 y 26,8 / 43,7 ms | **26,1 y 25,9 / 34,9 ms** | 20,7 y 20,8 / 32,1 ms |
+
+    Sobre el camino viejo el nuevo cuesta +3 a +5 ms de p50, muy dentro de DD-21 (≤ +150 ms). Una
+    primera medición no intercalada daba 48 → 24 ms, pero la consulta de comportamiento (que no
+    ancla) también bajaba, así que era la carga de la máquina; por eso las rondas intercaladas.
+  - *Desviación 3 no aceptada:* `get_references` lista por defecto `calls` e `instantiates` (la
+    semántica de 0.9.0 era "llamadas"; `new Foo()` llama al constructor de `Foo`). Las demás
+    relaciones van con el parámetro opt-in **`kinds`** (`references`, `imports`, `inherits`,
+    `implements` o `all`; MCP y `GET /references?kinds=`), documentado en la tool y en las docs EN/ES
+    (`references_default_to_calls_and_take_kinds`). DD-10 y CHANGELOG actualizados.
+  - *m1:* la descartada del test se marca además `external` (como haría un lector de `edges`) y
+    sigue sin llegar a nada. `memories_by_symbol("Foo.Bar::baz")` se prueba hasta la parte local
+    de la tool (`symbol_query` + `text_fallback_local`: el miembro `baz` sin archivo, `inference`);
+    la tool entera consulta el daemon central, que un test no debe levantar.
+  - *m2:* un `archivo::nombre` sin resultado nunca es externo (`a_file_qualified_miss_is_never_external`).
+  - *m3:* las filas sin decidir se cuentan con un `count(*)` aparte
+    (`Store::count_undecided_references`) y solo se listan con `low`; el conteo y el listado se
+    restringen al `dst_name` escrito igual que el nombre pedido (un `Left.flush` no cuenta un
+    `flush` pelado).
+  - *m4:* un error al leer `symbols` es `Reader::Legacy(Legacy::Error)` con su propio `warning`
+    ("read error, not a reason to reindex"), no "sin filas, reindexá"
+    (`a_failed_symbol_graph_read_is_not_a_reindex_hint`).
+  - *m5:* `devctx symbol` sin serve usa `state::read_symbol_at`: la misma respuesta que la tool
+    (aviso de grafo ausente, `branch_fallback`, sugerencias y externos en un fallo)
+    (`the_local_cli_answer_is_the_tool_answer`).
+  - *m6 (47b3f3c):* en un `impl Trait for T` con `T` de afuera, `self.m()` se resuelve por el
+    trait del `impl` como supertipo (`RepoIndex::impl_trait_member`; también un método por
+    defecto), `high`, `inherited`; nunca por nombre. `self_in_an_impl_for_an_outside_type_is_no_guess`
+    y su par de Go siguen verdes. **`LINK_VERSION` 18.**
+  - *NIT:* la vista omite `confidence` cuando es null; `Backend::Remote` agrega un `warning` si
+    pidió `min_confidence`/`kinds` y la respuesta no trae `confidence` (servidor o índice
+    anterior); fuera la ruta del sandbox de este Resultado; `@scope/pkg::fn` no es archivo.
+  - *Tests que fallaban antes del fix:* `self_in_an_impl_of_a_repo_trait_reaches_the_trait` (daba
+    `name_only` `low`) se escribió y corrió primero. Los demás se escribieron junto con el fix y se
+    verificaron revirtiéndolo (mutación con `touch`): `qualified_externals_over_the_symbol_graph`
+    (externo con las formas calificadas como sugerencias), `references_default_to_calls_and_take_kinds`
+    (default de todas las relaciones), `a_file_qualified_miss_is_never_external`,
+    `a_failed_symbol_graph_read_is_not_a_reindex_hint`, `a_search_anchored_by_name_warns`,
+    `batched_code_chunks_equal_the_per_symbol_lookup` (filas asignadas al primer símbolo; join
+    sin el archivo), `discarded_calls_reach_no_answer` (externos leídos de `edges`),
+    `a_dotted_type_before_double_colon_is_not_a_file` (`@scope`),
+    `references_show_high_and_medium_unless_asked_for_low` (conteo por último segmento) y
+    `the_local_cli_answer_is_the_tool_answer`. Los helpers `check_*` sobre el índice real pasaron
+    a la primera: el camino nuevo ya cumplía esos asserts salvo las sugerencias de un externo, que
+    los asserts de PLAN-008 no miraban para `from_str`.
+

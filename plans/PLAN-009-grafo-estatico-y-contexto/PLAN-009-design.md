@@ -751,8 +751,14 @@ viejo (DD-19) y `impact_analysis` los sigue usando hasta TASK-009. Toda lectura 
 anclaje fija **un chunk por definición** (`search_anchored` + `AnchorLookup::Symbols`) y marca
 `anchored` por el id del chunk de una definición encontrada (con `sym`); un identificador que el
 grafo no define se sigue buscando por nombre. `get_references` lista una fila por ocurrencia de toda
-relación menos `contains`, con `via`. `split_file_symbol` exige `/` o una extensión de lenguaje
-conocida (no consulta el índice). `read_symbol` sigue con un entry por chunk; campos e `impl` van
+~~relación menos `contains`~~ — **revisión:** por defecto `calls` e `instantiates` (la semántica
+de 0.9.0 era "llamadas", y `new Foo()` llama al constructor de `Foo`), con `via`; las demás
+relaciones (`references`, `imports`, `inherits`, `implements`, o `all`) con el parámetro opt-in
+`kinds`. Un externo no lleva `suggestions` (como 0.9.0) y un `archivo::nombre` sin resultado nunca
+es externo. El anclaje lee el código de todas las definiciones de un identificador en **una**
+consulta (`code_chunks_of`, `symbols` ⋈ `vectors` por archivo y rango) y reusa la elección de rama
+del search. `split_file_symbol` exige `/` (que no empiece con `@`, un scope de npm) o una extensión
+de lenguaje conocida (no consulta el índice). `read_symbol` sigue con un entry por chunk; campos e `impl` van
 después del resto. Se agregan `kind`, `qualified`, `via`, `below_confidence`.
 
 ## DD-11 — `impact_analysis` por lotes, con tope y marcas
@@ -893,7 +899,8 @@ romper.
   (`read_symbol`, `get_references`, `impact_analysis`, anclaje) usan el camino viejo sobre
   `graph_edges`/`vectors` y lo dicen (`extractor_stale` ya está en la respuesta; TASK-008: una rama
   vigente pero sin filas en `symbols` —un repo sin lenguajes parseables— también, con un `warning`
-  propio); las tools nuevas
+  propio; un error al leer `symbols` lleva otro, que no pide reindexar; y `search` en
+  `keyword`/`hybrid` avisa cuando su anclaje fue por nombre); las tools nuevas
   (`traverse`, `repo_map`, `skeleton`) contestan un error con la acción: "corré `devctx index
   --full`". Se borra el camino viejo en el plan siguiente, junto con `graph_edges`.
 - **Downgrade** a 0.9.0: las tablas nuevas quedan huérfanas e inocuas; `graph_edges` está al día
