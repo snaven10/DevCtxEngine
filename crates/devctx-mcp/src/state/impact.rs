@@ -90,7 +90,7 @@ const BELOW_CONFIDENCE_HINT: &str =
      walked (counted: symbols); pass min_confidence: \"low\" to include them, marked";
 
 /// The line the answer adds when calls to the name were left undecided.
-const UNDECIDED_CALLS_HINT: &str =
+pub(super) const UNDECIDED_CALLS_HINT: &str =
     "calls written with this name whose receiver the index could not type, so they may or \
      may not reach it (counted: calls, not from tests nor from callers already listed); pass \
      min_confidence: \"low\" to list their callers, marked undecided and not walked";

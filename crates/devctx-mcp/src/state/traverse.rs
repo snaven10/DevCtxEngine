@@ -144,6 +144,7 @@ impl TraverseQuery {
             need: offset.saturating_add(limit),
             // Set from the root's name once it is resolved (`traverse_on`).
             asked: String::new(),
+            by_name: false,
         })
     }
 }
@@ -249,6 +250,9 @@ fn edge_json(e: &TraverseEdge) -> Value {
     if let Some(l) = e.line {
         v["line"] = json!(l);
     }
+    if e.undecided {
+        v["undecided"] = json!(true);
+    }
     if e.occurrences > 1 {
         v["occurrences"] = json!(e.occurrences);
     }
@@ -311,8 +315,11 @@ pub(super) fn traverse_on(
     }
     // `impact_analysis`'s rule on roots: one a bare name stood for, reached
     // from another, is listed.
+    // A name with no file also stands for the calls to it the index could
+    // not decide (review MAJOR 1); a `sym` or a `file::name` never does.
     let opts = TraverseOptions {
         asked: bare.trim().replace("::", "."),
+        by_name: q.sym.as_deref().is_none_or(|s| s.trim().is_empty()) && file.is_none(),
         ..opts
     };
     let t = if roots.is_empty() {
@@ -381,6 +388,12 @@ pub(super) fn traverse_on(
             out["dispatch"] = note;
         }
     }
+    if t.undecided_calls > 0 {
+        out["undecided_calls"] = json!({
+            "count": t.undecided_calls,
+            "hint": super::impact::UNDECIDED_CALLS_HINT,
+        });
+    }
     if t.below_confidence > 0 {
         out["below_confidence"] = json!({
             "count": t.below_confidence,
@@ -417,7 +430,7 @@ pub(super) fn traverse_on(
 
 #[cfg(test)]
 mod tests {
-    use super::super::lookup::tests::indexed_files;
+    use super::super::lookup::tests::{indexed, indexed_files};
     use super::super::*;
     use super::TraverseQuery;
 
@@ -652,6 +665,62 @@ mod tests {
                 .any(|s| s == "update" || s == "ServiceImpl.update" || s == "IService.update"),
             "{v}"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review of TASK-013, MAJOR 1: calls to the name the index could not
+    /// decide (`s.flush()` on an untyped receiver, two `flush` in the repo)
+    /// are counted by default in `undecided_calls`, and with `low` their
+    /// callers are listed at depth 1, `undecided: true`, never walked — as
+    /// `impact_analysis` does. Not with `file::name`, nor with `sym`, nor
+    /// `out`, nor without `calls`.
+    #[test]
+    fn undecided_calls_to_the_name_are_counted_or_listed() {
+        let (state, repo) = indexed("traverse_undecided", &[]);
+        let v = run(&state, &q("flush", "calls", "in", 2));
+        assert!(!syms(&v).contains(&"Repo.walk".to_string()), "{v}");
+        assert!(v["undecided_calls"]["count"].as_u64().unwrap() >= 1, "{v}");
+        assert!(v["undecided_calls"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("min_confidence"));
+        let low = TraverseQuery {
+            min_confidence: Some("low".into()),
+            ..q("flush", "calls", "in", 2)
+        };
+        let v = run(&state, &low);
+        let n = node(&v, "Repo.walk");
+        assert_eq!(n["undecided"], true, "{v}");
+        assert_eq!(n["depth"], 1, "{v}");
+        assert_eq!(n["confidence"], "low", "{v}");
+        assert!(v.get("undecided_calls").is_none(), "{v}");
+        let e = v["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["from"] == n["sym"])
+            .unwrap_or_else(|| panic!("{v}"));
+        assert_eq!(e["to"], "flush", "{v}");
+        assert_eq!(e["undecided"], true, "{v}");
+        // Never with a file, a sym, `out`, or without `calls`.
+        for q in [
+            TraverseQuery {
+                symbol: Some("java/src/main/java/com/example/Left.java::flush".into()),
+                ..low.clone()
+            },
+            TraverseQuery {
+                direction: Some("out".into()),
+                ..low.clone()
+            },
+            TraverseQuery {
+                kinds: Some("references".into()),
+                ..low.clone()
+            },
+        ] {
+            let v = run(&state, &q);
+            assert!(!syms(&v).contains(&"Repo.walk".to_string()), "{v}");
+            assert!(v.get("undecided_calls").is_none(), "{v}");
+        }
         let _ = std::fs::remove_dir_all(&repo);
     }
 

@@ -251,7 +251,12 @@ omitted_for_budget?, branch_fallback?}`:
   (`below_confidence`, `excluded`) and not walked. With `calls`, dispatch
   through interfaces, abstract classes and traits is followed (`via:
   "dispatch"`, never `high`; `dispatch: false` turns it off, and
-  `dispatch: {evaluated: false, reason}` says when it was not followed).
+  `dispatch: {evaluated: false, reason}` says when it was not followed). With
+  `calls` `in` (or `both`) from a name — not a `sym`, not `file::name` — the
+  calls to that name the index could not decide are callers too, as in
+  `impact_analysis`: counted in `undecided_calls: {count, hint}` (not from tests
+  nor from a caller listed), and with `min_confidence: "low"` their callers are
+  listed at depth 1, `undecided: true`, never walked, with an edge to the name.
 - Paging (the contract of `search_routes`): `limit` (50) nodes from `offset`;
   `total`, `next_offset`, and `omitted: {count, reason, next_offset}`. A hub —
   a DTO referenced from hundreds of files — is paged, not dumped: once the walk

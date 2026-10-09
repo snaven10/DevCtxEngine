@@ -256,6 +256,12 @@ omitted_for_budget?, branch_fallback?}`:
   `excluded`) y no se recorre. Con `calls` se sigue el dispatch por interfaces,
   clases abstractas y traits (`via: "dispatch"`, nunca `high`; `dispatch: false`
   lo apaga, y `dispatch: {evaluated: false, reason}` dice cuándo no se siguió).
+  Con `calls` `in` (o `both`) desde un nombre — no un `sym` ni un
+  `archivo::nombre` — las llamadas a ese nombre que el índice no pudo decidir
+  también son llamadores, como en `impact_analysis`: se cuentan en
+  `undecided_calls: {count, hint}` (ni desde tests ni desde un llamador listado), y
+  con `min_confidence: "low"` sus llamadores se listan en la profundidad 1,
+  `undecided: true`, sin recorrerlos, con una arista al nombre.
 - Paginación (el contrato de `search_routes`): `limit` (50) nodos desde `offset`;
   `total`, `next_offset` y `omitted: {count, reason, next_offset}`. Un hub — un
   DTO referenciado desde cientos de archivos — se pagina, no se vuelca: cuando el

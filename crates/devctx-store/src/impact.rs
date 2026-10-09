@@ -752,7 +752,12 @@ impl Store {
     /// One row per call to `name` (dotted) the link pass left undecided,
     /// with its caller: what [`impact_undecided_callers`](Self::impact_undecided_callers)
     /// lists and the `undecided_calls` count counts.
-    fn undecided_call_rows(&self, repo: &str, branch: &str, name: &str) -> Result<Vec<LevelRow>> {
+    pub(crate) fn undecided_call_rows(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+    ) -> Result<Vec<LevelRow>> {
         let d = "replace(e.dst_name, '::', '.')";
         let mut stmt = self.conn.prepare(&format!(
             "SELECT 0, e.src_id, s.qualified, s.file, s.start_line, e.kind, e.confidence,

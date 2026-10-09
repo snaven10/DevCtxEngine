@@ -118,6 +118,11 @@ pub struct TraverseOptions {
     /// stood for, reached from another (`Resource.update` →
     /// `Service.update`), is. Empty: no root is listed.
     pub asked: String,
+    /// The roots are what `asked` names, with no file (not a `sym`, not
+    /// `file::name`): the calls to that name the index could not decide are
+    /// then callers too — counted (`undecided_calls`), or listed with `low`
+    /// — when `calls` is followed `in` (review of TASK-013, MAJOR 1).
+    pub by_name: bool,
 }
 
 impl Default for TraverseOptions {
@@ -132,6 +137,7 @@ impl Default for TraverseOptions {
             dispatch: true,
             need: 0,
             asked: String::new(),
+            by_name: false,
         }
     }
 }
@@ -171,12 +177,16 @@ pub struct TraverseNode {
     pub external: bool,
     /// Global rank (PageRank).
     pub rank: Option<f64>,
+    /// Reached only through a call to the name the link pass could not
+    /// decide: listed with `low`, never walked.
+    pub unsure: bool,
 }
 
 impl TraverseNode {
-    /// The link pass could not decide where the edge goes.
+    /// The link pass could not decide where the edge goes (or whether this
+    /// caller's call reaches the name at all).
     pub fn undecided(&self) -> bool {
-        self.id.is_none() && !self.external
+        self.unsure || (self.id.is_none() && !self.external)
     }
 }
 
@@ -212,6 +222,8 @@ pub struct TraverseEdge {
     pub occurrences: usize,
     /// Index in [`Traversal::nodes`] of the node it reached.
     pub reached: usize,
+    /// A call to the name the link pass could not decide (`to` is the name).
+    pub undecided: bool,
 }
 
 /// A traversal: nodes by depth and DD-11's order, the edges that reached
@@ -234,6 +246,10 @@ pub struct Traversal {
     pub dispatch_capped: usize,
     /// Override-equivalent methods past the dispatch depth cap.
     pub dispatch_beyond_depth: usize,
+    /// Calls to the name the link pass left undecided, counted one by one as
+    /// `impact_analysis` counts them (not from tests, nor from a caller
+    /// listed, nor from a root); 0 when `low` lists their callers.
+    pub undecided_calls: usize,
     /// Level statements run (one per level and direction).
     pub levels: usize,
 }
@@ -251,11 +267,15 @@ fn kinds_sql(kinds: &[&str]) -> String {
 
 /// The walk of `traverse` from `roots`, reading each level and direction
 /// with `level`.
+/// `first_up` joins the first `in` level: the callers of undecided calls to
+/// the name (each `unsure`, listed and never walked).
 pub(crate) fn traverse_walk(
     roots: &[StoredSymbol],
     opts: &TraverseOptions,
+    first_up: Vec<LevelRow>,
     mut level: impl FnMut(&[u64], Direction) -> Result<Level>,
 ) -> Result<Traversal> {
+    let mut first_up = Some(first_up);
     let mut t = Traversal::default();
     let mut names: HashMap<u64, String> =
         roots.iter().map(|s| (s.id, s.qualified.clone())).collect();
@@ -290,6 +310,9 @@ pub(crate) fn traverse_walk(
             cut.extend(read.cut.into_iter().map(Key::Id));
             beyond.extend(read.beyond.into_iter().map(Key::Id));
             rows.extend(read.rows.into_iter().map(|r| (dir, r)));
+        }
+        if let Some(extra) = first_up.take() {
+            rows.extend(extra.into_iter().map(|r| (Direction::Upstream, r)));
         }
         let mut best: HashMap<Key, LevelRow> = HashMap::new();
         let mut reached_by: HashMap<Key, Vec<(Direction, LevelRow)>> = HashMap::new();
@@ -335,7 +358,7 @@ pub(crate) fn traverse_walk(
             reported.insert(key.clone());
             if let Some(id) = r.id {
                 names.insert(id, r.symbol.clone());
-                if walked.insert(id) {
+                if !r.unsure && walked.insert(id) {
                     next.push(id);
                     reach.insert(id, r.confidence.clone());
                 }
@@ -353,9 +376,17 @@ pub(crate) fn traverse_walk(
                 if !opts.min_confidence.admits(e.confidence.as_deref()) {
                     continue;
                 }
-                let other = TraverseEnd {
-                    id: Some(e.from),
-                    symbol: names.get(&e.from).cloned().unwrap_or_default(),
+                // An undecided call goes to the name, not to a definition.
+                let other = if e.unsure {
+                    TraverseEnd {
+                        id: None,
+                        symbol: asked.to_string(),
+                    }
+                } else {
+                    TraverseEnd {
+                        id: Some(e.from),
+                        symbol: names.get(&e.from).cloned().unwrap_or_default(),
+                    }
                 };
                 let (from, to) = match dir {
                     Direction::Downstream => (other, me.clone()),
@@ -379,6 +410,7 @@ pub(crate) fn traverse_walk(
                         line: e.edge_line,
                         occurrences: 0,
                         reached: at,
+                        undecided: e.unsure,
                     });
                 slot.occurrences += 1;
                 if confidence_rank(e.confidence.as_deref())
@@ -404,6 +436,7 @@ pub(crate) fn traverse_walk(
                 test: r.test,
                 external: r.external,
                 rank: r.rank,
+                unsure: r.unsure,
             });
         }
         // The page is full: what a deeper level holds cannot be shown, so
@@ -490,7 +523,21 @@ impl Store {
             .iter()
             .filter_map(|s| s.parent_id.map(|p| (s.id, p)))
             .collect();
-        traverse_walk(roots, opts, |f, dir| {
+        // Calls to the name the link pass could not decide (review of
+        // TASK-013, MAJOR 1, as `impact_analysis`): one statement, for the
+        // first `in` level only — listed with `low`, counted otherwise.
+        let undecided = opts.by_name
+            && !opts.asked.is_empty()
+            && opts.kinds.contains(&"calls")
+            && opts.direction != TraverseDirection::Out;
+        let list = undecided && opts.min_confidence == MinConfidence::Low;
+        let first_up = if list {
+            crate::impact::count_statement();
+            self.undecided_call_rows(repo, branch, &opts.asked)?
+        } else {
+            Vec::new()
+        };
+        let mut t = traverse_walk(roots, opts, first_up, |f, dir| {
             let read = match &dispatch {
                 Some(index) => self.dispatch_level(
                     repo,
@@ -513,7 +560,21 @@ impl Store {
                 }
             }
             Ok(read)
-        })
+        })?;
+        if undecided && !list {
+            let shown: HashSet<u64> = t
+                .nodes
+                .iter()
+                .filter_map(|n| n.id)
+                .chain(roots.iter().map(|s| s.id))
+                .collect();
+            t.undecided_calls = self
+                .undecided_call_rows(repo, branch, &opts.asked)?
+                .iter()
+                .filter(|r| !r.test && r.id.is_some_and(|id| !shown.contains(&id)))
+                .count();
+        }
+        Ok(t)
     }
 }
 
@@ -986,6 +1047,78 @@ mod tests {
         for asked in ["", "X.run"] {
             let t = store.traverse("repo", "main", &roots, &o(asked)).unwrap();
             assert!(t.nodes.is_empty(), "{asked}");
+        }
+    }
+
+    /// Review of TASK-013, MAJOR 1: an undecided call to the name is a
+    /// caller — counted by default, listed with `low` at depth 1 and never
+    /// walked (`Top.t` calls the undecided caller: not reached) — read once,
+    /// not per level; nothing of it without `by_name`.
+    #[test]
+    fn undecided_calls_to_the_name_are_counted_or_listed() {
+        let store = Store::open_in_memory(3).unwrap();
+        let g = graph(
+            &store,
+            &[
+                ("Svc.update", "method", None),
+                ("Web.go", "method", None),
+                ("Api.handle", "method", None),
+                ("Top.t", "method", None),
+                ("TestApi.runs", "method", None),
+            ],
+            &[
+                ("Web.go", "calls", "Svc.update", "high", 1),
+                ("Api.handle", "calls", "update", "none", 2),
+                ("TestApi.runs", "calls", "update", "none", 3),
+                ("Top.t", "calls", "Api.handle", "high", 4),
+            ],
+        );
+        let root = [g["Svc.update"].clone()];
+        let o = TraverseOptions {
+            asked: "update".into(),
+            by_name: true,
+            ..opts(&["calls"], TraverseDirection::In, 2)
+        };
+        let t = store.traverse("repo", "main", &root, &o).unwrap();
+        assert_eq!(names(&t), ["Web.go"]);
+        assert_eq!(t.undecided_calls, 1, "not the test's");
+        let low = TraverseOptions {
+            min_confidence: MinConfidence::Low,
+            ..o.clone()
+        };
+        LEVEL_STATEMENTS.with(|c| c.set(0));
+        let t = store.traverse("repo", "main", &root, &low).unwrap();
+        assert_eq!(names(&t), ["Web.go", "Api.handle"]);
+        assert_eq!(LEVEL_STATEMENTS.with(|c| c.get()), t.levels + 1);
+        let n = &t.nodes[1];
+        assert!(n.undecided() && n.depth == 1, "{n:?}");
+        assert_eq!(t.undecided_calls, 0);
+        let e = t
+            .edges
+            .iter()
+            .find(|e| e.from.symbol == "Api.handle")
+            .unwrap();
+        assert!(
+            e.undecided
+                && e.to
+                    == TraverseEnd {
+                        id: None,
+                        symbol: "update".into()
+                    }
+        );
+        for o in [
+            TraverseOptions {
+                by_name: false,
+                ..low.clone()
+            },
+            TraverseOptions {
+                direction: TraverseDirection::Out,
+                ..low.clone()
+            },
+        ] {
+            let t = store.traverse("repo", "main", &root, &o).unwrap();
+            assert!(!names(&t).contains(&"Api.handle"), "{o:?}");
+            assert_eq!(t.undecided_calls, 0);
         }
     }
 
