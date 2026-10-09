@@ -245,6 +245,9 @@ pub(crate) struct LevelRow {
     /// A downstream dispatch row: no surer than the edge that reached
     /// `from` (`min(medium, original)`).
     pub from_reach: bool,
+    /// The node's container (its type, for a method): what dispatch starts
+    /// from at the next level.
+    pub parent: Option<u64>,
 }
 
 #[cfg(test)]
@@ -273,6 +276,7 @@ fn row_to_level(r: &duckdb::Row<'_>) -> duckdb::Result<LevelRow> {
         unsure: false,
         through: None,
         from_reach: false,
+        parent: r.get(10)?,
     })
 }
 
@@ -583,32 +587,48 @@ impl Store {
         let undecided = file.is_none();
         let list_undecided = undecided && opts.min_confidence == MinConfidence::Low;
         // Dispatch through supertypes (TASK-017): the supertype graph is
-        // read once (two statements), and each level is expanded in memory;
-        // a branch with no supertype edge pays for one statement.
-        let dispatch = if opts.dispatch {
-            self.dispatch_index(repo, branch)?
-        } else {
-            None
-        };
+        // read once, as id pairs, and each level reads the methods its
+        // frontier could dispatch to (one statement). Nothing is read when no
+        // dispatch could show: off, `min_confidence: high` (a dispatch is
+        // never `high`) or no definition to start from (review MAJOR 2).
+        let dispatch =
+            if opts.dispatch && opts.min_confidence != MinConfidence::High && !seeds.is_empty() {
+                self.dispatch_index(repo, branch)?
+            } else {
+                None
+            };
+        // The container of every node walked, so a level asks for dispatch
+        // only for the methods of a type with a supertype or a subtype.
+        let seed_parents: HashMap<u64, u64> = syms
+            .iter()
+            .filter_map(|s| s.parent_id.map(|p| (s.id, p)))
+            .collect();
         let side = |dir: Direction| {
             let up = dir == Direction::Upstream;
             let extra = up && (sites.is_some() || list_undecided);
             let mut first = true;
+            let mut parents = seed_parents.clone();
             walk(&seeds, &itself, opts, extra, |f| {
                 let mut read = if let Some(index) = &dispatch {
-                    self.dispatch_level(repo, branch, f, dir, mode, index)?
+                    self.dispatch_level(repo, branch, f, dir, mode, index, &parents)?
                 } else {
                     self.impact_level(repo, branch, f, dir, mode)?.into()
                 };
-                if !(up && std::mem::take(&mut first)) {
-                    return Ok(read);
+                if up && std::mem::take(&mut first) {
+                    let rows: &mut Vec<LevelRow> = &mut read.rows;
+                    if let Some(t) = &sites {
+                        rows.extend(self.impact_site_callers(repo, branch, t)?);
+                    }
+                    if list_undecided {
+                        rows.extend(self.impact_undecided_callers(repo, branch, &asked)?);
+                    }
                 }
-                let rows: &mut Vec<LevelRow> = &mut read.rows;
-                if let Some(t) = &sites {
-                    rows.extend(self.impact_site_callers(repo, branch, t)?);
-                }
-                if list_undecided {
-                    rows.extend(self.impact_undecided_callers(repo, branch, &asked)?);
+                if dispatch.is_some() {
+                    for r in &read.rows {
+                        if let (Some(id), Some(p)) = (r.id, r.parent) {
+                            parents.insert(id, p);
+                        }
+                    }
                 }
                 Ok(read)
             })
@@ -671,7 +691,8 @@ impl Store {
         count_statement();
         let mut stmt = self.conn.prepare(&format!(
             "SELECT 0, e.src_id, s.qualified, s.file, s.start_line, e.kind, e.confidence,
-                    false, coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank
+                    false, coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank,
+                    s.parent_id
                FROM live_edges e
                JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
               WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
@@ -704,7 +725,8 @@ impl Store {
         let d = "replace(e.dst_name, '::', '.')";
         let mut stmt = self.conn.prepare(&format!(
             "SELECT 0, e.src_id, s.qualified, s.file, s.start_line, e.kind, e.confidence,
-                    false, coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank
+                    false, coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank,
+                    s.parent_id
                FROM live_edges e
                JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
               WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
@@ -723,13 +745,14 @@ impl Store {
     }
 
     /// One level of the walk with dispatch (TASK-017): the override-
-    /// equivalents of the frontier (in memory, from `index`), then the level
-    /// query — one statement, as without dispatch.
+    /// equivalents of the frontier (one statement, over the types of
+    /// `index`), then the level query.
     /// Upstream, the level reads the callers of the frontier and of the
     /// methods it overrides, the latter as `dispatch` rows of the method
     /// that overrides them; downstream, the frontier's own callees plus its
     /// overriding methods as `dispatch` rows. Never surer than `medium`, nor
     /// than the edge they stand for.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_level(
         &self,
         repo: &str,
@@ -738,8 +761,16 @@ impl Store {
         dir: Direction,
         mode: FrontierSql,
         index: &DispatchIndex,
+        parents: &HashMap<u64, u64>,
     ) -> Result<Level> {
-        let eq = index.equivalents(frontier, dir);
+        // Only a method of a type in the supertype graph can dispatch: the
+        // others cost no statement.
+        let methods: Vec<u64> = frontier
+            .iter()
+            .copied()
+            .filter(|id| parents.get(id).is_some_and(|p| index.has_type(*p)))
+            .collect();
+        let eq = self.override_equivalents(repo, branch, &methods, dir, mode, index)?;
         let mut out = Level {
             rows: Vec::new(),
             cut: eq.cut,
@@ -784,6 +815,7 @@ impl Store {
                     unsure: false,
                     through: Some(e.origin_symbol),
                     from_reach: true,
+                    parent: Some(e.parent),
                 }));
             }
         }
@@ -857,7 +889,8 @@ impl Store {
             Direction::Upstream => format!(
                 "SELECT e.dst_id, e.src_id, s.qualified, s.file, s.start_line, e.kind,
                         e.confidence, false,
-                        coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank
+                        coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank,
+                        s.parent_id
                    FROM live_edges e
                    JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
                   WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
@@ -866,7 +899,7 @@ impl Store {
             Direction::Downstream => format!(
                 "SELECT e.src_id, e.dst_id, coalesce(t.qualified, e.dst_name), t.file,
                         t.start_line, e.kind, e.confidence, coalesce(e.external, false),
-                        coalesce(t.is_test, false), t.rank
+                        coalesce(t.is_test, false), t.rank, t.parent_id
                    FROM live_edges e
                    LEFT JOIN symbols t ON t.repo = e.repo AND t.branch = e.branch
                                       AND t.id = e.dst_id
@@ -2017,7 +2050,9 @@ pub(crate) mod tests {
             .impact_graph("repo", "main", "ServiceImpl.update", None, &high)
             .unwrap();
         assert!(im.upstream.nodes.is_empty());
-        assert_eq!(im.upstream.below_confidence, 2);
+        // Review MAJOR 2: with `high` no dispatch can show, so none is read
+        // (and none counted).
+        assert_eq!(im.upstream.below_confidence, 0);
         // No edge through dispatch is ever `high`, whatever the filters.
         for opts in [ImpactOptions::default(), all_in()] {
             for name in ["ServiceImpl.update", "IService.update", "Api.handle"] {
@@ -2069,19 +2104,29 @@ pub(crate) mod tests {
         assert_eq!(up("ServiceImpl.find"), ["Api.c"]);
     }
 
-    /// TASK-017, lesson 6: dispatch adds no statement per level — the
-    /// supertype graph is read once per call (two statements, like the seed
-    /// lookup: constant) and each level is expanded in memory, whatever the
-    /// frontier.
+    /// TASK-017, lesson 6 (and review MAJOR 2): at most one more statement
+    /// per level and direction, whatever the frontier — the supertype graph
+    /// is read once per call, as id pairs, and each level reads only the
+    /// methods with a frontier method's name in a type of it.
     #[test]
-    fn dispatch_adds_no_statement_per_level() {
+    fn dispatch_costs_at_most_one_statement_per_level() {
         let store = Store::open_in_memory(3).unwrap();
         let mut calls = Vec::new();
         for i in 0..300 {
             calls.push(call(&format!("A{i}.a"), "IService.update"));
             calls.push(call(&format!("B{i}.b"), &format!("A{i}.a")));
         }
+        calls.push(call("Lone.x", "Lone.y"));
         di_graph(&store, &calls);
+        // A walk whose nodes belong to no type with a supertype or a subtype
+        // pays for no dispatch statement, though the branch has some.
+        LEVEL_STATEMENTS.with(|c| c.set(0));
+        let im = store
+            .impact_graph("repo", "main", "Lone.x", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(names(&im.downstream), ["Lone.y"]);
+        let levels = im.upstream.levels + im.downstream.levels;
+        assert_eq!(LEVEL_STATEMENTS.with(|c| c.get()), levels);
         LEVEL_STATEMENTS.with(|c| c.set(0));
         crate::dispatch::INDEX_READS.with(|c| c.set(0));
         let opts = ImpactOptions {
@@ -2094,8 +2139,29 @@ pub(crate) mod tests {
         assert_eq!(im.upstream.nodes.len(), 601);
         let n = LEVEL_STATEMENTS.with(|c| c.get());
         let levels = im.upstream.levels + im.downstream.levels;
-        assert_eq!(n, levels, "{n} statements for {levels} levels");
+        assert!(n <= 2 * levels, "{n} statements for {levels} levels");
         assert_eq!(crate::dispatch::INDEX_READS.with(|c| c.get()), 1);
+        // Review MAJOR 2: nothing is read when dispatch cannot show — off,
+        // `min_confidence: high`, or no definition to start from.
+        let reads = |name: &str, opts: &ImpactOptions| {
+            crate::dispatch::INDEX_READS.with(|c| c.set(0));
+            store
+                .impact_graph("repo", "main", name, None, opts)
+                .unwrap();
+            crate::dispatch::INDEX_READS.with(|c| c.get())
+        };
+        let off = ImpactOptions {
+            dispatch: false,
+            ..Default::default()
+        };
+        let high = ImpactOptions {
+            min_confidence: MinConfidence::High,
+            ..Default::default()
+        };
+        assert_eq!(reads("ServiceImpl.update", &off), 0);
+        assert_eq!(reads("ServiceImpl.update", &high), 0);
+        assert_eq!(reads("nothingHere", &ImpactOptions::default()), 0);
+        assert_eq!(reads("ServiceImpl.update", &ImpactOptions::default()), 1);
     }
 
     /// TASK-017: downstream, an implementation is no surer than the edge

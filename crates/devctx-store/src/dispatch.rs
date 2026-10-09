@@ -21,8 +21,10 @@
 
 use std::collections::HashMap;
 
+use duckdb::params_from_iter;
+
 use crate::error::Result;
-use crate::impact::Direction;
+use crate::impact::{count_statement, Direction, FrontierSql};
 use crate::store::Store;
 
 /// Supertype levels a dispatch climbs (upstream) or descends (downstream):
@@ -48,6 +50,8 @@ pub(crate) struct Equivalent {
     pub origin_symbol: String,
     /// The equivalent method.
     pub id: u64,
+    /// Its type.
+    pub parent: u64,
     /// Its qualified name.
     pub symbol: String,
     /// File of its definition.
@@ -261,24 +265,10 @@ fn top_level_contains(p: &str, ch: char) -> bool {
     false
 }
 
-/// A method of a type that has a supertype or a subtype on the branch: what
-/// a dispatch can start from or arrive at.
-#[derive(Debug, Clone, PartialEq)]
-struct Method {
-    parent: u64,
-    name: String,
-    symbol: String,
-    file: Option<String>,
-    line: Option<i32>,
-    signature: String,
-    rank: Option<f64>,
-    test: bool,
-}
-
-/// The supertype graph of a branch, read once per walk (two statements,
-/// whatever the depth and the frontier): every resolved `inherits`/
-/// `implements` edge of `live_edges`, and the methods of the types at
-/// either end. Each level is then expanded in memory.
+/// The supertype graph of a branch, read once per walk as id pairs (one
+/// statement): every resolved `inherits`/`implements` edge of `live_edges`
+/// outside Go. The methods are read per level, only those with the name of a
+/// frontier method in a type of this graph (review of TASK-017, MAJOR 2).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct DispatchIndex {
     /// Type → its supertypes, with the edge's confidence (3 high, 2
@@ -286,87 +276,63 @@ pub(crate) struct DispatchIndex {
     supers: HashMap<u64, Vec<(u64, u8)>>,
     /// Type → its subtypes.
     subs: HashMap<u64, Vec<(u64, u8)>>,
-    /// Method id → the method.
-    methods: HashMap<u64, Method>,
-    /// Type → its methods.
-    by_type: HashMap<u64, Vec<u64>>,
+    /// Every type at either end, sorted.
+    types: Vec<u64>,
 }
 
 impl DispatchIndex {
-    /// The override-equivalent methods of the methods of `frontier`: of
-    /// their supertypes upstream, of their subtypes downstream, transitively
-    /// up to [`DISPATCH_DEPTH`] levels. At most [`DISPATCH_MAX_PER_NODE`]
-    /// per node, by rank and name; the rest are returned as `cut`.
-    pub(crate) fn equivalents(&self, frontier: &[u64], dir: Direction) -> Equivalents {
+    /// Whether `t` has a supertype or a subtype here.
+    pub(crate) fn has_type(&self, t: u64) -> bool {
+        self.types.binary_search(&t).is_ok()
+    }
+
+    /// The types reachable from `from` in direction `dir` within
+    /// [`DISPATCH_DEPTH`] levels, each with its surest chain.
+    fn reach(&self, from: u64, dir: Direction) -> HashMap<u64, u8> {
         let graph = match dir {
             Direction::Upstream => &self.supers,
             Direction::Downstream => &self.subs,
         };
-        let mut out = Equivalents::default();
-        for &origin in frontier {
-            let Some(m) = self.methods.get(&origin) else {
-                continue;
-            };
-            if never_overrides(&m.signature, &m.name) {
-                continue;
-            }
-            // The surest chain to each type within the depth.
-            let mut best: HashMap<u64, u8> = HashMap::new();
-            let mut layer: Vec<(u64, u8)> = vec![(m.parent, 3)];
-            for _ in 0..DISPATCH_DEPTH {
-                let mut next = Vec::new();
-                for (t, conf) in layer {
-                    for &(s, c) in graph.get(&t).into_iter().flatten() {
-                        let c = conf.min(c);
-                        if s != m.parent && best.get(&s).is_none_or(|&b| c > b) {
-                            best.insert(s, c);
-                            next.push((s, c));
-                        }
+        let mut best: HashMap<u64, u8> = HashMap::new();
+        let mut layer: Vec<(u64, u8)> = vec![(from, 3)];
+        for _ in 0..DISPATCH_DEPTH {
+            let mut next = Vec::new();
+            for (t, conf) in layer {
+                for &(s, c) in graph.get(&t).into_iter().flatten() {
+                    let c = conf.min(c);
+                    if s != from && best.get(&s).is_none_or(|&b| c > b) {
+                        best.insert(s, c);
+                        next.push((s, c));
                     }
                 }
-                layer = next;
             }
-            let mine = arity(&m.signature, &m.name);
-            let mut list: Vec<Equivalent> = Vec::new();
-            for (t, chain) in best {
-                for id in self.by_type.get(&t).into_iter().flatten() {
-                    let e = &self.methods[id];
-                    if *id == origin
-                        || e.name != m.name
-                        || never_overrides(&e.signature, &e.name)
-                        || !arities_meet(mine, arity(&e.signature, &e.name))
-                    {
-                        continue;
-                    }
-                    list.push(Equivalent {
-                        origin,
-                        origin_symbol: m.symbol.clone(),
-                        id: *id,
-                        symbol: e.symbol.clone(),
-                        file: e.file.clone(),
-                        line: e.line,
-                        rank: e.rank,
-                        test: e.test,
-                        chain,
-                    });
-                }
-            }
-            list.sort_by(|a, b| {
-                b.rank
-                    .unwrap_or(f64::NEG_INFINITY)
-                    .partial_cmp(&a.rank.unwrap_or(f64::NEG_INFINITY))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.symbol.cmp(&b.symbol))
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            if list.len() > DISPATCH_MAX_PER_NODE {
-                out.cut
-                    .extend(list.drain(DISPATCH_MAX_PER_NODE..).map(|e| e.id));
-            }
-            out.kept.extend(list);
+            layer = next;
         }
-        out
+        best
     }
+}
+
+/// A frontier method, as the dispatch query reads it.
+struct Origin {
+    parent: u64,
+    name: String,
+    symbol: String,
+    signature: String,
+}
+
+/// An origin, the types it reaches (with their chain) and its candidates there.
+type OriginFound = (Origin, HashMap<u64, u8>, Vec<(Candidate, u8)>);
+
+/// A method of the same name in a type of the supertype graph.
+struct Candidate {
+    id: u64,
+    parent: u64,
+    symbol: String,
+    file: Option<String>,
+    line: Option<i32>,
+    signature: String,
+    rank: Option<f64>,
+    test: bool,
 }
 
 #[cfg(test)]
@@ -384,11 +350,52 @@ fn confidence_rank(c: Option<&str>) -> u8 {
     }
 }
 
+/// The equivalents of one origin among its candidates (already reachable,
+/// with their chain): override-equivalent ones, ordered and capped.
+fn select(origin: u64, o: &Origin, found: Vec<(Candidate, u8)>, out: &mut Equivalents) {
+    if never_overrides(&o.signature, &o.name) {
+        return;
+    }
+    let mine = arity(&o.signature, &o.name);
+    let mut list: Vec<Equivalent> = found
+        .into_iter()
+        .filter(|(c, _)| {
+            !never_overrides(&c.signature, &o.name)
+                && arities_meet(mine, arity(&c.signature, &o.name))
+        })
+        .map(|(c, chain)| Equivalent {
+            origin,
+            origin_symbol: o.symbol.clone(),
+            id: c.id,
+            parent: c.parent,
+            symbol: c.symbol,
+            file: c.file,
+            line: c.line,
+            rank: c.rank,
+            test: c.test,
+            chain,
+        })
+        .collect();
+    list.sort_by(|a, b| {
+        b.rank
+            .unwrap_or(f64::NEG_INFINITY)
+            .partial_cmp(&a.rank.unwrap_or(f64::NEG_INFINITY))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.symbol.cmp(&b.symbol))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    if list.len() > DISPATCH_MAX_PER_NODE {
+        out.cut
+            .extend(list.drain(DISPATCH_MAX_PER_NODE..).map(|e| e.id));
+    }
+    out.kept.extend(list);
+}
+
 impl Store {
-    /// The supertype graph of `branch` ([`DispatchIndex`]); `None` when the
-    /// branch has no resolved supertype edge (then no level pays for
-    /// dispatch). Two statements, once per walk; Go's files are left out
-    /// (embedding promotes, it does not override).
+    /// The supertype graph of `branch` ([`DispatchIndex`]) as id pairs, one
+    /// statement; `None` when it has no resolved supertype edge (then no
+    /// level pays for dispatch). Go's files are left out (embedding promotes,
+    /// it does not override).
     pub(crate) fn dispatch_index(&self, repo: &str, branch: &str) -> Result<Option<DispatchIndex>> {
         #[cfg(test)]
         INDEX_READS.with(|c| c.set(c.get() + 1));
@@ -414,46 +421,106 @@ impl Store {
             let c = confidence_rank(conf.as_deref());
             idx.supers.entry(src).or_default().push((dst, c));
             idx.subs.entry(dst).or_default().push((src, c));
+            idx.types.extend([src, dst]);
         }
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT m.id, m.parent_id, m.name, m.qualified, m.file, m.start_line,
-                    m.signature, m.rank, coalesce(m.is_test, false)
-               FROM symbols m
-              WHERE m.repo = ? AND m.branch = ? AND m.kind IN {CALLABLE_KINDS}
-                AND NOT ends_with(m.file, '.go')
-                AND m.parent_id IN (
-                    SELECT src_id FROM live_edges
-                     WHERE repo = ? AND branch = ? AND kind IN {SUPER_KINDS}
-                       AND dst_id IS NOT NULL
-                    UNION
-                    SELECT dst_id FROM live_edges
-                     WHERE repo = ? AND branch = ? AND kind IN {SUPER_KINDS}
-                       AND dst_id IS NOT NULL)"
-        ))?;
-        let rows = stmt.query_map(
-            duckdb::params![repo, branch, repo, branch, repo, branch],
-            |r| {
-                Ok((
-                    r.get::<_, u64>(0)?,
-                    Method {
-                        parent: r.get(1)?,
-                        name: r.get(2)?,
-                        symbol: r.get(3)?,
-                        file: r.get(4)?,
-                        line: r.get(5)?,
-                        signature: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                        rank: r.get(7)?,
-                        test: r.get(8)?,
-                    },
-                ))
-            },
-        )?;
-        for row in rows {
-            let (id, m) = row?;
-            idx.by_type.entry(m.parent).or_default().push(id);
-            idx.methods.insert(id, m);
-        }
+        idx.types.sort_unstable();
+        idx.types.dedup();
         Ok(Some(idx))
+    }
+
+    /// The override-equivalent methods of the methods of `frontier` (one
+    /// statement per level): the frontier methods whose type is in the
+    /// supertype graph, and the methods with their name in another type of
+    /// it; then, in memory, the ones whose type is reachable (supertypes
+    /// upstream, subtypes downstream, up to [`DISPATCH_DEPTH`] levels),
+    /// override-equivalent, at most [`DISPATCH_MAX_PER_NODE`] per node.
+    pub(crate) fn override_equivalents(
+        &self,
+        repo: &str,
+        branch: &str,
+        frontier: &[u64],
+        dir: Direction,
+        mode: FrontierSql,
+        index: &DispatchIndex,
+    ) -> Result<Equivalents> {
+        let mut out = Equivalents::default();
+        if frontier.is_empty() {
+            return Ok(out);
+        }
+        let types = format!(
+            "[{}]",
+            index
+                .types
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut args: Vec<duckdb::types::Value> = vec![
+            types.into(),
+            repo.to_string().into(),
+            branch.to_string().into(),
+        ];
+        let set = self.frontier_set(frontier, mode, &mut args)?;
+        args.extend([repo.to_string().into(), branch.to_string().into()]);
+        let sql = format!(
+            "WITH t AS (SELECT unnest(CAST(? AS UBIGINT[])) AS id),
+             f AS (
+               SELECT s.id, s.parent_id, s.name, s.qualified, s.signature FROM symbols s
+                WHERE s.repo = ? AND s.branch = ? AND s.id IN {set}
+                  AND s.kind IN {CALLABLE_KINDS} AND NOT ends_with(s.file, '.go')
+                  AND s.parent_id IN (SELECT id FROM t)
+             )
+             SELECT f.id, f.parent_id, f.name, f.qualified, f.signature,
+                    m.id, m.parent_id, m.qualified, m.file, m.start_line, m.signature,
+                    m.rank, coalesce(m.is_test, false)
+               FROM f
+               JOIN symbols m ON m.repo = ? AND m.branch = ? AND m.name = f.name
+                             AND m.id <> f.id AND m.kind IN {CALLABLE_KINDS}
+                             AND NOT ends_with(m.file, '.go')
+                             AND m.parent_id IN (SELECT id FROM t)"
+        );
+        count_statement();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((
+                r.get::<_, u64>(0)?,
+                Origin {
+                    parent: r.get(1)?,
+                    name: r.get(2)?,
+                    symbol: r.get(3)?,
+                    signature: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                },
+                Candidate {
+                    id: r.get(5)?,
+                    parent: r.get(6)?,
+                    symbol: r.get(7)?,
+                    file: r.get(8)?,
+                    line: r.get(9)?,
+                    signature: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                    rank: r.get(11)?,
+                    test: r.get(12)?,
+                },
+            ))
+        })?;
+        let mut origins: HashMap<u64, OriginFound> = HashMap::new();
+        for row in rows {
+            let (id, o, c) = row?;
+            let entry = origins.entry(id).or_insert_with(|| {
+                let reach = index.reach(o.parent, dir);
+                (o, reach, Vec::new())
+            });
+            if let Some(&chain) = entry.1.get(&c.parent) {
+                entry.2.push((c, chain));
+            }
+        }
+        let mut ids: Vec<u64> = origins.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let (o, _, found) = origins.remove(&id).expect("listed");
+            select(id, &o, found, &mut out);
+        }
+        Ok(out)
     }
 }
 

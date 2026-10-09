@@ -968,14 +968,15 @@ mod tests {
             node(&v, "downstream", "ServiceImpl.update")["confidence"],
             "medium"
         );
-        // `min_confidence: high` leaves it out and counts it.
+        // `min_confidence: high` leaves it out, without reading it (review
+        // MAJOR 2): nothing of it is counted.
         let high = ImpactQuery {
             min_confidence: Some("high".into()),
             ..Default::default()
         };
         let v = impact(&state, "ServiceImpl.update", &high);
         assert!(syms(&v, "upstream").is_empty(), "{v}");
-        assert_eq!(v["below_confidence"]["count"], 1, "{v}");
+        assert!(v.get("below_confidence").is_none(), "{v}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
