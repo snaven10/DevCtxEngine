@@ -56,6 +56,8 @@ pub(crate) struct Equivalent {
     pub parent: u64,
     /// Its qualified name.
     pub symbol: String,
+    /// Its symbol kind.
+    pub kind: String,
     /// File of its definition.
     pub file: Option<String>,
     /// First line of its definition.
@@ -458,6 +460,7 @@ struct Candidate {
     id: u64,
     parent: u64,
     symbol: String,
+    kind: String,
     file: Option<String>,
     line: Option<i32>,
     signature: String,
@@ -547,6 +550,7 @@ fn select(
             id: c.id,
             parent: c.parent,
             symbol: c.symbol,
+            kind: c.kind,
             file: c.file,
             line: c.line,
             rank: c.rank,
@@ -668,7 +672,7 @@ impl Store {
              )
              SELECT f.id, f.parent_id, f.name, f.qualified, f.signature,
                     m.id, m.parent_id, m.qualified, m.file, m.start_line, m.signature,
-                    m.rank, coalesce(m.is_test, false)
+                    m.rank, coalesce(m.is_test, false), m.kind
                FROM f
                JOIN symbols m ON m.repo = ? AND m.branch = ? AND m.name = f.name
                              AND m.id <> f.id AND m.kind IN {CALLABLE_KINDS}
@@ -695,6 +699,7 @@ impl Store {
                     signature: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
                     rank: r.get(11)?,
                     test: r.get(12)?,
+                    kind: r.get(13)?,
                 },
             ))
         })?;

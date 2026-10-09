@@ -251,6 +251,10 @@ pub(crate) struct LevelRow {
     /// The node's container (its type, for a method): what dispatch starts
     /// from at the next level.
     pub parent: Option<u64>,
+    /// Line of the edge's occurrence (`traverse`, TASK-013).
+    pub edge_line: Option<i32>,
+    /// The node's symbol kind, when it has a definition.
+    pub node_kind: Option<String>,
 }
 
 #[cfg(test)]
@@ -280,6 +284,8 @@ fn row_to_level(r: &duckdb::Row<'_>) -> duckdb::Result<LevelRow> {
         through: None,
         from_reach: false,
         parent: r.get(10)?,
+        edge_line: r.get(11)?,
+        node_kind: r.get(12)?,
     })
 }
 
@@ -307,13 +313,13 @@ impl From<Vec<LevelRow>> for Level {
 
 /// A node, for deduplication within a direction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Key {
+pub(crate) enum Key {
     Id(u64),
     Name(String, bool),
 }
 
 impl Key {
-    fn of(r: &LevelRow) -> Key {
+    pub(crate) fn of(r: &LevelRow) -> Key {
         match r.id {
             Some(id) => Key::Id(id),
             None => Key::Name(r.symbol.clone(), r.external),
@@ -322,7 +328,7 @@ impl Key {
 }
 
 /// `high` 3, `medium` 2, anything else 1.
-fn confidence_rank(c: Option<&str>) -> u8 {
+pub(crate) fn confidence_rank(c: Option<&str>) -> u8 {
     match c {
         Some("high") => 3,
         Some("medium") => 2,
@@ -331,7 +337,7 @@ fn confidence_rank(c: Option<&str>) -> u8 {
 }
 
 /// Whether `r` is a better edge to its node than `b`.
-fn better(r: &LevelRow, b: &LevelRow) -> bool {
+pub(crate) fn better(r: &LevelRow, b: &LevelRow) -> bool {
     let (rc, bc) = (
         confidence_rank(r.confidence.as_deref()),
         confidence_rank(b.confidence.as_deref()),
@@ -344,7 +350,7 @@ fn better(r: &LevelRow, b: &LevelRow) -> bool {
 
 /// DD-11's order within a level: confidence, rank (NULL last), name; then
 /// file, line and id so the answer is deterministic.
-fn level_order(a: &LevelRow, b: &LevelRow) -> std::cmp::Ordering {
+pub(crate) fn level_order(a: &LevelRow, b: &LevelRow) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     confidence_rank(b.confidence.as_deref())
         .cmp(&confidence_rank(a.confidence.as_deref()))
@@ -634,6 +640,7 @@ impl Store {
                         index,
                         &parents,
                         opts.include_tests,
+                        IMPACT_KINDS,
                     )?
                 } else {
                     self.impact_level(repo, branch, f, dir, mode)?.into()
@@ -716,7 +723,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT 0, e.src_id, s.qualified, s.file, s.start_line, e.kind, e.confidence,
                     false, coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank,
-                    s.parent_id
+                    s.parent_id, e.line, s.kind
                FROM live_edges e
                JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
               WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
@@ -750,7 +757,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT 0, e.src_id, s.qualified, s.file, s.start_line, e.kind, e.confidence,
                     false, coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank,
-                    s.parent_id
+                    s.parent_id, e.line, s.kind
                FROM live_edges e
                JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
               WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
@@ -787,6 +794,7 @@ impl Store {
         index: &DispatchIndex,
         parents: &HashMap<u64, u64>,
         include_tests: bool,
+        kinds: &str,
     ) -> Result<Level> {
         // Only a method of a type in the supertype graph can dispatch: the
         // others cost no statement.
@@ -811,8 +819,11 @@ impl Store {
                 }
                 let mut set = frontier.to_vec();
                 set.extend(by_id.keys().filter(|id| !direct.contains(id)));
-                for r in self.impact_level(repo, branch, &set, dir, mode)? {
-                    for e in by_id.get(&r.from).into_iter().flatten() {
+                for r in self.edge_level(repo, branch, &set, dir, mode, kinds)? {
+                    // Only a call stands for a dispatch: another relation into
+                    // an equivalent (`traverse`) is that method's own.
+                    let stands = crate::traverse::dispatches(&r.kind);
+                    for e in by_id.get(&r.from).into_iter().flatten().filter(|_| stands) {
                         out.rows.push(LevelRow {
                             from: e.origin,
                             kind: DISPATCH_VIA.to_string(),
@@ -827,7 +838,7 @@ impl Store {
                 }
             }
             Direction::Downstream => {
-                out.rows = self.impact_level(repo, branch, frontier, dir, mode)?;
+                out.rows = self.edge_level(repo, branch, frontier, dir, mode, kinds)?;
                 out.rows.extend(eq.kept.into_iter().map(|e| LevelRow {
                     from: e.origin,
                     id: Some(e.id),
@@ -843,6 +854,8 @@ impl Store {
                     through: Some(e.origin_symbol),
                     from_reach: true,
                     parent: Some(e.parent),
+                    edge_line: None,
+                    node_kind: Some(e.kind),
                 }));
             }
         }
@@ -906,6 +919,21 @@ impl Store {
         dir: Direction,
         mode: FrontierSql,
     ) -> Result<Vec<LevelRow>> {
+        self.edge_level(repo, branch, frontier, dir, mode, IMPACT_KINDS)
+    }
+
+    /// [`impact_level`](Self::impact_level) over the relations `kinds` (an
+    /// SQL list of literals, `('calls', …)`): the level query `traverse`
+    /// shares (TASK-013).
+    pub(crate) fn edge_level(
+        &self,
+        repo: &str,
+        branch: &str,
+        frontier: &[u64],
+        dir: Direction,
+        mode: FrontierSql,
+        kinds: &str,
+    ) -> Result<Vec<LevelRow>> {
         if frontier.is_empty() {
             return Ok(Vec::new());
         }
@@ -917,20 +945,21 @@ impl Store {
                 "SELECT e.dst_id, e.src_id, s.qualified, s.file, s.start_line, e.kind,
                         e.confidence, false,
                         coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank,
-                        s.parent_id
+                        s.parent_id, e.line, s.kind
                    FROM live_edges e
                    JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
-                  WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
+                  WHERE e.repo = ? AND e.branch = ? AND e.kind IN {kinds}
                     AND e.dst_id IN {set}"
             ),
             Direction::Downstream => format!(
                 "SELECT e.src_id, e.dst_id, coalesce(t.qualified, e.dst_name), t.file,
                         t.start_line, e.kind, e.confidence, coalesce(e.external, false),
-                        coalesce(t.is_test, false), t.rank, t.parent_id
+                        coalesce(t.is_test, false), t.rank, t.parent_id,
+                        e.line, t.kind
                    FROM live_edges e
                    LEFT JOIN symbols t ON t.repo = e.repo AND t.branch = e.branch
                                       AND t.id = e.dst_id
-                  WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
+                  WHERE e.repo = ? AND e.branch = ? AND e.kind IN {kinds}
                     AND e.src_id IN {set}"
             ),
         };

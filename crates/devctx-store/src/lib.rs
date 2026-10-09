@@ -19,6 +19,7 @@ mod schema;
 mod state;
 mod store;
 mod symbols;
+mod traverse;
 
 pub use dispatch::{DISPATCH_DEPTH, DISPATCH_MAX_PER_NODE};
 pub use error::{Result, StoreError};
@@ -40,6 +41,10 @@ pub use schema::init_schema;
 pub use state::{CopySetup, FileState, IndexRecord, EMBED_FP_META_KEY, EXTRACTOR_META_KEY};
 pub use store::{normalize_metric, MemoryReport, Store};
 pub use symbols::{RankEdge, StoredSymbol, StoredSymbolEdge};
+pub use traverse::{
+    Traversal, TraverseDirection, TraverseEdge, TraverseEnd, TraverseNode, TraverseOptions,
+    TRAVERSE_KINDS, TRAVERSE_MAX_DEPTH,
+};
 
 #[cfg(test)]
 mod tests {
