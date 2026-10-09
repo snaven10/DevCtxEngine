@@ -172,7 +172,10 @@ confidence is `min(medium, the edge it stands for)` — never `high`, and a `low
 call stays `low` (counted in `below_confidence` by default). To leave dispatch
 out: `dispatch: false` (`--no-dispatch`, `?dispatch=false`), or
 `min_confidence: "high"`, which also leaves out every `medium` call (and does
-not read, nor count, any dispatch). Java,
+not read, nor count, any dispatch). Either way the answer says so, from the
+filters alone: `dispatch: {"evaluated": false, "reason": "dispatch:false"}` or
+`{"evaluated": false, "reason": "min_confidence high"}` (absent when dispatch was
+followed). Java,
 TypeScript (`implements`, abstract classes) and Rust traits are covered; Python
 base classes on a best-effort basis; Go not at all (embedding promotes methods, it
 does not override them, and an interface is satisfied without an edge to follow).

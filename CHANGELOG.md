@@ -332,7 +332,9 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   in its `count` nor in `omitted`, which count nodes). `dispatch: false` (tool,
   `GET /impact?dispatch=false`, `devctx impact --no-dispatch`) follows direct
   calls only, `min_confidence: "high"` leaves it out without reading it, and
-  `filters` says whether it applied. The supertype graph is read once per call
+  `filters` says whether it applied; when it was not evaluated the answer
+  carries `dispatch: {"evaluated": false, "reason": "dispatch:false" |
+  "min_confidence high"}`, read from the filters alone. The supertype graph is read once per call
   as id pairs, and a level pays one statement only when its frontier holds a
   method of a type with a supertype or a subtype; nothing is read when no
   dispatch could show. Measured on two Java repositories (1 250 and 216 files)

@@ -226,7 +226,9 @@ struct ImpactReq {
     /// implementations of an interface or abstract method, as `via:
     /// "dispatch"` with `through` (the method it went through), never surer
     /// than `medium`. `false` follows direct calls only; `min_confidence:
-    /// "high"` also leaves them out, without reading them (not counted).
+    /// "high"` also leaves them out, without reading them (not counted);
+    /// either way the answer carries `dispatch: {"evaluated": false,
+    /// "reason": "dispatch:false" | "min_confidence high"}`.
     #[serde(default)]
     dispatch: Option<bool>,
 }
@@ -1215,7 +1217,8 @@ impl DevctxServer {
         index could not decide, `excluded`, `omitted`), never dropped silently. A call \
         through an interface, abstract class or trait is followed by dispatch: \
         `via: \"dispatch\"` with `through`, never `high` (`dispatch: false` turns it off; \
-        what a node's cap cut is in `omitted_by_limit.dispatch`). \
+        what a node's cap cut is in `omitted_by_limit.dispatch`; when it was not \
+        evaluated, `dispatch: {evaluated: false, reason}` says why). \
         `min_confidence`, `include_tests`, `include_external`, `max_nodes` and `dispatch` \
         change that. Returns JSON."
     )]

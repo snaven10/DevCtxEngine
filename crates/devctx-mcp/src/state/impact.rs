@@ -17,7 +17,9 @@
 //! an interface method) has `via: "dispatch"`, never `high`, and `through`
 //! (the method it went through); the methods past the dispatch cap of a node
 //! are counted in `omitted_by_limit.dispatch` only (not in its `count`
-//! nor in `omitted`, which count nodes);
+//! nor in `omitted`, which count nodes), and an answer whose filters kept
+//! dispatch from being evaluated says so (`dispatch: {evaluated: false,
+//! reason}`);
 //! for a name with no definition here, `read_symbol`'s `external` +
 //! `called_from` + `next_step` (its upstream is the callers of its external
 //! call sites) or `suggestions`.
@@ -109,6 +111,22 @@ const CAPPED_HINT: &str =
     "max_nodes was reached: the symbols of that depth past it were counted, not listed or \
      walked, and no deeper level was read; raise max_nodes (0 = no cap) or ask about a \
      narrower symbol";
+
+/// `{"evaluated": false, "reason"}` when the filters kept dispatch from being
+/// evaluated (review of TASK-017): `dispatch: false`, or `min_confidence:
+/// high` (a dispatch is never `high`, so it is not read). Constant and read
+/// from the filters alone: nothing is queried to say it. `None` when dispatch
+/// was evaluated.
+pub(super) fn dispatch_not_evaluated(dispatch: bool, min: MinConfidence) -> Option<Value> {
+    let reason = if !dispatch {
+        "dispatch:false"
+    } else if min == MinConfidence::High {
+        "min_confidence high"
+    } else {
+        return None;
+    };
+    Some(json!({ "evaluated": false, "reason": reason }))
+}
 
 fn confidence_name(m: MinConfidence) -> &'static str {
     match m {
@@ -284,6 +302,9 @@ fn answer(
             "max_nodes": opts.max_nodes,
             "dispatch": opts.dispatch,
         });
+        if let Some(note) = dispatch_not_evaluated(opts.dispatch, opts.min_confidence) {
+            out["dispatch"] = note;
+        }
         let (u, d) = (&im.upstream, &im.downstream);
         let below = u.below_confidence + d.below_confidence;
         if below > 0 {
@@ -1049,6 +1070,45 @@ mod tests {
             "{v}"
         );
         assert!(v.get("omitted").is_none(), "{v}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review of TASK-017: when dispatch was not evaluated, the answer says
+    /// so — a constant note, read from the filters alone — so an empty
+    /// upstream under `min_confidence: high` or `dispatch: false` is not read
+    /// as "nobody reaches it through an interface". With dispatch on, no note.
+    #[test]
+    fn an_answer_says_when_dispatch_was_not_evaluated() {
+        let (state, repo) = indexed_files("impact_dispatch_note", JAVA_DI);
+        let v = impact(&state, "ServiceImpl.update", &ImpactQuery::default());
+        assert!(v.get("dispatch").is_none(), "{v}");
+        let high = ImpactQuery {
+            min_confidence: Some("high".into()),
+            ..Default::default()
+        };
+        let v = impact(&state, "ServiceImpl.update", &high);
+        assert_eq!(
+            v["dispatch"],
+            json!({ "evaluated": false, "reason": "min_confidence high" }),
+            "{v}"
+        );
+        for q in [
+            ImpactQuery {
+                dispatch: Some(false),
+                ..Default::default()
+            },
+            ImpactQuery {
+                dispatch: Some(false),
+                ..high.clone()
+            },
+        ] {
+            let v = impact(&state, "ServiceImpl.update", &q);
+            assert_eq!(
+                v["dispatch"],
+                json!({ "evaluated": false, "reason": "dispatch:false" }),
+                "{v}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&repo);
     }
 

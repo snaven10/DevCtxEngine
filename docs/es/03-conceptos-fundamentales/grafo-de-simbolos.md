@@ -178,7 +178,10 @@ pasó), y su confianza es `min(medium, la arista que representa)`: nunca `high`,
 una llamada `low` sigue `low` (contada en `below_confidence` por defecto). Para
 dejar el dispatch afuera: `dispatch: false` (`--no-dispatch`, `?dispatch=false`), o
 `min_confidence: "high"`, que deja afuera también toda llamada `medium` (y no lee
-ni cuenta ningún dispatch). Cubre
+ni cuenta ningún dispatch). En los dos casos la respuesta lo dice, leyendo solo
+los filtros: `dispatch: {"evaluated": false, "reason": "dispatch:false"}` o
+`{"evaluated": false, "reason": "min_confidence high"}` (no aparece cuando el
+dispatch se siguió). Cubre
 Java, TypeScript (`implements`, clases abstractas) y traits de Rust; las clases
 base de Python como mejor esfuerzo; Go no (embeber promueve métodos, no los
 sobrescribe, y una interfaz se satisface sin una arista que seguir).
