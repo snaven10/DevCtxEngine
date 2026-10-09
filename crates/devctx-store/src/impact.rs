@@ -1,0 +1,1041 @@
+//! `impact_analysis` over the symbol graph (PLAN-009 DD-11, TASK-009): the
+//! blast radius of a symbol walked **level by level over ids**, one query per
+//! level and direction whatever the size of the frontier, over `live_edges`
+//! (a call the link pass discarded reaches no answer).
+//!
+//! - The name is expanded once, into the ids of its definitions
+//!   ([`Store::lookup_symbols`]); every later hop follows ids, never names.
+//! - Each level keeps the best edge that reached each node; a node whose best
+//!   edge is under `min_confidence`, an external, or a test (by default) is
+//!   left out **and counted**, never dropped in silence, and is not walked.
+//! - Within a level nodes are ordered by `confidence`, then `rank` (the
+//!   global PageRank; NULL until TASK-010, when the order falls to the name),
+//!   then the name.
+//! - The cap (`max_nodes`, per direction) is applied **before** the next
+//!   level is computed: the nodes of the level that overflow it are counted,
+//!   not walked, and no deeper level is read.
+//!
+//! The 0.9.0 walk over `graph_edges` ([`Store::impact_analysis`]) stays as
+//! it is: it is the old path for a branch the current extractor has not
+//! indexed (DD-19).
+
+use std::collections::{HashMap, HashSet};
+
+use duckdb::params_from_iter;
+
+use crate::error::Result;
+use crate::lookup::{dotted, MinConfidence};
+use crate::store::Store;
+
+/// Default of `max_nodes` (DD-11).
+pub const DEFAULT_IMPACT_MAX_NODES: usize = 200;
+
+/// Default depth of `impact_analysis`.
+pub const DEFAULT_IMPACT_DEPTH: usize = 3;
+
+/// How many definitions a name may expand into. 0.9.0 had no cap; this one
+/// is only a guard against a pathological name.
+const SEED_LIMIT: usize = 10_000;
+
+/// The relations a blast radius follows: calls, as 0.9.0 did, and
+/// instantiations (`new Foo()` calls `Foo`'s constructor), as
+/// `get_references` lists by default.
+const IMPACT_KINDS: &str = "('calls', 'instantiates')";
+
+/// What `impact_analysis` shows and how far it walks (DD-11, Q-2 of the
+/// plan): by default `high` and `medium`, no tests, no externals, 200 nodes
+/// per direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImpactOptions {
+    /// Levels to walk.
+    pub depth: usize,
+    /// Lowest confidence of the edge that reaches a node.
+    pub min_confidence: MinConfidence,
+    /// Show (and walk) symbols of test files.
+    pub include_tests: bool,
+    /// Show the external destinations of the downstream side (never walked:
+    /// they have no definition here).
+    pub include_external: bool,
+    /// Nodes per direction; 0 = no cap.
+    pub max_nodes: usize,
+}
+
+impl Default for ImpactOptions {
+    fn default() -> Self {
+        Self {
+            depth: DEFAULT_IMPACT_DEPTH,
+            min_confidence: MinConfidence::Medium,
+            include_tests: false,
+            include_external: false,
+            max_nodes: DEFAULT_IMPACT_MAX_NODES,
+        }
+    }
+}
+
+/// How a level query names its frontier. Measured on a copy of a Java
+/// repository and of this one (TASK-009): see [`FrontierSql::default`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrontierSql {
+    /// `IN (1, 2, …)`, the ids written into the statement (they are
+    /// integers: nothing to escape). One statement per level.
+    #[default]
+    InList,
+    /// A temporary table refilled per level (delete, append, join).
+    TempTable,
+    /// One `UBIGINT[]` parameter, unnested.
+    ListParam,
+}
+
+/// A direction of the walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Callers: who is affected if the symbol changes.
+    Upstream,
+    /// Callees: what the symbol depends on.
+    Downstream,
+}
+
+/// A node of the blast radius.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImpactNode {
+    /// The definition's id; `None` for a destination with no definition here
+    /// (an external, or a call the link pass could not decide).
+    pub id: Option<u64>,
+    /// Qualified name; the name as written when there is no definition.
+    pub symbol: String,
+    /// File of the definition.
+    pub file: Option<String>,
+    /// First line of the definition.
+    pub line: Option<i32>,
+    /// Level it was reached at (1 = direct).
+    pub depth: usize,
+    /// Confidence of the best edge that reached it; `None` = undecided.
+    pub confidence: Option<String>,
+    /// Kind of that edge (`calls`, `instantiates`).
+    pub via: String,
+    /// A symbol of a test file (upstream: the occurrence is in one).
+    pub test: bool,
+    /// Defined outside the repository, with evidence (DD-9).
+    pub external: bool,
+    /// Global rank (PageRank), once the link pass computes it.
+    pub rank: Option<f64>,
+}
+
+impl ImpactNode {
+    /// Neither resolved nor external: the link pass could not decide.
+    pub fn undecided(&self) -> bool {
+        self.id.is_none() && !self.external
+    }
+}
+
+/// One direction of a blast radius, with what it left out.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImpactSide {
+    /// The nodes shown, by depth and then by the order of DD-11.
+    pub nodes: Vec<ImpactNode>,
+    /// Nodes found at `capped_at` that did not fit `max_nodes`: counted,
+    /// not shown, not walked; no deeper level was read.
+    pub capped: usize,
+    /// The level the cap stopped the walk at.
+    pub capped_at: Option<usize>,
+    /// Nodes reached only by edges under `min_confidence`.
+    pub below_confidence: usize,
+    /// Test symbols left out (`include_tests` false).
+    pub tests: usize,
+    /// External destinations left out (`include_external` false).
+    pub external: usize,
+    /// Level queries run.
+    pub levels: usize,
+}
+
+/// The blast radius of a name over the symbol graph.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SymbolImpact {
+    /// Qualified names of the definitions the name expanded into, sorted.
+    pub resolved: Vec<String>,
+    /// For a name with no definition here: the destination whose external
+    /// call sites stood for it (their callers are the upstream).
+    pub external_target: Option<String>,
+    /// Callers.
+    pub upstream: ImpactSide,
+    /// Callees.
+    pub downstream: ImpactSide,
+}
+
+/// One edge of a level, as a level query reads it.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct LevelRow {
+    /// The frontier id the edge leaves from (upstream: its destination).
+    pub from: u64,
+    /// The node reached.
+    pub id: Option<u64>,
+    /// Its qualified name, or the destination as written.
+    pub symbol: String,
+    /// File of its definition.
+    pub file: Option<String>,
+    /// First line of its definition.
+    pub line: Option<i32>,
+    /// Edge kind.
+    pub kind: String,
+    /// Edge confidence.
+    pub confidence: Option<String>,
+    /// External destination.
+    pub external: bool,
+    /// A test symbol, or an occurrence in a test file.
+    pub test: bool,
+    /// The node's rank.
+    pub rank: Option<f64>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Statements the level queries ran on this thread (test (a)).
+    pub(crate) static LEVEL_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn count_statement() {
+    #[cfg(test)]
+    LEVEL_STATEMENTS.with(|c| c.set(c.get() + 1));
+}
+
+fn row_to_level(r: &duckdb::Row<'_>) -> duckdb::Result<LevelRow> {
+    Ok(LevelRow {
+        from: r.get(0)?,
+        id: r.get(1)?,
+        symbol: r.get(2)?,
+        file: r.get(3)?,
+        line: r.get(4)?,
+        kind: r.get(5)?,
+        confidence: r.get(6)?,
+        external: r.get(7)?,
+        test: r.get(8)?,
+        rank: r.get(9)?,
+    })
+}
+
+/// A node, for deduplication within a direction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Key {
+    Id(u64),
+    Name(String, bool),
+}
+
+impl Key {
+    fn of(r: &LevelRow) -> Key {
+        match r.id {
+            Some(id) => Key::Id(id),
+            None => Key::Name(r.symbol.clone(), r.external),
+        }
+    }
+}
+
+/// `high` 3, `medium` 2, anything else 1.
+fn confidence_rank(c: Option<&str>) -> u8 {
+    match c {
+        Some("high") => 3,
+        Some("medium") => 2,
+        _ => 1,
+    }
+}
+
+/// Whether `r` is a better edge to its node than `b`.
+fn better(r: &LevelRow, b: &LevelRow) -> bool {
+    let (rc, bc) = (
+        confidence_rank(r.confidence.as_deref()),
+        confidence_rank(b.confidence.as_deref()),
+    );
+    rc > bc || (rc == bc && r.kind < b.kind)
+}
+
+/// DD-11's order within a level: confidence, rank (NULL last), name; then
+/// file, line and id so the answer is deterministic.
+fn level_order(a: &LevelRow, b: &LevelRow) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    confidence_rank(b.confidence.as_deref())
+        .cmp(&confidence_rank(a.confidence.as_deref()))
+        .then_with(|| match (a.rank, b.rank) {
+            (Some(x), Some(y)) => y.partial_cmp(&x).unwrap_or(Ordering::Equal),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        })
+        .then_with(|| a.symbol.cmp(&b.symbol))
+        .then_with(|| a.file.cmp(&b.file))
+        .then_with(|| a.line.cmp(&b.line))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+/// The level-by-level walk of one direction from `seeds`, reading each level
+/// with `level` (one call per level). `itself` are the seeds that are the
+/// name asked about as written: never reported (0.9.0 did not report the
+/// name asked about); any other seed is reported when reached from another
+/// node (`Resource.update → Service.update`, both answering to `update`).
+///
+/// With `from_sites`, the first level is read with an empty frontier: the
+/// callers of a name the repository does not define (its external call
+/// sites), as `get_references` lists them.
+pub(crate) fn walk(
+    seeds: &[u64],
+    itself: &HashSet<u64>,
+    opts: &ImpactOptions,
+    from_sites: bool,
+    mut level: impl FnMut(&[u64]) -> Result<Vec<LevelRow>>,
+) -> Result<ImpactSide> {
+    let mut side = ImpactSide::default();
+    let mut walked: HashSet<u64> = HashSet::new();
+    let mut frontier: Vec<u64> = seeds
+        .iter()
+        .copied()
+        .filter(|&s| walked.insert(s))
+        .collect();
+    let mut reported: HashSet<Key> = itself.iter().map(|&i| Key::Id(i)).collect();
+    let (mut below, mut tests, mut external) = (HashSet::new(), HashSet::new(), HashSet::new());
+    let cap = if opts.max_nodes == 0 {
+        usize::MAX
+    } else {
+        opts.max_nodes
+    };
+    for depth in 1..=opts.depth {
+        if frontier.is_empty() && !(from_sites && depth == 1) {
+            break;
+        }
+        let rows = level(&frontier)?;
+        side.levels += 1;
+        let mut best: HashMap<Key, LevelRow> = HashMap::new();
+        for r in rows {
+            // A recursive call reaches nothing new.
+            if r.id == Some(r.from) {
+                continue;
+            }
+            let key = Key::of(&r);
+            if reported.contains(&key) {
+                continue;
+            }
+            match best.get(&key) {
+                Some(b) if !better(&r, b) => {}
+                _ => {
+                    best.insert(key, r);
+                }
+            }
+        }
+        let mut admitted: Vec<(Key, LevelRow)> = Vec::new();
+        for (key, r) in best {
+            if !opts.min_confidence.admits(r.confidence.as_deref()) {
+                below.insert(key);
+            } else if r.external && !opts.include_external {
+                external.insert(key);
+            } else if r.test && !opts.include_tests {
+                tests.insert(key);
+            } else {
+                admitted.push((key, r));
+            }
+        }
+        admitted.sort_by(|a, b| level_order(&a.1, &b.1));
+        let room = cap.saturating_sub(side.nodes.len());
+        let over = admitted.len() > room;
+        if over {
+            side.capped = admitted.len() - room;
+            side.capped_at = Some(depth);
+            admitted.truncate(room);
+        }
+        let mut next = Vec::new();
+        for (key, r) in admitted {
+            reported.insert(key);
+            if let Some(id) = r.id {
+                if walked.insert(id) {
+                    next.push(id);
+                }
+            }
+            side.nodes.push(ImpactNode {
+                id: r.id,
+                symbol: r.symbol,
+                file: r.file,
+                line: r.line,
+                depth,
+                confidence: r.confidence,
+                via: r.kind,
+                test: r.test,
+                external: r.external,
+                rank: r.rank,
+            });
+        }
+        if over {
+            break;
+        }
+        frontier = next;
+    }
+    // A node left out at one level and reached at a later one by a better
+    // edge is shown, not counted.
+    let left_out = |set: HashSet<Key>| set.iter().filter(|k| !reported.contains(k)).count();
+    side.below_confidence = left_out(below);
+    side.tests = left_out(tests);
+    side.external = left_out(external);
+    Ok(side)
+}
+
+impl Store {
+    /// The blast radius of `name` over the symbol graph (DD-11): the
+    /// definitions it designates ([`lookup_symbols`](Self::lookup_symbols);
+    /// `file` restricts to `file::name`), then each direction walked level by
+    /// level over `live_edges`.
+    pub fn impact_graph(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+        file: Option<&str>,
+        opts: &ImpactOptions,
+    ) -> Result<SymbolImpact> {
+        self.impact_graph_with(repo, branch, name, file, opts, FrontierSql::default())
+    }
+
+    /// [`impact_graph`](Self::impact_graph) with an explicit frontier form
+    /// (the measurement of TASK-009 compares them).
+    #[doc(hidden)]
+    pub fn impact_graph_with(
+        &self,
+        repo: &str,
+        branch: &str,
+        name: &str,
+        file: Option<&str>,
+        opts: &ImpactOptions,
+        mode: FrontierSql,
+    ) -> Result<SymbolImpact> {
+        let syms = self.lookup_symbols(repo, branch, name, file, SEED_LIMIT)?;
+        let asked = dotted(name.trim());
+        let seeds: Vec<u64> = syms.iter().map(|s| s.id).collect();
+        let itself: HashSet<u64> = syms
+            .iter()
+            .filter(|s| s.qualified == asked)
+            .map(|s| s.id)
+            .collect();
+        // A name with no definition here stands for its external call
+        // sites (the rule of `lookup_external`; never under `file::name`):
+        // their callers are its upstream, it has no downstream.
+        let sites = if seeds.is_empty() && file.is_none() {
+            self.external_target(repo, branch, &asked)?
+        } else {
+            None
+        };
+        let side = |dir: Direction| {
+            let from_sites = dir == Direction::Upstream && sites.is_some();
+            walk(&seeds, &itself, opts, from_sites, |f| match (&sites, f) {
+                (Some(t), []) => self.impact_site_callers(repo, branch, t),
+                _ => self.impact_level(repo, branch, f, dir, mode),
+            })
+        };
+        Ok(SymbolImpact {
+            resolved: Store::qualified_names(&syms),
+            external_target: sites.clone(),
+            upstream: side(Direction::Upstream)?,
+            downstream: side(Direction::Downstream)?,
+        })
+    }
+
+    /// The `n` symbols with the most resolved incoming calls on a branch,
+    /// by bare name (what a measurement picks its cases from).
+    #[doc(hidden)]
+    pub fn impact_top_called(
+        &self,
+        repo: &str,
+        branch: &str,
+        n: usize,
+    ) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT s.name, count(*) AS c FROM live_edges e
+               JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.dst_id
+              WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
+              GROUP BY s.name ORDER BY c DESC, s.name LIMIT {n}"
+        ))?;
+        let rows = stmt.query_map(duckdb::params![repo, branch], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// The first upstream level of a name with no definition: the symbols
+    /// holding its external call sites (`target`, dotted, as written or as
+    /// the last segment of a qualified destination).
+    fn impact_site_callers(&self, repo: &str, branch: &str, target: &str) -> Result<Vec<LevelRow>> {
+        let d = "replace(e.dst_name, '::', '.')";
+        count_statement();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT 0, e.src_id, s.qualified, s.file, s.start_line, e.kind, e.confidence,
+                    false, coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank
+               FROM live_edges e
+               JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
+              WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
+                AND e.dst_id IS NULL AND coalesce(e.external, false)
+                AND ({d} = ? OR ends_with({d}, '.' || ?))"
+        ))?;
+        let rows = stmt.query_map(duckdb::params![repo, branch, target, target], row_to_level)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// One level of the walk: every `calls`/`instantiates` edge of
+    /// `live_edges` into (upstream) or out of (downstream) the ids of
+    /// `frontier`, with the node at its other end.
+    #[doc(hidden)]
+    pub fn impact_level(
+        &self,
+        repo: &str,
+        branch: &str,
+        frontier: &[u64],
+        dir: Direction,
+        mode: FrontierSql,
+    ) -> Result<Vec<LevelRow>> {
+        if frontier.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args: Vec<duckdb::types::Value> =
+            vec![repo.to_string().into(), branch.to_string().into()];
+        let set = match mode {
+            FrontierSql::InList => format!(
+                "({})",
+                frontier
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            FrontierSql::ListParam => {
+                args.push(
+                    format!(
+                        "[{}]",
+                        frontier
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                    .into(),
+                );
+                "(SELECT unnest(CAST(? AS UBIGINT[])))".to_string()
+            }
+            FrontierSql::TempTable => {
+                self.conn.execute_batch(
+                    "CREATE TEMP TABLE IF NOT EXISTS impact_frontier (id UBIGINT);
+                     DELETE FROM impact_frontier;",
+                )?;
+                count_statement();
+                let mut app = self.conn.appender("impact_frontier")?;
+                for &id in frontier {
+                    app.append_row([id])?;
+                }
+                app.flush()?;
+                count_statement();
+                "(SELECT id FROM impact_frontier)".to_string()
+            }
+        };
+        let sql = match dir {
+            Direction::Upstream => format!(
+                "SELECT e.dst_id, e.src_id, s.qualified, s.file, s.start_line, e.kind,
+                        e.confidence, false,
+                        coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank
+                   FROM live_edges e
+                   JOIN symbols s ON s.repo = e.repo AND s.branch = e.branch AND s.id = e.src_id
+                  WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
+                    AND e.dst_id IN {set}"
+            ),
+            Direction::Downstream => format!(
+                "SELECT e.src_id, e.dst_id, coalesce(t.qualified, e.dst_name), t.file,
+                        t.start_line, e.kind, e.confidence, coalesce(e.external, false),
+                        coalesce(t.is_test, false), t.rank
+                   FROM live_edges e
+                   LEFT JOIN symbols t ON t.repo = e.repo AND t.branch = e.branch
+                                      AND t.id = e.dst_id
+                  WHERE e.repo = ? AND e.branch = ? AND e.kind IN {IMPACT_KINDS}
+                    AND e.src_id IN {set}"
+            ),
+        };
+        count_statement();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), row_to_level)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::{StoredSymbol, StoredSymbolEdge};
+    use std::collections::BTreeMap;
+
+    /// An edge of a synthetic symbol graph: `src` → `dst` (a qualified name
+    /// that gets a symbol, or, with `resolved` false, a name as written).
+    #[derive(Clone)]
+    pub(crate) struct E {
+        pub src: String,
+        pub dst: String,
+        pub resolved: bool,
+        pub confidence: Option<&'static str>,
+        pub external: bool,
+        pub resolution: Option<&'static str>,
+        pub line: i32,
+    }
+
+    /// A resolved `high` call.
+    pub(crate) fn call(src: &str, dst: &str) -> E {
+        E {
+            src: src.into(),
+            dst: dst.into(),
+            resolved: true,
+            confidence: Some("high"),
+            external: false,
+            resolution: Some("local"),
+            line: 1,
+        }
+    }
+
+    /// The file a qualified name lives in: one file for the code, one per
+    /// test class (`Test` in its first segment), so a graph of thousands of
+    /// symbols is a handful of writes.
+    fn file_of(q: &str) -> String {
+        let head = q.split('.').next().unwrap_or(q);
+        if head.contains("Test") {
+            format!("src/test/{head}.java")
+        } else {
+            "src/main/Main.java".to_string()
+        }
+    }
+
+    /// Writes `symbols` and `edges` for `edges` on `repo`/`main`: one
+    /// symbol per qualified name that is a source or a resolved destination
+    /// (ids by first appearance), `ranks` set on the ones named there.
+    pub(crate) fn symbol_graph(
+        store: &Store,
+        edges: &[E],
+        ranks: &[(&str, f64)],
+    ) -> BTreeMap<String, u64> {
+        let mut ids: BTreeMap<String, u64> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for e in edges {
+            for (q, is_sym) in [(&e.src, true), (&e.dst, e.resolved)] {
+                if is_sym && !ids.contains_key(q) {
+                    ids.insert(q.clone(), 1000 + ids.len() as u64);
+                    order.push(q.clone());
+                }
+            }
+        }
+        let mut by_file: BTreeMap<String, Vec<StoredSymbol>> = BTreeMap::new();
+        for (i, q) in order.iter().enumerate() {
+            let file = file_of(q);
+            by_file.entry(file.clone()).or_default().push(StoredSymbol {
+                id: ids[q],
+                file: file.clone(),
+                kind: "method".into(),
+                name: q.rsplit('.').next().unwrap().to_string(),
+                qualified: q.clone(),
+                start_line: 10 + i as i32,
+                end_line: 12 + i as i32,
+                is_test: file.contains("/test/"),
+                rank: ranks.iter().find(|(n, _)| n == q).map(|(_, r)| *r),
+                ..Default::default()
+            });
+        }
+        for (file, syms) in &by_file {
+            store
+                .replace_file_symbols("repo", "main", file, syms)
+                .unwrap();
+        }
+        let mut edges_by_file: BTreeMap<String, Vec<StoredSymbolEdge>> = BTreeMap::new();
+        for e in edges {
+            let file = file_of(&e.src);
+            edges_by_file
+                .entry(file.clone())
+                .or_default()
+                .push(StoredSymbolEdge {
+                    kind: "calls".into(),
+                    src_id: ids[&e.src],
+                    dst_id: e.resolved.then(|| ids[&e.dst]),
+                    dst_name: e.dst.clone(),
+                    file: file.clone(),
+                    line: e.line,
+                    confidence: e.confidence.map(str::to_string),
+                    resolution: e.resolution.map(str::to_string),
+                    external: Some(e.external),
+                    from_test: file.contains("/test/"),
+                    edge_source: "treesitter".into(),
+                    hint: None,
+                });
+        }
+        for (file, rows) in &edges_by_file {
+            store
+                .replace_file_symbol_edges("repo", "main", file, rows)
+                .unwrap();
+        }
+        ids
+    }
+
+    fn names(side: &ImpactSide) -> Vec<&str> {
+        side.nodes.iter().map(|n| n.symbol.as_str()).collect()
+    }
+
+    fn all_in() -> ImpactOptions {
+        ImpactOptions {
+            min_confidence: MinConfidence::Low,
+            include_tests: true,
+            include_external: true,
+            max_nodes: 0,
+            ..Default::default()
+        }
+    }
+
+    /// (a) One statement per level and direction, whatever the size of the
+    /// frontier: three levels of 1 000 callers each, depth 3, are at most
+    /// 2 × 3 level statements (the seed lookup is one more, constant). The
+    /// 0.9.0 walk ran one query per node: 3 000 here.
+    #[test]
+    fn a_level_is_one_query_whatever_the_frontier() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut edges = Vec::new();
+        for i in 0..1000 {
+            edges.push(call(&format!("A{i}.a"), "Core.run"));
+            edges.push(call(&format!("B{i}.b"), &format!("A{i}.a")));
+            edges.push(call(&format!("C{i}.c"), &format!("B{i}.b")));
+        }
+        edges.push(call("Core.run", "Dep.x"));
+        symbol_graph(&store, &edges, &[]);
+        for mode in [FrontierSql::InList, FrontierSql::ListParam] {
+            LEVEL_STATEMENTS.with(|c| c.set(0));
+            let opts = ImpactOptions {
+                max_nodes: 0,
+                ..Default::default()
+            };
+            let im = store
+                .impact_graph_with("repo", "main", "Core.run", None, &opts, mode)
+                .unwrap();
+            assert_eq!(im.upstream.nodes.len(), 3000, "{mode:?}");
+            assert_eq!(names(&im.downstream), ["Dep.x"], "{mode:?}");
+            let n = LEVEL_STATEMENTS.with(|c| c.get());
+            assert!(n <= 2 * 3, "{mode:?}: {n} level statements");
+            assert!(im.upstream.levels <= 3 && im.downstream.levels <= 3);
+        }
+        // The temporary table costs two more statements per level (empty
+        // and fill), still independent of the frontier.
+        LEVEL_STATEMENTS.with(|c| c.set(0));
+        let im = store
+            .impact_graph_with(
+                "repo",
+                "main",
+                "Core.run",
+                None,
+                &ImpactOptions {
+                    max_nodes: 0,
+                    ..Default::default()
+                },
+                FrontierSql::TempTable,
+            )
+            .unwrap();
+        assert_eq!(im.upstream.nodes.len(), 3000);
+        assert!(LEVEL_STATEMENTS.with(|c| c.get()) <= 3 * 2 * 3);
+    }
+
+    /// (b) 1 000 callers and `max_nodes` 200: 200 shown, 800 counted, and
+    /// the next level is never read.
+    #[test]
+    fn the_cap_counts_the_rest_and_stops_before_the_next_level() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut edges: Vec<E> = (0..1000)
+            .map(|i| call(&format!("C{i:04}.c"), "Core.run"))
+            .collect();
+        edges.push(call("Far.away", "C0000.c"));
+        symbol_graph(&store, &edges, &[]);
+        let im = store
+            .impact_graph("repo", "main", "Core.run", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(im.upstream.nodes.len(), 200);
+        assert_eq!(im.upstream.capped, 800);
+        assert_eq!(im.upstream.capped_at, Some(1));
+        assert_eq!(im.upstream.levels, 1, "the cap is applied before level 2");
+        assert!(!names(&im.upstream).contains(&"Far.away"));
+        // By name, as rank is NULL: the first 200.
+        assert_eq!(im.upstream.nodes[0].symbol, "C0000.c");
+        assert_eq!(im.upstream.nodes[199].symbol, "C0199.c");
+        // A level that fills the cap exactly lets the next one be counted.
+        let opts = ImpactOptions {
+            max_nodes: 1000,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "Core.run", None, &opts)
+            .unwrap();
+        assert_eq!((im.upstream.nodes.len(), im.upstream.capped), (1000, 1));
+        assert_eq!(im.upstream.capped_at, Some(2));
+    }
+
+    /// (c) Tests and externals are left out by default, counted, and not
+    /// walked; with `include_*` they are listed and marked.
+    #[test]
+    fn tests_and_externals_are_counted_by_default_and_listed_on_request() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut ext = call("Svc.run", "serde.from_str");
+        ext.resolved = false;
+        ext.external = true;
+        ext.confidence = Some("medium");
+        let edges = vec![
+            call("Api.handle", "Svc.run"),
+            call("SvcTest.runs", "Svc.run"),
+            call("Helper.setup", "SvcTest.runs"),
+            call("Svc.run", "Repo.save"),
+            ext,
+        ];
+        symbol_graph(&store, &edges, &[]);
+        let im = store
+            .impact_graph("repo", "main", "Svc.run", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Api.handle"]);
+        assert_eq!(im.upstream.tests, 1);
+        assert_eq!(names(&im.downstream), ["Repo.save"]);
+        assert_eq!(im.downstream.external, 1);
+
+        let opts = ImpactOptions {
+            include_tests: true,
+            include_external: true,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "Svc.run", None, &opts)
+            .unwrap();
+        assert_eq!(
+            names(&im.upstream),
+            ["Api.handle", "SvcTest.runs", "Helper.setup"]
+        );
+        let t = &im.upstream.nodes[1];
+        assert!(t.test && t.depth == 1, "{t:?}");
+        assert_eq!(
+            im.upstream.nodes[2].depth, 2,
+            "a test is walked when listed"
+        );
+        assert_eq!(names(&im.downstream), ["Repo.save", "serde.from_str"]);
+        let e = &im.downstream.nodes[1];
+        assert!(e.external && e.id.is_none() && !e.undecided(), "{e:?}");
+        assert_eq!((im.upstream.tests, im.downstream.external), (0, 0));
+    }
+
+    /// (d) Within a level: confidence, then rank (NULL last: it falls to the
+    /// name), then the name.
+    #[test]
+    fn a_level_is_ordered_by_confidence_rank_and_name() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut medium = call("A.y", "Core.run");
+        medium.confidence = Some("medium");
+        let edges = vec![
+            call("B.z", "Core.run"),
+            medium,
+            call("D.b", "Core.run"),
+            call("C.a", "Core.run"),
+            call("E.e", "Core.run"),
+        ];
+        symbol_graph(&store, &edges, &[("C.a", 0.5), ("E.e", 0.9)]);
+        let im = store
+            .impact_graph("repo", "main", "Core.run", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["E.e", "C.a", "B.z", "D.b", "A.y"]);
+        assert_eq!(im.upstream.nodes[4].confidence.as_deref(), Some("medium"));
+    }
+
+    /// Requirement 1 of the review: a discarded call reaches no impact,
+    /// whatever the filters; `low` edges are counted by default and listed
+    /// with `min_confidence: low`, the undecided ones marked and not walked.
+    #[test]
+    fn discarded_calls_never_reach_an_impact_and_low_is_counted() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut gone = call("Gone.x", "Core.run");
+        gone.resolution = Some("discarded");
+        let mut gone_down = call("Core.run", "Lost.y");
+        gone_down.resolution = Some("discarded");
+        gone_down.external = true;
+        let mut low = call("Weak.w", "Core.run");
+        low.confidence = Some("low");
+        let mut undecided = call("Core.run", "flush");
+        undecided.resolved = false;
+        undecided.confidence = None;
+        undecided.resolution = None;
+        let edges = vec![gone, gone_down, low, undecided, call("Ok.k", "Core.run")];
+        symbol_graph(&store, &edges, &[]);
+        let im = store
+            .impact_graph("repo", "main", "Core.run", None, &all_in())
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Ok.k", "Weak.w"]);
+        assert_eq!(names(&im.downstream), ["flush"]);
+        assert!(im.downstream.nodes[0].undecided());
+        let im = store
+            .impact_graph("repo", "main", "Core.run", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Ok.k"]);
+        assert_eq!(im.upstream.below_confidence, 1);
+        assert!(im.downstream.nodes.is_empty());
+        assert_eq!(im.downstream.below_confidence, 1);
+    }
+
+    /// A node left out at one level and reached by a better edge at a later
+    /// one is listed, not counted; a recursive call adds nothing.
+    #[test]
+    fn a_node_shown_later_is_not_counted_and_recursion_adds_nothing() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut low = call("Late.l", "Core.run");
+        low.confidence = Some("low");
+        let edges = vec![
+            low,
+            call("Mid.m", "Core.run"),
+            call("Late.l", "Mid.m"),
+            call("Core.run", "Core.run"),
+        ];
+        symbol_graph(&store, &edges, &[]);
+        let im = store
+            .impact_graph("repo", "main", "Core.run", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Mid.m", "Late.l"]);
+        assert_eq!(im.upstream.nodes[1].depth, 2);
+        assert_eq!(im.upstream.below_confidence, 0);
+        assert!(im.downstream.nodes.is_empty());
+    }
+
+    /// The walk over the symbol graph as the 0.9.0 tests see it: `(symbol,
+    /// depth)` pairs.
+    fn as_0_9_0(
+        store: &Store,
+        opts: ImpactOptions,
+    ) -> impl Fn(&str, usize) -> crate::ImpactResult + '_ {
+        move |s, depth| {
+            let im = store
+                .impact_graph("repo", "main", s, None, &ImpactOptions { depth, ..opts })
+                .unwrap();
+            let pairs = |side: &ImpactSide| -> Vec<(String, usize)> {
+                side.nodes
+                    .iter()
+                    .map(|n| (n.symbol.clone(), n.depth))
+                    .collect()
+            };
+            crate::ImpactResult {
+                upstream: pairs(&im.upstream),
+                downstream: pairs(&im.downstream),
+            }
+        }
+    }
+
+    /// The `graph_edges` shapes of the 0.9.0 tests, as the symbol graph
+    /// holds them: every call resolved `high`.
+    fn seeded_graph() -> Store {
+        let store = Store::open_in_memory(3).unwrap();
+        symbol_graph(
+            &store,
+            &[call("a", "b"), call("a", "d"), call("b", "c")],
+            &[],
+        );
+        store
+    }
+
+    fn java_like_graph(extra: &[E]) -> Store {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut edges = vec![
+            call("OfficeResource.actualizar", "OfficeService.actualizar"),
+            call("TicketResource.actualizar", "TicketService.actualizar"),
+            call("OfficeService.actualizar", "Office.persist"),
+        ];
+        edges.extend_from_slice(extra);
+        symbol_graph(&store, &edges, &[]);
+        store
+    }
+
+    /// Review requirement 2: the asserts of the 0.9.0 impact tests
+    /// (`graph.rs`), unchanged, over the symbol graph — with the defaults,
+    /// and with every filter off (what 0.9.0, which had none, showed).
+    #[test]
+    fn the_0_9_0_impact_asserts_hold_over_the_symbol_graph() {
+        use crate::graph::tests as old;
+        for opts in [ImpactOptions::default(), all_in()] {
+            let store = seeded_graph();
+            old::check_impact_bfs_upstream_and_downstream(&as_0_9_0(&store, opts));
+            let store = java_like_graph(&[]);
+            old::check_impact_seeds_from_every_form_of_a_bare_name(&as_0_9_0(&store, opts));
+            let resolve = |s: &str| {
+                store
+                    .impact_graph("repo", "main", s, None, &opts)
+                    .unwrap()
+                    .resolved
+            };
+            old::check_resolving_a_bare_name_lists_every_declaration_it_could_mean(&resolve);
+            let callers = |s: &str| -> Vec<String> {
+                let walk = as_0_9_0(&store, opts);
+                walk(s, 1).upstream.into_iter().map(|(n, _)| n).collect()
+            };
+            old::check_a_qualified_name_does_not_collect_its_homonyms(&resolve, &callers);
+        }
+        // `Office.persist` calls a bare `flush` the link pass could not
+        // decide; an unrelated `Repo.flush` calls something that must never
+        // surface. 0.9.0 listed `flush`: so does the walk with every filter
+        // off, and it never follows it (it has no id).
+        let mut flush = call("Office.persist", "flush");
+        flush.resolved = false;
+        flush.confidence = None;
+        flush.resolution = None;
+        let mut deeper = call("Repo.flush", "noDebeAparecer");
+        deeper.resolved = false;
+        let store = java_like_graph(&[flush, deeper]);
+        old::check_traversal_does_not_re_expand_the_names_it_walks(&as_0_9_0(&store, all_in()));
+        // By default it is counted, not listed.
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "OfficeService.actualizar",
+                None,
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(names(&im.downstream), ["Office.persist"]);
+        assert_eq!(im.downstream.below_confidence, 1);
+    }
+
+    /// A name with no definition here stands for its external call sites
+    /// (as in `get_references`): their callers are the upstream, walked by
+    /// id from there; there is no downstream. A name with neither is empty.
+    #[test]
+    fn a_name_with_no_definition_walks_from_its_external_sites() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut ext = call("Svc.run", "serde_json::from_str");
+        ext.resolved = false;
+        ext.external = true;
+        ext.confidence = Some("medium");
+        let mut test_site = ext.clone();
+        test_site.src = "SvcTest.parses".into();
+        symbol_graph(
+            &store,
+            &[ext, test_site, call("Api.handle", "Svc.run")],
+            &[],
+        );
+        for name in ["from_str", "serde_json::from_str", "serde_json.from_str"] {
+            let im = store
+                .impact_graph("repo", "main", name, None, &ImpactOptions::default())
+                .unwrap();
+            assert!(im.resolved.is_empty(), "{name}");
+            assert!(im.external_target.is_some(), "{name}");
+            assert_eq!(names(&im.upstream), ["Svc.run", "Api.handle"], "{name}");
+            assert_eq!(im.upstream.nodes[0].confidence.as_deref(), Some("medium"));
+            assert_eq!(im.upstream.tests, 1, "{name}");
+            assert!(im.downstream.nodes.is_empty(), "{name}");
+        }
+        let im = store
+            .impact_graph("repo", "main", "nothing", None, &ImpactOptions::default())
+            .unwrap();
+        assert!(im.external_target.is_none() && im.upstream.nodes.is_empty());
+        // `file::name` never stands for a library's sites.
+        let im = store
+            .impact_graph(
+                "repo",
+                "main",
+                "from_str",
+                Some("src/main/Main.java"),
+                &ImpactOptions::default(),
+            )
+            .unwrap();
+        assert!(im.external_target.is_none() && im.upstream.nodes.is_empty());
+    }
+}

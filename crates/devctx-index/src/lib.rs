@@ -4080,4 +4080,38 @@ public class A extends B implements C {
         assert_eq!(calls, 4, "{edges:?}"); // helper ×2, Svc, run at module level
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The 0.9.0 assert of [`graph_edges_stays_readable_by_0_9_0`] on
+    /// `impact_analysis`, over the symbol graph of the same index (TASK-009):
+    /// two calls from one method are one caller.
+    #[test]
+    fn impact_over_the_symbol_graph_keeps_the_0_9_0_answer() {
+        let (dir, repo) = graph_repo(
+            "compat_impact",
+            &[(
+                "svc.py",
+                "class Svc:\n    def run(self):\n        self.helper()\n        self.helper()\n\n    def helper(self):\n        pass\n\nSvc().run()\n",
+            )],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let opts = devctx_store::ImpactOptions {
+            depth: 2,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph(&repo, "main", "Svc.helper", None, &opts)
+            .unwrap();
+        let upstream: Vec<(String, usize)> = im
+            .upstream
+            .nodes
+            .iter()
+            .map(|n| (n.symbol.clone(), n.depth))
+            .collect();
+        // Depth 2 reaches the module-level `Svc().run()` too (its source is
+        // the file symbol), which 0.9.0's `graph_edges` never held.
+        assert_eq!(upstream[0], ("Svc.run".to_string(), 1));
+        assert_eq!(upstream[1..], [("svc.py".to_string(), 2)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

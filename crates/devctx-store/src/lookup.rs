@@ -10,8 +10,8 @@
 //! The 0.9.0 readers (`symbol_definitions`, `symbol_matches`,
 //! `symbol_suggestions`, `resolve_symbol`, `find_references`,
 //! `external_call_sites`, `graph_edges`) stay as they are: they are the old
-//! path for a branch the current extractor has not indexed (DD-19), and
-//! `impact_analysis` still walks `graph_edges` until TASK-009.
+//! path for a branch the current extractor has not indexed (DD-19).
+//! `impact_analysis` over the symbol graph lives in `impact.rs` (TASK-009).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -147,7 +147,7 @@ impl MinConfidence {
 
 /// `Foo::bar` and `Foo.bar` are one name: the extractor writes Rust paths
 /// with `::` in `dst_name` and every `qualified` with `.`.
-fn dotted(name: &str) -> String {
+pub(crate) fn dotted(name: &str) -> String {
     name.replace("::", ".")
 }
 
@@ -475,6 +475,26 @@ impl Store {
         self.external_sites(repo, branch, last)
     }
 
+    /// The destination name whose external sites stand for `q` (dotted): `q`
+    /// itself when it has some, else its last segment when no definition of
+    /// the branch has that bare name (the rule of
+    /// [`lookup_external`](Self::lookup_external)).
+    pub(crate) fn external_target(
+        &self,
+        repo: &str,
+        branch: &str,
+        q: &str,
+    ) -> Result<Option<String>> {
+        if self.external_sites(repo, branch, q)?.is_some() {
+            return Ok(Some(q.to_string()));
+        }
+        let last = last_segment(q);
+        Ok(
+            (!last.is_empty() && last != q && !self.defines_name(repo, branch, last)?)
+                .then(|| last.to_string()),
+        )
+    }
+
     fn external_sites(&self, repo: &str, branch: &str, q: &str) -> Result<Option<ExternalSites>> {
         let d = dotted_sql("dst_name");
         let mut stmt = self.conn.prepare(&format!(
@@ -531,14 +551,7 @@ impl Store {
             ));
             args.extend(ids.iter().map(|&i| duckdb::types::Value::UBigInt(i)));
         } else if external {
-            let target = if self.external_sites(repo, branch, &q)?.is_some() {
-                Some(q.clone())
-            } else {
-                let last = last_segment(&q);
-                (!last.is_empty() && last != q && !self.defines_name(repo, branch, last)?)
-                    .then(|| last.to_string())
-            };
-            if let Some(t) = target {
+            if let Some(t) = self.external_target(repo, branch, &q)? {
                 conds.push(format!(
                     "(e.dst_id IS NULL AND coalesce(e.external, false)
                       AND ({d} = ? OR ends_with({d}, '.' || ?)))"

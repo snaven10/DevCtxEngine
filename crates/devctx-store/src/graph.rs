@@ -389,7 +389,7 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn edge(source: &str, target: &str, file: &str, line: i32) -> StoredEdge {
@@ -433,15 +433,22 @@ mod tests {
     #[test]
     fn impact_bfs_upstream_and_downstream() {
         let store = seeded();
-        let impact = store.impact_analysis("repo", "main", "c", 5).unwrap();
+        check_impact_bfs_upstream_and_downstream(&|s, d| {
+            store.impact_analysis("repo", "main", s, d).unwrap()
+        });
+    }
+
+    /// The asserts of [`impact_bfs_upstream_and_downstream`], for any walk
+    /// (the symbol graph runs them too, TASK-009).
+    pub(crate) fn check_impact_bfs_upstream_and_downstream(
+        walk: &dyn Fn(&str, usize) -> ImpactResult,
+    ) {
+        let impact = walk("c", 5);
         // upstream of c: b (1), a (2)
         assert!(impact.upstream.contains(&("b".to_string(), 1)));
         assert!(impact.upstream.contains(&("a".to_string(), 2)));
         // downstream of a: b (1), d (1), c (2)
-        let down = store
-            .impact_analysis("repo", "main", "a", 5)
-            .unwrap()
-            .downstream;
+        let down = walk("a", 5).downstream;
         assert!(down.contains(&("b".to_string(), 1)));
         assert!(down.contains(&("c".to_string(), 2)));
     }
@@ -518,7 +525,17 @@ mod tests {
     #[test]
     fn resolving_a_bare_name_lists_every_declaration_it_could_mean() {
         let store = java_like();
-        let names = store.resolve_symbol("repo", "main", "actualizar").unwrap();
+        check_resolving_a_bare_name_lists_every_declaration_it_could_mean(&|s| {
+            store.resolve_symbol("repo", "main", s).unwrap()
+        });
+    }
+
+    /// The asserts of
+    /// [`resolving_a_bare_name_lists_every_declaration_it_could_mean`].
+    pub(crate) fn check_resolving_a_bare_name_lists_every_declaration_it_could_mean(
+        resolve: &dyn Fn(&str) -> Vec<String>,
+    ) {
+        let names = resolve("actualizar");
         assert_eq!(
             names,
             vec![
@@ -536,16 +553,23 @@ mod tests {
     #[test]
     fn a_qualified_name_does_not_collect_its_homonyms() {
         let store = java_like();
+        check_a_qualified_name_does_not_collect_its_homonyms(
+            &|s| store.resolve_symbol("repo", "main", s).unwrap(),
+            &|s| store.get_callers("repo", "main", s).unwrap(),
+        );
+    }
+
+    /// The asserts of [`a_qualified_name_does_not_collect_its_homonyms`].
+    pub(crate) fn check_a_qualified_name_does_not_collect_its_homonyms(
+        resolve: &dyn Fn(&str) -> Vec<String>,
+        callers: &dyn Fn(&str) -> Vec<String>,
+    ) {
         assert_eq!(
-            store
-                .resolve_symbol("repo", "main", "OfficeService.actualizar")
-                .unwrap(),
+            resolve("OfficeService.actualizar"),
             vec!["OfficeService.actualizar"]
         );
         assert_eq!(
-            store
-                .get_callers("repo", "main", "OfficeService.actualizar")
-                .unwrap(),
+            callers("OfficeService.actualizar"),
             vec!["OfficeResource.actualizar"]
         );
     }
@@ -590,11 +614,17 @@ mod tests {
                 &[edge("Repo.flush", "noDebeAparecer", "Repo.java", 12)],
             )
             .unwrap();
+        check_traversal_does_not_re_expand_the_names_it_walks(&|s, d| {
+            store.impact_analysis("repo", "main", s, d).unwrap()
+        });
+    }
 
-        let down = store
-            .impact_analysis("repo", "main", "OfficeService.actualizar", 5)
-            .unwrap()
-            .downstream;
+    /// The asserts of [`traversal_does_not_re_expand_the_names_it_walks`],
+    /// once `Office.persist → flush` and `Repo.flush → noDebeAparecer` exist.
+    pub(crate) fn check_traversal_does_not_re_expand_the_names_it_walks(
+        walk: &dyn Fn(&str, usize) -> ImpactResult,
+    ) {
+        let down = walk("OfficeService.actualizar", 5).downstream;
         let reached: Vec<&str> = down.iter().map(|(n, _)| n.as_str()).collect();
         assert!(reached.contains(&"Office.persist"));
         assert!(reached.contains(&"flush"));
@@ -614,9 +644,16 @@ mod tests {
     #[test]
     fn impact_seeds_from_every_form_of_a_bare_name() {
         let store = java_like();
-        let impact = store
-            .impact_analysis("repo", "main", "actualizar", 5)
-            .unwrap();
+        check_impact_seeds_from_every_form_of_a_bare_name(&|s, d| {
+            store.impact_analysis("repo", "main", s, d).unwrap()
+        });
+    }
+
+    /// The asserts of [`impact_seeds_from_every_form_of_a_bare_name`].
+    pub(crate) fn check_impact_seeds_from_every_form_of_a_bare_name(
+        walk: &dyn Fn(&str, usize) -> ImpactResult,
+    ) {
+        let impact = walk("actualizar", 5);
         assert!(impact
             .upstream
             .contains(&("OfficeResource.actualizar".to_string(), 1)));

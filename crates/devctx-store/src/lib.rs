@@ -8,6 +8,7 @@
 
 mod error;
 mod graph;
+mod impact;
 mod lookup;
 mod memory;
 mod memory_refs;
@@ -20,6 +21,10 @@ mod symbols;
 
 pub use error::{Result, StoreError};
 pub use graph::{GraphEdge, ImpactResult, Reference, StoredEdge};
+pub use impact::{
+    Direction, FrontierSql, ImpactNode, ImpactOptions, ImpactSide, LevelRow, SymbolImpact,
+    DEFAULT_IMPACT_DEPTH, DEFAULT_IMPACT_MAX_NODES,
+};
 pub use lookup::{
     sym_hex, ExternalSites, MinConfidence, SymbolDefinition, SymbolReference, ViewEdge,
 };
