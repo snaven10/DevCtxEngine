@@ -143,7 +143,7 @@ walked:
 
 | Parameter (CLI flag) | Default | Left out by default, counted in |
 |---|---|---|
-| `min_confidence` (`--min-confidence`) | `medium` | calls of `low` confidence, and calls to the name the index could not decide (`svc.update()` on an untyped receiver) → `below_confidence: {count, min_confidence, hint}`; `low` lists them, their callers marked `undecided` and not walked |
+| `min_confidence` (`--min-confidence`) | `medium` | symbols reached only by calls of `low` confidence → `below_confidence: {count, min_confidence, hint}` (counted in symbols); calls to the name the index could not decide (`svc.update()` on an untyped receiver) → `undecided_calls: {count, hint}` (counted in calls, none from a test or from a caller already listed); `low` lists both, the callers of the undecided calls marked `undecided` and not walked |
 | `include_tests` (`--include-tests`) | `false` | symbols of test files → `excluded.tests` |
 | `include_external` (`--include-external`) | `false` | library callees → `excluded.external` |
 | `max_nodes` (`--max-nodes`) | `200` per direction (`0` = no cap) | the symbols of the depth that overflows it → `omitted: {count, reason: "limit"}` and `omitted_by_limit: {count, max_nodes, upstream/downstream: {count, depth}}`; no deeper level is read |
@@ -159,8 +159,9 @@ adds what the budget and `max_nodes` cut). A name with no definition in the
 repository answers as `read_symbol` does: `external: true` with `called_from`
 (its upstream is then the callers of its call sites) or `suggestions`. On an
 index made before 0.10 the walk is 0.9's — by name, no confidence, no filters, no
-cap — with the `warning` that says so; a server older than 0.10 ignores the
-parameters, and the client then says so in `warning`.
+cap — with the `warning` that says so (and, when filters were passed, that they
+were not applied); a server older than 0.10 ignores the parameters, and the
+client then says so in `warning`.
 
 ### `read_symbol(name)` — the definition
 

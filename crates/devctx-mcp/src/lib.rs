@@ -200,9 +200,12 @@ struct ImpactReq {
     #[serde(default)]
     depth: Option<usize>,
     /// Lowest confidence of the call that reaches a symbol: `"high"`,
-    /// `"medium"` (default) or `"low"`. Whatever it leaves out is counted in
-    /// `below_confidence` and not walked; `low` lists the ambiguous calls and
-    /// the ones the index could not decide, marked `undecided: true`.
+    /// `"medium"` (default) or `"low"`. The symbols it leaves out are counted
+    /// in `below_confidence` and not walked; the calls to the name the index
+    /// could not decide are counted apart, in calls, in `undecided_calls`
+    /// (none from tests or from callers already listed); `low` lists the
+    /// ambiguous calls and the callers of the undecided ones, marked
+    /// `undecided: true`.
     #[serde(default)]
     min_confidence: Option<String>,
     /// List symbols of test files (default false: counted in
@@ -1200,7 +1203,8 @@ impl DevctxServer {
         callees of a symbol, by depth. Each symbol carries `confidence` and `via`; by \
         default only high/medium calls are followed, test files and library callees are \
         left out, and 200 symbols per direction are listed — whatever that leaves out is \
-        counted (`below_confidence`, `excluded`, `omitted`), never dropped silently. \
+        counted (`below_confidence` in symbols, `undecided_calls` in calls to the name the \
+        index could not decide, `excluded`, `omitted`), never dropped silently. \
         `min_confidence`, `include_tests`, `include_external` and `max_nodes` change \
         that. Returns JSON."
     )]

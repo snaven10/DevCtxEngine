@@ -8,6 +8,8 @@
 //! - Each level keeps the best edge that reached each node; a node whose best
 //!   edge is under `min_confidence`, an external, or a test (by default) is
 //!   left out **and counted**, never dropped in silence, and is not walked.
+//!   Calls to the name the link pass left undecided are counted apart, in
+//!   calls (`undecided_calls`), or listed with `low`.
 //! - Within a level nodes are ordered by `confidence`, then `rank` (the
 //!   global PageRank; NULL until TASK-010, when the order falls to the name),
 //!   then the name.
@@ -42,9 +44,6 @@ const SEED_LIMIT: usize = 10_000;
 /// `get_references` lists by default.
 const IMPACT_KINDS: &str = "('calls', 'instantiates')";
 
-/// [`IMPACT_KINDS`] as a list.
-const IMPACT_KIND_LIST: &[&str] = &["calls", "instantiates"];
-
 /// What `impact_analysis` shows and how far it walks (DD-11, Q-2 of the
 /// plan): by default `high` and `medium`, no tests, no externals, 200 nodes
 /// per direction.
@@ -76,8 +75,12 @@ impl Default for ImpactOptions {
 }
 
 /// Frontiers up to this many ids go as an `IN` list under
-/// [`FrontierSql::Auto`]; larger ones as one `UBIGINT[]` parameter.
-const AUTO_IN_MAX: usize = 1024;
+/// [`FrontierSql::Auto`]; larger ones as one `UBIGINT[]` parameter. 512
+/// (review of TASK-009, NIT 1; it was 1 024): the widest frontier of a real
+/// walk measured was 373 ids, so every measured walk keeps the `IN` list,
+/// and the only width measured above that (1 000 ids) already favoured the
+/// parameter (24 against 36 ms), so the band in between goes to it.
+const AUTO_IN_MAX: usize = 512;
 
 /// How a level query names its frontier: the default, [`Auto`](Self::Auto),
 /// was chosen by measuring them all on copies of two Java repositories and
@@ -100,7 +103,7 @@ pub enum FrontierSql {
     /// [`ListParam`](Self::ListParam) above. Measured on a copy of a Java
     /// repository of 1 250 files (review of TASK-009, m3): in real walks
     /// (frontiers up to ~400 ids) the `IN` list is 10-40 ms faster per walk
-    /// than the parameter; over synthetic frontiers of 2 000-20 000 ids the
+    /// than the parameter; over synthetic frontiers of 1 000-20 000 ids the
     /// parameter is 1.5-3× faster than the `IN` list (and the typed list
     /// slower than both), and no statement grows with the frontier.
     #[default]
@@ -188,6 +191,12 @@ pub struct SymbolImpact {
     pub upstream: ImpactSide,
     /// Callees.
     pub downstream: ImpactSide,
+    /// Calls to the name the link pass left undecided, counted one by one
+    /// (review of TASK-009, m-a): only from code that is not a test and from
+    /// callers not already listed upstream (nor the definitions themselves).
+    /// 0 when `min_confidence` is `low` (their callers are listed instead)
+    /// and under `file::name`.
+    pub undecided_calls: usize,
 }
 
 /// One edge of a level, as a level query reads it.
@@ -275,7 +284,8 @@ fn better(r: &LevelRow, b: &LevelRow) -> bool {
         confidence_rank(r.confidence.as_deref()),
         confidence_rank(b.confidence.as_deref()),
     );
-    rc > bc || (rc == bc && r.kind < b.kind)
+    // A decided edge beats an undecided one of the same confidence.
+    rc > bc || (rc == bc && (!r.unsure, &b.kind) > (!b.unsure, &r.kind))
 }
 
 /// DD-11's order within a level: confidence, rank (NULL last), name; then
@@ -320,6 +330,9 @@ pub(crate) fn walk(
         .filter(|&s| walked.insert(s))
         .collect();
     let mut reported: HashSet<Key> = itself.iter().map(|&i| Key::Id(i)).collect();
+    // Nodes shown only through an undecided call (never walked): a decided
+    // edge at a later level replaces them and walks them (review NIT 2).
+    let mut unsure_shown: HashSet<Key> = HashSet::new();
     let (mut below, mut tests, mut external) = (HashSet::new(), HashSet::new(), HashSet::new());
     let cap = if opts.max_nodes == 0 {
         usize::MAX
@@ -340,7 +353,7 @@ pub(crate) fn walk(
                 continue;
             }
             let key = Key::of(&r);
-            if reported.contains(&key) {
+            if reported.contains(&key) && (r.unsure || !unsure_shown.contains(&key)) {
                 continue;
             }
             match best.get(&key) {
@@ -363,6 +376,16 @@ pub(crate) fn walk(
             }
         }
         admitted.sort_by(|a, b| level_order(&a.1, &b.1));
+        // An unsure node reached now by a decided edge leaves its old place.
+        let upgraded: HashSet<u64> = admitted
+            .iter()
+            .filter(|(k, _)| unsure_shown.remove(k))
+            .filter_map(|(_, r)| r.id)
+            .collect();
+        if !upgraded.is_empty() {
+            side.nodes
+                .retain(|n| !(n.unsure && n.id.is_some_and(|i| upgraded.contains(&i))));
+        }
         let room = cap.saturating_sub(side.nodes.len());
         let over = admitted.len() > room;
         if over {
@@ -372,6 +395,9 @@ pub(crate) fn walk(
         }
         let mut next = Vec::new();
         for (key, r) in admitted {
+            if r.unsure {
+                unsure_shown.insert(key.clone());
+            }
             reported.insert(key);
             if let Some(id) = r.id.filter(|_| !r.unsure) {
                 if walked.insert(id) {
@@ -513,16 +539,31 @@ impl Store {
                 Ok(rows)
             })
         };
-        let mut upstream = side(Direction::Upstream)?;
-        if undecided && !list_undecided {
-            upstream.below_confidence +=
-                self.count_undecided_references(repo, branch, &asked, IMPACT_KIND_LIST)?;
-        }
+        let upstream = side(Direction::Upstream)?;
+        // Counted in calls, in a count of their own (review m-a): not in
+        // `below_confidence`, which counts symbols. A call from a test, from
+        // a caller already listed or from a definition of the name hides no
+        // caller, so it is not counted.
+        let undecided_calls = if undecided && !list_undecided {
+            let shown: HashSet<u64> = upstream
+                .nodes
+                .iter()
+                .filter_map(|n| n.id)
+                .chain(seeds.iter().copied())
+                .collect();
+            self.undecided_call_rows(repo, branch, &asked)?
+                .iter()
+                .filter(|r| !r.test && r.id.is_some_and(|id| !shown.contains(&id)))
+                .count()
+        } else {
+            0
+        };
         Ok(SymbolImpact {
             resolved: Store::qualified_names(&syms),
             external_target: sites.clone(),
             upstream,
             downstream: side(Direction::Downstream)?,
+            undecided_calls,
         })
     }
 
@@ -578,8 +619,15 @@ impl Store {
         branch: &str,
         name: &str,
     ) -> Result<Vec<LevelRow>> {
-        let d = "replace(e.dst_name, '::', '.')";
         count_statement();
+        self.undecided_call_rows(repo, branch, name)
+    }
+
+    /// One row per call to `name` (dotted) the link pass left undecided,
+    /// with its caller: what [`impact_undecided_callers`](Self::impact_undecided_callers)
+    /// lists and the `undecided_calls` count counts.
+    fn undecided_call_rows(&self, repo: &str, branch: &str, name: &str) -> Result<Vec<LevelRow>> {
+        let d = "replace(e.dst_name, '::', '.')";
         let mut stmt = self.conn.prepare(&format!(
             "SELECT 0, e.src_id, s.qualified, s.file, s.start_line, e.kind, e.confidence,
                     false, coalesce(e.from_test, false) OR coalesce(s.is_test, false), s.rank
@@ -1193,7 +1241,7 @@ pub(crate) mod tests {
 
     /// Review of TASK-009, M1: a call to the name that the link pass left
     /// undecided (`svc.update()` on an untyped receiver) is a caller 0.9.0
-    /// listed. By default it is counted in `below_confidence`; with `low` its
+    /// listed. By default it is counted in `undecided_calls` (m-a); with `low` its
     /// caller is listed, marked undecided, and not walked. Under
     /// `file::name` it is neither (it names a name, not a file).
     #[test]
@@ -1213,7 +1261,7 @@ pub(crate) mod tests {
             .impact_graph("repo", "main", "update", None, &ImpactOptions::default())
             .unwrap();
         assert_eq!(names(&im.upstream), ["Web.go"]);
-        assert_eq!(im.upstream.below_confidence, 1);
+        assert_eq!(im.undecided_calls, 1);
         let low = ImpactOptions {
             min_confidence: MinConfidence::Low,
             ..Default::default()
@@ -1239,15 +1287,92 @@ pub(crate) mod tests {
                 &ImpactOptions::default(),
             )
             .unwrap();
-        assert_eq!(im.upstream.below_confidence, 0);
+        assert_eq!(im.undecided_calls, 0);
         // `file::name`: neither listed nor counted.
         for opts in [ImpactOptions::default(), low] {
             let im = store
                 .impact_graph("repo", "main", "update", Some("src/main/Main.java"), &opts)
                 .unwrap();
             assert_eq!(names(&im.upstream), ["Web.go"]);
-            assert_eq!(im.upstream.below_confidence, 0);
+            assert_eq!(im.undecided_calls, 0);
         }
+    }
+
+    /// Review of TASK-009, m-a: `below_confidence` counts symbols, and the
+    /// undecided calls to the name go to their own count, in calls: none
+    /// from a test, none from a caller already listed (by a decided edge) or
+    /// from the definition itself.
+    #[test]
+    fn undecided_calls_have_their_own_count_without_tests_or_listed_callers() {
+        let store = Store::open_in_memory(3).unwrap();
+        let unsure = |src: &str| {
+            let mut e = call(src, "update");
+            e.resolved = false;
+            e.confidence = None;
+            e.resolution = None;
+            e
+        };
+        let mut weak = call("Weak.w", "Svc.update");
+        weak.confidence = Some("low");
+        let mut second = unsure("Api.handle");
+        second.line = 2;
+        let edges = vec![
+            call("Web.go", "Svc.update"),
+            weak,
+            unsure("Api.handle"),
+            second,
+            unsure("Web.go"),
+            unsure("SvcTest.runs"),
+            unsure("Svc.update"),
+        ];
+        symbol_graph(&store, &edges, &[]);
+        let im = store
+            .impact_graph("repo", "main", "update", None, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Web.go"]);
+        assert_eq!(im.upstream.below_confidence, 1, "only Weak.w, a symbol");
+        assert_eq!(im.undecided_calls, 2, "the two calls of Api.handle");
+        // Listed with `low`: nothing left to count.
+        let low = ImpactOptions {
+            min_confidence: MinConfidence::Low,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "update", None, &low)
+            .unwrap();
+        assert_eq!(im.undecided_calls, 0);
+        assert_eq!(im.upstream.below_confidence, 0);
+    }
+
+    /// Review of TASK-009, NIT 2: a caller listed at level 1 only through an
+    /// undecided call, and reached at level 2 by a decided edge, is that
+    /// decided node (no longer `undecided`) and is walked.
+    #[test]
+    fn an_unsure_caller_reached_later_by_a_decided_edge_is_walked() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut unsure = call("Api.handle", "update");
+        unsure.resolved = false;
+        unsure.confidence = None;
+        unsure.resolution = None;
+        let edges = vec![
+            call("Web.go", "Svc.update"),
+            unsure,
+            call("Api.handle", "Web.go"),
+            call("Top.t", "Api.handle"),
+        ];
+        symbol_graph(&store, &edges, &[]);
+        let low = ImpactOptions {
+            min_confidence: MinConfidence::Low,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph("repo", "main", "update", None, &low)
+            .unwrap();
+        assert_eq!(names(&im.upstream), ["Web.go", "Api.handle", "Top.t"]);
+        let n = &im.upstream.nodes[1];
+        assert!(!n.undecided() && n.depth == 2, "{n:?}");
+        assert_eq!(n.confidence.as_deref(), Some("high"));
+        assert_eq!(im.upstream.nodes[2].depth, 3);
     }
 
     /// Review of TASK-009, m4: a qualified name names its definitions, all

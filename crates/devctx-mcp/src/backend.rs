@@ -1174,18 +1174,31 @@ pub fn note_unapplied_impact_filters(raw: String) -> String {
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return raw;
     };
-    if v.get("filters").is_some() {
-        return raw;
+    if add_unapplied_impact_note(&mut v) {
+        v.to_string()
+    } else {
+        raw
     }
+}
+
+/// The note of [`note_unapplied_impact_filters`] on a parsed answer, also
+/// for the local old path (review of TASK-009, NIT 3): added once, and only
+/// to an answer that does not say which filters it applied. Whether it was
+/// added.
+pub fn add_unapplied_impact_note(v: &mut serde_json::Value) -> bool {
     const NOTE: &str = "min_confidence/include_tests/include_external/max_nodes were not \
         applied: the server, or the index it answered from, predates them, so this is its \
         unfiltered answer";
-    let warning = match v.get("warning").and_then(|w| w.as_str()) {
+    let current = v.get("warning").and_then(|w| w.as_str());
+    if v.get("filters").is_some() || current.is_some_and(|w| w.contains(NOTE)) {
+        return false;
+    }
+    let warning = match current {
         Some(w) => format!("{w}; {NOTE}"),
         None => NOTE.to_string(),
     };
     v["warning"] = serde_json::Value::String(warning);
-    v.to_string()
+    true
 }
 
 #[cfg(test)]

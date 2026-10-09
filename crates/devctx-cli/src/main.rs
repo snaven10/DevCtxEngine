@@ -2377,6 +2377,12 @@ fn print_impact_answer(symbol: &str, depth: usize, json: &serde_json::Value) {
     if let Some(n) = count("below_confidence", "count") {
         eprintln!("· {n} symbol(s) below the confidence shown (--min-confidence low lists them)");
     }
+    if let Some(n) = count("undecided_calls", "count") {
+        eprintln!(
+            "· {n} call(s) to the name the index could not decide, outside tests and listed \
+             callers (--min-confidence low lists their callers)"
+        );
+    }
     let (tests, external) = (
         count("excluded", "tests").unwrap_or(0),
         count("excluded", "external").unwrap_or(0),

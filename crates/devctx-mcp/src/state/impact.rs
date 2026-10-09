@@ -10,7 +10,9 @@
 //! `branch_fallback`, `warning`, `omitted`/`omitted_for_budget` (half the
 //! budget per direction) keep their meaning; nodes add `sym`, `file`,
 //! `line`, `confidence`, `via` and `test`/`external`/`undecided` when true,
-//! and the answer adds `below_confidence`, `excluded` and `omitted_by_limit`;
+//! and the answer adds `below_confidence` (symbols), `undecided_calls`
+//! (calls to the name the index could not decide), `excluded` and
+//! `omitted_by_limit`;
 //! for a name with no definition here, `read_symbol`'s `external` +
 //! `called_from` + `next_step` (its upstream is the callers of its external
 //! call sites) or `suggestions`.
@@ -71,9 +73,14 @@ impl ImpactQuery {
 
 /// The line the answer adds when `min_confidence` left nodes out.
 const BELOW_CONFIDENCE_HINT: &str =
-    "symbols reached only through calls below the confidence shown, and calls to the name \
-     the index could not decide, were left out and not walked (counted: symbols, and those \
-     calls one by one); pass min_confidence: \"low\" to include them, marked";
+    "symbols reached only through calls below the confidence shown were left out and not \
+     walked (counted: symbols); pass min_confidence: \"low\" to include them, marked";
+
+/// The line the answer adds when calls to the name were left undecided.
+const UNDECIDED_CALLS_HINT: &str =
+    "calls written with this name whose receiver the index could not type, so they may or \
+     may not reach it (counted: calls, not from tests nor from callers already listed); pass \
+     min_confidence: \"low\" to list their callers, marked undecided and not walked";
 
 /// The line the answer adds when tests or externals were left out.
 const EXCLUDED_HINT: &str =
@@ -186,7 +193,7 @@ pub(super) fn impact_on(
             .map(|(s, d)| json!({ "symbol": s, "depth": d }))
             .collect()
     };
-    Ok(answer(
+    let mut out = answer(
         symbol,
         symbol,
         to_json(&impact.upstream),
@@ -196,7 +203,13 @@ pub(super) fn impact_on(
         reader,
         None,
         budget,
-    ))
+    );
+    // Filters were asked for and this path has none: say so, as a remote
+    // client does for a server that ignored them (review NIT 3).
+    if *q != ImpactQuery::default() {
+        crate::backend::add_unapplied_impact_note(&mut out);
+    }
+    Ok(out)
 }
 
 /// The answer object, the same on both paths: half the budget per
@@ -257,6 +270,12 @@ fn answer(
                 "count": below,
                 "min_confidence": confidence_name(opts.min_confidence),
                 "hint": BELOW_CONFIDENCE_HINT,
+            });
+        }
+        if im.undecided_calls > 0 {
+            out["undecided_calls"] = json!({
+                "count": im.undecided_calls,
+                "hint": UNDECIDED_CALLS_HINT,
             });
         }
         let (tests, external) = (u.tests + d.tests, u.external + d.external);
@@ -494,7 +513,8 @@ mod tests {
     }
 
     /// Review M1: an undecided call to the name (`s.flush()` on an untyped
-    /// receiver, two `flush` in the repo) is counted by default and its
+    /// receiver, two `flush` in the repo) is counted by default (in
+    /// `undecided_calls`, review m-a) and its
     /// caller listed with `low`, marked, as `get_references` does.
     #[test]
     fn an_undecided_call_to_the_name_is_counted_or_listed() {
@@ -504,7 +524,13 @@ mod tests {
             !syms(&v, "upstream").iter().any(|s| s == "Repo.walk"),
             "{v}"
         );
-        assert!(v["below_confidence"]["count"].as_u64().unwrap() >= 1, "{v}");
+        assert!(v["undecided_calls"]["count"].as_u64().unwrap() >= 1, "{v}");
+        // m-a: the calls are not symbols below the confidence shown.
+        assert!(v.get("below_confidence").is_none(), "{v}");
+        assert!(v["undecided_calls"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("min_confidence"));
         let v = impact(
             &state,
             "flush",
@@ -666,6 +692,53 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("no rows in the symbol graph"),
+            "{v}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review of TASK-009, NIT 3: on the old path (a stale index) the
+    /// filters cannot apply; a local backend that was given some says so in
+    /// `warning`, as a remote one does, and only once; without filters it
+    /// says nothing of the kind.
+    #[test]
+    fn a_stale_index_says_the_filters_were_not_applied() {
+        let (state, repo) = indexed_files("impact_stale_filters", JAVA);
+        {
+            let store = state.open_store().unwrap();
+            let (_, b) = state.repo_branch().unwrap();
+            store
+                .set_index_meta(
+                    &state.repo_path(),
+                    &b,
+                    devctx_store::EXTRACTOR_META_KEY,
+                    "v0-old",
+                )
+                .unwrap();
+        }
+        let backend = crate::backend::Backend::Local(std::sync::Arc::new(state));
+        let q = ImpactQuery {
+            include_tests: Some(false),
+            ..Default::default()
+        };
+        let v: Value =
+            serde_json::from_str(&backend.impact("Service.update", 3, &q).unwrap()).unwrap();
+        let w = v["warning"].as_str().unwrap();
+        assert!(w.contains("older extractor"), "{v}");
+        assert_eq!(w.matches("not applied").count(), 1, "{v}");
+        assert!(v.get("filters").is_none(), "{v}");
+        // A remote client noting the same answer again adds nothing.
+        let again = crate::backend::note_unapplied_impact_filters(v.to_string());
+        let again: Value = serde_json::from_str(&again).unwrap();
+        assert_eq!(again["warning"], v["warning"]);
+        let v: Value = serde_json::from_str(
+            &backend
+                .impact("Service.update", 3, &ImpactQuery::default())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !v["warning"].as_str().unwrap().contains("not applied"),
             "{v}"
         );
         let _ = std::fs::remove_dir_all(&repo);
@@ -949,6 +1022,7 @@ mod tests {
                     "omitted": first.get("omitted"),
                     "omitted_by_limit": first.get("omitted_by_limit"),
                     "below_confidence": first["below_confidence"].get("count"),
+                    "undecided_calls": first["undecided_calls"].get("count"),
                     "excluded": first.get("excluded").map(|e| json!([e["tests"], e["external"]])),
                     "resolved": first["resolved_symbols"].as_array().map(|a| a.len()),
                     "walks": walks,
