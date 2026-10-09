@@ -381,6 +381,9 @@ Cada task es un commit convencional propio. Puntos sensibles:
 - Un solo release al cerrar TASK-016. No se recomienda un release intermedio con el schema nuevo y
   sin las tools: obliga a reindexar dos veces a los 13 repos.
 - Notas del release: el aviso de reindex, el costo esperado con TASK-002 y cómo volver (DD-19).
+- **Merge a `main`: squash** (decisión del usuario, 2026-10-08). La rama de trabajo
+  `fix/plan-009-grafo` conserva la historia por task y sus revisiones; a `main` entra un solo
+  commit, así la historia de `main` no arrastra texto que se saneó hacia adelante en la rama.
 
 ## 11. Contrato de resultado (lo que cada task reporta al cerrar)
 
