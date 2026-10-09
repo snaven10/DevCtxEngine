@@ -2376,6 +2376,50 @@ pub(crate) mod tests {
         }
     }
 
+    /// Review of TASK-017, MINOR 3: Java overloads of the same arity in a
+    /// supertype (`save(User)`, `save(Order)`) are not both equivalent when
+    /// one matches the parameter types exactly; with no exact match (a
+    /// generic parameter), the arity still decides.
+    #[test]
+    fn an_exact_overload_wins_over_its_same_arity_siblings() {
+        let store = Store::open_in_memory(3).unwrap();
+        typed_graph(
+            &store,
+            &[
+                ("RepoImpl", "IRepo", "implements", "high"),
+                ("GenImpl", "IGen", "implements", "high"),
+            ],
+            &[
+                ("IRepo.save@User", "void save(User u);"),
+                ("IRepo.save@Order", "void save(Order o);"),
+                (
+                    "RepoImpl.save",
+                    "@Override public void save(final User user)",
+                ),
+                ("IGen.put@T", "void put(T item);"),
+                ("IGen.put@List", "void put(List<T> items);"),
+                ("GenImpl.put", "public void put(Item item)"),
+            ],
+            &[
+                call("Api.a", "IRepo.save@User"),
+                call("Api.b", "IRepo.save@Order"),
+                call("Api.c", "IGen.put@T"),
+                call("Api.d", "IGen.put@List"),
+            ],
+        );
+        let up = |s: &str| {
+            let im = store
+                .impact_graph("repo", "main", s, None, &ImpactOptions::default())
+                .unwrap();
+            names(&im.upstream)
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(up("RepoImpl.save"), ["Api.a"]);
+        assert_eq!(up("GenImpl.put"), ["Api.c", "Api.d"]);
+    }
+
     /// Measurement (PLAN-009 TASK-017 review, MAJOR 2; not a test): a
     /// synthetic hierarchy far wider than the measured Java repositories —
     /// 500 entities extending `BaseEntity` and implementing `IEntity` and

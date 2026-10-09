@@ -19,7 +19,7 @@
 //! surer than the edge it stands for: `min(medium, original)`, with the
 //! weakest `inherits`/`implements` edge of the chain counted too.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use duckdb::params_from_iter;
 
@@ -113,6 +113,73 @@ pub(crate) fn arity(signature: &str, name: &str) -> Option<(usize, Option<usize>
         }
     }
     Some((min, (!variadic).then_some(count)))
+}
+
+/// The simple types of the parameters of `name` in `signature` (`a.b.User`
+/// → `User`, generic arguments, annotations, `final`, references and
+/// lifetimes out), as Java (`Type name`), TypeScript, Rust and Python
+/// (`name: Type`) write them; `None` when some parameter has no readable
+/// type (an untyped Python one).
+fn parameter_types(signature: &str, name: &str) -> Option<Vec<String>> {
+    let params = parameter_list(signature, name)?;
+    let mut out = Vec::new();
+    for p in split_top_level(params) {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        // Annotations (`@Named("x")`) and default values out.
+        let mut text = String::new();
+        let mut depth = 0i32;
+        let mut skip_word = false;
+        for ch in p.chars() {
+            match ch {
+                '@' if depth == 0 => skip_word = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if depth > 0 => {}
+                c if skip_word && (c.is_alphanumeric() || c == '_' || c == '.') => {}
+                c => {
+                    skip_word = false;
+                    text.push(c);
+                }
+            }
+        }
+        let text = text.split('=').next().unwrap_or("").trim();
+        let ty = match text.split_once(':') {
+            Some((_, ty)) if !text.contains("::") || text.find(':') < text.find("::") => {
+                ty.trim().to_string()
+            }
+            _ => {
+                // Java: every token but the last (the name).
+                let words: Vec<&str> = text.split_whitespace().filter(|w| *w != "final").collect();
+                // A receiver (`self`, `&self`, `&mut self`) is no parameter type.
+                if words
+                    .last()
+                    .is_some_and(|w| w.trim_start_matches('&') == "self")
+                {
+                    continue;
+                }
+                if words.len() < 2 {
+                    return None;
+                }
+                words[..words.len() - 1].join(" ")
+            }
+        };
+        let ty = ty
+            .split('<')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+        let simple = ty.rsplit(['.', ':']).next().unwrap_or(ty).trim();
+        if simple.is_empty() || simple == "self" {
+            continue;
+        }
+        out.push(simple.to_string());
+    }
+    Some(out)
 }
 
 /// Whether two arity ranges can meet; an unreadable one meets anything.
@@ -357,12 +424,40 @@ fn select(origin: u64, o: &Origin, found: Vec<(Candidate, u8)>, out: &mut Equiva
         return;
     }
     let mine = arity(&o.signature, &o.name);
-    let mut list: Vec<Equivalent> = found
+    let mut found: Vec<(Candidate, u8)> = found
         .into_iter()
         .filter(|(c, _)| {
             !never_overrides(&c.signature, &o.name)
                 && arities_meet(mine, arity(&c.signature, &o.name))
         })
+        .collect();
+    // Overloads of one arity in one type (`save(User)`, `save(Order)`): the
+    // one whose simple parameter types match exactly, when there is one;
+    // otherwise (a generic parameter) the arity decides (review MINOR 3).
+    if let Some(types) = parameter_types(&o.signature, &o.name) {
+        let mut per_type: HashMap<u64, usize> = HashMap::new();
+        for (c, _) in &found {
+            *per_type.entry(c.parent).or_default() += 1;
+        }
+        let exact: Vec<(u64, bool)> = found
+            .iter()
+            .map(|(c, _)| {
+                let same = parameter_types(&c.signature, &o.name).as_ref() == Some(&types);
+                (c.parent, same)
+            })
+            .collect();
+        let has_exact: HashSet<u64> = exact
+            .iter()
+            .filter(|(p, same)| *same && per_type[p] > 1)
+            .map(|(p, _)| *p)
+            .collect();
+        let mut keep = exact
+            .iter()
+            .map(|(p, same)| !has_exact.contains(p) || *same);
+        found.retain(|_| keep.next().unwrap_or(true));
+    }
+    let mut list: Vec<Equivalent> = found
+        .into_iter()
         .map(|(c, chain)| Equivalent {
             origin,
             origin_symbol: o.symbol.clone(),
@@ -571,6 +666,31 @@ mod tests {
         );
         assert_eq!(arity("handle(): void", "handle"), Some((0, Some(0))));
         assert_eq!(arity("handle = (e: Event) =>", "handle"), None);
+    }
+
+    #[test]
+    fn parameter_types_are_the_simple_types() {
+        let t = |s: &str, n: &str| parameter_types(s, n);
+        let v = |x: &[&str]| Some(x.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            t("@Override public void save(final User user)", "save"),
+            v(&["User"])
+        );
+        assert_eq!(
+            t(
+                "void find(@Named(\"x\") a.b.Order o, Map<String, Long> m)",
+                "find"
+            ),
+            v(&["Order", "Map"])
+        );
+        assert_eq!(
+            t("update(id: string, opts?: Opts): void", "update"),
+            v(&["string", "Opts"])
+        );
+        assert_eq!(t("fn write(&self, line: &str)", "write"), v(&["str"]));
+        assert_eq!(t("fn put(&mut self, v: Vec<u8>)", "put"), v(&["Vec"]));
+        assert_eq!(t("def run(self, x):", "run"), None);
+        assert_eq!(t("handle(): void", "handle"), v(&[]));
     }
 
     #[test]
