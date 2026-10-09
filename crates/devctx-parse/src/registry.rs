@@ -251,6 +251,9 @@ const SOURCES: &[&str] = &[
 /// types type nothing; `type[X]` is `X`.
 /// 17: TASK-007 second review — a Rust `use` inside a block keeps the
 /// block's lines in its row's hint (`in 12-20`): it reaches only them.
+/// 18: TASK-010 review, MAJOR 4 — Rust test code inside a source file
+/// (`#[cfg(test)]`, `mod tests`, `#[test]`) is reported as `test_lines`:
+/// its symbols are tests and its calls `from_test`.
 ///
 /// The fingerprint hashes the JSON, not the Rust code, on purpose: a
 /// refactor, a comment or `rustfmt` must not make every user run `--full`.
@@ -258,7 +261,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 17;
+pub const EXTRACTOR_VERSION: u32 = 18;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {

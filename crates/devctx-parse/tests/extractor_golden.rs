@@ -47,6 +47,7 @@ const FIXTURES: &[(&str, &str, &str)] = &[
     ("javascript", "javascript/app.js", "web/app.js"),
     ("python", "python/orders.py", "shop/orders.py"),
     ("rust", "rust/cache.rs", "crates/demo/src/cache.rs"),
+    ("rust", "rust/inline_tests.rs", "crates/demo/src/inline.rs"),
     ("go", "go/server.go", "api/server.go"),
 ];
 
@@ -129,6 +130,12 @@ fn render() -> String {
                 i.reexport
             )
         }));
+        calls.extend(
+            pf.facts
+                .test_lines
+                .iter()
+                .map(|(a, b)| format!("{a}\ttest\tL{a}-{b}")),
+        );
         // Line first, then the text: a deterministic order that keeps an
         // edge next to the code it comes from.
         calls.sort_by(|a, b| {

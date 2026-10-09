@@ -103,6 +103,11 @@ impl LanguageParser {
             imports: import_facts,
             inherits: self.extract_inherits(root, bytes),
             refs,
+            test_lines: if self.lang.key() == "rust" {
+                rust_test_lines(root, bytes)
+            } else {
+                Vec::new()
+            },
         };
         Ok(ParsedFile {
             language: self.lang.name().to_string(),
@@ -1682,6 +1687,58 @@ fn simple_type_name(t: &str) -> String {
         }
     }
     out.rsplit('.').next().unwrap_or_default().to_string()
+}
+
+/// The attributes written right before `node` (contiguous `attribute_item`
+/// siblings), as text.
+fn rust_attributes<'a>(node: Node, src: &'a [u8]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut prev = node.prev_named_sibling();
+    while let Some(p) = prev {
+        if p.kind() != "attribute_item" {
+            break;
+        }
+        out.push(p.utf8_text(src).unwrap_or(""));
+        prev = p.prev_named_sibling();
+    }
+    out
+}
+
+/// Rust test code inside a source file (review of TASK-010, MAJOR 4): the
+/// line ranges of every item under `#[cfg(test)]`, every `mod tests` and
+/// every function marked `#[test]` (also `#[tokio::test]` and the like).
+fn rust_test_lines(root: Node, src: &[u8]) -> Vec<(u32, u32)> {
+    fn is_cfg_test(a: &str) -> bool {
+        let a: String = a.chars().filter(|c| !c.is_whitespace()).collect();
+        a.starts_with("#[cfg(") && a.contains("test") && !a.contains("not(test)")
+    }
+    fn is_test_attr(a: &str) -> bool {
+        let a: String = a.chars().filter(|c| !c.is_whitespace()).collect();
+        a == "#[test]" || a.ends_with("::test]") || a.starts_with("#[test_case")
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        let attrs = rust_attributes(n, src);
+        let name = n
+            .child_by_field_name("name")
+            .and_then(|x| x.utf8_text(src).ok());
+        let test = attrs.iter().any(|a| is_cfg_test(a))
+            || (n.kind() == "mod_item" && name == Some("tests"))
+            || (n.kind() == "function_item" && attrs.iter().any(|a| is_test_attr(a)));
+        if test && n.kind() != "attribute_item" {
+            out.push((
+                n.start_position().row as u32 + 1,
+                n.end_position().row as u32 + 1,
+            ));
+            continue;
+        }
+        let mut c = n.walk();
+        let children: Vec<Node> = n.named_children(&mut c).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    out.sort_unstable();
+    out
 }
 
 #[cfg(test)]

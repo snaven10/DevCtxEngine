@@ -22,6 +22,11 @@ pub struct FileFacts {
     pub inherits: Vec<InheritFact>,
     /// Instantiations and type uses, one per occurrence.
     pub refs: Vec<RefFact>,
+    /// Line ranges (1-based, inclusive) of test code inside a file that is
+    /// not a test file: in Rust, a `#[cfg(test)]` item, a `mod tests` and a
+    /// `#[test]` function (PLAN-009, review of TASK-010). Their symbols are
+    /// test symbols and their calls `from_test`, as a test file's are.
+    pub test_lines: Vec<(u32, u32)>,
 }
 
 /// One name an import brings in.

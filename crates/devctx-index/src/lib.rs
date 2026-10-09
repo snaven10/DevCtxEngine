@@ -2732,6 +2732,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Review of TASK-010, MAJOR 4: Rust tests live in the file they test.
+    /// A symbol inside `#[cfg(test)]`, a `mod tests` or a `#[test]` function
+    /// is a test symbol, and its calls are `from_test`; the rest of the file
+    /// is not.
+    #[test]
+    fn rust_inline_tests_are_test_symbols() {
+        let src = "pub fn open() {}\n\npub fn run() {\n    open();\n}\n\n#[cfg(test)]\nmod checks {\n    use super::*;\n\n    fn helper() {\n        open();\n    }\n\n    #[test]\n    fn opens() {\n        helper();\n    }\n}\n\nmod tests {\n    fn other() {\n        super::open();\n    }\n}\n\n#[test]\nfn loose() {\n    open();\n}\n\n#[cfg(not(test))]\npub fn prod_only() {}\n";
+        let (dir, repo) = graph_repo("rstests", &[("src/lib.rs", src)]);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let syms = store.file_symbols(&repo, "main", "src/lib.rs").unwrap();
+        let test_of = |q: &str| symbol(&syms, q).is_test;
+        assert!(
+            !test_of("open") && !test_of("run") && !test_of("prod_only"),
+            "{syms:?}"
+        );
+        for q in ["checks.helper", "checks.opens", "tests.other", "loose"] {
+            assert!(test_of(q), "{q}: {syms:?}");
+        }
+        let edges = store
+            .file_symbol_edges(&repo, "main", "src/lib.rs")
+            .unwrap();
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == "calls").collect();
+        let run = symbol(&syms, "run").id;
+        for e in &calls {
+            assert_eq!(e.from_test, e.src_id != run, "{e:?}");
+        }
+        assert!(calls.len() >= 5, "{calls:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An index from before TASK-010 — no rank anywhere, linked under the
     /// previous `LINK_VERSION` — is ranked by the next run, with nothing to
     /// reindex: the new version relinks the branch, and the pass ranks it.

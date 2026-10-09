@@ -1460,6 +1460,15 @@ fn graph_rows(
 ) -> (Vec<StoredSymbol>, Vec<StoredSymbolEdge>) {
     use devctx_parse::facts::{CONTAINS, IMPORTS};
     let is_test = devctx_core::path_kind(file, &parsed.language) == devctx_core::PathKind::Test;
+    // Test code inside a source file (a Rust `#[cfg(test)]` module): its
+    // symbols are tests and its calls `from_test` (review of TASK-010).
+    let in_tests = |lo: u32, hi: u32| {
+        parsed
+            .facts
+            .test_lines
+            .iter()
+            .any(|&(a, b)| a <= lo && hi <= b)
+    };
     let symbols = std::iter::once(&parsed.file_symbol)
         .chain(&parsed.symbols)
         .map(|s| StoredSymbol {
@@ -1479,7 +1488,9 @@ fn graph_rows(
             exported: s.exported,
             rank: None,
             in_degree: None,
-            is_test,
+            is_test: is_test
+                || (s.kind != devctx_parse::symbol_id::FILE_KIND
+                    && in_tests(s.start_line, s.end_line)),
             content_hash: (s.kind == devctx_parse::symbol_id::FILE_KIND)
                 .then(|| content_hash.to_string()),
         })
@@ -1495,7 +1506,7 @@ fn graph_rows(
         confidence: None,
         resolution: None,
         external: None,
-        from_test: is_test,
+        from_test: is_test || in_tests(line, line),
         edge_source: "treesitter".to_string(),
     };
     let file_id = parsed.file_symbol.id;
