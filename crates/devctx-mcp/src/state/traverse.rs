@@ -13,6 +13,8 @@
 //! There is no 0.9 path: a branch without a current symbol graph is an error
 //! that asks for `devctx index --full`.
 
+use std::collections::HashSet;
+
 use devctx_store::{
     sym_hex, MinConfidence, Store, StoredSymbol, Traversal, TraverseDirection, TraverseEdge,
     TraverseEnd, TraverseNode, TraverseOptions, TRAVERSE_KINDS, TRAVERSE_MAX_DEPTH,
@@ -285,6 +287,35 @@ fn fit_prefix(
     (kept, dropped)
 }
 
+/// `items` under `budget` tokens, with their positions: every one when
+/// they all fit (review of TASK-013, MINOR 2: an even share must not drop
+/// an item the total had room for), else each within an even share, as
+/// `fit_json_array` does; the dropped ones named by `label`. 0 = no budget.
+fn fit_whole_or_share(
+    items: Vec<Value>,
+    budget: usize,
+    label: impl Fn(&Value) -> String,
+) -> (Vec<(usize, Value)>, Vec<String>) {
+    let size = |v: &Value| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0);
+    let total: usize = items.iter().map(size).sum();
+    let room = budget * super::CHARS_PER_TOKEN;
+    if budget == 0 || items.is_empty() || total <= room {
+        return (items.into_iter().enumerate().collect(), Vec::new());
+    }
+    // The floor of `fit_json_array`: a share too small to hold anything is
+    // not worth enforcing on a long tail of small items.
+    let share = (budget / items.len()).max(64) * super::CHARS_PER_TOKEN;
+    let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+    for (i, v) in items.into_iter().enumerate() {
+        if size(&v) <= share {
+            kept.push((i, v));
+        } else {
+            dropped.push(label(&v));
+        }
+    }
+    (kept, dropped)
+}
+
 /// The `traverse` object on a chosen branch, under `budget` tokens.
 pub(super) fn traverse_on(
     store: &Store,
@@ -378,23 +409,28 @@ pub(super) fn traverse_on(
     let start = offset.min(total);
     let end = start.saturating_add(limit).min(total);
     let shown = start..end;
-    let nodes: Vec<Value> = t.nodes[shown.clone()].iter().map(node_json).collect();
-    let edges: Vec<Value> = t
-        .edges
-        .iter()
-        .filter(|e| shown.contains(&e.reached))
-        .map(edge_json)
-        .collect();
     let half = budget.saturating_sub(if roots.len() > 1 { budget / 4 } else { 0 }) / 2;
-    let (nodes, nodes_dropped) = super::fit_json_array(nodes, half, None, |v| {
+    // The page's nodes under half the budget: all of them when they fit
+    // (review of TASK-013, MINOR 2), else by share; only the edges of the
+    // nodes actually shown, under the other half.
+    let page: Vec<Value> = t.nodes[shown.clone()].iter().map(node_json).collect();
+    let (kept, nodes_dropped) = fit_whole_or_share(page, half, |v| {
         v.get("symbol")
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string()
     });
-    let (edges, edges_dropped) = super::fit_json_array(edges, half, None, |v| {
-        format!("{} -> {}", v["from"], v["to"])
-    });
+    let listed: HashSet<usize> = kept.iter().map(|(i, _)| start + i).collect();
+    let nodes: Vec<Value> = kept.into_iter().map(|(_, v)| v).collect();
+    let edges: Vec<Value> = t
+        .edges
+        .iter()
+        .filter(|e| listed.contains(&e.reached))
+        .map(edge_json)
+        .collect();
+    let (edges, edges_dropped) =
+        fit_whole_or_share(edges, half, |v| format!("{} -> {}", v["from"], v["to"]));
+    let edges: Vec<Value> = edges.into_iter().map(|(_, v)| v).collect();
     out["nodes"] = json!(nodes);
     out["edges"] = json!(edges);
     out["total"] = json!(total);
@@ -998,6 +1034,39 @@ mod tests {
             v["total"].as_u64().unwrap(),
             "{v}"
         );
+        // Review of TASK-013, MINOR 2: no edge hangs off a node the budget
+        // dropped.
+        let shown: Vec<&Value> = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| &n["sym"])
+            .collect();
+        for e in v["edges"].as_array().unwrap() {
+            assert!(
+                shown.contains(&&e["from"]),
+                "{e} hangs off a dropped node: {v}"
+            );
+        }
+        // MINOR 2: when the whole page fits the budget, all of it is shown,
+        // even a node larger than an even share of it.
+        let all = super::traverse_on(&store, &chosen, &q("OrderDto", "all", "in", 1), 0).unwrap();
+        let sizes: Vec<usize> = all["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.to_string().len())
+            .collect();
+        let total: usize = sizes.iter().sum();
+        let budget = 2 * (total / CHARS_PER_TOKEN + 1);
+        let share = (budget / 2 / sizes.len()).max(64) * CHARS_PER_TOKEN;
+        assert!(
+            sizes.iter().any(|&n| n > share),
+            "the fixture needs a large node"
+        );
+        let v =
+            super::traverse_on(&store, &chosen, &q("OrderDto", "all", "in", 1), budget).unwrap();
+        assert_eq!(v["nodes"], all["nodes"], "{v}");
         drop(store);
         let _ = std::fs::remove_dir_all(&repo);
     }
