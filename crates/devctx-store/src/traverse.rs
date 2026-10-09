@@ -249,6 +249,10 @@ pub struct Traversal {
     /// Calls to the name the link pass left undecided, counted one by one as
     /// `impact_analysis` counts them (not from tests, nor from a caller
     /// listed, nor from a root); 0 when `low` lists their callers.
+    /// With [`unread_from`](Self::unread_from) it can count too many, as in
+    /// `impact_analysis` past its cap: a caller on a level that was not read
+    /// is not "listed", so its undecided calls are counted (second review of
+    /// TASK-013, NIT).
     pub undecided_calls: usize,
     /// Level statements run (one per level and direction).
     pub levels: usize,
@@ -263,6 +267,34 @@ fn kinds_sql(kinds: &[&str]) -> String {
         .map(|k| format!("'{k}'"))
         .collect();
     format!("({})", known.join(", "))
+}
+
+/// Removes the nodes `gone` picks, with the edges that reached them, and
+/// renumbers what the other edges reached.
+fn drop_nodes(t: &mut Traversal, gone: impl Fn(&TraverseNode) -> bool) {
+    let mut at: Vec<Option<usize>> = Vec::with_capacity(t.nodes.len());
+    let mut kept = 0;
+    for n in &t.nodes {
+        if gone(n) {
+            at.push(None);
+        } else {
+            at.push(Some(kept));
+            kept += 1;
+        }
+    }
+    let mut i = 0;
+    t.nodes.retain(|_| {
+        i += 1;
+        at[i - 1].is_some()
+    });
+    t.edges
+        .retain_mut(|e| match at.get(e.reached).copied().flatten() {
+            Some(n) => {
+                e.reached = n;
+                true
+            }
+            None => false,
+        });
 }
 
 /// The walk of `traverse` from `roots`, reading each level and direction
@@ -296,6 +328,10 @@ pub(crate) fn traverse_walk(
         })
         .map(|s| Key::Id(s.id))
         .collect();
+    // Nodes listed only through an undecided call (never walked): a decided
+    // edge at a later level replaces them and walks them (second review of
+    // TASK-013, MINOR 1, as `impact_analysis`'s walk).
+    let mut unsure_shown: HashSet<Key> = HashSet::new();
     let (mut below, mut tests, mut external) = (HashSet::new(), HashSet::new(), HashSet::new());
     let (mut cut, mut beyond): (HashSet<Key>, HashSet<Key>) = (HashSet::new(), HashSet::new());
     let mut reach: HashMap<u64, Option<String>> = HashMap::new();
@@ -329,7 +365,7 @@ pub(crate) fn traverse_walk(
                 continue;
             }
             let key = Key::of(&r);
-            if reported.contains(&key) {
+            if reported.contains(&key) && (r.unsure || !unsure_shown.contains(&key)) {
                 continue;
             }
             match best.get(&key) {
@@ -353,8 +389,23 @@ pub(crate) fn traverse_walk(
             }
         }
         admitted.sort_by(|a, b| level_order(&a.1, &b.1));
+        // An unsure node reached now by a decided edge leaves its old place,
+        // with the undecided edge that listed it.
+        let upgraded: HashSet<u64> = admitted
+            .iter()
+            .filter(|(k, _)| unsure_shown.remove(k))
+            .filter_map(|(_, r)| r.id)
+            .collect();
+        if !upgraded.is_empty() {
+            drop_nodes(&mut t, |n| {
+                n.unsure && n.id.is_some_and(|i| upgraded.contains(&i))
+            });
+        }
         let mut next = Vec::new();
         for (key, r) in admitted {
+            if r.unsure {
+                unsure_shown.insert(key.clone());
+            }
             reported.insert(key.clone());
             if let Some(id) = r.id {
                 names.insert(id, r.symbol.clone());
@@ -413,6 +464,13 @@ pub(crate) fn traverse_walk(
                         undecided: e.unsure,
                     });
                 slot.occurrences += 1;
+                // The method gone through, whatever order the rows came in
+                // (second review of TASK-013, NIT): the smallest.
+                if let Some(t) = &e.through {
+                    if slot.through.as_ref().is_none_or(|s| t < s) {
+                        slot.through = Some(t.clone());
+                    }
+                }
                 if confidence_rank(e.confidence.as_deref())
                     > confidence_rank(slot.confidence.as_deref())
                 {
@@ -526,10 +584,13 @@ impl Store {
         // Calls to the name the link pass could not decide (review of
         // TASK-013, MAJOR 1, as `impact_analysis`): one statement, for the
         // first `in` level only — listed with `low`, counted otherwise.
+        // A root that is a file (a path asked) stands for no callable: its
+        // name has no calls to decide (second review of TASK-013, NIT).
         let undecided = opts.by_name
             && !opts.asked.is_empty()
             && opts.kinds.contains(&"calls")
-            && opts.direction != TraverseDirection::Out;
+            && opts.direction != TraverseDirection::Out
+            && !roots.iter().all(|s| s.kind == "file");
         let list = undecided && opts.min_confidence == MinConfidence::Low;
         let first_up = if list {
             crate::impact::count_statement();
@@ -568,6 +629,7 @@ impl Store {
                 .filter_map(|n| n.id)
                 .chain(roots.iter().map(|s| s.id))
                 .collect();
+            crate::impact::count_statement();
             t.undecided_calls = self
                 .undecided_call_rows(repo, branch, &opts.asked)?
                 .iter()
@@ -1143,6 +1205,122 @@ mod tests {
             let t = store.traverse("repo", "main", &root, &o).unwrap();
             assert!(!names(&t).contains(&"Api.handle"), "{o:?}");
             assert_eq!(t.undecided_calls, 0);
+        }
+    }
+
+    /// Second review of TASK-013, MINOR 1 (as `impact_analysis`, review of
+    /// TASK-009 NIT 2): a caller listed at depth 1 only through an undecided
+    /// call, and reached at depth 2 by a decided edge, is that decided node —
+    /// no longer `undecided`, its undecided edge gone — and is walked
+    /// (`Top.t`, its caller, is reached).
+    #[test]
+    fn an_unsure_caller_reached_later_by_a_decided_edge_is_walked() {
+        let store = Store::open_in_memory(3).unwrap();
+        let g = graph(
+            &store,
+            &[
+                ("Svc.update", "method", None),
+                ("Web.go", "method", None),
+                ("Api.handle", "method", None),
+                ("Top.t", "method", None),
+            ],
+            &[
+                ("Web.go", "calls", "Svc.update", "high", 1),
+                ("Api.handle", "calls", "update", "none", 2),
+                ("Api.handle", "calls", "Web.go", "high", 3),
+                ("Top.t", "calls", "Api.handle", "high", 4),
+            ],
+        );
+        let o = TraverseOptions {
+            asked: "update".into(),
+            by_name: true,
+            min_confidence: MinConfidence::Low,
+            ..opts(&["calls"], TraverseDirection::In, 3)
+        };
+        let t = store
+            .traverse("repo", "main", &[g["Svc.update"].clone()], &o)
+            .unwrap();
+        assert_eq!(names(&t), ["Web.go", "Api.handle", "Top.t"]);
+        let n = &t.nodes[1];
+        assert!(!n.undecided() && n.depth == 2, "{n:?}");
+        assert_eq!(n.confidence.as_deref(), Some("high"));
+        assert_eq!(t.nodes[2].depth, 3);
+        // Its edges: the decided one, to the node it reached; none undecided,
+        // and every edge points at the node it reached.
+        assert!(t.edges.iter().all(|e| !e.undecided), "{:?}", t.edges);
+        for e in &t.edges {
+            let reached = &t.nodes[e.reached];
+            assert!(
+                e.from.id == reached.id || e.to.id == reached.id,
+                "{e:?} -> {reached:?}"
+            );
+        }
+        assert_eq!(t.edges.len(), 3, "{:?}", t.edges);
+    }
+
+    /// Second review of TASK-013, NIT: the `through` of an edge grouped from
+    /// several dispatch rows (a caller of two interface methods both
+    /// implemented by the node) does not hang on the order rows come in:
+    /// the smallest.
+    #[test]
+    fn the_through_of_a_grouped_edge_is_the_smallest() {
+        let root = StoredSymbol {
+            id: 1,
+            qualified: "Impl.run".into(),
+            ..Default::default()
+        };
+        let row = |through: &str| LevelRow {
+            from: 1,
+            id: Some(2),
+            symbol: "Caller.go".into(),
+            kind: DISPATCH_VIA.into(),
+            confidence: Some("medium".into()),
+            through: Some(through.into()),
+            edge_line: Some(7),
+            ..Default::default()
+        };
+        let o = opts(&["calls"], TraverseDirection::In, 1);
+        for order in [["IB.run", "IA.run"], ["IA.run", "IB.run"]] {
+            let rows: Vec<LevelRow> = order.iter().map(|t| row(t)).collect();
+            let t = traverse_walk(std::slice::from_ref(&root), &o, Vec::new(), |_, _| {
+                Ok(rows.clone().into())
+            })
+            .unwrap();
+            assert_eq!(t.edges.len(), 1, "{:?}", t.edges);
+            assert_eq!(t.edges[0].occurrences, 2);
+            assert_eq!(t.edges[0].through.as_deref(), Some("IA.run"), "{order:?}");
+            assert_eq!(t.nodes[0].through.as_deref(), Some("IA.run"), "{order:?}");
+        }
+    }
+
+    /// Second review of TASK-013, NIT: a root that is a file (a path asked)
+    /// stands for no callable, so the undecided calls to its name are not
+    /// read — not even with `by_name` (the tool sets it for any name without
+    /// a file) —, counted or listed.
+    #[test]
+    fn a_file_root_reads_no_undecided_calls() {
+        let store = Store::open_in_memory(3).unwrap();
+        let g = graph(
+            &store,
+            &[
+                ("src/App.java", "file", None),
+                ("Api.handle", "method", None),
+            ],
+            &[("Api.handle", "calls", "pkg.src/App.java", "none", 2)],
+        );
+        for min in [MinConfidence::Low, MinConfidence::Medium] {
+            let o = TraverseOptions {
+                asked: "src/App.java".into(),
+                by_name: true,
+                min_confidence: min,
+                ..opts(&["calls"], TraverseDirection::In, 1)
+            };
+            LEVEL_STATEMENTS.with(|c| c.set(0));
+            let t = store
+                .traverse("repo", "main", &[g["src/App.java"].clone()], &o)
+                .unwrap();
+            assert_eq!(LEVEL_STATEMENTS.with(|c| c.get()), t.levels, "{min:?}");
+            assert!(t.nodes.is_empty() && t.undecided_calls == 0, "{t:?}");
         }
     }
 

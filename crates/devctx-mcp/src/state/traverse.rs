@@ -363,6 +363,8 @@ pub(super) fn traverse_on(
     };
     let mut roots = roots;
     let mut candidates_dropped: Vec<String> = Vec::new();
+    // Tokens the candidates took: what is left goes to the page.
+    let mut candidates_used = 0usize;
     let roots_cut = roots.len() > ROOTS_LIMIT;
     roots.truncate(ROOTS_LIMIT);
     let mut out = json!({});
@@ -378,6 +380,13 @@ pub(super) fn traverse_on(
         let (kept, dropped) = fit_prefix(all, budget / 4, |v| {
             v["symbol"].as_str().unwrap_or("").to_string()
         });
+        // What they use, not the whole quarter (second review of TASK-013,
+        // NIT: two candidates held a quarter of the budget back).
+        let chars: usize = kept
+            .iter()
+            .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+            .sum();
+        candidates_used = chars.div_ceil(super::CHARS_PER_TOKEN);
         out["candidates"] = json!(kept);
         candidates_dropped = dropped;
     }
@@ -409,7 +418,7 @@ pub(super) fn traverse_on(
     let start = offset.min(total);
     let end = start.saturating_add(limit).min(total);
     let shown = start..end;
-    let half = budget.saturating_sub(if roots.len() > 1 { budget / 4 } else { 0 }) / 2;
+    let half = budget.saturating_sub(candidates_used) / 2;
     // The page's nodes under half the budget: all of them when they fit
     // (review of TASK-013, MINOR 2), else by share; only the edges of the
     // nodes actually shown, under the other half.
@@ -1110,6 +1119,60 @@ mod tests {
         let v =
             super::traverse_on(&store, &chosen, &q("OrderDto", "all", "in", 1), budget).unwrap();
         assert_eq!(v["nodes"], all["nodes"], "{v}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Second review of TASK-013, NIT: the candidates of an ambiguous name
+    /// take from the budget what they use, not a quarter of it — two short
+    /// candidates leave the page room for a node the quarter would have cut.
+    #[test]
+    fn the_candidates_take_only_what_they_use() {
+        let long = format!("Use{}", "X".repeat(200));
+        let text =
+            format!("package p1;\n\nclass {long} {{\n    public void take(Dto d) {{\n    }}\n}}\n");
+        let path = format!("src/main/java/p1/{}Long.java", "deep/".repeat(60));
+        let files = [
+            (
+                "src/main/java/p1/Dto.java",
+                "package p1;\n\npublic class Dto {\n}\n",
+            ),
+            (
+                "src/main/java/p2/Dto.java",
+                "package p2;\n\npublic class Dto {\n}\n",
+            ),
+            (path.as_str(), text.as_str()),
+        ];
+        let (state, repo) = indexed_files("traverse_candidates_budget", &files);
+        let store = state.open_store().unwrap();
+        let chosen = graph_branch(&state, &store).unwrap();
+        let ask = q("Dto", "references", "in", 1);
+        let all = super::traverse_on(&store, &chosen, &ask, 0).unwrap();
+        let chars = |key: &str| -> usize {
+            all[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_string().len())
+                .sum()
+        };
+        assert_eq!(all["candidates"].as_array().unwrap().len(), 2, "{all}");
+        assert!(!all["nodes"].as_array().unwrap().is_empty(), "{all}");
+        let (nodes, used) = (
+            chars("nodes").div_ceil(CHARS_PER_TOKEN),
+            chars("candidates").div_ceil(CHARS_PER_TOKEN),
+        );
+        let budget = 2 * (nodes + 1) + used + 2;
+        // The fixture: a quarter of this budget held back would not leave
+        // the page its room.
+        assert!(
+            budget.saturating_sub(budget / 4) / 2 < nodes,
+            "{budget} {nodes}"
+        );
+        let v = super::traverse_on(&store, &chosen, &ask, budget).unwrap();
+        assert_eq!(v["candidates"], all["candidates"], "{v}");
+        assert_eq!(v["nodes"], all["nodes"], "{v}");
+        assert!(v.get("omitted_for_budget").is_none(), "{v}");
         drop(store);
         let _ = std::fs::remove_dir_all(&repo);
     }
