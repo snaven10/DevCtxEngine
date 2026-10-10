@@ -107,6 +107,31 @@ const DISPATCH_CAPPED_HINT: &str =
      counted, not listed or walked; ask about one implementation, or pass dispatch: false to \
      follow direct calls only";
 
+/// The line `omitted_by_limit.dispatch` adds for the attribution and
+/// safety caps (review of TASK-011).
+pub(super) const DISPATCH_ORIGINS_HINT: &str =
+    "a supertype method implemented by many of the methods walked is attributed to at most \
+     max_origins of them (origins_capped counts the rest: its callers are still listed, \
+     reached through the first ones), and a call builds at most max_rows dispatch rows \
+     (rows_capped counts the rest, whose callers may be missing); ask about one \
+     implementation, or pass dispatch: false";
+
+/// Adds `origins_capped` / `rows_capped` (with their caps and the hint) to a
+/// `dispatch` note.
+pub(super) fn dispatch_caps(note: &mut Value, origins: usize, rows: usize) {
+    if origins > 0 {
+        note["origins_capped"] = json!(origins);
+        note["max_origins"] = json!(devctx_store::DISPATCH_MAX_ORIGINS_PER_EQUIVALENT);
+    }
+    if rows > 0 {
+        note["rows_capped"] = json!(rows);
+        note["max_rows"] = json!(devctx_store::DISPATCH_MAX_ROWS);
+    }
+    if origins + rows > 0 {
+        note["hint"] = json!(DISPATCH_ORIGINS_HINT);
+    }
+}
+
 /// The line the answer adds when `max_nodes` stopped the walk.
 const CAPPED_HINT: &str =
     "max_nodes was reached: the symbols of that depth past it were counted, not listed or \
@@ -335,8 +360,12 @@ fn answer(
         // depth cap of the supertype chain (review of TASK-017, point 6).
         let beyond = u.dispatch_beyond_depth + d.dispatch_beyond_depth;
         let dispatch = u.dispatch_capped + d.dispatch_capped + beyond;
+        // Attribution and safety caps (review of TASK-011): apart from
+        // `count`, which counts methods not followed.
+        let origins = u.dispatch_origins_capped + d.dispatch_origins_capped;
+        let rows = u.dispatch_rows_capped + d.dispatch_rows_capped;
         by_limit = u.capped + d.capped;
-        if by_limit + dispatch > 0 {
+        if by_limit + dispatch + origins + rows > 0 {
             // The hint of what cut: `max_nodes`, or only the dispatch cap.
             let hint = if u.capped + d.capped > 0 {
                 CAPPED_HINT
@@ -354,7 +383,7 @@ fn answer(
                 }
             }
             // The dispatch cap, apart: methods a node was not expanded into.
-            if dispatch > 0 {
+            if dispatch + origins + rows > 0 {
                 note["dispatch"] = json!({
                     "count": dispatch,
                     "max_per_node": devctx_store::DISPATCH_MAX_PER_NODE,
@@ -363,6 +392,7 @@ fn answer(
                     note["dispatch"]["beyond_depth"] = json!(beyond);
                     note["dispatch"]["max_depth"] = json!(devctx_store::DISPATCH_DEPTH);
                 }
+                dispatch_caps(&mut note["dispatch"], origins, rows);
             }
             out["omitted_by_limit"] = note;
         }
@@ -935,6 +965,51 @@ mod tests {
         assert_eq!(d["max_depth"], devctx_store::DISPATCH_DEPTH, "{v}");
         assert_eq!(v["omitted_by_limit"]["count"], 0, "{v}");
         assert!(v.get("omitted").is_none(), "{v}");
+    }
+
+    /// Review of TASK-011: the origins a dispatch was not attributed to and
+    /// the rows past the budget of the call are counted in
+    /// `omitted_by_limit.dispatch` (`origins_capped`, `rows_capped`), apart
+    /// from `count` (methods not followed).
+    #[test]
+    fn capped_dispatch_origins_and_rows_are_said() {
+        let chosen = BranchChoice {
+            repo: "demo".into(),
+            branch: "main".into(),
+            fallback: None,
+            indexed: true,
+            extractor_stale: false,
+        };
+        let im = SymbolImpact {
+            upstream: ImpactSide {
+                dispatch_origins_capped: 24,
+                dispatch_rows_capped: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = ImpactOptions::default();
+        let v = answer(
+            "get",
+            "get",
+            Vec::new(),
+            Vec::new(),
+            &["Impl.get".to_string()],
+            &chosen,
+            super::super::lookup::Reader::SymbolGraph,
+            Some((&im, &opts)),
+            200,
+        );
+        let d = &v["omitted_by_limit"]["dispatch"];
+        assert_eq!(d["count"], 0, "{v}");
+        assert_eq!(d["origins_capped"], 24, "{v}");
+        assert_eq!(
+            d["max_origins"],
+            devctx_store::DISPATCH_MAX_ORIGINS_PER_EQUIVALENT,
+            "{v}"
+        );
+        assert_eq!(d["rows_capped"], 5, "{v}");
+        assert!(d["hint"].as_str().unwrap().contains("origins"), "{v}");
     }
 
     #[test]

@@ -37,6 +37,17 @@ pub const DISPATCH_DEPTH: usize = 4;
 /// most; the rest are counted (`omitted_by_limit.dispatch`), not followed.
 pub const DISPATCH_MAX_PER_NODE: usize = 16;
 
+/// Origins one override-equivalent is attributed to, at most (review of
+/// TASK-011): the callers of an interface method implemented by a thousand
+/// walked methods were cloned once per implementation. Past it the callers
+/// are still reached, through the first origins; the rest are counted
+/// (`omitted_by_limit.dispatch.origins_capped`).
+pub const DISPATCH_MAX_ORIGINS_PER_EQUIVALENT: usize = 16;
+
+/// Dispatch rows one call builds, at most (review of TASK-011): the last
+/// safety net; past it rows are counted (`rows_capped`), not built.
+pub const DISPATCH_MAX_ROWS: usize = 8192;
+
 /// The relations a dispatch follows between types.
 const SUPER_KINDS: &str = "('inherits', 'implements')";
 
@@ -438,6 +449,12 @@ impl DispatchIndex {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// (origin, candidate) rows the equivalents query read on this thread.
+    pub(crate) static EQUIVALENT_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A frontier method, as the dispatch query reads it.
 struct Origin {
     parent: u64,
@@ -637,6 +654,7 @@ impl Store {
         repo: &str,
         branch: &str,
         frontier: &[u64],
+        parents: &HashMap<u64, u64>,
         dir: Direction,
         mode: FrontierSql,
         index: &DispatchIndex,
@@ -646,38 +664,57 @@ impl Store {
         if frontier.is_empty() {
             return Ok(out);
         }
-        let types = format!(
-            "[{}]",
-            index
-                .types
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        // The types each frontier method's type reaches (within the depth
+        // cap, and past it), computed here once per type: the query joins
+        // only those pairs (review of TASK-011: joining every method of the
+        // same name in every type of the graph read a million rows for a
+        // thousand implementations of one interface).
+        let mut reach: HashMap<u64, (HashMap<u64, u8>, HashSet<u64>)> = HashMap::new();
+        for id in frontier {
+            if let Some(&p) = parents.get(id) {
+                reach.entry(p).or_insert_with(|| index.reach(p, dir));
+            }
+        }
+        let mut owners: Vec<u64> = reach.keys().copied().collect();
+        owners.sort_unstable();
+        let (mut ps, mut ts): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        for p in &owners {
+            let (best, past) = &reach[p];
+            let mut types: Vec<u64> = best.keys().chain(past.iter()).copied().collect();
+            types.sort_unstable();
+            for t in types {
+                ps.push(p.to_string());
+                ts.push(t.to_string());
+            }
+        }
+        if ps.is_empty() {
+            return Ok(out);
+        }
         let mut args: Vec<duckdb::types::Value> = vec![
-            types.into(),
+            format!("[{}]", ps.join(", ")).into(),
+            format!("[{}]", ts.join(", ")).into(),
             repo.to_string().into(),
             branch.to_string().into(),
         ];
         let set = self.frontier_set(frontier, mode, &mut args)?;
         args.extend([repo.to_string().into(), branch.to_string().into()]);
         let sql = format!(
-            "WITH t AS (SELECT unnest(CAST(? AS UBIGINT[])) AS id),
+            "WITH pairs AS (SELECT unnest(CAST(? AS UBIGINT[])) AS p,
+                                   unnest(CAST(? AS UBIGINT[])) AS t),
              f AS (
                SELECT s.id, s.parent_id, s.name, s.qualified, s.signature FROM symbols s
                 WHERE s.repo = ? AND s.branch = ? AND s.id IN {set}
                   AND s.kind IN {CALLABLE_KINDS} AND NOT ends_with(s.file, '.go')
-                  AND s.parent_id IN (SELECT id FROM t)
              )
              SELECT f.id, f.parent_id, f.name, f.qualified, f.signature,
                     m.id, m.parent_id, m.qualified, m.file, m.start_line, m.signature,
                     m.rank, coalesce(m.is_test, false), m.kind
                FROM f
+               JOIN pairs ON pairs.p = f.parent_id
                JOIN symbols m ON m.repo = ? AND m.branch = ? AND m.name = f.name
+                             AND m.parent_id = pairs.t
                              AND m.id <> f.id AND m.kind IN {CALLABLE_KINDS}
-                             AND NOT ends_with(m.file, '.go')
-                             AND m.parent_id IN (SELECT id FROM t)"
+                             AND NOT ends_with(m.file, '.go')"
         );
         count_statement();
         let mut stmt = self.conn.prepare(&sql)?;
@@ -706,9 +743,11 @@ impl Store {
         let mut origins: HashMap<u64, OriginFound> = HashMap::new();
         for row in rows {
             let (id, o, c) = row?;
+            #[cfg(test)]
+            EQUIVALENT_ROWS.with(|n| n.set(n.get() + 1));
             let entry = origins.entry(id).or_insert_with(|| {
-                let reach = index.reach(o.parent, dir);
-                (o, reach, Vec::new(), Vec::new())
+                let r = reach.get(&o.parent).cloned().unwrap_or_default();
+                (o, r, Vec::new(), Vec::new())
             });
             if let Some(&chain) = entry.1 .0.get(&c.parent) {
                 entry.2.push((c, chain));

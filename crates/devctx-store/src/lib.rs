@@ -21,7 +21,9 @@ mod store;
 mod symbols;
 mod traverse;
 
-pub use dispatch::{DISPATCH_DEPTH, DISPATCH_MAX_PER_NODE};
+pub use dispatch::{
+    DISPATCH_DEPTH, DISPATCH_MAX_ORIGINS_PER_EQUIVALENT, DISPATCH_MAX_PER_NODE, DISPATCH_MAX_ROWS,
+};
 pub use error::{Result, StoreError};
 pub use graph::{GraphEdge, ImpactResult, Reference, StoredEdge};
 #[cfg(feature = "bench")]

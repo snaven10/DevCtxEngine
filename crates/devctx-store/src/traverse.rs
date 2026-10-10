@@ -246,6 +246,11 @@ pub struct Traversal {
     pub dispatch_capped: usize,
     /// Override-equivalent methods past the dispatch depth cap.
     pub dispatch_beyond_depth: usize,
+    /// (origin, supertype method) pairs a dispatch was not attributed to
+    /// (`DISPATCH_MAX_ORIGINS_PER_EQUIVALENT`); their callers are reached.
+    pub dispatch_origins_capped: usize,
+    /// Dispatch rows past the budget of the call (`DISPATCH_MAX_ROWS`).
+    pub dispatch_rows_capped: usize,
     /// Calls to the name the link pass left undecided, counted one by one as
     /// `impact_analysis` counts them (not from tests, nor from a caller
     /// listed, nor from a root); 0 when `low` lists their callers.
@@ -345,6 +350,8 @@ pub(crate) fn traverse_walk(
             t.levels += 1;
             cut.extend(read.cut.into_iter().map(Key::Id));
             beyond.extend(read.beyond.into_iter().map(Key::Id));
+            t.dispatch_origins_capped += read.origins_capped;
+            t.dispatch_rows_capped += read.rows_capped;
             rows.extend(read.rows.into_iter().map(|r| (dir, r)));
         }
         if let Some(extra) = first_up.take() {
@@ -605,6 +612,7 @@ impl Store {
         } else {
             Vec::new()
         };
+        let budget = crate::impact::dispatch_row_budget();
         let mut t = traverse_walk(roots, opts, first_up, |f, dir| {
             let read = match &dispatch {
                 Some(index) => self.dispatch_level(
@@ -617,6 +625,7 @@ impl Store {
                     &parents,
                     opts.include_tests,
                     &kinds,
+                    &budget,
                 )?,
                 None => self.edge_level(repo, branch, f, dir, mode, &kinds)?.into(),
             };
@@ -1092,6 +1101,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(t.edges.len(), 300);
+    }
+
+    /// Review of TASK-011 (a bug of TASK-017): from 40 implementations of
+    /// one interface method, its callers are cloned for at most 16 origins;
+    /// the rest are counted, and every caller is reached.
+    #[test]
+    fn dispatch_origins_are_capped_per_equivalent() {
+        let store = Store::open_in_memory(3).unwrap();
+        let ids = crate::impact::tests::wide_interface(&store, 40);
+        let roots: Vec<StoredSymbol> = ids
+            .iter()
+            .filter(|(q, _)| q.starts_with("Impl") && q.ends_with(".get"))
+            .map(|(_, &id)| store.symbol_by_id("repo", "main", id).unwrap().unwrap())
+            .collect();
+        assert_eq!(roots.len(), 40);
+        crate::impact::DISPATCH_ROWS.with(|c| c.set(0));
+        let t = store
+            .traverse(
+                "repo",
+                "main",
+                &roots,
+                &opts(&["calls"], TraverseDirection::In, 1),
+            )
+            .unwrap();
+        let mut n = names(&t);
+        n.sort_unstable();
+        assert_eq!(n, ["Caller0.run", "Caller1.run", "Caller2.run"]);
+        assert!(crate::impact::DISPATCH_ROWS.with(|c| c.get()) <= 3 * 16);
+        assert_eq!(t.dispatch_origins_capped, 24);
+    }
+
+    /// Review of TASK-011 (the cost of that bug): the equivalents query reads
+    /// only the pairs (origin, type its type reaches) — one row per
+    /// implementation here — not every same-name method of every type of
+    /// the supertype graph (40 × 40 rows, a million in the measurement).
+    #[test]
+    fn the_equivalents_query_reads_only_reachable_types() {
+        let store = Store::open_in_memory(3).unwrap();
+        let ids = crate::impact::tests::wide_interface(&store, 40);
+        let roots: Vec<StoredSymbol> = ids
+            .iter()
+            .filter(|(q, _)| q.starts_with("Impl") && q.ends_with(".get"))
+            .map(|(_, &id)| store.symbol_by_id("repo", "main", id).unwrap().unwrap())
+            .collect();
+        crate::dispatch::EQUIVALENT_ROWS.with(|c| c.set(0));
+        store
+            .traverse(
+                "repo",
+                "main",
+                &roots,
+                &opts(&["calls"], TraverseDirection::In, 1),
+            )
+            .unwrap();
+        let read = crate::dispatch::EQUIVALENT_ROWS.with(|c| c.get());
+        assert_eq!(read, 40, "{read} rows");
     }
 
     /// Dispatch, when `calls` is followed: upstream from an implementation,

@@ -509,7 +509,8 @@ pub(super) fn traverse_on(
         });
     }
     let dispatch = t.dispatch_capped + t.dispatch_beyond_depth;
-    if dispatch > 0 {
+    let (origins, rows) = (t.dispatch_origins_capped, t.dispatch_rows_capped);
+    if dispatch + origins + rows > 0 {
         let mut d = json!({
             "count": dispatch,
             "max_per_node": devctx_store::DISPATCH_MAX_PER_NODE,
@@ -518,7 +519,12 @@ pub(super) fn traverse_on(
             d["beyond_depth"] = json!(t.dispatch_beyond_depth);
             d["max_depth"] = json!(devctx_store::DISPATCH_DEPTH);
         }
+        super::impact::dispatch_caps(&mut d, origins, rows);
         out["omitted_by_limit"] = json!({ "dispatch": d, "hint": DISPATCH_CAPPED_HINT });
+    }
+    // Rows past the budget may hide nodes: `total` is then a floor.
+    if rows > 0 {
+        out["total_is_lower_bound"] = json!(true);
     }
     chosen.annotate(&mut out);
     // Both given: `sym` wins, and the answer says so (review NIT).

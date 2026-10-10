@@ -25,7 +25,9 @@ use std::collections::{HashMap, HashSet};
 
 use duckdb::params_from_iter;
 
-use crate::dispatch::{dispatch_confidence, DispatchIndex, Equivalent};
+use crate::dispatch::{
+    dispatch_confidence, DispatchIndex, Equivalent, DISPATCH_MAX_ORIGINS_PER_EQUIVALENT,
+};
 use crate::error::Result;
 use crate::lookup::{dotted, MinConfidence};
 use crate::store::Store;
@@ -192,6 +194,12 @@ pub struct ImpactSide {
     /// Override-equivalent methods in a type past `DISPATCH_DEPTH` supertype
     /// levels: counted, not followed (review of TASK-017, point 6).
     pub dispatch_beyond_depth: usize,
+    /// (origin, supertype method) pairs a dispatch was not attributed to:
+    /// past `DISPATCH_MAX_ORIGINS_PER_EQUIVALENT` origins of one method;
+    /// its callers are still reached (review of TASK-011).
+    pub dispatch_origins_capped: usize,
+    /// Dispatch rows past the budget of the call (`DISPATCH_MAX_ROWS`).
+    pub dispatch_rows_capped: usize,
     /// Level queries run.
     pub levels: usize,
     /// The largest frontier a level query read (ids).
@@ -263,6 +271,33 @@ thread_local! {
     pub(crate) static LEVEL_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Dispatch rows the level queries built on this thread (review of
+    /// TASK-011: the fan-out of an equivalent shared by many origins).
+    pub(crate) static DISPATCH_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The dispatch row budget a call starts with (tests lower it).
+    pub(crate) static DISPATCH_ROW_BUDGET: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(crate::dispatch::DISPATCH_MAX_ROWS) };
+}
+
+/// The dispatch rows one call may build ([`crate::dispatch::DISPATCH_MAX_ROWS`]).
+pub(crate) fn dispatch_row_budget() -> std::cell::Cell<usize> {
+    #[cfg(test)]
+    return std::cell::Cell::new(DISPATCH_ROW_BUDGET.with(|b| b.get()));
+    #[cfg(not(test))]
+    std::cell::Cell::new(crate::dispatch::DISPATCH_MAX_ROWS)
+}
+
+fn count_dispatch_row() {
+    #[cfg(test)]
+    DISPATCH_ROWS.with(|c| c.set(c.get() + 1));
+}
+
 pub(crate) fn count_statement() {
     #[cfg(test)]
     LEVEL_STATEMENTS.with(|c| c.set(c.get() + 1));
@@ -299,14 +334,18 @@ pub(crate) struct Level {
     pub cut: Vec<u64>,
     /// Ids of the equivalents past the depth cap of the supertype chain.
     pub beyond: Vec<u64>,
+    /// (origin, equivalent) pairs past
+    /// [`DISPATCH_MAX_ORIGINS_PER_EQUIVALENT`](crate::dispatch::DISPATCH_MAX_ORIGINS_PER_EQUIVALENT).
+    pub origins_capped: usize,
+    /// Dispatch rows past the budget of the call, counted, not built.
+    pub rows_capped: usize,
 }
 
 impl From<Vec<LevelRow>> for Level {
     fn from(rows: Vec<LevelRow>) -> Self {
         Level {
             rows,
-            cut: Vec::new(),
-            beyond: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -427,6 +466,8 @@ pub(crate) fn walk(
         side.widest = side.widest.max(frontier.len());
         cut.extend(read.cut.into_iter().map(Key::Id));
         beyond.extend(read.beyond.into_iter().map(Key::Id));
+        side.dispatch_origins_capped += read.origins_capped;
+        side.dispatch_rows_capped += read.rows_capped;
         let mut best: HashMap<Key, LevelRow> = HashMap::new();
         for mut r in read.rows {
             // Downstream dispatch: no surer than the edge that reached the
@@ -594,6 +635,8 @@ impl Store {
         mode: FrontierSql,
     ) -> Result<SymbolImpact> {
         let syms = self.lookup_symbols(repo, branch, name, file, SEED_LIMIT)?;
+        // The dispatch rows of the whole call, both directions.
+        let budget = dispatch_row_budget();
         let asked = dotted(name.trim());
         let seeds: Vec<u64> = syms.iter().map(|s| s.id).collect();
         // The name asked about is never reported as reached: a qualified
@@ -655,6 +698,7 @@ impl Store {
                         &parents,
                         opts.include_tests,
                         IMPACT_KINDS,
+                        &budget,
                     )?
                 } else {
                     self.impact_level(repo, branch, f, dir, mode)?.into()
@@ -814,6 +858,7 @@ impl Store {
         parents: &HashMap<u64, u64>,
         include_tests: bool,
         kinds: &str,
+        budget: &std::cell::Cell<usize>,
     ) -> Result<Level> {
         // Only a method of a type in the supertype graph can dispatch: the
         // others cost no statement.
@@ -822,12 +867,33 @@ impl Store {
             .copied()
             .filter(|id| parents.get(id).is_some_and(|p| index.has_type(*p)))
             .collect();
-        let eq =
-            self.override_equivalents(repo, branch, &methods, dir, mode, index, include_tests)?;
+        let eq = self.override_equivalents(
+            repo,
+            branch,
+            &methods,
+            parents,
+            dir,
+            mode,
+            index,
+            include_tests,
+        )?;
         let mut out = Level {
             rows: Vec::new(),
             cut: eq.cut,
             beyond: eq.beyond,
+            ..Default::default()
+        };
+        // One more dispatch row, if the call's budget has room (review of
+        // TASK-011: the last safety net); counted otherwise.
+        let room = |out: &mut Level| {
+            if budget.get() == 0 {
+                out.rows_capped += 1;
+                false
+            } else {
+                budget.set(budget.get() - 1);
+                count_dispatch_row();
+                true
+            }
         };
         match dir {
             Direction::Upstream => {
@@ -836,14 +902,32 @@ impl Store {
                 for e in &eq.kept {
                     by_id.entry(e.id).or_default().push(e);
                 }
+                // At most so many origins per equivalent, the same ones
+                // whatever the order (by origin id): each caller of the
+                // equivalent was cloned once per origin (review of TASK-011).
+                for list in by_id.values_mut() {
+                    list.sort_by_key(|e| (e.origin, e.chain));
+                    if list.len() > DISPATCH_MAX_ORIGINS_PER_EQUIVALENT {
+                        out.origins_capped += list.len() - DISPATCH_MAX_ORIGINS_PER_EQUIVALENT;
+                        list.truncate(DISPATCH_MAX_ORIGINS_PER_EQUIVALENT);
+                    }
+                }
                 let mut set = frontier.to_vec();
                 set.extend(by_id.keys().filter(|id| !direct.contains(id)));
-                for r in self.edge_level(repo, branch, &set, dir, mode, kinds)? {
+                let mut level = self.edge_level(repo, branch, &set, dir, mode, kinds)?;
+                // A fixed order, so the budget keeps the same rows.
+                level.sort_by(|a, b| {
+                    (a.from, a.id, a.edge_line, &a.kind).cmp(&(b.from, b.id, b.edge_line, &b.kind))
+                });
+                for r in level {
                     // Only a call or an instantiation (`DISPATCH_KINDS`)
                     // stands for a dispatch: another relation into an
                     // equivalent (`traverse`) is that method's own.
                     let stands = crate::traverse::dispatches(&r.kind);
                     for e in by_id.get(&r.from).into_iter().flatten().filter(|_| stands) {
+                        if !room(&mut out) {
+                            continue;
+                        }
                         out.rows.push(LevelRow {
                             from: e.origin,
                             kind: DISPATCH_VIA.to_string(),
@@ -859,7 +943,10 @@ impl Store {
             }
             Direction::Downstream => {
                 out.rows = self.edge_level(repo, branch, frontier, dir, mode, kinds)?;
-                out.rows.extend(eq.kept.into_iter().map(|e| LevelRow {
+                let mut kept = eq.kept;
+                kept.sort_by_key(|e| (e.origin, e.id));
+                let kept: Vec<Equivalent> = kept.into_iter().filter(|_| room(&mut out)).collect();
+                out.rows.extend(kept.into_iter().map(|e| LevelRow {
                     from: e.origin,
                     id: Some(e.id),
                     symbol: e.symbol,
@@ -1589,6 +1676,72 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(im.undecided_calls, 0);
         assert_eq!(im.upstream.below_confidence, 0);
+    }
+
+    /// A supertype method implemented by `n` methods of `n` types (`Impl{i}`
+    /// implements `IGet`), called by three callers through the interface.
+    pub(crate) fn wide_interface(store: &Store, n: usize) -> BTreeMap<String, u64> {
+        let supers: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("Impl{i:03}"), "IGet".to_string()))
+            .collect();
+        let supers: Vec<(&str, &str, &str, &str)> = supers
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str(), "implements", "high"))
+            .collect();
+        let mut methods: Vec<(String, &str)> = (0..n)
+            .map(|i| (format!("Impl{i:03}.get"), "public String get()"))
+            .collect();
+        methods.push(("IGet.get".into(), "String get();"));
+        let methods: Vec<(&str, &str)> = methods.iter().map(|(q, s)| (q.as_str(), *s)).collect();
+        let calls: Vec<E> = (0..3)
+            .map(|c| call(&format!("Caller{c}.run"), "IGet.get"))
+            .collect();
+        typed_graph(store, &supers, &methods, &calls)
+    }
+
+    /// Review of TASK-011 (a bug of TASK-017): an equivalent shared by many
+    /// origins — 40 implementations of one interface method, all walked —
+    /// cloned each caller of it once per origin (300 × 1 000 rows in the
+    /// synthetic measurement). At most `DISPATCH_MAX_ORIGINS_PER_EQUIVALENT`
+    /// origins are attributed; the rest are counted; every caller is still
+    /// reached.
+    #[test]
+    fn an_equivalent_shared_by_many_origins_is_read_once_per_capped_origin() {
+        let store = Store::open_in_memory(3).unwrap();
+        wide_interface(&store, 40);
+        DISPATCH_ROWS.with(|c| c.set(0));
+        let im = store
+            .impact_graph("repo", "main", "get", None, &ImpactOptions::default())
+            .unwrap();
+        let mut got = names(&im.upstream);
+        got.sort_unstable();
+        assert_eq!(got, ["Caller0.run", "Caller1.run", "Caller2.run"]);
+        // Upstream 3 callers × 16 origins; downstream the interface method
+        // is expanded into 16 implementations (`DISPATCH_MAX_PER_NODE`).
+        let rows = DISPATCH_ROWS.with(|c| c.get());
+        assert!(rows <= 3 * 16 + 16, "{rows} dispatch rows");
+        assert_eq!(im.upstream.dispatch_origins_capped, 40 - 16);
+    }
+
+    /// Review of TASK-011: a budget of dispatch rows per call is the last
+    /// safety net — past it rows are counted, not built.
+    #[test]
+    fn dispatch_rows_have_a_budget_per_call() {
+        let store = Store::open_in_memory(3).unwrap();
+        wide_interface(&store, 40);
+        DISPATCH_ROW_BUDGET.with(|b| b.set(10));
+        DISPATCH_ROWS.with(|c| c.set(0));
+        let im = store
+            .impact_graph("repo", "main", "get", None, &ImpactOptions::default())
+            .unwrap();
+        DISPATCH_ROW_BUDGET.with(|b| b.set(crate::dispatch::DISPATCH_MAX_ROWS));
+        assert_eq!(DISPATCH_ROWS.with(|c| c.get()), 10);
+        assert_eq!(
+            im.upstream.dispatch_rows_capped + im.downstream.dispatch_rows_capped,
+            3 * 16 + 16 - 10
+        );
+        // The callers of the interface method itself are direct rows.
+        assert_eq!(names(&im.upstream).len(), 3);
     }
 
     /// Review of TASK-009, NIT 2: a caller listed at level 1 only through an
