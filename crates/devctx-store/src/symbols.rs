@@ -173,8 +173,90 @@ fn row_to_edge(r: &duckdb::Row<'_>) -> duckdb::Result<StoredSymbolEdge> {
     })
 }
 
+/// A symbol as the repo map reads it ([`Store::map_symbols`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MapSymbol {
+    /// Stable id.
+    pub id: u64,
+    /// Container's id (the file symbol's for a top-level symbol).
+    pub parent_id: Option<u64>,
+    /// Repo-relative path.
+    pub file: String,
+    /// `file`/`class`/`method`/…
+    pub kind: String,
+    /// Bare name.
+    pub name: String,
+    /// Qualified name.
+    pub qualified: String,
+    /// Definition head without the body.
+    pub signature: Option<String>,
+    /// 1-based first line.
+    pub start_line: i32,
+    /// Test code (a test file, or test code inside one, DD-9).
+    pub is_test: bool,
+    /// Global PageRank.
+    pub rank: Option<f64>,
+}
+
+/// The relation of a [`RankEdge`], read as a number rather than a string per
+/// row (PLAN-009 TASK-011: the repo map reloads the adjacency, the NIT of
+/// TASK-010's review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RankKind {
+    /// `calls`.
+    Calls,
+    /// `instantiates`.
+    Instantiates,
+    /// `inherits`.
+    Inherits,
+    /// `implements`.
+    Implements,
+    /// `references`.
+    References,
+    /// `imports`.
+    Imports,
+    /// Any other relation (none contributes to centrality).
+    Other,
+}
+
+impl RankKind {
+    fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Calls,
+            1 => Self::Instantiates,
+            2 => Self::Inherits,
+            3 => Self::Implements,
+            4 => Self::References,
+            5 => Self::Imports,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The confidence of a [`RankEdge`]: `high`, `medium`, or anything else
+/// (`low`, none), which weighs the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RankConfidence {
+    /// `high`.
+    High,
+    /// `medium`.
+    Medium,
+    /// `low`, or no confidence.
+    Low,
+}
+
+impl RankConfidence {
+    fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::High,
+            1 => Self::Medium,
+            _ => Self::Low,
+        }
+    }
+}
+
 /// An aggregated edge of a branch's PageRank graph
-/// ([`Store::branch_rank_edges`]).
+/// ([`Store::branch_rank_edges`]): ids and two enums, no string per row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankEdge {
     /// Source symbol.
@@ -182,9 +264,9 @@ pub struct RankEdge {
     /// Destination symbol.
     pub dst: u64,
     /// Relation (`calls`, `instantiates`, …; never `contains`).
-    pub kind: String,
-    /// `high`, `medium`, `low`.
-    pub confidence: Option<String>,
+    pub kind: RankKind,
+    /// `high`, `medium`, `low` (or none).
+    pub confidence: RankConfidence,
     /// The occurrences are in a test file.
     pub from_test: bool,
     /// Occurrences.
@@ -401,6 +483,32 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Every symbol of a branch, with only what the repo map shows or ranks
+    /// by (PLAN-009 TASK-011): no byte offsets, package nor hashes.
+    pub fn map_symbols(&self, repo: &str, branch: &str) -> Result<Vec<MapSymbol>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent_id, file, kind, name, qualified, signature, start_line,
+                    coalesce(is_test, false), rank
+               FROM symbols WHERE repo = ? AND branch = ? ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![repo, branch], |r| {
+            Ok(MapSymbol {
+                id: r.get(0)?,
+                parent_id: r.get(1)?,
+                file: r.get(2)?,
+                kind: r.get(3)?,
+                name: r.get(4)?,
+                qualified: r.get(5)?,
+                signature: r.get(6)?,
+                start_line: r.get(7)?,
+                is_test: r.get(8)?,
+                rank: r.get(9)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Every edge of a branch but `contains`, by file and line (what the
     /// link pass resolves).
     pub fn branch_linkable_edges(&self, repo: &str, branch: &str) -> Result<Vec<StoredSymbolEdge>> {
@@ -469,20 +577,28 @@ impl Store {
     /// with a destination — a call the link pass discarded never counts —
     /// but `contains`, aggregated per `(src, dst, kind, confidence,
     /// from_test)` with their number of occurrences, in that order.
+    /// The relation and the confidence come back as codes ([`RankKind`],
+    /// [`RankConfidence`]); the groups are still those of the strings, so
+    /// a `low` and a confidence-less group of one pair stay two rows.
     pub fn branch_rank_edges(&self, repo: &str, branch: &str) -> Result<Vec<RankEdge>> {
         let mut stmt = self.conn.prepare(
-            "SELECT src_id, dst_id, kind, confidence, coalesce(from_test, false), count(*)
+            "SELECT src_id, dst_id,
+                    CASE kind WHEN 'calls' THEN 0 WHEN 'instantiates' THEN 1
+                              WHEN 'inherits' THEN 2 WHEN 'implements' THEN 3
+                              WHEN 'references' THEN 4 WHEN 'imports' THEN 5 ELSE 6 END::UTINYINT,
+                    CASE confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END::UTINYINT,
+                    coalesce(from_test, false), count(*)
                FROM live_edges
               WHERE repo = ? AND branch = ? AND dst_id IS NOT NULL AND kind <> 'contains'
-              GROUP BY ALL
-              ORDER BY 1, 2, 3, 4 NULLS FIRST, 5",
+              GROUP BY src_id, dst_id, kind, confidence, coalesce(from_test, false)
+              ORDER BY src_id, dst_id, kind, confidence NULLS FIRST, coalesce(from_test, false)",
         )?;
         let rows = stmt.query_map(params![repo, branch], |r| {
             Ok(RankEdge {
                 src: r.get(0)?,
                 dst: r.get(1)?,
-                kind: r.get(2)?,
-                confidence: r.get(3)?,
+                kind: RankKind::from_code(r.get(2)?),
+                confidence: RankConfidence::from_code(r.get(3)?),
                 from_test: r.get(4)?,
                 n: r.get::<_, i64>(5)? as u64,
             })
@@ -786,11 +902,79 @@ mod tests {
             vec![RankEdge {
                 src: run.id,
                 dst: helper.id,
-                kind: "calls".into(),
-                confidence: Some("high".into()),
+                kind: RankKind::Calls,
+                confidence: RankConfidence::High,
                 from_test: false,
                 n: 2,
             }]
+        );
+    }
+
+    /// Measurement harness (PLAN-009 TASK-011, not a test): reads a branch's
+    /// rank graph from `$DEVCTX_RANK_BENCH_DB` (`$DEVCTX_RANK_BENCH_REPO`,
+    /// `$DEVCTX_RANK_BENCH_BRANCH`) as TASK-010 did — two strings per row —
+    /// and as [`Store::branch_rank_edges`] does now, interleaved, 20 times
+    /// each: p50 in ms and the rows.
+    ///
+    /// `cargo test --release -p devctx-store --lib rank_edges_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn rank_edges_bench() {
+        let var = |k: &str| std::env::var(k).ok();
+        let (Some(db), Some(repo), Some(branch)) = (
+            var("DEVCTX_RANK_BENCH_DB"),
+            var("DEVCTX_RANK_BENCH_REPO"),
+            var("DEVCTX_RANK_BENCH_BRANCH"),
+        ) else {
+            eprintln!("set DEVCTX_RANK_BENCH_DB, _REPO and _BRANCH");
+            return;
+        };
+        let store = Store::open(std::path::Path::new(&db), 384).unwrap();
+        type Old = (u64, u64, String, Option<String>, bool, i64);
+        let old = |store: &Store| -> Vec<Old> {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "SELECT src_id, dst_id, kind, confidence, coalesce(from_test, false), count(*)
+                       FROM live_edges
+                      WHERE repo = ? AND branch = ? AND dst_id IS NOT NULL AND kind <> 'contains'
+                      GROUP BY ALL
+                      ORDER BY 1, 2, 3, 4 NULLS FIRST, 5",
+                )
+                .unwrap();
+            stmt.query_map(params![repo, branch], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let (mut rows_old, mut rows_new) = (0, 0);
+        for _ in 0..20 {
+            let t = std::time::Instant::now();
+            rows_old = old(&store).len();
+            a.push(t.elapsed().as_secs_f64() * 1000.0);
+            let t = std::time::Instant::now();
+            rows_new = store.branch_rank_edges(&repo, &branch).unwrap().len();
+            b.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        b.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        println!(
+            "strings: {rows_old} rows, p50 {:.1} ms; enums: {rows_new} rows, p50 {:.1} ms; \
+             row size {} -> {} bytes",
+            a[10],
+            b[10],
+            std::mem::size_of::<Old>(),
+            std::mem::size_of::<RankEdge>()
         );
     }
 

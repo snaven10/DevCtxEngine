@@ -16,10 +16,16 @@
 //!   sorted first, so the same graph gives the same ranks bit for bit.
 //!
 //! Own implementation (~60 lines): no `petgraph` nor any other dependency.
+//!
+//! The same matrix ([`RankMatrix`]) also ranks **personalized** (DD-12,
+//! DD-14, TASK-011): teleport and what a node does not spread go to a
+//! personalization vector instead of uniformly, and a multiplier per
+//! destination reweighs how each source splits what it spreads. The repo
+//! map builds it once per branch and index generation and runs it per query.
 
 use std::collections::HashMap;
 
-use devctx_store::RankEdge;
+use devctx_store::{RankConfidence, RankEdge, RankKind};
 
 /// Damping factor.
 pub(crate) const DAMPING: f64 = 0.85;
@@ -35,23 +41,23 @@ pub(crate) const MAX_ITERATIONS: usize = 100;
 /// What a relation contributes to centrality (DD-12): a call or an
 /// instantiation fully, inheritance a little less, a type use half, an
 /// import less, `contains` nothing (it serves `traverse` and the repo map).
-pub(crate) fn kind_weight(kind: &str) -> f64 {
+pub(crate) fn kind_weight(kind: RankKind) -> f64 {
     match kind {
-        "calls" | "instantiates" => 1.0,
-        "inherits" | "implements" => 0.8,
-        "references" => 0.5,
-        "imports" => 0.3,
-        _ => 0.0,
+        RankKind::Calls | RankKind::Instantiates => 1.0,
+        RankKind::Inherits | RankKind::Implements => 0.8,
+        RankKind::References => 0.5,
+        RankKind::Imports => 0.3,
+        RankKind::Other => 0.0,
     }
 }
 
 /// What a confidence contributes: `high` 1, `medium` 0.6, `low` (or none)
 /// 0.2.
-pub(crate) fn confidence_weight(c: Option<&str>) -> f64 {
+pub(crate) fn confidence_weight(c: RankConfidence) -> f64 {
     match c {
-        Some("high") => 1.0,
-        Some("medium") => 0.6,
-        _ => 0.2,
+        RankConfidence::High => 1.0,
+        RankConfidence::Medium => 0.6,
+        RankConfidence::Low => 0.2,
     }
 }
 
@@ -60,94 +66,244 @@ pub(crate) fn confidence_weight(c: Option<&str>) -> f64 {
 /// them) × `sqrt(n)` (a helper called 300 times must not eat the ranking).
 pub(crate) fn edge_weight(e: &RankEdge) -> f64 {
     let test = if e.from_test { 0.1 } else { 1.0 };
-    kind_weight(&e.kind) * confidence_weight(e.confidence.as_deref()) * test * (e.n as f64).sqrt()
+    kind_weight(e.kind) * confidence_weight(e.confidence) * test * (e.n as f64).sqrt()
 }
 
 /// The global rank of each of `nodes` (returned in the order of `nodes`),
 /// over `edges`; an edge whose end is not a node, a self-loop or one of
 /// weight 0 is ignored. The ranks sum to 1.
 pub(crate) fn pagerank_run(nodes: &[u64], edges: &[RankEdge]) -> PageRankRun {
-    let mut sorted: Vec<u64> = nodes.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let n = sorted.len();
-    if n == 0 {
-        return PageRankRun {
-            ranks: Vec::new(),
-            iterations: 0,
-            converged: true,
-        };
-    }
-    let index: HashMap<u64, usize> = sorted.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-    // One (weight, share) per (src, dst), summed in a fixed order: the
-    // weight is the edge's; the share, what the source would spread over it
-    // if every occurrence were sure and outside tests (kind × sqrt(n)).
-    let mut pairs: Vec<(usize, usize, f64, f64)> = edges
-        .iter()
-        .filter(|e| e.src != e.dst)
-        .filter_map(|e| {
-            let w = edge_weight(e);
-            let (s, d) = (*index.get(&e.src)?, *index.get(&e.dst)?);
-            (w > 0.0).then(|| (s, d, w, kind_weight(&e.kind) * (e.n as f64).sqrt()))
-        })
-        .collect();
-    pairs.sort_by(|a, b| {
-        (a.0, a.1)
-            .cmp(&(b.0, b.1))
-            .then(a.2.total_cmp(&b.2))
-            .then(a.3.total_cmp(&b.3))
-    });
-    let mut merged: Vec<(usize, usize, f64)> = Vec::with_capacity(pairs.len());
-    let mut full = vec![0.0f64; n];
-    for (s, d, w, share) in pairs {
-        full[s] += share;
-        match merged.last_mut() {
-            Some(last) if last.0 == s && last.1 == d => last.2 += w,
-            _ => merged.push((s, d, w)),
-        }
-    }
-    // A source spreads `weight / full` over each edge: all of its rank when
-    // every edge is a sure call from production code, less over an edge
-    // that is `low`, `medium` or from a test. What it does not spread (all
-    // of it for a node with no edge out) is redistributed uniformly, like a
-    // dangling node's. Normalising by the weights themselves would cancel
-    // the confidence and test factors for a source whose edges all share
-    // them (a test method: every edge from a test).
-    let mut kept = vec![0.0f64; n];
-    for &(s, _, w) in &merged {
-        kept[s] += w / full[s];
-    }
-    let nf = n as f64;
-    let mut rank = vec![1.0 / nf; n];
-    let (mut iterations, mut converged) = (0, false);
-    for _ in 0..MAX_ITERATIONS {
-        iterations += 1;
-        let leaked: f64 = (0..n).map(|i| rank[i] * (1.0 - kept[i]).max(0.0)).sum();
-        let base = (1.0 - DAMPING) / nf + DAMPING * leaked / nf;
-        let mut next = vec![base; n];
-        for &(s, d, w) in &merged {
-            next[d] += DAMPING * rank[s] * w / full[s];
-        }
-        let delta: f64 = next.iter().zip(&rank).map(|(a, b)| (a - b).abs()).sum();
-        rank = next;
-        if delta < TOLERANCE {
-            converged = true;
-            break;
-        }
-    }
+    let m = RankMatrix::new(nodes, edges);
+    let run = m.global();
     PageRankRun {
-        ranks: nodes.iter().map(|id| rank[index[id]]).collect(),
-        iterations,
-        converged,
+        ranks: nodes.iter().map(|id| run.ranks[m.index[id]]).collect(),
+        iterations: run.iterations,
+        converged: run.converged,
+    }
+}
+
+/// A branch's PageRank matrix (DD-12): the nodes sorted by id, each pair's
+/// summed weight, and what each source spreads. Built once; ranked globally
+/// ([`global`](Self::global)) or personalized
+/// ([`personalized`](Self::personalized)) as often as needed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RankMatrix {
+    /// The nodes, sorted and unique: position = node index.
+    ids: Vec<u64>,
+    /// Node index of each id.
+    index: HashMap<u64, usize>,
+    /// `(source, destination, weight)` per pair, sorted.
+    merged: Vec<(u32, u32, f64)>,
+    /// Per source: what it would spread if every occurrence were sure and
+    /// outside tests (`Σ kind × sqrt(n)`).
+    full: Vec<f64>,
+    /// Per source: the share of its rank it spreads (`Σ weight / full`).
+    kept: Vec<f64>,
+}
+
+impl RankMatrix {
+    /// The matrix of `edges` over `nodes`; an edge whose end is not a node,
+    /// a self-loop or one of weight 0 is left out.
+    pub fn new(nodes: &[u64], edges: &[RankEdge]) -> Self {
+        let mut ids: Vec<u64> = nodes.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let n = ids.len();
+        let index: HashMap<u64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        // One (weight, share) per (src, dst), summed in a fixed order: the
+        // weight is the edge's; the share, what the source would spread over it
+        // if every occurrence were sure and outside tests (kind × sqrt(n)).
+        let mut pairs: Vec<(usize, usize, f64, f64)> = edges
+            .iter()
+            .filter(|e| e.src != e.dst)
+            .filter_map(|e| {
+                let w = edge_weight(e);
+                let (s, d) = (*index.get(&e.src)?, *index.get(&e.dst)?);
+                (w > 0.0).then(|| (s, d, w, kind_weight(e.kind) * (e.n as f64).sqrt()))
+            })
+            .collect();
+        pairs.sort_by(|a, b| {
+            (a.0, a.1)
+                .cmp(&(b.0, b.1))
+                .then(a.2.total_cmp(&b.2))
+                .then(a.3.total_cmp(&b.3))
+        });
+        let mut merged: Vec<(u32, u32, f64)> = Vec::with_capacity(pairs.len());
+        let mut full = vec![0.0f64; n];
+        for (s, d, w, share) in pairs {
+            full[s] += share;
+            match merged.last_mut() {
+                Some(last) if last.0 as usize == s && last.1 as usize == d => last.2 += w,
+                _ => merged.push((s as u32, d as u32, w)),
+            }
+        }
+        merged.shrink_to_fit();
+        // A source spreads `weight / full` over each edge: all of its rank when
+        // every edge is a sure call from production code, less over an edge
+        // that is `low`, `medium` or from a test. What it does not spread (all
+        // of it for a node with no edge out) is redistributed uniformly, like a
+        // dangling node's. Normalising by the weights themselves would cancel
+        // the confidence and test factors for a source whose edges all share
+        // them (a test method: every edge from a test).
+        let mut kept = vec![0.0f64; n];
+        for &(s, _, w) in &merged {
+            kept[s as usize] += w / full[s as usize];
+        }
+        Self {
+            ids,
+            index,
+            merged,
+            full,
+            kept,
+        }
+    }
+
+    /// The nodes, sorted by id: the order of every rank vector.
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+
+    /// Node index of `id`.
+    pub fn index_of(&self, id: u64) -> Option<usize> {
+        self.index.get(&id).copied()
+    }
+
+    /// Aggregated pairs (edges of the matrix).
+    pub fn edge_count(&self) -> usize {
+        self.merged.len()
+    }
+
+    /// Bytes the matrix holds, roughly (for `status` and the measurements).
+    pub fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        self.ids.capacity() * size_of::<u64>()
+            + self.index.capacity() * (size_of::<u64>() + size_of::<usize>() + 8)
+            + self.merged.capacity() * size_of::<(u32, u32, f64)>()
+            + (self.full.capacity() + self.kept.capacity()) * size_of::<f64>()
+    }
+
+    /// The global PageRank (teleport and leaks uniform), in node order.
+    pub fn global(&self) -> PageRankRun {
+        let n = self.ids.len();
+        if n == 0 {
+            return PageRankRun {
+                ranks: Vec::new(),
+                iterations: 0,
+                converged: true,
+            };
+        }
+        let nf = n as f64;
+        let mut rank = vec![1.0 / nf; n];
+        let (mut iterations, mut converged) = (0, false);
+        for _ in 0..MAX_ITERATIONS {
+            iterations += 1;
+            let leaked: f64 = (0..n)
+                .map(|i| rank[i] * (1.0 - self.kept[i]).max(0.0))
+                .sum();
+            let base = (1.0 - DAMPING) / nf + DAMPING * leaked / nf;
+            let mut next = vec![base; n];
+            for &(s, d, w) in &self.merged {
+                let (s, d) = (s as usize, d as usize);
+                next[d] += DAMPING * rank[s] * w / self.full[s];
+            }
+            let delta: f64 = next.iter().zip(&rank).map(|(a, b)| (a - b).abs()).sum();
+            rank = next;
+            if delta < TOLERANCE {
+                converged = true;
+                break;
+            }
+        }
+        PageRankRun {
+            ranks: rank,
+            iterations,
+            converged,
+        }
+    }
+
+    /// The PageRank personalized to `p` (one weight per node, in node order;
+    /// normalized here): teleport and what a node does not spread go to `p`
+    /// instead of uniformly. `dst_mult` (one per node, or empty for none)
+    /// reweighs each edge by its destination's multiplier: a source still
+    /// spreads the same share of its rank (confidence and tests decide how
+    /// much, as in [`global`](Self::global)), split over its edges by
+    /// `weight × multiplier`. With a uniform `p` and no multipliers it is the
+    /// global rank (up to rounding). A `p` with no weight is the global rank.
+    pub fn personalized(&self, p: &[f64], dst_mult: &[f64]) -> PageRankRun {
+        let n = self.ids.len();
+        let total: f64 = p
+            .iter()
+            .take(n)
+            .filter(|x| x.is_finite() && **x > 0.0)
+            .sum();
+        if n == 0 || p.len() != n || total <= 0.0 {
+            return self.global();
+        }
+        let p: Vec<f64> = p
+            .iter()
+            .map(|x| {
+                if x.is_finite() && *x > 0.0 {
+                    x / total
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let mult = |d: usize| dst_mult.get(d).copied().unwrap_or(1.0).max(0.0);
+        // Per edge, the share of its source's rank it carries.
+        let mut denom = vec![0.0f64; n];
+        for &(s, d, w) in &self.merged {
+            denom[s as usize] += w * mult(d as usize);
+        }
+        let coef: Vec<f64> = self
+            .merged
+            .iter()
+            .map(|&(s, d, w)| {
+                let s = s as usize;
+                if denom[s] > 0.0 {
+                    self.kept[s] * w * mult(d as usize) / denom[s]
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let mut spread = vec![0.0f64; n];
+        for (&(s, _, _), c) in self.merged.iter().zip(&coef) {
+            spread[s as usize] += c;
+        }
+        let mut rank = p.clone();
+        let (mut iterations, mut converged) = (0, false);
+        for _ in 0..MAX_ITERATIONS {
+            iterations += 1;
+            let leaked: f64 = (0..n).map(|i| rank[i] * (1.0 - spread[i]).max(0.0)).sum();
+            let to_p = (1.0 - DAMPING) + DAMPING * leaked;
+            let mut next: Vec<f64> = p.iter().map(|x| to_p * x).collect();
+            for (&(s, d, _), c) in self.merged.iter().zip(&coef) {
+                next[d as usize] += DAMPING * rank[s as usize] * c;
+            }
+            let delta: f64 = next.iter().zip(&rank).map(|(a, b)| (a - b).abs()).sum();
+            rank = next;
+            if delta < TOLERANCE {
+                converged = true;
+                break;
+            }
+        }
+        PageRankRun {
+            ranks: rank,
+            iterations,
+            converged,
+        }
     }
 }
 
 /// A PageRank run: the ranks, the iterations it took and whether it
 /// converged under [`TOLERANCE`] before [`MAX_ITERATIONS`].
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PageRankRun {
+pub struct PageRankRun {
+    /// One rank per node.
     pub ranks: Vec<f64>,
+    /// Power iterations run.
     pub iterations: usize,
+    /// Converged under the tolerance.
     pub converged: bool,
 }
 
@@ -189,9 +345,9 @@ pub(crate) fn rank_branch(
     let run = pagerank_run(&ids, &edges);
     let mut in_degree: HashMap<u64, i64> = HashMap::new();
     for e in &edges {
-        if e.kind == "calls"
+        if e.kind == RankKind::Calls
             && !e.from_test
-            && matches!(e.confidence.as_deref(), Some("high" | "medium"))
+            && matches!(e.confidence, RankConfidence::High | RankConfidence::Medium)
         {
             *in_degree.entry(e.dst).or_default() += e.n as i64;
         }
@@ -225,8 +381,8 @@ mod tests {
         RankEdge {
             src,
             dst,
-            kind: "calls".into(),
-            confidence: Some("high".into()),
+            kind: RankKind::Calls,
+            confidence: RankConfidence::High,
             from_test: false,
             n: 1,
         }
@@ -268,12 +424,16 @@ mod tests {
     #[test]
     fn the_ranks_are_deterministic() {
         let nodes: Vec<u64> = (1..=40).map(|i| i * 7919 % 1000).collect();
-        let conf = ["high", "medium", "low"];
+        let conf = [
+            RankConfidence::High,
+            RankConfidence::Medium,
+            RankConfidence::Low,
+        ];
         let edges: Vec<RankEdge> = (0..600)
             .map(|i| {
                 let mut x = e(nodes[i % 40], nodes[(i * 13 + 5) % 23]);
                 x.n = 1 + (i as u64 * 37 % 11);
-                x.confidence = Some(conf[i % 3].into());
+                x.confidence = conf[i % 3];
                 x.from_test = i % 7 == 0;
                 x
             })
@@ -299,17 +459,17 @@ mod tests {
         t.from_test = true;
         assert!((edge_weight(&t) - 0.1).abs() < 1e-12);
         let mut low = e(1, 2);
-        low.confidence = Some("low".into());
+        low.confidence = RankConfidence::Low;
         assert!((edge_weight(&low) - 0.2).abs() < 1e-12);
         let mut many = e(1, 2);
         many.n = 4;
         assert!((edge_weight(&many) - 2.0).abs() < 1e-12);
         let mut c = e(1, 2);
-        c.kind = "contains".into();
+        c.kind = RankKind::Other;
         assert_eq!(edge_weight(&c), 0.0);
         let mut i = e(1, 2);
-        i.kind = "imports".into();
-        i.confidence = Some("medium".into());
+        i.kind = RankKind::Imports;
+        i.confidence = RankConfidence::Medium;
         assert!((edge_weight(&i) - 0.18).abs() < 1e-12);
     }
 
@@ -333,6 +493,99 @@ mod tests {
         let r = pagerank(&[1, 5, 6, 7], &[hundred, quarter]);
         let ratio = (r[1] - r[3]) / (r[2] - r[3]);
         assert!((ratio - 2.0).abs() < 1e-6, "{ratio} {r:?}");
+    }
+
+    /// TASK-011: personalized with a uniform vector and no multipliers is
+    /// the global rank (up to rounding); an empty or zero vector is the
+    /// global rank itself.
+    #[test]
+    fn a_uniform_personalization_is_the_global_rank() {
+        let nodes: Vec<u64> = (1..=30).collect();
+        let edges: Vec<RankEdge> = (0..120u64)
+            .map(|i| {
+                let mut x = e(1 + i % 30, 1 + (i * 7 + 3) % 17);
+                x.n = 1 + i % 5;
+                x.from_test = i % 9 == 0;
+                x.confidence = [RankConfidence::High, RankConfidence::Low][(i % 2) as usize];
+                x
+            })
+            .collect();
+        let m = RankMatrix::new(&nodes, &edges);
+        let g = m.global();
+        let p = m.personalized(&[1.0; 30], &[]);
+        for (a, b) in g.ranks.iter().zip(&p.ranks) {
+            assert!((a - b).abs() < 1e-9, "{a} {b}");
+        }
+        assert_eq!(m.personalized(&[0.0; 30], &[]), g);
+        assert_eq!(m.personalized(&[], &[]), g);
+    }
+
+    /// TASK-011: the personalization decides what ranks: from the focus `1`
+    /// (which calls `2`), `2` outranks `9`, the global hub that five other
+    /// nodes call; globally it is the other way round.
+    #[test]
+    fn the_focus_and_what_it_uses_outrank_the_global_hub() {
+        let nodes = [1, 2, 3, 4, 5, 6, 7, 9];
+        let edges: Vec<RankEdge> = [3, 4, 5, 6, 7]
+            .iter()
+            .map(|&i| e(i, 9))
+            .chain([e(1, 2)])
+            .collect();
+        let m = RankMatrix::new(&nodes, &edges);
+        let at = |id| m.index_of(id).unwrap();
+        let g = m.global().ranks;
+        assert!(g[at(9)] > g[at(2)], "{g:?}");
+        let mut p = vec![0.0; nodes.len()];
+        p[at(1)] = 50.0;
+        let r = m.personalized(&p, &[]).ranks;
+        assert!(r[at(2)] > r[at(9)], "{r:?}");
+        assert!((r.iter().sum::<f64>() - 1.0).abs() < 1e-6, "{r:?}");
+        // Nothing reaches the hub from the focus: it gets nothing.
+        assert_eq!(r[at(9)], 0.0, "{r:?}");
+    }
+
+    /// TASK-011: a destination multiplier reweighs how a source splits what
+    /// it spreads (`1` calls `2` and `3` alike; ×10 on `3` sends it ten times
+    /// as much), never how much it spreads.
+    #[test]
+    fn a_destination_multiplier_reweighs_the_split() {
+        let nodes = [1, 2, 3];
+        let m = RankMatrix::new(&nodes, &[e(1, 2), e(1, 3)]);
+        let mut p = vec![0.0; 3];
+        p[0] = 1.0;
+        let even = m.personalized(&p, &[]).ranks;
+        assert!((even[1] - even[2]).abs() < 1e-12, "{even:?}");
+        let r = m.personalized(&p, &[1.0, 1.0, 10.0]).ranks;
+        assert!((r[2] / r[1] - 10.0).abs() < 1e-6, "{r:?}");
+        assert!(((r[1] + r[2]) - (even[1] + even[2])).abs() < 1e-9, "{r:?}");
+    }
+
+    /// TASK-011: personalized ranks are deterministic too — the same graph in
+    /// another order gives the same bits.
+    #[test]
+    fn personalized_ranks_are_deterministic() {
+        let nodes: Vec<u64> = (1..=40).map(|i| i * 7919 % 1000).collect();
+        let edges: Vec<RankEdge> = (0..400)
+            .map(|i| {
+                let mut x = e(nodes[i % 40], nodes[(i * 13 + 5) % 23]);
+                x.n = 1 + (i as u64 * 37 % 11);
+                x
+            })
+            .collect();
+        let m = RankMatrix::new(&nodes, &edges);
+        let mut rn = nodes.clone();
+        rn.reverse();
+        let mut re = edges.clone();
+        re.reverse();
+        let m2 = RankMatrix::new(&rn, &re);
+        let p: Vec<f64> = (0..40).map(|i| (i % 3) as f64).collect();
+        let mult: Vec<f64> = (0..40)
+            .map(|i| if i % 5 == 0 { 0.1 } else { 1.0 })
+            .collect();
+        let a = m.personalized(&p, &mult);
+        let b = m2.personalized(&p, &mult);
+        assert_eq!(m.ids(), m2.ids());
+        assert_eq!(a, b);
     }
 
     /// A self-loop, an edge to a node that is not there and an empty graph

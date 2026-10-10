@@ -40,7 +40,7 @@ pub use routes::StoredRoute;
 pub use schema::init_schema;
 pub use state::{CopySetup, FileState, IndexRecord, EMBED_FP_META_KEY, EXTRACTOR_META_KEY};
 pub use store::{normalize_metric, MemoryReport, Store};
-pub use symbols::{RankEdge, StoredSymbol, StoredSymbolEdge};
+pub use symbols::{MapSymbol, RankConfidence, RankEdge, RankKind, StoredSymbol, StoredSymbolEdge};
 pub use traverse::{
     Traversal, TraverseDirection, TraverseEdge, TraverseEnd, TraverseNode, TraverseOptions,
     TRAVERSE_KINDS, TRAVERSE_MAX_DEPTH,

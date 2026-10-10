@@ -20,6 +20,7 @@ pub use devctx_parse::{extractor_fingerprint, lang_for_extension, raw_text_langu
 pub use error::{IndexError, Result};
 pub use git::{Change, GitRepo, GitState};
 pub use id::chunk_id;
+pub use pagerank::{PageRankRun, RankMatrix};
 pub use pipeline::{
     run, IndexRequest, IndexResult, ProgressSink, PENDING_FTS_META_KEY, PENDING_HNSW_META_KEY,
 };
