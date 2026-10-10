@@ -420,10 +420,17 @@ pub(crate) fn traverse_walk(
                 symbol: r.symbol.clone(),
             };
             // The edges that reached it at this depth, one per pair,
-            // relation and dispatch; under `min_confidence`, none.
+            // relation and dispatch; under `min_confidence`, none. A node
+            // past the page shows none, so none is built (second review of
+            // TASK-013, MINOR 2: a name of thousands of definitions built
+            // hundreds of thousands); with `low`, an upgraded unsure node
+            // can move the page, so all are.
             let mut edges: BTreeMap<(TraverseEnd, TraverseEnd, String, bool), TraverseEdge> =
                 BTreeMap::new();
-            for (dir, e) in reached_by.remove(&key).unwrap_or_default() {
+            let past_page =
+                opts.need > 0 && at >= opts.need && opts.min_confidence != MinConfidence::Low;
+            let reached = reached_by.remove(&key).unwrap_or_default();
+            for (dir, e) in reached.into_iter().filter(|_| !past_page) {
                 if !opts.min_confidence.admits(e.confidence.as_deref()) {
                     continue;
                 }
@@ -1037,6 +1044,54 @@ mod tests {
             .traverse("repo", "main", &[g["Dto"].clone()], &o)
             .unwrap();
         assert_eq!((t.nodes.len(), t.unread_from), (600, None));
+    }
+
+    /// Second review of TASK-013, MINOR 2 (found re-measuring with thousands
+    /// of definitions): the edges of a node past the page are never shown,
+    /// so they are not built — the hub of 300 users with a page of 50 holds
+    /// 50 edges, all of nodes of the page.
+    #[test]
+    fn edges_are_built_only_for_the_page() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut syms: Vec<String> = vec!["Dto".into()];
+        for i in 0..300 {
+            syms.push(format!("U{i:03}.use"));
+        }
+        let s: Vec<Sym> = syms
+            .iter()
+            .map(|q| {
+                (
+                    q.as_str(),
+                    if q == "Dto" { "class" } else { "method" },
+                    None,
+                )
+            })
+            .collect();
+        let r: Vec<Rel> = syms[1..]
+            .iter()
+            .map(|u| (u.as_str(), "references", "Dto", "high", 1))
+            .collect();
+        let g = graph(&store, &s, &r);
+        let o = TraverseOptions {
+            need: 50,
+            ..opts(&["references"], TraverseDirection::In, 1)
+        };
+        let t = store
+            .traverse("repo", "main", &[g["Dto"].clone()], &o)
+            .unwrap();
+        assert_eq!(t.nodes.len(), 300);
+        assert_eq!(t.edges.len(), 50);
+        assert!(t.edges.iter().all(|e| e.reached < 50));
+        // No page: every edge.
+        let t = store
+            .traverse(
+                "repo",
+                "main",
+                &[g["Dto"].clone()],
+                &TraverseOptions { need: 0, ..o },
+            )
+            .unwrap();
+        assert_eq!(t.edges.len(), 300);
     }
 
     /// Dispatch, when `calls` is followed: upstream from an implementation,

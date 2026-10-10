@@ -290,7 +290,8 @@ fn fit_prefix(
 /// `items` under `budget` tokens, with their positions: every one when
 /// they all fit (review of TASK-013, MINOR 2: an even share must not drop
 /// an item the total had room for), else each within an even share, as
-/// `fit_json_array` does; the dropped ones named by `label`. 0 = no budget.
+/// `fit_json_array` does, while the total fits; the dropped ones named by
+/// `label`. 0 = no budget.
 fn fit_whole_or_share(
     items: Vec<Value>,
     budget: usize,
@@ -305,9 +306,14 @@ fn fit_whole_or_share(
     // The floor of `fit_json_array`: a share too small to hold anything is
     // not worth enforcing on a long tail of small items.
     let share = (budget / items.len()).max(64) * super::CHARS_PER_TOKEN;
-    let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+    // The floor lets each item take more than an even share, so the total
+    // is enforced too (second review of TASK-013, MINOR 2: hundreds of
+    // small edges all passed the share, far past the budget).
+    let (mut used, mut kept, mut dropped) = (0usize, Vec::new(), Vec::new());
     for (i, v) in items.into_iter().enumerate() {
-        if size(&v) <= share {
+        let n = size(&v);
+        if n <= share && used + n <= room {
+            used += n;
             kept.push((i, v));
         } else {
             dropped.push(label(&v));
@@ -1173,6 +1179,60 @@ mod tests {
         assert_eq!(v["candidates"], all["candidates"], "{v}");
         assert_eq!(v["nodes"], all["nodes"], "{v}");
         assert!(v.get("omitted_for_budget").is_none(), "{v}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Second review of TASK-013, MINOR 2 (found re-measuring): many small
+    /// edges hang off few nodes — one caller of 200 definitions of a name —
+    /// and an even share with a floor of 64 tokens per item kept them all,
+    /// far past the budget. The edges take at most their half of it, in
+    /// order, and the rest is counted.
+    #[test]
+    fn many_small_edges_stay_within_the_budget() {
+        let mut files: Vec<(String, String)> = Vec::new();
+        let mut fields = String::new();
+        let mut calls = String::new();
+        for i in 0..200 {
+            files.push((
+                format!("src/main/java/many/Job{i:03}.java"),
+                format!("package many;\n\npublic class Job{i:03} {{\n    public void execute() {{\n    }}\n}}\n"),
+            ));
+            fields.push_str(&format!(
+                "    private final Job{i:03} j{i} = new Job{i:03}();\n"
+            ));
+            calls.push_str(&format!("        j{i}.execute();\n"));
+        }
+        files.push((
+            "src/main/java/many/Runner.java".into(),
+            format!("package many;\n\npublic class Runner {{\n{fields}\n    public void run() {{\n{calls}    }}\n}}\n"),
+        ));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (state, repo) = indexed_files("traverse_many_edges", &refs);
+        let store = state.open_store().unwrap();
+        let chosen = graph_branch(&state, &store).unwrap();
+        let ask = q("execute", "calls", "in", 1);
+        let all = super::traverse_on(&store, &chosen, &ask, 0).unwrap();
+        assert_eq!(syms(&all), ["Runner.run"], "{}", all["total"]);
+        assert_eq!(all["edges"].as_array().unwrap().len(), 200);
+        let budget = 2000;
+        let v = super::traverse_on(&store, &chosen, &ask, budget).unwrap();
+        let edges = v["edges"].as_array().unwrap();
+        let chars: usize = edges.iter().map(|e| e.to_string().len()).sum();
+        assert!(
+            chars <= budget / 2 * CHARS_PER_TOKEN,
+            "{chars} chars of edges"
+        );
+        let cut = v["omitted_for_budget"]["edges"].as_u64().unwrap() as usize;
+        assert!(
+            cut > 0 && cut + edges.len() == 200,
+            "{cut} + {}",
+            edges.len()
+        );
+        assert_eq!(syms(&v), ["Runner.run"]);
         drop(store);
         let _ = std::fs::remove_dir_all(&repo);
     }
