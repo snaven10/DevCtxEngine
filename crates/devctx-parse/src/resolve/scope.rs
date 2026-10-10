@@ -85,7 +85,9 @@ impl TypeText {
         }
         if let Some(open) = t.find('<') {
             let base = t[..open].to_string();
-            let inner = &t[open + 1..t.rfind('>').unwrap_or(t.len())];
+            // The last `>` after it (an arrow's `>` can come before).
+            let close = t[open + 1..].rfind('>').map_or(t.len(), |i| open + 1 + i);
+            let inner = &t[open + 1..close];
             let first = top_level_first(inner);
             let first = first
                 .strip_prefix("?extends")
@@ -722,5 +724,15 @@ mod tests {
         assert_eq!(TypeText::parse("Foo").unwrap().elem, None);
         assert_eq!(TypeText::parse("Foo | null").unwrap().base, "Foo");
         assert_eq!(TypeText::parse("A | B").unwrap().base, "A|B");
+    }
+
+    /// A `>` before the first `<` (an arrow `=>` of a function type whose
+    /// generic argument is not closed in the text) used to slice backwards
+    /// and panic — the whole index run of a TypeScript repository with it.
+    #[test]
+    fn a_closing_bracket_before_the_opening_one_does_not_panic() {
+        let t = TypeText::parse("(e: Event) => Observable<Item").unwrap();
+        assert_eq!(t.base, "(e:Event)=>Observable");
+        assert_eq!(t.elem.as_deref(), Some("Item"));
     }
 }
