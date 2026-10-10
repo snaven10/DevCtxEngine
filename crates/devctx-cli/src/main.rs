@@ -305,6 +305,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// A map of the repository for orientation: the signatures of the symbols
+    /// most relevant to a focus, grouped by file, within a token budget.
+    Map {
+        /// Tokens the map may take (default 1024; at least 256 is used).
+        #[arg(long)]
+        budget: Option<usize>,
+        /// Files you have open or are editing (repeatable, or comma-separated):
+        /// what they use ranks first; they are not listed themselves.
+        #[arg(long, value_delimiter = ',')]
+        focus: Vec<String>,
+        /// Symbols the task is about (repeatable, or comma-separated).
+        #[arg(long = "symbol", value_delimiter = ',')]
+        symbols: Vec<String>,
+        /// The task in words: its identifiers count as focus symbols.
+        #[arg(long)]
+        query: Option<String>,
+    },
     /// Progress on the plans under `plans/` (markdown, source of truth). No daemon, no store:
     /// reads markdown from disk. Fast enough for a shell-startup hook.
     PlanStatus {
@@ -705,6 +722,17 @@ fn main() -> Result<()> {
             },
             json,
         ),
+        Command::Map {
+            budget,
+            focus,
+            symbols,
+            query,
+        } => cmd_map(devctx_mcp::repo_map::RepoMapQuery {
+            budget,
+            focus_files: focus,
+            focus_symbols: symbols,
+            query,
+        }),
         Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),
         Command::Routes { method, path } => cmd_routes(method, path),
         Command::Summarize {
@@ -2415,6 +2443,29 @@ fn cmd_impact(symbol: String, depth: usize, q: devctx_mcp::state::ImpactQuery) -
         }
     };
     print_impact_answer(&symbol, depth, &json);
+    Ok(())
+}
+
+/// `devctx map` — the repo map (PLAN-009 TASK-011): the same text as the
+/// `repo_map` tool, through the server when there is one.
+fn cmd_map(q: devctx_mcp::repo_map::RepoMapQuery) -> Result<()> {
+    // A bad parameter is refused before a server or a store is touched.
+    q.validate().map_err(|e| anyhow!(e))?;
+    let cfg = load_project()?;
+    let text = match remote::ensure_cli(&cfg)? {
+        Some(r) => r.repo_map(&q)?,
+        None => {
+            let store = open_store(&cfg, configured_dimension(&cfg))?;
+            devctx_mcp::state::repo_map_at(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+                &q,
+            )
+            .map_err(|e| anyhow!(e))?
+        }
+    };
+    print!("{text}");
     Ok(())
 }
 

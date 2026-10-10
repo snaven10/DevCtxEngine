@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -26,9 +26,11 @@ use serde_json::{json, Value};
 
 mod impact;
 mod lookup;
+mod repo_map;
 mod traverse;
 
 pub use impact::ImpactQuery;
+pub use repo_map::REPO_MAP_NEEDS_REINDEX;
 pub use traverse::{TraverseQuery, DEFAULT_TRAVERSE_LIMIT, TRAVERSE_NEEDS_REINDEX};
 
 /// How far an indexing run has got, for anyone who asks while it runs.
@@ -276,6 +278,12 @@ pub struct AppState {
     /// Consecutive polls that found the project's `.devctx/` missing; see
     /// [`AppState::project_vanished`].
     vanish_strikes: AtomicU32,
+    /// The adjacency `repo_map` ranks over (PLAN-009 TASK-011): one branch,
+    /// by index generation; dropped when an `index` ends and when unused
+    /// (see [`AppState::release_idle_models`]).
+    repo_map: Mutex<Option<repo_map::CachedMap>>,
+    /// Times that adjacency was read from the database.
+    repo_map_loads: AtomicUsize,
 }
 
 impl AppState {
@@ -319,6 +327,8 @@ impl AppState {
             index_progress: Arc::new(Mutex::new(IndexProgress::default())),
             index_cancel: Arc::new(AtomicBool::new(false)),
             vanish_strikes: AtomicU32::new(0),
+            repo_map: Mutex::new(None),
+            repo_map_loads: AtomicUsize::new(0),
         })
     }
 
@@ -407,6 +417,12 @@ impl AppState {
                 released.push("reranker");
             }
         }
+        // The repo map's adjacency follows the same policy (DD-12): megabytes
+        // on a large repository, rebuilt in under a second.
+        if self.release_idle_repo_map(max_idle) {
+            keys.push("repo map graph".to_string());
+            released.push("repo map graph");
+        }
         if !released.is_empty() {
             trim_allocator();
             log_model_event("released", &keys.join(", "), None, rss_before);
@@ -460,6 +476,7 @@ impl AppState {
                 "database_size": report.database_size,
                 "notes": report.notes,
             },
+            "repo_map": self.repo_map_json(),
             "hnsw": {
                 "present": report.hnsw_present,
                 "metric": report.hnsw_metric,
@@ -1284,6 +1301,9 @@ fn do_index_inner(
             .then_some(state.cfg.storage.metric.as_str()),
         embed_fingerprint: &fingerprint,
     });
+    // Whatever the run wrote, the repo map's adjacency is of before it
+    // (DD-12): dropped on every outcome, an error included.
+    state.drop_repo_map();
     let res = run.map_err(|e| e.to_string())?;
     if res.cancelled {
         // The server is going away: say what happened and touch nothing else
@@ -4336,6 +4356,44 @@ pub fn traverse_at(
     .ready()?;
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     traverse::traverse_on(store, &chosen, q, budget)
+}
+
+/// `repo_map` tool (PLAN-009 TASK-011, DD-14): the signatures of the
+/// symbols most relevant to the focus of `q`, grouped by file, within its
+/// budget; see [`RepoMapQuery`](crate::repo_map::RepoMapQuery). Ranks over
+/// the branch's adjacency, cached per index generation. A branch without a
+/// current symbol graph is an error that asks for `devctx index --full`.
+pub fn do_repo_map(state: &AppState, q: &crate::repo_map::RepoMapQuery) -> Result<String, String> {
+    q.validate()?;
+    let store = state.open_store()?;
+    let chosen = graph_branch(state, &store)?;
+    repo_map::check(&chosen, &store)?;
+    let graph = state.repo_map_graph(&store, &chosen)?;
+    Ok(repo_map::map_on(&graph, &chosen, q))
+}
+
+/// [`do_repo_map`] for a caller that holds a store but no [`AppState`] (the
+/// local CLI): the same map, read for this one call.
+pub fn repo_map_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    q: &crate::repo_map::RepoMapQuery,
+) -> Result<String, String> {
+    q.validate()?;
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    repo_map::check(&chosen, store)?;
+    let graph = repo_map::load(store, &chosen.repo, &chosen.branch)?;
+    Ok(repo_map::map_on(&graph, &chosen, q))
 }
 
 /// The centrality weight a search without a server (the CLI's local path,

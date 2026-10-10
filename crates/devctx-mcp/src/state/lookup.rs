@@ -491,7 +491,7 @@ pub(super) mod tests {
         }
     }
 
-    fn git(dir: &Path, args: &[&str]) {
+    pub(crate) fn git(dir: &Path, args: &[&str]) {
         let ok = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)

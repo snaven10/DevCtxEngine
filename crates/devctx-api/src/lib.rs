@@ -62,6 +62,7 @@ fn router(api: Api) -> Router {
         .route("/impact/:symbol", get(impact))
         .route("/references/:symbol", get(references))
         .route("/traverse", post(traverse))
+        .route("/repo-map", get(repo_map))
         .route("/memories/by-symbol/:symbol", get(memories_by_symbol))
         .route("/memories/by-file/:file", get(memories_by_file))
         .route("/memory/:id/refs", get(memory_refs))
@@ -1232,6 +1233,32 @@ async fn traverse(
     run(api.state, move |s| devctx_mcp::state::do_traverse(s, &q)).await
 }
 
+/// The query string of `GET /repo-map`: lists comma-separated.
+#[derive(Debug, Default, serde::Deserialize)]
+struct RepoMapParams {
+    budget: Option<usize>,
+    focus_files: Option<String>,
+    focus_symbols: Option<String>,
+    query: Option<String>,
+}
+
+/// `GET /repo-map` (PLAN-009 TASK-011): the `repo_map` tool, its parameters
+/// in the query string (`budget`, `focus_files` and `focus_symbols`
+/// comma-separated, `query`). The map is text. A bad parameter is a 400; an
+/// old index is refused as every tool error (a 500 with `error`).
+async fn repo_map(State(api): State<Api>, Query(p): Query<RepoMapParams>) -> Response {
+    let q = devctx_mcp::repo_map::RepoMapQuery::from_params(
+        p.budget,
+        p.focus_files.as_deref(),
+        p.focus_symbols.as_deref(),
+        p.query,
+    );
+    if let Err(e) = q.validate() {
+        return json_err(StatusCode::BAD_REQUEST, e);
+    }
+    run(api.state, move |s| devctx_mcp::state::do_repo_map(s, &q)).await
+}
+
 /// Link memories saved before the junction existed.
 async fn backfill_links(State(api): State<Api>, Json(b): Json<BackfillBody>) -> Response {
     run(api.state, move |s| {
@@ -1639,6 +1666,44 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("between 1 and 4"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-011: `GET /repo-map` exists and takes the tool's
+    /// parameters from the query string; a budget of 0 is a 400 with its
+    /// message; a project with nothing indexed is an error, never an empty
+    /// map.
+    #[tokio::test]
+    async fn repo_map_takes_its_parameters_from_the_query() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_repo_map_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .uri("/repo-map?budget=0&focus_files=a.rs,b.rs&query=why")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("budget"), "{text}");
+        let req = Request::builder()
+            .uri("/repo-map?budget=512&focus_symbols=Store.open")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!v["error"].as_str().unwrap().is_empty(), "{v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

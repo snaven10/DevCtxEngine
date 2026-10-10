@@ -1235,6 +1235,30 @@ impl Remote {
         })
     }
 
+    /// `GET /repo-map`; a server older than the tool answers 404 (405), read
+    /// from the status code, and is told as such. The map is text.
+    pub fn repo_map(&self, q: &devctx_mcp::repo_map::RepoMapQuery) -> Result<String> {
+        let path = devctx_mcp::backend::repo_map_path(q);
+        let missing = std::cell::Cell::new(false);
+        self.send(|r| {
+            let res = r
+                .auth(r.agent().get(&format!("{}{path}", r.base)))
+                .call()
+                .map_err(Box::new);
+            if let Err(e) = &res {
+                missing.set(matches!(&**e, ureq::Error::Status(404 | 405, _)));
+            }
+            res
+        })
+        .map_err(|e| {
+            if missing.get() {
+                anyhow::anyhow!(devctx_mcp::backend::REPO_MAP_OLD_SERVER)
+            } else {
+                e
+            }
+        })
+    }
+
     pub fn backfill_links(&self, dry_run: bool, from_text: bool) -> Result<String> {
         self.post(
             "/memories/backfill-links",
@@ -1622,6 +1646,39 @@ mod tests {
             cfg: None,
         };
         let e = failing.traverse(&q).unwrap_err().to_string();
+        assert!(e.contains("boom") && !e.contains("predates"), "{e}");
+    }
+
+    /// PLAN-009 TASK-011: `devctx map` against a server older than the tool
+    /// (404 on `GET /repo-map`) says to restart it; a 500 keeps the server's
+    /// own message.
+    #[test]
+    fn repo_map_on_an_old_server_says_to_restart_it() {
+        let q = devctx_mcp::repo_map::RepoMapQuery::default();
+        let old = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = old.repo_map(&q).unwrap_err().to_string();
+        assert!(e.contains("predates repo_map"), "{e}");
+        let failing = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                     Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = failing.repo_map(&q).unwrap_err().to_string();
         assert!(e.contains("boom") && !e.contains("predates"), "{e}");
     }
 

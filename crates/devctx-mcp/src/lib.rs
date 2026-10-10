@@ -1,12 +1,13 @@
 //! `devctx-mcp` — Model Context Protocol server (stdio) exposing DevCtxEngine to agents.
 //!
-//! 25 tools over the indexing pipeline: code (`search`, `read_file`,
-//! `read_symbol`, `get_references`, `impact_analysis`, `traverse`, `summarize`), routes,
+//! 26 tools over the indexing pipeline: code (`search`, `read_file`,
+//! `read_symbol`, `get_references`, `impact_analysis`, `traverse`, `repo_map`, `summarize`), routes,
 //! memory, and project/index management. Built on the official `rmcp` SDK.
 //! See `docs/architecture-spec.md` §8 for the process model.
 
 pub mod backend;
 pub mod lifecycle;
+pub mod repo_map;
 pub mod state;
 
 use std::collections::HashMap;
@@ -333,6 +334,30 @@ struct ReadSymbolReq {
     /// than once across a repository.
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// Parameters for the `repo_map` tool (PLAN-009 TASK-011, DD-14).
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct RepoMapReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
+    /// Tokens the map may take (default 1024; at least 256 is used).
+    #[serde(default)]
+    budget: Option<usize>,
+    /// Files you have open or are editing (repo-relative paths, or their
+    /// tail): what they use ranks first. They are not listed themselves.
+    #[serde(default)]
+    focus_files: Option<Vec<String>>,
+    /// Symbols the task is about: bare (`place`), qualified
+    /// (`OrderService.place`) or `file::name`.
+    #[serde(default)]
+    focus_symbols: Option<Vec<String>>,
+    /// The task in words; its identifiers (camelCase, snake_case,
+    /// Type.member) count as focus symbols, and so does a one-word query.
+    #[serde(default)]
+    query: Option<String>,
 }
 
 /// Parameters for the `build_context` tool.
@@ -1345,6 +1370,41 @@ impl DevctxServer {
         run_blocking(move || backend.traverse(&q))
             .await
             .map(|out| Self::annotate(out, resolved))
+    }
+
+    /// A map of the repository for orientation.
+    #[tool(
+        description = "Map of the repository, to orient yourself: the signatures (no bodies) of \
+        the symbols most relevant to your focus, grouped by file, ranked by PageRank \
+        personalized to that focus, within `budget` tokens (default 1024). Give a focus: \
+        `focus_files` (files you have open or are editing: what they use ranks first; they \
+        are not listed themselves), `focus_symbols` (names of the task: bare, Type.member or \
+        file::name) and/or `query` (the task in words: its identifiers count). Without one it \
+        is the globally central code, which on a large repository says little. Test code and \
+        libraries never appear. Use it at the start of a task to know where things are; to \
+        read code use read_symbol / read_file; for one symbol's neighbours, traverse. \
+        Returns text: per file its path and `│`-prefixed signatures under their containers, \
+        `⋮` when a file has more, and closing `[devctx]` lines that say what the focus \
+        matched and how many symbols did not fit. Needs an index made by 0.10 (else: devctx \
+        index --full)."
+    )]
+    async fn repo_map(&self, Parameters(req): Parameters<RepoMapReq>) -> Result<String, ErrorData> {
+        let q = repo_map::RepoMapQuery {
+            budget: req.budget,
+            focus_files: req.focus_files.unwrap_or_default(),
+            focus_symbols: req.focus_symbols.unwrap_or_default(),
+            query: req.query,
+        };
+        // A bad parameter is the caller's, said before a server is reached.
+        q.validate()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        let out = run_blocking(move || backend.repo_map(&q)).await?;
+        // Which repository answered is part of the answer (text: a line).
+        Ok(match resolved {
+            Some(p) => format!("[devctx] map of {p}\n\n{out}"),
+            None => out,
+        })
     }
 
     /// Progress on the plans under `plans/` (markdown, source of truth).

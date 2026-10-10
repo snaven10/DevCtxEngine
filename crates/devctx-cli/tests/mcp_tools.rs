@@ -825,3 +825,20 @@ fn traverse_refuses_a_depth_over_four() {
     );
     assert!(message.contains("between 1 and 4"), "{message}");
 }
+
+/// PLAN-009 TASK-011: `repo_map` is a tool of the MCP, and a budget of 0 is
+/// refused with its message before any server is reached.
+#[test]
+fn repo_map_refuses_a_budget_of_zero() {
+    let tmp = Tmp::new("repo_map_budget");
+    let home = tmp.home();
+    let repo = tmp.repo("proj");
+    devctx(&home, &repo, &["projects", "add", ".", "--init"]);
+    let message = call_tool_error(
+        &home,
+        &repo,
+        "repo_map",
+        serde_json::json!({ "budget": 0, "focus_files": ["src/a.rs"] }),
+    );
+    assert!(message.contains("budget"), "{message}");
+}
