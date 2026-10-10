@@ -258,4 +258,34 @@ paginación y conteo de omitidos. Inspirada en TraverseGraph de LocAgent. Implem
     (el test de la API, de esta task, pasa a pedir 400); CHANGELOG: tras un cambio de versión del
     extractor `traverse` da error hasta `devctx index --full` mientras impact y get_references
     degradan con `warning`. **Para TASK-015 (guía de reindex):** esa diferencia va en la guía.
+- **Segunda revisión (MINOR 1-2, NITs), resuelta en commits encima de `b5ddae9`** (rama de TASK-011):
+  - *MINOR 1* (`f31a047`): un nodo listado `undecided` en el nivel 1 y alcanzado después por una
+    arista decidida deja su lugar —con su arista sin decidir— y se recorre (`unsure_shown` de
+    impact; `drop_nodes` renumera lo que alcanzaba cada arista). Test
+    `an_unsure_caller_reached_later_by_a_decided_edge_is_walked` (**fallaba antes**: faltaba
+    `Top.t`).
+  - *NITs* (`f31a047`): el `through` de una arista agrupada es el menor
+    (`the_through_of_a_grouped_edge_is_the_smallest`, **fallaba antes** con un orden); una raíz que
+    es un archivo no lee las llamadas sin decidir (`a_file_root_reads_no_undecided_calls`, **fallaba
+    antes**: 2 sentencias por 1 nivel con `low` y `undecided_calls` 1; también **por mutación**); las
+    candidates descuentan del presupuesto lo que usan (`the_candidates_take_only_what_they_use`,
+    **fallaba antes**: dos candidates dejaban afuera un nodo que entraba); con `partial`,
+    `undecided_calls` puede contar de más (documentado en `Traversal::undecided_calls` y en las docs).
+    El conteo sin `low` pasa a contar su sentencia en el contador de test.
+  - *MINOR 2 — re-medición* (`traverse_bench`, binario `--release`, 40 corridas × 2 rondas, carga
+    4-6): en backend-a no hay nombres de miles de definiciones (el máximo, 111, es un método de
+    setup de tests; uno de código, 24; `get` y `toString`, ≤ 23 o ninguna): ese de 111, `calls`
+    `in`: p95 71-87 ms (0 nodos); el de 24: `in` p95 70-102 ms, `both` 89-107 ms (prof. 2, `partial`).
+    **Sintético** (3 000 clases con `get()`, 1 000 implementan una interfaz que llaman sus 300
+    llamadores, más una llamada sin decidir por llamador): `get` `calls` `in` p95 2,6-2,9 s (prof.
+    1-2), `both` 4,0-4,3 s; `IGet.get` `in` p95 55-75 ms. Esa medición encontró dos problemas,
+    arreglados en `535e7a8`: la respuesta traía **50 550 aristas** para 50 nodos —la cuota pareja de
+    `fit_whole_or_share` tiene piso de 64 tokens por ítem y cada arista chica pasaba—, ahora el
+    total también se respeta (`many_small_edges_stay_within_the_budget`, **fallaba antes**: 19 400
+    caracteres de aristas con presupuesto 2 000); y se armaban las aristas de todos los nodos, no
+    solo de la página (`edges_are_built_only_for_the_page`, **fallaba antes**: 300 por 50). Después:
+    88 aristas, `in` p95 2,2 s, `both` 3,5 s. **Pasa el presupuesto de DD-21 (200 ms) en ese
+    extremo**: el costo es leer las filas de dispatch (llamadores × implementaciones: ~300 000) y
+    las de las 3 000 raíces; reducirlo pide deduplicar por llamador en SQL. Queda para TASK-016
+    (no se observó en los repos medidos).
 

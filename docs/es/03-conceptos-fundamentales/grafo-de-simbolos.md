@@ -236,7 +236,8 @@ transitivos, con tope por dirección); `get_references` para los sitios de llama
 un archivo (el archivo mismo: de él salen los imports); si un símbolo tiene ese
 nombre, el símbolo gana sobre la ruta. Un nombre pelado con
 varias definiciones se recorre desde todas y se listan en `candidates`
-(`{sym, symbol, kind, file, line}`, en un cuarto del presupuesto de salida, el
+(`{sym, symbol, kind, file, line}`, dentro de un cuarto del presupuesto de
+salida —la página se queda con lo que no usan—, el
 resto nombrado en `omitted_for_budget.candidates`; hasta 10 000 definiciones, como
 `impact_analysis`, y `candidates_truncated` si hay más); `sym` (el id hex que
 lleva un nodo o un candidato) arranca desde exactamente una.
@@ -264,7 +265,11 @@ omitted_for_budget?, branch_fallback?}`:
   también son llamadores, como en `impact_analysis`: se cuentan en
   `undecided_calls: {count, hint}` (ni desde tests ni desde un llamador listado), y
   con `min_confidence: "low"` sus llamadores se listan en la profundidad 1,
-  `undecided: true`, sin recorrerlos, con una arista al nombre.
+  `undecided: true`, sin recorrerlos, con una arista al nombre (uno que una
+  arista decidida alcanza más abajo es ese nodo decidido, y se recorre). Con
+  `partial` la cuenta puede pasarse, como en `impact_analysis` pasado su tope:
+  un llamador de un nivel que no se leyó no está "listado". Una raíz que es un
+  archivo (una ruta) no tiene llamadas sin decidir.
 - Paginación (el contrato de `search_routes`): `limit` (50) nodos desde `offset`;
   `total`, `next_offset` y `omitted: {count, reason, next_offset}`. Un hub — un
   DTO referenciado desde cientos de archivos — se pagina, no se vuelca: cuando el
@@ -282,6 +287,73 @@ con los parámetros como cuerpo JSON; un servidor más viejo que la tool respond
 terminal: `devctx traverse OrderDto --kinds references --dir in --depth 2`
 (`--sym`, `--min-confidence`, `--include-tests`, `--include-external`,
 `--no-dispatch`, `--limit`, `--offset`, `--json`).
+
+### `repo_map` — un mapa para orientarse
+
+Unos mil tokens que le dicen a un agente dónde está cada cosa: las firmas (nunca
+los cuerpos) de los símbolos más relevantes para su foco, agrupadas por archivo,
+ordenadas por PageRank personalizado a ese foco, los miembros bajo sus
+contenedores. Sirve para orientarse al empezar una tarea; para leer código está
+`read_symbol` o `read_file`, y para los vecinos de un símbolo, `traverse`.
+
+| Parámetro | Qué es |
+|---|---|
+| `budget` | Tokens que puede ocupar el mapa (default 1024; se usan al menos 256 y como mucho `DEVCTX_MAX_OUTPUT_TOKENS`; 0 se rechaza) |
+| `focus_files` | Archivos que tenés abiertos o estás editando (ruta relativa al repo o su final): lo que usan rankea primero; ellos no se listan |
+| `focus_symbols` | Símbolos de la tarea: pelados, `Tipo.miembro` o `archivo::nombre` |
+| `query` | La tarea en palabras: sus identificadores (`camelCase`, `snake_case`, `Tipo.miembro`) cuentan como símbolos de foco, y también una consulta de una sola palabra |
+
+Cómo rankea (DD-12, DD-14): sin foco, por el rank global que escribe el link pass
+(`symbols.rank`). Con foco, la misma matriz se rankea de nuevo, personalizada:
+cada símbolo de un archivo de foco pesa 50 en el vector de personalización, un
+símbolo nombrado en `focus_symbols` o en `query` pesa 10 y las aristas hacia él
+cuentan ×10; las aristas hacia un `_nombre` o hacia un nombre definido en más de
+cinco archivos cuentan ×0,1. Solo cuentan las aristas vivas (una llamada que el
+link pass descartó no aporta nada). El código de test (un archivo de test, o
+código `#[cfg(test)]`) y las librerías nunca aparecen, ni los símbolos de
+archivo ni los archivos de foco. Cuántas firmas entran se decide con una
+búsqueda binaria sobre la lista rankeada, que para cuando el mapa queda dentro
+del 15 % por debajo del presupuesto (tokens = caracteres / 4, como en todo el
+producto). Los archivos van por la suma del rank de sus símbolos, los símbolos
+por línea, indentados bajo sus contenedores; `⋮` indica que el archivo tiene más:
+
+```
+crates/devctx-search/src/lib.rs
+│ pub enum SearchMode
+│ pub struct RankOptions
+│   impl RankOptions
+│     pub fn keeps(&self, kind: PathKind) -> bool
+│ pub fn search_ranked(store: &Store, query: &str, filter: &SearchFilter, limit: usize, …
+│ pub fn identifier_tokens(query: &str) -> Vec<String>
+│ pub fn reciprocal_rank_fusion(lists: &[Vec<SearchResult>], k: f32) -> Vec<SearchResult>
+⋮
+crates/devctx-core/src/types.rs
+│ pub struct SearchResult
+│   impl SearchResult
+│     pub fn rewrite_score(&mut self, score: f32)
+⋮
+[devctx] focus: query identifier search_ranked (1 definition)
+[devctx] repo map: 45 of 4267 symbols in 9 files, ranked by PageRank personalized to the focus; 4222 more did not fit the 1024-token budget (a focus or a larger budget shows others). To read code: read_symbol / read_file.
+```
+
+(Un extracto de `devctx map --query search_ranked` sobre este repositorio.)
+
+Las líneas finales `[devctx]` dicen qué encontró el foco (`not found` para un
+nombre o archivo que no existe, y que entonces el ranking quedó global) y cuántos
+símbolos no entraron. Sin foco, el mapa de un repo grande es su código central
+global, que dice poco: dale un foco.
+
+El serve guarda la adyacencia de la rama en memoria, por generación del índice:
+un mapa cuesta un PageRank personalizado y el render; se vuelve a leer tras cada
+`index` y se suelta cuando no se usa, igual que un modelo
+(`DEVCTX_MODEL_IDLE_SECS`). `status` la reporta en `memory.repo_map`.
+
+No hay camino 0.9: sobre un índice anterior a 0.10 (o sin filas de símbolos)
+`repo_map` es un error que pide `devctx index --full`. Por HTTP: `GET
+/repo-map?budget=…&focus_files=a,b&focus_symbols=…&query=…` (listas separadas
+por coma); un servidor más viejo que la tool responde 404, y el cliente lo
+traduce a "reinicialo: `devctx serve --stop`". Desde la terminal: `devctx map
+--focus src/api/client.ts --symbol OrderService.place --query "…" --budget 1500`.
 
 ### `read_symbol(nombre)` — la definición
 

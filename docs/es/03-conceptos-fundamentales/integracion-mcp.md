@@ -160,7 +160,7 @@ manuales (`kill <pid>` y borrar el archivo).
 
 ## Las herramientas
 
-25 herramientas, agrupadas por lo que responden.
+26 herramientas, agrupadas por lo que responden.
 
 ### Código
 
@@ -172,6 +172,7 @@ manuales (`kill <pid>` y borrar el archivo).
 | `get_references` | Cada sitio de llamada de un símbolo, uno por ocurrencia, con `confidence` y `via`; `min_confidence: "low"` agrega las ambiguas, `kinds` otras relaciones (ver [Grafo de símbolos](grafo-de-simbolos.md#get_referencessímbolo--quién-llama-a-esto)) |
 | `impact_analysis` | Llamadores transitivos (radio de impacto) y llamados, por profundidad, cada uno con `confidence` y `via`; por defecto solo llamadas high/medium, sin tests, sin llamados de librerías, 200 por dirección — lo que eso deja afuera se cuenta; las llamadas por una interfaz, clase abstracta o trait se siguen como `via: "dispatch"` (nunca `high`). `min_confidence`, `include_tests`, `include_external`, `max_nodes`, `dispatch` (ver [Grafo de símbolos](grafo-de-simbolos.md#impact_analysissímbolo--radio-de-impacto)) |
 | `traverse` | Recorrer el grafo de símbolos salto a salto desde un símbolo: `kinds` (calls, instantiates, imports, inherits, implements, contains, references), `direction` in/out/both, `depth` 1-4; nodos con `sym` y las aristas que los alcanzaron, paginado (`limit`, `offset`, `next_offset`, `omitted`), con los filtros de `impact_analysis` (ver [Grafo de símbolos](grafo-de-simbolos.md#traversesímbolo--recorrer-el-grafo-por-tu-cuenta)) |
+| `repo_map` | Un mapa del repositorio para orientarse: las firmas (sin cuerpos) más relevantes para `focus_files`, `focus_symbols` o `query`, agrupadas por archivo, ordenadas por PageRank personalizado, dentro de `budget` tokens (1024); texto (ver [Grafo de símbolos](grafo-de-simbolos.md#repo_map--un-mapa-para-orientarse)) |
 | `summarize` | Texto reducido a ~`max_tokens`, extractivo por defecto para que sobrevivan los identificadores |
 
 La distinción entre `search` y `read_symbol` conviene interiorizarla:

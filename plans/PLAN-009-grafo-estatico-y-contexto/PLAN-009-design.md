@@ -925,6 +925,21 @@ símbolo y agregar a archivo sumando; al revés no.
   de **100** iteraciones (no 50): `LinkStats.{rank_iterations, rank_converged}` y la línea del
   link pass lo dicen.
 
+**Implementado en TASK-011 (parte personalizada):** `RankMatrix` (`devctx_index`, público) arma
+una vez la matriz de DD-12 (nodos por id, peso por par, `full` y `kept` por fuente) y rankea
+`global()` (el algoritmo de TASK-010, bit a bit: el link pass lo usa) o `personalized(p, mult)`:
+el teletransporte y lo que un nodo no reparte van al vector `p` (normalizado), y `mult` por
+destino cambia **cómo** reparte cada fuente (`peso × mult`), nunca **cuánto** (eso sigue siendo
+confianza y tests). Con `p` uniforme y sin multiplicadores da el global (±1e-9, test). Un nodo
+que el foco no alcanza queda en 0 y se ordena por el rank global. `RankEdge` pasa a ids y dos
+enums (`RankKind`, `RankConfidence`; el NIT de TASK-010): en backend-a 31 093 filas, 30,1 → 20,3 ms
+de lectura (p50, 20 corridas) y 80 → 32 bytes por fila; los grupos siguen siendo los de las
+cadenas. Caché en `AppState` por `(repo, rama, generación)` — generación = commit, `indexed_at` y
+conteos del registro del índice —, que se suelta al terminar cualquier `index` y por inactividad
+con la política de los modelos. Medido (Resultado de TASK-011): backend-a 22 801 símbolos, 28 942
+pares, ~7,4 MB estimados (RSS +7,6 MB), primera carga 104 ms (lectura y armado) / 132 ms con el
+mapa; caliente p95 34 ms.
+
 ## DD-13 — Cómo compone con el ranking actual
 
 Orden del pipeline de `search_ranked` (`devctx-search/src/lib.rs:269-357`) con la señal nueva:
@@ -1010,6 +1025,31 @@ src/main/java/com/example/app/service/OfficeService.java
 - Excluye tests y externos siempre (no tienen firma en el repo / no orientan). Cierra con
   `[devctx] N símbolos más no entraron en el presupuesto`.
 
+**Implementado en TASK-011, con estas diferencias:**
+- `crates/devctx-mcp/src/repo_map.rs` (`MapGraph`, `RepoMapQuery`, `render`; puro) y
+  `state/repo_map.rs` (caché, `do_repo_map`, `repo_map_at`), `Backend::repo_map`,
+  `GET /repo-map` (listas separadas por coma), `devctx map [--budget N] [--focus F]… [--symbol S]…
+  [--query Q]`. Sin `project` en la API (el MCP lo resuelve como las demás tools y antepone
+  `[devctx] map of <proyecto>`).
+- **×50 de `focus_files`** es masa de personalización (cada símbolo de un archivo de foco pesa 50
+  en `p`; un símbolo nombrado, 10): multiplicar todas las aristas que **salen** de un archivo se
+  cancela en el reparto de cada fuente (igual en Aider). Las aristas **hacia** un símbolo nombrado
+  ×10, hacia `_nombre` o un nombre definido en > 5 archivos ×0,1 (ambos solo con foco).
+- Los archivos de foco **no se listan** (el agente los tiene); sí los símbolos nombrados.
+- `query`: los identificadores de `identifier_tokens` y, si no hay, la consulta de una sola palabra
+  (`Cached`, `dispatch`): un agente nombrando un símbolo.
+- Búsqueda binaria: el mayor número de firmas cuyo mapa (con las líneas de cierre) entra en el
+  presupuesto, y para apenas queda dentro del 15 % por debajo; **nunca lo supera** (salvo que las
+  líneas de cierre solas no entren: por eso el mínimo es 256). Tokens = caracteres / 4 hacia
+  arriba. Presupuesto acotado a 256..=`DEVCTX_MAX_OUTPUT_TOKENS` (lo dice); 0 se rechaza.
+- Firma: la de `symbols.signature` (DD-17, ya con tope de 200) sin anotaciones ni atributos al
+  principio (`@Override`, `@Path("…")`, `#[inline]`; `@interface` se queda) y, en `field`/`const`,
+  sin el valor; sin firma, `kind nombre`. `⋮` cuando el archivo tiene más candidatos.
+- Cierre: `[devctx] focus: …` (cada archivo/símbolo pedido y si se encontró; `query: no identifier
+  in it`) y `[devctx] repo map: K of N symbols in F files, ranked by …; M more did not fit the
+  B-token budget …`; si el foco no encontró nada, el ranking global y lo dice.
+- Empates: puntaje, rank global, archivo, línea, id (test que falla ordenando solo por id).
+
 ## DD-15 — Ego-graph en `build_context`
 
 - Para los **primeros 5 hits de código** que entraron al brief, sus vecinos a 1 salto
@@ -1070,6 +1110,20 @@ omitted_by_limit?, dispatch?, omitted_for_budget?, branch_fallback?}`:
   símbolo con ese nombre gana sobre una ruta; `sym` gana sobre `symbol` con un `warning`;
   `POST /traverse` responde 400 a un parámetro inválido; el 404 de un serve viejo se lee del código
   de estado.
+- **segunda revisión:** un nodo listado `undecided` en el nivel 1 que una arista decidida alcanza
+  más abajo es ese nodo decidido y se recorre (`unsure_shown` de impact; su arista sin decidir se
+  va); el `through` de una arista agrupada es el menor; una raíz que es un archivo no lee las
+  llamadas sin decidir; las `candidates` descuentan lo que usan, no un cuarto fijo; con `partial`,
+  `undecided_calls` puede contar de más (documentado, igual que impact pasado su tope). Al
+  re-medir con miles de definiciones apareció que nodos y aristas podían pasar su mitad del
+  presupuesto (la cuota pareja tiene piso de 64 tokens por ítem: 200 aristas chicas pasaban todas)
+  —ahora también se respeta el total— y que se armaban las aristas de nodos fuera de la página
+  (ya no, salvo con `low`, donde un nodo que sube puede mover la página). **Costo con miles de
+  definiciones** (sintético: 3 000 `get`, 1 000 implementan una interfaz que llaman los 300
+  llamadores, más llamadas sin decidir): `calls` `in` p95 2,2 s, `both` 3,5 s — el dispatch
+  multiplica filas (llamadores × implementaciones) y se leen todas; **pasa el presupuesto de DD-21
+  (200 ms)** en ese extremo. En backend-a el nombre más definido tiene 111 definiciones (de tests)
+  y uno de código 24: p95 ≤ 107 ms. Queda para TASK-016 (ver Resultado de TASK-013).
 
 ## DD-17 — Vista `skeleton`
 

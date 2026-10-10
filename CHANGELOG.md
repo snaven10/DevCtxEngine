@@ -30,6 +30,21 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   (`undecided_calls`) or, with `min_confidence: "low"`, listed at depth 1; with
   `partial`, `total_is_lower_bound: true`.
 
+- **`repo_map`** (PLAN-009 TASK-011): a new tool (MCP, `GET /repo-map`,
+  `devctx map`) that answers, in about a thousand tokens (`budget`, default
+  1024), a map of the repository to orient an agent: the signatures — never
+  bodies — of the symbols most relevant to its focus (`focus_files`: files it
+  has open, whose uses rank first and which are not listed themselves;
+  `focus_symbols`; `query`, whose identifiers count), grouped by file, members
+  under their containers, ranked by PageRank personalized to that focus over
+  the same weighted matrix as the global rank (live edges only; test code and
+  libraries never appear). Text, closed by `[devctx]` lines that say what the
+  focus matched and how many symbols did not fit. The serve caches the
+  branch's adjacency per index generation (dropped when an `index` ends and
+  when idle, like a model; `status.memory.repo_map` reports it). An index made
+  before 0.10 is an error that asks for `devctx index --full`; a server older
+  than the tool answers 404, which clients report as "restart it".
+
 ### Changed
 
 - **Reindex reuses vectors by chunk `content_hash`** (PLAN-009 TASK-002): a
@@ -393,6 +408,16 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   index type 'HNSW'") and invalidated the database for the process. Where VSS
   cannot be loaded at all (offline), every checkpoint over such an index is
   skipped instead, leaving the write-ahead log for an open that can.
+
+- `traverse`: a caller listed through an undecided call and reached deeper by
+  a decided edge is that decided node and is walked; the `through` of a
+  grouped edge no longer depends on row order; a file root reads no undecided
+  calls; candidates take from the budget only what they use; nodes and edges
+  never exceed their share of the output budget (hundreds of small edges used
+  to pass an even share with a floor), and the edges of nodes past the page
+  are not built.
+- Indexing a TypeScript repository no longer panics on a type whose `>` (an
+  arrow's) comes before its first `<`.
 
 ### Known issues
 

@@ -231,7 +231,8 @@ line — of one symbol.
 file itself: imports leave from it); when a symbol has that name, the symbol
 wins over the path. A bare name with several definitions is
 walked from all of them and listed in `candidates` (`{sym, symbol, kind, file,
-line}`, under a quarter of the output budget, the rest named in
+line}`, within a quarter of the output budget — the page gets whatever they
+leave of it — the rest named in
 `omitted_for_budget.candidates`; up to 10 000 definitions, as `impact_analysis`,
 and `candidates_truncated` past that); `sym` (the hex id a node or a candidate
 carries) starts from exactly one.
@@ -259,7 +260,11 @@ omitted_for_budget?, branch_fallback?}`:
   calls to that name the index could not decide are callers too, as in
   `impact_analysis`: counted in `undecided_calls: {count, hint}` (not from tests
   nor from a caller listed), and with `min_confidence: "low"` their callers are
-  listed at depth 1, `undecided: true`, never walked, with an edge to the name.
+  listed at depth 1, `undecided: true`, never walked, with an edge to the name
+  (one that a decided edge reaches deeper is that decided node, walked). With
+  `partial` the count can be too high, as in `impact_analysis` past its cap: a
+  caller on a level that was not read is not "listed". A root that is a file
+  (a path) has no undecided calls.
 - Paging (the contract of `search_routes`): `limit` (50) nodes from `offset`;
   `total`, `next_offset`, and `omitted: {count, reason, next_offset}`. A hub —
   a DTO referenced from hundreds of files — is paged, not dumped: once the walk
@@ -277,6 +282,72 @@ answers 404, which the client turns into "restart it: `devctx serve --stop`".
 From the shell: `devctx traverse OrderDto --kinds references --dir in --depth 2`
 (`--sym`, `--min-confidence`, `--include-tests`, `--include-external`,
 `--no-dispatch`, `--limit`, `--offset`, `--json`).
+
+### `repo_map` — a map to orient yourself
+
+About a thousand tokens that tell an agent where things are: the signatures
+(never bodies) of the symbols most relevant to its focus, grouped by file,
+ranked by PageRank personalized to that focus, members under their containers.
+It is for orientation at the start of a task; to read code use `read_symbol` or
+`read_file`, and for one symbol's neighbours, `traverse`.
+
+| Parameter | Meaning |
+|---|---|
+| `budget` | Tokens the map may take (default 1024; at least 256 is used, at most `DEVCTX_MAX_OUTPUT_TOKENS`; 0 is refused) |
+| `focus_files` | Files you have open or are editing (a repo-relative path or its tail): what they use ranks first; they are not listed themselves |
+| `focus_symbols` | Symbols the task is about: bare, `Type.member` or `file::name` |
+| `query` | The task in words: its identifiers (`camelCase`, `snake_case`, `Type.member`) count as focus symbols, and so does a one-word query |
+
+How it ranks (DD-12, DD-14): without a focus, by the global rank the link pass
+writes (`symbols.rank`). With one, the same matrix is ranked again, personalized:
+every symbol of a focus file weighs 50 in the personalization vector, a symbol
+named in `focus_symbols` or `query` weighs 10 and the edges into it count ×10;
+edges into a `_name` or into a name defined in more than five files count ×0.1.
+Only live edges count (a call the link pass discarded lends nothing). Test code
+(a test file, or `#[cfg(test)]` code) and libraries never appear, nor do file
+symbols or the focus files. How many signatures fit is a binary search over the
+ranked list, stopping once the map is within 15 % under the budget (tokens are
+characters / 4, as everywhere in the product). Files come in the order of their
+symbols' summed rank, symbols by line, indented under their containers; `⋮`
+says a file has more:
+
+```
+crates/devctx-search/src/lib.rs
+│ pub enum SearchMode
+│ pub struct RankOptions
+│   impl RankOptions
+│     pub fn keeps(&self, kind: PathKind) -> bool
+│ pub fn search_ranked(store: &Store, query: &str, filter: &SearchFilter, limit: usize, …
+│ pub fn identifier_tokens(query: &str) -> Vec<String>
+│ pub fn reciprocal_rank_fusion(lists: &[Vec<SearchResult>], k: f32) -> Vec<SearchResult>
+⋮
+crates/devctx-core/src/types.rs
+│ pub struct SearchResult
+│   impl SearchResult
+│     pub fn rewrite_score(&mut self, score: f32)
+⋮
+[devctx] focus: query identifier search_ranked (1 definition)
+[devctx] repo map: 45 of 4267 symbols in 9 files, ranked by PageRank personalized to the focus; 4222 more did not fit the 1024-token budget (a focus or a larger budget shows others). To read code: read_symbol / read_file.
+```
+
+(An excerpt of `devctx map --query search_ranked` on this repository.)
+
+The closing `[devctx]` lines say what the focus matched (`not found` for a name
+or file that is nothing here, and that the ranking then stayed global) and how
+many symbols did not fit. Without a focus a large repository's map is its
+globally central code, which says little: give one.
+
+The serve keeps the branch's adjacency in memory, per index generation, so a
+map costs a personalized PageRank and a render; it is read again after every
+`index` and released when unused as long as a model would be
+(`DEVCTX_MODEL_IDLE_SECS`). `status` reports it under `memory.repo_map`.
+
+There is no 0.9 path: on an index made before 0.10 (or without symbol rows)
+`repo_map` is an error that asks for `devctx index --full`. Over HTTP: `GET
+/repo-map?budget=…&focus_files=a,b&focus_symbols=…&query=…` (lists
+comma-separated); a server older than the tool answers 404, which the client
+turns into "restart it: `devctx serve --stop`". From the shell: `devctx map
+--focus src/api/client.ts --symbol OrderService.place --query "…" --budget 1500`.
 
 ### `read_symbol(name)` — the definition
 
