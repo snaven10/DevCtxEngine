@@ -9,11 +9,11 @@
 //! from it per request.
 //!
 //! - **Ranking.** Without a focus, the global rank (`symbols.rank`). With one,
-//!   the same matrix personalized (DD-14): every symbol of a `focus_files`
-//!   file weighs 50 in the personalization vector — the files the agent has
-//!   open are the referencers whose uses rank —, a symbol named in
-//!   `focus_symbols` or as an identifier of `query` weighs 10, and the edges
-//!   into it count ×10; an edge into a name starting with `_` or defined in
+//!   the same matrix personalized (DD-14): every `focus_files` file weighs
+//!   50 in the personalization vector, shared among its symbols — the files
+//!   the agent has open are the referencers whose uses rank —, every term of
+//!   `focus_symbols` or identifier of `query` weighs 10, shared among its
+//!   definitions, and the edges into a named symbol count ×10; an edge into a name starting with `_` or defined in
 //!   more than 5 files counts ×0.1. (A ×50 on every edge *out of* a focus
 //!   file would cancel in each source's split, as in Aider: the 50 is the
 //!   personalization.)
@@ -40,11 +40,12 @@ pub const MIN_REPO_MAP_BUDGET: usize = 256;
 /// The search stops once the map is this close under the budget.
 const TOLERANCE: f64 = 0.15;
 
-/// Personalization of a symbol of a focus file (DD-14: the referencers).
+/// Personalization of a focus file, shared among its symbols (DD-14: the
+/// referencers).
 const FOCUS_FILE_WEIGHT: f64 = 50.0;
 
-/// Personalization of a symbol the request names, and the multiplier of the
-/// edges into it.
+/// Personalization of a term the request names, shared among its
+/// definitions, and the multiplier of the edges into a named symbol.
 const MENTIONED_WEIGHT: f64 = 10.0;
 
 /// Multiplier of the edges into a `_name` or a name defined in many files.
@@ -360,6 +361,9 @@ struct Focus {
     files: HashSet<u32>,
     /// Symbols named.
     mentioned: Vec<usize>,
+    /// Personalization of each symbol named: a term's weight shared among
+    /// its definitions (review of TASK-011, M1).
+    named_mass: HashMap<usize, f64>,
     /// One item per thing asked, for the closing line.
     items: Vec<String>,
     /// Something was asked.
@@ -403,7 +407,9 @@ fn resolve_focus(g: &MapGraph, q: &RepoMapQuery) -> Focus {
             1 => format!("{what} {t} (1 definition)"),
             n => format!("{what} {t} ({n} definitions)"),
         });
+        let each = MENTIONED_WEIGHT / found.len().max(1) as f64;
         for i in found {
+            *f.named_mass.entry(i).or_default() += each;
             if !f.mentioned.contains(&i) {
                 f.mentioned.push(i);
             }
@@ -646,19 +652,25 @@ fn plan<'a>(g: &'a MapGraph, q: &RepoMapQuery, max_budget: usize, tail: &[String
     tail_notes.extend(tail.iter().cloned());
     let focus = resolve_focus(g, q);
     let n = g.nodes.len();
+    // The focus weighs per file and per term, shared among their symbols
+    // (review of TASK-011, M1): a file of 300 symbols weighs what one of 3
+    // does, and a symbol named next to it keeps a share of its own.
+    let mut in_file: HashMap<u32, usize> = HashMap::new();
+    for x in &g.nodes {
+        if focus.files.contains(&x.file) {
+            *in_file.entry(x.file).or_default() += 1;
+        }
+    }
     let mut p: Vec<f64> = g
         .nodes
         .iter()
-        .map(|x| {
-            if focus.files.contains(&x.file) {
-                FOCUS_FILE_WEIGHT
-            } else {
-                0.0
-            }
+        .map(|x| match in_file.get(&x.file) {
+            Some(&n) => FOCUS_FILE_WEIGHT / n as f64,
+            None => 0.0,
         })
         .collect();
-    for &i in &focus.mentioned {
-        p[i] += MENTIONED_WEIGHT;
+    for (&i, &m) in &focus.named_mass {
+        p[i] += m;
     }
     let personalized = p.iter().any(|x| *x > 0.0);
     let (score, how): (Vec<f64>, &'static str) = if personalized {
@@ -938,8 +950,10 @@ mod tests {
             let tail = vec!["[devctx] branch_fallback: current branch x is not indexed; answering from branch main".to_string()];
             let map = render(&g, &req, 8000, &tail);
             let effective = budget.clamp(MIN_REPO_MAP_BUDGET, 8000);
+            // The contract: never over the budget (the 15 % is the
+            // tolerance under it, review of TASK-011 m5).
             assert!(
-                tokens(&map) as f64 <= effective as f64 * 1.15,
+                tokens(&map) <= effective,
                 "case {case}: {} tokens for a budget of {effective}:\n{map}",
                 tokens(&map)
             );
@@ -1202,8 +1216,6 @@ mod tests {
         assert!(pos("class Svc()") < pos("Svc.Inner()") && pos("deep") < pos("Svc.top"));
         // With a budget for two symbols only, the third one of the file is
         // cut and the file says so.
-        let mut cut = q(256);
-        cut.focus_symbols.push("Svc.top".into());
         let g2 = MapGraph::build(
             ranked(
                 (0..80)
@@ -1267,6 +1279,104 @@ mod tests {
         let p = plan(&g, &q(256), 8000, &[]);
         let ids: Vec<u64> = p.order.iter().map(|&i| g.nodes[i].id).collect();
         assert_eq!(ids, [3, 4, 2, 1]);
+    }
+
+    /// The score share of node `q` in a personalized plan.
+    fn share(g: &MapGraph, req: &RepoMapQuery, q: &str) -> f64 {
+        let p = plan(g, req, 8000, &[]);
+        let total: f64 = p.score.iter().sum();
+        let i = g.nodes.iter().position(|n| &*n.qualified == q).unwrap();
+        p.score[i] / total
+    }
+
+    /// Review of TASK-011, M1: the focus weighs per file and per term, not
+    /// per symbol — a symbol named next to a focus file of 200 symbols keeps
+    /// its share (it took ~0.1 % when each of the 200 weighed 50).
+    #[test]
+    fn a_named_symbol_keeps_its_weight_next_to_a_large_focus_file() {
+        let mut syms = vec![sym(1, "src/Big.java", "file", "src/Big.java", None)];
+        for i in 0..200u64 {
+            syms.push(sym(
+                10 + i,
+                "src/Big.java",
+                "function",
+                &format!("b{i}"),
+                Some(1),
+            ));
+        }
+        syms.push(sym(500, "src/Task.java", "function", "Task.run", None));
+        syms.push(sym(501, "src/Help.java", "function", "Help.go", None));
+        let mut edges: Vec<RankEdge> = (0..200u64).map(|i| edge(10 + i, 501)).collect();
+        edges.push(edge(500, 501));
+        let g = MapGraph::build(ranked(syms, &edges), &edges);
+        let req = RepoMapQuery {
+            focus_files: vec!["src/Big.java".into()],
+            focus_symbols: vec!["Task.run".into()],
+            ..q(1024)
+        };
+        let s = share(&g, &req, "Task.run");
+        assert!(s > 0.05, "the named symbol's share: {s}");
+        // A term of 300 definitions (`get`) weighs what a term of one does.
+        let mut syms: Vec<MapSymbol> = (0..300u64)
+            .map(|i| {
+                sym(
+                    1000 + i,
+                    &format!("src/g/G{i}.java"),
+                    "function",
+                    &format!("G{i}.get"),
+                    None,
+                )
+            })
+            .collect();
+        syms.push(sym(500, "src/Task.java", "function", "Task.run", None));
+        let g = MapGraph::build(ranked(syms, &[]), &[]);
+        let req = RepoMapQuery {
+            focus_symbols: vec!["get".into(), "Task.run".into()],
+            ..q(1024)
+        };
+        let s = share(&g, &req, "Task.run");
+        assert!(s > 0.3, "next to a term of 300 definitions: {s}");
+    }
+
+    /// Review of TASK-011, M1: two focus files weigh the same whatever their
+    /// size — what a file of 3 symbols uses is not drowned by what a file of
+    /// 300 uses (100 : 1 when each symbol weighed 50).
+    #[test]
+    fn focus_files_weigh_the_same_whatever_their_size() {
+        let mut syms = vec![
+            sym(1, "src/Large.java", "file", "src/Large.java", None),
+            sym(2, "src/Small.java", "file", "src/Small.java", None),
+            sym(900, "src/A.java", "function", "A.used", None),
+            sym(901, "src/B.java", "function", "B.used", None),
+        ];
+        let mut edges = Vec::new();
+        for i in 0..300u64 {
+            syms.push(sym(
+                10 + i,
+                "src/Large.java",
+                "function",
+                &format!("l{i}"),
+                Some(1),
+            ));
+            edges.push(edge(10 + i, 900));
+        }
+        for i in 0..3u64 {
+            syms.push(sym(
+                600 + i,
+                "src/Small.java",
+                "function",
+                &format!("s{i}"),
+                Some(2),
+            ));
+            edges.push(edge(600 + i, 901));
+        }
+        let g = MapGraph::build(ranked(syms, &edges), &edges);
+        let req = RepoMapQuery {
+            focus_files: vec!["src/Large.java".into(), "src/Small.java".into()],
+            ..q(1024)
+        };
+        let (a, b) = (share(&g, &req, "A.used"), share(&g, &req, "B.used"));
+        assert!(a / b < 2.0 && b / a < 2.0, "{a} vs {b}");
     }
 
     /// DD-14's dampening: of two callees equally reached from the focus, a
