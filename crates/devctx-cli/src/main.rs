@@ -732,6 +732,7 @@ fn main() -> Result<()> {
             focus_files: focus,
             focus_symbols: symbols,
             query,
+            label: None,
         }),
         Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),
         Command::Routes { method, path } => cmd_routes(method, path),

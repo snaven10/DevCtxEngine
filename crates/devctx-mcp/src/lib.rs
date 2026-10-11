@@ -1394,17 +1394,19 @@ impl DevctxServer {
             focus_files: req.focus_files.unwrap_or_default(),
             focus_symbols: req.focus_symbols.unwrap_or_default(),
             query: req.query,
+            label: None,
         };
         // A bad parameter is the caller's, said before a server is reached.
         q.validate()
             .map_err(|e| ErrorData::invalid_params(e, None))?;
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        let out = run_blocking(move || backend.repo_map(&q)).await?;
-        // Which repository answered is part of the answer (text: a line).
-        Ok(match resolved {
-            Some(p) => format!("[devctx] map of {p}\n\n{out}"),
-            None => out,
-        })
+        // Which repository answered is part of the answer, a line inside
+        // the budget (review of TASK-011, m6).
+        let q = repo_map::RepoMapQuery {
+            label: resolved.map(|p| format!("[devctx] map of {p}")),
+            ..q
+        };
+        run_blocking(move || backend.repo_map(&q)).await
     }
 
     /// Progress on the plans under `plans/` (markdown, source of truth).

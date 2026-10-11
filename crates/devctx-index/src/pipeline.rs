@@ -74,6 +74,12 @@ fn heartbeat<T>(progress: Option<&dyn ProgressSink>, name: &str, op: impl FnOnce
 /// that the HNSW index was dropped for a run and not yet rebuilt; its value is
 /// the metric.
 pub const PENDING_HNSW_META_KEY: &str = "pending_hnsw";
+
+/// `index_meta` key of a counter every run that ends bumps (PLAN-009
+/// TASK-011, review m2): what tells two runs apart when their records are
+/// the same (the record's time has a resolution of a second), for the
+/// serve's caches of a branch.
+pub const GENERATION_META_KEY: &str = "index_generation";
 /// Same, for the BM25 index.
 pub const PENDING_FTS_META_KEY: &str = "pending_fts";
 
@@ -725,6 +731,17 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
         chunk_count: counts.2,
         indexed_at: now_stamp(),
     })?;
+    let generation = req
+        .store
+        .get_index_meta(&repo_path, &branch, GENERATION_META_KEY)?
+        .and_then(|g| g.parse::<u64>().ok())
+        .unwrap_or(0);
+    req.store.set_index_meta(
+        &repo_path,
+        &branch,
+        GENERATION_META_KEY,
+        &(generation + 1).to_string(),
+    )?;
 
     // Stamp the extractor only when the whole branch was produced by it: a full
     // run, or an incremental one over an index already stamped with it. An

@@ -7,7 +7,7 @@
 //! There is no 0.9 path: a branch without a current symbol graph is an error
 //! that asks for `devctx index --full`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use devctx_core::procmem;
@@ -39,6 +39,12 @@ pub(super) struct CachedMap {
     took: Duration,
 }
 
+/// The cache's slot, even after a panic while it was held (review of
+/// TASK-011, m3): it holds a whole graph or nothing, never half of one.
+fn slot(m: &Mutex<Option<CachedMap>>) -> MutexGuard<'_, Option<CachedMap>> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Refuses a branch without a current symbol graph, with the action.
 pub(super) fn check(chosen: &BranchChoice, store: &Store) -> Result<(), String> {
     match Reader::of(chosen, store) {
@@ -63,12 +69,19 @@ pub(super) fn load(store: &Store, repo: &str, branch: &str) -> Result<MapGraph, 
 /// A run that ends rewrites it; the serve drops the cache anyway when its
 /// own `index` ends.
 fn generation(store: &Store, repo_path: &str, branch: &str) -> String {
+    // The counter every run bumps: the record alone has a resolution of a
+    // second (review of TASK-011, m2).
+    let counter = store
+        .get_index_meta(repo_path, branch, devctx_index::GENERATION_META_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     match store.get_index_record(repo_path, branch) {
         Ok(Some(r)) => format!(
-            "{}|{}|{}|{}",
+            "{counter}|{}|{}|{}|{}",
             r.last_commit, r.indexed_at, r.symbol_count, r.file_count
         ),
-        _ => String::new(),
+        _ => counter,
     }
 }
 
@@ -100,16 +113,22 @@ impl AppState {
             chosen.branch.clone(),
             generation(store, &self.repo_path(), &chosen.branch),
         );
-        let mut slot = self.repo_map.lock().map_err(|e| e.to_string())?;
-        if let Some(c) = slot.as_mut().filter(|c| c.key == key) {
+        if let Some(c) = slot(&self.repo_map).as_mut().filter(|c| c.key == key) {
             c.last_used = Instant::now();
             return Ok(c.graph.clone());
         }
-        // Another branch, or another generation: the old one goes first.
-        *slot = None;
+        // Built outside the lock (review of TASK-011, m3): `status` and the
+        // idle release do not wait for a load, and a load that panics
+        // poisons nothing.
         let (rss_before, started) = (procmem::rss_bytes(), Instant::now());
         let graph = Arc::new(load(store, &chosen.repo, &chosen.branch)?);
         let took = started.elapsed();
+        let mut held = slot(&self.repo_map);
+        // Another call may have built the same one meanwhile: keep that.
+        if let Some(c) = held.as_mut().filter(|c| c.key == key) {
+            c.last_used = Instant::now();
+            return Ok(c.graph.clone());
+        }
         self.repo_map_loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         super::log_model_event(
@@ -125,7 +144,8 @@ impl AppState {
             Some(took),
             rss_before,
         );
-        *slot = Some(CachedMap {
+        // Another branch, or another generation: replaced.
+        *held = Some(CachedMap {
             key,
             graph: graph.clone(),
             last_used: Instant::now(),
@@ -137,22 +157,17 @@ impl AppState {
 
     /// Drops the cached adjacency: an `index` ended, or it went unused.
     pub(super) fn drop_repo_map(&self) -> bool {
-        self.repo_map
-            .lock()
-            .map(|mut s| s.take().is_some())
-            .unwrap_or(false)
+        slot(&self.repo_map).take().is_some()
     }
 
     /// Drops the adjacency when unused for `max_idle`.
     pub(super) fn release_idle_repo_map(&self, max_idle: Duration) -> bool {
-        let Ok(mut slot) = self.repo_map.lock() else {
-            return false;
-        };
-        if slot
+        let mut held = slot(&self.repo_map);
+        if held
             .as_ref()
             .is_some_and(|c| c.last_used.elapsed() >= max_idle)
         {
-            *slot = None;
+            *held = None;
             return true;
         }
         false
@@ -160,7 +175,7 @@ impl AppState {
 
     /// The `repo_map` block of `status.memory`: what the cache holds.
     pub(super) fn repo_map_json(&self) -> serde_json::Value {
-        let held = self.repo_map.lock().ok().and_then(|s| {
+        let held = Some(slot(&self.repo_map)).and_then(|s| {
             s.as_ref().map(|c| {
                 serde_json::json!({
                     "loaded": true,
@@ -333,6 +348,77 @@ mod tests {
         }
         map(&state, &RepoMapQuery::default());
         assert_eq!(loads(), 2);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review of TASK-011, m2: two runs in the same second (from another
+    /// process: the serve's own `index` drops the cache) leave the same
+    /// record; the generation counter every run bumps tells them apart.
+    #[test]
+    fn a_run_in_the_same_second_is_another_generation() {
+        let (state, repo) = indexed_files("repo_map_counter", APP);
+        let loads = || state.repo_map_loads.load(Ordering::Relaxed);
+        map(&state, &RepoMapQuery::default());
+        {
+            let store = state.open_store().unwrap();
+            let (_, b) = state.repo_branch().unwrap();
+            let n: u64 = store
+                .get_index_meta(&state.repo_path(), &b, devctx_index::GENERATION_META_KEY)
+                .unwrap()
+                .expect("every run bumps it")
+                .parse()
+                .unwrap();
+            store
+                .set_index_meta(
+                    &state.repo_path(),
+                    &b,
+                    devctx_index::GENERATION_META_KEY,
+                    &(n + 1).to_string(),
+                )
+                .unwrap();
+        }
+        map(&state, &RepoMapQuery::default());
+        assert_eq!(loads(), 2);
+        // Every run that ends bumps it, even one that changes nothing.
+        let counter = || -> u64 {
+            let store = state.open_store().unwrap();
+            let (_, b) = state.repo_branch().unwrap();
+            store
+                .get_index_meta(&state.repo_path(), &b, devctx_index::GENERATION_META_KEY)
+                .unwrap()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let before = counter();
+        do_index(&state, false).unwrap();
+        assert_eq!(counter(), before + 1);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review of TASK-011, m3: a panic while the cache was held poisons its
+    /// lock; the map and `status` keep answering.
+    #[test]
+    fn a_poisoned_cache_still_answers() {
+        let (state, repo) = indexed_files("repo_map_poison", APP);
+        map(&state, &RepoMapQuery::default());
+        std::thread::scope(|sc| {
+            let _ = sc
+                .spawn(|| {
+                    let _held = state.repo_map.lock().unwrap();
+                    panic!("a load that panicked");
+                })
+                .join();
+        });
+        assert!(state.repo_map.is_poisoned());
+        let m = do_repo_map(&state, &RepoMapQuery::default()).unwrap();
+        assert!(m.contains("[devctx] repo map: "), "{m}");
+        let store = state.open_store().unwrap();
+        assert_eq!(state.memory_json(&store)["repo_map"]["loaded"], true);
+        drop(store);
+        assert!(state
+            .release_idle_models(Duration::ZERO)
+            .contains(&"repo map graph"));
         let _ = std::fs::remove_dir_all(&repo);
     }
 

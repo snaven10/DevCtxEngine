@@ -1240,6 +1240,7 @@ struct RepoMapParams {
     focus_files: Option<String>,
     focus_symbols: Option<String>,
     query: Option<String>,
+    label: Option<String>,
 }
 
 /// `GET /repo-map` (PLAN-009 TASK-011): the `repo_map` tool, its parameters
@@ -1252,6 +1253,7 @@ async fn repo_map(State(api): State<Api>, Query(p): Query<RepoMapParams>) -> Res
         p.focus_files.as_deref(),
         p.focus_symbols.as_deref(),
         p.query,
+        p.label,
     );
     if let Err(e) = q.validate() {
         return json_err(StatusCode::BAD_REQUEST, e);

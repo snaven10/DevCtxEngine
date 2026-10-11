@@ -280,7 +280,9 @@ pub struct AppState {
     vanish_strikes: AtomicU32,
     /// The adjacency `repo_map` ranks over (PLAN-009 TASK-011): one branch,
     /// by index generation; dropped when an `index` ends and when unused
-    /// (see [`AppState::release_idle_models`]).
+    /// (see [`AppState::release_idle_models`]). One slot: maps of two
+    /// branches asked alternately rebuild it each time (review of TASK-011,
+    /// m4; an LRU if TASK-016 sees it matter).
     repo_map: Mutex<Option<repo_map::CachedMap>>,
     /// Times that adjacency was read from the database.
     repo_map_loads: AtomicUsize,

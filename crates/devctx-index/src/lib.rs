@@ -22,7 +22,8 @@ pub use git::{Change, GitRepo, GitState};
 pub use id::chunk_id;
 pub use pagerank::{PageRankRun, RankMatrix};
 pub use pipeline::{
-    run, IndexRequest, IndexResult, ProgressSink, PENDING_FTS_META_KEY, PENDING_HNSW_META_KEY,
+    run, IndexRequest, IndexResult, ProgressSink, GENERATION_META_KEY, PENDING_FTS_META_KEY,
+    PENDING_HNSW_META_KEY,
 };
 
 #[cfg(test)]

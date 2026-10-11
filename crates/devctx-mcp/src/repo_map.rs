@@ -80,6 +80,11 @@ pub struct RepoMapQuery {
     /// `Type.member`) count as focus symbols, and so does a one-word query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    /// A line the map carries, counted in its budget (the MCP's `[devctx]
+    /// map of <project>` when another project answered: review of TASK-011,
+    /// m6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl RepoMapQuery {
@@ -110,6 +115,9 @@ impl RepoMapQuery {
         if let Some(q) = self.query.as_deref().filter(|q| !q.trim().is_empty()) {
             out.push(("query", q.to_string()));
         }
+        if let Some(l) = self.label.as_deref().filter(|l| !l.trim().is_empty()) {
+            out.push(("label", l.to_string()));
+        }
         out
     }
 
@@ -119,6 +127,7 @@ impl RepoMapQuery {
         focus_files: Option<&str>,
         focus_symbols: Option<&str>,
         query: Option<String>,
+        label: Option<String>,
     ) -> Self {
         let list = |s: Option<&str>| -> Vec<String> {
             s.map(|s| {
@@ -135,6 +144,7 @@ impl RepoMapQuery {
             focus_files: list(focus_files),
             focus_symbols: list(focus_symbols),
             query: query.filter(|q| !q.trim().is_empty()),
+            label: label.filter(|l| !l.trim().is_empty()),
         }
     }
 
@@ -644,6 +654,9 @@ fn plan<'a>(g: &'a MapGraph, q: &RepoMapQuery, max_budget: usize, tail: &[String
     let max_budget = max_budget.max(MIN_REPO_MAP_BUDGET);
     let budget = asked.clamp(MIN_REPO_MAP_BUDGET, max_budget);
     let mut tail_notes: Vec<String> = Vec::new();
+    if let Some(l) = q.label.as_deref().filter(|l| !l.trim().is_empty()) {
+        tail_notes.push(clip(l.trim(), 2 * FOCUS_ITEM_CHARS));
+    }
     if budget != asked {
         tail_notes.push(format!(
             "[devctx] budget {asked} is outside {MIN_REPO_MAP_BUDGET}..={max_budget} tokens: used {budget}"
@@ -1445,6 +1458,24 @@ mod tests {
         assert_eq!(display_signature(&g, 1), "method run");
     }
 
+    /// Review of TASK-011, m6: the label of the answer (`[devctx] map of
+    /// <project>`) is inside the budget, never added past it.
+    #[test]
+    fn the_label_counts_in_the_budget() {
+        let syms: Vec<MapSymbol> = (0..400u64)
+            .map(|i| sym(i + 1, "src/a.rs", "function", &format!("f{i:03}"), None))
+            .collect();
+        let g = MapGraph::build(ranked(syms, &[]), &[]);
+        let label = format!("[devctx] map of {}", "p".repeat(100));
+        let req = RepoMapQuery {
+            label: Some(label.clone()),
+            ..q(256)
+        };
+        let m = render(&g, &req, 8000, &[]);
+        assert!(m.contains(&label[..60]), "{m}");
+        assert!(tokens(&m) <= 256, "{}", tokens(&m));
+    }
+
     /// The query string of `GET /repo-map` round-trips.
     #[test]
     fn the_query_round_trips_through_its_parameters() {
@@ -1453,6 +1484,7 @@ mod tests {
             focus_files: vec!["src/a.rs".into(), "src/b.rs".into()],
             focus_symbols: vec!["Store.open".into()],
             query: Some("why".into()),
+            label: Some("[devctx] map of api".into()),
         };
         let pairs: HashMap<&str, String> = req.query_pairs().into_iter().collect();
         let back = RepoMapQuery::from_params(
@@ -1460,6 +1492,7 @@ mod tests {
             pairs.get("focus_files").map(String::as_str),
             pairs.get("focus_symbols").map(String::as_str),
             pairs.get("query").cloned(),
+            pairs.get("label").cloned(),
         );
         assert_eq!(back, req);
         assert_eq!(query_identifiers("Cached"), ["Cached"]);
