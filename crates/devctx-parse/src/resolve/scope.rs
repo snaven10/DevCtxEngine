@@ -64,11 +64,32 @@ pub struct TypeText {
     pub elem: Option<String>,
 }
 
+/// A TypeScript function type (`(x: Foo) => Bar`): an `=>` outside every
+/// bracket. It names no class whose members a call could resolve to.
+fn has_top_level_arrow(t: &str) -> bool {
+    let mut depth = 0i32;
+    let mut prev = ' ';
+    for c in t.chars() {
+        match c {
+            '(' | '<' | '[' | '{' => depth += 1,
+            '>' if prev == '=' => {
+                if depth == 0 {
+                    return true;
+                }
+            }
+            ')' | '>' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        prev = c;
+    }
+    false
+}
+
 impl TypeText {
     /// Parse a type as written (`java.util.List<? extends Foo>`, `Foo[]`).
     pub fn parse(text: &str) -> Option<Self> {
         let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        if t.is_empty() {
+        if t.is_empty() || has_top_level_arrow(&t) {
             return None;
         }
         // A TypeScript union with `null`/`undefined` is the other member
@@ -731,8 +752,13 @@ mod tests {
     /// and panic — the whole index run of a TypeScript repository with it.
     #[test]
     fn a_closing_bracket_before_the_opening_one_does_not_panic() {
-        let t = TypeText::parse("(e: Event) => Observable<Item").unwrap();
-        assert_eq!(t.base, "(e:Event)=>Observable");
-        assert_eq!(t.elem.as_deref(), Some("Item"));
+        // A function type names no class to look a member up in (review
+        // of TASK-011, NIT: it used to yield `(x:Foo` and `Bar`).
+        assert_eq!(TypeText::parse("(e: Event) => Observable<Item"), None);
+        assert_eq!(TypeText::parse("(x:Foo<Bar>)=>Baz"), None);
+        assert_eq!(TypeText::parse("() => void"), None);
+        // An arrow inside a generic argument is the argument's own.
+        let t = TypeText::parse("Array<(x: A) => B>").unwrap();
+        assert_eq!(t.base, "Array");
     }
 }
