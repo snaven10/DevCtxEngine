@@ -286,6 +286,9 @@ pub struct AppState {
     repo_map: Mutex<Option<repo_map::CachedMap>>,
     /// Times that adjacency was read from the database.
     repo_map_loads: AtomicUsize,
+    /// Times it was dropped because an `index` ended: a graph read across
+    /// one is not kept.
+    repo_map_drops: AtomicUsize,
 }
 
 impl AppState {
@@ -331,6 +334,7 @@ impl AppState {
             vanish_strikes: AtomicU32::new(0),
             repo_map: Mutex::new(None),
             repo_map_loads: AtomicUsize::new(0),
+            repo_map_drops: AtomicUsize::new(0),
         })
     }
 

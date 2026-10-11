@@ -7,6 +7,7 @@
 //! There is no 0.9 path: a branch without a current symbol graph is an error
 //! that asks for `devctx index --full`.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,22 @@ impl AppState {
         store: &Store,
         chosen: &BranchChoice,
     ) -> Result<Arc<MapGraph>, String> {
+        self.repo_map_graph_with(store, chosen, || {})
+    }
+
+    /// [`repo_map_graph`](Self::repo_map_graph), with `after_load` run
+    /// between the read and the store (tests: an `index` ending then).
+    pub(super) fn repo_map_graph_with(
+        &self,
+        store: &Store,
+        chosen: &BranchChoice,
+        after_load: impl FnOnce(),
+    ) -> Result<Arc<MapGraph>, String> {
+        // Read before anything else: an `index` that ends from here on
+        // bumps it, and the graph read meanwhile is not kept (second review
+        // of TASK-011, m3: a failed or cancelled run leaves the generation
+        // where it was).
+        let drops = self.repo_map_drops.load(Ordering::SeqCst);
         let key = (
             chosen.repo.clone(),
             chosen.branch.clone(),
@@ -123,7 +140,11 @@ impl AppState {
         let (rss_before, started) = (procmem::rss_bytes(), Instant::now());
         let graph = Arc::new(load(store, &chosen.repo, &chosen.branch)?);
         let took = started.elapsed();
+        after_load();
         let mut held = slot(&self.repo_map);
+        if self.repo_map_drops.load(Ordering::SeqCst) != drops {
+            return Ok(graph);
+        }
         // Another call may have built the same one meanwhile: keep that.
         if let Some(c) = held.as_mut().filter(|c| c.key == key) {
             c.last_used = Instant::now();
@@ -157,7 +178,9 @@ impl AppState {
 
     /// Drops the cached adjacency: an `index` ended, or it went unused.
     pub(super) fn drop_repo_map(&self) -> bool {
-        slot(&self.repo_map).take().is_some()
+        let mut held = slot(&self.repo_map);
+        self.repo_map_drops.fetch_add(1, Ordering::SeqCst);
+        held.take().is_some()
     }
 
     /// Drops the adjacency when unused for `max_idle`.
@@ -393,6 +416,29 @@ mod tests {
         let before = counter();
         do_index(&state, false).unwrap();
         assert_eq!(counter(), before + 1);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Second review of TASK-011, m3: an `index` that ends (or fails, or is
+    /// cancelled: the generation does not move) while a graph is being read
+    /// drops the cache; that graph — maybe of a run half done — is answered
+    /// once and never kept under the old key.
+    #[test]
+    fn a_graph_read_while_an_index_ended_is_not_kept() {
+        let (state, repo) = indexed_files("repo_map_drop_race", APP);
+        let store = state.open_store().unwrap();
+        let chosen = graph_branch(&state, &store).unwrap();
+        let g = state
+            .repo_map_graph_with(&store, &chosen, || {
+                state.drop_repo_map();
+            })
+            .unwrap();
+        assert!(g.symbol_count() > 0);
+        assert_eq!(state.memory_json(&store)["repo_map"]["loaded"], false);
+        // The next call reads it again, and keeps it.
+        state.repo_map_graph(&store, &chosen).unwrap();
+        assert_eq!(state.memory_json(&store)["repo_map"]["loaded"], true);
+        drop(store);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
