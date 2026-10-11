@@ -325,7 +325,7 @@ enum Command {
     /// The structure of one file, to locate where something is: its symbols
     /// with signatures and line ranges, nested, without bodies.
     Skeleton {
-        /// The file: a repo-relative path (as read_file takes it).
+        /// The file: relative to the working directory (or absolute).
         file: String,
     },
     /// Progress on the plans under `plans/` (markdown, source of truth). No daemon, no store:
@@ -740,7 +740,7 @@ fn main() -> Result<()> {
             query,
             label: None,
         }),
-        Command::Skeleton { file } => cmd_skeleton(devctx_mcp::skeleton::SkeletonQuery::of(file)),
+        Command::Skeleton { file } => cmd_skeleton(file),
         Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),
         Command::Routes { method, path } => cmd_routes(method, path),
         Command::Summarize {
@@ -2479,10 +2479,18 @@ fn cmd_map(q: devctx_mcp::repo_map::RepoMapQuery) -> Result<()> {
 
 /// `devctx skeleton <file>` — the file's structure (PLAN-009 TASK-014): the
 /// same text as the `skeleton` tool, through the server when there is one.
-fn cmd_skeleton(q: devctx_mcp::skeleton::SkeletonQuery) -> Result<()> {
+fn cmd_skeleton(file: String) -> Result<()> {
     // A bad parameter is refused before a server or a store is touched.
-    q.validate().map_err(|e| anyhow!(e))?;
+    devctx_mcp::skeleton::SkeletonQuery::of(file.clone())
+        .validate()
+        .map_err(|e| anyhow!(e))?;
     let cfg = load_project()?;
+    let cwd = std::env::current_dir()?;
+    let q = devctx_mcp::skeleton::SkeletonQuery::of(skeleton_file_arg(
+        &cwd,
+        &project_root(&cfg)?,
+        &file,
+    ));
     let text = match remote::ensure_cli(&cfg)? {
         Some(r) => r.skeleton(&q)?,
         None => {
@@ -2498,6 +2506,48 @@ fn cmd_skeleton(q: devctx_mcp::skeleton::SkeletonQuery) -> Result<()> {
     };
     print!("{text}");
     Ok(())
+}
+
+/// `file` as `devctx skeleton` sends it: a relative path is the shell's,
+/// relative to `cwd`; when that lands inside `root` (lexically, `..`
+/// resolved against `cwd`), it is sent relative to the root. Anything else
+/// goes as typed and the tool decides.
+fn skeleton_file_arg(cwd: &std::path::Path, root: &std::path::Path, file: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+    if Path::new(file).is_absolute() {
+        return file.to_string();
+    }
+    let mut abs = PathBuf::new();
+    for c in cwd.join(file).components() {
+        match c {
+            Component::ParentDir => {
+                abs.pop();
+            }
+            Component::CurDir => {}
+            other => abs.push(other),
+        }
+    }
+    let roots = [Some(root.to_path_buf()), root.canonicalize().ok()];
+    let cwds = [
+        abs.clone(),
+        cwd.canonicalize().map_or(abs.clone(), |c| {
+            c.join(abs.strip_prefix(cwd).unwrap_or(&abs))
+        }),
+    ];
+    for r in roots.iter().flatten() {
+        for a in &cwds {
+            if let Ok(rel) = a.strip_prefix(r) {
+                let parts: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                if !parts.is_empty() {
+                    return parts.join("/");
+                }
+            }
+        }
+    }
+    file.to_string()
 }
 
 /// `devctx traverse` — walk the symbol graph from a symbol.
@@ -4475,6 +4525,39 @@ fn render_table(hits: &[SearchResult]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Review of TASK-014, MINOR 6: `devctx skeleton <file>` reads `file`
+    /// from where it is typed, like any shell command: relative to the
+    /// working directory, sent relative to the repository root.
+    #[test]
+    fn a_skeleton_path_is_relative_to_the_working_directory() {
+        use std::path::Path;
+        let root = Path::new("/r/repo");
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo/web"), root, "src/x.ts"),
+            "web/src/x.ts"
+        );
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo/web"), root, "../crates/a.rs"),
+            "crates/a.rs"
+        );
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo"), root, "./a.rs"),
+            "a.rs"
+        );
+        // Outside the repository, or absolute: as typed (the tool decides).
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/elsewhere"), root, "a.rs"),
+            "a.rs"
+        );
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo/web"), root, "/r/repo/a.rs"),
+            "/r/repo/a.rs"
+        );
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo/web"), root, "../../x.rs"),
+            "../../x.rs"
+        );
+    }
 
     /// Review of TASK-013, MINOR 3: a lower-bound total reads `>= N`.
     #[test]

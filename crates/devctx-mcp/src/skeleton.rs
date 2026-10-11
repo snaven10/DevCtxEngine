@@ -26,9 +26,11 @@ pub struct SkeletonQuery {
     /// The file: repo-relative (or absolute inside the repository), as
     /// `read_file` takes it.
     pub file: String,
-    /// A first line naming the project that answered (MCP `project`), inside
-    /// the budget.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A first line naming the project that answered (MCP `project`): the
+    /// MCP's own, never read from nor sent over the wire (a query string
+    /// could otherwise put text in the answer). Local: inside the budget;
+    /// routed, added by the client in front of the server's answer.
+    #[serde(skip)]
     pub label: Option<String>,
 }
 
@@ -51,13 +53,9 @@ impl SkeletonQuery {
         Ok(())
     }
 
-    /// The parameters of `GET /skeleton`.
+    /// The parameters of `GET /skeleton` (`label` is not one).
     pub fn query_pairs(&self) -> Vec<(&'static str, String)> {
-        let mut out = vec![("file", self.file.clone())];
-        if let Some(l) = self.label.as_deref().filter(|l| !l.trim().is_empty()) {
-            out.push(("label", l.to_string()));
-        }
-        out
+        vec![("file", self.file.clone())]
     }
 }
 
@@ -102,7 +100,9 @@ pub fn render(input: &SkeletonInput<'_>, budget: usize) -> String {
         nodes.len(),
         if test_file { ", test file" } else { "" }
     ));
+    let mut imports_at = None;
     if let Some(line) = imports_line(input.imports) {
+        imports_at = Some(fixed.len());
         fixed.push(line);
     }
     let order = tree_order(&nodes);
@@ -128,15 +128,30 @@ pub fn render(input: &SkeletonInput<'_>, budget: usize) -> String {
     // Characters, not tokens: a text of `c` characters is `ceil(c / 4)`
     // tokens, so it is within the budget exactly when `c <= 4 * budget`.
     let chars = |l: &String| l.chars().count() + 1;
-    let fixed_chars: usize = fixed.iter().chain(input.tail).map(chars).sum();
     let body_chars: usize = body.iter().map(chars).sum();
     let room = budget.map(|b| b.saturating_mul(CHARS_PER_TOKEN));
+    // The closing line at its longest (every symbol cut, the last line of
+    // the file), reserved whenever not everything fits.
+    let worst = closing(nodes.len(), lines, lines, budget.unwrap_or(0));
+    let worst_chars = worst.chars().count() + 1;
+    let mut fixed_chars: usize = fixed.iter().chain(input.tail).map(chars).sum();
+    // The imports line is the one fixed line that can give way: to its
+    // count when the fixed lines and the closing one leave no room (review
+    // of TASK-014, MINOR 4), and out if even that does not fit.
+    if let (Some(room), Some(at)) = (room, imports_at) {
+        if fixed_chars + worst_chars > room {
+            let short = format!("imports ({})", imports_total(input.imports));
+            fixed_chars = fixed_chars - chars(&fixed[at]) + chars(&short);
+            fixed[at] = short;
+            if fixed_chars + worst_chars > room {
+                fixed_chars -= chars(&fixed[at]);
+                fixed.remove(at);
+            }
+        }
+    }
     let shown = match room {
         Some(room) if fixed_chars + body_chars > room => {
-            // The closing line at its longest (every symbol cut, the last
-            // line of the file) is reserved.
-            let worst = closing(nodes.len(), lines, lines, budget.unwrap_or(0));
-            let mut left = room.saturating_sub(fixed_chars + worst.chars().count() + 1);
+            let mut left = room.saturating_sub(fixed_chars + worst_chars);
             body.iter()
                 .take_while(|l| match left.checked_sub(chars(l)) {
                     Some(rest) => {
@@ -156,8 +171,15 @@ pub fn render(input: &SkeletonInput<'_>, budget: usize) -> String {
         out.push('\n');
     }
     if shown < body.len() {
+        // The lowest line of what was cut, not the first cut in tree order:
+        // a member drawn under its container (a Rust `impl` under its type)
+        // can be far below a sibling that was cut after it (MAJOR 1).
         let cut = &order[shown..];
-        let first = nodes[cut[0].0].start_line;
+        let first = cut
+            .iter()
+            .map(|&(i, _)| nodes[i].start_line)
+            .min()
+            .unwrap_or(0);
         let last = cut
             .iter()
             .map(|&(i, _)| nodes[i].end_line)
@@ -182,9 +204,6 @@ const INDENT: &str = "  ";
 /// The token estimate of the whole product (`repo_map::tokens`).
 const CHARS_PER_TOKEN: usize = 4;
 
-/// The longest signature the index keeps (DD-17): one this long was cut.
-const SIGNATURE_CAP: usize = 200;
-
 /// One import target, at most, in characters.
 const IMPORT_CHARS: usize = 80;
 
@@ -201,7 +220,7 @@ fn imports_line(imports: &FileImports) -> Option<String> {
     if imports.total == 0 && imports.first.is_empty() {
         return None;
     }
-    let total = imports.total.max(imports.first.len());
+    let total = imports_total(imports);
     let mut names: Vec<String> = imports
         .first
         .iter()
@@ -223,27 +242,27 @@ fn imports_line(imports: &FileImports) -> Option<String> {
     Some(format!("imports ({total}): {}", names.join(", ")))
 }
 
+/// Distinct import targets of the file.
+fn imports_total(imports: &FileImports) -> usize {
+    imports.total.max(imports.first.len())
+}
+
 /// A symbol's signature as the skeleton shows it: as the repo map does
-/// (annotations, a field's value and a final `;` out), with `…` when the
-/// index cut it at
-/// [`SIGNATURE_CAP`] characters, and `kind name …` when the cut left no
-/// name (a long annotation took the 200 characters).
+/// (annotations, a field's value and a final `;` out); a signature the index
+/// cut ends in its own `…`. When what is left still starts with an
+/// annotation or attribute that never closes, the cut fell inside it (an
+/// index from before the extractor skipped them, review of TASK-014): no
+/// name is left to show, so `kind name …`.
 fn shown_signature(s: &StoredSymbol) -> String {
-    let raw = s.signature.as_deref().map(str::trim).unwrap_or("");
     // `int qty;`, `void run();`: the terminator is no part of the head.
     let shown = clean_signature(s.signature.as_deref(), &s.kind, &s.name)
         .trim_end_matches(';')
         .trim_end()
         .to_string();
-    if raw.chars().count() < SIGNATURE_CAP {
-        return shown;
-    }
-    if !s.name.is_empty() && !shown.contains(&*s.name) {
-        return format!("{} {} …", s.kind, s.name);
-    }
-    // Only when the end that was cut is still shown (not a value dropped).
-    if raw.ends_with(&*shown) {
-        format!("{shown} …")
+    let unclosed =
+        (shown.starts_with('@') && !shown.starts_with("@interface")) || shown.starts_with("#[");
+    if unclosed {
+        format!("{} {} …", s.kind, s.name)
     } else {
         shown
     }
@@ -575,33 +594,138 @@ mod tests {
         assert!(!none.contains("imports"), "{none}");
     }
 
-    /// A signature the index cut at 200 characters is marked `…`; one cut
-    /// inside its leading annotations (no name left) is `kind name …`.
+    /// The index marks a signature it cut with `…` (199 characters and
+    /// `…`); shown as is. One whose cut fell inside its leading annotations
+    /// (an index from before the extractor skipped them) leaves an
+    /// annotation that never closes: `kind name …`, decided by that and not
+    /// by whether the name appears somewhere (review of TASK-014, MINOR 3:
+    /// `get` inside `summary = "get the order…"`). Exactly 200 characters
+    /// without `…`: whole, no false mark.
     #[test]
     fn cut_signatures_are_named() {
-        let long_annotation = format!(
+        let cut = |s: String| -> String {
+            let mut c: String = s.chars().take(199).collect();
+            c.push('…');
+            c
+        };
+        let in_annotation = cut(format!(
             "@Operation(summary = \"{}\") public Response list()",
             "x".repeat(300)
-        );
-        let cut: String = long_annotation.chars().take(200).collect();
-        let long_params = format!(
+        ));
+        let get_inside = cut(format!(
+            "@Operation(summary = \"get the order {}\") public Order get()",
+            "x".repeat(300)
+        ));
+        let id_inside = cut(format!(
+            "@Path(\"/{{id}}/{}\") public Order id()",
+            "y".repeat(300)
+        ));
+        let wide = cut(format!(
             "public void wide({})",
             (0..40)
                 .map(|i| format!("String p{i}"))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
-        let long_params: String = long_params.chars().take(200).collect();
+        ));
+        let name = "n".repeat(200 - "void ()".len());
+        let exact = format!("void {name}()");
         let rows = vec![
             file(40),
             sym(10, Some(1), "class", "Foo", "public class Foo", (3, 40), 30),
-            sym(11, Some(10), "method", "list", &cut, (5, 9), 60),
-            sym(12, Some(10), "method", "wide", &long_params, (11, 12), 90),
+            sym(11, Some(10), "method", "list", &in_annotation, (5, 9), 60),
+            sym(12, Some(10), "method", "wide", &wide, (11, 12), 90),
+            sym(13, Some(10), "method", "get", &get_inside, (14, 15), 120),
+            sym(14, Some(10), "method", "id", &id_inside, (17, 18), 150),
+            sym(15, Some(10), "method", &name, &exact, (20, 21), 180),
         ];
         let out = draw(&rows, &FileImports::default(), 8000);
         assert!(out.contains("  method list … [5-9]\n"), "{out}");
-        assert!(!out.contains("xxxx"), "{out}");
+        assert!(out.contains("  method get … [14-15]\n"), "{out}");
+        assert!(out.contains("  method id … [17-18]\n"), "{out}");
+        assert!(!out.contains("xxxx") && !out.contains("yyyy"), "{out}");
         let wide = out.lines().find(|l| l.contains("wide(")).unwrap();
         assert!(wide.ends_with("… [11-12]"), "{wide}");
+        assert!(out.contains(&format!("  {exact} [20-21]\n")), "{out}");
+    }
+
+    /// NIT of the review: `label` is the MCP's own line, never a parameter
+    /// of the wire: `GET /skeleton?label=…` cannot put text in the answer.
+    #[test]
+    fn the_label_is_not_a_wire_parameter() {
+        let q: SkeletonQuery =
+            serde_json::from_value(serde_json::json!({ "file": "a.rs", "label": "evil" })).unwrap();
+        assert_eq!(q.label, None);
+        let q = SkeletonQuery {
+            label: Some("[devctx] skeleton from x".into()),
+            ..SkeletonQuery::of("a.rs")
+        };
+        assert_eq!(q.query_pairs(), vec![("file", "a.rs".to_string())]);
+    }
+
+    /// Review of TASK-014, MAJOR 1: the closing line names the lowest line
+    /// of what was cut, not the line of the first symbol cut in tree order.
+    /// A Rust `impl` is drawn under its type: with `struct A` (l. 10), `struct
+    /// B` (l. 20), `impl A` (l. 300) under A and `impl B` (l. 600) under B, a
+    /// cut inside `impl A` also cuts `struct B`, which starts at line 20.
+    #[test]
+    fn the_closing_line_names_the_lowest_cut_line() {
+        let mut rows = vec![
+            file(900),
+            sym(10, Some(1), "struct", "A", "pub struct A", (10, 12), 100),
+            sym(20, Some(1), "struct", "B", "pub struct B", (20, 22), 200),
+            sym(30, Some(10), "impl", "A", "impl A", (300, 590), 3000),
+            sym(40, Some(20), "impl", "B", "impl B", (600, 890), 6000),
+        ];
+        for i in 0..100 {
+            let line = 301 + i * 2;
+            rows.push(sym(
+                1000 + i as u64,
+                Some(30),
+                "method",
+                &format!("a{i}"),
+                &format!("pub fn a{i}(&self, first: String, second: String) -> String"),
+                (line, line + 1),
+                3001 + i as i64 * 10,
+            ));
+        }
+        let out = draw(&rows, &FileImports::default(), MIN_SKELETON_BUDGET);
+        assert!(out.contains("pub fn a0("), "{out}");
+        assert!(!out.contains("pub struct B"), "{out}");
+        let last = out.lines().last().unwrap();
+        assert!(
+            last.contains("(lines 20-890)") && last.contains("start_line=20 "),
+            "{last}"
+        );
+    }
+
+    /// Review of TASK-014, MINOR 4: when the fixed lines (here a long tail
+    /// and eight long imports) leave no room, the imports line shrinks to its
+    /// count, and the budget still holds.
+    #[test]
+    fn the_imports_line_gives_way_to_the_budget() {
+        let imports = FileImports {
+            total: 30,
+            first: (0..IMPORTS_SHOWN)
+                .map(|i| format!("pkg{i}.{}", "q".repeat(76)))
+                .collect(),
+        };
+        let tail = vec![format!("[devctx] branch_fallback: {}", "z".repeat(600))];
+        let out = render(
+            &SkeletonInput {
+                file: "a/Foo.java",
+                symbols: &java(),
+                imports: &imports,
+                head: &[],
+                tail: &tail,
+            },
+            MIN_SKELETON_BUDGET,
+        );
+        assert!(
+            tokens(&out) <= MIN_SKELETON_BUDGET,
+            "{}\n{out}",
+            tokens(&out)
+        );
+        assert!(out.contains("\nimports (30)\n"), "{out}");
+        assert!(out.contains("public class Foo"), "{out}");
     }
 }

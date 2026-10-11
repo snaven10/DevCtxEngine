@@ -19,6 +19,13 @@ pub const SKELETON_NEEDS_REINDEX: &str =
     "skeleton reads the symbol graph, and this branch's index predates it (an older \
      extractor, or no symbol rows): reindex with devctx index --full (vectors are reused)";
 
+/// The error of a current index with no symbol rows: no file of the branch
+/// is in a language with symbol extraction, so a reindex would change
+/// nothing (asking for one sent callers round in a loop).
+const SKELETON_NO_SYMBOLS: &str =
+    "this branch's index is current but holds no symbols (no file in a language with \
+     symbol extraction), so there is no skeleton to draw; read files with read_file";
+
 /// The error of a failed read of the symbol graph: not a reason to reindex.
 const SKELETON_READ_ERROR: &str =
     "could not read the symbol graph of this branch (a read error, not a reason to \
@@ -27,33 +34,67 @@ const SKELETON_READ_ERROR: &str =
 /// Paths suggested for a file the index does not hold, at most.
 const MAX_FILE_SUGGESTIONS: usize = 5;
 
-/// `file` as the index spells it: relative to `root` (an absolute path
-/// inside the repository is made relative, as `read_file` reads it), with
-/// `/` separators and no leading `./`.
+/// `file` as the index spells it: relative to `root`, with `/` separators.
+/// An absolute path inside the repository is made relative (lexically, or
+/// through a symbolic link once canonical), as `read_file` reads it.
+///
+/// A path that leaves the repository — any `..`, or an absolute one outside
+/// it — is refused before anything about it is looked up on disk, with the
+/// same message whether it exists or not, and without the repository's own
+/// path (review of TASK-014, MAJOR 2: otherwise the answer was an oracle of
+/// the host's files).
 pub(super) fn repo_relative(root: &Path, file: &str) -> Result<String, String> {
+    use std::path::{Component, PathBuf};
     let f = file.trim().replace('\\', "/");
-    let rel = if Path::new(&f).is_absolute() {
-        let canonical = root.canonicalize().ok();
-        let inside = std::iter::once(root)
-            .chain(canonical.as_deref())
-            .find_map(|r| Path::new(&f).strip_prefix(r).ok().map(Path::to_path_buf));
-        match inside {
-            Some(p) => p.to_string_lossy().replace('\\', "/"),
-            None => {
-                return Err(format!(
-                    "{file} is outside this repository ({}): pass a repo-relative path",
-                    root.display()
-                ))
-            }
+    let outside =
+        || format!("{file} is outside this repository: pass a repo-relative path, without `..`");
+    let p = Path::new(&f);
+    if p.components().any(|c| c == Component::ParentDir) {
+        return Err(outside());
+    }
+    let rel: PathBuf = if p.is_absolute() {
+        let canonical_root = root.canonicalize().ok();
+        let lexical = std::iter::once(root)
+            .chain(canonical_root.as_deref())
+            .find_map(|r| p.strip_prefix(r).ok().map(Path::to_path_buf));
+        match lexical {
+            Some(r) => r,
+            // Through a link: the canonical path, against the canonical root.
+            // Whatever is outside answers the same, existing or not.
+            None => match (p.canonicalize(), canonical_root) {
+                (Ok(c), Some(r)) => c
+                    .strip_prefix(&r)
+                    .map(Path::to_path_buf)
+                    .map_err(|_| outside())?,
+                _ => return Err(outside()),
+            },
         }
     } else {
-        f
+        PathBuf::from(&f)
     };
-    let mut rel = rel.as_str();
-    while let Some(rest) = rel.strip_prefix("./") {
-        rel = rest;
+    let mut parts = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(x) => parts.push(x.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => return Err(outside()),
+        }
     }
-    Ok(rel.trim_start_matches('/').to_string())
+    if parts.is_empty() {
+        return Err(format!("{file} names no file of this repository"));
+    }
+    Ok(parts.join("/"))
+}
+
+/// Whether `file` (already checked by [`repo_relative`]) is a file on disk
+/// inside the repository once links are resolved: a link inside the
+/// repository that points out of it reads as "no such file", whatever is
+/// out there.
+fn on_disk(root: &Path, file: &str) -> bool {
+    match (root.join(file).canonicalize(), root.canonicalize()) {
+        (Ok(c), Ok(r)) => c.starts_with(&r) && c.is_file(),
+        _ => false,
+    }
 }
 
 /// The skeleton `q` asks for on `chosen`, within `budget` tokens.
@@ -68,7 +109,8 @@ pub(super) fn skeleton_on(
     match Reader::of(chosen, store) {
         Reader::SymbolGraph => {}
         Reader::Legacy(Legacy::Error) => return Err(SKELETON_READ_ERROR.into()),
-        Reader::Legacy(_) => return Err(SKELETON_NEEDS_REINDEX.into()),
+        Reader::Legacy(Legacy::NoRows) => return Err(SKELETON_NO_SYMBOLS.into()),
+        Reader::Legacy(Legacy::Stale) => return Err(SKELETON_NEEDS_REINDEX.into()),
     }
     let file = repo_relative(root, &q.file)?;
     let (repo, branch) = (&chosen.repo, &chosen.branch);
@@ -114,7 +156,7 @@ fn not_found(store: &Store, chosen: &BranchChoice, root: &Path, file: &str) -> S
              symbol extraction); read it with read_file"
         );
     }
-    let why = if root.join(file).is_file() {
+    let why = if on_disk(root, file) {
         "it exists on disk, but the index does not hold it: excluded, not committed, or \
          added since the last index (devctx index)"
     } else {
@@ -605,12 +647,85 @@ def handler(event, context):
         let e = skeleton(&state, JAVA_PATH).unwrap_err();
         assert!(e.contains("devctx index --full"), "{e}");
         let _ = std::fs::remove_dir_all(&repo);
+        // A current index with no symbol rows (no language with symbol
+        // extraction): reindexing would change nothing, so it says so and
+        // sends to read_file instead of asking for `--full` in a loop (NIT).
         let (state, repo) = indexed_files(
             "skel_norows",
             &[("db/schema.sql", "CREATE TABLE things (id INT);\n")],
         );
         let e = skeleton(&state, "db/schema.sql").unwrap_err();
-        assert!(e.contains("devctx index --full"), "{e}");
+        assert!(e.contains("read_file") && !e.contains("--full"), "{e}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review of TASK-014, MAJOR 2: a path that leaves the repository is
+    /// refused before the disk is touched, with one message whether or not
+    /// the outside file exists (no oracle of the host's files) and without
+    /// the repository's own path in it.
+    #[test]
+    fn a_path_out_of_the_repository_is_refused_without_looking() {
+        let (state, repo) = indexed("skel_escape");
+        let outside = repo
+            .parent()
+            .unwrap()
+            .join(format!("skel_outside_{}.txt", std::process::id()));
+        std::fs::write(&outside, "x\n").unwrap();
+        let name = outside.file_name().unwrap().to_string_lossy().into_owned();
+        let said = |file: &str| skeleton(&state, file).unwrap_err().replace(file, "<f>");
+        let exists = said(&format!("../{name}"));
+        assert!(exists.contains("outside this repository"), "{exists}");
+        assert_eq!(exists, said("../skel_no_such_file.txt"));
+        assert_eq!(exists, said(&format!("web/../../{name}")));
+        let root = repo.to_string_lossy().into_owned();
+        let abs = said(&format!("{root}/../{name}"));
+        assert_eq!(abs, said(&format!("{root}/../skel_no_such_file.txt")));
+        assert!(abs.contains("outside this repository"), "{abs}");
+        assert!(!abs.contains(&root) && !exists.contains(&root), "{abs}");
+        let elsewhere = said("/elsewhere/X.java");
+        assert!(!elsewhere.contains(&root), "{elsewhere}");
+        // `a/../b` inside the repository is still refused: no `..` at all.
+        let e = said(&format!("web/../{JAVA_PATH}"));
+        assert!(
+            e.contains("outside this repository") || e.contains(".."),
+            "{e}"
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// MINOR 5 and MAJOR 2: an absolute path through a symbolic link to the
+    /// repository is the same file; a link inside the repository that points
+    /// out of it tells nothing about what is out there.
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_links_resolve_and_leak_nothing() {
+        let (state, repo) = indexed("skel_links");
+        let link = repo
+            .parent()
+            .unwrap()
+            .join(format!("skel_link_{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let via_link = link.join(JAVA_PATH).to_string_lossy().into_owned();
+        assert_eq!(
+            skeleton(&state, &via_link).unwrap(),
+            skeleton(&state, JAVA_PATH).unwrap()
+        );
+        let outside = repo
+            .parent()
+            .unwrap()
+            .join(format!("skel_out_target_{}.txt", std::process::id()));
+        std::fs::write(&outside, "x\n").unwrap();
+        std::os::unix::fs::symlink(repo.parent().unwrap(), repo.join("up")).unwrap();
+        let name = outside.file_name().unwrap().to_string_lossy().into_owned();
+        let said = |file: &str| skeleton(&state, file).unwrap_err().replace(file, "<f>");
+        assert_eq!(
+            said(&format!("up/{name}")),
+            said("up/skel_no_such_file.txt")
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&repo);
     }
 

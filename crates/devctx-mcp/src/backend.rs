@@ -695,9 +695,16 @@ impl Backend {
     pub fn skeleton(&self, q: &SkeletonQuery) -> Result<String, String> {
         match self {
             Backend::Local(s) => do_skeleton(s, q),
-            Backend::Remote(r, _) => r
-                .get_route(&skeleton_path(q))?
-                .ok_or_else(|| SKELETON_OLD_SERVER.to_string()),
+            Backend::Remote(r, _) => {
+                let text = r
+                    .get_route(&skeleton_path(q))?
+                    .ok_or_else(|| SKELETON_OLD_SERVER.to_string())?;
+                // The label is the MCP's: not sent, put in front here.
+                Ok(match q.label.as_deref().filter(|l| !l.trim().is_empty()) {
+                    Some(l) => format!("{l}\n{text}"),
+                    None => text,
+                })
+            }
         }
     }
 
@@ -1187,6 +1194,26 @@ mod tests {
         let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
         assert_eq!(backend.skeleton(&q).unwrap_err(), "boom");
         assert_eq!(skeleton_path(&q), "/skeleton?file=src%2Fa%20b.rs");
+        // The MCP's label goes first, added here: it is not sent.
+        let ok = serve_fixed(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\n\
+             Connection: close\r\n\r\na.rs: 1 symbols",
+        );
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: ok.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        let labelled = SkeletonQuery {
+            label: Some("[devctx] skeleton from x".into()),
+            ..SkeletonQuery::of("a.rs")
+        };
+        assert_eq!(
+            backend.skeleton(&labelled).unwrap(),
+            "[devctx] skeleton from x\na.rs: 1 symbols"
+        );
     }
 
     #[test]
