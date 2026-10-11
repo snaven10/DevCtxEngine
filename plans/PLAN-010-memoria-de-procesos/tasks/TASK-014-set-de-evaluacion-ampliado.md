@@ -3,6 +3,7 @@
 - **Plan:** PLAN-010 — Memoria de procesos (bloque de calidad de búsqueda, decisión del usuario 2026-10-11)
 - **Especialista:** general-purpose (casos a mano + scripts; poco o nada de Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`) + casos privados fuera del repo
+- **Release:** `0.10.x`
 - **Depende de:** — (después de PLAN-009; usa su arnés `scripts/graph-eval/`)
 - **Estado:** `pending`
 

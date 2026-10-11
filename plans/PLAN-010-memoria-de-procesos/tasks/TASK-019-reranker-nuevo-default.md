@@ -3,6 +3,7 @@
 - **Plan:** PLAN-010 — Memoria de procesos (bloque de calidad de búsqueda, decisión del usuario 2026-10-11)
 - **Especialista:** general-purpose (Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
+- **Release:** `0.11.0`
 - **Depende de:** TASK-005, TASK-018
 - **Estado:** `pending`
 
@@ -22,8 +23,8 @@ con esos números si `reranking.enabled` sigue en `false`. PLAN-010 DD-16.
 - Default de la key hoy: `bge-base` (`crates/devctx-core/src/config.rs:452`,
   `crates/devctx-rerank/src/local.rs:26`); pool 100 (`config.rs:448`); `enabled: false` (`:443`).
   `SearchReq.rerank` es `true` por defecto en la tool, pero no hace nada si `enabled: false`.
-- `jina-v2` (`JINARerankerV2BaseMultiligual`) es **CC-BY-NC-4.0** y hoy se ofrece como key
-  (`local.rs:266`) y en `docs/09-models-and-tuning.md`.
+- `jina-v2` (`JINARerankerV2BaseMultiligual`, **CC-BY-NC-4.0**) ya lo retiró TASK-021 en la `0.10.x`
+  (cae a "sin rerank" con aviso; Q-8). Esta task no lo vuelve a ofrecer.
 - Descarga de modelos: `devctx models` / `devctx models --download <key>` para embeddings
   (AGENTS.md §2) con la caché compartida `model_cache_dir()` y `guard_load`.
 
@@ -52,10 +53,10 @@ con esos números si `reranking.enabled` sigue en `false`. PLAN-010 DD-16.
 - [ ] **Paso 5 — `enabled`.** Propuesta a confirmar con el usuario (Q-7): pasa a `true` solo si
       p95 ≤ 2 s al pool elegido con `intra_threads` por defecto **y** se mantiene la ganancia; si no,
       queda `false` y la doc dice cuándo prenderlo.
-- [ ] **Paso 6 — compatibilidad.** Las keys viejas (`bge-base`, `bge-v2-m3`, `jina-turbo`) siguen
-      funcionando; `jina-v2` se mantiene solo si el usuario lo pide explícitamente, con aviso de
-      licencia no comercial en `devctx models` y en la doc (Q-8). Una config que no nombra `model`
-      pasa al default nuevo: anotarlo en el CHANGELOG.
+- [ ] **Paso 6 — compatibilidad.** Las keys vigentes (`bge-base`, `bge-v2-m3`, `jina-turbo`) siguen
+      funcionando sobre el motor propio; `jina-v2` sigue retirado (TASK-021, Q-8) y el catálogo del
+      motor propio respeta `RETIRED_MODELS` (mismo fallback a "sin rerank" con aviso). Una config que
+      no nombra `model` pasa al default nuevo: anotarlo en el CHANGELOG.
 - [ ] **Paso 7 — arnés de equivalencia.** Dorados del reranker nuevo generados con la referencia de
       Python (onnxruntime, mismo ONNX) y comparados con el motor propio (`|Δ| ≤ 1e-3`, mismo orden),
       igual que TASK-005 con los viejos.

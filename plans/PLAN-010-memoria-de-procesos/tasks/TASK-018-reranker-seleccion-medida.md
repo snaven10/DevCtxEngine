@@ -3,6 +3,7 @@
 - **Plan:** PLAN-010 — Memoria de procesos (bloque de calidad de búsqueda, decisión del usuario 2026-10-11)
 - **Especialista:** general-purpose (scripts + config; Rust solo si hace falta para medir)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
+- **Release:** `0.10.x` (solo la medición; el cambio de default es TASK-019, `0.11.0`)
 - **Depende de:** TASK-014
 - **Estado:** `pending`
 
@@ -91,7 +92,7 @@ cubre). Se re-evalúan si algún día hay GPU usable.
 
 - **Modificar:** `scripts/graph-eval/run.sh` + `score.py` (modo rerank: candidatos congelados,
   latencia por búsqueda separada de la carga), `scripts/bench-rerank.sh` (lista de candidatos:
-  sacar `jina-v2` por licencia o marcarlo NC, agregar los finalistas).
+  agregar los finalistas; `jina-v2` lo saca TASK-021).
 - **Crear:** `scripts/rerank-eval/fetch.sh` (descarga los finalistas a un directorio del scratchpad
   o del cache de modelos con sha256 anotado).
 

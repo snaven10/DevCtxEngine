@@ -3,6 +3,7 @@
 - **Plan:** PLAN-010 — Memoria de procesos (bloque de calidad de búsqueda, decisión del usuario 2026-10-11)
 - **Especialista:** general-purpose (Rust + SQL de DuckDB)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
+- **Release:** `0.10.x`
 - **Depende de:** TASK-014
 - **Estado:** `pending`
 
