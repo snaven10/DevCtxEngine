@@ -1132,6 +1132,57 @@ mod tests {
         assert_eq!(t.dispatch_origins_capped, 24);
     }
 
+    /// Second review of TASK-011, MAJOR: the origins kept per equivalent are
+    /// the surest ones, not the lowest ids — 20 implementations through a
+    /// `low` `implements` and one, of the highest id, through a `high` one:
+    /// with the default `medium` the callers are still listed (by the `high`
+    /// one), not left `below_confidence`.
+    #[test]
+    fn the_origins_kept_are_the_surest() {
+        let store = Store::open_in_memory(3).unwrap();
+        let mut types: Vec<(String, &str)> =
+            (0..20).map(|i| (format!("Weak{i:02}"), "low")).collect();
+        types.push(("Zstrong".into(), "high"));
+        let supers: Vec<(&str, &str, &str, &str)> = types
+            .iter()
+            .map(|(t, c)| (t.as_str(), "IGet", "implements", *c))
+            .collect();
+        let qs: Vec<String> = types.iter().map(|(t, _)| format!("{t}.get")).collect();
+        let mut methods: Vec<(&str, &str)> = qs
+            .iter()
+            .map(|q| (q.as_str(), "public String get()"))
+            .collect();
+        methods.push(("IGet.get", "String get();"));
+        let calls: Vec<crate::impact::tests::E> = (0..3)
+            .map(|c| crate::impact::tests::call(&format!("Caller{c}.run"), "IGet.get"))
+            .collect();
+        let ids = crate::impact::tests::typed_graph(&store, &supers, &methods, &calls);
+        assert!(
+            qs.iter().all(|q| ids[q] <= ids["Zstrong.get"]),
+            "the strong one has the highest id"
+        );
+        let roots: Vec<StoredSymbol> = qs
+            .iter()
+            .map(|q| store.symbol_by_id("repo", "main", ids[q]).unwrap().unwrap())
+            .collect();
+        let t = store
+            .traverse(
+                "repo",
+                "main",
+                &roots,
+                &opts(&["calls"], TraverseDirection::In, 1),
+            )
+            .unwrap();
+        let mut n = names(&t);
+        n.sort_unstable();
+        assert_eq!(n, ["Caller0.run", "Caller1.run", "Caller2.run"], "{t:?}");
+        assert!(t
+            .nodes
+            .iter()
+            .all(|n| n.confidence.as_deref() == Some("medium")));
+        assert_eq!(t.dispatch_origins_capped, 21 - 16);
+    }
+
     /// Review of TASK-011 (the cost of that bug): the equivalents query reads
     /// only the pairs (origin, type its type reaches) — one row per
     /// implementation here — not every same-name method of every type of

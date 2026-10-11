@@ -902,11 +902,12 @@ impl Store {
                 for e in &eq.kept {
                     by_id.entry(e.id).or_default().push(e);
                 }
-                // At most so many origins per equivalent, the same ones
-                // whatever the order (by origin id): each caller of the
+                // At most so many origins per equivalent: each caller of the
                 // equivalent was cloned once per origin (review of TASK-011).
+                // The surest chains first, then by origin id, so a caller is
+                // never left `low` while a surer path existed (second review).
                 for list in by_id.values_mut() {
-                    list.sort_by_key(|e| (e.origin, e.chain));
+                    list.sort_by_key(|e| (std::cmp::Reverse(e.chain), e.origin));
                     if list.len() > DISPATCH_MAX_ORIGINS_PER_EQUIVALENT {
                         out.origins_capped += list.len() - DISPATCH_MAX_ORIGINS_PER_EQUIVALENT;
                         list.truncate(DISPATCH_MAX_ORIGINS_PER_EQUIVALENT);
