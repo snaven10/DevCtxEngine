@@ -390,16 +390,22 @@ mod tests [137-264] [test]
 (`devctx skeleton crates/devctx-store/src/skeleton.rs` on this repository: 244 tokens for a file of 2 406.)
 
 - `file` is a repo-relative path, as `read_file` takes it (an absolute path inside
-  the repository and a leading `./` are accepted).
-- The tree follows `parent_id`: two spaces per level; siblings in source order
-  (line, then byte, then name: any order of the rows draws the same text). A Rust
+  the repository, also through a symbolic link, and a leading `./` are
+  accepted). A path with `..`, or an absolute one outside the repository, is
+  refused before anything is looked up, with the same message whether it exists
+  or not. `devctx skeleton` reads the path relative to the working directory.
+- The tree follows `parent_id`: two spaces per level; siblings by line, byte, end
+  (the longest first), kind, name and id: any order of the rows draws the same
+  text. A Rust
   `impl` is a member of its type, as the extractor records it, so it is drawn
   under the type even when it is written further down: the range says where.
 - The signature is the stored one (DD-17: the definition up to its body,
-  whitespace collapsed, at most 200 characters) without leading annotations,
-  decorators or attributes, a field's or constant's value, or a final `;`. One
-  the index cut at 200 characters ends in `…`; one cut inside its annotations
-  (no name left) is drawn `kind name …`.
+  whitespace collapsed; its head — after leading annotations, decorators and
+  attributes — at most 200 characters, ending in `…` when cut; the leading
+  annotations that fit whole in 200 more stay in front) shown without those
+  annotations, a field's or constant's value, or a final `;`. An index made
+  before extractor version 21 counted the annotations against the 200: a cut
+  that left an annotation unclosed is drawn `kind name …`.
 - `imports (N): …` names the first 8 distinct targets, by line; the rest are
   counted (`+M more`).
 - Test code is **marked, not hidden**: a `#[cfg(test)]` module and its members
@@ -407,8 +413,9 @@ mod tests [137-264] [test]
   file is what was asked for, so hiding part of it would answer a different
   question.
 - The text stays within `DEVCTX_MAX_OUTPUT_TOKENS` (8000; `0` is no cap; at
-  least 256 is used). Symbols are dropped from the end, in tree order, and the
-  closing line says how many and which lines they cover: `[devctx] N more
+  least 256 is used; when the fixed lines leave no room the imports line shrinks
+  to its count). Symbols are dropped from the end, in tree order, and the
+  closing line says how many and the lowest and highest line they cover: `[devctx] N more
   symbols (lines a-b) did not fit the B-token budget (DEVCTX_MAX_OUTPUT_TOKENS);
   read_file with start_line=a shows them`.
 - A file the index does not hold is an error that says whether it exists on disk
@@ -417,9 +424,15 @@ mod tests [137-264] [test]
   without symbol extraction: SQL, YAML…) is an error that sends to `read_file`.
 - Nothing is read from the file itself: the skeleton is the index's view of the
   last indexed version.
+- What the extractor does not give, the skeleton does not show: TypeScript
+  `namespace` blocks are not symbols (their members come out flat, at the top),
+  TypeScript overload signatures are not extracted (only the implementation),
+  and functions nested in Python functions are extracted but not covered by a
+  fixture of this tool.
 
-There is no 0.9 path: on an index made before 0.10 (or without symbol rows)
-`skeleton` is an error that asks for `devctx index --full`. Over HTTP: `GET
+There is no 0.9 path: on an index made before 0.10 `skeleton` is an error that
+asks for `devctx index --full`; on a current index with no symbols at all (no
+language with symbol extraction) it says so and sends to `read_file`. Over HTTP: `GET
 /skeleton?file=…`; a server older than the tool answers 404, which the client
 turns into "restart it: `devctx serve --stop`". From the shell: `devctx skeleton
 src/api/client.ts`.

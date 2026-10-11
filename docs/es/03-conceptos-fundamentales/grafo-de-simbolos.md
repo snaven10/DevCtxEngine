@@ -395,17 +395,22 @@ mod tests [137-264] [test]
 (`devctx skeleton crates/devctx-store/src/skeleton.rs` sobre este repositorio: 244 tokens para un archivo de 2 406.)
 
 - `file` es una ruta relativa al repo, como la toma `read_file` (se aceptan una
-  ruta absoluta dentro del repositorio y un `./` al principio).
-- El árbol sigue `parent_id`: dos espacios por nivel; los hermanos en orden de
-  fuente (línea, después byte, después nombre: cualquier orden de las filas dibuja
-  el mismo texto). Un `impl` de Rust es miembro de su tipo, como lo registra el
+  ruta absoluta dentro del repositorio, también a través de un enlace simbólico, y
+  un `./` al principio). Una ruta con `..`, o una absoluta fuera del repositorio, se
+  rechaza antes de mirar nada, con el mismo mensaje exista o no. `devctx skeleton`
+  lee la ruta relativa al directorio de trabajo.
+- El árbol sigue `parent_id`: dos espacios por nivel; los hermanos por línea, byte,
+  fin (el más largo primero), kind, nombre e id: cualquier orden de las filas dibuja
+  el mismo texto. Un `impl` de Rust es miembro de su tipo, como lo registra el
   extractor, así que se dibuja bajo el tipo aunque esté escrito más abajo: el rango
   dice dónde.
 - La firma es la guardada (DD-17: la definición hasta su cuerpo, espacios
-  colapsados, a lo sumo 200 caracteres) sin anotaciones, decoradores ni atributos
-  al principio, sin el valor de un campo o constante y sin un `;` final. Una que el
-  índice cortó en 200 caracteres termina en `…`; una cortada dentro de sus
-  anotaciones (sin nombre) se dibuja `kind nombre …`.
+  colapsados; su cabeza —después de anotaciones, decoradores y atributos
+  iniciales— a lo sumo 200 caracteres, con `…` si se cortó; las anotaciones que
+  entran enteras en otros 200 quedan delante) mostrada sin esas anotaciones, sin el
+  valor de un campo o constante y sin un `;` final. Un índice anterior a la versión
+  21 del extractor contaba las anotaciones dentro de los 200: un corte que dejó una
+  anotación sin cerrar se dibuja `kind nombre …`.
 - `imports (N): …` nombra los primeros 8 destinos distintos, por línea; el resto se
   cuenta (`+M more`).
 - El código de test se **marca, no se oculta**: un módulo `#[cfg(test)]` y sus
@@ -413,8 +418,9 @@ mod tests [137-264] [test]
   línea (`test file`). El archivo es lo que se pidió: ocultar parte sería contestar
   otra pregunta.
 - El texto entra en `DEVCTX_MAX_OUTPUT_TOKENS` (8000; `0` es sin tope; se usa al
-  menos 256). Los símbolos se cortan desde el final, en orden de árbol, y la línea
-  de cierre dice cuántos y qué líneas cubren: `[devctx] N more symbols (lines a-b)
+  menos 256; si las líneas fijas no dejan lugar, la de imports se reduce a su
+  cuenta). Los símbolos se cortan desde el final, en orden de árbol, y la línea de
+  cierre dice cuántos y la menor y la mayor línea que cubren: `[devctx] N more symbols (lines a-b)
   did not fit the B-token budget (DEVCTX_MAX_OUTPUT_TOKENS); read_file with
   start_line=a shows them`.
 - Un archivo que el índice no tiene es un error que dice si existe en disco y
@@ -424,9 +430,14 @@ mod tests [137-264] [test]
   `read_file`.
 - No se lee nada del archivo: el skeleton es la vista del índice de la última
   versión indexada.
+- Lo que el extractor no da, el skeleton no lo muestra: los bloques `namespace` de
+  TypeScript no son símbolos (sus miembros salen planos, arriba), las firmas de
+  sobrecarga de TypeScript no se extraen (solo la implementación) y las funciones
+  anidadas en funciones de Python se extraen pero no tienen fixture de esta tool.
 
-No hay camino 0.9: sobre un índice anterior a 0.10 (o sin filas de símbolos)
-`skeleton` es un error que pide `devctx index --full`. Por HTTP: `GET
+No hay camino 0.9: sobre un índice anterior a 0.10 `skeleton` es un error que
+pide `devctx index --full`; sobre un índice vigente sin ningún símbolo (ningún
+lenguaje con extracción de símbolos) lo dice y manda a `read_file`. Por HTTP: `GET
 /skeleton?file=…`; un serve anterior a la tool responde 404, que el cliente
 traduce a "reinicialo: `devctx serve --stop`". Desde la terminal: `devctx skeleton
 src/api/client.ts`.

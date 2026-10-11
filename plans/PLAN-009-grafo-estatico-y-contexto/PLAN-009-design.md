@@ -1162,11 +1162,18 @@ primeros 8 por línea, solo esos se leen), `has_file_rows`, `file_suggestions` /
   `<archivo>: N symbols` (sin número de líneas: el fin del símbolo de archivo es el del parser,
   uno más que la última línea si termina en salto).
 - **Firma mostrada** = `clean_signature` de repo_map (sin anotaciones/decoradores/atributos al
-  principio, sin valor en `field`/`const`) más sin `;` final; `…` si la guardada llegó a 200
-  caracteres y su final se ve; `kind nombre …` si el corte quedó dentro de las anotaciones (la
-  firma no contiene el nombre). La normalización del extractor **no cambia** (sin subir
-  `EXTRACTOR_VERSION`): una anotación Java de más de 200 caracteres sigue comiéndose la firma
-  guardada (también en `repo_map`, que no tiene este resguardo).
+  principio, sin valor en `field`/`const`) más sin `;` final. ~~La normalización del extractor no
+  cambia~~ — **revisión de TASK-014, MAJOR 3:** el extractor (`EXTRACTOR_VERSION` 21,
+  `signature_text`/`leading_annotations`) topa en 200 solo la **cabeza** (lo que sigue a las
+  anotaciones, decoradores y atributos iniciales; literales de cadena no cuentan como
+  paréntesis), con `…` propio cuando la corta (199 + `…`; una de 200 justos queda entera), y deja
+  delante las anotaciones que entran **enteras** en otros 200 (una más larga se omite, nunca se
+  corta): el link pass las lee (`@Data` de Lombok, `link.rs::accessor`; sin ellas fallaba
+  `an_incremental_link_pass_equals_a_full_one`). Firma guardada ≤ 401 caracteres. El id no sale
+  de la firma (disambiguador: tipos de parámetros, `impl_args`, forma de scope), así que no se
+  mueve; el golden no cambió de salida. El resguardo `kind nombre …` queda para índices
+  anteriores: se decide porque la firma mostrada sigue empezando con una anotación sin cerrar
+  (MINOR 3), no por subcadena del nombre.
 - **Tests marcados, no ocultos** (`[test]` por línea; un archivo de test lo dice una vez en la
   cabecera): el archivo es lo que se pidió; `repo_map` los excluye porque elige qué mostrar.
 - **Orden**: preorden del árbol por `parent_id`, hermanos por (línea, byte, fin desc., kind,
@@ -1174,14 +1181,21 @@ primeros 8 por línea, solo esos se leen), `has_file_rows`, `file_suggestions` /
   bajo él aunque esté más abajo; el rango dice dónde. Decoradores de miembros TS no son parte
   del nodo: el rango empieza en el nombre.
 - **Tope**: `DEVCTX_MAX_OUTPUT_TOKENS` (0 = sin tope; mínimo 256), por caracteres exactos
-  (tokens = caracteres / 4), reservando la línea de cierre en su peor caso; se cortan símbolos
+  (tokens = caracteres / 4), reservando la línea de cierre en su peor caso; si las líneas fijas
+  y el cierre no entran, la de imports se reduce a `imports (N)` (o sale); se cortan símbolos
   desde el final en orden de árbol y se nombran (`N more symbols (lines a-b) … read_file with
-  start_line=a`).
+  start_line=a`, `a` = la **menor** línea de lo cortado: revisión, MAJOR 1).
+- **Rutas** (revisión, MAJOR 2): `..` o absoluta fuera del repo → error antes de mirar el disco,
+  mismo mensaje exista o no, sin la ruta del repo; "existe en disco" sobre la ruta canónica dentro
+  de la raíz canónica; una absoluta por un enlace al repo se canonicaliza; el CLI resuelve contra
+  el cwd. `label` (línea `[devctx] skeleton from …`) no viaja por la query: el cliente remoto la
+  antepone (fuera del presupuesto del serve, una línea). Índice vigente sin símbolos: error que
+  manda a `read_file`, no a `--full`.
 - **Archivo no indexado**: sugerencias de las rutas con símbolos de la rama (no `FileIndex`, que
   es de todas las ramas y de `vectors`): cola de ruta, mismo nombre, mismo stem, nombre a pocas
   ediciones, mismo directorio; dice si existe en disco. Indexado sin símbolos (SQL, YAML…):
   error que manda a `read_file`.
-- Medido (TASK-014): 4,9-10,2 % de los tokens del archivo en 13 archivos de 633-4 684 líneas,
+- Medido (TASK-014): 4,9-10,2 % de los tokens del archivo en 12 archivos de 623-4 684 líneas,
   p95 ≤ 26 ms.
 
 ## DD-18 — Selección de miembro de grupo

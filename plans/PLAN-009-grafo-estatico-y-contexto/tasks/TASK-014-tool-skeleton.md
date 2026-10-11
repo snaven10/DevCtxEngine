@@ -62,7 +62,7 @@ como contexto de edición, y la descripción del tool lo dice. Implementa DD-17.
 <!-- Contrato: PLAN-009 §11 -->
 - **Estado final:** `done`. Tests (a)-(e) verdes más fixtures multilínea (anotaciones Java,
   decoradores TS, genéricos largos, Rust con `where`); tokens del skeleton **4,9-10,2 %** del
-  archivo en 13 archivos de 633-4 684 líneas (meta ≤ 15 %); p95 caliente **≤ 26 ms**.
+  archivo en 12 archivos de 623-4 684 líneas (meta ≤ 15 %); p95 caliente **≤ 26 ms**.
 - **Resumen:** tool `skeleton(file)` (MCP, `GET /skeleton?file=…`, `devctx skeleton <archivo>`,
   `Backend` local y remoto con 404 tipado). Lee las filas de `symbols` del archivo (nunca el
   archivo) y dibuja texto: `<archivo>: N symbols`, `imports (N): …` (los primeros 8 por línea;
@@ -186,3 +186,41 @@ como contexto de edición, y la descripción del tool lo dice. Implementa DD-17.
      largo que agrupar por módulo.
   4. legacy-migration (Python) no se midió; Python cubierto solo por fixture. macOS/Windows solo
      por el cross-check de CI (no corrido en esta task).
+- **Revisión (READY WITH CAVEATS) — fixup** sobre `fb29489`, cada punto con su test escrito antes
+  (o mutación con `touch`), visto fallar:
+  - `cbff8ae` fix(parse) — *MAJOR 3*: el extractor topa la cabeza de la firma, no las anotaciones
+    (ver DD-17); `EXTRACTOR_VERSION` 20 → 21, golden regenerado (solo la versión). El
+    disambiguador del id no sale de la firma: confirmado (`params`, `impl_args`, forma), ids sin
+    cambio (el test lo compara). Primera versión quitaba las anotaciones del todo y rompía Lombok
+    (`an_incremental_link_pass_equals_a_full_one`: `@lombok.Data` en la firma de clase lo lee
+    `link.rs::accessor`); por eso se guardan delante las que entran enteras. Test
+    `leading_annotations_do_not_eat_the_signature` (anotación de 240+ con `:-)` dentro de la
+    cadena, decorador TS largo, cabeza cortada con `…`, 200 justos sin `…`, id igual) fallaba
+    con la firma `@Operation(summary = "sss…`; `multi_line_signatures_are_one_line` ahora exige
+    `public void annotated()` en skeleton **y** en `repo_map`.
+  - `583f8c3` fix(skeleton) — *MAJOR 1* `the_closing_line_names_the_lowest_cut_line` (struct A
+    l.10, B l.20, impl A l.300 con 100 métodos, impl B l.600: decía `start_line=3xx`, ahora 20);
+    *MAJOR 2* `a_path_out_of_the_repository_is_refused_without_looking` (`../x`, `web/../../x`,
+    `<raíz>/../x`: mismo mensaje exista o no, sin la raíz) y `symbolic_links_resolve_and_leak_nothing`
+    (absoluta por enlace al repo = misma salida; enlace del repo hacia afuera: sin oráculo);
+    *MINOR 3* en `cut_signatures_are_named` (`get` dentro de `summary="get the order…"`, `id` en
+    `@Path("/{id}…")`); *MINOR 4* `the_imports_line_gives_way_to_the_budget`; *MINOR 5* en el test
+    de enlaces; *MINOR 6* `a_skeleton_path_is_relative_to_the_working_directory` (CLI); NITs:
+    `the_label_is_not_a_wire_parameter` y el label antepuesto en
+    `backend::tests::skeleton_on_an_old_server_says_to_restart_it`; sin `…` falso a 200 justos;
+    índice vigente sin símbolos manda a `read_file` (`an_old_index_asks_for_a_full_reindex`).
+  - Mutaciones (todas detectadas): sin separar anotaciones; sin conservarlas; cortando las
+    largas; sin comillas en `closing_bracket`; sin `…`; cierre con el primero; sin achicar
+    imports; resguardo por subcadena; las dos defensas de `..` juntas (cada una sola alcanza, son
+    redundantes a propósito); "en disco" sin canonicalizar; sin canonicalizar la absoluta por
+    enlace; sin filas → `--full`; `label` deserializable; CLI sin cwd.
+  - *MINOR 7*: documentado en las docs EN/ES (namespaces TS no son símbolos, sobrecargas TS no se
+    extraen, Python anidado sin fixture). *MINOR 8*: eran 12 archivos de **623**-4 684 líneas (la
+    13.ª fila era `skeleton.rs`, 264, fuera de la tabla), corregido aquí, en DD-17 y en el
+    CHANGELOG. *NIT* del orden documentado: corregido en las docs.
+  - No re-medido tras el fixup: la tabla de tokens es de la versión 20 del extractor; con
+    anotaciones conservadas delante y quitadas al mostrar, lo mostrado no cambia salvo en las
+    firmas que antes se cortaban.
+  - Gate: commit 1 — un fallo por carga en `remote::tests::the_autospawn_mark_is_read_from_the_environment`
+    (lee `/proc/<pid>/environ` justo tras el spawn), verde 3/3 al reintentarlo; commit 2 — verde
+    (1 213).

@@ -40,8 +40,9 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   is marked `[test]`, not hidden. Within `DEVCTX_MAX_OUTPUT_TOKENS` (at least
   256), closed by `[devctx] N more symbols (lines a-b)` when cut. `file` is
   repo-relative, as `read_file` takes it; a file the index does not hold is an
-  error naming the nearest indexed paths. Measured on 13 files of 633-4 684 lines
-  in four repositories: 4.9-10.2 % of the file's tokens, p95 ≤ 26 ms. An index
+  error naming the nearest indexed paths, and a path with `..` or outside the
+  repository is refused before anything is looked up. Measured on 12 files of
+  623-4 684 lines in four repositories: 4.9-10.2 % of the file's tokens, p95 ≤ 26 ms. An index
   made before 0.10 is an error that asks for `devctx index --full`; a server
   older than the tool answers 404, which clients report as "restart it".
 
@@ -62,6 +63,14 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   than the tool answers 404, which clients report as "restart it".
 
 ### Changed
+
+- **Signatures: leading annotations no longer count against the 200-character
+  cap** (review of PLAN-009 TASK-014; extractor version 21). A Java annotation
+  or TS decorator longer than the cap used to leave a stored signature with no
+  name (in `repo_map`, `skeleton`, `read_symbol`'s `code` for a field). The head
+  is capped on its own and ends in `…` when cut; the leading annotations that fit
+  whole in another 200 stay in front (the link pass reads `@Data`). The bump
+  rides on the `--full` 0.10 already requires; ids do not change.
 
 - **Reindex reuses vectors by chunk `content_hash`** (PLAN-009 TASK-002): a
   `--full` over unchanged source embeds nothing, loads no model and rebuilds no
