@@ -27,10 +27,12 @@ use serde_json::{json, Value};
 mod impact;
 mod lookup;
 mod repo_map;
+mod skeleton;
 mod traverse;
 
 pub use impact::ImpactQuery;
 pub use repo_map::REPO_MAP_NEEDS_REINDEX;
+pub use skeleton::SKELETON_NEEDS_REINDEX;
 pub use traverse::{TraverseQuery, DEFAULT_TRAVERSE_LIMIT, TRAVERSE_NEEDS_REINDEX};
 
 /// How far an indexing run has got, for anyone who asks while it runs.
@@ -4362,6 +4364,43 @@ pub fn traverse_at(
     .ready()?;
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     traverse::traverse_on(store, &chosen, q, budget)
+}
+
+/// `skeleton` tool (PLAN-009 TASK-014, DD-17): the structure of one file —
+/// its symbols with signature and `[l1-l2]`, nested by container, no bodies —
+/// from the symbol graph, within `DEVCTX_MAX_OUTPUT_TOKENS`; see
+/// [`crate::skeleton`]. A branch without a current symbol graph is an error
+/// that asks for `devctx index --full`; a file the index does not hold, an
+/// error with the nearest indexed paths.
+pub fn do_skeleton(state: &AppState, q: &crate::skeleton::SkeletonQuery) -> Result<String, String> {
+    q.validate()?;
+    let store = state.open_store()?;
+    let chosen = graph_branch(state, &store)?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    skeleton::skeleton_on(&store, &chosen, &state.root, q, budget)
+}
+
+/// [`do_skeleton`] for a caller that holds a store but no [`AppState`] (the
+/// local CLI).
+pub fn skeleton_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    q: &crate::skeleton::SkeletonQuery,
+) -> Result<String, String> {
+    q.validate()?;
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    skeleton::skeleton_on(store, &chosen, root, q, budget)
 }
 
 /// `repo_map` tool (PLAN-009 TASK-011, DD-14): the signatures of the

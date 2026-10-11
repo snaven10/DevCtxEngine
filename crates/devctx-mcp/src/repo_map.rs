@@ -449,15 +449,15 @@ pub fn tokens(text: &str) -> usize {
 /// most [`SIGNATURE_MAX`] characters; `kind name` when there is none.
 fn display_signature(g: &MapGraph, i: usize) -> String {
     let n = &g.nodes[i];
-    let kind = g.kind(i);
-    let mut s = match n
-        .signature
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    clean_signature(n.signature.as_deref(), g.kind(i), &n.name)
+}
+
+/// [`display_signature`] of a stored `signature` of a symbol of `kind`
+/// named `name` (the skeleton shows signatures the same way, TASK-014).
+pub(crate) fn clean_signature(signature: Option<&str>, kind: &str, name: &str) -> String {
+    let mut s = match signature.map(str::trim).filter(|s| !s.is_empty()) {
         Some(sig) => strip_annotations(sig).to_string(),
-        None => format!("{kind} {}", n.name),
+        None => format!("{kind} {name}"),
     };
     if matches!(kind, "field" | "const") {
         if let Some(at) = s.find(" = ") {

@@ -2028,7 +2028,7 @@ pub(crate) fn rank_suggestions(name: &str, cands: Vec<String>, n: usize) -> Vec<
 }
 
 /// Levenshtein distance over chars.
-fn edit_distance(a: &str, b: &str) -> usize {
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();

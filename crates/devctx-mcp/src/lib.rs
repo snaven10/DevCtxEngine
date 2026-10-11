@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod lifecycle;
 pub mod repo_map;
+pub mod skeleton;
 pub mod state;
 
 use std::collections::HashMap;
