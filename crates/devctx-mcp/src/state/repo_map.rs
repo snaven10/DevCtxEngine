@@ -613,6 +613,74 @@ mod bench {
                 println!("{m}");
             }
         }
+        // Review of TASK-011, M2: the focus a file that uses the expected
+        // symbol (a neighbour, not the expected file, no test), no query:
+        // whether what the neighbour uses shows (DD-14).
+        if var("DEVCTX_MAP_BENCH_NEIGHBOR").is_some() {
+            let store = state.open_store().unwrap();
+            let chosen = graph_branch(&state, &store).unwrap();
+            for line in text.lines().map(str::trim) {
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let f: Vec<&str> = line.split('|').map(str::trim).collect();
+                if f.len() < 4 || f[3] != name || f[2] == "-" {
+                    continue;
+                }
+                let expected: Vec<&str> = f[1].split(',').map(str::trim).collect();
+                let in_expected = |file: &str| expected.iter().any(|e| file.contains(e));
+                let roots: Vec<_> = store
+                    .lookup_symbols(&chosen.repo, &chosen.branch, f[2], None, 200)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|s| in_expected(&s.file))
+                    .collect();
+                let opts = devctx_store::TraverseOptions {
+                    kinds: vec!["calls", "instantiates", "references", "imports"],
+                    direction: devctx_store::TraverseDirection::In,
+                    ..Default::default()
+                };
+                let t = store
+                    .traverse(&chosen.repo, &chosen.branch, &roots, &opts)
+                    .unwrap();
+                let mut by_file: std::collections::BTreeMap<String, usize> = Default::default();
+                for n in &t.nodes {
+                    if let Some(file) = n.file.as_deref().filter(|f| !in_expected(f) && !n.test) {
+                        *by_file.entry(file.to_string()).or_default() += 1;
+                    }
+                }
+                let neighbour = by_file
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+                    .map(|(f, _)| f.clone());
+                let Some(neighbour) = neighbour else {
+                    println!("{}", json!({ "neighbour_case": f[2], "neighbour": null }));
+                    continue;
+                };
+                let m = do_repo_map(
+                    &state,
+                    &RepoMapQuery {
+                        focus_files: vec![neighbour.clone()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let files: Vec<&str> = m
+                    .lines()
+                    .filter(|l| !l.starts_with('│') && !l.starts_with('⋮') && !l.starts_with('['))
+                    .collect();
+                let rank = files.iter().position(|l| in_expected(l));
+                println!(
+                    "{}",
+                    json!({ "neighbour_case": f[2], "neighbours": by_file.len(),
+                            "present": rank.is_some(), "file_rank": rank,
+                            "files": files.len(), "tokens": tokens(&m) })
+                );
+                if var("DEVCTX_MAP_BENCH_SHOW").is_some() {
+                    println!("focus: {neighbour}\n{m}");
+                }
+            }
+        }
         let mut ms: Vec<Vec<f64>> = vec![Vec::new(); list.len() + 1];
         let global = RepoMapQuery::default();
         for _ in 0..runs {
