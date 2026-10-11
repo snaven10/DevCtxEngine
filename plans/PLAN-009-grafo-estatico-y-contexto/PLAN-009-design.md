@@ -936,7 +936,11 @@ enums (`RankKind`, `RankConfidence`; el NIT de TASK-010): en backend-a 31 093 fi
 de lectura (p50, 20 corridas) y 80 → 32 bytes por fila; los grupos siguen siendo los de las
 cadenas. Caché en `AppState` por `(repo, rama, generación)` — generación = commit, `indexed_at` y
 conteos del registro del índice —, que se suelta al terminar cualquier `index` y por inactividad
-con la política de los modelos. Medido (Resultado de TASK-011): backend-a 22 801 símbolos, 28 942
+con la política de los modelos (revisión: la generación incluye el contador `index_generation`
+de `index_meta`, que sube todo `index` que termina —el registro tiene resolución de un
+segundo—; el lock tolera el envenenamiento y la adyacencia se arma fuera de él, con doble
+chequeo; un solo slot). Golden bit a bit de `global()` contra los ranks de `b5ddae9`. Medido
+(Resultado de TASK-011): backend-a 22 801 símbolos, 28 942
 pares, ~7,4 MB estimados (RSS +7,6 MB), primera carga 104 ms (lectura y armado) / 132 ms con el
 mapa; caliente p95 34 ms.
 
@@ -1031,8 +1035,10 @@ src/main/java/com/example/app/service/OfficeService.java
   `GET /repo-map` (listas separadas por coma), `devctx map [--budget N] [--focus F]… [--symbol S]…
   [--query Q]`. Sin `project` en la API (el MCP lo resuelve como las demás tools y antepone
   `[devctx] map of <proyecto>`).
-- **×50 de `focus_files`** es masa de personalización (cada símbolo de un archivo de foco pesa 50
-  en `p`; un símbolo nombrado, 10): multiplicar todas las aristas que **salen** de un archivo se
+- **×50 de `focus_files`** es masa de personalización (~~cada símbolo de un archivo de foco pesa
+  50 en `p`; un símbolo nombrado, 10~~ — revisión, M1: **50 por archivo repartido entre sus
+  símbolos y 10 por término repartido entre sus definiciones**; por símbolo, un archivo de 200
+  dejaba al símbolo de la tarea con ~0,05 % de la masa y uno de 300 pesaba 100× uno de 3): multiplicar todas las aristas que **salen** de un archivo se
   cancela en el reparto de cada fuente (igual en Aider). Las aristas **hacia** un símbolo nombrado
   ×10, hacia `_nombre` o un nombre definido en > 5 archivos ×0,1 (ambos solo con foco).
 - Los archivos de foco **no se listan** (el agente los tiene); sí los símbolos nombrados.
@@ -1123,7 +1129,15 @@ omitted_by_limit?, dispatch?, omitted_for_budget?, branch_fallback?}`:
   llamadores, más llamadas sin decidir): `calls` `in` p95 2,2 s, `both` 3,5 s — el dispatch
   multiplica filas (llamadores × implementaciones) y se leen todas; **pasa el presupuesto de DD-21
   (200 ms)** en ese extremo. En backend-a el nombre más definido tiene 111 definiciones (de tests)
-  y uno de código 24: p95 ≤ 107 ms. Queda para TASK-016 (ver Resultado de TASK-013).
+  y uno de código 24: p95 ≤ 107 ms. ~~Queda para TASK-016~~ — **revisión de TASK-011: era un bug
+  de TASK-017**, arreglado: la consulta de equivalentes hacía join de cada método de la frontera
+  con todos los del mismo nombre en todos los tipos del grafo de supertipos (un millón de filas;
+  ahora solo los pares tipo del origen → tipo que alcanza, calculados antes en memoria), y cada
+  llamador de un equivalente se clonaba por cada origen que lo compartía (ahora a lo sumo
+  `DISPATCH_MAX_ORIGINS_PER_EQUIVALENT` = 16; el resto en `omitted_by_limit.dispatch.
+  origins_capped`), más un tope de `DISPATCH_MAX_ROWS` = 8 192 filas de dispatch por llamada
+  (`rows_capped`, y en traverse `total_is_lower_bound`). Sintético después: traverse p95 ≤ 126 ms,
+  impact_analysis p95 98 ms (`get`) y 66 ms (`IGet.get`).
 
 ## DD-17 — Vista `skeleton`
 

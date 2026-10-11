@@ -37,7 +37,8 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   has open, whose uses rank first and which are not listed themselves;
   `focus_symbols`; `query`, whose identifiers count), grouped by file, members
   under their containers, ranked by PageRank personalized to that focus over
-  the same weighted matrix as the global rank (live edges only; test code and
+  the same weighted matrix as the global rank (each focus file and each focus
+  term weighs the same, shared among its symbols; live edges only; test code and
   libraries never appear). Text, closed by `[devctx]` lines that say what the
   focus matched and how many symbols did not fit. The serve caches the
   branch's adjacency per index generation (dropped when an `index` ends and
@@ -417,7 +418,12 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   to pass an even share with a floor), and the edges of nodes past the page
   are not built.
 - Indexing a TypeScript repository no longer panics on a type whose `>` (an
-  arrow's) comes before its first `<`.
+  arrow's) comes before its first `<`; a function type names no class.
+- Dispatch in `impact_analysis` and `traverse`: a supertype method implemented
+  by many of the methods walked no longer costs seconds — the equivalents query
+  reads only the types each origin reaches, a supertype method is attributed to
+  at most 16 origins (`omitted_by_limit.dispatch.origins_capped`; its callers
+  are all reached) and a call builds at most 8 192 dispatch rows (`rows_capped`).
 
 ### Known issues
 

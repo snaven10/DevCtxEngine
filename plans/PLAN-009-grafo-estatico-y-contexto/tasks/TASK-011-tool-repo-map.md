@@ -80,7 +80,8 @@ DD-12 (parte personalizada) y DD-14.
 
 <!-- Contrato: PLAN-009 §11 -->
 - **Estado final:** `done`. Tests (a)-(f) verdes; arnés: archivo esperado en el mapa en **7/7**
-  casos con foco (muestra chica, ver abajo), tokens ≤ 1024 siempre (máx. 996); backend-a: p95
+  casos con foco por identificador (casi tautológico, revisión M2) y en **16/17 con foco por
+  archivo vecino** (la medida de DD-14, abajo en la revisión), tokens ≤ 1024 siempre (máx. 996); backend-a: p95
   caliente 34 ms, primera carga 132 ms, caché ~7,4 MB. Antes, los follow-ups de la segunda
   revisión de TASK-013 (MINOR 1, NITs y la re-medición del MINOR 2, que encontró dos fallos más).
 - **Resumen:** tool nueva `repo_map` (MCP, `GET /repo-map`, `devctx map`, `Backend` local y
@@ -216,3 +217,60 @@ DD-12 (parte personalizada) y DD-14.
   (2) `traverse` sobre un nombre de miles de definiciones con dispatch masivo tarda 2-4 s (Resultado
   de TASK-013): TASK-016. (3) Medir el arnés con foco por archivo (`focus_files` = un archivo
   vecino) da una medida más exigente que la de identificador; queda para TASK-016.
+- **Revisión (APROBADA CON CAMBIOS, sin BLOCKER), resuelta en commits encima de `7c1f4b6`:**
+  - *Patología de traverse (bug de TASK-017)* (`3d84718`): la causa medida (instrumentación
+    temporal, ya quitada) no eran solo las filas clonadas: `override_equivalents` tardaba 1,2 s de
+    1,3 s, porque hacía join de cada método de la frontera con todos los métodos del mismo nombre de
+    todos los tipos del grafo de supertipos (1 001 × 1 001 filas con cadenas) y filtraba por alcance
+    en memoria. Ahora el alcance se calcula antes (por tipo, una vez) y la consulta solo lee los
+    pares (tipo del origen, tipo alcanzado). Además, lo pedido: a lo sumo 16 orígenes por
+    equivalente (`DISPATCH_MAX_ORIGINS_PER_EQUIVALENT`, por id de origen; el resto en
+    `omitted_by_limit.dispatch.origins_capped` + `max_origins`) y un presupuesto de 8 192 filas de
+    dispatch por llamada (`DISPATCH_MAX_ROWS`; `rows_capped` + `max_rows`, y en traverse
+    `total_is_lower_bound`), con las filas del nivel ordenadas antes para que el corte sea
+    determinista. Tests que **fallaban antes**: `an_equivalent_shared_by_many_origins_is_read_once_per_capped_origin`
+    (120 filas de dispatch con 40 implementaciones, tope 64),
+    `the_equivalents_query_reads_only_reachable_types` (con la consulta vieja: 1 600 filas leídas
+    por 40), `capped_dispatch_origins_and_rows_are_said` (JSON, sin campos);
+    `dispatch_rows_have_a_budget_per_call` y `dispatch_origins_are_capped_per_equivalent` se
+    escribieron con la API (verificados **por mutación**: sin `truncate` o sin presupuesto fallan).
+    Tests de TASK-017 y de contrato verdes sin tocarlos. **Sintético** (3 000 `get`, 1 000
+    implementan `IGet`, 300 llamadores; `--release`, 40 corridas × 2 rondas, carga 4-5): traverse
+    `get` `calls` `in` p95 2,2 s → **93-104 ms**, `both` 3,5 s → **115-126 ms**, `IGet.get` 34-40 ms;
+    impact_analysis (tool, `impact_bench`) `get` p95 **98 ms**, `IGet.get` **66 ms** (antes: el arnés
+    no terminó una pasada en 18 min). backend-a: mismos nodos y aristas, p95 ≤ 62 ms (antes ≤ 107).
+  - *M1* (`4746186`): masa de 50 por archivo de foco repartida entre sus símbolos y 10 por término
+    repartida entre sus definiciones. **Fallaban antes**:
+    `a_named_symbol_keeps_its_weight_next_to_a_large_focus_file` (participación del símbolo
+    nombrado 0,05 %; y la de uno junto a un término de 300 definiciones) y
+    `focus_files_weigh_the_same_whatever_their_size` (0,453 contra 0,0045); por mutación, volver a
+    la masa por símbolo (de archivo o de definición) hace fallar cada uno.
+  - *M2* (`0a500ea`, arnés): foco = el archivo que más usa el símbolo esperado (llamadas,
+    instanciaciones, referencias, imports; no el archivo esperado ni tests), sin query; ¿aparece el
+    archivo esperado? DevCtxEngine 3/3 (puestos 1, 3, 8 de 18-32 archivos), backend-a 6/7 (puestos 1,
+    1, 1, 1, 4, 7, 7; el que falta no entra en 22 archivos), backend-b 1/1, frontend 6/6 (puestos 1,
+    2, 2, 4, 7 y 29 de 30): **16/17 = 94 %** (meta ≥ 70 %). 3 casos sin vecino (nadie usa el
+    símbolo fuera de su archivo) no cuentan. Tokens ≤ 1 024. Los de identificador siguen 7/7.
+  - *m1* (`686eea2`): golden bit a bit de `global()`: dos grafos de 6 nodos con los `to_bits` del
+    `pagerank_run` de `b5ddae9` (compilado aparte en el sandbox) y un FNV de los 40 ranks del grafo
+    de `the_ranks_are_deterministic`. Por mutación (reasociar la suma o el término base) falla el
+    hash de 40 nodos; los de 6 nodos solos no lo detectaban.
+  - *m3* (`9b0ae7c`): lock con `PoisonError::into_inner` y la carga fuera del lock con doble
+    chequeo. `a_poisoned_cache_still_answers` **fallaba antes** (PoisonError).
+  - *m5* (`4746186`): el test (a) exige `≤ effective`; pasó (el contrato ya se cumplía).
+  - *m2* (`9b0ae7c`): contador `index_generation` en `index_meta`, que sube todo `index` que
+    termina; la generación de la caché lo incluye. `a_run_in_the_same_second_is_another_generation`
+    (verificado por mutación: sin el contador en la clave y sin la suba, falla).
+  - *m6* (`9b0ae7c`): `RepoMapQuery.label` (también `label` en `GET /repo-map`) lleva el
+    `[devctx] map of <proyecto>` del MCP dentro del presupuesto (`the_label_counts_in_the_budget`,
+    por mutación).
+  - *m4*: documentado (un slot; LRU si TASK-016 lo ve).
+  - *NITs:* `TypeText::parse` de un tipo función da `None` (`c20e57d`, test que **fallaba antes**);
+    variable sin usar del test (e) quitada; comas en rutas y `│`/`⋮` documentados como límites.
+  - *Gate:* fmt, clippy con y sin `--features gpu` y `cargo test --workspace --locked
+    --no-fail-fast` antes de cada commit de código: 1 178, 1 180, 1 183, 1 184 y 1 184 pasan.
+    Flakes de carga (load 16-18 por trabajo ajeno), verdes al repetir:
+    `procown::a_checkpoint_that_ends_inside_the_term_wait_still_earns_the_margin`,
+    `remote::the_autospawn_mark_is_read_from_the_environment`,
+    `serve_lifecycle::an_idle_server_exits_after_its_window`.
+

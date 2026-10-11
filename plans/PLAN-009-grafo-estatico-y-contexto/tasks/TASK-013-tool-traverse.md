@@ -288,4 +288,7 @@ paginación y conteo de omitidos. Inspirada en TraverseGraph de LocAgent. Implem
     extremo**: el costo es leer las filas de dispatch (llamadores × implementaciones: ~300 000) y
     las de las 3 000 raíces; reducirlo pide deduplicar por llamador en SQL. Queda para TASK-016
     (no se observó en los repos medidos).
+  - *Revisión de TASK-011 (la patología era un bug de TASK-017):* ver el Resultado de TASK-011
+    (`3d84718`). Sintético: `get` `calls` `in` p95 2,2 s → 93-104 ms, `both` 3,5 s → 115-126 ms;
+    backend-a sin cambios en los nodos y p95 ≤ 62 ms.
 

@@ -171,7 +171,13 @@ whose simple parameter types match exactly wins. The chain of supertypes is foll
 (`ServiceImpl` → `BaseService` → `IService` → its super-interface); an
 override-equivalent method further away is counted in
 `omitted_by_limit.dispatch` (its `count`, and apart in `beyond_depth`, with
-`max_depth: 4`), not followed. Such a node
+`max_depth: 4`), not followed. A supertype method that many of the methods
+walked implement (an interface with a thousand implementations, all of them
+roots) is attributed to at most 16 of them: its callers are all reached, and the
+pairs left unattributed are counted in `omitted_by_limit.dispatch.origins_capped`
+(with `max_origins`); a call builds at most 8 192 dispatch rows, the rest counted
+in `rows_capped` (with `max_rows`; `traverse` then says `total_is_lower_bound`).
+Such a node
 has `via: "dispatch"` and `through` (the method it went through), and its
 confidence is `min(medium, the edge it stands for)` — never `high`, and a `low`
 call stays `low` (counted in `below_confidence` by default). To leave dispatch
@@ -300,8 +306,9 @@ It is for orientation at the start of a task; to read code use `read_symbol` or
 
 How it ranks (DD-12, DD-14): without a focus, by the global rank the link pass
 writes (`symbols.rank`). With one, the same matrix is ranked again, personalized:
-every symbol of a focus file weighs 50 in the personalization vector, a symbol
-named in `focus_symbols` or `query` weighs 10 and the edges into it count ×10;
+every focus file weighs 50 in the personalization vector, shared among its
+symbols, every term of `focus_symbols` or `query` weighs 10, shared among its
+definitions, and the edges into a named symbol count ×10;
 edges into a `_name` or into a name defined in more than five files count ×0.1.
 Only live edges count (a call the link pass discarded lends nothing). Test code
 (a test file, or `#[cfg(test)]` code) and libraries never appear, nor do file
@@ -340,7 +347,12 @@ globally central code, which says little: give one.
 The serve keeps the branch's adjacency in memory, per index generation, so a
 map costs a personalized PageRank and a render; it is read again after every
 `index` and released when unused as long as a model would be
-(`DEVCTX_MODEL_IDLE_SECS`). `status` reports it under `memory.repo_map`.
+(`DEVCTX_MODEL_IDLE_SECS`). `status` reports it under `memory.repo_map`. It
+holds one branch: maps of two branches asked in turn rebuild it each time.
+Lists in `GET /repo-map` and `devctx map --focus/--symbol` are comma-separated,
+so a path with a comma can only be passed through the MCP tool. Tokens are
+estimated as characters / 4 like everywhere else; the `│` and `⋮` of the layout
+may cost a real tokenizer more than that.
 
 There is no 0.9 path: on an index made before 0.10 (or without symbol rows)
 `repo_map` is an error that asks for `devctx index --full`. Over HTTP: `GET

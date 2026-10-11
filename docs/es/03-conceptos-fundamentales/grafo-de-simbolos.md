@@ -177,7 +177,13 @@ un supertipo gana la que coincide exacto en los tipos simples de sus parámetros
 hasta cuatro niveles (`ServiceImpl` → `BaseService` → `IService` → su
 super-interfaz); un método override-equivalente más lejos se cuenta en
 `omitted_by_limit.dispatch` (en su `count`, y aparte en `beyond_depth`, con
-`max_depth: 4`), sin seguirlo. Ese nodo lleva `via: "dispatch"` y `through` (el método por el que
+`max_depth: 4`), sin seguirlo. Un método de supertipo que implementan muchos de
+los métodos recorridos (una interfaz con mil implementaciones, todas raíces) se
+atribuye a lo sumo a 16 de ellos: sus llamadores se alcanzan todos, y los pares sin
+atribuir se cuentan en `omitted_by_limit.dispatch.origins_capped` (con
+`max_origins`); una llamada arma como mucho 8 192 filas de dispatch, y el resto se
+cuenta en `rows_capped` (con `max_rows`; `traverse` dice entonces
+`total_is_lower_bound`). Ese nodo lleva `via: "dispatch"` y `through` (el método por el que
 pasó), y su confianza es `min(medium, la arista que representa)`: nunca `high`, y
 una llamada `low` sigue `low` (contada en `below_confidence` por defecto). Para
 dejar el dispatch afuera: `dispatch: false` (`--no-dispatch`, `?dispatch=false`), o
@@ -305,9 +311,9 @@ contenedores. Sirve para orientarse al empezar una tarea; para leer código est�
 
 Cómo rankea (DD-12, DD-14): sin foco, por el rank global que escribe el link pass
 (`symbols.rank`). Con foco, la misma matriz se rankea de nuevo, personalizada:
-cada símbolo de un archivo de foco pesa 50 en el vector de personalización, un
-símbolo nombrado en `focus_symbols` o en `query` pesa 10 y las aristas hacia él
-cuentan ×10; las aristas hacia un `_nombre` o hacia un nombre definido en más de
+cada archivo de foco pesa 50 en el vector de personalización, repartido entre sus
+símbolos, cada término de `focus_symbols` o de `query` pesa 10, repartido entre
+sus definiciones, y las aristas hacia un símbolo nombrado cuentan ×10; las aristas hacia un `_nombre` o hacia un nombre definido en más de
 cinco archivos cuentan ×0,1. Solo cuentan las aristas vivas (una llamada que el
 link pass descartó no aporta nada). El código de test (un archivo de test, o
 código `#[cfg(test)]`) y las librerías nunca aparecen, ni los símbolos de
@@ -346,7 +352,12 @@ global, que dice poco: dale un foco.
 El serve guarda la adyacencia de la rama en memoria, por generación del índice:
 un mapa cuesta un PageRank personalizado y el render; se vuelve a leer tras cada
 `index` y se suelta cuando no se usa, igual que un modelo
-(`DEVCTX_MODEL_IDLE_SECS`). `status` la reporta en `memory.repo_map`.
+(`DEVCTX_MODEL_IDLE_SECS`). `status` la reporta en `memory.repo_map`. Guarda
+una rama: mapas de dos ramas pedidos por turno la rearman cada vez. Las listas de
+`GET /repo-map` y de `devctx map --focus/--symbol` van separadas por coma, así que
+una ruta con coma solo se puede pasar por la tool MCP. Los tokens se estiman como
+caracteres / 4, como en todo el producto; los `│` y `⋮` del dibujo pueden costarle
+más a un tokenizador real.
 
 No hay camino 0.9: sobre un índice anterior a 0.10 (o sin filas de símbolos)
 `repo_map` es un error que pide `devctx index --full`. Por HTTP: `GET
