@@ -30,6 +30,21 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   (`undecided_calls`) or, with `min_confidence: "low"`, listed at depth 1; with
   `partial`, `total_is_lower_bound: true`.
 
+- **`skeleton`** (PLAN-009 TASK-014): a new tool (MCP, `GET /skeleton?file=…`,
+  `devctx skeleton <file>`) that answers the structure of one file to locate
+  where something is: its symbols with their signatures and line ranges
+  `[l1-l2]`, nested by container (`parent_id`), without bodies, and its imports
+  in one line (`imports (N): …`, the first 8). Read from the symbol graph, never
+  from the file; signatures cleaned as in `repo_map` (no leading annotations, no
+  value, no final `;`), `…` when the index cut one at 200 characters. Test code
+  is marked `[test]`, not hidden. Within `DEVCTX_MAX_OUTPUT_TOKENS` (at least
+  256), closed by `[devctx] N more symbols (lines a-b)` when cut. `file` is
+  repo-relative, as `read_file` takes it; a file the index does not hold is an
+  error naming the nearest indexed paths. Measured on 13 files of 633-4 684 lines
+  in four repositories: 4.9-10.2 % of the file's tokens, p95 ≤ 26 ms. An index
+  made before 0.10 is an error that asks for `devctx index --full`; a server
+  older than the tool answers 404, which clients report as "restart it".
+
 - **`repo_map`** (PLAN-009 TASK-011): a new tool (MCP, `GET /repo-map`,
   `devctx map`) that answers, in about a thousand tokens (`budget`, default
   1024), a map of the repository to orient an agent: the signatures — never

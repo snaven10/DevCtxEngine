@@ -1151,6 +1151,39 @@ definición hasta antes del cuerpo (`{`, `:` en Python, `=>`/`{` en arrow), cola
 tope de 200 caracteres. La doc aclara que sirve para **localizar**, no como contexto de edición
 (evidencia en el master §2).
 
+**Implementado en TASK-014, con estas diferencias:** `crates/devctx-mcp/src/skeleton.rs`
+(`SkeletonQuery`, `render`; puro) y `state/skeleton.rs` (`skeleton_on`, `repo_relative`),
+`do_skeleton`/`skeleton_at`, `Backend::skeleton` (404 tipado: `SKELETON_OLD_SERVER`),
+`GET /skeleton?file=…`, `devctx skeleton <archivo>`; en el store `file_imports` (cantidad y los
+primeros 8 por línea, solo esos se leen), `has_file_rows`, `file_suggestions` /
+`rank_file_suggestions`.
+- **Sin `kind` en cada línea**: la firma ya es la declaración (`public class`, `pub fn`); el
+  `kind` aparece solo sin firma o cuando el corte dejó sin nombre (`method list …`). Cabecera
+  `<archivo>: N symbols` (sin número de líneas: el fin del símbolo de archivo es el del parser,
+  uno más que la última línea si termina en salto).
+- **Firma mostrada** = `clean_signature` de repo_map (sin anotaciones/decoradores/atributos al
+  principio, sin valor en `field`/`const`) más sin `;` final; `…` si la guardada llegó a 200
+  caracteres y su final se ve; `kind nombre …` si el corte quedó dentro de las anotaciones (la
+  firma no contiene el nombre). La normalización del extractor **no cambia** (sin subir
+  `EXTRACTOR_VERSION`): una anotación Java de más de 200 caracteres sigue comiéndose la firma
+  guardada (también en `repo_map`, que no tiene este resguardo).
+- **Tests marcados, no ocultos** (`[test]` por línea; un archivo de test lo dice una vez en la
+  cabecera): el archivo es lo que se pidió; `repo_map` los excluye porque elige qué mostrar.
+- **Orden**: preorden del árbol por `parent_id`, hermanos por (línea, byte, fin desc., kind,
+  nombre, id). Un `impl` de Rust es hijo de su tipo (lo decide el extractor), así que se dibuja
+  bajo él aunque esté más abajo; el rango dice dónde. Decoradores de miembros TS no son parte
+  del nodo: el rango empieza en el nombre.
+- **Tope**: `DEVCTX_MAX_OUTPUT_TOKENS` (0 = sin tope; mínimo 256), por caracteres exactos
+  (tokens = caracteres / 4), reservando la línea de cierre en su peor caso; se cortan símbolos
+  desde el final en orden de árbol y se nombran (`N more symbols (lines a-b) … read_file with
+  start_line=a`).
+- **Archivo no indexado**: sugerencias de las rutas con símbolos de la rama (no `FileIndex`, que
+  es de todas las ramas y de `vectors`): cola de ruta, mismo nombre, mismo stem, nombre a pocas
+  ediciones, mismo directorio; dice si existe en disco. Indexado sin símbolos (SQL, YAML…):
+  error que manda a `read_file`.
+- Medido (TASK-014): 4,9-10,2 % de los tokens del archivo en 13 archivos de 633-4 684 líneas,
+  p95 ≤ 26 ms.
+
 ## DD-18 — Selección de miembro de grupo
 
 Hoy `build_context` de grupo puntúa miembros por cosenos crudos y desempata con

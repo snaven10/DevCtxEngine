@@ -361,6 +361,69 @@ comma-separated); a server older than the tool answers 404, which the client
 turns into "restart it: `devctx serve --stop`". From the shell: `devctx map
 --focus src/api/client.ts --symbol OrderService.place --query "…" --budget 1500`.
 
+### `skeleton(file)` — the structure of one file
+
+The symbols of one file — classes, methods, functions, fields — with their
+signatures and line ranges, nested by container, without bodies, and its imports
+in one line. It is for **locating** where something is, at a fraction of the
+file's tokens; it is not the code: to edit, read it with `read_symbol` or
+`read_file` (a line range from the skeleton).
+
+```
+crates/devctx-store/src/skeleton.rs: 13 symbols
+imports (6): duckdb::params, crate::error::Result, crate::store::Store, super::*, crate::StoredSymbol, crate::StoredSymbolEdge
+pub struct FileImports [13-18]
+  pub total: usize [15-15]
+  pub first: Vec<String> [17-17]
+impl Store [20-82]
+  pub fn file_imports(&self, repo: &str, branch: &str, file: &str, limit: usize) -> Result<FileImports> [24-51]
+  pub fn has_file_rows(&self, repo: &str, branch: &str, file: &str) -> Result<bool> [55-63]
+  pub fn file_suggestions(&self, repo: &str, branch: &str, asked: &str, n: usize) -> Result<Vec<String>> [67-81]
+pub fn rank_file_suggestions(asked: &str, files: &[String], n: usize) -> Vec<String> [92-134]
+mod tests [137-264] [test]
+  fn files(v: &[&str]) -> Vec<String> [141-143] [test]
+  fn suggestions_rank_tail_then_name_then_near_miss() [148-193] [test]
+  fn file_sym(file: &str) -> StoredSymbol [195-207] [test]
+  fn imports_are_counted_and_only_the_first_read() [212-263] [test]
+```
+
+(`devctx skeleton crates/devctx-store/src/skeleton.rs` on this repository: 244 tokens for a file of 2 406.)
+
+- `file` is a repo-relative path, as `read_file` takes it (an absolute path inside
+  the repository and a leading `./` are accepted).
+- The tree follows `parent_id`: two spaces per level; siblings in source order
+  (line, then byte, then name: any order of the rows draws the same text). A Rust
+  `impl` is a member of its type, as the extractor records it, so it is drawn
+  under the type even when it is written further down: the range says where.
+- The signature is the stored one (DD-17: the definition up to its body,
+  whitespace collapsed, at most 200 characters) without leading annotations,
+  decorators or attributes, a field's or constant's value, or a final `;`. One
+  the index cut at 200 characters ends in `…`; one cut inside its annotations
+  (no name left) is drawn `kind name …`.
+- `imports (N): …` names the first 8 distinct targets, by line; the rest are
+  counted (`+M more`).
+- Test code is **marked, not hidden**: a `#[cfg(test)]` module and its members
+  end in `[test]`, and a test file says `test file` once in its first line. The
+  file is what was asked for, so hiding part of it would answer a different
+  question.
+- The text stays within `DEVCTX_MAX_OUTPUT_TOKENS` (8000; `0` is no cap; at
+  least 256 is used). Symbols are dropped from the end, in tree order, and the
+  closing line says how many and which lines they cover: `[devctx] N more
+  symbols (lines a-b) did not fit the B-token budget (DEVCTX_MAX_OUTPUT_TOKENS);
+  read_file with start_line=a shows them`.
+- A file the index does not hold is an error that says whether it exists on disk
+  and names the nearest indexed paths (the same path tail, the same file name,
+  a near miss of it, the same directory). A file indexed as text (a language
+  without symbol extraction: SQL, YAML…) is an error that sends to `read_file`.
+- Nothing is read from the file itself: the skeleton is the index's view of the
+  last indexed version.
+
+There is no 0.9 path: on an index made before 0.10 (or without symbol rows)
+`skeleton` is an error that asks for `devctx index --full`. Over HTTP: `GET
+/skeleton?file=…`; a server older than the tool answers 404, which the client
+turns into "restart it: `devctx serve --stop`". From the shell: `devctx skeleton
+src/api/client.ts`.
+
 ### `read_symbol(name)` — the definition
 
 Code, file, line range and kind. Use this when you know the name and want the

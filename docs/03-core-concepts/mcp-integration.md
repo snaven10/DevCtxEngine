@@ -153,7 +153,7 @@ and delete the file).
 
 ## The tools
 
-26 tools, grouped by what they answer.
+27 tools, grouped by what they answer.
 
 ### Code
 
@@ -166,6 +166,7 @@ and delete the file).
 | `impact_analysis` | Transitive callers (blast radius) and callees, by depth, each with `confidence` and `via`; by default high/medium calls only, no tests, no library callees, 200 per direction — what that leaves out is counted; calls through an interface, abstract class or trait are followed as `via: "dispatch"` (never `high`). `min_confidence`, `include_tests`, `include_external`, `max_nodes`, `dispatch` (see [Symbol graph](symbol-graph.md#impact_analysissymbol--blast-radius)) |
 | `traverse` | Walk the symbol graph hop by hop from a symbol: `kinds` (calls, instantiates, imports, inherits, implements, contains, references), `direction` in/out/both, `depth` 1-4; nodes with `sym` and the edges that reached them, paged (`limit`, `offset`, `next_offset`, `omitted`), with the filters of `impact_analysis` (see [Symbol graph](symbol-graph.md#traversesymbol--walk-the-graph-yourself)) |
 | `repo_map` | A map of the repository to orient yourself: the signatures (no bodies) most relevant to `focus_files`, `focus_symbols` or `query`, grouped by file, ranked by personalized PageRank, within `budget` tokens (1024); text (see [Symbol graph](symbol-graph.md#repo_map--a-map-to-orient-yourself)) |
+| `skeleton` | The structure of one file to locate where something is: its symbols with signatures and `[l1-l2]`, nested, no bodies, imports in one line; within `DEVCTX_MAX_OUTPUT_TOKENS`; text (see [Symbol graph](symbol-graph.md#skeletonfile--the-structure-of-one-file)). To edit, `read_symbol` / `read_file` |
 | `summarize` | Text down to roughly `max_tokens`, extractive by default so identifiers survive |
 
 The distinction between `search` and `read_symbol` is worth internalising:

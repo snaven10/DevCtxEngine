@@ -366,6 +366,71 @@ por coma); un servidor más viejo que la tool responde 404, y el cliente lo
 traduce a "reinicialo: `devctx serve --stop`". Desde la terminal: `devctx map
 --focus src/api/client.ts --symbol OrderService.place --query "…" --budget 1500`.
 
+### `skeleton(archivo)` — la estructura de un archivo
+
+Los símbolos de un archivo — clases, métodos, funciones, campos — con su firma y
+su rango de líneas, anidados por contenedor, sin cuerpos, y sus imports en una
+línea. Sirve para **ubicar** dónde está algo, por una fracción de los tokens del
+archivo; no es el código: para editar, leelo con `read_symbol` o `read_file` (un
+rango de líneas del skeleton).
+
+```
+crates/devctx-store/src/skeleton.rs: 13 symbols
+imports (6): duckdb::params, crate::error::Result, crate::store::Store, super::*, crate::StoredSymbol, crate::StoredSymbolEdge
+pub struct FileImports [13-18]
+  pub total: usize [15-15]
+  pub first: Vec<String> [17-17]
+impl Store [20-82]
+  pub fn file_imports(&self, repo: &str, branch: &str, file: &str, limit: usize) -> Result<FileImports> [24-51]
+  pub fn has_file_rows(&self, repo: &str, branch: &str, file: &str) -> Result<bool> [55-63]
+  pub fn file_suggestions(&self, repo: &str, branch: &str, asked: &str, n: usize) -> Result<Vec<String>> [67-81]
+pub fn rank_file_suggestions(asked: &str, files: &[String], n: usize) -> Vec<String> [92-134]
+mod tests [137-264] [test]
+  fn files(v: &[&str]) -> Vec<String> [141-143] [test]
+  fn suggestions_rank_tail_then_name_then_near_miss() [148-193] [test]
+  fn file_sym(file: &str) -> StoredSymbol [195-207] [test]
+  fn imports_are_counted_and_only_the_first_read() [212-263] [test]
+```
+
+(`devctx skeleton crates/devctx-store/src/skeleton.rs` sobre este repositorio: 244 tokens para un archivo de 2 406.)
+
+- `file` es una ruta relativa al repo, como la toma `read_file` (se aceptan una
+  ruta absoluta dentro del repositorio y un `./` al principio).
+- El árbol sigue `parent_id`: dos espacios por nivel; los hermanos en orden de
+  fuente (línea, después byte, después nombre: cualquier orden de las filas dibuja
+  el mismo texto). Un `impl` de Rust es miembro de su tipo, como lo registra el
+  extractor, así que se dibuja bajo el tipo aunque esté escrito más abajo: el rango
+  dice dónde.
+- La firma es la guardada (DD-17: la definición hasta su cuerpo, espacios
+  colapsados, a lo sumo 200 caracteres) sin anotaciones, decoradores ni atributos
+  al principio, sin el valor de un campo o constante y sin un `;` final. Una que el
+  índice cortó en 200 caracteres termina en `…`; una cortada dentro de sus
+  anotaciones (sin nombre) se dibuja `kind nombre …`.
+- `imports (N): …` nombra los primeros 8 destinos distintos, por línea; el resto se
+  cuenta (`+M more`).
+- El código de test se **marca, no se oculta**: un módulo `#[cfg(test)]` y sus
+  miembros terminan en `[test]`, y un archivo de test lo dice una vez en su primera
+  línea (`test file`). El archivo es lo que se pidió: ocultar parte sería contestar
+  otra pregunta.
+- El texto entra en `DEVCTX_MAX_OUTPUT_TOKENS` (8000; `0` es sin tope; se usa al
+  menos 256). Los símbolos se cortan desde el final, en orden de árbol, y la línea
+  de cierre dice cuántos y qué líneas cubren: `[devctx] N more symbols (lines a-b)
+  did not fit the B-token budget (DEVCTX_MAX_OUTPUT_TOKENS); read_file with
+  start_line=a shows them`.
+- Un archivo que el índice no tiene es un error que dice si existe en disco y
+  nombra las rutas indexadas más cercanas (la misma cola de ruta, el mismo nombre de
+  archivo, uno parecido, el mismo directorio). Un archivo indexado como texto (un
+  lenguaje sin extracción de símbolos: SQL, YAML…) es un error que manda a
+  `read_file`.
+- No se lee nada del archivo: el skeleton es la vista del índice de la última
+  versión indexada.
+
+No hay camino 0.9: sobre un índice anterior a 0.10 (o sin filas de símbolos)
+`skeleton` es un error que pide `devctx index --full`. Por HTTP: `GET
+/skeleton?file=…`; un serve anterior a la tool responde 404, que el cliente
+traduce a "reinicialo: `devctx serve --stop`". Desde la terminal: `devctx skeleton
+src/api/client.ts`.
+
 ### `read_symbol(nombre)` — la definición
 
 Código, archivo, rango de líneas y tipo. Usalo cuando sabés el nombre y querés
