@@ -12,6 +12,8 @@ publicado 0.8.5 (y de lo que haya en `main` de PLAN-008 P1 en ese momento). Rama
 **Origen:** investigación verificada de consumo de memoria del 2026-10-05 (devctx 0.8.4, máquina
 con `nproc=20`, WSL2), medida con `/proc/<pid>/status` sobre el central y 14 serves vivos.
 **Release:** `0.11.0` (Q-4, decidido 2026-10-06): se ejecuta completo DESPUÉS de PLAN-009 (`0.10.0`).
+**Ampliación (2026-10-11):** bloque de calidad de búsqueda sin cambiar el modelo de embeddings
+(TASK-013…020, §2.1, DD-11…DD-17), por decisión del usuario.
 
 Todas las referencias `archivo:línea` son contra `main` = v0.8.4 (`47eea79`). El hotfix 0.8.5 mueve
 líneas de `devctx-embed/src/local.rs`, `devctx-central/src/lib.rs` y `devctx-api/src/central.rs`:
@@ -43,6 +45,10 @@ Este plan ataca lo estructural:
    verificación de que el `SET` se aplicó).
 5. **Opcional:** un modo `embeddings.provider: central` donde los serves piden embeddings al central
    en vez de cargar el modelo, evaluado con números después del reemplazo.
+6. **Calidad de búsqueda sin cambiar el modelo** (agregado 2026-10-11, TASK-013…020): huella de
+   embeddings completa, set de evaluación con poder estadístico en español, FTS que entienda español
+   e identificadores, consulta bilingüe, Granite con el pooling con que fue entrenado (CLS) y un
+   reranker elegido con evidencia. Ver §2.1.
 
 ### 1.1 Números medidos (2026-10-05, devctx 0.8.4, `/proc/<pid>/status`)
 
@@ -133,6 +139,30 @@ de procesos `devctx mcp` anteriores (binario `(deleted)`), que no tienen ese có
 TASK-017 no los menciona, y no hace falta: desaparecen al cerrar esas sesiones. TASK-001 confirma
 la versión del padre de cada zombie; si alguno cuelga de un binario ≥ 0.8.3, se abre bug aparte.
 
+### 2.1 Hallazgos de calidad de búsqueda (verificado 2026-10-11, rama `feat/plan-009-grafo`)
+
+- **Q-H1 — pooling equivocado.** `crates/devctx-embed/src/local.rs:252` carga los user-defined con
+  `.with_pooling(Pooling::Mean)`; el `1_Pooling/config.json` de `granite-embedding-97m-multilingual-r2`
+  dice `pooling_mode_cls_token: true` (leído en HF). Igual en `ml-granite-lg` (hallazgo del usuario).
+- **Q-H2 — `max_length`.** `with_max_length` solo se aplica a builtins (`local.rs:201`); los
+  user-defined quedan en el 512 de fastembed, aunque Granite declara `model_max_length: 32768`.
+  Los chunks de > ~512 tokens pierden la cola sin aviso (con `DEVCTX_EMBED_MAX_CHARS` 4096).
+- **Q-H3 — FTS solo en inglés.** `crates/devctx-store/src/store.rs:520`:
+  `create_fts_index('vectors','id','text', overwrite=1)` → porter + 571 stopwords en inglés, y
+  `lower` antes de `ignore` funde `camelCase` en un token. **Hipótesis sin verificar** de por qué el
+  híbrido rinde peor en español (Hit@5 6/13 contra 8/13 vectorial, PLAN-009 TASK-001).
+- **Q-H4 — huella incompleta.** `embedding_fingerprint` (`crates/devctx-embed/src/lib.rs:106`) no
+  incluye pooling, `max_length` ni el ONNX; las memorias no tienen huella (el central solo rechaza
+  cambios de **dimensión**), y `memories import` reusa vectores por modelo+ancho. Corregir Q-H1/Q-H2
+  sin esto mezcla espacios en silencio.
+- **Q-H5 — reranker.** El configurado por el usuario (`bge-reranker-v2-m3`, 568M) tarda ~180 s por
+  búsqueda a pool 100 en CPU. Con un recuperador denso fuerte, v2-m3 saca 41.38 en MTEB-Code contra
+  75.41 del propio recuperador (tabla de la tarjeta de Qwen3-Reranker): en código un reranker puede
+  empeorar el orden, como ya vimos (ADR-15). Además, nuestra latencia luce 6-9× peor que la publicada
+  para modelos equivalentes en CPU (sospecha: `par_chunks` × `intra_threads` en el reranker de
+  fastembed, que 0.8.5 no serializó). Detalle y candidatos en TASK-018.
+- **Q-H6 — set de evaluación chico.** 13 casos en español: cada uno vale ~8 pp y el ruido es ±1.
+
 ## 3. Decisiones
 
 Resumen; el detalle y los tradeoffs están en [`PLAN-010-design.md`](./PLAN-010-design.md).
@@ -149,6 +179,14 @@ Resumen; el detalle y los tradeoffs están en [`PLAN-010-design.md`](./PLAN-010-
 | DD-8 | `embeddings.provider: central` opt-in, apagado por defecto; sin embeber bajo el mutex; versión y modelo en cada respuesta |
 | DD-9 | Opción B (un solo proceso multi-proyecto) **descartada** |
 | DD-10 | Instrumentación permanente (no un script de un día): bloque `memory` en `status` |
+| DD-11 | Huella de embeddings v2 (pooling, `max_length`, hash del ONNX) para índices **y memorias**; migración v1→v2 sin re-embeber si el setup no cambió; el motor propio hereda la clase numérica de fastembed solo si pasa DD-3 |
+| DD-12 | Set de evaluación ≥ 40 ES / ≥ 30 EN + recall, escrito antes de medir; umbrales: ES Hit@5 ≥ +10 pp o MRR ≥ +0.05 (IC 90 % sin cruzar 0), EN ≤ −1 caso, brief y recall sin regresión, indexado ≤ +20 % |
+| DD-13 | FTS: verificar la hipótesis del español antes de cambiar; stemmer/stopwords configurables y partido de identificadores en una tabla auxiliar; cambiarlo reconstruye solo el FTS |
+| DD-14 | Consulta bilingüe: `queries[]` opcional con fusión, método elegido por medición (RRF, promedio de vectores o llamadas del cliente) |
+| DD-15 | Granite con CLS y `max_length` medido, como **cambio declarado** después del motor propio; el pooling efectivo se fija al de la huella guardada hasta una migración explícita (nada se re-embebe solo) |
+| DD-16 | Reranker: finalistas `mmarco-mMiniLMv2-L12-H384-v1` y `gte-multilingual-reranker-base`, elegidos contra "sin rerank" con candidatos congelados; sin rerankers LLM mientras la inferencia sea solo CPU; nada NC ni gated |
+| DD-17 | Adaptador lineal de consulta **pospuesto**: es un fine-tuning chico y no hay datos de entrenamiento separados del set de evaluación |
+| DD-18 | Orden del bloque de calidad: huella y set primero; FTS, `queries` y medición del reranker en paralelo; pooling tras TASK-007 y reranker nuevo tras TASK-005; una sola migración de vectores, con aprobación |
 
 ## 4. Fuera de alcance
 
@@ -156,10 +194,18 @@ Resumen; el detalle y los tradeoffs están en [`PLAN-010-design.md`](./PLAN-010-
   comentario de `central.rs`). Este plan parte de ahí.
 - **Opción B**: un único proceso workspace con todos los proyectos. Descartada con el usuario
   (DD-9): rehace el ciclo de vida que PLAN-008 acaba de estabilizar.
-- **Cambiar de modelo** (otro embedder, cuantización distinta, dimensiones distintas) o de reranker.
-- **Cambiar `max_length` por defecto** (DD-4: se hace configurable, el default queda en 512).
+- **Cambiar de modelo de embeddings** (otro embedder, cuantización distinta, dimensiones distintas):
+  sigue `ml-granite` (decisión del usuario 2026-10-11). Corregir cómo se usa (pooling, `max_length`)
+  **no** cuenta como cambiar de modelo y entra (TASK-017). El reranker **sí** puede cambiar
+  (TASK-018/019).
+- **Fine-tuning** de cualquier modelo, incluido el adaptador lineal de consulta (TASK-020, pospuesta).
+- **Rerankers basados en LLM** (Qwen3-Reranker, mxbai v2) mientras la inferencia sea solo CPU (DD-16).
+- **Cambiar `max_length` por defecto de los builtins** (DD-4). Para Granite lo decide TASK-017 con
+  números (Q-2).
 - **Actualizar `ort`** a rc.10/2.0 final ni ONNX Runtime > 1.20 (cambia numéricos; plan aparte).
-- **Reindexar** cualquier proyecto: el criterio es justamente no tener que hacerlo.
+- **Reindexar** cualquier proyecto **como efecto de actualizar**: el motor (TASK-004…008), el FTS,
+  `queries` y el reranker no lo piden. El único re-embebido es la migración opt-in de TASK-017,
+  explícita y con aprobación (TASK-011).
 - **Zombies de MCPs ≤ 0.8.2** (H7): arreglados en 0.8.3; desaparecen al cerrar esas sesiones.
 - Ítems de PLAN-008 TASK-017 (idle exit con listener abierto, `in_tx`, kqueue…): siguen allá.
 - Tocar `/home/you/acme` más allá de lectura y medición (copias del DB para las pruebas de
@@ -172,15 +218,23 @@ Resumen; el detalle y los tradeoffs están en [`PLAN-010-design.md`](./PLAN-010-
 | TASK-001 | Instrumentación de memoria (`status.memory`, logs de carga/liberación) y línea base post-0.8.5 | general-purpose (Rust) | — | `done` |
 | TASK-002 | DuckDB: `memory_limit`/`threads` en config, valores efectivos, defaults medidos con frontend | general-purpose (Rust) | TASK-001 | `pending` |
 | TASK-003 | Arnés de equivalencia: fixtures + vectores y scores dorados generados con fastembed | general-purpose (Rust) | — | `pending` |
-| TASK-004 | Motor ONNX propio para embeddings (`ort` + `tokenizers`), builtins y user-defined, CUDA y stall guard | general-purpose (Rust) | TASK-003 | `pending` |
+| TASK-004 | Motor ONNX propio para embeddings (`ort` + `tokenizers`), builtins y user-defined, CUDA y stall guard | general-purpose (Rust) | TASK-003, TASK-013 | `pending` |
 | TASK-005 | Reranker sobre el motor propio | general-purpose (Rust) | TASK-004 | `pending` |
 | TASK-006 | Pesos compartidos entre procesos: spike ORT/mmap e implementación | general-purpose (Rust) | TASK-001, TASK-004 | `pending` |
 | TASK-007 | Perillas de runtime ONNX en config (hilos, arena, memory pattern, batch, `max_length`) con defaults medidos | general-purpose (Rust) | TASK-001, TASK-004 | `pending` |
 | TASK-008 | Retirar fastembed del árbol y cross-check Windows/macOS | general-purpose (Rust) | TASK-005, TASK-006, TASK-007 | `pending` |
 | TASK-009 | Modo opcional `embeddings.provider: central` (`/embed`, `RemoteProvider`, `base_url`) | general-purpose (Rust) | TASK-008 | `pending` |
-| TASK-010 | Docs EN + ES | general-purpose (Rust) | TASK-002, TASK-008, TASK-009 | `pending` |
+| TASK-010 | Docs EN + ES | general-purpose (Rust) | TASK-002, TASK-008, TASK-009, TASK-015, TASK-016, TASK-017, TASK-019 | `pending` |
 | TASK-011 | Verificación de campo antes/después contra §6 | — (orquestador, con aprobación del usuario) | TASK-010 | `pending` |
 | TASK-012 | Bloques libres que crecen con las reescrituras: curva de varias corridas y evaluación de recuperar espacio | general-purpose (Rust) | TASK-001 | `pending` |
+| TASK-013 | Huella de embeddings completa (pooling, `max_length`, hash del ONNX) para índices y memorias, con migración v1→v2 sin re-embeber | general-purpose (Rust) | — | `pending` |
+| TASK-014 | Set de evaluación ampliado (≥ 40 ES, ≥ 30 EN, recall de memorias) y línea base de calidad | general-purpose (casos + scripts) | — | `pending` |
+| TASK-015 | FTS: verificar la hipótesis del español; stemmer/stopwords configurables y partido de identificadores | general-purpose (Rust) | TASK-014 | `pending` |
+| TASK-016 | Consulta bilingüe: `queries[]` con fusión, método elegido por medición | general-purpose (Rust) | TASK-014 | `pending` |
+| TASK-017 | Granite con pooling CLS y `max_length` medido: cambio de vectores declarado, fijación por huella y migración explícita | general-purpose (Rust) | TASK-007, TASK-013, TASK-014 | `pending` |
+| TASK-018 | Reranker: selección medida entre finalistas contra "sin rerank" (calidad ES/EN, latencia CPU) | general-purpose (scripts) | TASK-014 | `pending` |
+| TASK-019 | Reranker elegido como default sobre el motor propio: catálogo, descarga, pool y latencia | general-purpose (Rust) | TASK-005, TASK-018 | `pending` |
+| TASK-020 | Adaptador lineal de consulta 384×384 (pospuesta: es fine-tuning chico) | general-purpose (Rust) | TASK-016, TASK-017 | `postponed` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
 
@@ -194,6 +248,18 @@ Resumen; el detalle y los tradeoffs están en [`PLAN-010-design.md`](./PLAN-010-
   sesión del motor nuevo: la segunda en entrar rebasea (conflicto de zona, no lógico).
 - TASK-009 espera a TASK-008 porque el `/embed` del central debe correr el motor final, y porque la
   decisión de hacerlo default (Q-3) depende de los números de TASK-006/007.
+- **Bloque de calidad (2026-10-11).** Arranca junto con TASK-001/003, apenas PLAN-009 está en `main`:
+  - **TASK-013 y TASK-014 primero y en paralelo** (una toca `devctx-embed`/`devctx-store`/central,
+    la otra solo `scripts/graph-eval/` y casos privados). TASK-013 va antes de TASK-004 para que el
+    cambio de motor quede registrado con la huella completa.
+  - Tras TASK-014: **TASK-015, TASK-016 y TASK-018 en paralelo** (FTS en `devctx-store`; `queries` en
+    `devctx-mcp`/`devctx-search`; TASK-018 solo scripts y config, mide sobre fastembed por
+    `model_dir`). 015 y 016 tocan las dos `devctx-search`: la segunda rebasea.
+  - **TASK-017** espera al motor propio con perillas (TASK-007): la equivalencia de TASK-003/004 se
+    mide contra fastembed **tal cual, Mean incluido**, y CLS entra después como cambio declarado.
+  - **TASK-019** espera a TASK-005 (reranker en el motor propio) y a la elección de TASK-018.
+  - Una sola migración de vectores para el usuario (pooling + `max_length` juntos), en TASK-011, con
+    aprobación: nunca dos reindex de los 15 repos.
 
 **Esquema de ejecución (igual que PLAN-008):** una sesión ejecuta, otra revisa cada lote en modo
 solo lectura antes de seguir. Compilar y correr tests queda autorizado sólo cuando el usuario apruebe
@@ -221,6 +287,13 @@ de comparación (la columna se completa ahí).
 | DuckDB acotado y HNSW creado en frontend (2.3 GB) con el default elegido | 2 GB, sin medir | `CREATE INDEX … USING HNSW` termina sin OOM; `memory_limit` efectivo visible en `status` |
 | `status` informa memoria | no; **TASK-001: sí** (`status.memory`) | bloque `memory`: modelo cargado sí/no, RSS anon/file, DuckDB usado/límite, vectores HNSW |
 | `provider: central` (si se activa) | — | serve con `provider: central` en reposo ≤ 60 MB; `search` OK; error explícito con central caído |
+| Relevancia ES (set de TASK-014, mediana de 3) | línea base de TASK-014 | Hit@5 ≥ +10 pp **o** MRR ≥ +0.05 (IC 90 % sin cruzar 0), por el bloque de calidad en conjunto |
+| Relevancia EN | línea base de TASK-014 | Hit@5 sin bajar más de 1 caso; MRR ≥ −0.02 |
+| Brief (`context`) y recall de memorias | línea base de TASK-014 | sin regresión (≤ −1 caso) |
+| Híbrido vs vectorial en ES | PLAN-009: híbrido 6/13 < vectorial 8/13 | híbrido ≥ vectorial en ES (TASK-015) |
+| Reranker por defecto | `bge-base` (pool 100, ~30 s); el usuario usa `bge-v2-m3` (~180 s) | le gana a "sin rerank" con el umbral de DD-12; p95 medido; ningún default NC |
+| Huella de embeddings | sin pooling/`max_length`/ONNX; memorias sin huella | ningún store con vectores de dos espacios; actualizar no re-embebe nada |
+| Costo de indexado tras TASK-017 (si se migra) | línea base de TASK-001 (chunks/s) | ≤ +20 % de tiempo; `VmHWM` ≤ 1.5 GB |
 
 ## 7. Riesgos
 
@@ -248,6 +321,15 @@ de comparación (la columna se completa ahí).
   y en el cross-check; el comportamiento queda declarado como no verificado si no hay hardware.
 - **`provider: central` crea un punto único de falla.** Mitigación: opt-in, error explícito y
   reintento perezoso (DD-8); nunca es default en este plan.
+- **Mezcla silenciosa de espacios de vectores** al corregir pooling o `max_length`, o al cambiar de
+  motor (Q-H4). Mitigación: TASK-013 antes que TASK-004 y TASK-017; fijación del pooling a la huella
+  guardada (DD-15); `memories import` reusa solo con huella igual.
+- **Medir mejoras con un set sin poder.** Mitigación: DD-12 (≥ 40 ES, IC por bootstrap, mediana de 3
+  corridas) y casos escritos antes de medir.
+- **Un reranker que empeora el código** (ADR-15; tabla de Qwen3 Q-H5). Mitigación: la vara es "sin
+  rerank" y `enabled` solo se prende con números (Q-7).
+- **Costo de la migración para el usuario** (~4-4.5 h de reindex + ~45 min de memorias). Mitigación:
+  opt-in, una sola vez, pooling y `max_length` juntos, con export previo y reembebido atómico.
 - **Trabajo en paralelo con PLAN-008 P1** en `state.rs`/`devctx-api`. Mitigación: este plan arranca
   después de 0.8.5 y rebasea sobre lo que haya mergeado de P1; las zonas compartidas son pocas
   (`status`).
@@ -264,6 +346,15 @@ de comparación (la columna se completa ahí).
   4. `memory_limit`/`threads` desde config, env gana, valor efectivo reportado — TASK-002;
   5. `/embed` del central: rechaza modelo/dimensión distintos, no toma el mutex del registro
      durante la inferencia (test con un embedder falso lento + `projects list` concurrente) — TASK-009.
+  6. huella v2: cambia con pooling/`max_length`/ONNX, migra v1 sin re-embeber, bloquea memorias de
+     otro espacio e imports con otra huella — TASK-013;
+  7. dorados CLS de Granite contra la referencia de onnxruntime en Python; fijación del pooling a la
+     huella guardada — TASK-017;
+  8. FTS: partido de identificadores igual en consulta y documento; cambiar `storage.fts` reconstruye
+     solo el FTS — TASK-015;
+  9. `queries[]`: sin el parámetro, resultado idéntico al de hoy — TASK-016.
+- Calidad: arnés `scripts/graph-eval/` con el set de TASK-014 (mediana de 3 corridas, IC por
+  bootstrap), umbrales de DD-12.
 - Mediciones con la metodología de TASK-001 (script en `scripts/`, salida en el `## Resultado` de
   cada task).
 - Campo: TASK-011, antes/después contra §6.
@@ -284,7 +375,14 @@ Cada task es un commit convencional propio. Puntos sensibles:
 - **TASK-008** es la única irreversible "en la práctica" (saca la dependencia): sólo entra cuando
   003-007 están `done` y el campo intermedio está verde.
 - **TASK-009** es opt-in: con `provider: local` (default) el código nuevo no se ejecuta.
-Ninguna task migra ni reescribe datos.
+Las tasks 001-012 no migran ni reescriben datos. Del bloque de calidad:
+- **TASK-013** sella huellas v2: revertir deja huellas que el código viejo no entiende → las trata
+  como "otro setup" y hace `--full`. Por eso la v2 conserva el prefijo legible y TASK-013 documenta
+  cómo volver (borrar la clave de `index_meta` la devuelve a "índice sin huella").
+- **TASK-015** solo reconstruye el FTS; revertir y reconstruir vuelve al de hoy.
+- **TASK-017** re-embebe solo con la migración explícita; `embeddings.pooling: mean` vuelve al espacio
+  viejo (con otro `--full`). `memories export` previo es obligatorio en el comando.
+- **TASK-019** cambia un default: una config que nombra `model` no se ve afectada.
 
 ## 10. Release
 
@@ -343,6 +441,36 @@ Cada TASK llena su `## Resultado` con:
 - **TASK-012 nueva (2026-10-07):** los bloques libres del archivo DuckDB crecen con las reescrituras
   (75 → 95 al reescribir 40 archivos, medido en PLAN-009 TASK-003). Se mide la curva de varias corridas
   y se evalúa recuperar espacio. No bloquea la 0.10.0.
+
+### Decisiones del usuario (2026-10-11): calidad de búsqueda
+
+- El bloque de calidad va en **PLAN-010**, no en PLAN-009, para no afectarlo.
+- **Sin fine-tuning** por ahora (por eso TASK-020 queda pospuesta).
+- **Sin cambiar el modelo de embeddings:** sigue `ml-granite`
+  (`ibm-granite/granite-embedding-97m-multilingual-r2`). Corregir cómo se usa (pooling,
+  `max_length`) no cuenta como cambiar de modelo.
+- **El reranker sí puede cambiar**, con evidencia sólida (TASK-018: finalistas medidos contra "sin
+  rerank").
+- Buscar el mejor método para cada pieza (por eso FTS, consulta bilingüe y pooling se eligen por
+  matriz medida, no por suposición).
+
+### Preguntas abiertas nuevas (2026-10-11)
+
+- **Q-2 (reformulada) — `max_length` de Granite.** TASK-017 mide 512 / 1024 / efectivo (~2048 con
+  `max_chars` 4096). Propuesta: adoptar el mayor que quepa en +20 % de indexado y 1.5 GB de pico,
+  junto con CLS, en una sola migración. Builtins siguen en 512.
+- **Q-6 — Migración de los 15 repos y memorias.** ¿Se ejecuta en TASK-011 (≈ 4-4.5 h + ~45 min de
+  memorias, en una ventana que el usuario elija) o queda como paso manual documentado? Propuesta:
+  en TASK-011, solo si TASK-017 pasa los umbrales.
+- **Q-7 — `reranking.enabled` por defecto.** Propuesta: pasa a `true` solo si el ganador de TASK-018
+  le gana a "sin rerank" y su p95 en el motor propio es ≤ 2 s al pool elegido; si no, sigue `false`.
+  ¿Es 2 s el presupuesto correcto para el uso desde un agente?
+- **Q-8 — `jina-v2` (CC-BY-NC-4.0).** Hoy se ofrece como key builtin. Propuesta: mantenerlo solo con
+  aviso de licencia en `devctx models` y en la doc, y sacarlo de `bench-rerank.sh`; alternativa:
+  retirarlo.
+- **Q-9 — Release.** El bloque de calidad viaja en la `0.11.0` junto con el motor (propuesta: sí; el
+  motor y TASK-013 son prerequisito de TASK-017/019), o se separa TASK-013…016/018 en una `0.10.x`
+  previa si PLAN-010 se demora.
 
 ## 13. Cierre
 

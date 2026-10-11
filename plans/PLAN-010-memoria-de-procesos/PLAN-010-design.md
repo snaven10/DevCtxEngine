@@ -257,3 +257,141 @@ Se descarta con el usuario el 2026-10-05.
 3. TASK-006 y TASK-007 dependen de la línea base: sin "antes" no hay "después".
 4. TASK-009 al final y opt-in; su default (Q-3) se decide con sus números.
 5. Cross-check Windows/macOS vía push a `fix/**` antes de cualquier tag.
+
+---
+
+# Bloque de calidad de búsqueda (agregado 2026-10-11)
+
+Decisiones del usuario del 2026-10-11: sin fine-tuning; el modelo de embeddings no cambia
+(`ml-granite`); corregir cómo se usa sí; el reranker puede cambiar con evidencia. Hallazgos en el
+master §2.1 (Q-H1…Q-H6). Orden y compuertas en DD-18.
+
+## DD-11 — Huella de embeddings v2, también para memorias
+
+**Problema.** La huella actual (`crates/devctx-embed/src/lib.rs:106`) es
+`local|{model}|{dim}|{LOCAL_ENGINE}|max_chars=N|l2`. Dos setups con el mismo modelo y otro pooling,
+otro `max_length` u otro archivo ONNX dan la misma huella y sus vectores se reusan como si fueran
+intercambiables. Las memorias no tienen huella: el central solo detecta un cambio de dimensión.
+
+**Decisión.**
+- Formato v2 con campos con nombre: `v2|local|{model}|{dim}|eng=…|pool=…|maxlen=…|onnx=…|max_chars=…|l2`.
+  `onnx` = prefijo del sha256 del archivo cargado (cacheado por mtime+tamaño); para builtins, el
+  `repo/archivo@revisión`.
+- **Migración v1→v2 sin re-embeber:** una v1 equivale a la v2 activa si el resto coincide y `pool`
+  y `maxlen` activos son los implícitos de hoy (Granite = Mean/512). Se re-sella. Mismo criterio de
+  confianza que ya se aplicó a los índices "anteriores a fingerprints".
+- **`eng=` es una clase numérica**, no un nombre de crate: el motor propio de TASK-004 usa la misma
+  clase que fastembed (`fe-compat/1`) **solo si** pasa el arnés con la tolerancia de DD-3 (como el
+  device CPU/CUDA, que ya queda fuera de la huella por mover solo redondeo). Si no pasa, clase nueva
+  y `--full` declarado.
+- **Memorias:** huella del espacio de memorias guardada en el central y en cada store de repo;
+  `shares_vector_space` compara huellas; `remember`/`recall` se niegan a mezclar; el JSONL de export
+  lleva la huella y el import reusa solo con huella igual.
+
+**Alternativa descartada:** una clave por campo en `index_meta`. Más consultas, y la regla de
+"igualdad de huella" que ya usan el pipeline y la copia entre ramas dejaría de ser una comparación de
+strings.
+
+## DD-12 — Evaluación con poder estadístico
+
+**Decisión.** Antes de cualquier cambio de calidad: ≥ 40 casos ES y ≥ 30 EN (repo + privados por
+`$DEVCTX_EVAL_CASES`, regla Q-5 de PLAN-009), casos de recall de memorias sintéticas, corte por
+idioma × modo × tipo de consulta, mediana de 3 corridas e IC 90 % de la diferencia por bootstrap.
+Los targets se escriben antes de medir.
+
+**Umbral de adopción** (cada task del bloque): ES Hit@5 ≥ +10 pp o MRR ES ≥ +0.05 con IC sin cruzar
+0; EN sin bajar más de 1 caso (MRR ≥ −0.02); brief y recall sin regresión; indexado ≤ +20 %;
+`search` p95 ≤ +10 % sin rerank.
+
+**Por qué +10 pp y no +2/13:** con 13 casos, +2 es 15 pp y está dentro de lo que el ruido (±1 caso)
+más la elección de casos pueden producir; con 40, +10 pp son 4 casos y el IC lo separa del azar.
+
+## DD-13 — FTS con idioma e identificadores
+
+**Hechos** (doc de DuckDB FTS): un stemmer y una lista de stopwords **por índice**; `spanish` existe;
+stopwords puede ser una tabla propia; `lower` corre antes de `ignore = '(\\.|[^a-z])+'`, así que
+`camelCase` queda fundido y `snake_case` se parte.
+
+**Decisión.** Verificar primero (TASK-015 Paso 1: qué hipótesis explica cada caso ES que pierde el
+híbrido). Si se confirma, matriz de configuraciones y default por números: stopwords EN+ES en una
+tabla, stemmer ganador entre `porter`/`none`/`spanish`, y una tabla auxiliar `fts_docs(id, body)` con
+los identificadores partidos en SQL (`regexp_replace`), indexada en vez de `vectors.text`. La consulta
+pasa por la misma transformación. La huella de la config FTS va a `index_meta`: cambiarla reconstruye
+solo el FTS, nunca los vectores.
+
+**Alternativas descartadas:** dos índices FTS (porter + spanish) fusionados — doble costo, solo si las
+opciones simples no alcanzan; partir identificadores en Rust al indexar — cambia el schema de
+`vectors` y obliga a reescribir todo para algo que SQL resuelve al reconstruir.
+
+## DD-14 — Consulta bilingüe
+
+**Decisión.** El agente es un LLM y traduce mejor que cualquier cosa que podamos meter en el
+binario. `search` y `recall` aceptan `queries` (hasta 4, la primera es `query`). Se miden: llamadas
+separadas del cliente (simulado en el arnés), RRF de una búsqueda por consulta, promedio de vectores
+normalizados en una sola búsqueda, y RRF ponderado hacia la original. El rerank, si está activo,
+corre una vez con la consulta original sobre el pool fusionado. Se queda solo el ganador.
+
+**Descartado:** traducir del lado del servidor (otro modelo en memoria, contra el objetivo de este
+plan) y reemplazar la consulta por su traducción (pierde términos de negocio que en los repos
+privados están en español en los identificadores).
+
+## DD-15 — Granite con CLS y `max_length` medido, como cambio declarado
+
+**Decisión.**
+- El pooling pasa a ser un dato del registro (`LocalModelSpec.pooling`); Granite declara CLS como
+  nativo y Mean como legado.
+- `embeddings.pooling: auto` (default) **se fija a la huella guardada**: un índice o store de memorias
+  en Mean sigue consultando en Mean hasta que el usuario migra; un repo nuevo usa CLS. Lo mismo con
+  `max_length`. Esto evita que un `index` incremental o un hook de git disparen horas de re-embebido.
+- La migración es explícita (`index --full --upgrade-embeddings`, `memories reembed` atómico con
+  export previo) y se hace una sola vez, con pooling y `max_length` juntos.
+- Va **después** de TASK-004/007: la equivalencia del motor se mide contra fastembed con Mean (DD-3),
+  y CLS se valida aparte contra una referencia de onnxruntime en Python sobre el mismo ONNX.
+- `memory.model` no cambia (sigue `ml-granite`), así que no choca con la regla de que no se puede
+  cambiar con memorias adentro; lo que cambia es la huella, que DD-11 protege.
+
+**Tradeoff de `max_length`:** ModernBERT de Granite tiene atención local de 128 tokens y global cada
+3 capas: el costo crece menos que cuadrático, pero crece. El techo práctico es `max_chars` 4096
+(~1000-1500 tokens de código). Se adopta el mayor valor que entre en +20 % de indexado y 1.5 GB de
+pico.
+
+## DD-16 — Reranker elegido con evidencia
+
+**Hechos verificados** (detalle y fuentes en TASK-018): fastembed 4.9.1 tiene cuatro rerankers
+builtin y uno es CC-BY-NC (`jina-v2`); su user-defined acepta cualquier cross-encoder clásico con
+salida `logits`. En la tabla de la tarjeta de Qwen3-Reranker (top-100 de un denso fuerte),
+`bge-reranker-v2-m3` queda en MTEB-Code 41.38, por debajo del propio recuperador (75.41);
+`gte-multilingual-reranker-base` 54.18; Qwen3-Reranker-0.6B 73.42.
+
+**Decisión.**
+- Finalistas: `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` (Apache-2.0, 118M, entrenado con español,
+  ONNX oficial int8 de 119 MB, el más barato multilingüe) y `Alibaba-NLP/gte-multilingual-reranker-base`
+  (Apache-2.0, 306M, mejor número publicado en código entre los clásicos multilingües, ONNX
+  comunitario). Controles: sin rerank, `bge-v2-m3`, `bge-reranker-base`.
+- La vara es **sin rerank**, no el reranker actual; candidatos congelados (top-50) para todos;
+  pool 20/30/50; fp32 e int8.
+- Sin rerankers LLM (Qwen3, mxbai v2) mientras solo haya CPU: cuestan ≥ v2-m3 y exigen plantilla y
+  logits sí/no en el motor propio.
+- La latencia absoluta se mide de nuevo sobre el motor propio (TASK-019): la de hoy parece inflada
+  por la sobre-suscripción de hilos del reranker de fastembed.
+- `enabled` por defecto se decide con el usuario (Q-7) con esos números.
+
+## DD-17 — Adaptador lineal de consulta, pospuesto
+
+Una matriz 384×384 sobre la consulta no obliga a reindexar, pero entrenarla es un fine-tuning chico
+y necesita cientos de pares que no tenemos fuera del set de evaluación. Se pospone hasta ver el
+efecto de DD-14 y DD-15; se reabre solo si la brecha ES/EN en Hit@5 sigue > 15 pp y el usuario acepta
+que no viola "sin fine-tuning".
+
+## DD-18 — Orden y compuertas del bloque de calidad
+
+1. **TASK-013 (huella) y TASK-014 (set + línea base)** primero, en paralelo con TASK-001/003. La huella
+   va antes del motor (TASK-004) para que ese cambio quede registrado bien.
+2. Con la línea base: **TASK-015 (FTS), TASK-016 (`queries`) y TASK-018 (medición del reranker)** en
+   paralelo; ninguna cambia vectores ni depende del motor (TASK-018 mide por `model_dir` sobre
+   fastembed).
+3. La cadena del motor sigue igual: TASK-003 → 004 → 005/006/007 → 008. Encima:
+   **TASK-017** tras TASK-007 (pooling y `max_length` sobre el motor final, cambio declarado) y
+   **TASK-019** tras TASK-005 (catálogo del reranker en el motor propio).
+4. TASK-010 documenta todo; TASK-011 verifica primero "actualizar no re-embebe" y la calidad sin
+   migrar, y **después**, con aprobación, la migración única de vectores (Q-6).

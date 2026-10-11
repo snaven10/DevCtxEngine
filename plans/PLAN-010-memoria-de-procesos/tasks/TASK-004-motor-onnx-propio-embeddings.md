@@ -3,7 +3,8 @@
 - **Plan:** PLAN-010 — Memoria de procesos
 - **Especialista:** general-purpose (Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
-- **Depende de:** TASK-003
+- **Depende de:** TASK-003, TASK-013
+- **Nota (2026-10-11):** TASK-013 se agregó como dependencia porque la huella completa decide el campo `eng=` (Paso 9).
 - **Estado:** `pending`
 
 ---
@@ -74,6 +75,13 @@ PLAN-010 DD-2, DD-3.
       `ml-granite`. Si no pasa: `blocked` con el peor coseno y el texto que lo produce.
 - [ ] **Paso 8 — `index_meta`.** Registrar `embed_engine = ort-direct/1` como diagnóstico (no
       dispara reindex, DD-3).
+- [ ] **Paso 9 — huella (`eng=`, TASK-013 / DD-11).** Hoy `LOCAL_ENGINE` (`fastembed-<v>/ort-<v>`)
+      entra en `embedding_fingerprint` y su comentario exige cambiarlo si el motor cambia. Si el
+      arnés pasa con la tolerancia de DD-3, el motor propio usa la clase numérica `fe-compat/1`
+      (la misma que la huella v2 asigna a los índices de fastembed) y **no** se pierde el reuso de
+      vectores; si no pasa, `ort-direct/1` y el primer `index` de cada repo es `--full`
+      (declararlo en el Resultado: contradice §6 "sin reindex"). Pooling sigue en Mean para Granite:
+      la corrección a CLS es TASK-017, no esta.
 
 ## Criterios de aceptación
 
