@@ -1596,18 +1596,122 @@ fn signature_of(def: Node<'_>, bytes: &[u8]) -> String {
     signature_text(bytes, def.start_byte(), end)
 }
 
-/// `bytes[start..end]` as a signature: whitespace collapsed, capped.
+/// `bytes[start..end]` as a signature: whitespace collapsed; the head (the
+/// declaration after its leading annotations, decorators and attributes)
+/// capped at [`SIGNATURE_MAX`] characters — a cut one is 199 and `…`, so a
+/// reader can tell it apart from one exactly that long —, and in front of
+/// it the leading annotations that fit in [`ANNOTATIONS_MAX`] characters,
+/// whole, in order (one that does not fit is left out, never cut). The
+/// annotations used to count against the cap, and one longer than it left
+/// a signature with no name (review of TASK-014); they stay because the
+/// link pass reads them (`@Data` makes Lombok accessors, `link.rs`).
 fn signature_text(bytes: &[u8], start: usize, end: usize) -> String {
     let text = std::str::from_utf8(&bytes[start..end]).unwrap_or_default();
-    text.split_whitespace()
+    let collapsed = text
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .replace("( ", "(")
         .replace(", )", ")")
-        .replace(" )", ")")
-        .chars()
-        .take(SIGNATURE_MAX)
-        .collect()
+        .replace(" )", ")");
+    let (annotations, head) = leading_annotations(&collapsed);
+    let head = if head.chars().count() <= SIGNATURE_MAX {
+        head.to_string()
+    } else {
+        let mut out: String = head.chars().take(SIGNATURE_MAX - 1).collect();
+        out.push('…');
+        out
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut left = ANNOTATIONS_MAX;
+    for a in annotations {
+        let n = a.chars().count() + 1;
+        if n <= left {
+            left -= n;
+            kept.push(a);
+        }
+    }
+    if kept.is_empty() {
+        head
+    } else {
+        format!("{} {head}", kept.join(" "))
+    }
+}
+
+/// Characters of leading annotations a signature keeps, at most.
+const ANNOTATIONS_MAX: usize = 200;
+
+/// `sig` split into its leading annotations (`@Override`, `@Path("/x")`, TS
+/// decorators `@Component({…})`) and attributes (`#[inline]`), each whole,
+/// and the rest; `@interface` declares an annotation and is the rest.
+/// Brackets inside string literals do not count. No annotations when one
+/// never closes or nothing would be left.
+pub(crate) fn leading_annotations(sig: &str) -> (Vec<&str>, &str) {
+    let mut rest = sig.trim_start();
+    let mut found = Vec::new();
+    loop {
+        let skipped = if let Some(after_at) = rest.strip_prefix('@') {
+            let name_len = after_at
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '$'))
+                .unwrap_or(after_at.len());
+            if name_len == 0 || &after_at[..name_len] == "interface" {
+                break;
+            }
+            let after = &after_at[name_len..];
+            if after.starts_with('(') {
+                match closing_bracket(after, b'(', b')') {
+                    Some(end) => 1 + name_len + end + 1,
+                    None => return (Vec::new(), sig),
+                }
+            } else {
+                1 + name_len
+            }
+        } else if rest.starts_with("#[") {
+            match closing_bracket(&rest[1..], b'[', b']') {
+                Some(end) => end + 2,
+                None => return (Vec::new(), sig),
+            }
+        } else {
+            break;
+        };
+        let next = rest[skipped..].trim_start();
+        if next.is_empty() {
+            return (Vec::new(), sig);
+        }
+        found.push(&rest[..skipped]);
+        rest = next;
+    }
+    (found, rest)
+}
+
+/// Byte offset of the bracket closing the one `s` starts with, skipping
+/// string and character literals (`"…"`, `'…'`, `` `…` ``, with `\` escapes).
+fn closing_bracket(s: &str, open: u8, close: u8) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut depth, mut i, mut quote) = (0usize, 0usize, None::<u8>);
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if matches!(c, b'"' | b'\'' | b'`') => quote = Some(c),
+            None if c == open => depth += 1,
+            None if c == close => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Where the body of `def` starts, if it has one (see [`signature_of`]).

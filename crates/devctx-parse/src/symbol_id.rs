@@ -782,6 +782,59 @@ class S {
         assert_eq!(pf.symbols[1].signature, "struct S;");
     }
 
+    /// Leading annotations, decorators and attributes do not count against
+    /// the 200 characters of the head (review of TASK-014, MAJOR 3): a Java
+    /// annotation longer than that used to leave a signature with no name.
+    /// The ones that fit in their own 200 stay in front, whole (the link
+    /// pass reads `@Data`); a longer one is left out, never cut. A head cut
+    /// at the cap ends in `…` (and is 200 characters); one exactly 200 long
+    /// is whole, with no `…`. Ids do not move (the signature is no part of
+    /// them).
+    #[test]
+    fn leading_annotations_do_not_eat_the_signature() {
+        let long = "s".repeat(240);
+        let src = format!(
+            "public class Foo {{\n    @Operation(summary = \"{long} :-)\")\n    @GET\n    public Response list(String id) {{ return null; }}\n}}\n"
+        );
+        let pf = ids(Lang::java(), &src, "Foo.java");
+        let list = pf.symbols.iter().find(|s| s.name == "list").unwrap();
+        assert_eq!(list.signature, "@GET public Response list(String id)");
+        let plain = ids(
+            Lang::java(),
+            "public class Foo {\n    public Response list(String id) { return null; }\n}\n",
+            "Foo.java",
+        );
+        assert_eq!(
+            list.id,
+            plain.symbols.iter().find(|s| s.name == "list").unwrap().id
+        );
+        let ts = ids(
+            Lang::typescript(),
+            &format!("@Component({{ selector: '{long}' }})\nclass Box {{}}\n"),
+            "box.ts",
+        );
+        assert_eq!(ts.symbols[0].signature, "class Box");
+        // Cut: 199 characters and `…`.
+        let params: Vec<String> = (0..40).map(|i| format!("String p{i}")).collect();
+        let wide = ids(
+            Lang::java(),
+            &format!("class W {{ void wide({}) {{}} }}\n", params.join(", ")),
+            "W.java",
+        );
+        let w = wide.symbols.iter().find(|s| s.name == "wide").unwrap();
+        assert_eq!(w.signature.chars().count(), 200, "{}", w.signature);
+        assert!(w.signature.ends_with('…'), "{}", w.signature);
+        // Exactly 200: whole.
+        let name = "n".repeat(200 - "void ()".len());
+        let exact = ids(
+            Lang::java(),
+            &format!("class E {{ void {name}() {{}} }}\n"),
+            "E.java",
+        );
+        let e = exact.symbols.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(e.signature, format!("void {name}()"));
+    }
+
     /// A nested class qualifies its members with the whole chain, so two
     /// inner classes with a member of the same name do not collide.
     #[test]

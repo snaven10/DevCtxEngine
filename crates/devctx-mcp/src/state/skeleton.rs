@@ -377,9 +377,11 @@ def handler(event, context):
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    /// Multi-line signatures: an annotation too long for the 200 characters
-    /// the index keeps leaves no name (`method annotated …`), long generics
-    /// and a parameter list over lines are one line.
+    /// Multi-line signatures: an annotation longer than the 200 characters
+    /// the index keeps no longer eats the signature (the extractor skips
+    /// leading annotations before the cap, review of TASK-014 MAJOR 3), in
+    /// the skeleton and in the repo map; long generics and a parameter list
+    /// over lines are one line.
     #[test]
     fn multi_line_signatures_are_one_line() {
         let (state, repo) = indexed("skel_multiline");
@@ -387,9 +389,19 @@ def handler(event, context):
         let java_out = skeleton(&state, JAVA_PATH).unwrap();
         let at = line_of(&src, "@Operation(");
         assert!(
-            java_out.contains(&format!("\n  method annotated … [{at}-{}]\n", at + 3)),
+            java_out.contains(&format!("\n  public void annotated() [{at}-{}]\n", at + 3)),
             "{java_out}"
         );
+        let map = do_repo_map(
+            &state,
+            &crate::repo_map::RepoMapQuery {
+                focus_symbols: vec!["annotated".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(map.contains("public void annotated()"), "{map}");
+        assert!(!map.contains("sssss"), "{map}");
         assert!(!java_out.contains("sssss"), "{java_out}");
         let g = line_of(&src, "public <T extends");
         assert!(

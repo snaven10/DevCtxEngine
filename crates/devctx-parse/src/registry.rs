@@ -269,7 +269,7 @@ const SOURCES: &[&str] = &[
 /// kinds, qualified names and ids the extractor produces for a fixture in
 /// every language, together with the version they were produced under, and
 /// fails when the output changes without a bump here.
-pub const EXTRACTOR_VERSION: u32 = 20;
+pub const EXTRACTOR_VERSION: u32 = 21;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
