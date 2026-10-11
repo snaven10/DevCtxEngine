@@ -8,14 +8,15 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::repo_map::RepoMapQuery;
+use crate::skeleton::SkeletonQuery;
 use crate::state::{
     do_backfill_links, do_build_context, do_impact_with, do_index, do_index_status,
     do_list_projects, do_memories_by_file, do_memories_by_symbol, do_memory_context,
     do_memory_forget, do_memory_move, do_memory_refs, do_memory_stats, do_plan_status,
     do_read_file, do_read_symbol, do_recall_scoped, do_references_with, do_remember,
     do_remember_shared, do_repo_map, do_routes_for_handler, do_search, do_search_project,
-    do_search_routes, do_summarize, do_traverse, parse_mode, AppState, MemoriesOpts, Page,
-    PlanListOpts, TraverseQuery,
+    do_search_routes, do_skeleton, do_summarize, do_traverse, parse_mode, AppState, MemoriesOpts,
+    Page, PlanListOpts, TraverseQuery,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -688,6 +689,18 @@ impl Backend {
         }
     }
 
+    /// The structure of one file, to locate where something is
+    /// (`skeleton`, PLAN-009 TASK-014). A server older than the tool has no
+    /// `GET /skeleton`: its 404 is told as such, with what to do.
+    pub fn skeleton(&self, q: &SkeletonQuery) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_skeleton(s, q),
+            Backend::Remote(r, _) => r
+                .get_route(&skeleton_path(q))?
+                .ok_or_else(|| SKELETON_OLD_SERVER.to_string()),
+        }
+    }
+
     /// Delete one memory for good, wherever it lives.
     pub fn memory_forget(&self, id: &str) -> Result<String, String> {
         match self {
@@ -1143,6 +1156,39 @@ mod tests {
         assert_eq!(repo_map_path(&q), "/repo-map?focus_files=src%2Fa%20b.rs");
     }
 
+    /// PLAN-009 TASK-014: a server older than `skeleton` answers its route
+    /// with a 404; the client says the server is old and how to restart it;
+    /// any other failure keeps its message (a file not indexed is a 500).
+    #[test]
+    fn skeleton_on_an_old_server_says_to_restart_it() {
+        let old =
+            serve_fixed("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: old.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        let q = SkeletonQuery::of("src/a b.rs");
+        let e = backend.skeleton(&q).unwrap_err();
+        assert!(e.contains("predates skeleton"), "{e}");
+        assert!(e.contains("devctx serve --stop"), "{e}");
+        let failing = serve_fixed(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+             Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}",
+        );
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: failing.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        assert_eq!(backend.skeleton(&q).unwrap_err(), "boom");
+        assert_eq!(skeleton_path(&q), "/skeleton?file=src%2Fa%20b.rs");
+    }
+
     #[test]
     fn a_plain_503_is_a_final_answer() {
         let plain = serve_fixed(PLAIN_503);
@@ -1295,6 +1341,22 @@ pub const TRAVERSE_OLD_SERVER: &str =
 pub const REPO_MAP_OLD_SERVER: &str =
     "the running devctx serve predates repo_map (it has no GET /repo-map): restart it with \
      devctx serve --stop, and the next call starts the installed binary";
+
+/// What a routed `skeleton` says when the server answered 404: it predates
+/// the tool.
+pub const SKELETON_OLD_SERVER: &str =
+    "the running devctx serve predates skeleton (it has no GET /skeleton): restart it with \
+     devctx serve --stop, and the next call starts the installed binary";
+
+/// The path and query string of `GET /skeleton` for `q`.
+pub fn skeleton_path(q: &SkeletonQuery) -> String {
+    let pairs: Vec<String> = q
+        .query_pairs()
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", urlencode(&v)))
+        .collect();
+    format!("/skeleton?{}", pairs.join("&"))
+}
 
 /// The path and query string of `GET /repo-map` for `q`.
 pub fn repo_map_path(q: &RepoMapQuery) -> String {

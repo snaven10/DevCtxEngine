@@ -133,7 +133,7 @@ fn not_found(store: &Store, chosen: &BranchChoice, root: &Path, file: &str) -> S
 
 #[cfg(test)]
 mod tests {
-    use super::super::lookup::tests::indexed_files;
+    use super::super::lookup::tests::{indexed_files, Fake};
     use super::super::*;
     use crate::skeleton::SkeletonQuery;
 
@@ -600,6 +600,90 @@ def handler(event, context):
         let e = skeleton(&state, "db/schema.sql").unwrap_err();
         assert!(e.contains("devctx index --full"), "{e}");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The measurement of TASK-014 (ignored): indexes `$DEVCTX_SKEL_BENCH_REPO`
+    /// into `$DEVCTX_SKEL_BENCH_STATE` with a model-less embedder (the symbol
+    /// graph is real; vectors do not matter to a skeleton), then for each file
+    /// of `$DEVCTX_SKEL_BENCH_FILES` (comma-separated, repo-relative; an
+    /// optional `alias=` in front names it in the output) prints its lines,
+    /// the tokens of the whole file (what `read_file` costs uncapped), the
+    /// tokens of its skeleton uncapped and as the tool answers it (the default
+    /// budget), and `$DEVCTX_SKEL_BENCH_RUNS` (40) warm calls' p50 / p95;
+    /// with `$DEVCTX_SKEL_BENCH_PRINT`, each skeleton on stderr.
+    ///
+    /// `cargo test --release -p devctx-mcp --lib skeleton_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn skeleton_bench() {
+        use crate::repo_map::tokens;
+        let var = |k: &str| std::env::var(k).ok();
+        let (Some(repo), Some(state_dir), Some(files)) = (
+            var("DEVCTX_SKEL_BENCH_REPO"),
+            var("DEVCTX_SKEL_BENCH_STATE"),
+            var("DEVCTX_SKEL_BENCH_FILES"),
+        ) else {
+            eprintln!("set DEVCTX_SKEL_BENCH_REPO, _STATE and _FILES");
+            return;
+        };
+        let runs: usize = var("DEVCTX_SKEL_BENCH_RUNS")
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(40);
+        let mut cfg = ProjectConfig::default();
+        cfg.project.path = repo.clone();
+        cfg.state_dir = state_dir;
+        cfg.storage.hnsw = false;
+        let state = AppState::build(cfg).unwrap();
+        let dim = configured_dimension(&state.cfg);
+        *state.embedder.lock().unwrap() = Some(Cached {
+            value: Arc::new(Fake(dim)),
+            last_used: Instant::now(),
+            key: "fake/fake".into(),
+            loaded_at: procmem::unix_now(),
+        });
+        let t = Instant::now();
+        do_index(&state, false).unwrap();
+        eprintln!("index: {:.1} s", t.elapsed().as_secs_f64());
+        println!("| file | lines | file tokens | skeleton (uncapped) | % | skeleton (tool) | % | symbols | p50 ms | p95 ms |");
+        for entry in files.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            let (alias, file) = entry.split_once('=').unwrap_or((entry, entry));
+            let text = std::fs::read_to_string(std::path::Path::new(&repo).join(file)).unwrap();
+            let file_tokens = tokens(&text);
+            let store = state.open_store().unwrap();
+            let chosen = graph_branch(&state, &store).unwrap();
+            let q = SkeletonQuery::of(file);
+            let uncapped = super::skeleton_on(&store, &chosen, &state.root, &q, 0).unwrap();
+            drop(store);
+            if var("DEVCTX_SKEL_BENCH_PRINT").is_some() {
+                eprintln!("{uncapped}");
+            }
+            let tool = do_skeleton(&state, &q).unwrap();
+            let mut ms: Vec<f64> = (0..runs)
+                .map(|_| {
+                    let t = Instant::now();
+                    do_skeleton(&state, &q).unwrap();
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |p: f64| ms[((ms.len() as f64 * p).ceil() as usize).clamp(1, ms.len()) - 1];
+            let symbols = uncapped
+                .lines()
+                .next()
+                .and_then(|l| l.rsplit(": ").next())
+                .unwrap_or("")
+                .to_string();
+            println!(
+                "| {alias} | {} | {file_tokens} | {} | {:.1} | {} | {:.1} | {symbols} | {:.1} | {:.1} |",
+                text.lines().count(),
+                tokens(&uncapped),
+                100.0 * tokens(&uncapped) as f64 / file_tokens as f64,
+                tokens(&tool),
+                100.0 * tokens(&tool) as f64 / file_tokens as f64,
+                pct(0.5),
+                pct(0.95),
+            );
+        }
     }
 
     /// The same file through the local CLI's entry point: the same text.

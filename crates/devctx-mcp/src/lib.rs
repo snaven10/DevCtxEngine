@@ -1,7 +1,8 @@
 //! `devctx-mcp` — Model Context Protocol server (stdio) exposing DevCtxEngine to agents.
 //!
-//! 26 tools over the indexing pipeline: code (`search`, `read_file`,
-//! `read_symbol`, `get_references`, `impact_analysis`, `traverse`, `repo_map`, `summarize`), routes,
+//! 27 tools over the indexing pipeline: code (`search`, `read_file`,
+//! `read_symbol`, `get_references`, `impact_analysis`, `traverse`, `repo_map`, `skeleton`,
+//! `summarize`), routes,
 //! memory, and project/index management. Built on the official `rmcp` SDK.
 //! See `docs/architecture-spec.md` §8 for the process model.
 
@@ -359,6 +360,18 @@ struct RepoMapReq {
     /// Type.member) count as focus symbols, and so does a one-word query.
     #[serde(default)]
     query: Option<String>,
+}
+
+/// Parameters for the `skeleton` tool (PLAN-009 TASK-014, DD-17).
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct SkeletonReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
+    /// The file: a repo-relative path (or absolute inside the repository),
+    /// as read_file takes it.
+    file: String,
 }
 
 /// Parameters for the `build_context` tool.
@@ -1408,6 +1421,40 @@ impl DevctxServer {
             ..q
         };
         run_blocking(move || backend.repo_map(&q)).await
+    }
+
+    /// The structure of one file: its symbols with signatures and lines.
+    #[tool(
+        description = "Skeleton of one file, to locate where something is: its symbols \
+        (classes, methods, functions, fields…) with their signatures and line ranges `[l1-l2]`, \
+        nested by container, without bodies, and its imports summarized in one line. Much \
+        cheaper than reading the file. Use it to locate where something is; to edit, \
+        read_symbol / read_file (a line range from the skeleton): a skeleton is not the code. \
+        `file` is a repo-relative path, as read_file takes it; a file the index does not hold \
+        is an error that names the nearest indexed paths. Test code is marked `[test]` (a \
+        test file says so in its first line). Returns text, within DEVCTX_MAX_OUTPUT_TOKENS: \
+        a symbol-count line, `imports (N): …`, one line per symbol, and a closing `[devctx] \
+        N more symbols (lines a-b)` line when it was cut. Needs an index made by 0.10 (else: \
+        devctx index --full)."
+    )]
+    async fn skeleton(
+        &self,
+        Parameters(req): Parameters<SkeletonReq>,
+    ) -> Result<String, ErrorData> {
+        let q = skeleton::SkeletonQuery::of(req.file.clone());
+        // A bad parameter is the caller's, said before a server is reached.
+        q.validate()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        // As read_file: an absolute path names its project.
+        let hint = req.project.clone().or_else(|| Some(req.file.clone()));
+        let (backend, resolved) = self.backend_for(hint.as_deref())?;
+        // Which repository answered is part of the answer, a line inside
+        // the budget (as repo_map).
+        let q = skeleton::SkeletonQuery {
+            label: resolved.map(|p| format!("[devctx] skeleton from {p}")),
+            ..q
+        };
+        run_blocking(move || backend.skeleton(&q)).await
     }
 
     /// Progress on the plans under `plans/` (markdown, source of truth).

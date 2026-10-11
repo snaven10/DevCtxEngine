@@ -63,6 +63,7 @@ fn router(api: Api) -> Router {
         .route("/references/:symbol", get(references))
         .route("/traverse", post(traverse))
         .route("/repo-map", get(repo_map))
+        .route("/skeleton", get(skeleton))
         .route("/memories/by-symbol/:symbol", get(memories_by_symbol))
         .route("/memories/by-file/:file", get(memories_by_file))
         .route("/memory/:id/refs", get(memory_refs))
@@ -1261,6 +1262,20 @@ async fn repo_map(State(api): State<Api>, Query(p): Query<RepoMapParams>) -> Res
     run(api.state, move |s| devctx_mcp::state::do_repo_map(s, &q)).await
 }
 
+/// `GET /skeleton?file=…` (PLAN-009 TASK-014): the `skeleton` tool, text. A
+/// missing `file` is a 400; an old index or a file the index does not hold is
+/// refused as every tool error (a 500 with `error`), never a 404, which
+/// clients read as "this server predates the route".
+async fn skeleton(
+    State(api): State<Api>,
+    Query(q): Query<devctx_mcp::skeleton::SkeletonQuery>,
+) -> Response {
+    if let Err(e) = q.validate() {
+        return json_err(StatusCode::BAD_REQUEST, e);
+    }
+    run(api.state, move |s| devctx_mcp::state::do_skeleton(s, &q)).await
+}
+
 /// Link memories saved before the junction existed.
 async fn backfill_links(State(api): State<Api>, Json(b): Json<BackfillBody>) -> Response {
     run(api.state, move |s| {
@@ -1697,6 +1712,44 @@ mod tests {
         assert!(text.contains("budget"), "{text}");
         let req = Request::builder()
             .uri("/repo-map?budget=512&focus_symbols=Store.open")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!v["error"].as_str().unwrap().is_empty(), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-014: `GET /skeleton` exists and takes `file` from the
+    /// query string; an empty one is a 400 with its message; a project with
+    /// nothing indexed is an error (a 500, never the 404 a client reads as
+    /// "old server"), never an empty skeleton.
+    #[tokio::test]
+    async fn skeleton_takes_its_file_from_the_query() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_skeleton_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .uri("/skeleton?file=%20")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("file is required"), "{text}");
+        let req = Request::builder()
+            .uri("/skeleton?file=src%2Fa.rs")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

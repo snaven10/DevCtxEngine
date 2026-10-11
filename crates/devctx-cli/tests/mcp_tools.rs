@@ -826,6 +826,18 @@ fn traverse_refuses_a_depth_over_four() {
     assert!(message.contains("between 1 and 4"), "{message}");
 }
 
+/// PLAN-009 TASK-014: `skeleton` is a tool of the MCP, and an empty `file`
+/// is refused with its message before any server is reached.
+#[test]
+fn skeleton_refuses_an_empty_file() {
+    let tmp = Tmp::new("skeleton_file");
+    let home = tmp.home();
+    let repo = tmp.repo("proj");
+    devctx(&home, &repo, &["projects", "add", ".", "--init"]);
+    let message = call_tool_error(&home, &repo, "skeleton", serde_json::json!({ "file": " " }));
+    assert!(message.contains("file is required"), "{message}");
+}
+
 /// PLAN-009 TASK-011: `repo_map` is a tool of the MCP, and a budget of 0 is
 /// refused with its message before any server is reached.
 #[test]

@@ -51,7 +51,7 @@ const EN: &str = "\
 Commands by job:
   Set up        init · models · mcp configure · projects add
   Index         index · reindex · watch · hooks install · status · repair
-  Read code     search · symbol · context · map · impact · traverse · routes · summarize
+  Read code     search · symbol · context · map · skeleton · impact · traverse · routes · summarize
   Memory        remember · recall · memory-stats · memory-forget · memories export|import
   Interfaces    tui · web · api · mcp · serve
 
@@ -62,6 +62,8 @@ Easy to miss:
                     members, type uses (--kinds, --dir in|out|both, --depth).
   map               A map of the repo to orient yourself: the signatures that
                     matter for a focus (--focus file, --symbol, --query), ~1k tokens.
+  skeleton <file>   A file's symbols with signatures and line ranges, no bodies:
+                    to locate; to edit, symbol / read_file.
   context <query>   One budgeted brief: what is already known, the code that
                     ranks highest, and the memories recorded against those files.
   symbol <name>     A symbol's definition and code, by name.
@@ -76,7 +78,7 @@ const ES: &str = "\
 Comandos por tarea:
   Configurar    init · models · mcp configure · projects add
   Indexar       index · reindex · watch · hooks install · status · repair
-  Leer código   search · symbol · context · map · impact · traverse · routes · summarize
+  Leer código   search · symbol · context · map · skeleton · impact · traverse · routes · summarize
   Memoria       remember · recall · memory-stats · memory-forget · memories export|import
   Interfaces    tui · web · api · mcp · serve
 
@@ -87,6 +89,8 @@ Fáciles de pasar por alto:
                     imports, jerarquía, miembros, usos de tipo (--kinds, --dir, --depth).
   map               Un mapa del repo para orientarse: las firmas que importan
                     para un foco (--focus archivo, --symbol, --query), ~1k tokens.
+  skeleton <archivo> Los símbolos de un archivo con firma y líneas, sin cuerpos:
+                    para ubicar; para editar, symbol / read_file.
   context <query>   Un brief con presupuesto: lo que ya se sabe, el código que
                     mejor rankea, y las memorias registradas sobre esos archivos.
   symbol <nombre>   La definición y el código de un símbolo, por nombre.

@@ -322,6 +322,12 @@ enum Command {
         #[arg(long)]
         query: Option<String>,
     },
+    /// The structure of one file, to locate where something is: its symbols
+    /// with signatures and line ranges, nested, without bodies.
+    Skeleton {
+        /// The file: a repo-relative path (as read_file takes it).
+        file: String,
+    },
     /// Progress on the plans under `plans/` (markdown, source of truth). No daemon, no store:
     /// reads markdown from disk. Fast enough for a shell-startup hook.
     PlanStatus {
@@ -734,6 +740,7 @@ fn main() -> Result<()> {
             query,
             label: None,
         }),
+        Command::Skeleton { file } => cmd_skeleton(devctx_mcp::skeleton::SkeletonQuery::of(file)),
         Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),
         Command::Routes { method, path } => cmd_routes(method, path),
         Command::Summarize {
@@ -2458,6 +2465,29 @@ fn cmd_map(q: devctx_mcp::repo_map::RepoMapQuery) -> Result<()> {
         None => {
             let store = open_store(&cfg, configured_dimension(&cfg))?;
             devctx_mcp::state::repo_map_at(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+                &q,
+            )
+            .map_err(|e| anyhow!(e))?
+        }
+    };
+    print!("{text}");
+    Ok(())
+}
+
+/// `devctx skeleton <file>` — the file's structure (PLAN-009 TASK-014): the
+/// same text as the `skeleton` tool, through the server when there is one.
+fn cmd_skeleton(q: devctx_mcp::skeleton::SkeletonQuery) -> Result<()> {
+    // A bad parameter is refused before a server or a store is touched.
+    q.validate().map_err(|e| anyhow!(e))?;
+    let cfg = load_project()?;
+    let text = match remote::ensure_cli(&cfg)? {
+        Some(r) => r.skeleton(&q)?,
+        None => {
+            let store = open_store(&cfg, configured_dimension(&cfg))?;
+            devctx_mcp::state::skeleton_at(
                 &store,
                 &project_root(&cfg)?,
                 cfg.indexing.default_branch(),
