@@ -399,6 +399,13 @@ cerrar TASK-011, con TASK-009 incluida pero apagada.
 (un solo release al cerrar TASK-011). TASK-001 (instrumentación) se mergea antes a `main` sin release
 y viaja con `0.10.0`.
 
+**Decidido (2026-10-11, Q-9):** el bloque de calidad se parte. Una **`0.10.x`** (después de la
+`0.10.0` de PLAN-009) lleva lo que no toca vectores: TASK-013, TASK-014, TASK-015, TASK-016, la
+medición de TASK-018 y el retiro de `jina-v2`. Con fastembed todavía como motor, TASK-013 ya sella
+`eng=fe-compat/1`, así que la `0.11.0` no re-sella. La `0.11.0` (cierre de TASK-011) lleva el motor
+propio, TASK-017 y TASK-019. Ninguna de las dos exige reindex al actualizar (§6); la migración CLS es
+el paso opcional de TASK-011 (Q-6).
+
 ## 11. Contrato de resultado (lo que cada task reporta al cerrar)
 
 Cada TASK llena su `## Resultado` con:
@@ -457,7 +464,22 @@ Cada TASK llena su `## Resultado` con:
 - Buscar el mejor método para cada pieza (por eso FTS, consulta bilingüe y pooling se eligen por
   matriz medida, no por suposición).
 
-### Preguntas abiertas nuevas (2026-10-11)
+### Respondidas por el usuario (2026-10-11), según la recomendación salvo Q-9
+
+- **Q-2 →** `max_length` de Granite: **el mayor que quepa** en +20 % de indexado y 1.5 GB de pico,
+  medido en TASK-017, en la misma migración que CLS.
+- **Q-6 →** la migración la **corre el orquestador dentro de TASK-011**, de a un repo, con OK del
+  usuario justo antes de arrancar (y solo si TASK-017 pasa la regla por task).
+- **Q-7 →** `reranking.enabled: true` por defecto **solo si** el ganador de TASK-018 le gana a "sin
+  rerank" y su **p95 ≤ 2 s** en el motor propio; si no, sigue `false`.
+- **Q-8 →** **retirar `jina-v2`** de los builtins: quien lo tenga configurado recibe un aviso que pide
+  elegir otro (TASK-019).
+- **Q-9 →** **release en dos partes**: una **`0.10.x` previa** con lo que no toca vectores
+  (TASK-013 huella v2, TASK-014 set ampliado, TASK-015 FTS, TASK-016 consulta bilingüe y la medición
+  de TASK-018, más el retiro de `jina-v2`), y el resto (motor propio, TASK-017 CLS/`max_length`,
+  TASK-019 nuevo default) en la `0.11.0`. Ver §10.
+
+### Preguntas abiertas nuevas (2026-10-11) — texto original
 
 - **Q-2 (reformulada; reemplaza a la Q-2 original) — `max_length` de Granite.** TASK-017 mide 512 / 1024 / efectivo (~2048 con
   `max_chars` 4096). Propuesta: adoptar el mayor que quepa en +20 % de indexado y 1.5 GB de pico,
