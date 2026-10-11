@@ -495,6 +495,73 @@ mod tests {
         assert!((ratio - 2.0).abs() < 1e-6, "{ratio} {r:?}");
     }
 
+    /// Review of TASK-011, m1: `global()` is TASK-010's algorithm bit for
+    /// bit — the ranks of two graphs as `b5ddae9` computed them (its
+    /// `pagerank_run`, built apart from this tree), hard-coded.
+    #[test]
+    fn global_ranks_are_those_of_task_010_bit_for_bit() {
+        let nodes = [1, 2, 3, 4, 5, 6];
+        let bits = |r: &[f64]| r.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        let six: Vec<RankEdge> = (1..=5).map(|i| e(i, 6)).chain([e(6, 1)]).collect();
+        let run = pagerank_run(&nodes, &six);
+        assert_eq!(
+            bits(&run.ranks),
+            [
+                0x3fdb54683cf02cb4,
+                0x3f9999999999999b,
+                0x3f9999999999999b,
+                0x3f9999999999999b,
+                0x3f9999999999999b,
+                0x3fde45315ca96ce4
+            ]
+        );
+        assert_eq!(run.iterations, 87);
+        let mut w = vec![e(1, 2), e(2, 3), e(3, 1), e(4, 1), e(5, 6), e(6, 4)];
+        w[0].confidence = RankConfidence::Low;
+        w[1].confidence = RankConfidence::Medium;
+        w[2].from_test = true;
+        w[3].n = 9;
+        w[4].kind = RankKind::References;
+        w[5].kind = RankKind::Imports;
+        let run = pagerank_run(&nodes, &w);
+        assert_eq!(
+            bits(&run.ranks),
+            [
+                0x3fd19f04c6c4224e,
+                0x3fc08b4afa1f5816,
+                0x3fc2fd8adc31027a,
+                0x3fcb25b9a60b267c,
+                0x3fb51b172c3fa02d,
+                0x3fc385db5ffc6a46
+            ]
+        );
+        assert_eq!(run.iterations, 18);
+        // The 40-node graph of `the_ranks_are_deterministic` (confidences,
+        // tests, multiplicities): an FNV-1a of every rank's bits.
+        let nodes: Vec<u64> = (1..=40).map(|i| i * 7919 % 1000).collect();
+        let conf = [
+            RankConfidence::High,
+            RankConfidence::Medium,
+            RankConfidence::Low,
+        ];
+        let edges: Vec<RankEdge> = (0..600)
+            .map(|i| {
+                let mut x = e(nodes[i % 40], nodes[(i * 13 + 5) % 23]);
+                x.n = 1 + (i as u64 * 37 % 11);
+                x.confidence = conf[i % 3];
+                x.from_test = i % 7 == 0;
+                x
+            })
+            .collect();
+        let run = pagerank_run(&nodes, &edges);
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in run.ranks.iter().flat_map(|x| x.to_bits().to_le_bytes()) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        assert_eq!((h, run.iterations), (0x4d71b67b452becda, 7));
+    }
+
     /// TASK-011: personalized with a uniform vector and no multipliers is
     /// the global rank (up to rounding); an empty or zero vector is the
     /// global rank itself.
