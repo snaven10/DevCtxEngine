@@ -1136,7 +1136,10 @@ omitted_by_limit?, dispatch?, omitted_for_budget?, branch_fallback?}`:
   llamador de un equivalente se clonaba por cada origen que lo compartía (ahora a lo sumo
   `DISPATCH_MAX_ORIGINS_PER_EQUIVALENT` = 16; el resto en `omitted_by_limit.dispatch.
   origins_capped`), más un tope de `DISPATCH_MAX_ROWS` = 8 192 filas de dispatch por llamada
-  (`rows_capped`, y en traverse `total_is_lower_bound`). Sintético después: traverse p95 ≤ 126 ms,
+  (`rows_capped`, y `total_is_lower_bound` en traverse e impact). Los orígenes que se quedan son los
+  de cadena más segura (luego por id: segunda revisión; por id solo, un camino `medium` podía
+  perderse). Pendiente de TASK-016: en downstream los pares `owners × reach` pueden llegar a
+  cientos de miles. Sintético después: traverse p95 ≤ 126 ms,
   impact_analysis p95 98 ms (`get`) y 66 ms (`IGet.get`).
 
 ## DD-17 — Vista `skeleton`

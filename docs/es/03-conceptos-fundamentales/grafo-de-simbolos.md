@@ -179,10 +179,10 @@ super-interfaz); un método override-equivalente más lejos se cuenta en
 `omitted_by_limit.dispatch` (en su `count`, y aparte en `beyond_depth`, con
 `max_depth: 4`), sin seguirlo. Un método de supertipo que implementan muchos de
 los métodos recorridos (una interfaz con mil implementaciones, todas raíces) se
-atribuye a lo sumo a 16 de ellos: sus llamadores se alcanzan todos, y los pares sin
+atribuye a lo sumo a 16 de ellos, primero las cadenas más seguras: sus llamadores se alcanzan todos, y los pares sin
 atribuir se cuentan en `omitted_by_limit.dispatch.origins_capped` (con
 `max_origins`); una llamada arma como mucho 8 192 filas de dispatch, y el resto se
-cuenta en `rows_capped` (con `max_rows`; `traverse` dice entonces
+cuenta en `rows_capped` (con `max_rows`; la respuesta dice entonces
 `total_is_lower_bound`). Ese nodo lleva `via: "dispatch"` y `through` (el método por el que
 pasó), y su confianza es `min(medium, la arista que representa)`: nunca `high`, y
 una llamada `low` sigue `low` (contada en `below_confidence` por defecto). Para

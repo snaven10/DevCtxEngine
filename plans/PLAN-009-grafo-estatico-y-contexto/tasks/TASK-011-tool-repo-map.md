@@ -245,7 +245,7 @@ DD-12 (parte personalizada) y DD-14.
     nombrado 0,05 %; y la de uno junto a un término de 300 definiciones) y
     `focus_files_weigh_the_same_whatever_their_size` (0,453 contra 0,0045); por mutación, volver a
     la masa por símbolo (de archivo o de definición) hace fallar cada uno.
-  - *M2* (`0a500ea`, arnés): foco = el archivo que más usa el símbolo esperado (llamadas,
+  - *M2* (`0a500ea`, arnés): foco = el **vecino más fuerte**, el archivo que más usa el símbolo esperado (llamadas,
     instanciaciones, referencias, imports; no el archivo esperado ni tests), sin query; ¿aparece el
     archivo esperado? DevCtxEngine 3/3 (puestos 1, 3, 8 de 18-32 archivos), backend-a 6/7 (puestos 1,
     1, 1, 1, 4, 7, 7; el que falta no entra en 22 archivos), backend-b 1/1, frontend 6/6 (puestos 1,
@@ -273,4 +273,26 @@ DD-12 (parte personalizada) y DD-14.
     `procown::a_checkpoint_that_ends_inside_the_term_wait_still_earns_the_margin`,
     `remote::the_autospawn_mark_is_read_from_the_environment`,
     `serve_lifecycle::an_idle_server_exits_after_its_window`.
+- **Segunda revisión (APROBADA CON UN CAMBIO), resuelta encima de `72366d3`:**
+  - *MAJOR* (`0715d62`): el tope de orígenes por equivalente se quedaba con los 16 de id más bajo; si
+    llegaban por un `implements` `low` y el que quedaba afuera por uno `high`, todas las filas salían
+    `low` y, con `medium`, los llamadores caían en `below_confidence`. Ahora se ordena por cadena
+    descendente y luego por origen. `the_origins_kept_are_the_surest` (20 orígenes `low`, uno `high`
+    de id más alto) **fallaba antes**: 0 nodos, `below_confidence: 3`.
+  - *m1* (`2e8143d`): impact pone `total_is_lower_bound: true` con `rows_capped`;
+    `capped_dispatch_origins_and_rows_are_said` amplía (**fallaba antes**) y fija que con solo
+    `origins_capped` no aparece.
+  - *m3* (`79895fe`): un contador de drops leído antes de la carga; si un `index` termina (bien,
+    mal o cancelado) mientras se lee, el grafo se responde y no se guarda.
+    `a_graph_read_while_an_index_ended_is_not_kept` **fallaba antes** (quedaba guardado).
+  - *Gate* por commit (fmt, clippy con y sin `gpu`, `cargo test --workspace --locked
+    --no-fail-fast`): 1 185, 1 185 y 1 186 pasan, 0 fallan.
+  - **Pendientes para TASK-016 (anotados, no hechos):** (m4) el arnés M2 usa el vecino más fuerte:
+    medir también un vecino mediano o aleatorio y uno a 2 saltos; (m2) en downstream los pares
+    `owners × reach` de la consulta de equivalentes pueden llegar a cientos de miles (una interfaz
+    con muchas implementaciones en la frontera); (NIT) un serve viejo ignora `label`;
+    `has_top_level_arrow` puede bajar a profundidad negativa con un `)` o `>` sobrante; empates
+    exactos en el borde de las 8 192 filas (el orden fija cuáles, pero filas iguales en clave se
+    cortan por posición); **reindexar el frontend del arnés antes de TASK-016** (se indexó con las
+    bases basura de `TypeText` previas a `c20e57d`).
 

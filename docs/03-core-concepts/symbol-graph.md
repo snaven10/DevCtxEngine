@@ -173,10 +173,10 @@ override-equivalent method further away is counted in
 `omitted_by_limit.dispatch` (its `count`, and apart in `beyond_depth`, with
 `max_depth: 4`), not followed. A supertype method that many of the methods
 walked implement (an interface with a thousand implementations, all of them
-roots) is attributed to at most 16 of them: its callers are all reached, and the
+roots) is attributed to at most 16 of them, the surest chains first: its callers are all reached, and the
 pairs left unattributed are counted in `omitted_by_limit.dispatch.origins_capped`
 (with `max_origins`); a call builds at most 8 192 dispatch rows, the rest counted
-in `rows_capped` (with `max_rows`; `traverse` then says `total_is_lower_bound`).
+in `rows_capped` (with `max_rows`; the answer then says `total_is_lower_bound`).
 Such a node
 has `via: "dispatch"` and `through` (the method it went through), and its
 confidence is `min(medium, the edge it stands for)` — never `high`, and a `low`
