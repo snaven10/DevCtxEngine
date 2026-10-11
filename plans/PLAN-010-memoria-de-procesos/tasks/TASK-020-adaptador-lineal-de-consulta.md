@@ -4,7 +4,7 @@
 - **Especialista:** general-purpose (Rust + script de entrenamiento)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`)
 - **Depende de:** TASK-016, TASK-017
-- **Estado:** `postponed` (pospuesta: ver "Por qué se pospone")
+- **Estado:** `skipped` — pospuesto por decisión del usuario 2026-10-11 (sin fine-tuning por ahora; ver "Por qué se pospone")
 
 ---
 
@@ -42,12 +42,12 @@ tocar los índices. PLAN-010 DD-17.
 - [ ] Entrenamiento fuera del binario (script de Python, `W` inicializada en identidad, pérdida
       contrastiva con negativos del mismo repo, regularización hacia la identidad).
 - [ ] `W` versionada como archivo con sha256; `embeddings.query_adapter: <ruta>`; apagado por defecto.
-- [ ] Medición con el arnés de TASK-014 y los umbrales de DD-12; EN no puede bajar.
+- [ ] Medición con el arnés de TASK-014 y los umbrales de PLAN-010 DD-12; EN no puede bajar.
 
 ## Criterios de aceptación (si se reabre)
 
 - [ ] Decisión explícita del usuario de que esto no viola "sin fine-tuning", registrada en el master.
-- [ ] Umbrales de DD-12 sobre el set de evaluación, que nunca se usó para entrenar.
+- [ ] Umbrales de PLAN-010 DD-12 sobre el set de evaluación, que nunca se usó para entrenar.
 
 ## Resultado
 

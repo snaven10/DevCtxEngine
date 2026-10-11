@@ -131,7 +131,7 @@ usuario; además no separa modelo de DuckDB.
 - **Batch y padding**: con `BatchLongest`, el vector de un texto puede variar en el último ULP según
   con qué otros textos comparta lote (ModernBERT con padding + máscara). El arnés compara también
   "mismo texto en lotes distintos" para saber cuánto ruido es inherente y no culparle al motor.
-- Se registra el motor en `index_meta` (`embed_engine = ort-direct/1`, tabla de PLAN-008 TASK-007)
+- Se registra el motor en `index_meta` (`embed_runtime = devctx-onnx/1`, tabla de PLAN-008 TASK-007)
   sólo como diagnóstico: **no** dispara aviso de reindex.
 
 **Si no se alcanza la tolerancia:** TASK-004 queda `blocked` con el diff medido; se evalúa con el
@@ -148,7 +148,9 @@ activaciones por texto. Pero **cambia el vector de todo chunk que tenga > 256 to
 distinto), así que los índices existentes quedan mezclados: chunks viejos a 512 y nuevos a 256 en el
 mismo espacio. Por eso: el valor efectivo se guarda en `index_meta` (`embed_max_length`) y, si la
 config no coincide con lo indexado, `status` avisa "reindex recomendado" (mismo mecanismo que
-`extractor_stale`). Además `DEVCTX_EMBED_MAX_CHARS` (4096, `local.rs:23`) ya recorta antes del
+`extractor_stale`). Para Granite, desde el bloque de calidad, el `max_length` efectivo (igual que el
+pooling) se fija al de la huella guardada y solo cambia con una migración explícita: ver PLAN-010
+DD-15 y DD-11. Además `DEVCTX_EMBED_MAX_CHARS` (4096, `local.rs:23`) ya recorta antes del
 tokenizer; se documenta la relación.
 
 ## DD-5 — Pesos compartidos entre procesos
@@ -218,7 +220,7 @@ YAML. El central usa los de `defaults.embeddings` de su config.
 
 - **Servidor (central):** `POST /embed { "texts": [...], "model": "<key>", "dimension": 384,
   "max_length": 512 }` → `{ "vectors": [[...]], "model": "<key>", "dimension": 384,
-  "engine": "ort-direct/1", "version": "<devctx>" }`. Rechaza (409) si `model`/`dimension`/
+  "engine": "devctx-onnx/1", "version": "<devctx>" }`. Rechaza (409) si `model`/`dimension`/
   `max_length` no coinciden con su embedder (`shares_vector_space`, `devctx-central/src/lib.rs:158`,
   por fin tiene uso).
 - **Sin mutex:** el handler toma el `Arc<dyn EmbeddingProvider>` con el lock **sólo para clonarlo**
@@ -280,10 +282,14 @@ intercambiables. Las memorias no tienen huella: el central solo detecta un cambi
 - **Migración v1→v2 sin re-embeber:** una v1 equivale a la v2 activa si el resto coincide y `pool`
   y `maxlen` activos son los implícitos de hoy (Granite = Mean/512). Se re-sella. Mismo criterio de
   confianza que ya se aplicó a los índices "anteriores a fingerprints".
-- **`eng=` es una clase numérica**, no un nombre de crate: el motor propio de TASK-004 usa la misma
-  clase que fastembed (`fe-compat/1`) **solo si** pasa el arnés con la tolerancia de DD-3 (como el
-  device CPU/CUDA, que ya queda fuera de la huella por mover solo redondeo). Si no pasa, clase nueva
-  y `--full` declarado.
+- **`eng=` es una clase numérica**, no un nombre de crate, y TASK-013 la escribe como
+  `fe-compat/1` **desde el primer día**, con un mapa explícito en el código
+  (`fastembed-4.9.1/ort-2.0.0-rc.9` → `fe-compat/1`); la equivalencia v1↔v2 traduce el motor de la v1
+  por ese mapa. Así la huella cambia **una sola vez** (v1→v2, sin re-embeber) y no otra vez con el
+  motor: TASK-004 solo agrega su motor al mapa con la misma clase si pasa el arnés con la tolerancia
+  de DD-3 (como el device CPU/CUDA, que ya queda fuera de la huella por mover solo redondeo). Si no
+  pasa, TASK-004 queda `blocked`; una clase nueva (y `--full` en todos los repos) solo con aprobación
+  explícita del usuario. El diagnóstico `embed_runtime` de DD-3 es otro campo y no entra en la huella.
 - **Memorias:** huella del espacio de memorias guardada en el central y en cada store de repo;
   `shares_vector_space` compara huellas; `remember`/`recall` se niegan a mezclar; el JSONL de export
   lleva la huella y el import reusa solo con huella igual.
@@ -299,11 +305,19 @@ strings.
 idioma × modo × tipo de consulta, mediana de 3 corridas e IC 90 % de la diferencia por bootstrap.
 Los targets se escriben antes de medir.
 
-**Umbral de adopción** (cada task del bloque): ES Hit@5 ≥ +10 pp o MRR ES ≥ +0.05 con IC sin cruzar
-0; EN sin bajar más de 1 caso (MRR ≥ −0.02); brief y recall sin regresión; indexado ≤ +20 %;
-`search` p95 ≤ +10 % sin rerank.
+**Dos reglas.**
+- **Por task** (adopción de cada cambio): la mediana mejora en ES (Hit@5 o MRR) respecto del punto de
+  partida de la task, y **ninguna regresión con IC**: en ES, EN, brief y recall el IC 90 % de la
+  diferencia no queda entero por debajo de 0; además EN ≤ −1 caso (MRR ≥ −0.02), brief y recall
+  ≤ −1 caso; indexado ≤ +20 %; `search` p95 ≤ +10 % sin rerank. Un reranker además tiene que subir la
+  mediana del MRR global frente a "sin rerank".
+- **Por bloque** (meta, TASK-011 contra la línea base de TASK-014): ES Hit@5 ≥ +10 pp o MRR ES ≥ +0.05
+  con IC 90 % sin cruzar 0, con los mismos límites de no regresión.
 
-**Por qué +10 pp y no +2/13:** con 13 casos, +2 es 15 pp y está dentro de lo que el ruido (±1 caso)
+Por qué separarlas: exigir +10 pp a cada task descartaría cambios chicos que sumados sí llegan; la
+meta fuerte se pide al conjunto.
+
+**Por qué +10 pp (por bloque) y no +2/13:** con 13 casos, +2 es 15 pp y está dentro de lo que el ruido (±1 caso)
 más la elección de casos pueden producir; con 40, +10 pp son 4 casos y el IC lo separa del azar.
 
 ## DD-13 — FTS con idioma e identificadores
@@ -385,8 +399,8 @@ que no viola "sin fine-tuning".
 
 ## DD-18 — Orden y compuertas del bloque de calidad
 
-1. **TASK-013 (huella) y TASK-014 (set + línea base)** primero, en paralelo con TASK-001/003. La huella
-   va antes del motor (TASK-004) para que ese cambio quede registrado bien.
+1. **TASK-013 (huella) y TASK-014 (set + línea base)** primero, en paralelo con TASK-002/003 (TASK-001
+   ya está `done`). La huella va antes del motor (TASK-004) para que ese cambio quede registrado bien.
 2. Con la línea base: **TASK-015 (FTS), TASK-016 (`queries`) y TASK-018 (medición del reranker)** en
    paralelo; ninguna cambia vectores ni depende del motor (TASK-018 mide por `model_dir` sobre
    fastembed).

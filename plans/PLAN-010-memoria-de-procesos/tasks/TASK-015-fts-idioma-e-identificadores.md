@@ -64,7 +64,7 @@ reconstruye el índice FTS (barato). PLAN-010 DD-13.
       | F3 | spanish | english+spanish | no |
       | F4 | mejor de F1-F3 | english+spanish | partidos |
       | F5 | dos índices (porter / spanish) fusionados por RRF | ídem | partidos |
-      F5 solo si F1-F4 no alcanzan el umbral (cuesta el doble de FTS).
+      F5 solo si F1-F4 no cumplen la regla por task (cuesta el doble de FTS).
 - [ ] **Paso 3 — partido de identificadores.** Tabla auxiliar `fts_docs(id, body)` que se rehace en
       `rebuild_fts`: `body = text || ' ' || <text con camelCase partido>` vía `regexp_replace` en SQL
       (`([a-z0-9])([A-Z])` → `\1 \2`, `([A-Z]+)([A-Z][a-z])` → `\1 \2`), y el índice FTS sobre ella.
@@ -83,9 +83,9 @@ reconstruye el índice FTS (barato). PLAN-010 DD-13.
 ## Criterios de aceptación
 
 - [ ] Paso 1 en el Resultado: tabla caso a caso de los ES perdidos con la hipótesis que lo explica.
-- [ ] Con el default elegido, **híbrido ES**: Hit@5 ≥ +10 pp **o** MRR ≥ +0.05 sobre la línea base
-      de TASK-014, con IC 90 % sin cruzar 0; **híbrido EN** sin bajar más de 1 caso; brief sin
-      regresión. Si solo se logra igualar al vectorial en ES, se documenta y se decide con el usuario.
+- [ ] Con el default elegido, el **híbrido** cumple la **regla por task** de PLAN-010 DD-12 (mejora puntual en ES, ninguna regresión con IC) contra la línea base de
+      TASK-014, y el híbrido ES queda ≥ vectorial ES (fila de §6). Si solo se logra igualar al
+      vectorial en ES, se documenta y se decide con el usuario.
 - [ ] `rebuild_fts` con la config nueva ≤ +20 % de tiempo y ≤ +20 % de bloques del FTS en
       frontend (el índice más grande del grupo).
 - [ ] Tests: `split_identifiers` parte `findUserById`, `HTTPServer2Config`, `user_id` igual en

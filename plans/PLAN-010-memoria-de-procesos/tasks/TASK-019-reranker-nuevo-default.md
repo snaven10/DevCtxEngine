@@ -47,7 +47,7 @@ con esos números si `reranking.enabled` sigue en `false`. PLAN-010 DD-16.
       aparte) a pool 20/30/50 con `intra_threads` 4 y 8; `VmHWM`; costo de la primera carga.
       Contrastar con lo medido en TASK-018 sobre fastembed.
 - [ ] **Paso 4 — defaults.** `model` = ganador; `pool` = el de TASK-018 (esperado 20-30, no 100: el
-      pool multiplica todo el costo); el ganador debe seguir pasando el umbral de calidad de TASK-018
+      pool multiplica todo el costo); el ganador debe seguir cumpliendo la regla de elegibilidad de TASK-018
       sobre el motor propio (re-correr el arnés con candidatos congelados).
 - [ ] **Paso 5 — `enabled`.** Propuesta a confirmar con el usuario (Q-7): pasa a `true` solo si
       p95 ≤ 2 s al pool elegido con `intra_threads` por defecto **y** se mantiene la ganancia; si no,
@@ -66,8 +66,8 @@ con esos números si `reranking.enabled` sigue en `false`. PLAN-010 DD-16.
       reranker nuevo y reranquea (test ignorado con red + verificación manual con caché vacía).
 - [ ] Latencia p50/p95 y `VmHWM` medidos en el Resultado; con los defaults, p95 ≤ 2 s si
       `enabled: true` por defecto, o documentado como opt-in si no.
-- [ ] Calidad sobre el set de TASK-014 con el motor propio: le gana a "sin rerank" con el umbral de
-      DD-12.
+- [ ] Calidad sobre el set de TASK-014 con el motor propio: le gana a "sin rerank" con la regla por
+      task de PLAN-010 DD-12, como en TASK-018 Paso 5.
 - [ ] `devctx models` muestra licencia; ninguna key por defecto es NC o gated.
 - [ ] Gate del plan verde.
 

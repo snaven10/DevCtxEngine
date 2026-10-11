@@ -61,8 +61,8 @@ PLAN-010 DD-12.
       keyword) × tipo: Hit@1/5/10, MRR, brief archivo/símbolo, y para recall Hit@3/MRR. Intervalo
       simple: bootstrap de 1000 remuestreos por caso → IC 90 % de la diferencia entre dos corridas
       (stdlib, `random` con semilla fija).
-- [ ] **Paso 5 — ruido.** 3 corridas del mismo índice; reportar mediana y rango. El umbral de una
-      task es contra la mediana.
+- [ ] **Paso 5 — ruido.** 3 corridas del mismo índice; reportar mediana y rango. Los umbrales (por
+      task y por bloque) son contra la mediana.
 - [ ] **Paso 6 — línea base congelada.** Correr sobre el binario de `main` al arrancar esta task (sin
       ningún cambio de PLAN-010 de calidad) y guardar `report.md` en el Resultado: es el "antes" de
       TASK-015…019.
@@ -78,15 +78,22 @@ PLAN-010 DD-12.
 - [ ] `git grep` de privacidad del plan vacío sobre todo lo commiteado; los casos privados no están en
       el repo.
 
-## Umbrales que usan las tasks siguientes (DD-12)
+## Umbrales que usan las tasks siguientes (PLAN-010 DD-12)
 
-Una mejora se adopta si, contra la mediana de esta línea base y sobre el set ampliado:
+Dos reglas, una por task y otra por bloque. Todas se miden contra la mediana de 3 corridas.
+
+**Regla por task (adopción de cada cambio de TASK-015…019).** Se compara contra el punto de partida
+de la task, o sea la línea base de esta task más lo ya adoptado. Se adopta si:
+- **ES:** la mediana mejora en Hit@5 o en MRR ES (mejora puntual > 0);
+- **ninguna regresión con IC:** en ES, EN, brief y recall, el IC 90 % de la diferencia **no** queda
+  entero por debajo de 0; además EN no baja más de 1 caso en Hit@5 ni más de 0.02 de MRR, y brief y
+  recall no bajan más de 1 caso (salvo recall en TASK-017, donde se espera que suba);
+- **costo:** indexado ≤ +20 % de tiempo, `search` p95 ≤ +10 % (sin rerank).
+
+**Regla por bloque (meta del bloque, se verifica en TASK-011 contra la línea base de esta task).**
 - **ES:** Hit@5 ≥ +10 pp (≈ +4 casos sobre 40) **o** MRR ES ≥ +0.05, con el IC 90 % de la diferencia
   sin cruzar 0;
-- **EN:** no baja más de 1 caso en Hit@5 ni más de 0.02 de MRR;
-- **brief:** archivo/símbolo sin regresión (≤ −1 caso);
-- **recall:** Hit@3 sin regresión (≤ −1 caso), salvo en TASK-017 donde se espera que suba;
-- **costo:** indexado ≤ +20 % de tiempo, `search` p95 ≤ +10 % (sin rerank).
+- EN, brief y recall: los mismos límites de no regresión de la regla por task.
 
 ## Riesgos
 

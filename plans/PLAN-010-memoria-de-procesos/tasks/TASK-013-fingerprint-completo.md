@@ -13,7 +13,9 @@
 Que la huella de embeddings describa **todo** lo que decide el número que sale para un texto, para
 que ningún cambio de TASK-004, TASK-007 o TASK-017 pueda mezclar vectores de dos espacios en
 silencio: ni en el índice de código, ni en las memorias (locales y del central), ni al importar un
-JSONL. Es la red de seguridad del bloque de calidad. PLAN-010 DD-11.
+JSONL. Es la red de seguridad del bloque de calidad. PLAN-010 DD-11. Actualizar a un binario con
+esta task **no** re-embebe ningún índice ni rompe `remember`/`recall` (§6, "reindex requerido tras
+actualizar: ninguno").
 
 ## Contexto verificado (2026-10-11, rama `feat/plan-009-grafo`; re-verificar líneas al arrancar)
 
@@ -58,7 +60,13 @@ JSONL. Es la red de seguridad del bloque de calidad. PLAN-010 DD-11.
 ## Pasos
 
 - [ ] **Paso 1 — huella v2.** Formato con versión y campos con nombre, p. ej.
-      `v2|local|ml-granite|384|eng=<LOCAL_ENGINE>|pool=mean|maxlen=512|onnx=<sha256[:16]>|max_chars=4096|l2`.
+      `v2|local|ml-granite|384|eng=fe-compat/1|pool=mean|maxlen=512|onnx=<sha256[:16]>|max_chars=4096|l2`.
+      **`eng=` es una clase numérica y se escribe `fe-compat/1` desde el primer día**, nunca el string
+      crudo de `LOCAL_ENGINE`. Mapa explícito y versionado en el código (tabla `ENGINE_CLASSES`):
+      `fastembed-4.9.1/ort-2.0.0-rc.9` → `fe-compat/1`. Un `LOCAL_ENGINE` que no está en el mapa (p. ej.
+      tras un `cargo update` de fastembed u ort) da una clase nueva `unmapped:<LOCAL_ENGINE>` y no
+      reusa nada, igual que hoy. Así TASK-004 no tiene que volver a re-sellar: si su motor pasa el
+      arnés, se agrega al mapa con la misma clase y la huella no cambia.
       Para builtins, `onnx=` es el `model_code/model_file` + revisión de la caché (o el sha si es
       barato); para HTTP queda como hoy. El sha256 del ONNX se calcula una vez por carga y se cachea
       junto al archivo (`<onnx>.sha256` con mtime+tamaño) para no leer 98 MB en cada `index`.
@@ -67,7 +75,8 @@ JSONL. Es la red de seguridad del bloque de calidad. PLAN-010 DD-11.
       `max_length` efectivo = `min(config/def 512, model_max_length, max_input_tokens)`, el mismo
       cálculo que hace fastembed. Nada cambia de valor en esta task: solo se nombra.
 - [ ] **Paso 3 — migración de índices existentes (sin re-embeber).** Una huella v1 guardada se
-      considera **igual** a la v2 activa si y solo si: mismo provider/modelo/ancho/motor/`max_chars`,
+      considera **igual** a la v2 activa si y solo si: mismo provider/modelo/ancho/`max_chars`, el motor
+      de la v1 traducido por el mapa del Paso 1 da la misma clase que el `eng=` activo,
       y la v2 activa tiene `pool` y `maxlen` iguales a los valores implícitos de la v1 (los del Paso 2)
       — o sea, si el setup no cambió. El hash del ONNX no existe en la v1: se acepta (mismo criterio
       que el índice "antes de fingerprints": hubo un solo archivo por clave) y la corrida **re-sella**
@@ -87,14 +96,16 @@ JSONL. Es la red de seguridad del bloque de calidad. PLAN-010 DD-11.
       import reusa el vector solo si la huella es **igual**; un archivo viejo (sin huella) se reusa solo
       si modelo y ancho coinciden **y** la huella activa es la equivalente a la v1 (Paso 3); si no,
       re-embebe y lo dice en el resumen.
-- [ ] **Paso 7 — motor nuevo.** Dejar documentado (comentario + DD-11) que TASK-004 decide el campo
-      `eng=`: si el arnés de TASK-003 pasa con la tolerancia de DD-3, el motor propio se declara del
-      mismo **clase numérica** que fastembed (`eng=fe-compat/1`) y se reusan vectores; si no pasa,
-      `eng=ort-direct/1` y el primer `index` de cada repo es `--full`. Esta task no cambia el motor.
+- [ ] **Paso 7 — motor nuevo.** Dejar documentado (comentario + PLAN-010 DD-11) que TASK-004 solo
+      **agrega una entrada** al mapa del Paso 1 (su motor → `fe-compat/1`) cuando el arnés de
+      TASK-003 pasa con la tolerancia de DD-3; la huella guardada no cambia y no hay re-sellado. Si
+      el arnés no pasa, TASK-004 queda `blocked` (ver su Paso 7) y no se toca el mapa. Esta task no
+      cambia el motor.
 
 ## Criterios de aceptación
 
-- [ ] Tests unitarios: la huella cambia con `pool`, `maxlen`, `onnx`; no cambia con `device`.
+- [ ] Tests unitarios: la huella cambia con `pool`, `maxlen`, `onnx`; no cambia con `device`;
+      `fastembed-4.9.1/ort-2.0.0-rc.9` produce `eng=fe-compat/1`, y un motor fuera del mapa, otra clase.
 - [ ] Test de migración: un store con huella v1 de hoy + config sin cambios → la corrida siguiente
       es **incremental**, reusa vectores y re-sella v2 (cero embeddings nuevos para archivos sin cambio).
 - [ ] Test: misma config pero `pool` distinto → `transition` + `--full`, y nada se reusa.

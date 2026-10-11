@@ -111,8 +111,9 @@ cubre). Se re-evalúan si algún día hay GPU usable.
       justa, y `VmHWM` del serve. Incluir `bge-v2-m3` para confirmar o refutar el ~1.8 s/par y la
       sospecha de sobre-suscripción (con `RAYON_NUM_THREADS=1` como prueba barata).
 - [ ] **Paso 5 — decidir.** Regla: un modelo es elegible si, al pool elegido, **le gana a sin rerank**
-      con el umbral de DD-12 (ES Hit@5 ≥ +10 pp o MRR ES ≥ +0.05, IC 90 % sin cruzar 0; EN sin bajar
-      más de 1 caso; MRR global ≥ sin rerank). Entre elegibles: el de menor p95; empate de ±0.02 de
+      con la regla por task de PLAN-010 DD-12 (mejora puntual en ES, ninguna regresión con IC; EN sin
+      bajar más de 1 caso), y además la mediana del MRR global es mayor que la de sin rerank: el
+      costo del reranker solo se justifica si mejora algo. Entre elegibles: el de menor p95; empate de ±0.02 de
       MRR → el más chico. Si ninguno es elegible, se recomienda dejar `enabled: false` y cambiar solo
       el modelo por defecto al más barato que no empeore (para quien lo active), y se cierra así.
 
@@ -128,7 +129,7 @@ cubre). Se re-evalúan si algún día hay GPU usable.
 ## Riesgos
 
 - **Set chico para rerankers:** 40+40 casos con pool 50 distinguen mejoras grandes, no finas. Por
-  eso el umbral exige IC sin cruzar 0 y se reporta también MRR global.
+  eso el regla exige que ninguna regresión sea significativa (IC) y se reporta también MRR global.
 - **int8 vs fp32:** la cuantización puede mover el orden; se mide, no se asume.
 - **ONNX comunitario de gte:** puede romperse o cambiar; TASK-019 fija la revisión (commit de HF) y el
   sha256.

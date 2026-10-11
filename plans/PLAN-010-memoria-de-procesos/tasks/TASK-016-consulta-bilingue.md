@@ -69,13 +69,12 @@ código. Si Q1 ≈ Q2, Q2 gana igual por tokens y latencia del cliente.
 
 ## Criterios de aceptación
 
-- [ ] Método elegido con: ES Hit@5 ≥ +10 pp **o** MRR ES ≥ +0.05 sobre Q0 (IC 90 % sin cruzar 0),
-      EN sin bajar más de 1 caso, brief sin regresión, recall Hit@3 sin regresión.
+- [ ] El método elegido cumple la **regla por task** de PLAN-010 DD-12 (mejora puntual en ES, ninguna regresión con IC) contra Q0, recall incluido.
 - [ ] Latencia p95 de `search` con 2 consultas ≤ 1.5× la de una (sin rerank); con una sola consulta,
       sin cambio (≤ +10 %, §6).
 - [ ] Compatibilidad: un cliente que no manda `queries` obtiene exactamente lo de hoy (test).
 - [ ] Tests: dedupe, tope de 4, orden estable de la fusión, rerank una sola vez sobre el pool fusionado.
-- [ ] Si ninguna variante pasa el umbral con traducción LLM, se cierra `skipped` con la tabla (el
+- [ ] Si ninguna variante cumple la regla por task con traducción LLM, se cierra `skipped` con la tabla (el
       resultado con traducción a mano solo no alcanza para cambiar la tool).
 
 ## Riesgos

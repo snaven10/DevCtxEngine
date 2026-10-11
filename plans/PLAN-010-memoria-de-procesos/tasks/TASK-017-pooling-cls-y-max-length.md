@@ -79,8 +79,8 @@ antes/después por idioma. PLAN-010 DD-15.
       (servers parados, como `migrate`) re-embebe memorias con el setup nuevo, re-sella la huella del
       espacio de memorias y no pierde nada si se corta (se escribe a una tabla nueva y se reemplaza al
       final; idempotente). `memories export` antes de reembeber, siempre (lo hace el comando).
-- [ ] **Paso 6 — decidir defaults** con la matriz: el par (pooling, `max_length`) que pasa los
-      umbrales con menor costo. Si CLS no gana, se deja Mean y se documenta por qué contra la tarjeta.
+- [ ] **Paso 6 — decidir defaults** con la matriz: el par (pooling, `max_length`) que cumple la
+      regla por task de PLAN-010 DD-12 con menor costo. Si CLS no gana, se deja Mean y se documenta por qué contra la tarjeta.
 - [ ] **Paso 7 — guía de migración** (insumo de TASK-010): orden recomendado para un usuario con N
       repos y memorias: parar servers → `memories export` → `memories reembed` → `index --full
       --upgrade-embeddings` repo por repo (o en serie con un script); tiempo estimado por repo según
@@ -90,9 +90,8 @@ antes/después por idioma. PLAN-010 DD-15.
 
 - [ ] Paso 1 y la estadística de truncación en el Resultado.
 - [ ] Dorados CLS: coseno ≥ 0.9999 contra la referencia de Python, peor caso anotado.
-- [ ] Con los defaults elegidos, sobre el set de TASK-014: ES Hit@5 ≥ +10 pp **o** MRR ES ≥ +0.05
-      (IC 90 % sin cruzar 0); EN sin bajar más de 1 caso; brief sin regresión; recall Hit@3 sin
-      regresión; indexado ≤ +20 % de tiempo; `VmHWM` del indexado ≤ 1.5 GB (§6).
+- [ ] Con los defaults elegidos, sobre el set de TASK-014, se cumple la **regla por task** de PLAN-010 DD-12 (mejora puntual en ES, ninguna regresión con IC)
+      (recall Hit@3 sin regresión); indexado ≤ +20 % de tiempo; `VmHWM` del indexado ≤ 1.5 GB (§6).
 - [ ] Tests: `pooling: auto` sobre un store con huella Mean consulta en Mean; repo nuevo usa CLS;
       `--upgrade-embeddings` re-sella; `memories reembed` cortado a la mitad deja las memorias
       originales intactas; `recall` con huella distinta falla con el mensaje de TASK-013.
