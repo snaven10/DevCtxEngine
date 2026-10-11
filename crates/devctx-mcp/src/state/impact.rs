@@ -395,6 +395,12 @@ fn answer(
                 dispatch_caps(&mut note["dispatch"], origins, rows);
             }
             out["omitted_by_limit"] = note;
+            // Rows past the budget may hide symbols: what is listed and
+            // counted is a floor, as in traverse (second review of
+            // TASK-011, m1).
+            if rows > 0 {
+                out["total_is_lower_bound"] = json!(true);
+            }
         }
     }
     let by_budget = up_dropped.len() + down_dropped.len();
@@ -1010,6 +1016,28 @@ mod tests {
         );
         assert_eq!(d["rows_capped"], 5, "{v}");
         assert!(d["hint"].as_str().unwrap().contains("origins"), "{v}");
+        // Second review of TASK-011, m1: rows past the budget may hide
+        // symbols, so what is listed and counted is a floor (as traverse).
+        assert_eq!(v["total_is_lower_bound"], true, "{v}");
+        let only_origins = SymbolImpact {
+            upstream: ImpactSide {
+                dispatch_origins_capped: 24,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let v = answer(
+            "get",
+            "get",
+            Vec::new(),
+            Vec::new(),
+            &["Impl.get".to_string()],
+            &chosen,
+            super::super::lookup::Reader::SymbolGraph,
+            Some((&only_origins, &opts)),
+            200,
+        );
+        assert!(v.get("total_is_lower_bound").is_none(), "{v}");
     }
 
     #[test]
