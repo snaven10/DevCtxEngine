@@ -148,9 +148,11 @@ existe desde 0.9.0: el mismo archivo compila contra un checkout anterior para el
 ### Gold edges sobre la tabla `edges` (TASK-005 en adelante)
 
 Si el índice tiene `symbols`/`edges`, `run.sh` exporta `edges_new.tsv` (llamadas e instanciaciones
-con el `qualified` de su `dst_id`, `confidence`, `resolution`, `external`) y `score.py gold
+con el `qualified` y el archivo de su `dst_id`, `confidence`, `resolution`, `external`) y `score.py gold
 --new-edges` agrega una segunda tabla: correcto = destino resuelto igual al esperado (o que termina
-en `.esperado`, una clase interna) o marca `external` si el esperado es externo; error = resuelto a
+en `.esperado`, una clase interna; o, para un destino calificado por módulo como `mod.f` de Python,
+cuyo `qualified` guardado es `f`, mismo nombre y archivo del destino igual a la columna 5 del gold)
+o marca `external` si el esperado es externo; error = resuelto a
 otro o marcado al revés; sin decidir = ni destino ni marca; sin arista = no hay ocurrencia (p. ej.
 descartada: las filas `resolution = 'discarded'` no se exportan). Un getter de Lombok cuenta como
 correcto si apunta al campo (`Dto.getX` → `Dto.x`, la convención del link pass). Reporta precisión

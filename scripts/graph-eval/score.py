@@ -372,6 +372,15 @@ def judge_new(site: dict, rows: list[dict], tol: int) -> tuple[str, dict | None]
         if q and (q == want or q.endswith("." + want)
                   or (field and (q == field or q.endswith("." + field)))):
             return "correct", r
+    # Un destino calificado por módulo (Python `mod.f`, el `qualified` guardado es `f`) cuenta
+    # si el nombre coincide y el archivo del destino es el de la columna 5 del gold (el criterio
+    # con que TASK-007 juzgó sus sitios); sin esa columna, o un `edges_new.tsv` viejo sin
+    # `dst_file`, no se usa.
+    if site.get("dst_file"):
+        for r in same:
+            q = norm_target(r["dst_qualified"]) if r["dst_qualified"] else ""
+            if q and leaf(q) == wl and r.get("dst_file") == site["dst_file"]:
+                return "correct", r
     for r in same:
         if r["dst_qualified"] or ext(r):
             return "wrong", r

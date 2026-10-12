@@ -269,9 +269,9 @@ with open(f"{outdir}/edges.tsv", "w", encoding="utf-8", newline="") as fh:
 if have_new:
     with open(f"{outdir}/edges_new.tsv", "w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh, delimiter="\t")
-        w.writerow(["kind", "file", "line", "dst_name", "dst_qualified", "confidence", "resolution", "external"])
+        w.writerow(["kind", "file", "line", "dst_name", "dst_qualified", "confidence", "resolution", "external", "dst_file"])
         for r in con.execute("""select e.kind, e.file, e.line, e.dst_name, s.qualified, e.confidence,
-                                       e.resolution, coalesce(e.external, false)
+                                       e.resolution, coalesce(e.external, false), s.file
                                 from edges e left join symbols s
                                   on s.id = e.dst_id and s.repo = e.repo and s.branch = e.branch
                                 where e.kind in ('calls', 'instantiates')
