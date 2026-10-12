@@ -1294,19 +1294,29 @@ impl Remote {
         self.get(&format!("/symbol/{}?limit={limit}", urlencode(name)))
     }
 
+    /// A brief from the server; `opts` asks for the related section, and a
+    /// server older than it gets a line saying it was not applied
+    /// (`note_unapplied_related`).
     pub fn build_context(
         &self,
         query: &str,
         max_tokens: usize,
         include_memories: bool,
         sel: &devctx_search::KindSel,
+        opts: &devctx_mcp::state::ContextOpts,
     ) -> Result<String> {
-        self.post(
-            "/context",
-            serde_json::json!({ "query": query, "max_tokens": max_tokens,
+        opts.resolve().map_err(|e| anyhow::anyhow!(e))?;
+        let mut body = serde_json::json!({ "query": query, "max_tokens": max_tokens,
                                 "include_memories": include_memories,
-                                "kind": sel.kind, "include_tests": sel.include_tests }),
-        )
+                                "kind": sel.kind, "include_tests": sel.include_tests });
+        if let Some(v) = opts.related {
+            body["related"] = serde_json::json!(v);
+        }
+        if let Some(h) = opts.graph_hops {
+            body["graph_hops"] = serde_json::json!(h);
+        }
+        let out = self.post("/context", body)?;
+        Ok(devctx_mcp::backend::note_unapplied_related(out, opts))
     }
 
     pub fn routes(&self, method: Option<&str>, path: Option<&str>) -> Result<String> {

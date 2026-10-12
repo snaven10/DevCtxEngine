@@ -26,11 +26,15 @@ use serde_json::{json, Value};
 
 mod impact;
 mod lookup;
+mod related;
 mod repo_map;
 mod skeleton;
 mod traverse;
 
 pub use impact::ImpactQuery;
+pub use related::{
+    ContextOpts, DEFAULT_GRAPH_HOPS, DEFAULT_RELATED, RELATED_HEADING, RELATED_NOTE,
+};
 pub use repo_map::REPO_MAP_NEEDS_REINDEX;
 pub use skeleton::SKELETON_NEEDS_REINDEX;
 pub use traverse::{TraverseQuery, DEFAULT_TRAVERSE_LIMIT, TRAVERSE_NEEDS_REINDEX};
@@ -717,6 +721,9 @@ pub fn do_search(
 /// takes as long as the corpus is big, and a brief must not pay that on its
 /// first call. There hybrid without the index degrades to vector search plus
 /// identifier anchoring (`search_ranked` treats a failed keyword leg as empty).
+/// (`build_context` reads the branch too, through `search_items_full`; the
+/// lookup tests read this.)
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn search_items(
     state: &AppState,
@@ -749,6 +756,31 @@ fn search_items_with(
     sel: &devctx_search::KindSel,
     build_fts: bool,
 ) -> Result<SearchRows, String> {
+    search_items_full(state, query, limit, language, mode, rerank, sel, build_fts)
+        .map(|(items, fallback, reader, _)| (items, fallback, reader))
+}
+
+/// [`SearchRows`] and the branch they came from.
+type SearchRowsFrom = (
+    Vec<Value>,
+    Option<BranchFallback>,
+    Option<lookup::Reader>,
+    Option<BranchChoice>,
+);
+
+/// [`search_items_with`], plus the branch the rows came from (what
+/// `build_context`'s related section reads the graph of).
+#[allow(clippy::too_many_arguments)]
+fn search_items_full(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    language: Option<String>,
+    mode: SearchMode,
+    rerank: bool,
+    sel: &devctx_search::KindSel,
+    build_fts: bool,
+) -> Result<SearchRowsFrom, String> {
     let mut opts = sel.options(state.cfg.search.penalty)?;
     let store = state.open_store()?;
     let (branch_filter, fallback, choice) = search_scope(state, &store);
@@ -851,7 +883,7 @@ fn search_items_with(
             }
         }
     }
-    Ok((items, fallback, reader))
+    Ok((items, fallback, reader, choice))
 }
 
 /// Whether a hit is the definition of one of the identifiers anchoring looked
@@ -4505,6 +4537,29 @@ pub fn do_build_context(
     include_memories: bool,
     sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
+    do_build_context_with(
+        state,
+        query,
+        max_tokens,
+        include_memories,
+        sel,
+        &ContextOpts::default(),
+    )
+}
+
+/// [`do_build_context`] with what the call asks of the related section
+/// (PLAN-009 DD-15): with it on, the graph neighbors of the brief's best code
+/// hits, as signatures, after the code; off (or not asked, with
+/// [`DEFAULT_RELATED`] off), the 0.9.0 brief and no read of the graph.
+pub fn do_build_context_with(
+    state: &AppState,
+    query: &str,
+    max_tokens: usize,
+    include_memories: bool,
+    sel: &devctx_search::KindSel,
+    opts: &ContextOpts,
+) -> Result<String, String> {
+    let (related_on, hops) = opts.resolve()?;
     let mems: Vec<Value> = if include_memories {
         // Unbudgeted on purpose: `do_recall_scoped` would shrink each memory to
         // its share of the *tool's* output budget and stamp it "truncated";
@@ -4521,7 +4576,7 @@ pub fn do_build_context(
     //
     // Hybrid without building the BM25 index when it is missing (see
     // `search_items`): the first brief of a project would otherwise wait for it.
-    let (hits, fallback) = search_items(
+    let (hits, fallback, _, choice) = search_items_full(
         state,
         query,
         30,
@@ -4536,7 +4591,20 @@ pub fn do_build_context(
     let fallback_note = fallback
         .as_ref()
         .and_then(|f| fallback_note(&json!({ "branch_fallback": f.to_json() }).to_string()));
-    Ok(compose_context(
+    // Read only when the section is on, and only once the brief knows which
+    // hits it shows.
+    let neighbors = |brief: &[&Value]| -> related::Related {
+        let Some(chosen) = choice.as_ref() else {
+            return related::Related::Unavailable("not shown: no branch is indexed".into());
+        };
+        match state.open_store() {
+            Ok(store) => related::gather(&store, chosen, brief, hops),
+            Err(e) => related::Related::Unavailable(format!(
+                "not shown: the store could not be opened ({e})"
+            )),
+        }
+    };
+    Ok(compose_context_with(
         &mems,
         &hits,
         fallback_note,
@@ -4554,6 +4622,7 @@ pub fn do_build_context(
             .map(|raw| parse_memories(&raw))
             .unwrap_or_default()
         },
+        related_on.then_some(&neighbors as RelatedSource<'_>),
     ))
 }
 
@@ -4588,7 +4657,9 @@ const QUOTE_MIN_CHARS: usize = 40;
 /// comment is shortened first, the chunk is capped, and one that still does not
 /// fit is skipped — the next, smaller one may. (Stopping at the first that did
 /// not fit lost every relevant chunk behind one big one.) What did not fit is
-/// counted and named once, at the end.
+/// counted and named once, at the end. (The 0.9.0 brief, kept as the
+/// reference the tests compare [`compose_context_with`] against.)
+#[cfg(test)]
 fn compose_context(
     mems: &[Value],
     hits: &[Value],
@@ -4596,6 +4667,40 @@ fn compose_context(
     max_tokens: usize,
     include_memories: bool,
     linked: &dyn Fn(&str) -> Vec<Value>,
+) -> String {
+    compose_context_with(
+        mems,
+        hits,
+        fallback_note,
+        max_tokens,
+        include_memories,
+        linked,
+        None,
+    )
+}
+
+/// The neighbors of a brief's code, from the hits it shows (in its order).
+type RelatedSource<'a> = &'a dyn Fn(&[&Value]) -> related::Related;
+
+/// Assemble the brief, with the related section when `related` is given
+/// (PLAN-009 DD-15; see [`compose_context`] for the rest of the rules).
+///
+/// `related` reads the graph neighbors of the hits the code shows, and is
+/// called only when it is given — `None` is the 0.9.0 brief, byte for byte.
+/// The section goes after `## Code` and before "Recorded against this
+/// code", within [`related::CTX_RELATED_SHARE_PCT`] % of the budget, and
+/// takes its room from the code: the code is laid out again within what the
+/// section leaves, a neighbor of a hit that no longer fits goes with it, and
+/// the room such lines leave goes back to the code. Every line not shown and
+/// every hit pushed out is counted in the one `omitted` line.
+fn compose_context_with(
+    mems: &[Value],
+    hits: &[Value],
+    fallback_note: Option<String>,
+    max_tokens: usize,
+    include_memories: bool,
+    linked: &dyn Fn(&str) -> Vec<Value>,
+    related: Option<RelatedSource<'_>>,
 ) -> String {
     let mut out = String::new();
     let mut dropped = 0usize;
@@ -4624,40 +4729,105 @@ fn compose_context(
         }
     }
 
-    let mut code_files: Vec<String> = Vec::new();
-    let mut head = "## Code\n\n";
+    // The code, laid out within `limit` (characters of the whole brief).
+    let code_start = out.len();
     let chunk_cap = (budget / CTX_CODE_CAP_DIV).max(CTX_CODE_CAP_MIN);
-    for h in hits {
-        let file = field(h, "file");
-        // Code a memory in the brief already quotes is not worth paying for
-        // twice.
-        let quoted = field(h, "text").trim();
-        // A short hit (`}`, `use super::*;`) is "contained" in nearly any
-        // memory: only text long enough to be a quotation may suppress code.
-        if is_quotable(quoted) && memory_text.contains(quoted) {
-            continue;
+    let lay_code = |limit: usize| -> CodeLayout {
+        let mut lay = CodeLayout::default();
+        let mut head = "## Code\n\n";
+        for (i, h) in hits.iter().enumerate() {
+            let file = field(h, "file");
+            // Code a memory in the brief already quotes is not worth paying for
+            // twice.
+            let quoted = field(h, "text").trim();
+            // A short hit (`}`, `use super::*;`) is "contained" in nearly any
+            // memory: only text long enough to be a quotation may suppress code.
+            if is_quotable(quoted) && memory_text.contains(quoted) {
+                continue;
+            }
+            let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
+            let style = comment_style(field(h, "language"), file);
+            // Only code has a doc comment to shorten: a Markdown list, a YAML
+            // block or a SQL script is the content itself.
+            let text = if hit_kind(h) == devctx_core::PathKind::Code {
+                trim_leading_doc(field(h, "text"), style)
+            } else {
+                field(h, "text").to_string()
+            };
+            let body = cap_lines(&text, chunk_cap, style);
+            let piece = format!("{head}// {file}:{line}\n{body}\n\n");
+            if code_start + lay.text.len() + piece.len() > limit {
+                lay.dropped += 1;
+                continue;
+            }
+            lay.text.push_str(&piece);
+            head = "";
+            lay.shown.push(i);
+            if !lay.files.iter().any(|f| f == file) {
+                lay.files.push(file.to_string());
+            }
         }
-        let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
-        let style = comment_style(field(h, "language"), file);
-        // Only code has a doc comment to shorten: a Markdown list, a YAML
-        // block or a SQL script is the content itself.
-        let text = if hit_kind(h) == devctx_core::PathKind::Code {
-            trim_leading_doc(field(h, "text"), style)
-        } else {
-            field(h, "text").to_string()
-        };
-        let body = cap_lines(&text, chunk_cap, style);
-        let piece = format!("{head}// {file}:{line}\n{body}\n\n");
-        if out.len() + piece.len() > budget {
-            dropped += 1;
-            continue;
-        }
-        out.push_str(&piece);
-        head = "";
-        if !code_files.iter().any(|f| f == file) {
-            code_files.push(file.to_string());
+        lay
+    };
+    let mut code = lay_code(budget);
+
+    // The related section (DD-15) is read from the hits the code shows and
+    // may take up to its share of the budget from the code: the code is laid
+    // out again within what the section leaves, and a neighbor of a hit that
+    // no longer fits goes with it.
+    let mut related_text = String::new();
+    let mut related_note: Option<String> = None;
+    if let Some(source) = related {
+        let brief: Vec<&Value> = code.shown.iter().map(|&i| &hits[i]).collect();
+        match source(&brief) {
+            related::Related::Unavailable(why) => related_note = Some(why),
+            related::Related::Lines(lines) if lines.is_empty() => {
+                related_note = Some(
+                    "none: no code hit of this brief has a graph neighbor that passes the \
+                     filters (high or medium confidence, no tests, no externals, not \
+                     already shown)"
+                        .into(),
+                )
+            }
+            related::Related::Lines(mut lines) => {
+                // `hit` indexes `brief`; from here on it indexes `hits`.
+                for l in &mut lines {
+                    l.hit = code.shown[l.hit];
+                }
+                let cap = (budget * related::CTX_RELATED_SHARE_PCT / 100)
+                    .min(budget.saturating_sub(code_start));
+                let (first, _) = render_related(&lines, cap);
+                let read = lines.len();
+                if !first.is_empty() {
+                    code = lay_code(budget - first.len());
+                    lines.retain(|l| code.shown.contains(&l.hit));
+                }
+                let left = lines.len();
+                let (text, cut) = render_related(&lines, cap);
+                // Every line not shown is counted: past the share, or gone
+                // with its hit.
+                dropped += read - left;
+                // Lines that went with their hit give their room back to the
+                // code (which then shows every hit it showed with less).
+                if text.len() < first.len() {
+                    code = lay_code(budget - text.len());
+                }
+                dropped += cut;
+                if text.is_empty() {
+                    related_note = Some(format!(
+                        "none fitted: {read} neighbor signature(s) did not fit the related \
+                         section's {}% of the budget",
+                        related::CTX_RELATED_SHARE_PCT
+                    ));
+                }
+                related_text = text;
+            }
         }
     }
+    dropped += code.dropped;
+    out.push_str(&code.text);
+    out.push_str(&related_text);
+    let code_files = code.files;
 
     if include_memories {
         let mut seen: HashSet<String> = HashSet::new();
@@ -4679,6 +4849,9 @@ fn compose_context(
         }
     }
 
+    if let Some(note) = related_note {
+        out.push_str(&format!("\n{} {note}\n", related::RELATED_NOTE));
+    }
     if dropped > 0 {
         out.push_str(&format!(
             "\n[devctx] omitted: {dropped} item(s), reason: budget ({max_tokens} tokens). \
@@ -4687,6 +4860,58 @@ fn compose_context(
     }
     close_context(&mut out, fallback_note);
     out
+}
+
+/// The code part of a brief as laid out within a limit.
+#[derive(Default)]
+struct CodeLayout {
+    /// The `## Code` section.
+    text: String,
+    /// Indices into the hits of the ones it shows, in order.
+    shown: Vec<usize>,
+    /// Their files, first appearance first.
+    files: Vec<String>,
+    /// Hits that did not fit.
+    dropped: usize,
+}
+
+/// The related section (DD-15): the hit each group surrounds, then one line
+/// per neighbor — relation, signature on one line, `file:line` —, within
+/// `cap` characters (the blank line that closes it included). Returns the
+/// text (empty when no line fits) and how many lines did not fit.
+fn render_related(lines: &[related::RelatedLine], cap: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut head = format!("{}\n\n", related::RELATED_HEADING);
+    let mut around: Option<&str> = None;
+    let mut dropped = 0usize;
+    for l in lines {
+        let group = if around == Some(l.around.as_str()) {
+            String::new()
+        } else {
+            format!("{}:\n", l.around)
+        };
+        let hops = if l.hops > 1 {
+            format!(" ({} hops)", l.hops)
+        } else {
+            String::new()
+        };
+        let signature = l.signature.split_whitespace().collect::<Vec<_>>().join(" ");
+        let piece = format!(
+            "{head}{group}- {}{hops} `{signature}` · {}:{}\n",
+            l.relation, l.file, l.line
+        );
+        if out.len() + piece.len() + 1 > cap {
+            dropped += 1;
+            continue;
+        }
+        out.push_str(&piece);
+        head.clear();
+        around = Some(&l.around);
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    (out, dropped)
 }
 
 fn field<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -8161,6 +8386,314 @@ mod tests {
         Vec::new()
     }
 
+    fn golden_inputs() -> (Vec<Value>, Vec<Value>) {
+        let mems = vec![ctx_mem("m1", "Decision", "we chose X\nbecause Y")];
+        let big = (0..60)
+            .map(|i| format!("    step_{i}(input);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hits = vec![
+            ctx_hit("src/a.rs", 3, "fn a() {\n    b();\n}"),
+            ctx_hit("src/big.rs", 1, &format!("fn big() {{\n{big}\n}}")),
+            ctx_hit("src/b.rs", 9, "fn b() {}"),
+        ];
+        (mems, hits)
+    }
+
+    fn golden_linked(file: &str) -> Vec<Value> {
+        if file == "src/a.rs" {
+            vec![
+                json!({ "id": "m2", "title": "About a", "content": "a is hot",
+                         "link_sources": "files-field" }),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// (e) Without the related section the brief is the 0.9.0 brief, byte for
+    /// byte (golden captured from 0.9.0's `compose_context` on this input).
+    #[test]
+    fn without_related_the_brief_is_the_old_one_byte_for_byte() {
+        let (mems, hits) = golden_inputs();
+        let note = Some("[devctx] branch_fallback: answered from main".to_string());
+        let old = compose_context(&mems, &hits, note.clone(), 120, true, &golden_linked);
+        let none = compose_context_with(&mems, &hits, note, 120, true, &golden_linked, None);
+        assert_eq!(none, old);
+        assert_eq!(old, GOLDEN_090, "{old}");
+    }
+
+    const GOLDEN_090: &str =
+        "## What is already known\n\n[memory] m1 — Decision\nwe chose X\nbecause \
+         Y\n\n## Code\n\n// src/a.rs:3\nfn a() {\n    b();\n}\n\n// src/b.rs:9\nfn b() {}\n\n\
+         ## Recorded against this code\n\n[memory · files-field · about src/a.rs] m2 — About a\n\
+         a is hot\n\n\n[devctx] omitted: 1 item(s), reason: budget (120 tokens). Raise \
+         max_tokens, or narrow the query.\n\n[devctx] branch_fallback: answered from main";
+
+    fn rel(
+        around: &str,
+        relation: &'static str,
+        sig: &str,
+        file: &str,
+        line: i32,
+    ) -> related::RelatedLine {
+        related::RelatedLine {
+            hit: 0,
+            around: around.into(),
+            relation,
+            hops: 1,
+            signature: sig.into(),
+            file: file.into(),
+            line,
+        }
+    }
+
+    fn section(out: &str) -> &str {
+        let start = out
+            .find(related::RELATED_HEADING)
+            .expect("a related section");
+        let rest = &out[start..];
+        let end = ["\n## ", "\n[devctx]"]
+            .iter()
+            .filter_map(|m| rest[1..].find(m).map(|i| i + 1))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    fn many_lines(n: usize) -> Vec<related::RelatedLine> {
+        (0..n)
+            .map(|i| {
+                rel(
+                    "Svc.run",
+                    "called by",
+                    &format!("pub fn caller_number_{i}(input: &str) -> Result<()>"),
+                    &format!("src/callers/c{i}.rs"),
+                    10 + i as i32,
+                )
+            })
+            .collect()
+    }
+
+    /// (a) The section never takes more than 20 % of the budget, and (c)
+    /// what does not fit is counted in the brief's one `omitted` line.
+    #[test]
+    fn related_keeps_to_its_share_and_counts_what_does_not_fit() {
+        let hits = vec![ctx_hit("src/svc.rs", 5, "fn run() {}")];
+        let lines = many_lines(40);
+        let source = |_: &[&Value]| related::Related::Lines(many_lines(40));
+        let out = compose_context_with(&[], &hits, None, 1000, false, &no_linked, Some(&source));
+        let sec = section(&out);
+        let cap = 1000 * CHARS_PER_TOKEN * related::CTX_RELATED_SHARE_PCT / 100;
+        assert!(sec.len() <= cap, "{} > {cap}: {out}", sec.len());
+        let shown = sec.lines().filter(|l| l.starts_with("- ")).count();
+        assert!(shown > 0 && shown < lines.len(), "{out}");
+        assert!(
+            out.contains(&format!(
+                "omitted: {} item(s), reason: budget",
+                lines.len() - shown
+            )),
+            "{out}"
+        );
+        assert_eq!(out.matches("omitted:").count(), 1, "{out}");
+    }
+
+    /// The section takes its room from the code, up to its share: a brief
+    /// whose code fills the budget still shows the neighbors, and the code
+    /// it pushed out is counted.
+    #[test]
+    fn related_takes_its_room_from_the_code() {
+        let hits: Vec<Value> = (0..20)
+            .map(|i| {
+                let body = (0..8)
+                    .map(|k| format!("    let v{k} = work_{i}_{k}(input);"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ctx_hit(
+                    &format!("src/f{i}.rs"),
+                    1,
+                    &format!("fn f{i}() {{\n{body}\n}}"),
+                )
+            })
+            .collect();
+        let off = compose_context(&[], &hits, None, 1000, false, &no_linked);
+        assert!(off.contains("omitted:"), "the code fills the budget: {off}");
+        let source = |_: &[&Value]| {
+            related::Related::Lines(
+                (0..6)
+                    .map(|k| {
+                        rel(
+                            "f0",
+                            "called by",
+                            &format!(
+                                "pub fn caller_with_a_long_name_{k}(input: &str) -> Result<()>"
+                            ),
+                            &format!("src/callers/c{k}.rs"),
+                            3,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let on = compose_context_with(&[], &hits, None, 1000, false, &no_linked, Some(&source));
+        let sec = section(&on);
+        assert_eq!(
+            sec.lines().filter(|l| l.starts_with("- ")).count(),
+            6,
+            "{on}"
+        );
+        let shown = |out: &str| {
+            out.matches("\n// src/").count() + usize::from(out.starts_with("## Code\n\n// "))
+        };
+        assert!(shown(&on) < shown(&off), "{on}");
+        let omitted = |out: &str| -> usize {
+            out.split("omitted: ")
+                .nth(1)
+                .and_then(|r| r.split(' ').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            omitted(&on),
+            omitted(&off) + (shown(&off) - shown(&on)),
+            "{on}"
+        );
+        assert!(
+            on.find("omitted:").unwrap() <= 1000 * CHARS_PER_TOKEN + 2,
+            "{on}"
+        );
+    }
+
+    /// A neighbor of a hit the section pushed out of the code goes with it,
+    /// and its room goes back to the code.
+    #[test]
+    fn a_neighbor_of_a_hit_pushed_out_goes_with_it() {
+        let big = (0..60)
+            .map(|k| format!("    step_{k}(input);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let big = ctx_hit("src/big.rs", 1, &format!("fn big() {{\n{big}\n}}"));
+        // The first hit fills the budget but for a few characters: less room
+        // than the section needs.
+        let probe = compose_context(
+            &[],
+            &[ctx_hit("src/a.rs", 1, ""), big.clone()],
+            None,
+            300,
+            false,
+            &no_linked,
+        );
+        let pad = 300 * CHARS_PER_TOKEN - probe.len() - 20;
+        let hits = vec![ctx_hit("src/a.rs", 1, &"x".repeat(pad)), big];
+        let off = compose_context(&[], &hits, None, 300, false, &no_linked);
+        assert!(
+            off.contains("src/big.rs:1") && !off.contains("omitted"),
+            "{off}"
+        );
+        let source = |_: &[&Value]| {
+            let mut l = rel("big", "called by", "pub fn main()", "src/main.rs", 3);
+            l.hit = 1;
+            related::Related::Lines(vec![l])
+        };
+        let on = compose_context_with(&[], &hits, None, 300, false, &no_linked, Some(&source));
+        assert!(!on.contains(related::RELATED_HEADING), "{on}");
+        assert!(
+            on.contains("src/big.rs:1"),
+            "the code got its room back: {on}"
+        );
+        assert!(on.contains("[devctx] related: none fitted"), "{on}");
+        assert!(
+            on.contains("omitted: 1 item(s)"),
+            "the line is counted: {on}"
+        );
+    }
+
+    /// (b) After `## Code`, before "Recorded against this code".
+    #[test]
+    fn related_goes_between_the_code_and_the_linked_memories() {
+        let (_, hits) = golden_inputs();
+        let source = |_: &[&Value]| {
+            related::Related::Lines(vec![rel("a", "calls", "fn b()", "src/b.rs", 9)])
+        };
+        let out = compose_context_with(&[], &hits, None, 4096, true, &golden_linked, Some(&source));
+        let code = out.find("## Code").expect("code");
+        let rel_at = out.find(related::RELATED_HEADING).expect("related");
+        let linked = out.find("## Recorded against this code").expect("linked");
+        assert!(code < rel_at && rel_at < linked, "{out}");
+    }
+
+    /// (d) Never a body: each line is the relation, the signature on one
+    /// line and `file:line`, under the name of the hit it surrounds.
+    #[test]
+    fn related_lines_are_a_signature_a_relation_and_a_place() {
+        let hits = vec![ctx_hit("src/svc.rs", 5, "fn run() {}")];
+        let mut two = rel(
+            "Svc.run",
+            "calls",
+            "fn helper(\n    a: u32,\n) -> u32",
+            "src/h.rs",
+            8,
+        );
+        two.hops = 2;
+        let source = move |_: &[&Value]| {
+            related::Related::Lines(vec![
+                rel("Svc.run", "called by", "pub fn main()", "src/main.rs", 3),
+                two.clone(),
+                rel("Other.go", "implements", "pub trait Runner", "src/r.rs", 1),
+            ])
+        };
+        let out = compose_context_with(&[], &hits, None, 4096, false, &no_linked, Some(&source));
+        let sec = section(&out);
+        let body: Vec<&str> = sec.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            body,
+            vec![
+                related::RELATED_HEADING,
+                "Svc.run:",
+                "- called by `pub fn main()` · src/main.rs:3",
+                "- calls (2 hops) `fn helper( a: u32, ) -> u32` · src/h.rs:8",
+                "Other.go:",
+                "- implements `pub trait Runner` · src/r.rs:1",
+            ],
+            "{out}"
+        );
+    }
+
+    /// The section is read from the hits the brief shows, in its order: a
+    /// hit the budget left out is not a seed.
+    #[test]
+    fn related_reads_the_hits_the_brief_shows() {
+        let huge = "x".repeat(5000);
+        let hits = vec![
+            ctx_hit("src/a.rs", 1, "fn a() {}"),
+            ctx_hit("src/huge.rs", 1, &huge),
+            ctx_hit("src/b.rs", 2, "fn b() {}"),
+        ];
+        let seen = std::cell::RefCell::new(Vec::new());
+        let source = |brief: &[&Value]| {
+            seen.borrow_mut()
+                .extend(brief.iter().map(|h| field(h, "file").to_string()));
+            related::Related::Lines(Vec::new())
+        };
+        compose_context_with(&[], &hits, None, 100, false, &no_linked, Some(&source));
+        assert_eq!(*seen.borrow(), vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    /// No section to show is said, never left as silence: a branch without a
+    /// current graph names why, and so does a brief with no neighbor.
+    #[test]
+    fn no_related_section_says_why() {
+        let hits = vec![ctx_hit("src/svc.rs", 5, "fn run() {}")];
+        let stale = |_: &[&Value]| related::Related::Unavailable("not shown: stale".into());
+        let out = compose_context_with(&[], &hits, None, 4096, false, &no_linked, Some(&stale));
+        assert!(!out.contains(related::RELATED_HEADING), "{out}");
+        assert!(out.contains("[devctx] related: not shown: stale"), "{out}");
+        let none = |_: &[&Value]| related::Related::Lines(Vec::new());
+        let out = compose_context_with(&[], &hits, None, 4096, false, &no_linked, Some(&none));
+        assert!(!out.contains(related::RELATED_HEADING), "{out}");
+        assert!(out.contains(related::RELATED_NOTE), "{out}");
+    }
+
     /// A first hit bigger than the whole budget no longer ends the brief: the
     /// smaller hits behind it that fit are still delivered, and the one that
     /// could not be is counted.
@@ -8409,6 +8942,145 @@ mod tests {
 
     /// Group selection: a query that only matches the non-default member
     /// chooses it, by name, saying how many members were compared.
+    /// PLAN-009 TASK-012, DD-18: the group selection as it is and with the
+    /// experimental bonus for the rank of the symbol a member defines, over
+    /// members whose servers run. A measurement, not a check (ignored):
+    /// `DEVCTX_GROUP_EVAL_MEMBERS` = `name=path;…` (indexed checkouts with a
+    /// running `devctx serve`), `DEVCTX_GROUP_EVAL_CASES` = a file of
+    /// `query | expected member` lines. The variant adds, to a member that
+    /// defines an identifier of the query, `PICK_MARGIN` × the percentile of
+    /// the best rank among that identifier's definitions in its branch (read
+    /// from a copy of its database), on top of today's `PICK_MARGIN`. Prints
+    /// one row per case.
+    #[test]
+    #[ignore]
+    fn group_pick_rank_variant_eval() {
+        let members: Vec<ProjectRow> = std::env::var("DEVCTX_GROUP_EVAL_MEMBERS")
+            .expect("DEVCTX_GROUP_EVAL_MEMBERS")
+            .split(';')
+            .filter(|x| !x.trim().is_empty())
+            .map(|pair| {
+                let (name, path) = pair.split_once('=').expect("name=path");
+                let path = PathBuf::from(path.trim());
+                ProjectRow {
+                    name: name.trim().into(),
+                    path: path.clone(),
+                    group: Some("eval".into()),
+                    embed_dim: 384,
+                    embed_model: "ml-granite".into(),
+                    last_indexed_at: 1,
+                    config_path: path.join(".devctx/config.yaml"),
+                    db_path: path.join(".devctx/state/index.duckdb"),
+                    description: String::new(),
+                }
+            })
+            .collect();
+        let cases = std::fs::read_to_string(
+            std::env::var("DEVCTX_GROUP_EVAL_CASES").expect("DEVCTX_GROUP_EVAL_CASES"),
+        )
+        .unwrap();
+        let tmp = std::env::temp_dir().join(format!("group_eval_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // The percentile of the best rank among a name's definitions, per
+        // member, from a copy of its database (its server holds the file).
+        let pct_of = |m: &ProjectRow, name: &str| -> f64 {
+            let copy = tmp.join(format!("{}.duckdb", m.name));
+            if !copy.exists() {
+                std::fs::copy(&m.db_path, &copy).unwrap();
+                let wal = m.db_path.with_extension("duckdb.wal");
+                if wal.exists() {
+                    std::fs::copy(&wal, copy.with_extension("duckdb.wal")).unwrap();
+                }
+            }
+            let store = Store::open(&copy, 384).unwrap();
+            let git = GitRepo::open(&m.path).unwrap();
+            let repo = git.short_name();
+            let root = git.root().to_string_lossy().into_owned();
+            let branch = store
+                .indexed_branches(&root)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let syms = store.map_symbols(&repo, &branch).unwrap();
+            let ranked: Vec<f64> = syms.iter().filter_map(|s| s.rank).collect();
+            let best = syms
+                .iter()
+                .filter(|s| s.name == name && s.kind != "file")
+                .filter_map(|s| s.rank)
+                .fold(None, |a: Option<f64>, r| Some(a.map_or(r, |a| a.max(r))));
+            match best {
+                Some(r) if !ranked.is_empty() => {
+                    ranked.iter().filter(|x| **x < r).count() as f64 / ranked.len() as f64
+                }
+                _ => 0.0,
+            }
+        };
+        let sel = devctx_search::KindSel::default();
+        let penalty = devctx_core::KindPenalty::default();
+        println!("case | expected | today | today ambiguous | variant | variant ambiguous");
+        for (i, line) in cases
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .enumerate()
+        {
+            let (query, expected) = line.rsplit_once('|').expect("query | member");
+            let (query, expected) = (query.trim(), expected.trim());
+            let mut idents = devctx_search::identifier_tokens(query);
+            idents.truncate(PICK_IDENT_TOKENS);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let outcomes: Vec<(String, MemberOutcome)> = members
+                .iter()
+                .map(|m| {
+                    (
+                        m.name.clone(),
+                        score_member(m, query, &sel, &idents, &penalty, deadline),
+                    )
+                })
+                .collect();
+            let today = choose_member(outcomes.clone(), None, &[]).unwrap();
+            let variant_outcomes: Vec<(String, MemberOutcome)> = outcomes
+                .into_iter()
+                .map(|(name, o)| match o {
+                    MemberOutcome::Scored {
+                        code,
+                        all,
+                        defines: Some(t),
+                    } => {
+                        let m = members.iter().find(|m| m.name == name).unwrap();
+                        let extra = PICK_MARGIN * pct_of(m, &t);
+                        let up = |x: f64| if x > 0.0 { x + extra } else { x };
+                        (
+                            name,
+                            MemberOutcome::Scored {
+                                code: up(code),
+                                all: up(all),
+                                defines: Some(t),
+                            },
+                        )
+                    }
+                    other => (name, other),
+                })
+                .collect();
+            let variant = choose_member(variant_outcomes, None, &[]).unwrap();
+            let amb = |p: &GroupPick| {
+                p.warning
+                    .as_deref()
+                    .is_some_and(|w| w.contains("ambiguous"))
+            };
+            println!(
+                "{} | {expected} | {} | {} | {} | {} | {}",
+                i + 1,
+                today.member,
+                amb(&today),
+                variant.member,
+                amb(&variant),
+                today.label
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn group_pick_chooses_the_member_that_matches() {
         let pick = choose_member(

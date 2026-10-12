@@ -238,6 +238,16 @@ enum Command {
         /// Leave memories out and return code only.
         #[arg(long)]
         no_memories: bool,
+        /// Add the related section: callers, callees and supertypes of the
+        /// best code hits, as signatures (off by default in this version).
+        #[arg(long, conflicts_with = "no_related")]
+        related: bool,
+        /// Leave the related section out.
+        #[arg(long)]
+        no_related: bool,
+        /// Hops of the related section: 1 (default) or 2.
+        #[arg(long)]
+        hops: Option<u8>,
     },
     /// Show the blast radius (transitive callers/callees) of a symbol.
     Impact {
@@ -679,7 +689,22 @@ fn main() -> Result<()> {
             query,
             max_tokens,
             no_memories,
-        } => cmd_context(query, max_tokens, !no_memories),
+            related,
+            no_related,
+            hops,
+        } => cmd_context(
+            query,
+            max_tokens,
+            !no_memories,
+            devctx_mcp::state::ContextOpts {
+                related: match (related, no_related) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
+                graph_hops: hops,
+            },
+        ),
         Command::Impact {
             symbol,
             depth,
@@ -2411,7 +2436,12 @@ fn print_read_symbol(name: &str, v: &serde_json::Value) {
 /// Always routed through the server when one is up: the brief needs the
 /// embedder, the central store and this project's graph at once, and the server
 /// is the process that already holds all three.
-fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Result<()> {
+fn cmd_context(
+    query: String,
+    max_tokens: usize,
+    include_memories: bool,
+    opts: devctx_mcp::state::ContextOpts,
+) -> Result<()> {
     let cfg = load_project()?;
     let Some(r) = remote::ensure_cli(&cfg)? else {
         bail!(
@@ -2425,7 +2455,8 @@ fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Resu
             &query,
             max_tokens,
             include_memories,
-            &devctx_search::KindSel::default()
+            &devctx_search::KindSel::default(),
+            &opts,
         )?
     );
     Ok(())

@@ -10,13 +10,13 @@ use serde_json::{json, Value};
 use crate::repo_map::RepoMapQuery;
 use crate::skeleton::SkeletonQuery;
 use crate::state::{
-    do_backfill_links, do_build_context, do_impact_with, do_index, do_index_status,
+    do_backfill_links, do_build_context_with, do_impact_with, do_index, do_index_status,
     do_list_projects, do_memories_by_file, do_memories_by_symbol, do_memory_context,
     do_memory_forget, do_memory_move, do_memory_refs, do_memory_stats, do_plan_status,
     do_read_file, do_read_symbol, do_recall_scoped, do_references_with, do_remember,
     do_remember_shared, do_repo_map, do_routes_for_handler, do_search, do_search_project,
-    do_search_routes, do_skeleton, do_summarize, do_traverse, parse_mode, AppState, MemoriesOpts,
-    Page, PlanListOpts, TraverseQuery,
+    do_search_routes, do_skeleton, do_summarize, do_traverse, parse_mode, AppState, ContextOpts,
+    MemoriesOpts, Page, PlanListOpts, TraverseQuery,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -751,22 +751,36 @@ impl Backend {
         }
     }
 
-    /// One budgeted brief assembled for a question.
+    /// One budgeted brief assembled for a question. `opts` asks for the
+    /// related section (PLAN-009 TASK-012); a server older than it ignores
+    /// the fields, and when the call wanted the section the brief says so.
     pub fn build_context(
         &self,
         query: &str,
         max_tokens: usize,
         include_memories: bool,
         sel: &devctx_search::KindSel,
+        opts: &ContextOpts,
     ) -> Result<String, String> {
+        opts.resolve()?;
         match self {
-            Backend::Local(s) => do_build_context(s, query, max_tokens, include_memories, sel),
-            Backend::Remote(r, _) => r.post(
-                "/context",
-                json!({ "query": query, "max_tokens": max_tokens,
+            Backend::Local(s) => {
+                do_build_context_with(s, query, max_tokens, include_memories, sel, opts)
+            }
+            Backend::Remote(r, _) => {
+                let mut body = json!({ "query": query, "max_tokens": max_tokens,
                         "include_memories": include_memories,
-                        "kind": sel.kind, "include_tests": sel.include_tests }),
-            ),
+                        "kind": sel.kind, "include_tests": sel.include_tests });
+                // Only what the call set: an unset field is the server's default.
+                if let Some(v) = opts.related {
+                    body["related"] = json!(v);
+                }
+                if let Some(h) = opts.graph_hops {
+                    body["graph_hops"] = json!(h);
+                }
+                let out = r.post("/context", body)?;
+                Ok(note_unapplied_related(out, opts))
+            }
         }
     }
 
@@ -1090,6 +1104,58 @@ mod tests {
             );
         let client = RemoteClient::new(connect);
         assert_eq!(client.get("/status").unwrap(), "ok");
+    }
+
+    /// PLAN-009 TASK-012: a server older than the related section ignores
+    /// `related`; when the call wanted it, the brief says so and how to
+    /// restart the server. A server that applied it (section or note), or a
+    /// call that did not want it, is passed through.
+    #[test]
+    fn related_on_an_old_server_says_it_was_not_applied() {
+        let backend_for = |reply: &'static str| {
+            let base = serve_fixed(reply);
+            let connect: Connector = Arc::new(move || {
+                Ok(ServerConn {
+                    base: base.clone(),
+                    token: None,
+                })
+            });
+            Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default())
+        };
+        let sel = devctx_search::KindSel::default();
+        let on = crate::state::ContextOpts {
+            related: Some(true),
+            graph_hops: None,
+        };
+        let off = crate::state::ContextOpts {
+            related: Some(false),
+            graph_hops: None,
+        };
+        const OLD: &str = "HTTP/1.1 200 OK\r\nContent-Length: 29\r\nConnection: close\r\n\r\n## Code\n\n// a.rs:1\nfn a() {}\n";
+        let out = backend_for(OLD)
+            .build_context("q", 4096, false, &sel, &on)
+            .unwrap();
+        assert!(out.starts_with("## Code"), "{out}");
+        assert!(out.contains("[devctx] related: not applied"), "{out}");
+        assert!(out.contains("devctx serve --stop"), "{out}");
+        let out = backend_for(OLD)
+            .build_context("q", 4096, false, &sel, &off)
+            .unwrap();
+        assert!(!out.contains("related"), "{out}");
+        const NEW: &str = "HTTP/1.1 200 OK\r\nContent-Length: 56\r\nConnection: close\r\n\r\n## Code\n\nfn a() {}\n\n## Related (signatures)\n\nx:\n- calls\n";
+        let out = backend_for(NEW)
+            .build_context("q", 4096, false, &sel, &on)
+            .unwrap();
+        assert!(!out.contains("not applied"), "{out}");
+        // An invalid `graph_hops` is refused before anything is sent.
+        let bad = crate::state::ContextOpts {
+            related: Some(true),
+            graph_hops: Some(3),
+        };
+        let e = backend_for(OLD)
+            .build_context("q", 4096, false, &sel, &bad)
+            .unwrap_err();
+        assert!(e.contains("graph_hops"), "{e}");
     }
 
     /// PLAN-009 TASK-013: a server older than `traverse` answers its route
@@ -1421,6 +1487,26 @@ fn note_unapplied_filters(raw: String) -> String {
     };
     v["warning"] = serde_json::Value::String(warning);
     v.to_string()
+}
+
+/// The line a brief from a server older than the related section gets when
+/// the call wanted the section (PLAN-009 TASK-012).
+pub const RELATED_OLD_SERVER_NOTE: &str = "[devctx] related: not applied: the running server \
+     predates the related section and ignored `related`/`graph_hops`; restart it (`devctx \
+     serve --stop`, the next command starts the new one)";
+
+/// `out`, a brief from a server, with [`RELATED_OLD_SERVER_NOTE`] at its end
+/// when `opts` wanted the related section and the server answered with code
+/// but neither the section nor the line that says why it has none: it did
+/// not know the fields. A brief with no code (nothing matched) is left as
+/// it is.
+pub fn note_unapplied_related(out: String, opts: &ContextOpts) -> String {
+    let applied =
+        out.contains(crate::state::RELATED_HEADING) || out.contains(crate::state::RELATED_NOTE);
+    if !opts.wants_related() || applied || !out.contains("## Code") {
+        return out;
+    }
+    format!("{}\n\n{RELATED_OLD_SERVER_NOTE}\n", out.trim_end())
 }
 
 /// [`note_unapplied_filters`] for `impact_analysis`, for an answer to a

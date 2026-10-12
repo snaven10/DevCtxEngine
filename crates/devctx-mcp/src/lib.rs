@@ -401,6 +401,14 @@ struct BuildContextReq {
     /// `false` drops test files from the code (default true: tests rank lower).
     #[serde(default)]
     include_tests: Option<bool>,
+    /// Add `## Related (signatures)`: the callers, callees and supertypes of
+    /// the best code hits, as signatures (at most 20 % of the budget). The
+    /// default is the server's (off in this version).
+    #[serde(default)]
+    related: Option<bool>,
+    /// Hops of the related section: 1 (default) or 2.
+    #[serde(default)]
+    graph_hops: Option<u8>,
 }
 
 /// Parameters for the `memories_by_symbol` tool.
@@ -1536,6 +1544,12 @@ impl DevctxServer {
             kind: req.kind.clone(),
             include_tests: req.include_tests,
         };
+        let opts = state::ContextOpts {
+            related: req.related,
+            graph_hops: req.graph_hops,
+        };
+        opts.resolve()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
         let (backend, label) = self
             .context_backend(req.project.as_deref(), &req.query, &sel)
             .await?;
@@ -1545,6 +1559,7 @@ impl DevctxServer {
                 req.max_tokens.unwrap_or(4096),
                 req.include_memories.unwrap_or(true),
                 &sel,
+                &opts,
             )
         })
         .await?;

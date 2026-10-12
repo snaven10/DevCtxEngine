@@ -17,12 +17,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_backfill_links, do_build_context, do_graph, do_impact_with, do_index_on, do_index_paths,
-    do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
+    do_backfill_links, do_build_context_with, do_graph, do_impact_with, do_index_on,
+    do_index_paths, do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
     do_memories_by_symbol, do_memory_context, do_memory_forget, do_memory_move, do_memory_refs,
     do_memory_stats, do_plan_graph, do_plan_status, do_read_file, do_read_symbol, do_recall_scoped,
     do_references_with, do_remember, do_remember_shared, do_routes_for_handler, do_search,
-    do_search_routes, do_summarize, parse_mode, AppState, MemoriesOpts, Page, PlanListOpts,
+    do_search_routes, do_summarize, parse_mode, AppState, ContextOpts, MemoriesOpts, Page,
+    PlanListOpts,
 };
 use serde::Deserialize;
 
@@ -989,6 +990,12 @@ struct ContextBody {
     kind: Option<String>,
     #[serde(default)]
     include_tests: Option<bool>,
+    /// The related section (PLAN-009 TASK-012); unset is the default.
+    #[serde(default)]
+    related: Option<bool>,
+    /// Its hops: 1 or 2.
+    #[serde(default)]
+    graph_hops: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -1311,7 +1318,7 @@ async fn read_symbol(
 /// One budgeted brief assembled for a question.
 async fn build_context(State(api): State<Api>, Json(b): Json<ContextBody>) -> Response {
     run(api.state, move |s| {
-        do_build_context(
+        do_build_context_with(
             s,
             &b.query,
             b.max_tokens.unwrap_or(4096),
@@ -1319,6 +1326,10 @@ async fn build_context(State(api): State<Api>, Json(b): Json<ContextBody>) -> Re
             &devctx_search::KindSel {
                 kind: b.kind,
                 include_tests: b.include_tests,
+            },
+            &ContextOpts {
+                related: b.related,
+                graph_hops: b.graph_hops,
             },
         )
     })
