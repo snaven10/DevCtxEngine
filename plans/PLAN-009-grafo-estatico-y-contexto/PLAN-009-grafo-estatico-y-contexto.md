@@ -252,7 +252,7 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-012 | Ego-graph en `build_context` y evaluación de la selección de grupo | general-purpose (Rust) | TASK-009, TASK-010 | `done` |
 | TASK-013 | Tool `traverse` | general-purpose (Rust) | TASK-009, TASK-017 | `done` |
 | TASK-014 | Tool `skeleton` por archivo | general-purpose (Rust) | TASK-004 | `done` |
-| TASK-015 | Docs EN + ES y guía de reindex | general-purpose (Rust) | TASK-002, TASK-011, TASK-012, TASK-013, TASK-014 | `pending` |
+| TASK-015 | Docs EN + ES y guía de reindex | general-purpose (Rust) | TASK-002, TASK-011, TASK-012, TASK-013, TASK-014 | `done` |
 | TASK-016 | Verificación de campo contra §6 | — (orquestador, con aprobación del usuario) | TASK-015 | `pending` |
 | TASK-017 | Dispatch por interfaz en `impact_analysis` (y `traverse`): override-equivalentes vía `implements`/`inherits`, `medium`, `via: "dispatch"` | general-purpose (Rust) | TASK-009 | `done` |
 
