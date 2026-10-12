@@ -468,63 +468,17 @@ pub(crate) fn clean_signature(signature: Option<&str>, kind: &str, name: &str) -
 }
 
 /// `sig` without its leading annotations and attributes; itself when that
-/// would leave nothing.
+/// would leave nothing. The parser's reading
+/// ([`devctx_index::leading_annotations`]): a bracket inside a string literal
+/// (`@Pattern(regexp = "^\\(")`) does not count, and an annotation that never
+/// closes leaves the signature as it is.
 fn strip_annotations(sig: &str) -> &str {
-    let mut rest = sig.trim_start();
-    loop {
-        let bytes = rest.as_bytes();
-        let skipped = if bytes.first() == Some(&b'@') {
-            let name_end = rest[1..]
-                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
-                .map_or(rest.len(), |e| e + 1);
-            // `@interface Marker` declares an annotation: it is the head.
-            if name_end == 1 || &rest[1..name_end] == "interface" {
-                break;
-            }
-            let after = &rest[name_end..];
-            if after.starts_with('(') {
-                match closing(after, '(', ')') {
-                    Some(end) => name_end + end + 1,
-                    None => break,
-                }
-            } else {
-                name_end
-            }
-        } else if rest.starts_with("#[") {
-            match closing(&rest[1..], '[', ']') {
-                Some(end) => end + 2,
-                None => break,
-            }
-        } else {
-            break;
-        };
-        let next = rest[skipped..].trim_start();
-        if next.is_empty() {
-            break;
-        }
-        rest = next;
-    }
+    let rest = devctx_index::leading_annotations(sig).1;
     if rest.is_empty() {
         sig
     } else {
         rest
     }
-}
-
-/// Byte offset of the bracket closing the one `s` starts with.
-fn closing(s: &str, open: char, close: char) -> Option<usize> {
-    let mut depth = 0usize;
-    for (i, c) in s.char_indices() {
-        if c == open {
-            depth += 1;
-        } else if c == close {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(i);
-            }
-        }
-    }
-    None
 }
 
 /// The containers of node `i` shown above it (no file symbol, no test),
@@ -1433,6 +1387,30 @@ mod tests {
         };
         assert!(at("function plain()") < at("function _hidden()"), "{map}");
         assert!(at("function plain()") < at("function get()"), "{map}");
+    }
+
+    /// A bracket inside a string literal of an annotation does not hide the
+    /// head (the MINOR of TASK-014's review): the signature is cleaned with
+    /// the parser's own reading of leading annotations.
+    #[test]
+    fn an_annotation_with_a_bracket_in_a_literal_is_stripped() {
+        assert_eq!(
+            clean_signature(
+                Some("@Pattern(regexp = \"^\\(\") @NotNull public String code()"),
+                "method",
+                "code"
+            ),
+            "public String code()"
+        );
+        assert_eq!(
+            clean_signature(Some("#[doc = \"a ] b\"] pub fn f()"), "function", "f"),
+            "pub fn f()"
+        );
+        // `$` is part of an annotation's name, as the parser reads it.
+        assert_eq!(
+            clean_signature(Some("@Gen$Marker void run()"), "method", "run"),
+            "void run()"
+        );
     }
 
     /// Annotations and attributes leave the signature; a field loses its

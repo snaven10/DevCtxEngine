@@ -1646,7 +1646,7 @@ const ANNOTATIONS_MAX: usize = 200;
 /// and the rest; `@interface` declares an annotation and is the rest.
 /// Brackets inside string literals do not count. No annotations when one
 /// never closes or nothing would be left.
-pub(crate) fn leading_annotations(sig: &str) -> (Vec<&str>, &str) {
+pub fn leading_annotations(sig: &str) -> (Vec<&str>, &str) {
     let mut rest = sig.trim_start();
     let mut found = Vec::new();
     loop {
