@@ -266,7 +266,9 @@ list of methods gains them, and the context header of a generic `impl`'s
 methods loses its type arguments (`Cache<T>` → `Cache`).
 
 Measured in a sandbox, release build, `minilm-l6`, while the extractor was
-being built — so each row is one step of it, not 0.9.0 → 0.10.0 in one go:
+being built — so each row is one step of it, not 0.9.0 → 0.10.0 in one go
+(this repository grew meanwhile: 281 files on 2026-10-06, about 440 two days
+later):
 
 | Date | Repository | From scratch | `--full` after the extractor changed | Chunks reused |
 |---|---|---|---|---|
@@ -301,14 +303,15 @@ Nothing breaks while a branch waits for its `--full`:
 | `read_symbol`, `get_references`, `search` (`keyword`/`hybrid`), the web graph view | As 0.9 did, by name over `graph_edges`, with a `warning` |
 | `impact_analysis` | The 0.9 walk — by name, no confidence, no filters, no cap — with the `warning`, which adds, when filters were passed, that they were not applied |
 | `build_context` with `related: true` | No section, and `[devctx] related: not shown: …` |
-| `traverse`, `repo_map`, `skeleton` | **An error**: `… reads the symbol graph, and this branch's index predates it (an older extractor, or no symbol rows): reindex with devctx index --full (vectors are reused)`. They have no 0.9 answer to fall back to |
+| `traverse`, `repo_map`, `skeleton` | **An error**: `… reads the symbol graph, and this branch's index predates it (an older extractor): reindex with devctx index --full (vectors are reused)`. They have no 0.9 answer to fall back to |
 | hybrid search with `search.centrality_weight` > 0 | Vector + keyword only |
 | a new branch indexed from a stale one | Re-embeds its files instead of copying them |
 
 A branch indexed by 0.10 whose language has no symbol extraction (only text
 files) has no symbol rows either: the old tools answer the 0.9 way with a
-`warning` of their own, and `skeleton` sends to `read_file` instead of asking
-for a reindex that would change nothing.
+`warning` of their own, and `traverse`, `repo_map` and `skeleton` answer an
+error that sends to `search` or `read_file` instead of asking for a reindex that
+would change nothing.
 
 ### Going back to 0.9.0
 

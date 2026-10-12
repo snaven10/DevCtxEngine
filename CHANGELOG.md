@@ -46,9 +46,12 @@ index --full`**, which reuses the stored vectors.
    follows only `high`/`medium` calls, leaves test code and library callees
    out, lists 200 symbols per direction, follows dispatch through interfaces,
    and counts what it left out; a bare name means the repository's definitions
-   of it, not every call written with it. `get_references` lists one row per
-   occurrence, with its `confidence`, and counts the `low` ones instead of
-   listing them. JSON contracts only grew.
+   of it (at most 10 000), not every call written with it. `get_references`
+   lists one row per occurrence, with its `confidence`, and counts the `low`
+   ones instead of listing them. `read_symbol` on a miss: a `Foo::new` that does
+   not exist is no longer `external` because some `new` is called — it gets
+   `suggestions` instead; a `file::name` miss is never `external`; an `external`
+   answer carries no `suggestions`. JSON contracts only grew.
 5. **The database grows** (on a 216-file Java repository, 79 → 112 used blocks
    of 256 KiB, plus 66 free that DuckDB does not reclaim).
 
@@ -138,7 +141,8 @@ for `devctx index --full` again, with vectors reused.
   once a page is full no deeper level is read (`partial`, and then
   `total_is_lower_bound: true`), so a type referenced from hundreds of files is
   paged, not dumped. Calls to the name the index could not decide are counted
-  (`undecided_calls`) or, with `min_confidence: "low"`, listed at depth 1.
+  (`undecided_calls`) or, with `min_confidence: "low"`, listed at depth 1. A
+  bare name is walked from all its definitions, up to 10 000.
 - **`repo_map`** (TASK-011): a new tool (MCP, `GET /repo-map`, `devctx map`)
   that answers, in about a thousand tokens (`budget`, default 1024), a map of
   the repository to orient an agent: the signatures — never bodies — of the
@@ -146,9 +150,9 @@ for `devctx index --full` again, with vectors reused.
   uses rank first and which are not listed themselves; `focus_symbols`;
   `query`, whose identifiers count), grouped by file, members under their
   containers, ranked by PageRank personalized to that focus over the same
-  weighted matrix as the global rank (each focus file and each focus term
-  weighs the same, shared among its symbols; live edges only; test code and
-  libraries never appear). Text, closed by `[devctx]` lines that say what the
+  weighted matrix as the global rank (each focus file weighs 50, shared among
+  its symbols, and each focus term 10, shared among its definitions; live
+  edges only; test code and libraries never appear). Text, closed by `[devctx]` lines that say what the
   focus matched and how many symbols did not fit. The serve caches the
   branch's adjacency per index generation (dropped when an `index` ends and
   when idle, like a model; `status.memory.repo_map` reports it).
@@ -164,6 +168,15 @@ for `devctx index --full` again, with vectors reused.
   outside the repository is refused before anything is looked up. Measured on
   12 files of 623-4 684 lines in four repositories: 4.9-10.2 % of the file's
   tokens, p95 ≤ 26 ms.
+- **How the three new tools refuse.** On an index made before 0.10 they answer
+  an error that asks for `devctx index --full` (there is no 0.9 answer to fall
+  back to). On a current index with no symbols at all (only text, config or
+  SQL files) the error sends to `search` or `read_file` instead, since a
+  reindex would change nothing. Over HTTP an invalid parameter is a 400 with
+  its message (`POST /traverse` with a depth over 4, `GET /repo-map` with a
+  budget of 0, `GET /skeleton` with an empty `file`), any other tool error a
+  500 with `error`, never a 404, which clients read as an older server. `GET
+  /impact` still answers an invalid filter with a 500.
 - **Related signatures in `build_context`** (TASK-012), **off by default**:
   with `related: true` (MCP and `POST /context`; `devctx context --related`)
   the brief adds `## Related (signatures)` between the code and *Recorded
@@ -231,7 +244,8 @@ for `devctx index --full` again, with vectors reused.
 - **`impact_analysis` walks the symbol graph by levels** (TASK-009): one query
   per depth and direction over ids, whatever the size of the frontier (an `IN`
   list up to 512 ids, one `UBIGINT[]` parameter above). **A bare name means the
-  repository's definitions of it**, as in `get_references`; a name with no
+  repository's definitions of it** (at most 10 000, a guard; past it the rest
+  are not seeds and nothing reports it), as in `get_references`; a name with no
   definition stands for its external call sites and answers `external` +
   `called_from`, or `suggestions`. **New defaults:** only `high`/`medium` calls,
   no symbols of test files, no library callees, 200 symbols per direction; what

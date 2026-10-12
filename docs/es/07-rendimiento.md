@@ -101,7 +101,11 @@ del camino vectorial.
 
 Medido mientras se construía 0.10, en octubre de 2026, en la misma máquina solo
 CPU — muchas veces cargada por otro trabajo, así que leé las cifras como órdenes
-de magnitud. Los repositorios: este (≈440 archivos en ese momento), dos
+de magnitud. Los repositorios: este (≈440 archivos en ese momento; tenía 128
+cuando se tomaron las cifras de búsqueda y almacenamiento de arriba, en agosto,
+y 281 en las del reindexado de
+[Mantener el índice al día](13-mantener-el-indice-al-dia.md#cuánto-cuesta), el
+6 de octubre), dos
 repositorios Java privados (1 250 y 216 archivos), un subconjunto de un
 workspace Angular privado y, para `build_context`, ese workspace entero. Las
 herramientas de grafo se midieron en caliente, cada llamada abriendo el store

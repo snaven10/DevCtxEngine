@@ -147,8 +147,8 @@ vectores de TASK-002), qué pasa mientras tanto y cómo volver atrás. Cerrar co
 - **Privacidad:** antes de cada commit, `git grep` de los patrones privados (vacío) y barrido de
   las líneas `+` de los términos de la lista (vacío). Los ejemplos usan este repo o nombres
   genéricos (`OrderService`, `OrderDto`); los repos privados van como "a 1 250-file Java
-  repository", "a subset of an Angular workspace". `OfficeService.actualizar`/Quarkus ya estaban en
-  la doc pública antes de esta task; se conservaron.
+  repository", "a subset of an Angular workspace". El ejemplo de métodos homónimos que venía de
+  un repo de cliente se reemplazó por uno genérico en la revisión (abajo).
 - **Verificado por:** lectura del código y de los tests citados (versiones, textos de error,
   defaults de `get_references`/`impact`/`traverse`, `with_centrality`, `extractor_stale` y
   `graph_out_of_step`, camino de copia antes del parse en `index_file`, `cmd_reindex`); conteo de
@@ -163,3 +163,30 @@ vectores de TASK-002), qué pasa mientras tanto y cómo volver atrás. Cerrar co
   el binario final, downgrade con el binario 0.9.0 publicado) y decide si la centralidad o
   `related` cambian de default; si cambian, hay que actualizar `search`, `context-builder`, ADR-21
   y el CHANGELOG. La fecha y el tag de 0.10.0 esperan el OK del usuario.
+- **Revisión (APROBADA CON OBSERVACIONES, sin BLOCKER ni MAJOR), resuelta en dos commits encima de
+  `d8e1605`:**
+  - *Bug NoRows, confirmado* (`371912d`, código): `traverse_on` y `repo_map::check` trataban
+    `Legacy::NoRows` como `Stale` y pedían `--full` en bucle. Mensaje compartido
+    `lookup::no_symbols_error(tool)` para traverse, repo_map y skeleton (manda a `search` o
+    `read_file`); los tres `*_NEEDS_REINDEX` ya no dicen "or no symbol rows". Tests
+    `a_current_index_without_symbols_does_not_ask_for_a_reindex` en `state::{traverse,repo_map,
+    skeleton}::tests` (repo de un `.sql`; el error no contiene `index --full` y nombra `search` y
+    `read_file`): **los tres fallaban antes del fix** (corridos sobre el árbol sin el fix: traverse y
+    repo_map pedían `--full`, skeleton no nombraba `search`). Las mitades "sin filas" de
+    `an_old_index_asks_for_a_full_reindex` de traverse y repo_map afirmaban el bug: pasaron a los
+    tests nuevos. Gate: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets
+    --locked -- -D warnings` con y sin `--features gpu`; `TMPDIR=<sandbox>/tmp cargo test --workspace
+    --locked --no-fail-fast`: 1 248 pasan, 0 fallan, 14 ignorados.
+  - *Docs* (commit siguiente): MINOR 6 privacidad — el ejemplo de métodos homónimos con una
+    métrica de un repo de cliente pasa a uno genérico (`update`, "a few dozen", `OrderService.update`) en
+    symbol-graph y 04-agent-workflow y sus pares; NoRows en symbol-graph (traverse, repo_map,
+    skeleton, tabla de índice viejo) y en 13; MINOR 2, 400 por parámetro inválido en `POST
+    /traverse`, `GET /repo-map`, `GET /skeleton` y 500 en `GET /impact` (verificado en
+    `devctx-api` y sus tests); MINOR 3, cambios de `read_symbol` en el paso 4 del upgrade del
+    CHANGELOG; MINOR 4, la frase de derivables de Rust se reduce a lo que afirma
+    `a_derived_default_is_its_type`; MINOR 5, fuera `arity_is_read_from_java_signatures_only` de la
+    evidencia Java; MINOR 7, el CHANGELOG dice 50 por archivo de foco y 10 por término; NIT, el tope
+    de 10 000 semillas de impact (y de raíces de traverse) en la doc y el CHANGELOG, y los tres
+    tamaños de este repo (128, 281, ≈440) aclarados en 07 y 13. El punto "Posible bug de código"
+    de arriba queda resuelto por `371912d`.
+

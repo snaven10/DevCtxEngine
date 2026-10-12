@@ -82,8 +82,8 @@ are in one file; `traverse` walks the relations `impact_analysis` does not
 (what a type contains, what implements it, who imports it).
 
 **A bare name is every definition of it.** `verify_token` means every symbol of
-the repository with that name, and the report says which it stood for — in one
-Quarkus repository `actualizar` is twenty-one distinct methods. Ask with the
+the repository with that name, and the report says which it stood for — a
+common name like `update` can be a few dozen distinct methods. Ask with the
 qualified name, `file::name` or a `sym` when you mean exactly one.
 
 **Read the counts.** `impact_analysis` and `get_references` leave out by default

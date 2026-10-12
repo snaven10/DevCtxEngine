@@ -148,7 +148,7 @@ comentario en la fuente de esta página.
 | **Java** | Campos por clase interna; `var` desde su inicializador; constantes (`LOG`) como campos de su tipo declarado, nunca como tipos; inyección por constructor (`this.x = x`) y campos `@Inject`; imports, mismo paquete, imports comodín, `java.lang`; `new T()` como `instantiates`; supertipos, incluidos los estáticos que hereda una entidad Panache (externos); elementos de un for-each; imports estáticos (JUnit, Mockito); métodos de `Object` sobre un receptor sin tipo (externos, `medium`); accessors de Lombok `@Data`/`@Getter` (al campo, `medium`); receptores a través de campos (`this.cfg.server.port()`); clases anónimas | El tipo de un parámetro de lambda sin tipo; sobrecargas elegidas por tipo de argumento (solo por aridad); genéricos más allá del elemento de una colección; lo que devuelven `Optional.get()`/`List.get()` |
 | **TypeScript / JavaScript** | Imports relativos (`.js` escrito por `.ts`, archivos `index`); alias de `paths` y `baseUrl` del `tsconfig.base.json` / `tsconfig.json` de la raíz (un `extends`); barrels hasta 4 niveles; imports por nombre, default, namespace y de paquete; paquetes externos solo con evidencia (una dependencia de `package.json`, un builtin de Node); DI de Angular (propiedades-parámetro del constructor, `inject(T)` de `@angular/core` en un campo o un local); funciones flecha ligadas a un `const` como símbolos y fuentes de sus llamadas; scopes léxicos (parámetros, `catch` y funciones de bloque sombrean); tipos de retorno declarados a lo largo de una cadena; métodos de interfaz (y métodos abstractos) como símbolos | CommonJS (`require`, `module.exports`), `export =`, `import()` dinámico, componentes JSX como llamadas, declaraciones ambientales `.d.ts`; los `paths` de un `tsconfig.json` por app; los bloques `namespace` no son símbolos (solo califican a sus miembros); las firmas de sobrecarga no son símbolos (solo la implementación); `this` en un método de objeto literal o en una *class expression*; las signals de Angular llamadas como funciones; receptores a través de varios campos (`this.a.b.m()`, por nombre) |
 | **Python** | Módulos por ruta y paquete (`__init__.py`, la raíz del repositorio, `src/`, el directorio propio de un script); imports relativos, `import *`, re-exports; llamadas a nivel de módulo (desde el símbolo de archivo); una llamada a una clase (a la clase); `self.x = …` en un método, tipado desde un parámetro tipado de `__init__`; `x = Foo()` / `x = make()` por la clase o la anotación de retorno; herencia y `super()`; funciones anidadas; la biblioteca estándar, los builtins y las distribuciones declaradas como externos; formas de `typing` (`Any`, `TypeVar` y uniones no tipan nada, `type[X]` es `X`, `Self` es la clase) | Parámetros sin anotar; `self.a.b()` (Python no declara campos); decoradores que cambian un tipo; los `-r` de un archivo de requirements |
-| **Rust** | Crates por `Cargo.toml` (el propio, dependencias por path, `workspace = true`); módulos por ruta y `mod` en línea; `use` (grupos, alias, globs) con el scope de su módulo, función o bloque; `crate::`, `self::`, `super::`, `Self::`; re-exports con `pub use`; los `impl` de un tipo en cualquier archivo de su crate; `impl Trait for T`; cada bound de un parámetro de tipo; campos por su declaración; `let x = T::new()?` por el tipo de retorno (`?`/`unwrap()` desenvuelven `Result`/`Option`); `std`/`core`/`alloc`, el prelude y los crates declarados como externos; métodos derivables (`clone`, `default`) como externos `medium`; gemelos por `#[cfg]` como `medium` | Las macros no son llamadas, y los ítems que define una macro no son símbolos; módulos declarados con `#[path]` o un `mod` condicional; un `impl<T: X> Y for T` genérico no pertenece a ningún tipo (sus métodos son `T.m`); `let x = a.f()` con `f` fuera del repositorio (una cadena, sin más tipo) |
+| **Rust** | Crates por `Cargo.toml` (el propio, dependencias por path, `workspace = true`); módulos por ruta y `mod` en línea; `use` (grupos, alias, globs) con el scope de su módulo, función o bloque; `crate::`, `self::`, `super::`, `Self::`; re-exports con `pub use`; los `impl` de un tipo en cualquier archivo de su crate; `impl Trait for T`; cada bound de un parámetro de tipo; campos por su declaración; `let x = T::new()?` por el tipo de retorno (`?`/`unwrap()` desenvuelven `Result`/`Option`); `std`/`core`/`alloc`, el prelude y los crates declarados como externos; `T::default()` de un derive (ningún `impl` lo define) vale un `T`, en `medium`; gemelos por `#[cfg]` como `medium` | Las macros no son llamadas, y los ítems que define una macro no son símbolos; módulos declarados con `#[path]` o un `mod` condicional; un `impl<T: X> Y for T` genérico no pertenece a ningún tipo (sus métodos son `T.m`); `let x = a.f()` con `f` fuera del repositorio (una cadena, sin más tipo) |
 | **Go** | El `module` de `go.mod` (y un `replace` local) decide qué es del repositorio; la biblioteca estándar y otros módulos como externos; un método por el tipo de su receptor, también desde otro archivo del paquete; campos por su declaración; `x := New()` por su resultado declarado; métodos de interfaz como símbolos; gemelos por build tags como `medium`; un tipo externo embebido hace externo a un método que falta (`medium`) | Dispatch por embebido (embeber promueve métodos, no los sobrescribe); un método promovido desde un tipo embebido del repositorio no tiene test; verificado solo con fixtures: no se midió ningún repositorio Go |
 | Kotlin y archivos de texto crudo | — | Ni símbolos ni aristas (sus rutas de Spring sí se extraen) |
 
@@ -158,7 +158,7 @@ c_a_constant_is_a_field_with_its_type, d_constructor_injection, e_same_package_a
 f_fluent_chains, g_new_is_instantiates, h_an_undefined_panache_static_is_inherited_and_external,
 i_for_each_variables, static_imports_object_methods_literals_and_lombok,
 a_dotted_receiver_is_typed_through_its_fields, lambda_parameters_and_patterns_bind_their_names,
-an_anonymous_class_scopes_its_bare_calls, arity_is_read_from_java_signatures_only,
+an_anonymous_class_scopes_its_bare_calls,
 confidence_never_escalates, a_call_after_an_external_one_is_not_external_by_default;
 facts_java.rs java_symbols_with_kind_parent_signature_and_visibility (@Inject, record, constructor).
 TypeScript/JavaScript: link_typescript.rs constructor_injection_aliases_and_barrels,
@@ -350,9 +350,12 @@ base de Python como mejor esfuerzo; Go no (embeber promueve métodos, no los
 sobrescribe, y una interfaz se satisface sin una arista que seguir).
 
 Por HTTP: `GET /impact/<símbolo>?depth=3&min_confidence=low&include_tests=true&max_nodes=500&dispatch=false`.
-La respuesta dice en `filters` qué filtros aplicó. Un nombre pelado significa las
+La respuesta dice en `filters` qué filtros aplicó; un filtro inválido
+(`min_confidence=most`) sigue siendo un 500 con `error` por HTTP, no un 400 como
+en `traverse`, `repo_map` y `skeleton`. Un nombre pelado significa las
 definiciones del repositorio con ese nombre (como en `get_references`), no toda
-llamada escrita con ese nombre.
+llamada escrita con ese nombre — a lo sumo 10 000, una guarda contra un nombre
+patológico (pasado ese tope el resto no son semillas, y nada informa el corte).
 Los campos de 0.9 conservan su significado: `resolved_symbols` (un nombre pelado
 que representaba varias declaraciones), `branch_fallback`, `warning`, y `omitted`
 / `omitted_for_budget` (la mitad del presupuesto de salida por dirección;
@@ -439,9 +442,13 @@ omitted_for_budget?, branch_fallback?}`:
 - El presupuesto de salida (`DEVCTX_MAX_OUTPUT_TOKENS`) se reparte por mitades
   entre nodos y aristas; lo que no entra se nombra en `omitted_for_budget`.
 
-No hay camino 0.9: sobre un índice anterior a 0.10 (o sin filas de símbolos)
-`traverse` es un error que pide `devctx index --full`. Por HTTP: `POST /traverse`
-con los parámetros como cuerpo JSON; un servidor más viejo que la tool responde
+No hay camino 0.9: sobre un índice anterior a 0.10 `traverse` es un error que
+pide `devctx index --full`; sobre un índice vigente sin ningún símbolo (ningún
+lenguaje con extracción de símbolos) lo dice y manda a `search` o `read_file`,
+porque un reindexado no cambiaría nada. Por HTTP: `POST /traverse` con los
+parámetros como cuerpo JSON — un parámetro inválido (una profundidad mayor a 4,
+una relación desconocida) es un 400 con su mensaje, cualquier otro error de la
+tool un 500 con `error`; un servidor más viejo que la tool responde
 404, y el cliente lo traduce a "reinicialo: `devctx serve --stop`". Desde la
 terminal: `devctx traverse OrderDto --kinds references --dir in --depth 2`
 (`--sym`, `--min-confidence`, `--include-tests`, `--include-external`,
@@ -512,10 +519,12 @@ una ruta con coma solo se puede pasar por la tool MCP. Los tokens se estiman com
 caracteres / 4, como en todo el producto; los `│` y `⋮` del dibujo pueden costarle
 más a un tokenizador real.
 
-No hay camino 0.9: sobre un índice anterior a 0.10 (o sin filas de símbolos)
-`repo_map` es un error que pide `devctx index --full`. Por HTTP: `GET
+No hay camino 0.9: sobre un índice anterior a 0.10 `repo_map` es un error que
+pide `devctx index --full`; sobre un índice vigente sin ningún símbolo lo dice y
+manda a `search` o `read_file`. Por HTTP: `GET
 /repo-map?budget=…&focus_files=a,b&focus_symbols=…&query=…` (listas separadas
-por coma); un servidor más viejo que la tool responde 404, y el cliente lo
+por coma; un parámetro inválido, como un presupuesto de 0, es un 400, cualquier
+otro error de la tool un 500 con `error`); un servidor más viejo que la tool responde 404, y el cliente lo
 traduce a "reinicialo: `devctx serve --stop`". Desde la terminal: `devctx map
 --focus src/api/client.ts --symbol OrderService.place --query "…" --budget 1500`.
 
@@ -590,8 +599,10 @@ mod tests [137-264] [test]
 
 No hay camino 0.9: sobre un índice anterior a 0.10 `skeleton` es un error que
 pide `devctx index --full`; sobre un índice vigente sin ningún símbolo (ningún
-lenguaje con extracción de símbolos) lo dice y manda a `read_file`. Por HTTP: `GET
-/skeleton?file=…`; un serve anterior a la tool responde 404, que el cliente
+lenguaje con extracción de símbolos) lo dice y manda a `search` o `read_file`.
+Por HTTP: `GET /skeleton?file=…` (un `file` vacío es un 400, cualquier otro error
+de la tool — incluido un archivo que el índice no tiene — un 500 con `error`,
+nunca un 404); un serve anterior a la tool responde 404, que el cliente
 traduce a "reinicialo: `devctx serve --stop`". Desde la terminal: `devctx skeleton
 src/api/client.ts`.
 
@@ -660,7 +671,7 @@ entonces una rama informa `extractor_stale: true` en `index_status`, y:
 | `read_symbol`, `get_references`, `search` (`keyword`/`hybrid`), la vista web del grafo | Como 0.9, por nombre sobre `graph_edges`, con un `warning` que lo dice |
 | `impact_analysis` | El recorrido de 0.9 — por nombre, sin confianza, sin filtros, sin tope — con el `warning` (que agrega, si se pasaron filtros, que no se aplicaron) |
 | `build_context` con `related: true` | El brief sin la sección, y `[devctx] related: not shown: …` |
-| `traverse`, `repo_map`, `skeleton` | Un error: `… reads the symbol graph, and this branch's index predates it …: reindex with devctx index --full (vectors are reused)` |
+| `traverse`, `repo_map`, `skeleton` | Un error: `… reads the symbol graph, and this branch's index predates it (an older extractor): reindex with devctx index --full (vectors are reused)` |
 | búsqueda híbrida con `search.centrality_weight` > 0 | Solo vector + palabra clave: no hay ranks que sumar |
 
 El paso a 0.10, cuánto cuesta y cómo volver atrás están en
@@ -673,9 +684,9 @@ El paso a 0.10, cuánto cuesta y cómo volver atrás están en
 símbolo llamado `update` y recorren desde todos por id, no a cada llamada
 escrita `.update(` — el `.map()` de una librería no es un llamador de tu `map`.
 La respuesta lista lo que el nombre pelado representó (`resolved_symbols`,
-`candidates`); veintiún métodos llamados `actualizar` es un número corriente
-para un repositorio Quarkus, así que leé esa línea. Preguntá con el nombre
-calificado (`OfficeService.actualizar`), con `archivo::nombre` o con un `sym`
+`candidates`); un nombre común como `update` puede representar unas cuantas
+decenas de métodos, así que leé esa línea. Preguntá con el nombre calificado
+(`OrderService.update`), con `archivo::nombre` o con un `sym`
 cuando querés decir uno solo. Un nombre sin definición en el repositorio
 representa sus sitios de llamada externos.
 

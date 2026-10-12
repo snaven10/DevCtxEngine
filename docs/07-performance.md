@@ -100,7 +100,10 @@ both retrievers, so treat it as at least the cost of the vector path.
 
 Measured while 0.10 was built, October 2026, on the same CPU-only machine —
 often loaded by other work, so read the figures as orders of magnitude. The
-repositories: this one (≈440 files at the time), two private Java repositories
+repositories: this one (≈440 files at the time; it had 128 when the search and
+storage figures above were taken, in August, and 281 in the reindex figures of
+[Keeping the index fresh](13-keeping-the-index-fresh.md#what-it-costs), on
+October 6), two private Java repositories
 (1 250 and 216 files), a subset of a private Angular workspace and, for
 `build_context`, that workspace whole. Graph tools were measured warm, each call
 opening the store as the server does, 40 calls per case.

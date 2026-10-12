@@ -82,7 +82,8 @@ recorre (qué contiene un tipo, qué lo implementa, quién lo importa).
 
 **Un nombre pelado es cada definición con ese nombre.** `verify_token` significa
 cada símbolo del repositorio con ese nombre, y el reporte dice cuáles representó
-— en un repositorio Quarkus, `actualizar` son veintiún métodos distintos.
+— un nombre común como `update` puede ser unas cuantas decenas de métodos
+distintos.
 Preguntá con el nombre calificado, `archivo::nombre` o un `sym` cuando querés
 decir uno solo.
 

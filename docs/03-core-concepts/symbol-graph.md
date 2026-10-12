@@ -144,7 +144,7 @@ source.
 | **Java** | Fields per inner class; `var` from its initializer; constants (`LOG`) as fields of their declared type, never as types; constructor injection (`this.x = x`) and `@Inject` fields; imports, same package, wildcard imports, `java.lang`; `new T()` as `instantiates`; supertypes, including statics a Panache entity inherits (external); for-each elements; static imports (JUnit, Mockito); `Object` methods on an untyped receiver (external, `medium`); Lombok `@Data`/`@Getter` accessors (to the field, `medium`); receivers through fields (`this.cfg.server.port()`); anonymous classes | The type of an untyped lambda parameter; overloads chosen by argument types (only by arity); generics beyond the element of a collection; what `Optional.get()`/`List.get()` return |
 | **TypeScript / JavaScript** | Relative imports (`.js` written for `.ts`, `index` files); `paths` aliases and `baseUrl` of the root `tsconfig.base.json` / `tsconfig.json` (one `extends`); barrels up to 4 levels; named, default, namespace and package imports; packages external only with evidence (a `package.json` dependency, a Node builtin); Angular DI (constructor parameter properties, `inject(T)` from `@angular/core` in a field or a local); arrow functions bound to a `const` as symbols and sources of their calls; lexical scopes (parameters, `catch`, block functions shadow); declared return types along a chain; interface methods (and abstract methods) as symbols | CommonJS (`require`, `module.exports`), `export =`, dynamic `import()`, JSX components as calls, ambient `.d.ts` declarations; the `paths` of a per-app `tsconfig.json`; `namespace` blocks are not symbols (they only qualify their members); overload signatures are not symbols (only the implementation); `this` in an object literal's method or a class expression; Angular signals called as functions; receivers through several fields (`this.a.b.m()`, by name) |
 | **Python** | Modules by path and package (`__init__.py`, the repository root, `src/`, a script's own directory); relative imports, `import *`, re-exports; module-level calls (from the file symbol); a call to a class (to the class); `self.x = …` in a method, typed from a typed `__init__` parameter; `x = Foo()` / `x = make()` by the class or the return annotation; inheritance and `super()`; nested functions; the standard library, builtins and declared distributions as external; `typing` forms (`Any`, `TypeVar` and unions type nothing, `type[X]` is `X`, `Self` the class) | Unannotated parameters; `self.a.b()` (Python declares no fields); decorators that change a type; a requirements file's `-r` includes |
-| **Rust** | Crates by `Cargo.toml` (own crate, path dependencies, `workspace = true`); modules by path and inline `mod`; `use` (groups, aliases, globs) scoped to its module, function or block; `crate::`, `self::`, `super::`, `Self::`; `pub use` re-exports; a type's `impl`s in any file of its crate; `impl Trait for T`; every bound of a type parameter; fields by their declaration; `let x = T::new()?` by the return type (`?`/`unwrap()` unwrap `Result`/`Option`); `std`/`core`/`alloc`, the prelude and declared crates as external; derivable methods (`clone`, `default`) as external `medium`; `#[cfg]` twins as `medium` | Macros are not calls, and items a macro defines are not symbols; modules declared with `#[path]` or a conditional `mod`; a blanket `impl<T: X> Y for T` belongs to no type (its methods are `T.m`); `let x = a.f()` with `f` outside the repository (a chain, typed no further) |
+| **Rust** | Crates by `Cargo.toml` (own crate, path dependencies, `workspace = true`); modules by path and inline `mod`; `use` (groups, aliases, globs) scoped to its module, function or block; `crate::`, `self::`, `super::`, `Self::`; `pub use` re-exports; a type's `impl`s in any file of its crate; `impl Trait for T`; every bound of a type parameter; fields by their declaration; `let x = T::new()?` by the return type (`?`/`unwrap()` unwrap `Result`/`Option`); `std`/`core`/`alloc`, the prelude and declared crates as external; `T::default()` from a derive (no `impl` defines it) holds a `T`, at `medium`; `#[cfg]` twins as `medium` | Macros are not calls, and items a macro defines are not symbols; modules declared with `#[path]` or a conditional `mod`; a blanket `impl<T: X> Y for T` belongs to no type (its methods are `T.m`); `let x = a.f()` with `f` outside the repository (a chain, typed no further) |
 | **Go** | The `module` of `go.mod` (and a local `replace`) decides what is the repository's; the standard library and other modules as external; a method by its receiver type, also from another file of the package; fields by their declaration; `x := New()` by its declared result; interface methods as symbols; build-tag twins as `medium`; an embedded external type makes a missing method external (`medium`) | Dispatch through embedding (embedding promotes methods, it does not override them); a method promoted from an embedded repository type has no test; checked only with fixtures: no Go repository was measured |
 | Kotlin and raw-text files | — | No symbols, no edges (their Spring routes are still extracted) |
 
@@ -154,7 +154,7 @@ c_a_constant_is_a_field_with_its_type, d_constructor_injection, e_same_package_a
 f_fluent_chains, g_new_is_instantiates, h_an_undefined_panache_static_is_inherited_and_external,
 i_for_each_variables, static_imports_object_methods_literals_and_lombok,
 a_dotted_receiver_is_typed_through_its_fields, lambda_parameters_and_patterns_bind_their_names,
-an_anonymous_class_scopes_its_bare_calls, arity_is_read_from_java_signatures_only,
+an_anonymous_class_scopes_its_bare_calls,
 confidence_never_escalates, a_call_after_an_external_one_is_not_external_by_default;
 facts_java.rs java_symbols_with_kind_parent_signature_and_visibility (@Inject, record, constructor).
 TypeScript/JavaScript: link_typescript.rs constructor_injection_aliases_and_barrels,
@@ -344,9 +344,12 @@ base classes on a best-effort basis; Go not at all (embedding promotes methods, 
 does not override them, and an interface is satisfied without an edge to follow).
 
 Over HTTP: `GET /impact/<symbol>?depth=3&min_confidence=low&include_tests=true&max_nodes=500&dispatch=false`.
-The answer says which filters it applied in `filters`. A bare name means the
-repository's definitions of it (as in `get_references`), not every call written
-with that name.
+The answer says which filters it applied in `filters`; an invalid filter
+(`min_confidence=most`) is still a 500 with `error` over HTTP, not a 400 like
+`traverse`, `repo_map` and `skeleton`. A bare name means the repository's
+definitions of it (as in `get_references`), not every call written with that
+name — at most 10 000 of them, a guard against a pathological name (past it the
+rest are not seeds, and nothing reports the cut).
 The fields of 0.9 keep their meaning: `resolved_symbols` (a bare name that stood
 for several declarations), `branch_fallback`, `warning`, and `omitted` /
 `omitted_for_budget` (half the output budget per direction; `omitted.count`
@@ -433,10 +436,13 @@ omitted_for_budget?, branch_fallback?}`:
 - The output budget (`DEVCTX_MAX_OUTPUT_TOKENS`) halves between nodes and
   edges; what does not fit is named in `omitted_for_budget`.
 
-There is no 0.9 path: on an index made before 0.10 (or without symbol rows)
-`traverse` is an error that asks for `devctx index --full`. Over HTTP: `POST
-/traverse` with the parameters as its JSON body; a server older than the tool
-answers 404, which the client turns into "restart it: `devctx serve --stop`".
+There is no 0.9 path: on an index made before 0.10 `traverse` is an error that
+asks for `devctx index --full`; on a current index with no symbols at all (no
+language with symbol extraction) it says so and sends to `search` or
+`read_file`, since a reindex would change nothing. Over HTTP: `POST /traverse`
+with the parameters as its JSON body — an invalid parameter (a depth over 4, an
+unknown relation) is a 400 with its message, any other error of the tool a 500
+with `error`; a server older than the tool answers 404, which the client turns into "restart it: `devctx serve --stop`".
 From the shell: `devctx traverse OrderDto --kinds references --dir in --depth 2`
 (`--sym`, `--min-confidence`, `--include-tests`, `--include-external`,
 `--no-dispatch`, `--limit`, `--offset`, `--json`).
@@ -506,10 +512,12 @@ so a path with a comma can only be passed through the MCP tool. Tokens are
 estimated as characters / 4 like everywhere else; the `│` and `⋮` of the layout
 may cost a real tokenizer more than that.
 
-There is no 0.9 path: on an index made before 0.10 (or without symbol rows)
-`repo_map` is an error that asks for `devctx index --full`. Over HTTP: `GET
+There is no 0.9 path: on an index made before 0.10 `repo_map` is an error that
+asks for `devctx index --full`; on a current index with no symbols at all it
+says so and sends to `search` or `read_file`. Over HTTP: `GET
 /repo-map?budget=…&focus_files=a,b&focus_symbols=…&query=…` (lists
-comma-separated); a server older than the tool answers 404, which the client
+comma-separated; an invalid parameter, such as a budget of 0, is a 400, any
+other error of the tool a 500 with `error`); a server older than the tool answers 404, which the client
 turns into "restart it: `devctx serve --stop`". From the shell: `devctx map
 --focus src/api/client.ts --symbol OrderService.place --query "…" --budget 1500`.
 
@@ -584,8 +592,10 @@ mod tests [137-264] [test]
 
 There is no 0.9 path: on an index made before 0.10 `skeleton` is an error that
 asks for `devctx index --full`; on a current index with no symbols at all (no
-language with symbol extraction) it says so and sends to `read_file`. Over HTTP: `GET
-/skeleton?file=…`; a server older than the tool answers 404, which the client
+language with symbol extraction) it says so and sends to `search` or
+`read_file`. Over HTTP: `GET /skeleton?file=…` (an empty `file` is a 400, any
+other error of the tool — a file the index does not hold included — a 500 with
+`error`, never a 404); a server older than the tool answers 404, which the client
 turns into "restart it: `devctx serve --stop`". From the shell: `devctx skeleton
 src/api/client.ts`.
 
@@ -652,7 +662,7 @@ then a branch reports `extractor_stale: true` on `index_status`, and:
 | `read_symbol`, `get_references`, `search` (`keyword`/`hybrid`), the web graph view | As 0.9 did, by name over `graph_edges`, with a `warning` that says so |
 | `impact_analysis` | The 0.9 walk — by name, no confidence, no filters, no cap — with the `warning` (which adds, when filters were passed, that they were not applied) |
 | `build_context` with `related: true` | The brief without the section, and `[devctx] related: not shown: …` |
-| `traverse`, `repo_map`, `skeleton` | An error: `… reads the symbol graph, and this branch's index predates it …: reindex with devctx index --full (vectors are reused)` |
+| `traverse`, `repo_map`, `skeleton` | An error: `… reads the symbol graph, and this branch's index predates it (an older extractor): reindex with devctx index --full (vectors are reused)` |
 | hybrid search with `search.centrality_weight` > 0 | Vector + keyword only: there are no ranks to add |
 
 The upgrade, what it costs and how to go back are in
@@ -664,10 +674,10 @@ The upgrade, what it costs and how to go back are in
 `impact_analysis` and `traverse` resolve `update` to every symbol named
 `update` and walk from all of them by id, not to every call written `.update(`
 — a library's `.map()` is not a caller of your `map`. The answer lists what a
-bare name stood for (`resolved_symbols`, `candidates`); twenty-one methods
-named `actualizar` is an ordinary number for one Quarkus repository, so read
-that line. Ask with the qualified name (`OfficeService.actualizar`), with
-`file::name`, or with a `sym` when you mean exactly one. A name with no
+bare name stood for (`resolved_symbols`, `candidates`); a common name such as
+`update` can stand for a few dozen methods, so read that line. Ask with the
+qualified name (`OrderService.update`), with `file::name`, or with a `sym` when
+you mean exactly one. A name with no
 definition in the repository stands for its external call sites.
 
 **Calls the index could not decide are counted, not hidden.** A call on an

@@ -280,7 +280,9 @@ suma, y el header de contexto de los métodos de un `impl` genérico pierde sus
 argumentos de tipo (`Cache<T>` → `Cache`).
 
 Medido en un sandbox, build release, `minilm-l6`, mientras se construía el
-extractor — así que cada fila es un paso, no 0.9.0 → 0.10.0 de una vez:
+extractor — así que cada fila es un paso, no 0.9.0 → 0.10.0 de una vez (este
+repositorio creció mientras tanto: 281 ficheros el 2026-10-06, unos 440 dos
+días después):
 
 | Fecha | Repositorio | Desde cero | `--full` tras cambiar el extractor | Chunks reusados |
 |---|---|---|---|---|
@@ -315,14 +317,15 @@ Nada se rompe mientras una rama espera su `--full`:
 | `read_symbol`, `get_references`, `search` (`keyword`/`hybrid`), la vista web del grafo | Como 0.9, por nombre sobre `graph_edges`, con un `warning` |
 | `impact_analysis` | El recorrido de 0.9 — por nombre, sin confianza, sin filtros, sin tope — con el `warning`, que agrega, si se pasaron filtros, que no se aplicaron |
 | `build_context` con `related: true` | Sin sección, y `[devctx] related: not shown: …` |
-| `traverse`, `repo_map`, `skeleton` | **Un error**: `… reads the symbol graph, and this branch's index predates it (an older extractor, or no symbol rows): reindex with devctx index --full (vectors are reused)`. No tienen una respuesta de 0.9 a la que volver |
+| `traverse`, `repo_map`, `skeleton` | **Un error**: `… reads the symbol graph, and this branch's index predates it (an older extractor): reindex with devctx index --full (vectors are reused)`. No tienen una respuesta de 0.9 a la que volver |
 | búsqueda híbrida con `search.centrality_weight` > 0 | Solo vector + palabra clave |
 | una rama nueva indexada desde una vieja | Re-embebe sus ficheros en vez de copiarlos |
 
 Una rama indexada por 0.10 cuyo lenguaje no tiene extracción de símbolos (solo
 ficheros de texto) tampoco tiene filas de símbolos: las herramientas viejas
-responden a la manera de 0.9 con un `warning` propio, y `skeleton` manda a
-`read_file` en vez de pedir un reindexado que no cambiaría nada.
+responden a la manera de 0.9 con un `warning` propio, y `traverse`, `repo_map`
+y `skeleton` responden un error que manda a `search` o `read_file` en vez de
+pedir un reindexado que no cambiaría nada.
 
 ### Volver a 0.9.0
 
