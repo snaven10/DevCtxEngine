@@ -31,7 +31,9 @@ el reporte lo dice). El módulo `duckdb` de Python debe ser **igual o más nuevo
 
 Variables: ver el encabezado de `run.sh` (`DEVCTX`, `DEVCTX_EVAL_CASES`, `DEVCTX_EVAL_GOLD`,
 `DEVCTX_EVAL_IMPACT`, `DEVCTX_EVAL_ROOT`, `DEVCTX_EVAL_OUT`, `DEVCTX_EVAL_LIMIT`, `DEVCTX_EVAL_RUNS`,
-`DEVCTX_EVAL_PY`, `DEVCTX_EVAL_ONLY`, `DEVCTX_EVAL_BRANCH`).
+`DEVCTX_EVAL_PY`, `DEVCTX_EVAL_ONLY`, `DEVCTX_EVAL_BRANCH`, `DEVCTX_EVAL_STEPS` y
+`DEVCTX_EVAL_CONTEXT_ARGS`, los argumentos extra de `devctx context`: `--related` o
+`--related --hops 2` miden el brief con la sección de firmas relacionadas de TASK-012).
 
 ### Casos fuera del repo (privacidad)
 

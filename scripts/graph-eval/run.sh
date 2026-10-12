@@ -28,6 +28,8 @@
 #   DEVCTX_EVAL_BRANCH  rama a medir en el DuckDB si hay varias (default: la de más aristas)
 #   DEVCTX_EVAL_STEPS   pasos a correr, separados por coma: relevance,impact,graph  (default: los tres;
 #                       `graph` incluye las métricas SQL y los gold edges)
+#   DEVCTX_EVAL_CONTEXT_ARGS  argumentos extra de `devctx context`, p. ej. `--related` o
+#                       `--related --hops 2` (TASK-012; default: ninguno)
 
 set -uo pipefail
 
@@ -40,6 +42,7 @@ STEPS="${DEVCTX_EVAL_STEPS:-relevance,impact,graph}"
 step() { [[ ",$STEPS," == *",$1,"* ]]; }
 OUT="${DEVCTX_EVAL_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/graph-eval.XXXXXX")}"
 SCORE=(python3 "$HERE/score.py")
+read -r -a CTX_ARGS <<<"${DEVCTX_EVAL_CONTEXT_ARGS:-}"
 
 mkdir -p "$OUT"
 log() { printf '[graph-eval] %s\n' "$*" >&2; }
@@ -104,7 +107,7 @@ emit() { printf '%s\n' "$*" | tee -a "$REPORT"; }
 emit "# graph-eval — $(date -u +%Y-%m-%dT%H:%MZ)"
 emit ""
 emit "- binario: \`$("$DEVCTX" --version 2>&1 | head -1)\` (\`$DEVCTX\`)"
-emit "- casos: ${CASE_FILES[*]##*/} | gold: ${GOLD_FILES[*]##*/} | search --limit $LIMIT | impact × $RUNS"
+emit "- casos: ${CASE_FILES[*]##*/} | gold: ${GOLD_FILES[*]##*/} | search --limit $LIMIT | impact × $RUNS | context ${CTX_ARGS[*]:-(sin argumentos extra)}"
 emit ""
 
 for repo in "${REPOS[@]}"; do
@@ -146,7 +149,7 @@ for repo in "${REPOS[@]}"; do
       t1=$EPOCHREALTIME
       "$DEVCTX" search "$q" --limit "$LIMIT" --no-rerank --hybrid --format json >"$W/$i.hybrid.json" 2>"$W/$i.hybrid.err"
       t2=$EPOCHREALTIME
-      "$DEVCTX" context "$q" --max-tokens 4096 --no-memories >"$W/$i.context.txt" 2>"$W/$i.context.err"
+      "$DEVCTX" context "$q" --max-tokens 4096 --no-memories "${CTX_ARGS[@]}" >"$W/$i.context.txt" 2>"$W/$i.context.err"
       t3=$EPOCHREALTIME
       elapsed_ms "$t0" "$t1" >>"$W/lat-vector.txt"; echo >>"$W/lat-vector.txt"
       elapsed_ms "$t1" "$t2" >>"$W/lat-hybrid.txt"; echo >>"$W/lat-hybrid.txt"
