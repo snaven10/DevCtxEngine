@@ -153,12 +153,12 @@ registry's copy.
 | `DEVCTX_EMBED_BATCH_SIZE` | Texts per encoder batch. Default `8` (was `32` before 0.8.5); batches run one after another, so peak memory scales with this. `0` or unparsable falls back to the default. |
 | `DEVCTX_DB_MEMORY_LIMIT` | DuckDB per-process memory budget, any DuckDB size literal. Default `2GB`. |
 | `DEVCTX_DB_THREADS` | DuckDB worker threads. Default `4`. |
-| `DEVCTX_MODEL_IDLE_SECS` | How long an unused model is kept loaded, in project servers and in the central daemon (which drops its embedder and reloads it on the next `remember` / `recall`). Default `300`; `0` keeps it for the life of the process. |
+| `DEVCTX_MODEL_IDLE_SECS` | How long an unused model is kept loaded, in project servers and in the central daemon (which drops its embedder and reloads it on the next `remember` / `recall`). Default `300`; `0` keeps it for the life of the process. The adjacency `repo_map` caches is released on the same schedule. |
 | `DEVCTX_MODEL_STALL_SECS` | Seconds with no growth of the model cache before a model download is declared stuck and fails (the model is then refused until the server restarts). Default `120`; `0` disables the guard. |
 | `DEVCTX_INDEX_STALL_SECS` | How long an index run may go without reaching a new file and still keep the server from its idle exit. Default `900`. |
 | `DEVCTX_SHUTDOWN_GRACE_SECS` | Grace a stopping server gives itself before the watchdog ends it. Default and maximum `3` — it can only be lowered, so `serve --stop` never SIGKILLs mid-checkpoint. |
 | `DEVCTX_VANISH_POLL_MS` | How often a server checks that its project directory still exists. Default `10000`. |
-| `DEVCTX_MAX_OUTPUT_TOKENS` | Cap on a whole-file `read_file` with no line range. Default `8000`; `0` disables. |
+| `DEVCTX_MAX_OUTPUT_TOKENS` | Output budget of the tools that answer lists or text: a whole-file `read_file` with no line range, `search`, `search_project`, `recall`, `memory_context`, `plan_status`, `search_routes`, `memories_by_*`, `get_references`, `impact_analysis` (half per direction), `traverse` and `skeleton`, and the largest `budget` `repo_map` takes; what does not fit is counted in `omitted`. Default `8000`; `0` disables. Read by the process that answers: set it on the server (`devctx serve`), not only on the MCP client. |
 | `DEVCTX_DAEMON_TIMEOUT_SECS` | How long an MCP session waits for a routed call to the shared daemon before giving up. Default `120`. `index_repo` stays on a fixed 1800s regardless of this, since indexing a large repository can legitimately run for many minutes. |
 | `DEVCTX_NO_UPDATE_CHECK` | Opt out of the background release check. |
 | `DEVCTX_LANG` | Language of the grouped `--help` summary (`en` / `es`). |

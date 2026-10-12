@@ -157,12 +157,12 @@ la copia del registro.
 | `DEVCTX_EMBED_BATCH_SIZE` | Textos por lote del encoder. Default `8` (era `32` antes de 0.8.5); los lotes corren uno tras otro, así que el pico de memoria escala con este valor. `0` o un valor no numérico vuelve al default. |
 | `DEVCTX_DB_MEMORY_LIMIT` | Presupuesto de memoria de DuckDB por proceso, cualquier literal de tamaño de DuckDB. Default `2GB`. |
 | `DEVCTX_DB_THREADS` | Hilos de trabajo de DuckDB. Default `4`. |
-| `DEVCTX_MODEL_IDLE_SECS` | Cuánto se mantiene cargado un modelo sin uso, en los servidores de proyecto y en el daemon central (que suelta su embedder y lo recarga en el siguiente `remember` / `recall`). Default `300`; `0` lo mantiene mientras viva el proceso. |
+| `DEVCTX_MODEL_IDLE_SECS` | Cuánto se mantiene cargado un modelo sin uso, en los servidores de proyecto y en el daemon central (que suelta su embedder y lo recarga en el siguiente `remember` / `recall`). Default `300`; `0` lo mantiene mientras viva el proceso. La adyacencia que cachea `repo_map` se suelta con el mismo plazo. |
 | `DEVCTX_MODEL_STALL_SECS` | Segundos sin crecimiento de la caché de modelos antes de dar una descarga por atascada y fallar (el modelo queda rechazado hasta reiniciar el servidor). Default `120`; `0` desactiva la guardia. |
 | `DEVCTX_INDEX_STALL_SECS` | Cuánto puede pasar una corrida de indexado sin llegar a un archivo nuevo y aun así evitar la salida por inactividad del servidor. Default `900`. |
 | `DEVCTX_SHUTDOWN_GRACE_SECS` | Gracia que se da un servidor que se detiene antes de que el watchdog lo termine. Default y máximo `3` — solo se puede bajar, para que `serve --stop` nunca mande SIGKILL en mitad de un checkpoint. |
 | `DEVCTX_VANISH_POLL_MS` | Cada cuánto verifica un servidor que su directorio de proyecto siga existiendo. Default `10000`. |
-| `DEVCTX_MAX_OUTPUT_TOKENS` | Tope de un `read_file` completo sin rango de líneas. Default `8000`; `0` lo desactiva. |
+| `DEVCTX_MAX_OUTPUT_TOKENS` | Presupuesto de salida de las herramientas que responden listas o texto: un `read_file` completo sin rango de líneas, `search`, `search_project`, `recall`, `memory_context`, `plan_status`, `search_routes`, `memories_by_*`, `get_references`, `impact_analysis` (la mitad por dirección), `traverse` y `skeleton`, y el mayor `budget` que acepta `repo_map`; lo que no entra se cuenta en `omitted`. Default `8000`; `0` lo desactiva. Lo lee el proceso que responde: ponelo en el servidor (`devctx serve`), no solo en el cliente MCP. |
 | `DEVCTX_DAEMON_TIMEOUT_SECS` | Cuánto espera una sesión MCP una llamada ruteada al servidor compartido antes de rendirse. Default `120`. `index_repo` queda en 1800 s fijos, porque indexar un repositorio grande puede tardar muchos minutos. |
 | `DEVCTX_NO_UPDATE_CHECK` | Optar por no hacer la verificación de releases en segundo plano. |
 | `DEVCTX_LANG` | Idioma del resumen agrupado de `--help` (`en` / `es`). |

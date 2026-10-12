@@ -31,6 +31,9 @@ weird branch exists because of a production incident.
 | I know the name — show me the thing | `read_symbol` |
 | What calls this? | `get_references` |
 | What breaks if I change it? | `impact_analysis` |
+| What does this class contain, what implements this, who uses this type? | `traverse` |
+| Where do I start in this repository? | `repo_map` (with a focus) |
+| Where in this file is the thing I want? | `skeleton` |
 | Why is it written this way? | `memories_by_symbol` / `memories_by_file` |
 | What do we know about X? | `recall` |
 | What should I read before answering? | `build_context` |
@@ -73,15 +76,27 @@ get_references("verify_token")   → every call site
 impact_analysis("verify_token")  → the blast radius, transitively
 ```
 
-**The graph is keyed by qualified name.** A bare name expands to every
-`Class.method` carrying it, and the report says which declarations it merged —
-in one Quarkus repository `actualizar` is twenty-one distinct methods. Ask with
-the qualified name when you mean exactly one.
+To find your way before that: `repo_map(query: "verify_token")` lists the
+signatures around it, ranked; `skeleton("src/auth/token.rs")` shows where things
+are in one file; `traverse` walks the relations `impact_analysis` does not
+(what a type contains, what implements it, who imports it).
+
+**A bare name is every definition of it.** `verify_token` means every symbol of
+the repository with that name, and the report says which it stood for — in one
+Quarkus repository `actualizar` is twenty-one distinct methods. Ask with the
+qualified name, `file::name` or a `sym` when you mean exactly one.
+
+**Read the counts.** `impact_analysis` and `get_references` leave out by default
+what they are not sure of (`low` confidence, calls the index could not decide),
+test code and library calls (`impact_analysis`), and say how much in
+`below_confidence`, `undecided_calls`, `excluded` and `omitted`. A large count is
+a reason to ask again with `min_confidence: "low"` or `include_tests: true`.
 
 **Empty is still not proof.** A clean report means "nothing found", never
-"nothing there": dynamic dispatch leaves no edge, only 7 languages produce edges
-at all, and a stale index looks identical to absent code. Cross-check an empty
-one with `search --keyword` before you touch anything.
+"nothing there": a call through a callback or reflection leaves no edge, only 7
+languages produce edges at all, and a stale index looks identical to absent
+code. Cross-check an empty one with `search --keyword` before you touch
+anything.
 
 ### Before you decide the code is wrong
 
@@ -231,6 +246,13 @@ daemon keeps serving the root it resolved at start: after changing this, run
 
 `index_status` reports the last-indexed commit and whether the index is current.
 If it is behind, `index_repo` catches it up incrementally — only what changed.
+
+`extractor_stale: true` is different: the index was built by an older version
+(after an upgrade to 0.10, every index is in that state once). An incremental
+run does not clear it; `index_repo` with `full: true` does, reusing the stored
+vectors. Until then the graph tools answer the old way with a `warning`, and
+`traverse`, `repo_map` and `skeleton` answer an error that asks for it — see
+[Keeping the index fresh](13-keeping-the-index-fresh.md#upgrading-to-010-the-symbol-graph).
 
 The index mirrors the **work tree**, not the last commit, so uncommitted code is
 searchable. Anything git ignores is not, which is the usual reason a file you

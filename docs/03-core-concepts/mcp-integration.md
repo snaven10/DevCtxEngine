@@ -231,11 +231,13 @@ you are working in — the backend question you hit while editing the frontend.
 
 ## Return shapes
 
-Most tools return **JSON**. Two do not:
+Most tools return **JSON**. Four do not:
 
 - `build_context` returns **prose**, because the result is meant to be read
   straight into a model's context and a JSON envelope would spend budget on
   punctuation.
+- `repo_map` and `skeleton` return text for the same reason: signatures laid
+  out as code, with `[devctx]` lines that say what was cut.
 - `summarize` returns text.
 
 ### The list tools always answer with an object
@@ -251,7 +253,7 @@ guess. Next to the rows, any of these may appear:
 | `omitted` | `{count, reason, next_offset?}` — what was left out. `reason` is `limit` (the page size) or `budget` (the output budget; wins when both cut). Absent means nothing was left out. (`omitted_for_budget`, which also names the dropped items, is kept one more release.) |
 | `total`, `next_offset` | `search_routes` and `plan_status`: rows matching before paging, and the `offset` of the next page (absent on the last) |
 | `branch_fallback` | `{current, used, why}` — the answer came from another branch; see [Search](search.md#branch-awareness) |
-| `warning` | The index was produced by an older extractor; reindex with `devctx index --full` |
+| `warning` | The answer came from the 0.9 path: the branch was indexed by an older extractor or has no symbol rows (reindex with `devctx index --full`), or the symbol table could not be read (a read error, not a reason to reindex) |
 
 Search hits carry `score`, `file`, `start_line`, `end_line`, `symbol`,
 `symbol_type`, `level`, `language`, `kind` (`code` / `test` / `doc` / `config`),
@@ -288,7 +290,7 @@ the junction row is missing but the memory's `files` names the file.
 
 ## Discovery
 
-On `tools/list` the server returns all 25 definitions with JSON Schema
+On `tools/list` the server returns all 27 definitions with JSON Schema
 parameters, declared upfront. The client validates arguments before each call.
 There is no runtime discovery step.
 
@@ -306,6 +308,26 @@ devctx serve      # long-lived server that owns the DB; other commands route to 
 `serve` matters for concurrency: DuckDB allows one writer per file, so a
 long-lived server owns the database and the CLI — and the MCP — route through it
 rather than contending for the lock.
+
+## Upgrading to 0.10
+
+- **Run `devctx index --full` once per repository, and per branch you use.**
+  0.10 writes a symbol graph that 0.9 indexes do not have; until the full run
+  the graph tools answer the 0.9 way with a `warning`, and `traverse`,
+  `repo_map` and `skeleton` answer an error that asks for it. The run reuses
+  the stored vectors. What it costs and what each tool answers meanwhile:
+  [Keeping the index fresh → Upgrading to 0.10](../13-keeping-the-index-fresh.md#upgrading-to-010-the-symbol-graph).
+- **Restart your AI sessions and stop old servers** (`devctx serve --stop`). A
+  0.9 MCP does not list `traverse`, `repo_map` or `skeleton` and cannot pass
+  `min_confidence`, `kinds`, `include_tests`, `include_external`, `max_nodes`,
+  `dispatch`, `related` or `graph_hops`. A 0.10 client against a 0.9 server gets
+  a 404 for the new tools, which it turns into "restart it: `devctx serve
+  --stop`", and a `warning` when the server ignored the new parameters.
+- **What an agent sees changes** even with no parameter: `impact_analysis`
+  follows only `high`/`medium` calls, leaves tests and library callees out and
+  lists 200 per direction, counting the rest; `get_references` lists one row
+  per occurrence with its `confidence`, and counts the `low` ones instead of
+  listing them. See [Symbol Graph](symbol-graph.md).
 
 ## Upgrading to 0.9
 
