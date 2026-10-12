@@ -1,31 +1,128 @@
 # Changelog
 
 Notable changes per release. Dates are tag dates. The plan behind 0.8.3 – 0.9.0
-is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
+is `plans/PLAN-008-robustez-y-salida-para-agentes/`; the one behind 0.10.0,
+`plans/PLAN-009-grafo-estatico-y-contexto/`.
 
-## Unreleased (0.10.0)
+## 0.10.0 — unreleased
+
+Not tagged yet: the release waits for the field verification and for the
+maintainer's go-ahead. This is PLAN-009, a static symbol graph and context built
+on it (`plans/PLAN-009-grafo-estatico-y-contexto/`).
+
+The call graph of 0.9 — one relation, names matched by suffix, library calls
+mixed in — becomes a **symbol graph**: symbols with stable ids, seven relations
+recorded per occurrence, and a link pass that resolves each one, per language,
+with a confidence and the reason. Three new tools read it (`traverse`,
+`repo_map`, `skeleton`); `read_symbol`, `get_references`, `impact_analysis` and
+search's identifier anchoring move onto it. **Every index needs one `devctx
+index --full`**, which reuses the stored vectors.
+
+### Upgrading from 0.9.x
+
+1. **Stop the servers and restart your AI sessions.** `devctx serve --stop`; a
+   running `devctx mcp` keeps the code it started with (`mcp.binary_replaced`).
+   A 0.9 MCP does not list the new tools nor pass the new parameters; a 0.10
+   client against a 0.9 server gets a 404 for the new tools, reported as
+   "restart it", and a `warning` when the server ignored new parameters.
+2. **Run `devctx index --full` once per repository and per branch you query**
+   (`devctx index --full --branch <b>`; `devctx reindex --all --full` for every
+   registered project's default branch). The extractor is now version 21 and
+   the link rules version 21, so every branch indexed by 0.9 reports
+   `extractor_stale: true`; hooks, `watch` and incremental runs never clear
+   it. The run re-parses everything and reuses the vector of every chunk whose
+   text did not change — measured during development at 24.8–54.9 s per
+   `--full` against 278–442 s from scratch on repositories of 216–281 files,
+   97.5–100 % of the chunks reused; a few chunks do change text and are
+   re-embedded (constructors become chunks, a generic `impl`'s methods lose the
+   type arguments in their header). Once one branch is rebuilt the others copy
+   the files they share with it.
+3. **Until then nothing breaks:** `read_symbol`, `get_references`,
+   `impact_analysis`, keyword/hybrid `search` and the web graph view answer as
+   0.9 did, with a `warning`; `traverse`, `repo_map` and `skeleton` answer an
+   error that asks for `devctx index --full`; `build_context` with `related`
+   says the section is not shown; a new branch re-embeds instead of copying.
+4. **What an agent sees changes, with no parameter:** `impact_analysis`
+   follows only `high`/`medium` calls, leaves test code and library callees
+   out, lists 200 symbols per direction, follows dispatch through interfaces,
+   and counts what it left out; a bare name means the repository's definitions
+   of it, not every call written with it. `get_references` lists one row per
+   occurrence, with its `confidence`, and counts the `low` ones instead of
+   listing them. JSON contracts only grew.
+5. **The database grows** (on a 216-file Java repository, 79 → 112 used blocks
+   of 256 KiB, plus 66 free that DuckDB does not reclaim).
+
+The guide, with the measurements and what each tool answers meanwhile:
+`docs/13-keeping-the-index-fresh.md`, *Upgrading to 0.10*.
+
+### Going back to 0.9.0
+
+Install 0.9.0, `devctx serve --stop`, restart the AI sessions. The new tables
+stay in the database, unread and harmless; nothing is migrated or rewritten.
+`graph_edges` was kept current in its 0.9 format, so 0.9.0's graph tools answer
+from it (verified with a build that has 0.9.0's read path: the same `impact`
+answer byte for byte; the field verification repeats it with the released
+binary). 0.9.0 reports `extractor_stale` and works anyway; its `--full` would
+re-embed everything (0.9.0 does not reuse vectors). Coming back to 0.10 after
+0.9.0 indexed files: the branch reads as stale (`graph_out_of_step`) and asks
+for `devctx index --full` again, with vectors reused.
 
 ### Added
 
-- **Related signatures in `build_context`** (PLAN-009 TASK-012): with
-  `related: true` (MCP and `POST /context`; `devctx context --related`) the
-  brief adds `## Related (signatures)` between the code and *Recorded against
-  this code*: the callers, callees, instantiations and supertypes (and the
-  supertype method a method overrides) of its first 5 code hits, as
-  signatures with their relation and `file:line`, never bodies — `high`/`medium`
-  edges only, no tests or libraries, nothing already shown, by PageRank, 4 per
-  hit. `graph_hops: 2` (`--hops 2`) adds the neighbors' neighbors. The section
-  takes at most 20 % of the budget from the code but never the best hit, no
-  line stands without its hit in the code, the whole brief (its note included)
-  stays within the budget, and what is left out is counted in the brief's
-  `omitted` line. Read once per brief, as one batch;
-  **off by default** (`--no-related` turns it off explicitly), and off it reads
-  nothing and the brief is byte for byte the 0.9 one. A branch without a
-  current symbol graph says so (`[devctx] related: not shown: …`) instead of an
-  empty section, and a server older than the client gets `[devctx] related: not
-  applied: … restart it` from the client.
-
-- **`traverse`** (PLAN-009 TASK-013): a new tool (MCP, `POST /traverse`,
+- **The symbol graph** (`symbols` and `edges`, PLAN-009 TASK-003 to TASK-007).
+  One row per definition with a stable, branch-free id (`sym`, 16 hex digits),
+  its kind (`file`, `module`, `class`, `interface`, `enum`, `record`, `struct`,
+  `trait`, `impl`, `type`, `function`, `method`, `constructor`, `field`,
+  `const`), qualified name (every enclosing scope), parent, package, signature
+  (the head up to the body, on one line, 200 characters after leading
+  annotations) and visibility. One row per *occurrence* of `calls`,
+  `instantiates`, `imports`, `inherits`, `implements`, `references` (type uses)
+  and `contains`: a second call to the same target from one method, and calls
+  outside any function (from a per-file symbol), are no longer lost. New
+  definitions: constructors, records, fields, constants, Rust `impl`s, TS/JS
+  functions bound to a `const` (`export const x = () => …`, now sources of their
+  calls), TS `enum`/`type`, Go `struct`/`interface`, interface and abstract
+  methods. Rust test code inside a source file (`#[cfg(test)]` that requires
+  `test`, `mod tests`, `#[test]`, `#[tokio::test]`, `#[rstest]`) is test code,
+  like a test file.
+- **The link pass.** Every run ends by resolving the branch's edges — those
+  the run touched, or all of them when a fifth of the branch changed, the link
+  rules changed or a manifest changed — to the definition they reach (`dst_id`),
+  with a `confidence` (`high`, `medium`, `low`) and a `resolution` (`self`,
+  `local`, `param`, `field`, `ctor_inject`, `import`, `same_file`,
+  `same_package`, `inherited`, `return_type`, `unique_name`, `name_only`,
+  `external_known`, `chain_external`). `external` only with evidence: the
+  platform or a dependency a manifest declares (`package.json`, `Cargo.toml`,
+  `go.mod`, `pyproject.toml`, `setup.cfg`, `requirements*.txt`), each of them
+  read into the link environment (a changed one relinks the branch; an
+  unreadable one keeps its last good version). A call on an untyped receiver to
+  a name the repository lacks is discarded (kept as `resolution = discarded`,
+  out of every answer, reopened when the name appears); `index_repo` reports
+  `edges_discarded` and `edges_unresolved`. The incremental pass is tested equal
+  to a full one, row by row. Per language:
+  - *Java:* lexical scopes (each inner class its own fields), `var` from its
+    initializer, constants such as `LOG` never taken for types, constructor
+    and field injection, imports, same package, statics a Panache entity
+    inherits, `Object` methods, static imports, Lombok accessors, receivers
+    through fields, declared return types along a chain.
+  - *TypeScript/JavaScript:* relative imports, the root `tsconfig`'s `paths`
+    and `baseUrl`, barrels up to four levels, packages external only when a
+    `package.json` declares them (or a Node builtin), Angular DI (constructor
+    parameter properties, `inject(T)`), lexical scopes, declared return types.
+  - *Python:* modules by path and package, relative and star imports,
+    re-exports, `self.x` typed in methods, `x = Foo()`, the standard library,
+    builtins and declared distributions as external, `typing` forms.
+  - *Rust:* crates by `Cargo.toml`, modules, scoped `use`, `crate::`/`super::`/
+    `Self::`, `pub use`, a type's `impl`s across its crate, `impl Trait for T`,
+    every bound of a type parameter, `?`/`unwrap()`; macros are not calls.
+  - *Go* (fixtures only): `go.mod` decides what is the repository's, methods
+    by receiver type across a package's files, build-tag twins at `medium`.
+  Measured on call sites labelled by hand: Java 20 of 25 right (19 of 19
+  `high`), TypeScript 20 of 20, Python 26 of 27, Rust 26 of 26; calls left
+  undecided 4–8 % (Java), 11 % (TypeScript), 2 % (Python), 17.5 % (Rust), from
+  59–94 % unqualified before. `graph_edges` loses its `var.*` and `LOG.*`
+  targets.
+- **`traverse`** (TASK-013): a new tool (MCP, `POST /traverse`,
   `devctx traverse`) to walk the symbol graph hop by hop from a symbol — a bare,
   qualified or `file::name` symbol, a file path, or one `sym` — along the
   relations asked (`calls`, `instantiates`, `imports`, `inherits`,
@@ -38,443 +135,169 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   filters, …}`: nodes with `sym`, `kind`, `file`, `line`, `depth`,
   `confidence`, `via`; the edges that reached them (`from`/`to` as `sym`s, one
   per pair and relation with its occurrences). Paged (`limit` 50, `offset`):
-  once a page is full no deeper level is read (`partial`), so a type referenced
-  from hundreds of files is paged, not dumped. An index made before 0.10 is an
-  error that asks for `devctx index --full`; a server older than the tool
-  answers 404, which clients report as "restart it". **After a change of
-  extractor version, `traverse` errors until `devctx index --full`**, while
-  `impact_analysis` and `get_references` degrade to the 0.9 answer with a
-  `warning`. Calls to the name the index could not decide are counted
-  (`undecided_calls`) or, with `min_confidence: "low"`, listed at depth 1; with
-  `partial`, `total_is_lower_bound: true`.
-
-- **`skeleton`** (PLAN-009 TASK-014): a new tool (MCP, `GET /skeleton?file=…`,
-  `devctx skeleton <file>`) that answers the structure of one file to locate
-  where something is: its symbols with their signatures and line ranges
-  `[l1-l2]`, nested by container (`parent_id`), without bodies, and its imports
-  in one line (`imports (N): …`, the first 8). Read from the symbol graph, never
-  from the file; signatures cleaned as in `repo_map` (no leading annotations, no
-  value, no final `;`), `…` when the index cut one at 200 characters. Test code
-  is marked `[test]`, not hidden. Within `DEVCTX_MAX_OUTPUT_TOKENS` (at least
-  256), closed by `[devctx] N more symbols (lines a-b)` when cut. `file` is
-  repo-relative, as `read_file` takes it; a file the index does not hold is an
-  error naming the nearest indexed paths, and a path with `..` or outside the
-  repository is refused before anything is looked up. Measured on 12 files of
-  623-4 684 lines in four repositories: 4.9-10.2 % of the file's tokens, p95 ≤ 26 ms. An index
-  made before 0.10 is an error that asks for `devctx index --full`; a server
-  older than the tool answers 404, which clients report as "restart it".
-
-- **`repo_map`** (PLAN-009 TASK-011): a new tool (MCP, `GET /repo-map`,
-  `devctx map`) that answers, in about a thousand tokens (`budget`, default
-  1024), a map of the repository to orient an agent: the signatures — never
-  bodies — of the symbols most relevant to its focus (`focus_files`: files it
-  has open, whose uses rank first and which are not listed themselves;
-  `focus_symbols`; `query`, whose identifiers count), grouped by file, members
-  under their containers, ranked by PageRank personalized to that focus over
-  the same weighted matrix as the global rank (each focus file and each focus
-  term weighs the same, shared among its symbols; live edges only; test code and
+  once a page is full no deeper level is read (`partial`, and then
+  `total_is_lower_bound: true`), so a type referenced from hundreds of files is
+  paged, not dumped. Calls to the name the index could not decide are counted
+  (`undecided_calls`) or, with `min_confidence: "low"`, listed at depth 1.
+- **`repo_map`** (TASK-011): a new tool (MCP, `GET /repo-map`, `devctx map`)
+  that answers, in about a thousand tokens (`budget`, default 1024), a map of
+  the repository to orient an agent: the signatures — never bodies — of the
+  symbols most relevant to its focus (`focus_files`: files it has open, whose
+  uses rank first and which are not listed themselves; `focus_symbols`;
+  `query`, whose identifiers count), grouped by file, members under their
+  containers, ranked by PageRank personalized to that focus over the same
+  weighted matrix as the global rank (each focus file and each focus term
+  weighs the same, shared among its symbols; live edges only; test code and
   libraries never appear). Text, closed by `[devctx]` lines that say what the
   focus matched and how many symbols did not fit. The serve caches the
   branch's adjacency per index generation (dropped when an `index` ends and
-  when idle, like a model; `status.memory.repo_map` reports it). An index made
-  before 0.10 is an error that asks for `devctx index --full`; a server older
-  than the tool answers 404, which clients report as "restart it".
+  when idle, like a model; `status.memory.repo_map` reports it).
+- **`skeleton`** (TASK-014): a new tool (MCP, `GET /skeleton?file=…`,
+  `devctx skeleton <file>`) that answers the structure of one file to locate
+  where something is: its symbols with their signatures and line ranges
+  `[l1-l2]`, nested by container, without bodies, and its imports in one line
+  (`imports (N): …`, the first 8). Read from the symbol graph, never from the
+  file; signatures cleaned as in `repo_map`. Test code is marked `[test]`, not
+  hidden. Within `DEVCTX_MAX_OUTPUT_TOKENS` (at least 256), closed by
+  `[devctx] N more symbols (lines a-b)` when cut. A file the index does not
+  hold is an error naming the nearest indexed paths, and a path with `..` or
+  outside the repository is refused before anything is looked up. Measured on
+  12 files of 623-4 684 lines in four repositories: 4.9-10.2 % of the file's
+  tokens, p95 ≤ 26 ms.
+- **Related signatures in `build_context`** (TASK-012), **off by default**:
+  with `related: true` (MCP and `POST /context`; `devctx context --related`)
+  the brief adds `## Related (signatures)` between the code and *Recorded
+  against this code*: the callers, callees, instantiations and supertypes (and
+  the supertype method a method overrides) of its first 5 code hits, as
+  signatures with their relation and `file:line`, never bodies — `high`/`medium`
+  edges only, no tests or libraries, nothing already shown, by PageRank, 4 per
+  hit. `graph_hops: 2` (`--hops 2`) adds the neighbors' neighbors. The section
+  takes at most 20 % of the budget from the code but never the best hit, no
+  line stands without its hit in the code, the whole brief stays within the
+  budget, and what is left out is counted in the brief's `omitted` line. Off,
+  it reads nothing and the brief is laid out byte for byte as in 0.9. On the
+  evaluation set it raised the expected-file rate 21 → 22 of 26, short of the
+  10 points a default required.
+- **Symbol centrality in hybrid search, opt-in** (TASK-010): every link pass
+  that completes computes a global PageRank of the branch's symbols
+  (`symbols.rank`, written only where it changed) and their `in_degree`, over
+  live edges: calls and instantiations weigh 1, inheritance 0.8, type uses 0.5,
+  imports 0.3, `contains` 0; `high` 1, `medium` 0.6, `low` 0.2, from a test
+  × 0.1, `sqrt(n)` for repeated calls; damping 0.85, at most 100 iterations,
+  deterministic. Hybrid search — and so `build_context` — can add it as a third
+  list of the rank fusion over the candidates the retrievers brought,
+  `search.centrality_weight` (0-1; a value outside, or not a number, is
+  bounded and warned about). **Off by default** (`0`): on 12 of the 30
+  evaluation cases turning it on was within the noise and the one Spanish case
+  that moved got worse; it is re-evaluated on all of them, by language. When
+  on, hybrid `score`s and order change and a ranked hit carries `raw_score`;
+  vector search is unchanged and an anchored definition still comes first.
+  Cost: 21–165 ms per link pass; hybrid search p50 within a few ms.
+- **Dispatch in `impact_analysis`** (TASK-017), on by default: a caller that
+  holds a service by its interface (an injected field, a parameter typed by a
+  trait) is in the blast radius of the implementation. At every depth,
+  upstream, a method reaches the callers of the methods it overrides in its
+  supertypes, and downstream an interface or abstract method reaches the
+  methods that implement it and what they call; through resolved
+  `inherits`/`implements` edges, up to four supertype levels, same name and an
+  arity that can match (in TS/JS an implementation may take fewer parameters),
+  never a private or static method, not in Go (embedding is no override).
+  Such a node has `via: "dispatch"` and `through`, and confidence
+  `min(medium, the edge it stands for)` — never `high`. At most 16 equivalents
+  per node, 16 origins per equivalent and 8 192 dispatch rows per call; what
+  that cuts is counted in `omitted_by_limit.dispatch` (`count`, `beyond_depth`,
+  `origins_capped`, `rows_capped`). `dispatch: false` (`--no-dispatch`,
+  `?dispatch=false`) follows direct calls only, `min_confidence: "high"` leaves
+  it out without reading it, and `dispatch: {"evaluated": false, reason}` says
+  so. Also in `traverse` on `calls`.
 
 ### Changed
 
-- **Signatures: leading annotations no longer count against the 200-character
-  cap** (review of PLAN-009 TASK-014; extractor version 21). A Java annotation
-  or TS decorator longer than the cap used to leave a stored signature with no
-  name (in `repo_map`, `skeleton`, `read_symbol`'s `code` for a field). The head
-  is capped on its own and ends in `…` when cut; the leading annotations that fit
-  whole in another 200 stay in front (the link pass reads `@Data`). The bump
-  rides on the `--full` 0.10 already requires; ids do not change.
-
-- **Reindex reuses vectors by chunk `content_hash`** (PLAN-009 TASK-002): a
-  `--full` over unchanged source embeds nothing, loads no model and rebuilds no
-  HNSW/BM25 index. The branch's embedding fingerprint (provider, model, width,
-  engine read from `Cargo.lock`, character cap, normalization, HTTP endpoint)
-  must equal the active one; a run under another setup marks the branch
-  "transition" until it completes.
-- **Indexes from before fingerprints** are reused only when their recorded model
-  and width equal the active ones (and no run left them in "transition"); the
-  run seals them. The same rule decides which branches may be a source for the
-  cross-branch copy, which now also requires the source's fingerprint to match.
-- `index` reports `files_unchanged` (files a `--full` found identical and did
-  not write) separately from `files_indexed`.
-- **New `symbols` and `edges` tables** (PLAN-009 TASK-003): one row per
-  symbol with a stable, branch-free id, and one row per call *occurrence* —
-  the second call to the same target from one method, and module-level calls
-  (sourced from a per-file symbol), are no longer lost. Written in the same
-  per-file transaction as the vectors and maintained on delete, branch copy and
-  branch prune; a renamed file's rows are dropped and rewritten by the reindex
-  at the new path (the id carries the file, so its symbols get new ids). The
-  qualified name carries every enclosing scope (module, function, class,
-  namespace, Go receiver) and a Rust trait impl carries its trait, so adding a
-  homonym elsewhere in a file does not move an existing symbol's id.
-  `graph_edges` is still written in the same format, so 0.9.0 can read a
-  downgraded index. **Extractor version 2:** existing indexes report
-  `extractor_stale` until `devctx index --full`; so does one whose graph lost
-  step with its files (files added, deleted or modified by 0.9.0 after a
-  downgrade), and such a branch is no longer a source for the cross-branch
-  copy.
-- **Structured extraction** (PLAN-009 TASK-004, **extractor version 3**:
-  existing indexes report `extractor_stale` until `devctx index --full`, which
-  reuses the vectors of unchanged chunks). New symbol kinds: `constructor`,
-  `record`, `field`, `const`, `impl` (Rust), TS/JS functions bound to a `const`
-  (`export const x = () => …`) and arrow-valued class fields, TS `enum`/`type`,
-  Go `struct`/`interface`. Symbols carry a package (declared or derived from
-  the path), a signature (the head up to the body, multi-line collapsed) and
-  `exported`. `edges` now holds `imports`, `inherits`, `implements`,
-  `instantiates`, `references` (type uses) and `contains` besides `calls`;
-  only `contains` is resolved at write time (both ends in the file,
-  `resolution = 'structural'`). Calls inside an arrow-const have it as their
-  source (they used to be dropped); a callback, an arrow bound to an object
-  key or to `this.x` is not a source, its calls belong to the enclosing
-  function; TS/JS re-exports (`export { x } from './y'`) are imports;
-  Rust path calls keep their path (`Foo::bar()` → `Foo.bar`, `Self::new()` →
-  the impl's type, `std::fs::read()` → `std::fs::read`); a Go method's calls
-  come from `Type.method`. Constructors are chunks of their own; fields,
-  constants and `impl`s are not (chunk churn on a Java repo: 80 of 3 284).
-  Parsers are cached per language and thread (queries were compiled per file).
-  A golden test pins the extractor's output per version: symbols with their
-  parent, visibility and signature, and every edge with its source.
+- **Lookups by symbol** (TASK-008): on a branch with a current symbol graph,
+  `read_symbol`, `get_references`, the identifier anchoring of `search` and the
+  web graph view read the `symbols` table and the resolved edges by id instead
+  of matching names and suffixes. Definitions add `sym`, `kind` and
+  `qualified`; anchored hits add `sym`; references add `confidence`, `via` and
+  `sym`, plus `external`, `test` and `undecided` when true. `get_references`
+  lists one reference per occurrence of calls and instantiations; **`kinds`**
+  adds type uses, imports and inherits/implements (or `all`) — the calls always
+  stay; **`min_confidence`** (`high`, `medium` — default —, `low`) and what the
+  default leaves out is counted in `below_confidence`. `external` comes from
+  the link pass's evidence: `Foo::new` that does not exist is no longer external
+  because some `new` is called (it gets `suggestions`), and a `file::name` miss
+  is never external. A call the link pass discarded reaches no answer.
+  Anchoring reads every definition's code in one query and pins one chunk per
+  definition.
+- **`impact_analysis` walks the symbol graph by levels** (TASK-009): one query
+  per depth and direction over ids, whatever the size of the frontier (an `IN`
+  list up to 512 ids, one `UBIGINT[]` parameter above). **A bare name means the
+  repository's definitions of it**, as in `get_references`; a name with no
+  definition stands for its external call sites and answers `external` +
+  `called_from`, or `suggestions`. **New defaults:** only `high`/`medium` calls,
+  no symbols of test files, no library callees, 200 symbols per direction; what
+  that leaves out is counted (`below_confidence` in symbols, `undecided_calls`
+  in calls, `excluded`, `omitted` + `omitted_by_limit`) and not walked, and
+  `min_confidence`, `include_tests`, `include_external`, `max_nodes` (tool,
+  `GET /impact`, `devctx impact` flags) change it; `filters` says which applied.
+  Each symbol adds `confidence`, `via`, `sym`, `file`, `line` and
+  `test`/`external`/`undecided` when true, ordered within a depth by
+  confidence, rank and name. On a 1 250-file Java repository, p95 of `get` and
+  `map` went from 4.2 and 5.7 s to 41 and 86 ms. The TUI's local view gives
+  the tool's answer.
+- **Signatures:** leading annotations no longer count against the
+  200-character cap: the head is capped on its own, ending in `…` when cut,
+  and the annotations that fit whole in another 200 stay in front.
 - **The type of an `impl` is named as its definition is** (`impl<T> Foo<T>`,
-  `impl Display for &'a Foo`, `impl crate::x::Foo` → `Foo`). This changes
-  content, not format: the `graph_edges` source of such a method is now
-  `Foo.get` (was `Foo<T>.get`), and its chunks' context header changes with
-  it, so the first `--full` after upgrading re-embeds those chunks instead of
-  reusing them (measured on this repository: 40 of 4928 chunks, 143 of 16 123
-  `graph_edges` rows).
-- **Extractor version 4** (review of TASK-004; `devctx index --full` again):
-  a Rust `impl`'s ids no longer change when `rustfmt` lays its `where` clause
-  or generic arguments out vertically (trailing commas dropped); the
-  `graph_edges` source of a named function is its symbol's qualified name
-  (`traced.wrapper` for a decorator's `wrapper`, `C.init.run` for an anonymous
-  class's method, `C.m.f` for a function nested in a method; `const x =
-  function named() {}` is `x`), so `impact_analysis`/`get_references` no longer
-  lose those callers; `export default foo;` marks `foo` exported.
-- **Extractor version 5** (`devctx index --full` again): a comment inside an
-  `impl`'s `where` clause or generic arguments no longer changes its ids, a
-  one-element tuple argument (`impl Foo<(u8,)>`) no longer shares the ids of
-  `impl Foo<(u8)>`, and `export default (foo);` marks `foo` exported.
-
-- **Link pass** (PLAN-009 TASK-005, **extractor version 6**: `devctx index
-  --full`): every run ends by resolving the branch's edges to the symbol they
-  reach (`dst_id`, `confidence`, `resolution`, `external`), incrementally after
-  the files it wrote. A call's receiver is typed by lexical scope in Java (each
-  inner class has its own fields; `var` from its initializer; for-each
-  elements; constructor injection), recorded per edge as `hint`, and a
-  constant such as `LOG` is never taken for a type, so `graph_edges` loses its
-  `var.*`/`LOG.*` targets. Java rules: imports, same package, nested types,
-  inheritance, Panache statics and `Object` methods as inherited externals,
-  static imports, the declared return type along a fluent chain. Calls on a
-  receiver nothing types, to a name the repository does not define, are
-  dropped and counted (`index_repo` reports `edges_discarded` and
-  `edges_unresolved`). Measured on two Java repositories: 2.7 % of calls left
-  undecided (was 100 %), 18 of 20 hand-labelled call sites resolved correctly,
-  all 18 of those marked `high`.
-- **Link pass, after review** (**extractor version 7**): a dotted receiver
-  whose first segment is a variable is typed through its fields, never taken
-  for a package; a call after an external one is no longer external by
-  default (`name_only` when the repository has the name, `chain_external`,
-  `medium`, otherwise); lambda parameters and pattern variables no longer take
-  the type of a field of their name; confidence never escalates along a chain;
-  an anonymous class scopes its calls; constructor injection keeps the field's
-  declared type. The incremental pass now matches a full one (tested), a pass
-  cut short is redone by the next run, a change of link rules relinks the
-  branch, and dropped calls are kept (`resolution = 'discarded'`) so a later
-  definition reopens them. Measured on two Java repositories: 8.1 % and 4.2 %
-  of calls undecided, 20 of 25 hand-labelled sites correct, all 19 `high`
-  ones right.
-- **Extractor version 8, link rules version 2:** `@lombok.Data` is recognised
-  like `@Data`; discarded calls wait for their name instead of being
-  re-resolved on every run, and readers get them filtered out through the
-  `live_edges` view; a call in an anonymous class that only the enclosing
-  class defines resolves to it (`medium`); `Config.INSTANCE.m()` is typed.
-  Link rules version 3: a hint's names are read by position, so a callee
-  called `name()` still reopens the edges after it.
-- **TypeScript/JavaScript resolution** (PLAN-009 TASK-006, **extractor
-  version 9**, link rules version 4): calls, type uses and imports resolve
-  through what the file imports — relative paths (`.js` written for `.ts`,
-  directory `index` files), the `paths` aliases and `baseUrl` of the root
-  `tsconfig.base.json`/`tsconfig.json` (comments, trailing commas, one
-  relative `extends`), barrels re-exporting up to four levels deep — and npm
-  packages are external only when the repository does not define the imported
-  name. Angular DI types receivers: constructor parameter properties and
-  `inject(T)` (in a field or a local) are `ctor_inject`. TS/JS get lexical
-  scopes: parameters, destructured names and `catch` variables shadow fields,
-  a bare name is never a member, `this` outside a declared class (an object
-  literal's method, a class expression) is untyped, and the declared return
-  type of a function types the next call of a chain. A changed `tsconfig`
-  relinks the branch; the incremental pass re-resolves the files importing a
-  written one, through barrels. Measured on three libraries of an Angular/Nx
-  workspace: 10.8 % of calls undecided (was 73.1 %), 20 of 20 hand-labelled
-  call sites correct, all `high`.
-- **TypeScript/JavaScript, after review** (**extractor version 10**, link rules
-  version 5): a package is external only with evidence — a dependency of the
-  root or nearest `package.json`, or a Node builtin — so an unmapped alias or
-  an undeclared module stays undecided; a call to a name imported from where
-  nothing can follow is undecided rather than matched to a repository
-  homonym; only Angular's `inject` injects; a function bound in a sibling
-  block no longer shadows. An unreadable `tsconfig.base.json` or
-  `package.json` (a merge conflict) no longer relinks the branch without its
-  aliases: the last good environment is kept; a byte-order mark and an
-  `extends` array are read. The incremental pass reopens a TS import row by
-  its imported name and follows an importer's return types, and falls back to
-  the full pass when the importers exceed a fifth of the branch.
-- **TypeScript/JavaScript, second review** (**extractor version 11**, link
-  rules version 6): an unreadable `tsconfig` or `package.json` now falls back
-  per file, so a broken template manifest no longer freezes alias and
-  dependency changes; an import from a declared package is external even when
-  the repository defines the same name; manifests under `dist/`, `vendor/`
-  and other excluded directories are not workspace packages. A receiver bound
-  to a function or class (`fn.call()`, `Klass.make()` with `const Klass =
-  class {…}`) is read as that name: `fn.call()` is now undecided instead of
-  discarded, and `Klass.make()` resolves to the method. Two same-named
-  functions in sibling blocks resolve at `medium`.
-- **Link environment** (PLAN-009 TASK-007): besides `tsconfig` and
-  `package.json`, every `Cargo.toml`, `go.mod`, `pyproject.toml`, `setup.cfg`
-  and `requirements*.txt` of the branch is read; changing one relinks the
-  branch in full, an unreadable one keeps its last good version (per file)
-  and relinks nothing. Manifests under `target/`, `vendor/`, `dist/`, `.venv/`
-  and similar are ignored.
-- **Python resolution** (PLAN-009 TASK-007, **extractor version 12**, link
-  rules version 7): modules by path and package (`__init__.py`, the
-  repository root, `src/`, a script's own directory), relative imports,
-  re-exports through a package or any module, `import *`; a call to a class
-  is its instantiation; `self.x = …` in a method types the attribute
-  (`ctor_inject` from a typed parameter of `__init__`); `x = Foo()` and
-  `x = make()` type `x` by the class or the return annotation. Parameters,
-  lambda and comprehension variables and loop targets shadow attributes.
-  External only with evidence: the standard library, builtins, or a
-  distribution a manifest declares (also when the repository has a module of
-  that name); a name Python cannot see, or an import that cannot be followed,
-  is undecided — never a guess by name, so some calls that used to resolve by
-  their unique name are now undecided. Calls on untyped receivers to names the
-  repository lacks are discarded (more of them, now that parameters no longer
-  borrow an attribute's type). Measured on a small worker repository: 1.6 % of
-  calls undecided (was 49.2 %), 24 of 25 hand-labelled call sites correct, all
-  of them `high`.
-- **Rust resolution** (PLAN-009 TASK-007, **extractor version 13**, link
-  rules version 8): crates by their `Cargo.toml`, modules by path and inline
-  `mod`, `use` (groups, `self`, aliases, globs) scoped to its module,
-  `crate::`/`self::`/`super::`/`Self::`, `pub use` re-exports; a type's
-  `impl`s in any file of its crate; `impl Trait for T`; fields typed by their
-  declaration (`self.store.open()`), `let x = T::new()?` by the return type;
-  trait methods without a body are symbols. External: `std`/`core`/`alloc`,
-  the prelude, and the crates a manifest declares; a missing derivable method
-  (`clone`, `default`…) is external at `medium`. Macros are not calls. A path
-  call's target drops generic arguments (`Vec::<u8>::new` → `Vec.new`).
-  Measured on this repository: 19.8 % of Rust calls undecided (was 54.1 %),
-  21 of 21 hand-labelled call sites correct, all `high`.
-- **Go resolution** (PLAN-009 TASK-007, **extractor version 14**, link rules
-  version 9): an import under the `module` of `go.mod` (or a local
-  `replace`) is the repository's, the standard library and other modules are
-  external; a method's receiver is `self` (also for a method in another file of
-  the package) and `s.m()` writes `Type.m` to `graph_edges`; fields are typed
-  by their declaration, `x := New()` by the declared result; interface methods
-  are symbols. Covered by fixtures only (no Go repository was measured).
-- **Python, Rust and Go, after review** (PLAN-009 TASK-007, **extractor
-  version 16**, link rules version 13): a Rust workspace crate counts only as
-  the file's own or a path dependency of its `Cargo.toml` (a `package =`
-  rename follows the path; `workspace = true` follows the root's entry), so a
-  registry dependency named like a workspace crate is external and an
-  undeclared one undecided; every bound of a type parameter is tried; an
-  inherent method wins over a trait impl's, and several candidates (two
-  `From` impls, two `#[cfg]` definitions, Go build-tag files) are `medium`; a
-  `use` inside a function is that function's; a missing method of a type with
-  an external supertype is external at `medium` in Rust and Go; `let x =
-  a.f()` makes `x.g()` a chain typed by `f`'s return type. Go needs a
-  `go.mod` above a file before an import outside its module counts as
-  external, and names an import by its package clause. Python: `Any`,
-  `object`, a `TypeVar` and a multi-member union type nothing, `type[X]` is
-  `X`, `Self` is the class; only an exactly declared distribution name beats
-  a repository module of that name. A barrel or star import with a branch
-  that cannot be followed no longer counts as external. Manifests: nested
-  multi-line TOML arrays, `requirements/*.txt`, `name @ url`, Poetry
-  dependency tables. A readable `tsconfig.json` beside a broken
-  `tsconfig.base.json` is used fresh; a broken `extends` base keeps the last
-  good aliases. The incremental pass reopens fewer Rust edges (a widely
-  imported file: 24 307 → 18 179) and follows a Python package's
-  `__init__.py` through `import pkg.sub`. Measured: 17.5 % of Rust calls
-  undecided (was 19.8 %), 26 of 26 hand-labelled Rust sites and 26 of 27
-  Python sites correct.
-- **Lookups by symbol** (PLAN-009 TASK-008): on a branch with a current symbol
-  graph, `read_symbol`, `get_references`, the identifier anchoring of `search`
-  and the web graph view read the `symbols` table and the resolved edges by id
-  instead of matching names and suffixes. Contracts only grow: definitions add
-  `sym` (16 hex digits), `kind` and `qualified`; anchored hits add `sym`;
-  references add `confidence`, `via` (the relation) and `sym`, plus `external`,
-  `test` and `undecided` when true. `get_references` lists one reference per
-  occurrence (two calls from one method are two) of calls and instantiations,
-  as 0.9.0 listed calls; **`kinds`** adds type uses, imports and
-  inherits/implements (or `all`) to them — the calls always stay. It takes **`min_confidence`** (`high`,
-  `medium` — default —, `low`): what the default leaves out is counted in
-  `below_confidence`. A server older than 0.10 ignores both, and the client
-  says so in `warning`.
-  `external` comes from the link pass's evidence, and a qualified name falls
-  back to its last segment only when the repository defines nothing by that
-  name (`Foo::new` that does not exist is no longer external because some
-  `new` is called; it gets `suggestions`). The graph view marks a node
-  external by that evidence (not "never calls anything") and an edge from a
-  test file `test`. A call the link pass discarded reaches no answer. An
-  external answers no `suggestions`, as in 0.9.0, and a `file::name` miss is
-  never external. An index from an older extractor, or a branch with no
-  symbol rows, answers as 0.9.0 did and says so in `warning` (`search`
-  included, whose identifier anchoring then goes by name); a failed read of
-  the symbol table has its own warning, not a reindex hint. Anchoring reads
-  the code of every definition of an identifier in one query.
-- **`impact_analysis` walks the symbol graph by levels** (PLAN-009 TASK-009):
-  one query per depth and direction over ids (through `live_edges`: a discarded
-  call reaches no answer), whatever the size of the frontier; the frontier goes
-  as an `IN` list up to 512 ids and as one `UBIGINT[]` parameter above.
-  **A bare name means the repository's definitions of it**, as in
-  `get_references` (0.9 merged every call written with that name, libraries'
-  included); a name with no definition stands for its external call sites (its
-  upstream is their callers) and answers `external` + `called_from`, or
-  `suggestions`, as `read_symbol` does. **New defaults** (the answer an agent
-  sees changes): only `high`/`medium` calls are followed, symbols of test files
-  and library callees are left out, and 200 symbols per direction are listed;
-  what that leaves out is counted (`below_confidence`, in symbols;
-  `undecided_calls`, the calls to the name the index could not decide, in
-  calls, none from a test or from a caller already listed; `excluded`,
-  `omitted` + `omitted_by_limit`) and not walked, and `min_confidence`, `include_tests`,
-  `include_external` and `max_nodes` (tool, `GET /impact` query, `devctx
-  impact` flags) change it; `filters` says which applied. Each symbol adds
-  `confidence`, `via`, `sym`, `file`, `line` and `test`/`external`/`undecided`
-  when true, ordered within a depth by confidence, rank and name. Two causes of
-  the speed-up, measured apart on this repository for a bare `new`: 0.9 walked
-  1 853 names, one query per name, in 1.4 s p50; the new walk with every filter
-  and the cap off reaches 547 symbols (the repository's definitions of `new`, by
-  id) in about 50 ms — the batching —, and the defaults list 252 (56 more counted
-  past the cap) in about 57 ms — the meaning of a bare name and the defaults. The
-  0.9 fields keep their meaning; an index from an older extractor, or without
-  symbol rows, walks as 0.9 did and says so in `warning` (and that the filters
-  passed were not applied, also on a local backend), and a client that passed
-  filters to a server that ignored them says so too. A caller listed only
-  through an undecided call that a later depth reaches by a decided one is
-  shown decided and walked. The TUI's local view
-  gives the tool's answer.
-- **Link rules version 19:** in a Rust `impl Trait for T` with `T` from
-  outside the repository, `self.m()` resolves to the `impl`'s own method
-  (an override), else to the repository trait's method (a default one
-  included) at `medium` — an inherent method of the outside type would win
-  and cannot be known — instead of staying undecided.
-- **Link rules version 20:** in that same `impl Trait for T` with `T` from
-  outside, the `impl`'s own method is `medium` too, no longer `high`: an
-  inherent method of `T` of that name wins in Rust (`self.len()` in an
-  `impl Counted for String` calls `String::len`).
-- **Symbol centrality in hybrid search, opt-in** (PLAN-009 TASK-010): every
-  link pass that completes ends by computing a global PageRank of the branch's
-  symbols (`symbols.rank`, written only where it changed) and their
-  `in_degree` (incoming non-test calls of `high` or `medium` confidence), over
-  `live_edges` (a discarded call never counts): calls and instantiations weigh
-  1, inheritance 0.8, type uses 0.5, imports 0.3, `contains` 0; confidence and
-  tests decide how much a symbol passes on (`high` 1, `medium` 0.6, `low` 0.2,
-  from a test × 0.1) and `sqrt(n)` tames repeated calls; damping 0.85, at most
-  100 iterations (the link pass line says how many, and whether it
-  converged), deterministic. Hybrid search — and so `build_context` — can add
-  it as a third list of the rank fusion over the candidates the retrievers
-  brought (after the hard filters), ordered by the rank of the innermost symbol
-  of each chunk as a percentile within its branch; a chunk of no symbol gets
-  nothing. **Off by default** (`search.centrality_weight: 0`; `0`-`1`, a value
-  outside or not a number is bounded and warned about): on 12 of the 30
-  evaluation cases turning it on was within the noise, and it is re-evaluated
-  on all of them, by language. When on, hybrid `score`s and order change and a
-  ranked hit carries `raw_score` (the vector + keyword fusion); vector search
-  is unchanged and an anchored definition still comes first. It applies only
-  where the branch has a current symbol graph, alike in the MCP, the CLI
-  without a server and the TUI. Cost: about 0.1-0.2 s per pass on a 1 250-file
-  Java repository (22 876 symbols); hybrid search p50 within a few ms.
-- **Rust test code inside a source file is test code** (extractor version 19):
-  symbols under a `cfg` that requires `test` (`#[cfg(test)]`, `all(test, …)`;
-  never `any(test, …)`, `not(…)` or a feature named like a test), in a
-  `mod tests`, under an inner `#![cfg(test)]` or marked `#[test]`,
-  `#[tokio::test(…)]` or `#[rstest]` are test symbols and their calls
-  `from_test`, as a test file's are — in
-  `get_references`, `impact_analysis` and the rank. Existing indexes report
-  `extractor_stale` until `devctx index --full` (vectors are reused).
-- **Link rules version 21:** an existing index is relinked — and ranked — by
-  its next `devctx index`, with nothing re-embedded.
-- **`impact_analysis` follows dispatch through interfaces, abstract classes and
-  traits** (PLAN-009 TASK-017), on by default: a caller that holds a service by
-  its interface (an injected field, a parameter typed by a trait) is in the
-  blast radius of the implementation. At every depth, upstream, a method
-  reaches the callers of the methods it overrides in its supertypes (at the
-  depth of a direct caller), and downstream an interface or abstract method
-  reaches the methods that implement it (one level below) and what they call;
-  through the resolved `inherits`/`implements` edges of `live_edges`, up to four
-  supertype levels, same name and an arity that can match, never a private or
-  static method, not in Go (embedding is no override). Such a node has `via:
-  "dispatch"` and `through` (the method it went through), and confidence
-  `min(medium, the edge it stands for)` — never `high`, a `low` call stays
-  `low`. In TypeScript and JavaScript an implementation may take fewer
-  parameters than the method it implements. Among same-arity overloads in one supertype, the one whose simple
-  parameter types match exactly. At most 16 equivalents per node, production
-  before tests; the rest are counted in `omitted_by_limit.dispatch` only (not
-  in its `count` nor in `omitted`, which count nodes), as is an equivalent
-  method past the four supertype levels (`beyond_depth`, `max_depth`). `dispatch: false` (tool,
-  `GET /impact?dispatch=false`, `devctx impact --no-dispatch`) follows direct
-  calls only, `min_confidence: "high"` leaves it out without reading it, and
-  `filters` says whether it applied; when it was not evaluated the answer
-  carries `dispatch: {"evaluated": false, "reason": "dispatch:false" |
-  "min_confidence high"}`, read from the filters alone. The supertype graph is read once per call
-  as id pairs, and a level pays one statement only when its frontier holds a
-  method of a type with a supertype or a subtype; nothing is read when no
-  dispatch could show. Measured on two Java repositories (1 250 and 216 files)
-  and on a synthetic hierarchy of 1 500 supertype edges (Resultado of TASK-017
-  in the plan).
-- **A method a TypeScript interface declares, and an abstract method of an
-  abstract class, are symbols** (extractor version 20), as a Java interface's or
-  a Rust trait's already were: a call through a receiver typed by the interface
-  resolves to it (`ctor_inject`/`field`, `high`) instead of staying a `low`
-  name-only row, and dispatch reaches the classes that implement it. Existing
-  indexes report `extractor_stale` until `devctx index --full` (vectors are
-  reused).
+  `impl Display for &'a Foo`, `impl crate::x::Foo` → `Foo`): the `graph_edges`
+  source of such a method is `Foo.get` (was `Foo<T>.get`) and its chunks'
+  header changes with it.
+- **Reindex reuses vectors by chunk `content_hash`** (TASK-002): a `--full`
+  embeds only the chunks whose text changed, and over unchanged source embeds
+  nothing, loads no model and rebuilds no HNSW/BM25 index (measured: 4.4 s
+  against 240 s from scratch on this repository). The branch's embedding
+  fingerprint (provider, model, width, engine read from `Cargo.lock`,
+  character cap, normalization, HTTP endpoint) must equal the active one; a run
+  under another setup marks the branch "transition" until it completes. Indexes
+  from before fingerprints are reused only when their recorded model and width
+  equal the active ones; the run seals them. The same rule, and a current
+  graph, decide which branches may be a source for the cross-branch copy.
+- With `storage.hnsw: true`, an index built through the server now leaves the
+  HNSW index behind too (before, only the direct path did, and a server-built
+  index searched by full scan); a database without one pays for building it at
+  its next run.
+- `index` reports `files_unchanged` separately from `files_indexed`.
+- `extractor_stale` is also true when a branch's graph is out of step with its
+  files (files added, deleted or modified by a binary that does not write the
+  graph, such as 0.9.0 after a downgrade); such a branch is not a copy source.
 
 ### Fixed
 
-- Signatures in `repo_map` and `skeleton` lose a leading annotation whose
-  string literal holds a bracket (`@Pattern(regexp = "^\\(")`): they are read
-  with the parser's own rule, which skips literals.
+- Opening an index that has an HNSW index loads VSS *before* creating tables
+  added by a release: the checkpoint after the DDL failed fatally ("unknown
+  index type 'HNSW'") and invalidated the database for the process. Where VSS
+  cannot be loaded at all (offline), every checkpoint over such an index is
+  skipped instead, leaving the write-ahead log for an open that can.
 - `file::symbol` subjects (`memories_by_symbol`, `read_symbol`) take the left
   part as a file only with a `/` or a known language extension: `Foo.Bar::baz`
   is the member `baz` of `Foo.Bar`, no longer the file `Foo.Bar`; an npm scope
   (`@scope/pkg::fn`) is not a directory.
 - `devctx symbol` without a server answers as the tool does: branch fallback,
   warnings, and on a miss its suggestions or external call sites.
-
 - A `--full` over several indexed branches no longer copies and rewrites every
   file another branch holds; and a branch made by another embedding setup is no
   longer a copy source.
 - Deleting a file the index never held no longer drops the HNSW/BM25 indexes.
-- Opening an index that has an HNSW index loads VSS *before* creating tables
-  added by a release: the checkpoint after the DDL failed fatally ("unknown
-  index type 'HNSW'") and invalidated the database for the process. Where VSS
-  cannot be loaded at all (offline), every checkpoint over such an index is
-  skipped instead, leaving the write-ahead log for an open that can.
-
-- `traverse`: a caller listed through an undecided call and reached deeper by
-  a decided edge is that decided node and is walked; the `through` of a
-  grouped edge no longer depends on row order; a file root reads no undecided
-  calls; candidates take from the budget only what they use; nodes and edges
-  never exceed their share of the output budget (hundreds of small edges used
-  to pass an even share with a floor), and the edges of nodes past the page
-  are not built.
 - Indexing a TypeScript repository no longer panics on a type whose `>` (an
-  arrow's) comes before its first `<`; a function type names no class.
-- Dispatch in `impact_analysis` and `traverse`: a supertype method implemented
-  by many of the methods walked no longer costs seconds — the equivalents query
-  reads only the types each origin reaches, a supertype method is attributed to
-  at most 16 origins (`omitted_by_limit.dispatch.origins_capped`; its callers
-  are all reached) and a call builds at most 8 192 dispatch rows (`rows_capped`).
+  arrow's) comes before its first `<`.
 
 ### Known issues
 
 - 0.8.3 – 0.9.0: the first open of an HNSW database created with 0.8.2 or
   earlier fails once with "unknown index type 'HNSW'"; retrying resolves it.
   Fixed in this release (see above); there is no 0.9.1.
+- Not measured yet on equal terms against 0.9.0: indexing from scratch,
+  database size and peak memory, and the upgrade of real 0.9.0 indexes with the
+  final binary (field verification before the tag).
 
 ## 0.9.0 — 2026-10-05
 
