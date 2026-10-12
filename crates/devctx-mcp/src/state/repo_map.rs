@@ -21,7 +21,7 @@ use crate::repo_map::{render, MapGraph, RepoMapQuery};
 /// The error of a branch the current extractor has not indexed (DD-19).
 pub const REPO_MAP_NEEDS_REINDEX: &str =
     "repo_map reads the symbol graph, and this branch's index predates it (an older \
-     extractor, or no symbol rows): reindex with devctx index --full (vectors are reused)";
+     extractor): reindex with devctx index --full (vectors are reused)";
 
 /// The error of a failed read of the symbol graph: not a reason to reindex.
 const REPO_MAP_READ_ERROR: &str =
@@ -51,7 +51,8 @@ pub(super) fn check(chosen: &BranchChoice, store: &Store) -> Result<(), String> 
     match Reader::of(chosen, store) {
         Reader::SymbolGraph => Ok(()),
         Reader::Legacy(Legacy::Error) => Err(REPO_MAP_READ_ERROR.into()),
-        Reader::Legacy(_) => Err(REPO_MAP_NEEDS_REINDEX.into()),
+        Reader::Legacy(Legacy::NoRows) => Err(super::lookup::no_symbols_error("repo_map")),
+        Reader::Legacy(Legacy::Stale) => Err(REPO_MAP_NEEDS_REINDEX.into()),
     }
 }
 
@@ -281,8 +282,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    /// (f) A branch indexed by an older extractor, or with no symbol rows:
-    /// an error that asks for `devctx index --full`, never an empty map.
+    /// (f) A branch indexed by an older extractor: an error that asks for
+    /// `devctx index --full`, never an empty map.
     #[test]
     fn an_old_index_asks_for_a_full_reindex() {
         let (state, repo) = indexed_files("repo_map_stale", APP);
@@ -301,12 +302,22 @@ mod tests {
         let e = do_repo_map(&state, &RepoMapQuery::default()).unwrap_err();
         assert!(e.contains("devctx index --full"), "{e}");
         let _ = std::fs::remove_dir_all(&repo);
+        // A current branch without symbol rows is not old: see
+        // `a_current_index_without_symbols_does_not_ask_for_a_reindex`.
+    }
+
+    /// Review of TASK-015: a current index with no symbol rows (only text
+    /// files) is not old — reindexing would change nothing — so the answer
+    /// sends to search/read_file instead of asking for `--full` in a loop.
+    #[test]
+    fn a_current_index_without_symbols_does_not_ask_for_a_reindex() {
         let (state, repo) = indexed_files(
-            "repo_map_norows",
+            "repo_map_text_only",
             &[("db/schema.sql", "CREATE TABLE things (id INT);\n")],
         );
         let e = do_repo_map(&state, &RepoMapQuery::default()).unwrap_err();
-        assert!(e.contains("devctx index --full"), "{e}");
+        assert!(!e.contains("index --full"), "{e}");
+        assert!(e.contains("search") && e.contains("read_file"), "{e}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 

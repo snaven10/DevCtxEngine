@@ -35,7 +35,7 @@ const ROOTS_LIMIT: usize = 10_000;
 /// `traverse` has no 0.9 path to fall back on.
 pub const TRAVERSE_NEEDS_REINDEX: &str =
     "traverse reads the symbol graph, and this branch's index predates it (an older \
-     extractor, or no symbol rows): reindex with devctx index --full (vectors are reused)";
+     extractor): reindex with devctx index --full (vectors are reused)";
 
 /// The error of a failed read of the symbol graph: a database error, not a
 /// reason to reindex.
@@ -333,7 +333,8 @@ pub(super) fn traverse_on(
     match Reader::of(chosen, store) {
         Reader::SymbolGraph => {}
         Reader::Legacy(Legacy::Error) => return Err(TRAVERSE_READ_ERROR.into()),
-        Reader::Legacy(_) => return Err(TRAVERSE_NEEDS_REINDEX.into()),
+        Reader::Legacy(Legacy::NoRows) => return Err(super::lookup::no_symbols_error("traverse")),
+        Reader::Legacy(Legacy::Stale) => return Err(TRAVERSE_NEEDS_REINDEX.into()),
     }
     let (repo, branch) = (chosen.repo.as_str(), chosen.branch.as_str());
     let asked = q.symbol.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -1013,8 +1014,7 @@ mod tests {
         assert_eq!(q("x", "all", "both", 4).options().unwrap().kinds.len(), 7);
     }
 
-    /// (g) A branch indexed by an older extractor (or with no symbol rows):
-    /// an error that asks for `devctx index --full` — traverse has no 0.9
+    /// (g) A branch indexed by an older extractor: an error that asks for `devctx index --full` — traverse has no 0.9
     /// path to answer from.
     #[test]
     fn an_old_index_asks_for_a_full_reindex() {
@@ -1034,12 +1034,22 @@ mod tests {
         let e = do_traverse(&state, &q("Repo.save", "calls", "in", 1)).unwrap_err();
         assert!(e.contains("devctx index --full"), "{e}");
         let _ = std::fs::remove_dir_all(&repo);
+        // A current branch without symbol rows is not old: see
+        // `a_current_index_without_symbols_does_not_ask_for_a_reindex`.
+    }
+
+    /// Review of TASK-015: a current index with no symbol rows (only text
+    /// files) is not old — reindexing would change nothing — so the answer
+    /// sends to search/read_file instead of asking for `--full` in a loop.
+    #[test]
+    fn a_current_index_without_symbols_does_not_ask_for_a_reindex() {
         let (state, repo) = indexed_files(
-            "traverse_norows",
+            "traverse_text_only",
             &[("db/schema.sql", "CREATE TABLE things (id INT);\n")],
         );
         let e = do_traverse(&state, &q("things", "calls", "in", 1)).unwrap_err();
-        assert!(e.contains("devctx index --full"), "{e}");
+        assert!(!e.contains("index --full"), "{e}");
+        assert!(e.contains("search") && e.contains("read_file"), "{e}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 

@@ -20,6 +20,18 @@ pub(super) const NO_SYMBOL_GRAPH_WARNING: &str =
      0.9 call graph (names and suffixes, no confidence); if it has source files, \
      reindex (devctx index --full)";
 
+/// The error `traverse`, `repo_map` and `skeleton` answer on a current index
+/// with no `symbols` rows: no file of the branch is in a language with symbol
+/// extraction (only text, config, SQL…), so a reindex would change nothing —
+/// asking for one sent callers round in a loop (review of TASK-015).
+pub(super) fn no_symbols_error(tool: &str) -> String {
+    format!(
+        "{tool} reads the symbol graph, and this branch's index is current but holds no \
+         symbols (no file in a language with symbol extraction), so reindexing would \
+         change nothing; use search, or read_file"
+    )
+}
+
 /// The line `get_references` adds when its default hid references.
 const BELOW_CONFIDENCE_HINT: &str =
     "references below the confidence shown were left out (ambiguous names or calls \

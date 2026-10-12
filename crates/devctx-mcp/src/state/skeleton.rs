@@ -17,14 +17,7 @@ use crate::skeleton::{render, SkeletonInput, SkeletonQuery, IMPORTS_SHOWN};
 /// The error of a branch the current extractor has not indexed (DD-19).
 pub const SKELETON_NEEDS_REINDEX: &str =
     "skeleton reads the symbol graph, and this branch's index predates it (an older \
-     extractor, or no symbol rows): reindex with devctx index --full (vectors are reused)";
-
-/// The error of a current index with no symbol rows: no file of the branch
-/// is in a language with symbol extraction, so a reindex would change
-/// nothing (asking for one sent callers round in a loop).
-const SKELETON_NO_SYMBOLS: &str =
-    "this branch's index is current but holds no symbols (no file in a language with \
-     symbol extraction), so there is no skeleton to draw; read files with read_file";
+     extractor): reindex with devctx index --full (vectors are reused)";
 
 /// The error of a failed read of the symbol graph: not a reason to reindex.
 const SKELETON_READ_ERROR: &str =
@@ -109,7 +102,7 @@ pub(super) fn skeleton_on(
     match Reader::of(chosen, store) {
         Reader::SymbolGraph => {}
         Reader::Legacy(Legacy::Error) => return Err(SKELETON_READ_ERROR.into()),
-        Reader::Legacy(Legacy::NoRows) => return Err(SKELETON_NO_SYMBOLS.into()),
+        Reader::Legacy(Legacy::NoRows) => return Err(super::lookup::no_symbols_error("skeleton")),
         Reader::Legacy(Legacy::Stale) => return Err(SKELETON_NEEDS_REINDEX.into()),
     }
     let file = repo_relative(root, &q.file)?;
@@ -627,8 +620,9 @@ def handler(event, context):
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    /// (d) A branch indexed by an older extractor, or with no symbol rows:
-    /// an error that asks for `devctx index --full`, never an empty skeleton.
+    /// (d) A branch indexed by an older extractor: an error that asks for
+    /// `devctx index --full`, never an empty skeleton (a current one with no
+    /// symbol rows sends to read_file instead).
     #[test]
     fn an_old_index_asks_for_a_full_reindex() {
         let (state, repo) = indexed("skel_stale");
@@ -656,6 +650,21 @@ def handler(event, context):
         );
         let e = skeleton(&state, "db/schema.sql").unwrap_err();
         assert!(e.contains("read_file") && !e.contains("--full"), "{e}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Review of TASK-015: the same answer as `traverse` and `repo_map` for a
+    /// current index with no symbol rows — not a reindex, but search or
+    /// read_file.
+    #[test]
+    fn a_current_index_without_symbols_does_not_ask_for_a_reindex() {
+        let (state, repo) = indexed_files(
+            "skel_text_only",
+            &[("db/schema.sql", "CREATE TABLE things (id INT);\n")],
+        );
+        let e = skeleton(&state, "db/schema.sql").unwrap_err();
+        assert!(!e.contains("index --full"), "{e}");
+        assert!(e.contains("search") && e.contains("read_file"), "{e}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
