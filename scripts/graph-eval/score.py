@@ -78,17 +78,22 @@ def position(hits: list[dict] | None, wanted: list[str]) -> int | None:
     return 0  # presente la respuesta, pero el archivo no apareció
 
 
-def brief_presence(text: str, files: list[str], symbol: str) -> tuple[bool, bool, int]:
-    """(archivo esperado en el brief, símbolo esperado en el brief, tokens estimados).
+def brief_presence(text: str, files: list[str], symbol: str) -> tuple[bool, bool, int, bool]:
+    """(archivo esperado en el brief, símbolo esperado en el brief, tokens estimados,
+    archivo esperado en el código del brief).
 
     El brief de `devctx context` marca cada bloque de código con `// <archivo>:<línea>`; no
     informa los tokens que usó, así que se estiman como caracteres / 4 (el mismo orden de
     magnitud que el presupuesto). El archivo se busca como substring en cualquier parte del
-    texto y el símbolo como palabra completa.
+    texto y el símbolo como palabra completa. "En el código" exige que el archivo sea el de un
+    bloque (`// <archivo>:`): un archivo solo citado (una línea `called by … · archivo:línea` de
+    la sección related, una memoria) cuenta en el primero y no en este (TASK-012, revisión).
     """
     has_file = any(f in text for f in files)
     has_sym = bool(symbol) and re.search(r"(?<![A-Za-z0-9_])" + re.escape(symbol) + r"(?![A-Za-z0-9_])", text) is not None
-    return has_file, has_sym, len(text) // 4
+    heads = [ln[3:] for ln in text.splitlines() if ln.startswith("// ")]
+    in_code = any(f in h.rsplit(":", 1)[0] for f in files for h in heads)
+    return has_file, has_sym, len(text) // 4, in_code
 
 
 def mrr_of(positions: list[int | None]) -> float:
@@ -132,6 +137,7 @@ def cmd_retrieval(a: argparse.Namespace) -> int:
         briefs = [r["brief"] for r in rows if r["brief"] is not None]
         nb = len(briefs)
         out.append(f" {sum(1 for b in briefs if b[0])}/{nb} |")
+        out.append(f" {sum(1 for b in briefs if b[3])}/{nb} |")
         withsym = [r["brief"] for r in rows if r["brief"] is not None and r["case"]["symbol"]]
         out.append(f" {sum(1 for b in withsym if b[1])}/{len(withsym)} |")
         toks = [b[2] for b in briefs if b[2]]
@@ -143,8 +149,8 @@ def cmd_retrieval(a: argparse.Namespace) -> int:
     for m in modes:
         hdr += f" {m} Hit@5 | {m} Hit@10 | {m} MRR |"
         sep += "---|---|---|"
-    hdr += " brief: archivo | brief: símbolo | brief: tokens est. medios |"
-    sep += "---|---|---|"
+    hdr += " brief: archivo | brief: archivo en el código | brief: símbolo | brief: tokens est. medios |"
+    sep += "---|---|---|---|"
     print(hdr)
     print(sep)
     print(summary(per_case, "todos"))
@@ -156,7 +162,8 @@ def cmd_retrieval(a: argparse.Namespace) -> int:
             print(summary([r for r in per_case if r["case"]["repo"] == rp], rp))
     print()
     print("Por caso (posición del archivo esperado; `—` = no apareció en el top pedido; "
-          "`F`/`S` = archivo/símbolo esperado presente en el brief):")
+          "`F`/`S` = archivo/símbolo esperado presente en el brief; `(solo citado)` = el archivo no es el de "
+          "ningún bloque de código):")
     print()
     h2 = "| # | idioma | consulta |"
     s2 = "|---|---|---|"
@@ -178,6 +185,8 @@ def cmd_retrieval(a: argparse.Namespace) -> int:
             bs, tk = "n/a", ""
         else:
             bs = ("F" if b[0] else "·") + ("S" if b[1] else ("·" if c["symbol"] else "-"))
+            if b[0] and not b[3]:
+                bs += " (solo citado)"
             tk = str(b[2] or "")
         q = c["query"] if len(c["query"]) <= 60 else c["query"][:57] + "..."
         print(f"| {c['idx']} | {c['lang']} | {q} | " + " | ".join(cells) + f" | {bs} | {tk} |")

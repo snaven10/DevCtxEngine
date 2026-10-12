@@ -60,7 +60,9 @@ consulta | archivo(s) esperado(s), separados por coma | símbolo esperado (o -) 
 - Hit@k = el archivo esperado aparece entre los primeros k de `search --no-rerank --limit 20`;
   MRR = media de 1/posición (0 si no aparece). Se miden `search` vectorial (sin flag) e híbrido (`--hybrid`).
 - Brief = `devctx context --max-tokens 4096 --no-memories`: se mira si el archivo (y el símbolo, si hay)
-  esperado está en el texto, y los tokens que dice usar.
+  esperado está en el texto, y los tokens que dice usar. "Archivo en el código" cuenta solo los casos
+  en que el archivo esperado es el de un bloque de código (`// <archivo>:<línea>`); uno citado nada
+  más (una línea de la sección related, una memoria) se marca `(solo citado)` por caso.
 - Reglas de oro: **los targets se escriben antes de medir** y no se editan después, salvo error de
   transcripción, que se anota en el `## Resultado` de la task. Al menos un tercio de los casos en
   español y un tercio "de comportamiento" (consulta que no nombra el identificador).
