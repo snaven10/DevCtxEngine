@@ -1406,6 +1406,16 @@ mod tests {
             clean_signature(Some("#[doc = \"a ] b\"] pub fn f()"), "function", "f"),
             "pub fn f()"
         );
+        // One that never closes, after others that do: the parser reads no
+        // annotation at all, so the signature stays as stored (review NIT).
+        assert_eq!(
+            clean_signature(
+                Some("@Override @Path(\"x\" public R get()"),
+                "method",
+                "get"
+            ),
+            "@Override @Path(\"x\" public R get()"
+        );
         // `$` is part of an annotation's name, as the parser reads it.
         assert_eq!(
             clean_signature(Some("@Gen$Marker void run()"), "method", "run"),

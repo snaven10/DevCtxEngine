@@ -692,19 +692,24 @@ fn main() -> Result<()> {
             related,
             no_related,
             hops,
-        } => cmd_context(
-            query,
-            max_tokens,
-            !no_memories,
-            devctx_mcp::state::ContextOpts {
-                related: match (related, no_related) {
-                    (true, _) => Some(true),
-                    (_, true) => Some(false),
-                    _ => None,
+        } => {
+            if hops.is_some() && !related && (no_related || !devctx_mcp::state::DEFAULT_RELATED) {
+                eprintln!("[devctx] --hops has no effect without --related");
+            }
+            cmd_context(
+                query,
+                max_tokens,
+                !no_memories,
+                devctx_mcp::state::ContextOpts {
+                    related: match (related, no_related) {
+                        (true, _) => Some(true),
+                        (_, true) => Some(false),
+                        _ => None,
+                    },
+                    graph_hops: hops,
                 },
-                graph_hops: hops,
-            },
-        ),
+            )
+        }
         Command::Impact {
             symbol,
             depth,

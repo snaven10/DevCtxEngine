@@ -4770,58 +4770,107 @@ fn compose_context_with(
         lay
     };
     let mut code = lay_code(budget);
+    let best = code.shown.first().copied();
 
     // The related section (DD-15) is read from the hits the code shows and
     // may take up to its share of the budget from the code: the code is laid
-    // out again within what the section leaves, and a neighbor of a hit that
-    // no longer fits goes with it.
+    // out again within what the section (and the note that stands for it)
+    // leaves, and the section is re-read against that code until neither
+    // changes — it can only shrink, every line keeps its hit in the code, no
+    // line repeats code the brief shows, and the best hit is never given up
+    // for it (review of TASK-012, M1, M2, m1, m2, m3).
     let mut related_text = String::new();
     let mut related_note: Option<String> = None;
     if let Some(source) = related {
         let brief: Vec<&Value> = code.shown.iter().map(|&i| &hits[i]).collect();
-        match source(&brief) {
-            related::Related::Unavailable(why) => related_note = Some(why),
+        let lines = match source(&brief) {
+            related::Related::Unavailable(why) => {
+                related_note = Some(why);
+                Vec::new()
+            }
             related::Related::Lines(lines) if lines.is_empty() => {
                 related_note = Some(
                     "none: no code hit of this brief has a graph neighbor that passes the \
                      filters (high or medium confidence, no tests, no externals, not \
                      already shown)"
                         .into(),
-                )
+                );
+                Vec::new()
             }
             related::Related::Lines(mut lines) => {
                 // `hit` indexes `brief`; from here on it indexes `hits`.
                 for l in &mut lines {
                     l.hit = code.shown[l.hit];
                 }
-                let cap = (budget * related::CTX_RELATED_SHARE_PCT / 100)
-                    .min(budget.saturating_sub(code_start));
-                let (first, _) = render_related(&lines, cap);
-                let read = lines.len();
-                if !first.is_empty() {
-                    code = lay_code(budget - first.len());
-                    lines.retain(|l| code.shown.contains(&l.hit));
-                }
-                let left = lines.len();
-                let (text, cut) = render_related(&lines, cap);
-                // Every line not shown is counted: past the share, or gone
-                // with its hit.
-                dropped += read - left;
-                // Lines that went with their hit give their room back to the
-                // code (which then shows every hit it showed with less).
-                if text.len() < first.len() {
-                    code = lay_code(budget - text.len());
-                }
-                dropped += cut;
-                if text.is_empty() {
-                    related_note = Some(format!(
-                        "none fitted: {read} neighbor signature(s) did not fit the related \
-                         section's {}% of the budget",
-                        related::CTX_RELATED_SHARE_PCT
-                    ));
-                }
-                related_text = text;
+                lines
             }
+        };
+        if !lines.is_empty() {
+            let cap = (budget * related::CTX_RELATED_SHARE_PCT / 100)
+                .min(budget.saturating_sub(code_start));
+            let read = lines.len();
+            let mut kept = lines;
+            let (mut text, _) = render_related(&kept, cap);
+            let mut went_with_hit = false;
+            while !text.is_empty() {
+                let next = lay_code(budget - text.len());
+                if next.shown.first().copied() != best {
+                    // The section would push out the best hit: no section.
+                    text.clear();
+                    kept.clear();
+                    related_note = Some(format!(
+                        "not shown: {read} neighbor(s) would push out the best hit"
+                    ));
+                    break;
+                }
+                let before = kept.len();
+                kept.retain(|l| {
+                    next.shown.contains(&l.hit)
+                        && !next
+                            .shown
+                            .iter()
+                            .any(|&i| hit_holds(&hits[i], &l.file, l.line))
+                });
+                went_with_hit |= kept.len() < before;
+                // Only ever shrinks: a line the first render cut is not let
+                // back in by the room another one left.
+                let (again, _) = render_related(&kept, text.len());
+                code = next;
+                if again.len() == text.len() {
+                    text = again;
+                    break;
+                }
+                text = again;
+            }
+            let shown_lines = if text.is_empty() {
+                0
+            } else {
+                text.lines().filter(|l| l.starts_with("- ")).count()
+            };
+            dropped += read - shown_lines;
+            if text.is_empty() && related_note.is_none() {
+                related_note = Some(if went_with_hit {
+                    format!("none shown: {read} neighbor(s) whose hits no longer fit")
+                } else {
+                    format!(
+                        "none fitted: {read} neighbor(s) over the {}% share",
+                        related::CTX_RELATED_SHARE_PCT
+                    )
+                });
+            }
+            related_text = text;
+        }
+    }
+    // The note is part of the brief: the code makes room for it — unless that
+    // would push out the best hit, and then it closes the brief unbudgeted,
+    // as the `omitted` line does.
+    let mut note_room = 0;
+    if let Some(note) = &related_note {
+        let room = related_note_line(note).len();
+        let relaid = lay_code(budget.saturating_sub(room));
+        if relaid.shown.first().copied() == best {
+            code = relaid;
+            note_room = room;
         }
     }
     dropped += code.dropped;
@@ -4839,7 +4888,7 @@ fn compose_context_with(
                 }
                 let tag = format!("memory · {} · about {file}", field(&m, "link_sources"));
                 let piece = format!("{head}{}\n\n", memory_brief(&m, &tag));
-                if out.len() + piece.len() > budget {
+                if out.len() + piece.len() + note_room > budget {
                     dropped += 1;
                 } else {
                     out.push_str(&piece);
@@ -4850,7 +4899,7 @@ fn compose_context_with(
     }
 
     if let Some(note) = related_note {
-        out.push_str(&format!("\n{} {note}\n", related::RELATED_NOTE));
+        out.push_str(&related_note_line(&note));
     }
     if dropped > 0 {
         out.push_str(&format!(
@@ -4860,6 +4909,19 @@ fn compose_context_with(
     }
     close_context(&mut out, fallback_note);
     out
+}
+
+/// The line that stands for a related section there is nothing to show in.
+fn related_note_line(note: &str) -> String {
+    format!("\n{} {note}\n", related::RELATED_NOTE)
+}
+
+/// Whether hit `h` shows line `line` of `file`.
+fn hit_holds(h: &Value, file: &str, line: i32) -> bool {
+    let at = |key: &str| h.get(key).and_then(Value::as_i64).unwrap_or(0) as i32;
+    let start = at("start_line");
+    let end = at("end_line").max(start + field(h, "text").lines().count() as i32 - 1);
+    field(h, "file") == file && start <= line && line <= end
 }
 
 /// The code part of a brief as laid out within a limit.
@@ -8423,6 +8485,39 @@ mod tests {
         assert_eq!(old, GOLDEN_090, "{old}");
     }
 
+    /// (e), second input (review of TASK-012, m8): a hit a memory quotes and
+    /// a long javadoc, golden captured from `compose_context` at cb350bb.
+    #[test]
+    fn without_related_a_quoted_hit_and_a_long_doc_are_the_old_brief() {
+        let quoted = "fn charge(card: &Card) -> Result<Receipt> {\n    gateway().charge(card)\n}";
+        let mems = vec![ctx_mem(
+            "m9",
+            "Why charge goes through the gateway",
+            &format!("We route it so:\n{quoted}\nand never directly."),
+        )];
+        let doc = (0..12)
+            .map(|i| format!(" * explains step {i} of the refund"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hits = vec![
+            ctx_hit("src/pay.rs", 10, quoted),
+            ctx_hit(
+                "src/Refund.java",
+                4,
+                &format!("/**\n{doc}\n */\npublic void refund() {{ undo(); }}"),
+            ),
+            ctx_hit("src/util.rs", 2, "fn undo() {}"),
+        ];
+        let out = compose_context_with(&mems, &hits, None, 300, true, &no_linked, None);
+        assert_eq!(out, GOLDEN_090_QUOTED_AND_DOC, "{out}");
+    }
+
+    const GOLDEN_090_QUOTED_AND_DOC: &str = "## What is already known\n\n[memory] m9 — Why charge goes \
+         through the gateway\nWe route it so:\nfn charge(card: &Card) -> Result<Receipt> {\n    \
+         gateway().charge(card)\n}\nand never directly.\n\n## Code\n\n// src/Refund.java:4\n/**\n * \
+         explains step 0 of the refund\n * explains step 1 of the refund\n * … (10 doc lines \
+         trimmed)\n */\npublic void refund() { undo(); }\n\n// src/util.rs:2\nfn undo() {}\n\n";
+
     const GOLDEN_090: &str =
         "## What is already known\n\n[memory] m1 — Decision\nwe chose X\nbecause \
          Y\n\n## Code\n\n// src/a.rs:3\nfn a() {\n    b();\n}\n\n// src/b.rs:9\nfn b() {}\n\n\
@@ -8564,6 +8659,294 @@ mod tests {
         );
     }
 
+    /// The brief as the tests read it: everything but the closing lines
+    /// that were never budgeted (`omitted`, `branch_fallback`).
+    fn budgeted_part(out: &str) -> &str {
+        match out.find("\n[devctx] omitted:") {
+            Some(at) => &out[..at],
+            None => out,
+        }
+    }
+
+    /// A deterministic table of briefs (hit sizes, neighbors per hit,
+    /// budgets): the whole brief, the related note included, never passes the
+    /// budget (review of TASK-012, M1 and m2), and no line of the section
+    /// stands without its hit in the code (M2).
+    #[test]
+    fn related_never_passes_the_budget_and_never_shows_a_line_without_its_hit() {
+        let mut seed = 7u64;
+        let mut next = |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        for case in 0..400 {
+            let n = 2 + next(6) as usize;
+            let hits: Vec<Value> = (0..n)
+                .map(|i| {
+                    let lines = 1 + next(70) as usize;
+                    let body = (0..lines)
+                        .map(|k| format!("    step_{k}(x);"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ctx_hit(
+                        &format!("src/h{i}.rs"),
+                        1,
+                        &format!("fn h{i}() {{\n{body}\n}}"),
+                    )
+                })
+                .collect();
+            let per_hit: Vec<usize> = (0..n).map(|_| next(5) as usize).collect();
+            let width: Vec<usize> = (0..n).map(|_| 10 + next(120) as usize).collect();
+            let source = |brief: &[&Value]| {
+                let mut v = Vec::new();
+                for (b, h) in brief.iter().enumerate() {
+                    let file = field(h, "file");
+                    let i: usize = file[5..file.len() - 3].parse().unwrap();
+                    for k in 0..per_hit[i] {
+                        let mut l = rel(
+                            &format!("h{i}"),
+                            "called by",
+                            &format!("fn n{i}_{k}({})", "a".repeat(width[i])),
+                            &format!("src/n{i}_{k}.rs"),
+                            1,
+                        );
+                        l.hit = b;
+                        v.push(l);
+                    }
+                }
+                related::Related::Lines(v)
+            };
+            let max_tokens = [300usize, 500, 700, 1000, 1500][case % 5];
+            let out = compose_context_with(
+                &[],
+                &hits,
+                None,
+                max_tokens,
+                false,
+                &no_linked,
+                Some(&source),
+            );
+            let part = budgeted_part(&out);
+            assert!(
+                part.len() <= max_tokens * CHARS_PER_TOKEN,
+                "case {case}: {} > {}: {out}",
+                part.len(),
+                max_tokens * CHARS_PER_TOKEN
+            );
+            if let Some(start) = out.find(related::RELATED_HEADING) {
+                for group in out[start..]
+                    .lines()
+                    .skip(1)
+                    .take_while(|l| !l.starts_with("[devctx]") && !l.starts_with("## "))
+                    .filter(|l| l.ends_with(':') && !l.starts_with("- "))
+                {
+                    let hit = group.trim_end_matches(':');
+                    assert!(
+                        out.contains(&format!("// src/{hit}.rs:1")),
+                        "case {case}: `{group}` without its code: {out}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The review's M2 example: four hits of 1 300, 1 300, 1 260 (four
+    /// neighbors) and 80 characters (one neighbor), 1 000 tokens. No group
+    /// stands without its code, and the brief stays within the budget.
+    #[test]
+    fn a_greedy_layout_never_leaves_a_group_without_its_hit() {
+        let sized = |i: usize, n: usize| {
+            let head = format!("fn h{i}() {{\n");
+            let fill = n.saturating_sub(head.len() + 2);
+            ctx_hit(
+                &format!("src/h{i}.rs"),
+                1,
+                &format!("{head}{}\n}}", "x".repeat(fill)),
+            )
+        };
+        let hits = vec![sized(0, 1300), sized(1, 1300), sized(2, 1260), sized(3, 80)];
+        let source = |brief: &[&Value]| {
+            let mut v = Vec::new();
+            for (b, h) in brief.iter().enumerate() {
+                let name = field(h, "file")
+                    .trim_start_matches("src/")
+                    .trim_end_matches(".rs")
+                    .to_string();
+                let n = match name.as_str() {
+                    "h2" => 4,
+                    "h3" => 1,
+                    _ => 0,
+                };
+                for k in 0..n {
+                    let mut l = rel(
+                        &name,
+                        "calls",
+                        &format!("fn {name}_dep_{k}(input: &str) -> u32"),
+                        &format!("src/d{k}.rs"),
+                        1,
+                    );
+                    l.hit = b;
+                    v.push(l);
+                }
+            }
+            related::Related::Lines(v)
+        };
+        let out = compose_context_with(&[], &hits, None, 1000, false, &no_linked, Some(&source));
+        assert!(budgeted_part(&out).len() <= 4000, "{out}");
+        for name in ["h2", "h3"] {
+            if out.contains(&format!("\n{name}:\n")) {
+                assert!(
+                    out.contains(&format!("// src/{name}.rs:1")),
+                    "{name} without its code: {out}"
+                );
+            }
+        }
+    }
+
+    /// m1: the section never pushes the best hit out of a small brief.
+    #[test]
+    fn related_never_pushes_out_the_best_hit() {
+        let best = (0..60)
+            .map(|k| format!("    step_{k}(x);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hits = vec![ctx_hit(
+            "src/best.rs",
+            1,
+            &format!("fn best() {{\n{best}\n}}"),
+        )];
+        let off = compose_context(&[], &hits, None, 170, false, &no_linked);
+        assert!(off.contains("src/best.rs:1"), "{off}");
+        let source = |_: &[&Value]| {
+            related::Related::Lines(
+                (0..4)
+                    .map(|k| {
+                        rel(
+                            "best",
+                            "called by",
+                            &format!("fn c{k}()"),
+                            &format!("src/c{k}.rs"),
+                            1,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let on = compose_context_with(&[], &hits, None, 170, false, &no_linked, Some(&source));
+        assert!(on.contains("src/best.rs:1"), "the best hit stays: {on}");
+        assert!(!on.contains(related::RELATED_HEADING), "{on}");
+        assert!(on.contains("would push out the best hit"), "{on}");
+        // The note closes the brief unbudgeted here, as `omitted` does: the
+        // rest keeps to the budget.
+        let note = on.find("\n[devctx] related:").expect("the note");
+        assert!(on[..note].len() <= 680, "{on}");
+    }
+
+    /// A section that shrinks because a hit left with its lines gives that
+    /// room back, and the hit comes back (without its lines: they were cut).
+    #[test]
+    fn a_section_that_shrinks_gives_the_room_back() {
+        let a = ctx_hit("src/a.rs", 1, "fn a() {}");
+        let b = ctx_hit("src/b.rs", 1, &"y".repeat(300));
+        let probe = compose_context(
+            &[],
+            &[a.clone(), ctx_hit("src/f.rs", 1, ""), b.clone()],
+            None,
+            250,
+            false,
+            &no_linked,
+        );
+        let slack = 120;
+        let pad = 250 * CHARS_PER_TOKEN - probe.len() - slack;
+        assert!(pad < 600, "the filler is not capped: {pad}");
+        let hits = vec![a, ctx_hit("src/f.rs", 1, &"x".repeat(pad)), b];
+        let off = compose_context(&[], &hits, None, 250, false, &no_linked);
+        assert!(
+            off.contains("src/b.rs:1") && !off.contains("omitted"),
+            "{off}"
+        );
+        let source = |brief: &[&Value]| {
+            let mut v = Vec::new();
+            for (k, h) in brief.iter().enumerate() {
+                let name = match field(h, "file") {
+                    "src/a.rs" => "a",
+                    "src/b.rs" => "b",
+                    _ => continue,
+                };
+                let mut l = rel(
+                    name,
+                    "called by",
+                    &format!("fn caller_of_{name}_with_a_long_name()"),
+                    &format!("src/c_{name}.rs"),
+                    1,
+                );
+                l.hit = k;
+                v.push(l);
+            }
+            related::Related::Lines(v)
+        };
+        let on = compose_context_with(&[], &hits, None, 250, false, &no_linked, Some(&source));
+        assert!(on.contains("src/b.rs:1"), "b got its room back: {on}");
+        let sec = section(&on);
+        assert!(
+            sec.contains("src/c_a.rs:1") && !sec.contains("src/c_b.rs"),
+            "{on}"
+        );
+        assert!(budgeted_part(&on).len() <= 1000, "{on}");
+    }
+
+    /// m2: the line that stands for a missing section is part of the
+    /// budget: the code makes room for it (here the second hit goes).
+    #[test]
+    fn the_related_note_is_part_of_the_budget() {
+        let second = ctx_hit("src/second.rs", 1, &"y".repeat(560));
+        let probe = compose_context(
+            &[],
+            &[ctx_hit("src/first.rs", 1, ""), second.clone()],
+            None,
+            300,
+            false,
+            &no_linked,
+        );
+        let pad = 300 * CHARS_PER_TOKEN - probe.len() - 30;
+        let hits = vec![ctx_hit("src/first.rs", 1, &"x".repeat(pad)), second];
+        let off = compose_context(&[], &hits, None, 300, false, &no_linked);
+        assert!(off.contains("src/second.rs:1"), "{off}");
+        let stale = |_: &[&Value]| related::Related::Unavailable("not shown: stale index".into());
+        let on = compose_context_with(&[], &hits, None, 300, false, &no_linked, Some(&stale));
+        assert!(
+            on.contains("[devctx] related: not shown: stale index"),
+            "{on}"
+        );
+        assert!(budgeted_part(&on).len() <= 1200, "{on}");
+        assert!(
+            !on.contains("src/second.rs:1") && on.contains("omitted: 1 item(s)"),
+            "{on}"
+        );
+    }
+
+    /// m3: a neighbor whose definition a hit of the final code shows is not
+    /// repeated in the section, even when the first layout did not show it.
+    #[test]
+    fn a_neighbor_the_final_code_shows_is_not_repeated() {
+        let hits = vec![
+            ctx_hit("src/a.rs", 1, "fn a() {\n    b();\n}"),
+            json!({ "file": "src/b.rs", "start_line": 1, "end_line": 3, "text": "fn b() {\n    work();\n}" }),
+        ];
+        let source = |_: &[&Value]| {
+            related::Related::Lines(vec![
+                rel("a", "calls", "fn b()", "src/b.rs", 1),
+                rel("a", "called by", "fn main()", "src/main.rs", 1),
+            ])
+        };
+        let out = compose_context_with(&[], &hits, None, 4096, false, &no_linked, Some(&source));
+        let sec = section(&out);
+        assert!(!sec.contains("src/b.rs:1"), "{out}");
+        assert!(sec.contains("src/main.rs:1"), "{out}");
+    }
+
     /// A neighbor of a hit the section pushed out of the code goes with it,
     /// and its room goes back to the code.
     #[test]
@@ -8573,8 +8956,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let big = ctx_hit("src/big.rs", 1, &format!("fn big() {{\n{big}\n}}"));
-        // The first hit fills the budget but for a few characters: less room
-        // than the section needs.
+        // The first hit fills the budget but for 90 characters: room for the
+        // note, not for the section.
         let probe = compose_context(
             &[],
             &[ctx_hit("src/a.rs", 1, ""), big.clone()],
@@ -8583,7 +8966,7 @@ mod tests {
             false,
             &no_linked,
         );
-        let pad = 300 * CHARS_PER_TOKEN - probe.len() - 20;
+        let pad = 300 * CHARS_PER_TOKEN - probe.len() - 90;
         let hits = vec![ctx_hit("src/a.rs", 1, &"x".repeat(pad)), big];
         let off = compose_context(&[], &hits, None, 300, false, &no_linked);
         assert!(
@@ -8591,7 +8974,13 @@ mod tests {
             "{off}"
         );
         let source = |_: &[&Value]| {
-            let mut l = rel("big", "called by", "pub fn main()", "src/main.rs", 3);
+            let mut l = rel(
+                "big",
+                "called by",
+                "pub fn main_entry_point_of_the_program(args: Vec<String>) -> ExitCode",
+                "src/main.rs",
+                3,
+            );
             l.hit = 1;
             related::Related::Lines(vec![l])
         };
@@ -8601,7 +8990,7 @@ mod tests {
             on.contains("src/big.rs:1"),
             "the code got its room back: {on}"
         );
-        assert!(on.contains("[devctx] related: none fitted"), "{on}");
+        assert!(on.contains("[devctx] related: none shown"), "{on}");
         assert!(
             on.contains("omitted: 1 item(s)"),
             "the line is counted: {on}"
@@ -8613,7 +9002,7 @@ mod tests {
     fn related_goes_between_the_code_and_the_linked_memories() {
         let (_, hits) = golden_inputs();
         let source = |_: &[&Value]| {
-            related::Related::Lines(vec![rel("a", "calls", "fn b()", "src/b.rs", 9)])
+            related::Related::Lines(vec![rel("a", "calls", "fn c()", "src/c.rs", 9)])
         };
         let out = compose_context_with(&[], &hits, None, 4096, true, &golden_linked, Some(&source));
         let code = out.find("## Code").expect("code");
@@ -8940,8 +9329,6 @@ mod tests {
         }
     }
 
-    /// Group selection: a query that only matches the non-default member
-    /// chooses it, by name, saying how many members were compared.
     /// PLAN-009 TASK-012, DD-18: the group selection as it is and with the
     /// experimental bonus for the rank of the symbol a member defines, over
     /// members whose servers run. A measurement, not a check (ignored):
@@ -9081,6 +9468,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// Group selection: a query that only matches the non-default member
+    /// chooses it, by name, saying how many members were compared.
     #[test]
     fn group_pick_chooses_the_member_that_matches() {
         let pick = choose_member(

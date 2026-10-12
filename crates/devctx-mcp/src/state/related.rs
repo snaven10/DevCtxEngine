@@ -340,6 +340,24 @@ mod tests {
     fn nothing_is_read_unless_the_section_is_on() {
         let (state, repo) = fixture("rel_reads");
         let sel = devctx_search::KindSel::default();
+        // The default (what every call that does not say gets) reads nothing
+        // and adds nothing: turning DEFAULT_RELATED on must fail here, on
+        // purpose (review of TASK-012, m7).
+        GATHERS.with(|c| c.set(0));
+        let out = do_build_context_with(
+            &state,
+            "run helper",
+            4096,
+            false,
+            &sel,
+            &ContextOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(GATHERS.with(|c| c.get()), 0, "{out}");
+        assert!(
+            !out.contains(RELATED_HEADING) && !out.contains(RELATED_NOTE),
+            "{out}"
+        );
         GATHERS.with(|c| c.set(0));
         let off = ContextOpts {
             related: Some(false),

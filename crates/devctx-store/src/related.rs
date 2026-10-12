@@ -753,6 +753,36 @@ mod tests {
         assert_eq!(shown_as(&got), own(&[("Med.b", "called by", 1)]));
     }
 
+    /// A destination marked external is left out even when the link pass
+    /// gave it an id (review NIT: the filter had no test of its own).
+    #[test]
+    fn an_external_neighbor_is_left_out() {
+        let store = Store::open_in_memory(3).unwrap();
+        let ids = write(
+            &store,
+            &[
+                s("Svc.run", "method", "svc.rs", (5, 10)),
+                s("Vendored.call", "function", "vendor.rs", (1, 9)),
+                s("Own.call", "function", "own.rs", (1, 9)),
+            ],
+            &[
+                ("Svc.run", "Vendored.call", "calls", "high", true),
+                e("Svc.run", "Own.call", "calls"),
+            ],
+        );
+        let got = store
+            .related_neighbors(
+                "repo",
+                "main",
+                &seeds(&store, &ids, &["Svc.run"]),
+                1,
+                RELATED_PER_SEED,
+                &nothing_shown,
+            )
+            .unwrap();
+        assert_eq!(shown_as(&got), own(&[("Own.call", "calls", 1)]));
+    }
+
     /// Ranked (highest first, a missing rank last) and capped per seed.
     #[test]
     fn neighbors_are_ranked_and_capped_per_seed() {
