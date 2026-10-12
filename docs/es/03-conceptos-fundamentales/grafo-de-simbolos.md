@@ -2,23 +2,30 @@
 
 > 🇬🇧 [Read in English](../../03-core-concepts/symbol-graph.md)
 
-Un grafo de llamadas sobre el código indexado: quién llama a qué, y hasta dónde
-llegaría un cambio.
+Un grafo sobre los símbolos del código indexado: quién llama, construye,
+importa, extiende o usa qué — y hasta dónde llegaría un cambio.
 
 ---
 
 ## Qué es
 
-Durante el indexado, tree-sitter parsea cada archivo soportado y extrae dos
-cosas: los símbolos que declara y las llamadas que hace. Las llamadas se
-vuelven aristas.
+Durante el indexado, tree-sitter parsea cada archivo soportado y extrae sus
+símbolos (clases, funciones, métodos, campos…) y cada relación que el archivo
+escribe: llamadas, instanciaciones, imports, supertipos, usos de tipo y qué
+símbolo contiene a cuál. Al final de cada corrida, un **link pass** resuelve
+cada relación a la definición que alcanza, entre archivos, y registra qué tan
+seguro está y por qué.
 
 ```bash
-devctx symbol authenticate          # la definición y su código
-devctx impact authenticate          # llamadores y llamados transitivos
+devctx symbol authenticate                 # la definición y su código
+devctx impact authenticate                 # llamadores y llamados transitivos
+devctx traverse OrderDto --kinds references --dir in   # quién usa un tipo
+devctx map --query search_ranked           # un mapa rankeado del repositorio
+devctx skeleton src/api/client.ts          # la estructura de un archivo
 ```
 
-Los agentes usan `read_symbol`, `get_references` e `impact_analysis`.
+Los agentes usan `read_symbol`, `get_references`, `impact_analysis`,
+`traverse`, `repo_map` y `skeleton`; cuál cuándo, [más abajo](#qué-herramienta-cuándo).
 
 ## Por qué existe
 
@@ -31,25 +38,169 @@ El grafo responde la pregunta estructural sin ranking: una arista existe o no
 existe. Pero **su ausencia no prueba nada** — ver los límites más abajo, porque
 esa distinción es la que evita un refactor roto.
 
-## Qué hay realmente en el grafo
+## Qué hay en el grafo
 
-**Un solo tipo de arista: `calls`.**
+Esto describe un índice hecho por 0.10 o posterior. Uno hecho antes solo tiene
+las aristas de llamada de 0.9 (`graph_edges`, más abajo) y se responde a la
+manera vieja hasta que se reconstruye: ver [Mantener el índice al día → Pasar a
+0.10](../13-mantener-el-indice-al-dia.md#pasar-a-010-el-grafo-de-símbolos).
 
-Vale la pena decirlo sin rodeos, porque es fácil suponer otra cosa. El parser
-también extrae imports y ligaduras de tipo, pero eso se usa para *resolver* los
-destinos de las llamadas — no se guardan como aristas. No hay aristas
-`inherits`, `implements` ni `references`.
+### Símbolos
 
-Entonces: esto es un grafo de llamadas. No un grafo de dependencias, ni una
-jerarquía de tipos.
+La tabla `symbols` tiene una fila por definición, por rama:
 
-Tipos de símbolo que reconocen las consultas:
+| Campo | Contiene |
+|---|---|
+| `id` | Un id estable, que se muestra como `sym` (16 dígitos hex): un hash de repositorio, archivo, clase de kind, nombre calificado y un desambiguador (los tipos de parámetro de un método Java, el trait y los argumentos de tipo de un `impl` de Rust). No lleva rama: el mismo método tiene el mismo `sym` en todas las ramas. Cambia si cambian el archivo, el scope que lo envuelve, el nombre o (Java) los tipos de parámetro — para "quién lo llama" es otro símbolo |
+| `kind` | `file`, `module`, `class`, `interface`, `enum`, `record`, `struct`, `trait`, `impl`, `type`, `function`, `method`, `constructor`, `field`, `const` |
+| `name`, `qualified` | `update` y `OrderService.update`: todo scope envolvente, sin el paquete (`Outer.Inner.m`, `tests.helper` en un `mod tests` de Rust, `N.f` dentro de un `namespace N` de TypeScript) |
+| `parent_id` | El contenedor — clase, `impl`, módulo — o el símbolo de archivo en el nivel superior |
+| `package` | Paquete Java o Go, módulo Python, ruta de módulo Rust, ruta de módulo TypeScript |
+| `signature` | La cabeza de la definición, hasta su cuerpo, en una línea: a lo sumo 200 caracteres después de sus anotaciones iniciales, terminada en `…` cuando se corta |
+| `exported` | Visible fuera de su paquete o módulo (`public`, `export`, `pub`, mayúscula en Go, sin `_` en Python) |
+| `rank`, `in_degree` | El PageRank global de la rama y las llamadas entrantes que no son de test, de confianza `high`/`medium` ([Búsqueda → Centralidad](busqueda.md#centralidad-solo-híbrida-opt-in)) |
+| `is_test` | Código de test: un archivo de test, o código Rust `#[cfg(test)]`, `mod tests`, `#[test]` dentro de un archivo de código |
 
-`function` · `method` · `class` · `struct` · `enum` · `interface` · `type`
+Cada archivo tiene además un **símbolo de archivo** (`kind = file`): la fuente
+de las llamadas hechas fuera de toda función (un script de Python,
+`export const x = f()`), de los imports del archivo, y la raíz de lo que
+contiene.
+
+### Aristas
+
+La tabla `edges` tiene una fila por **ocurrencia** — dos llamadas desde un
+mismo método al mismo destino son dos filas — de siete relaciones:
+
+| Kind | De → a | Sale de |
+|---|---|---|
+| `calls` | llamador → llamado | una llamada (en Python, llamar a una clase es un `calls` a la clase) |
+| `instantiates` | el código → el tipo construido | `new Foo()` (Java, TS/JS), una expresión de struct en Rust, un literal compuesto en Go |
+| `imports` | símbolo de archivo → lo que importa | `import`, `use`, `from … import`, re-exports |
+| `inherits` | tipo → supertipo | `extends`, bases de Python, un supertrait de Rust, un tipo embebido en Go |
+| `implements` | tipo → interfaz o trait | `implements`, `impl Trait for T` |
+| `references` | el código → el tipo que nombra | el tipo de un campo, parámetro, variable o valor de retorno |
+| `contains` | contenedor → miembro | el anidamiento, resuelto al parsear |
+
+Cada arista lleva:
+
+| Campo | Significado |
+|---|---|
+| `dst_id` | La definición alcanzada, cuando el link pass resolvió una |
+| `dst_name` | Cómo se escribió y calificó el destino (`OrderService.findPage`, `java.util.List.of`) — nunca una expresión |
+| `confidence` | `high`, `medium` o `low`: qué tan seguro está el índice de que la ocurrencia se refiere a esa definición |
+| `resolution` | Por qué: `self`, `local`, `param`, `field`, `ctor_inject`, `import`, `same_file`, `same_package`, `inherited`, `return_type` (tipado por un tipo de retorno declarado a lo largo de una cadena), `unique_name`, `name_only`, `external_known`, `chain_external`, `structural` (`contains`) |
+| `external` | El destino está fuera del repositorio, **con evidencia**: la plataforma (JDK, la biblioteca estándar y los builtins de Python, `std`/`core`/`alloc` de Rust, la biblioteca estándar de Go, los globales del DOM/Node) o una dependencia que declara un manifiesto (`package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `setup.cfg`, `requirements*.txt`). "No encontrado" no es "externo": un nombre sin definición y sin evidencia queda sin decidir, `low` |
+| `from_test` | La ocurrencia está en código de test (la misma regla que `is_test`) |
+| `hint` | Lo que el archivo dijo del receptor de una llamada (`typed field OrderService`, `chain findByCode name Order`): el link pass vuelve a resolver una arista desde ahí sin releer la fuente |
+
+Una llamada sobre un receptor que nada tipa, a un nombre que el repositorio no
+define (`.map()` sobre un stream sin tipo, un método de un parámetro de lambda
+sin tipo), se **descarta**: queda en la tabla con `resolution = discarded`,
+fuera de toda respuesta (las tools leen la vista `live_edges`), y vuelve sola
+cuando se indexa un archivo que define el nombre. `index_repo` informa cuántas
+hay (`edges_discarded`) y cuántas llamadas quedan sin decidir
+(`edges_unresolved`).
+
+`graph_edges`, la tabla de llamadas de 0.9 (una fila por par llamador → llamado,
+con nombres en vez de ids), se sigue escribiendo al lado, en su formato viejo,
+para que un índice hecho por 0.10 siga legible si volvés a 0.9.0. Nada en 0.10
+la lee salvo el camino viejo de una rama que todavía no se reconstruyó.
+
+### Cómo se resuelve una referencia
+
+Por ocurrencia, en orden; la primera regla que responde decide `resolution` y
+`confidence`:
+
+| # | Regla | `resolution` | `confidence` |
+|---|---|---|---|
+| 1 | `this` / `self` / `Self` / `super` → el tipo envolvente (o su supertipo) | `self`, `inherited` | `high` |
+| 2 | El receptor es un local o parámetro con tipo en el scope léxico | `local`, `param` | `high` |
+| 3 | El receptor es un campo de la clase envolvente (cada clase interna tiene los suyos) | `field` | `high` |
+| 4 | Un campo asignado desde un parámetro del constructor, una propiedad-parámetro de TypeScript, `inject(T)` de Angular | `ctor_inject` | `high` |
+| 5 | El receptor es un tipo, hallado por un import o por el paquete (nunca por empezar con mayúscula) | `import`, `same_package` | `high` |
+| 6 | Sin receptor: un miembro del contenedor o de un supertipo, después una función del archivo, después un import | `self`, `inherited`, `same_file`, `import` | `high` |
+| 7 | La única definición de ese nombre en el repositorio (solo Java y TypeScript; nunca a través de un import que no se puede seguir) | `unique_name` | `medium` |
+| 8 | Varios candidatos, nada decide | `name_only` (sin `dst_id`) | `low` |
+| 9 | Ningún candidato en el repositorio y el tipo o paquete es de afuera (con evidencia) | `external_known` | `high` |
+
+Una cadena fluent (`a.b().c()`) tipa el receptor de `c` por el **tipo de
+retorno declarado** de `b` cuando `b` resolvió dentro del repositorio
+(`return_type`); después de una llamada a una librería nada lo tipa: `c` es
+`chain_external` (`medium`) cuando el repositorio no tiene `c`, y `name_only`
+cuando sí. La confianza nunca crece a lo largo de una cadena, y lo que descansa
+en una conjetura (`unique_name`, un tipo definido dos veces, un import que no se
+pudo seguir) nunca es `high`.
+
+**Esto no es un compilador.** No hay inferencia de tipos más allá de
+declaraciones, inicializadores (`var x = new T()`, `x := New()`,
+`let s = Store::open(p)?`), elementos de un for-each y tipos de retorno
+declarados; no hay resolución de sobrecargas por tipo de argumento (Java elige
+por aridad); no hay análisis de flujo. `confidence` dice cuánto se puede confiar
+en cada arista, y se midió (ver abajo).
+
+### Qué resuelve, por lenguaje
+
+Cada fila está respaldada por un test; los nombres de los tests están en un
+comentario en la fuente de esta página.
+
+| Lenguaje | Resuelve | No resuelve |
+|---|---|---|
+| **Java** | Campos por clase interna; `var` desde su inicializador; constantes (`LOG`) como campos de su tipo declarado, nunca como tipos; inyección por constructor (`this.x = x`) y campos `@Inject`; imports, mismo paquete, imports comodín, `java.lang`; `new T()` como `instantiates`; supertipos, incluidos los estáticos que hereda una entidad Panache (externos); elementos de un for-each; imports estáticos (JUnit, Mockito); métodos de `Object` sobre un receptor sin tipo (externos, `medium`); accessors de Lombok `@Data`/`@Getter` (al campo, `medium`); receptores a través de campos (`this.cfg.server.port()`); clases anónimas | El tipo de un parámetro de lambda sin tipo; sobrecargas elegidas por tipo de argumento (solo por aridad); genéricos más allá del elemento de una colección; lo que devuelven `Optional.get()`/`List.get()` |
+| **TypeScript / JavaScript** | Imports relativos (`.js` escrito por `.ts`, archivos `index`); alias de `paths` y `baseUrl` del `tsconfig.base.json` / `tsconfig.json` de la raíz (un `extends`); barrels hasta 4 niveles; imports por nombre, default, namespace y de paquete; paquetes externos solo con evidencia (una dependencia de `package.json`, un builtin de Node); DI de Angular (propiedades-parámetro del constructor, `inject(T)` de `@angular/core` en un campo o un local); funciones flecha ligadas a un `const` como símbolos y fuentes de sus llamadas; scopes léxicos (parámetros, `catch` y funciones de bloque sombrean); tipos de retorno declarados a lo largo de una cadena; métodos de interfaz (y métodos abstractos) como símbolos | CommonJS (`require`, `module.exports`), `export =`, `import()` dinámico, componentes JSX como llamadas, declaraciones ambientales `.d.ts`; los `paths` de un `tsconfig.json` por app; los bloques `namespace` no son símbolos (solo califican a sus miembros); las firmas de sobrecarga no son símbolos (solo la implementación); `this` en un método de objeto literal o en una *class expression*; las signals de Angular llamadas como funciones; receptores a través de varios campos (`this.a.b.m()`, por nombre) |
+| **Python** | Módulos por ruta y paquete (`__init__.py`, la raíz del repositorio, `src/`, el directorio propio de un script); imports relativos, `import *`, re-exports; llamadas a nivel de módulo (desde el símbolo de archivo); una llamada a una clase (a la clase); `self.x = …` en un método, tipado desde un parámetro tipado de `__init__`; `x = Foo()` / `x = make()` por la clase o la anotación de retorno; herencia y `super()`; funciones anidadas; la biblioteca estándar, los builtins y las distribuciones declaradas como externos; formas de `typing` (`Any`, `TypeVar` y uniones no tipan nada, `type[X]` es `X`, `Self` es la clase) | Parámetros sin anotar; `self.a.b()` (Python no declara campos); decoradores que cambian un tipo; los `-r` de un archivo de requirements |
+| **Rust** | Crates por `Cargo.toml` (el propio, dependencias por path, `workspace = true`); módulos por ruta y `mod` en línea; `use` (grupos, alias, globs) con el scope de su módulo, función o bloque; `crate::`, `self::`, `super::`, `Self::`; re-exports con `pub use`; los `impl` de un tipo en cualquier archivo de su crate; `impl Trait for T`; cada bound de un parámetro de tipo; campos por su declaración; `let x = T::new()?` por el tipo de retorno (`?`/`unwrap()` desenvuelven `Result`/`Option`); `std`/`core`/`alloc`, el prelude y los crates declarados como externos; métodos derivables (`clone`, `default`) como externos `medium`; gemelos por `#[cfg]` como `medium` | Las macros no son llamadas, y los ítems que define una macro no son símbolos; módulos declarados con `#[path]` o un `mod` condicional; un `impl<T: X> Y for T` genérico no pertenece a ningún tipo (sus métodos son `T.m`); `let x = a.f()` con `f` fuera del repositorio (una cadena, sin más tipo) |
+| **Go** | El `module` de `go.mod` (y un `replace` local) decide qué es del repositorio; la biblioteca estándar y otros módulos como externos; un método por el tipo de su receptor, también desde otro archivo del paquete; campos por su declaración; `x := New()` por su resultado declarado; métodos de interfaz como símbolos; gemelos por build tags como `medium`; un tipo externo embebido hace externo a un método que falta (`medium`) | Dispatch por embebido (embeber promueve métodos, no los sobrescribe); un método promovido desde un tipo embebido del repositorio no tiene test; verificado solo con fixtures: no se midió ningún repositorio Go |
+| Kotlin y archivos de texto crudo | — | Ni símbolos ni aristas (sus rutas de Spring sí se extraen) |
+
+<!-- Evidencia de la columna "Resuelve" (crates/devctx-parse/tests salvo que se indique):
+Java: link_java.rs a_each_inner_class_types_its_own_field, b_var_is_never_a_type,
+c_a_constant_is_a_field_with_its_type, d_constructor_injection, e_same_package_and_import,
+f_fluent_chains, g_new_is_instantiates, h_an_undefined_panache_static_is_inherited_and_external,
+i_for_each_variables, static_imports_object_methods_literals_and_lombok,
+a_dotted_receiver_is_typed_through_its_fields, lambda_parameters_and_patterns_bind_their_names,
+an_anonymous_class_scopes_its_bare_calls, arity_is_read_from_java_signatures_only,
+confidence_never_escalates, a_call_after_an_external_one_is_not_external_by_default;
+facts_java.rs java_symbols_with_kind_parent_signature_and_visibility (@Inject, record, constructor).
+TypeScript/JavaScript: link_typescript.rs constructor_injection_aliases_and_barrels,
+inject_in_a_field_follows_a_renamed_import, an_exported_arrow_function_is_a_symbol_source_and_destination,
+local_bindings_shadow_fields, imports_by_name_namespace_default_and_package,
+a_package_needs_a_manifest_or_a_node_builtin, only_angulars_inject_injects,
+this_in_object_literals_and_class_expressions_is_not_a_class, javascript_without_types,
+a_tsconfig_with_comments_is_read, a_block_local_function_does_not_shadow_outside_its_block,
+a_call_through_an_interface_reaches_its_declared_method; facts_typescript.rs
+an_interface_method_is_a_symbol (las firmas de sobrecarga no son símbolos);
+src/symbol_id.rs qualified_names_carry_every_enclosing_symbol (namespace N → N.f).
+Python: link_python.rs two_calls_from_one_method_are_two_edges, module_level_calls_are_edges_of_the_file,
+relative_star_and_reexported_imports, instance_attributes_are_typed_in_init,
+builtins_stdlib_and_declared_packages_are_external, inheritance_and_nested_functions,
+a_script_imports_its_siblings_and_the_package, a_local_from_a_method_call_is_a_chain,
+typing_special_forms, local_bindings_shadow_attributes.
+Rust: link_rust.rs paths_resolve_by_use_and_self, impls_in_other_files_and_trait_impls,
+declared_crates_and_std_are_external, macros_are_not_calls, modules_and_functions, values_and_fields,
+declared_dependencies_decide_which_crate, every_bound_is_tried, cfg_homonyms_are_medium,
+a_use_in_a_function_is_scoped_to_it, a_use_in_a_block_is_scoped_to_it, owners_values_and_variants,
+a_derived_default_is_its_type, an_external_supertype_is_medium_evidence;
+facts_rust.rs only_a_required_test_cfg_marks_test_code;
+devctx-mcp state::impact::tests dispatch_follows_a_rust_blanket_impl (los métodos de un impl genérico son T.m).
+Go: link_go.rs methods_by_their_receiver, the_module_decides_what_is_the_repositorys,
+a_module_needs_its_go_mod, an_external_embedding_is_medium_evidence, package_names_tags_and_shadows;
+facts_go.rs go_symbols_imports_and_embedding (embeber es inherits).
+Llamadas descartadas: devctx-mcp state::lookup::tests discarded_calls_reach_no_answer;
+link_java.rs f_fluent_chains (dos descartadas). -->
+
+**Precisión medida.** Sitios de llamada etiquetados a mano antes de medir (los
+"gold edges" de `scripts/graph-eval/`), octubre de 2026: Java 20 de 25
+correctos, y 19 de 19 de los `high`; TypeScript 20 de 20; Python 26 de 27; Rust
+26 de 26 (22 de 22 `high`). Llamadas sin decidir: 4–8 % en dos repositorios
+Java, 11 % en un subconjunto de un workspace Angular, 2 % en un repositorio
+Python, 17,5 % en el Rust de este repositorio — sobre todo cadenas tras una
+llamada a una librería con un nombre que el repositorio también define, sin
+decidir a propósito. Go se verificó solo con fixtures. Son unas pocas decenas
+de sitios por lenguaje: un orden de magnitud, no una garantía.
 
 ## Lenguajes soportados
 
-**Parseo completo — símbolos y aristas de llamada (7):**
+**Parseo completo — símbolos y aristas (7):**
 
 | Lenguaje | Extensiones |
 |---|---|
@@ -75,21 +226,23 @@ detección de rutas tiene un camino aparte.
 
 Cualquier otra cosa no se indexa.
 
-## Almacenamiento
+## Qué herramienta cuándo
 
-Las aristas viven en la base DuckDB del proyecto, en `graph_edges`:
-
-| Columna | Contiene |
+| Pregunta | Herramienta |
 |---|---|
-| `source` / `target` | Nombres de símbolo |
-| `kind` | Siempre `calls` |
-| `source_file` / `target_file` | Dónde vive cada lado |
-| `line` | Dónde aparece la llamada |
-| `repo` / `branch` | Alcance — el grafo es por rama, como todo lo demás |
+| ¿Dónde está el código sobre una idea? | `search` (no el grafo) |
+| Sé el nombre: mostrame la definición | `read_symbol` |
+| ¿Dónde se llama o se construye esto — archivo y línea? | `get_references` |
+| ¿Qué se rompe si lo cambio (llamadores y llamados, transitivos)? | `impact_analysis` |
+| ¿Qué contiene esta clase, qué implementa esta interfaz, quién importa o usa este tipo — salto a salto, por cualquier relación? | `traverse` |
+| Soy nuevo en esta zona: ¿cuáles son sus piezas centrales? | `repo_map`, con un foco |
+| ¿Dónde está, en este archivo, lo que busco? | `skeleton`, y después `read_symbol` / `read_file` sobre el rango |
 
-La unicidad es `(source, target, kind, repo, branch, source_file)`, así que la
-misma llamada desde dos archivos distintos son dos aristas, y re-indexar no
-duplica.
+`get_references` es un salto y lista ocurrencias; `impact_analysis` recorre
+`calls` e `instantiates` (más el dispatch) hasta una profundidad, con tope por
+dirección; `traverse` recorre las relaciones que elijas, y devuelve también las
+aristas. `repo_map` y `skeleton` dan firmas, nunca código: ubican, no
+reemplazan la lectura.
 
 ## Operaciones
 
@@ -497,39 +650,58 @@ desde la rama por defecto o la indexada más recientemente y agregan
 explícito en vez de `[]`. Ver
 [Búsqueda → Conciencia de ramas](busqueda.md#conciencia-de-ramas).
 
+## Un índice hecho antes de 0.10
+
+El grafo de arriba lo escribe `devctx index --full` con un binario 0.10. Hasta
+entonces una rama informa `extractor_stale: true` en `index_status`, y:
+
+| Herramienta | Responde |
+|---|---|
+| `read_symbol`, `get_references`, `search` (`keyword`/`hybrid`), la vista web del grafo | Como 0.9, por nombre sobre `graph_edges`, con un `warning` que lo dice |
+| `impact_analysis` | El recorrido de 0.9 — por nombre, sin confianza, sin filtros, sin tope — con el `warning` (que agrega, si se pasaron filtros, que no se aplicaron) |
+| `build_context` con `related: true` | El brief sin la sección, y `[devctx] related: not shown: …` |
+| `traverse`, `repo_map`, `skeleton` | Un error: `… reads the symbol graph, and this branch's index predates it …: reindex with devctx index --full (vectors are reused)` |
+| búsqueda híbrida con `search.centrality_weight` > 0 | Solo vector + palabra clave: no hay ranks que sumar |
+
+El paso a 0.10, cuánto cuesta y cómo volver atrás están en
+[Mantener el índice al día](../13-mantener-el-indice-al-dia.md#pasar-a-010-el-grafo-de-símbolos).
+
 ## Límites que conviene conocer
 
-**Los nombres del grafo son calificados.** El `source` de una arista se escribe
-`Clase.metodo` siempre que la función que llama esté dentro de un contenedor; su
-`target` se escribe así cuando el sitio de llamada tenía un receptor con tipo
-resoluble, y pelado cuando no. Una pregunta hecha con un nombre pelado se expande
-a cada forma calificada que lo lleva, y la respuesta reporta qué declaraciones
-fundió. Veintiún métodos llamados `actualizar` es un número corriente para un
-repositorio Quarkus — un radio de impacto que los junta sin decirlo sería peor
-que uno vacío, así que leé esa línea.
+**Un nombre pelado significa las definiciones del repositorio con ese nombre.**
+`get_references`, `impact_analysis` y `traverse` resuelven `update` a cada
+símbolo llamado `update` y recorren desde todos por id, no a cada llamada
+escrita `.update(` — el `.map()` de una librería no es un llamador de tu `map`.
+La respuesta lista lo que el nombre pelado representó (`resolved_symbols`,
+`candidates`); veintiún métodos llamados `actualizar` es un número corriente
+para un repositorio Quarkus, así que leé esa línea. Preguntá con el nombre
+calificado (`OfficeService.actualizar`), con `archivo::nombre` o con un `sym`
+cuando querés decir uno solo. Un nombre sin definición en el repositorio
+representa sus sitios de llamada externos.
 
-Preguntá con el nombre calificado cuando querés decir un método y nada más. Es
-la única forma de acotarlo, y por eso un nombre calificado nunca se expande.
+**Las llamadas que el índice no pudo decidir se cuentan, no se esconden.** Una
+llamada sobre un receptor sin tipo a un nombre que el repositorio tiene
+(`svc.update()` con `svc` desconocido) no tiene destino: nunca se recorre, se
+cuenta en `undecided_calls` / `below_confidence`, y `min_confidence: "low"` la
+lista, marcada `undecided`.
 
-> Esto corrige una afirmación anterior de estas páginas: que la cobertura era
-> "binaria por símbolo, sin nada que distinguiera los casos". No lo era. Un
-> `actualizar` pelado devolvía cero mientras `OfficeService.actualizar` devolvía
-> un llamador y veintitrés llamados: las aristas estuvieron ahí todo el tiempo,
-> bajo una llave con la que nadie preguntaba.
-
-**Un resultado vacío sigue significando "no encontré", nunca "no hay".** Dos de las
-razones antes eran silenciosas y ya no lo son: una rama sin filas
-(`branch_fallback`) y un índice construido por un extractor más viejo (`warning`
+**Un resultado vacío sigue significando "no encontré", nunca "no hay".** Tres
+de las razones antes eran silenciosas y ya no lo son: una rama sin filas
+(`branch_fallback`), un índice construido por un extractor más viejo (`warning`
 en cada respuesta de grafo, `extractor_stale` en `index_status` — corré `devctx
-index --full`). Las de abajo siguen sin anunciarse. Ante un vacío, cruzá con
+index --full`) y lo que un filtro dejó afuera (`below_confidence`, `excluded`,
+`omitted`). Las de abajo siguen sin anunciarse. Ante un vacío, cruzá con
 `search --keyword` antes de renombrar o borrar.
 
-**La resolución de llamadas es por nombre**, informada por imports y ligaduras
-de tipo donde la gramática lo soporta.
+**La resolución es estática y por lenguaje** — imports, tipos declarados,
+scopes y las reglas de la tabla de arriba —, no la de un compilador. Una arista
+`high` equivocada es rara en los repositorios medidos; una que falta, no.
 
-**El despacho dinámico es invisible.** Una llamada hecha por un callback, una
-API de reflexión o un registro llaveado por strings no deja arista sintáctica de
-llamada. El grafo va a sub-reportar justo donde un lenguaje es más dinámico.
+**El despacho dinámico es visible a medias.** Una llamada por una interfaz, una
+clase abstracta o un trait se sigue (`via: "dispatch"`, nunca `high`). Una
+llamada por un callback, un valor función, reflexión, un servicio buscado por
+nombre o un registro llaveado por strings no deja ninguna arista. El grafo va a
+sub-reportar justo donde un lenguaje es más dinámico.
 
 **Solo 7 lenguajes producen aristas.** En un repositorio políglota, el grafo
 cubre una parte, y no hay aviso que diga cuál. `devctx status` muestra el conteo
@@ -543,12 +715,14 @@ lenguaje que se está indexando como texto.
 | *¿Dónde está el código sobre autenticación?* | `search` |
 | *¿Qué llama a `authenticate`?* | `get_references` |
 | *¿Qué se rompe si lo cambio?* | `impact_analysis` |
+| *¿Qué lo rodea — sus tipos, su jerarquía, sus miembros?* | `traverse` |
+| *¿Por dónde empiezo en este repositorio?* | `repo_map` |
 | *¿Por qué está escrito así?* | `memories_by_symbol` |
 | *¿Qué debería leer antes de responder?* | `build_context` |
 
-La búsqueda es difusa y rankeada. El grafo es exacto y sin ranking. La cuarta
-fila es la que a nadie se le ocurre preguntar, y es la única que el código no
-puede responder en absoluto.
+La búsqueda es difusa y rankeada. El grafo es estructural, y dice qué tan
+seguro está de cada arista. La fila del *por qué* es la que a nadie se le
+ocurre preguntar, y es la única que el código no puede responder en absoluto.
 
 ## Modelo mental
 

@@ -2,22 +2,29 @@
 
 > 🇪🇸 [Leer en español](../es/03-conceptos-fundamentales/grafo-de-simbolos.md)
 
-A call graph over the indexed code: who calls what, and what a change would
-reach.
+A graph over the indexed code's symbols: who calls, builds, imports, extends or
+uses what — and what a change would reach.
 
 ---
 
 ## What it is
 
-While indexing, tree-sitter parses each supported file and extracts two things:
-the symbols it declares, and the calls it makes. The calls become edges.
+While indexing, tree-sitter parses each supported file and extracts its symbols
+(classes, functions, methods, fields…) and every relation the file writes down:
+calls, instantiations, imports, supertypes, type uses, and which symbol holds
+which. At the end of every run a **link pass** resolves each relation to the
+definition it reaches, across files, and records how sure it is and why.
 
 ```bash
-devctx symbol authenticate          # the definition and its code
-devctx impact authenticate          # transitive callers and callees
+devctx symbol authenticate                 # the definition and its code
+devctx impact authenticate                 # transitive callers and callees
+devctx traverse OrderDto --kinds references --dir in   # who uses a type
+devctx map --query search_ranked           # a ranked map of the repository
+devctx skeleton src/api/client.ts          # the structure of one file
 ```
 
-Agents use `read_symbol`, `get_references` and `impact_analysis`.
+Agents use `read_symbol`, `get_references`, `impact_analysis`, `traverse`,
+`repo_map` and `skeleton`; which one when is [below](#which-tool-when).
 
 ## Why it exists
 
@@ -30,24 +37,166 @@ exists or it does not. But **its absence proves nothing** — see the limits
 below, because that distinction is what stands between you and a broken
 refactor.
 
-## What is actually in the graph
+## What is in the graph
 
-**One edge kind: `calls`.**
+This describes an index made by 0.10 or later. An index made before holds only
+the call edges of 0.9 (`graph_edges`, below) and is answered the old way until
+it is rebuilt: see [Keeping the index fresh → Upgrading to
+0.10](../13-keeping-the-index-fresh.md#upgrading-to-010-the-symbol-graph).
 
-This is worth stating plainly, because it is easy to assume otherwise. The
-parser also extracts imports and type bindings, but those are used to *resolve*
-call targets — they are not stored as edges. There are no `inherits`,
-`implements` or `references` edges.
+### Symbols
 
-So: this is a call graph. Not a dependency graph, not a type hierarchy.
+The `symbols` table holds one row per definition, per branch:
 
-Symbol kinds recognised by the queries:
+| Field | Holds |
+|---|---|
+| `id` | A stable id, shown as `sym` (16 hex digits): a hash of repository, file, kind class, qualified name and a disambiguator (the parameter types of a Java method, the trait and type arguments of a Rust `impl`). No branch in it: the same method has the same `sym` on every branch. It changes when the file, the enclosing scope, the name or (Java) the parameter types change — that is another symbol for "who calls it" |
+| `kind` | `file`, `module`, `class`, `interface`, `enum`, `record`, `struct`, `trait`, `impl`, `type`, `function`, `method`, `constructor`, `field`, `const` |
+| `name`, `qualified` | `update` and `OrderService.update`: every enclosing scope, without the package (`Outer.Inner.m`, `tests.helper` in a Rust `mod tests`, `N.f` inside a TypeScript `namespace N`) |
+| `parent_id` | The container — class, `impl`, module — or the file symbol at top level |
+| `package` | Java or Go package, Python module, Rust module path, TypeScript module path |
+| `signature` | The head of the definition, up to its body, on one line: at most 200 characters after its leading annotations, ending in `…` when cut |
+| `exported` | Visible outside its package or module (`public`, `export`, `pub`, a capital in Go, no `_` in Python) |
+| `rank`, `in_degree` | The branch's global PageRank and the incoming non-test calls of `high`/`medium` confidence ([Search → Centrality](search.md#centrality-hybrid-only-opt-in)) |
+| `is_test` | Test code: a test file, or Rust `#[cfg(test)]`, `mod tests`, `#[test]` code inside a source file |
 
-`function` · `method` · `class` · `struct` · `enum` · `interface` · `type`
+Every file also has a **file symbol** (`kind = file`): the source of the calls
+made outside any function (a Python script, `export const x = f()`), of the
+file's imports, and the root of what it contains.
+
+### Edges
+
+The `edges` table holds one row per **occurrence** — two calls from one method
+to the same target are two rows — of seven relations:
+
+| Kind | From → to | Comes from |
+|---|---|---|
+| `calls` | caller → callee | a call (a Python call to a class is a `calls` to the class) |
+| `instantiates` | the code → the type built | `new Foo()` (Java, TS/JS), a Rust struct expression, a Go composite literal |
+| `imports` | file symbol → what it imports | `import`, `use`, `from … import`, re-exports |
+| `inherits` | type → supertype | `extends`, Python bases, a Rust supertrait, a Go embedded type |
+| `implements` | type → interface or trait | `implements`, `impl Trait for T` |
+| `references` | the code → the type it names | the type of a field, parameter, variable or return value |
+| `contains` | container → member | the nesting itself, resolved at parse time |
+
+Each edge carries:
+
+| Field | Meaning |
+|---|---|
+| `dst_id` | The definition reached, when the link pass resolved one |
+| `dst_name` | How the target was written and qualified (`OrderService.findPage`, `java.util.List.of`) — never an expression |
+| `confidence` | `high`, `medium` or `low`: how sure the index is that the occurrence means that definition |
+| `resolution` | Why: `self`, `local`, `param`, `field`, `ctor_inject`, `import`, `same_file`, `same_package`, `inherited`, `return_type` (typed by a declared return type along a chain), `unique_name`, `name_only`, `external_known`, `chain_external`, `structural` (`contains`) |
+| `external` | The target is outside the repository, **with evidence**: the platform (JDK, Python standard library and builtins, Rust `std`/`core`/`alloc`, the Go standard library, DOM/Node globals) or a dependency a manifest declares (`package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `setup.cfg`, `requirements*.txt`). "Not found" is not "external": a name with no definition and no evidence stays undecided, `low` |
+| `from_test` | The occurrence is in test code (the same rule as `is_test`) |
+| `hint` | What the file said about a call's receiver (`typed field OrderService`, `chain findByCode name Order`): the link pass re-resolves an edge from it without re-reading the source |
+
+A call made on a receiver nothing types, to a name the repository does not
+define (`.map()` on an untyped stream, a method of an untyped lambda
+parameter), is **discarded**: it stays in the table with `resolution =
+discarded`, out of every answer (tools read the `live_edges` view), and comes
+back by itself when a file that defines the name is indexed. `index_repo`
+reports how many there are (`edges_discarded`) and how many calls are still
+undecided (`edges_unresolved`).
+
+`graph_edges`, the call table of 0.9 (one row per caller → callee pair, names
+instead of ids), is still written alongside, in its old format, so an index
+made by 0.10 stays readable if you go back to 0.9.0. Nothing in 0.10 reads it
+except the old path for a branch not yet rebuilt.
+
+### How a reference is resolved
+
+Per occurrence, in order; the first rule that answers decides `resolution` and
+`confidence`:
+
+| # | Rule | `resolution` | `confidence` |
+|---|---|---|---|
+| 1 | `this` / `self` / `Self` / `super` → the enclosing type (or its supertype) | `self`, `inherited` | `high` |
+| 2 | The receiver is a local or parameter with a type in the lexical scope | `local`, `param` | `high` |
+| 3 | The receiver is a field of the enclosing class (each inner class has its own) | `field` | `high` |
+| 4 | A field assigned from a constructor parameter, a TypeScript parameter property, Angular `inject(T)` | `ctor_inject` | `high` |
+| 5 | The receiver is a type, found through an import or the package (never because it starts with a capital) | `import`, `same_package` | `high` |
+| 6 | No receiver: a member of the container or a supertype, then a function of the file, then an import | `self`, `inherited`, `same_file`, `import` | `high` |
+| 7 | The one definition of that name in the repository (Java and TypeScript only; never across an import that cannot be followed) | `unique_name` | `medium` |
+| 8 | Several candidates, nothing decides | `name_only` (no `dst_id`) | `low` |
+| 9 | No candidate in the repository and the type or package is from outside (with evidence) | `external_known` | `high` |
+
+A fluent chain (`a.b().c()`) types `c`'s receiver by the **declared return
+type** of `b` when `b` resolved into the repository (`return_type`); after a
+call into a library nothing types it: `c` is `chain_external` (`medium`) when
+the repository has no `c`, and `name_only` when it does. Confidence never
+grows along a chain, and anything that rests on a guess (`unique_name`, a type
+defined twice, an import that could not be followed) is never `high`.
+
+**This is not a compiler.** There is no type inference beyond declarations,
+initializers (`var x = new T()`, `x := New()`, `let s = Store::open(p)?`),
+for-each elements and declared return types; no overload resolution by
+argument types (Java picks by arity); no flow analysis. `confidence` says how
+much each edge can be trusted, and it was measured (see below).
+
+### What it resolves, by language
+
+Each row is backed by a test; the test names are in a comment in this page's
+source.
+
+| Language | Resolves | Does not |
+|---|---|---|
+| **Java** | Fields per inner class; `var` from its initializer; constants (`LOG`) as fields of their declared type, never as types; constructor injection (`this.x = x`) and `@Inject` fields; imports, same package, wildcard imports, `java.lang`; `new T()` as `instantiates`; supertypes, including statics a Panache entity inherits (external); for-each elements; static imports (JUnit, Mockito); `Object` methods on an untyped receiver (external, `medium`); Lombok `@Data`/`@Getter` accessors (to the field, `medium`); receivers through fields (`this.cfg.server.port()`); anonymous classes | The type of an untyped lambda parameter; overloads chosen by argument types (only by arity); generics beyond the element of a collection; what `Optional.get()`/`List.get()` return |
+| **TypeScript / JavaScript** | Relative imports (`.js` written for `.ts`, `index` files); `paths` aliases and `baseUrl` of the root `tsconfig.base.json` / `tsconfig.json` (one `extends`); barrels up to 4 levels; named, default, namespace and package imports; packages external only with evidence (a `package.json` dependency, a Node builtin); Angular DI (constructor parameter properties, `inject(T)` from `@angular/core` in a field or a local); arrow functions bound to a `const` as symbols and sources of their calls; lexical scopes (parameters, `catch`, block functions shadow); declared return types along a chain; interface methods (and abstract methods) as symbols | CommonJS (`require`, `module.exports`), `export =`, dynamic `import()`, JSX components as calls, ambient `.d.ts` declarations; the `paths` of a per-app `tsconfig.json`; `namespace` blocks are not symbols (they only qualify their members); overload signatures are not symbols (only the implementation); `this` in an object literal's method or a class expression; Angular signals called as functions; receivers through several fields (`this.a.b.m()`, by name) |
+| **Python** | Modules by path and package (`__init__.py`, the repository root, `src/`, a script's own directory); relative imports, `import *`, re-exports; module-level calls (from the file symbol); a call to a class (to the class); `self.x = …` in a method, typed from a typed `__init__` parameter; `x = Foo()` / `x = make()` by the class or the return annotation; inheritance and `super()`; nested functions; the standard library, builtins and declared distributions as external; `typing` forms (`Any`, `TypeVar` and unions type nothing, `type[X]` is `X`, `Self` the class) | Unannotated parameters; `self.a.b()` (Python declares no fields); decorators that change a type; a requirements file's `-r` includes |
+| **Rust** | Crates by `Cargo.toml` (own crate, path dependencies, `workspace = true`); modules by path and inline `mod`; `use` (groups, aliases, globs) scoped to its module, function or block; `crate::`, `self::`, `super::`, `Self::`; `pub use` re-exports; a type's `impl`s in any file of its crate; `impl Trait for T`; every bound of a type parameter; fields by their declaration; `let x = T::new()?` by the return type (`?`/`unwrap()` unwrap `Result`/`Option`); `std`/`core`/`alloc`, the prelude and declared crates as external; derivable methods (`clone`, `default`) as external `medium`; `#[cfg]` twins as `medium` | Macros are not calls, and items a macro defines are not symbols; modules declared with `#[path]` or a conditional `mod`; a blanket `impl<T: X> Y for T` belongs to no type (its methods are `T.m`); `let x = a.f()` with `f` outside the repository (a chain, typed no further) |
+| **Go** | The `module` of `go.mod` (and a local `replace`) decides what is the repository's; the standard library and other modules as external; a method by its receiver type, also from another file of the package; fields by their declaration; `x := New()` by its declared result; interface methods as symbols; build-tag twins as `medium`; an embedded external type makes a missing method external (`medium`) | Dispatch through embedding (embedding promotes methods, it does not override them); a method promoted from an embedded repository type has no test; checked only with fixtures: no Go repository was measured |
+| Kotlin and raw-text files | — | No symbols, no edges (their Spring routes are still extracted) |
+
+<!-- Evidence for the "Resolves" column (crates/devctx-parse/tests unless noted):
+Java: link_java.rs a_each_inner_class_types_its_own_field, b_var_is_never_a_type,
+c_a_constant_is_a_field_with_its_type, d_constructor_injection, e_same_package_and_import,
+f_fluent_chains, g_new_is_instantiates, h_an_undefined_panache_static_is_inherited_and_external,
+i_for_each_variables, static_imports_object_methods_literals_and_lombok,
+a_dotted_receiver_is_typed_through_its_fields, lambda_parameters_and_patterns_bind_their_names,
+an_anonymous_class_scopes_its_bare_calls, arity_is_read_from_java_signatures_only,
+confidence_never_escalates, a_call_after_an_external_one_is_not_external_by_default;
+facts_java.rs java_symbols_with_kind_parent_signature_and_visibility (@Inject, record, constructor).
+TypeScript/JavaScript: link_typescript.rs constructor_injection_aliases_and_barrels,
+inject_in_a_field_follows_a_renamed_import, an_exported_arrow_function_is_a_symbol_source_and_destination,
+local_bindings_shadow_fields, imports_by_name_namespace_default_and_package,
+a_package_needs_a_manifest_or_a_node_builtin, only_angulars_inject_injects,
+this_in_object_literals_and_class_expressions_is_not_a_class, javascript_without_types,
+a_tsconfig_with_comments_is_read, a_block_local_function_does_not_shadow_outside_its_block,
+a_call_through_an_interface_reaches_its_declared_method; facts_typescript.rs
+an_interface_method_is_a_symbol (overload signatures not symbols);
+src/symbol_id.rs qualified_names_carry_every_enclosing_symbol (namespace N → N.f).
+Python: link_python.rs two_calls_from_one_method_are_two_edges, module_level_calls_are_edges_of_the_file,
+relative_star_and_reexported_imports, instance_attributes_are_typed_in_init,
+builtins_stdlib_and_declared_packages_are_external, inheritance_and_nested_functions,
+a_script_imports_its_siblings_and_the_package, a_local_from_a_method_call_is_a_chain,
+typing_special_forms, local_bindings_shadow_attributes.
+Rust: link_rust.rs paths_resolve_by_use_and_self, impls_in_other_files_and_trait_impls,
+declared_crates_and_std_are_external, macros_are_not_calls, modules_and_functions, values_and_fields,
+declared_dependencies_decide_which_crate, every_bound_is_tried, cfg_homonyms_are_medium,
+a_use_in_a_function_is_scoped_to_it, a_use_in_a_block_is_scoped_to_it, owners_values_and_variants,
+a_derived_default_is_its_type, an_external_supertype_is_medium_evidence;
+facts_rust.rs only_a_required_test_cfg_marks_test_code;
+devctx-mcp state::impact::tests dispatch_follows_a_rust_blanket_impl (blanket impl methods are T.m).
+Go: link_go.rs methods_by_their_receiver, the_module_decides_what_is_the_repositorys,
+a_module_needs_its_go_mod, an_external_embedding_is_medium_evidence, package_names_tags_and_shadows;
+facts_go.rs go_symbols_imports_and_embedding (embedding is inherits).
+Discarded calls: devctx-mcp state::lookup::tests discarded_calls_reach_no_answer;
+link_java.rs f_fluent_chains (two discarded). -->
+
+**Measured precision.** Call sites labelled by hand before measuring (the
+"gold edges" of `scripts/graph-eval/`), October 2026: Java 20 of 25 right, and
+19 of 19 of the `high` ones; TypeScript 20 of 20; Python 26 of 27; Rust 26 of
+26 (22 of 22 `high`). Calls left undecided: 4–8 % in two Java repositories,
+11 % in a subset of an Angular workspace, 2 % in a Python repository, 17.5 % in
+this repository's Rust — mostly chains after a library call to a name the
+repository also defines, undecided on purpose. Go was checked with fixtures
+only. These are a few dozen sites per language: an order of magnitude, not a
+guarantee.
 
 ## Supported languages
 
-**Full parsing — symbols and call edges (7):**
+**Full parsing — symbols and edges (7):**
 
 | Language | Extensions |
 |---|---|
@@ -73,20 +222,23 @@ detection has a separate path.
 
 Anything else is not indexed.
 
-## Storage
+## Which tool when
 
-Edges live in the project's DuckDB database, in `graph_edges`:
-
-| Column | Holds |
+| Question | Tool |
 |---|---|
-| `source` / `target` | Symbol names |
-| `kind` | Always `calls` |
-| `source_file` / `target_file` | Where each side lives |
-| `line` | Where the call appears |
-| `repo` / `branch` | Scope — the graph is per-branch, like everything else |
+| Where is the code about an idea? | `search` (not the graph) |
+| I know the name: show me the definition | `read_symbol` |
+| Where is this called or built — file and line? | `get_references` |
+| What breaks if I change it (callers and callees, transitively)? | `impact_analysis` |
+| What does this class contain, what implements this interface, who imports or uses this type — hop by hop, along any relation? | `traverse` |
+| I am new to this area: what are its central pieces? | `repo_map`, with a focus |
+| Where in this file is the thing I want? | `skeleton`, then `read_symbol` / `read_file` on the range |
 
-Uniqueness is `(source, target, kind, repo, branch, source_file)`, so the same
-call from two different files is two edges, and re-indexing does not duplicate.
+`get_references` is one hop and lists occurrences; `impact_analysis` walks
+`calls` and `instantiates` (plus dispatch) to a depth, capped per direction;
+`traverse` walks the relations you pick, and returns the edges too. `repo_map`
+and `skeleton` give signatures, never code: they locate, they do not replace
+reading.
 
 ## Operations
 
@@ -490,44 +642,62 @@ from the default or most recently indexed branch and add
 explicit error instead of `[]`. See
 [Search → Branch awareness](search.md#branch-awareness).
 
+## An index made before 0.10
+
+The graph above is written by `devctx index --full` with a 0.10 binary. Until
+then a branch reports `extractor_stale: true` on `index_status`, and:
+
+| Tool | Answers |
+|---|---|
+| `read_symbol`, `get_references`, `search` (`keyword`/`hybrid`), the web graph view | As 0.9 did, by name over `graph_edges`, with a `warning` that says so |
+| `impact_analysis` | The 0.9 walk — by name, no confidence, no filters, no cap — with the `warning` (which adds, when filters were passed, that they were not applied) |
+| `build_context` with `related: true` | The brief without the section, and `[devctx] related: not shown: …` |
+| `traverse`, `repo_map`, `skeleton` | An error: `… reads the symbol graph, and this branch's index predates it …: reindex with devctx index --full (vectors are reused)` |
+| hybrid search with `search.centrality_weight` > 0 | Vector + keyword only: there are no ranks to add |
+
+The upgrade, what it costs and how to go back are in
+[Keeping the index fresh](../13-keeping-the-index-fresh.md#upgrading-to-010-the-symbol-graph).
+
 ## Limits worth knowing
 
-**Names in the graph are qualified.** An edge's `source` is written
-`Class.method` whenever the calling function sits inside a container; its
-`target` is written that way when the call site had a receiver whose type could
-be resolved, and as a bare name when it did not. A question asked with a bare
-name expands to every qualified form carrying it, and the answer reports which
-declarations it merged. Twenty-one methods named `actualizar` is an ordinary
-number for one Quarkus repository — a blast radius that folds them together
-without saying so would be worse than an empty one, so read that line.
+**A bare name means the repository's definitions of it.** `get_references`,
+`impact_analysis` and `traverse` resolve `update` to every symbol named
+`update` and walk from all of them by id, not to every call written `.update(`
+— a library's `.map()` is not a caller of your `map`. The answer lists what a
+bare name stood for (`resolved_symbols`, `candidates`); twenty-one methods
+named `actualizar` is an ordinary number for one Quarkus repository, so read
+that line. Ask with the qualified name (`OfficeService.actualizar`), with
+`file::name`, or with a `sym` when you mean exactly one. A name with no
+definition in the repository stands for its external call sites.
 
-Ask with the qualified name when you mean exactly one method. That is the only
-way to narrow it, and it is why qualified names are never expanded.
+**Calls the index could not decide are counted, not hidden.** A call on an
+untyped receiver to a name the repository has (`svc.update()` with `svc`
+unknown) has no destination: it is never walked, it is counted in
+`undecided_calls` / `below_confidence`, and `min_confidence: "low"` lists it,
+marked `undecided`.
 
-> This is the correction to an earlier claim in these pages that coverage was
-> "binary per symbol, with nothing to tell the cases apart". It was not. A bare
-> `actualizar` returned nothing while `OfficeService.actualizar` returned one
-> caller and twenty-three callees: the edges were there the whole time, under a
-> key nobody was asking with.
+**An empty result still means "nothing found", never "nothing there".** Three
+of the reasons used to be silent and no longer are: a branch with no rows
+(`branch_fallback`), an index built by an older extractor (`warning` on every
+graph answer, `extractor_stale` on `index_status` — run `devctx index --full`),
+and what a filter left out (`below_confidence`, `excluded`, `omitted`). The
+ones below still announce nothing. Cross-check an empty result with `search
+--keyword` before renaming or deleting.
 
-**An empty result still means "nothing found", never "nothing there".** Two of
-the reasons used to be silent and no longer are: a branch with no rows
-(`branch_fallback`) and an index built by an older extractor (`warning` on every
-graph answer, `extractor_stale` on `index_status` — run `devctx index --full`).
-The ones below still announce nothing. Cross-check an empty result with
-`search --keyword` before renaming or deleting.
+**Resolution is static and per language** — imports, declared types, scopes and
+the rules in the table above — not a compiler's. A wrong `high` edge is rare in
+the measured repositories; a missing one is not.
 
-**Call resolution is name-based**, informed by imports and type bindings where
-the grammar supports it.
+**Dynamic dispatch is half visible.** A call through an interface, an abstract
+class or a trait is followed (`via: "dispatch"`, never `high`). A call through a
+callback, a function value, reflection, a service looked up by name or a
+string-keyed registry leaves no edge at all. The graph under-reports exactly
+where a language is most dynamic.
 
-**Dynamic dispatch is invisible.** A call made through a callback, a reflection
-API, or a string-keyed registry leaves no syntactic call edge. The graph will
-under-report exactly where a language is most dynamic.
-
-**Only 7 languages produce edges.** In a polyglot repository, the graph covers
+**Only 7 languages produce edges.** In a polyglot repository the graph covers
 part of it, and there is no warning that says which part. `devctx status` shows
-the symbol count; a suspiciously low one usually means the code is in a language
-that is being indexed as text.
+the symbol count; a suspiciously low one usually means the code is in a
+language that is being indexed as text.
 
 ## How it complements search
 
@@ -536,12 +706,14 @@ that is being indexed as text.
 | *Where is the code about authentication?* | `search` |
 | *What calls `authenticate`?* | `get_references` |
 | *What breaks if I change it?* | `impact_analysis` |
+| *What surrounds it — its types, its hierarchy, its members?* | `traverse` |
+| *Where do I start in this repository?* | `repo_map` |
 | *Why is it written this way?* | `memories_by_symbol` |
 | *What should I read before answering?* | `build_context` |
 
-Search is fuzzy and ranked. The graph is exact and unranked. The fourth row is
-the one people do not think to ask, and it is the one the code cannot answer at
-all.
+Search is fuzzy and ranked. The graph is structural, and says how sure it is of
+each edge. The *why* row is the one people do not think to ask, and it is the
+one the code cannot answer at all.
 
 ## Mental model
 

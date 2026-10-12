@@ -28,7 +28,8 @@ The rest — `store`, `index`, `chunk`, `search`, `memory`, `summarize`, `api`,
 
 ## 1. A new language
 
-Three edits in `crates/devctx-parse/src/lang.rs`, plus a dependency.
+A language is a JSON file under `crates/devctx-parse/languages/`, embedded in the
+binary at compile time, plus its grammar. Adding one:
 
 **Add the grammar** to `crates/devctx-parse/Cargo.toml`:
 
@@ -36,44 +37,46 @@ Three edits in `crates/devctx-parse/src/lang.rs`, plus a dependency.
 tree-sitter-ruby = "0.23"
 ```
 
-**Add the variant** and its grammar:
+**Wire it** in `grammar_for` (`crates/devctx-parse/src/registry.rs`), the one
+hand-written table left, and list the JSON in `SOURCES` next to it:
 
 ```rust
-pub enum Lang {
-    // ...
-    Ruby,
-}
-
-pub fn grammar(self) -> Language {
-    match self {
-        // ...
-        Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-    }
-}
+"ruby" => tree_sitter_ruby::LANGUAGE.into(),
 ```
 
-**Map the extensions:**
+**Write `languages/ruby.json`.** The extensions live here, and so do the
+queries — `tags.scm` style — that are the real work:
 
-```rust
-pub fn lang_for_extension(ext: &str) -> Option<Lang> {
-    Some(match ext {
-        // ...
-        "rb" => Lang::Ruby,
-        _ => return None,
-    })
-}
-```
-
-**Write the queries.** This is the real work. Each language needs:
-
-| Query | Purpose | Required |
+| Key | Captures | Required |
 |---|---|---|
-| `symbol_query` | Captures declarations as `@function`, `@method`, `@class`, `@struct`, `@enum`, `@interface`, `@type` | Yes |
-| `calls_query` | Captures call expressions — these become the graph's edges | Yes |
-| `import_query` | Imports, used to resolve call targets | Yes |
-| `type_bindings_query` | Variable → type, sharpening method-call resolution | Optional (`None`) |
+| `definitions` | Each definition as `@definition.<kind>` (`function`, `method`, `class`, `field`… — the kinds in `DEFINITION_KINDS`) with its `@name` | Yes |
+| `references` | Calls (`@reference.call` + `@name`), instantiations (`@reference.new` + `@type`), type uses (`@reference.type`) — the graph's edges | Yes |
+| `imports` | `@import` with `@import.path`, `.name`, `.alias`, `.wildcard`, `.default`, `.namespace` | Yes |
+| `inherits` | Supertypes inside a definition: `@inherit.extends`, `@inherit.implements` | No |
+| `types`, `scopes` | Declarations that type a receiver (`@name`, `@type`, `@init`, `@bind.field|param|local…`) and the node kinds that open a scope | No (without them, one scope per file) |
+| `package`, `type_names`, `function_kinds`, `container_kinds`, `scope_kinds`, `overloads` | The package clause; what names a type; which nodes are callables, containers or named scopes; whether parameter types are part of an id | Partly |
+| `platform_prefixes`, `builtins`, `platform_modules` | What belongs to the platform: the evidence for `external` | No |
 
-The capture names matter: the chunker and the graph both key off them.
+`every_definition_compiles` compiles every query and rejects an unknown capture
+or node kind, so CI catches a malformed one. What it cannot catch is a valid
+query that matches nothing — the failure mode that once made the call graph look
+empty for months.
+
+**Resolution across files** is Rust, not JSON: a `LangResolver` in
+`crates/devctx-parse/src/resolve/` (`resolver_for` maps a language to it). A
+language without one gets only the link pass's generic rules, so its edges stay
+undecided more often. Add the language to `GRAPH_LANGUAGES`
+(`crates/devctx-core/src/symbol_id.rs`) too, which is how a stale graph is
+detected.
+
+**Pin it.** `tests/extractor_golden.rs` renders everything the index keeps from
+one fixture per language into `tests/golden/extractor.txt`. A change to what the
+extractor writes must bump `EXTRACTOR_VERSION` (`registry.rs`) and regenerate the
+golden (`DEVCTX_UPDATE_GOLDEN=1 cargo test -p devctx-parse --test
+extractor_golden`): existing indexes then report `extractor_stale` until `devctx
+index --full`. A change to the link rules bumps `LINK_VERSION`
+(`crates/devctx-index/src/link.rs`) instead, and the next run relinks without
+reindexing.
 
 **Test with a real file**, not a snippet. Grammars disagree with intuition about
 node names, and a query that matches a toy example often misses the shape real
