@@ -245,4 +245,121 @@ truncar sería *engañoso* en vez de meramente peor, el sistema lo dice: ver
 modelo. Un sobre JSON alrededor de código y prosa gasta presupuesto en
 puntuación y compra estructura que nadie parsea.
 
-**Costo.** Inconsistente con las otras 22 herramientas, que devuelven JSON.
+**Costo.** Inconsistente con la mayoría de las otras herramientas, que devuelven
+JSON. `repo_map` y `skeleton` (0.10) devuelven texto por la misma razón, y
+también `summarize`.
+
+## ADR-18: Una raíz de workspace se vincula a su grupo, no a nada
+
+**Decisión.** Cuando el directorio de trabajo del servidor MCP no contiene un
+proyecto pero *contiene* proyectos registrados, desciende al registro: un solo
+proyecto debajo vincula ese proyecto, varios que comparten un `project.group`
+vinculan el grupo. Vinculado a un grupo, `remember` usa por defecto
+`scope: group`. Las herramientas de código aceptan un `project` opcional — un
+nombre o cualquier ruta dentro de uno — que resuelve una sola llamada sin mover
+la sesión.
+
+**Por qué.** Un servidor registrado globalmente hereda el directorio de trabajo
+del cliente, y para quien tiene sus repositorios uno al lado del otro bajo una
+carpeta, ese directorio es la raíz del workspace. Mirar solo *hacia arriba*
+desde ahí no encuentra nada, así que el servidor arrancaba sin vincular — y sin
+vincular no es un modo degradado: `remember` falla del todo y la memoria se
+pierde. El registro sabía todo el tiempo dónde estaba cada uno de esos
+proyectos.
+
+La pista `project` existe porque el directorio de trabajo del proceso queda
+fijo al lanzarlo. Una vinculación resuelta al arrancar no puede seguir a un
+agente que se mueve entre repositorios, así que el trabajo entre repositorios
+necesita una señal que viaje con la llamada.
+
+**Costo.** Dos cambios de comportamiento observable. Desde una raíz de
+workspace el servidor ahora arranca vinculado donde antes arrancaba sin
+vincular; y en modo grupo un `remember` sin `scope` explícito cae en `group` en
+vez de `local`. Lo segundo es más suave de lo que parece — las llamadas que
+cambia antes fallaban en vez de escribir.
+
+El campo `repo` de una memoria sigue saliendo de la vinculación, así que en modo
+grupo nombra al miembro por defecto. La atribución es un modelo aparte del
+alcance y cambiarla quedó afuera.
+
+**Descartado.** Vincular un miembro y llamarlo el workspace: atribuiría cada
+memoria a un repositorio que nadie eligió. Repartir la búsqueda de código entre
+los stores de un grupo: útil, pero es otra funcionalidad con su propio problema
+de ranking.
+
+## ADR-19: Un grafo estático de tree-sitter y reglas por lenguaje — no stack-graphs, LSP ni SCIP, todavía
+
+**Decisión.** Los símbolos y sus relaciones salen de consultas de tree-sitter
+guardadas en `languages/*.json`; resolverlas entre archivos es un link pass de
+reglas ordenadas, por lenguaje, escritas en Rust (imports, scopes léxicos, tipos
+declarados, manifiestos). Cada arista registra qué tan segura es (`confidence`)
+y por qué (`resolution`), y lo que una regla no puede decidir queda sin decidir
+en vez de adivinarse.
+
+**Por qué.** Encaja con ADR-01: un binario, sin compilador, servidor de
+lenguaje ni runtime de JVM/Node en la máquina del usuario, y funciona sobre
+cualquier checkout — un repositorio que no compila, una rama a mitad de un
+refactor — archivo por archivo, en la misma pasada que lo chunkea, de forma
+incremental. Lo que un agente de código necesita del grafo es ubicar (dónde
+está, qué lo rodea, a qué llega), y los sistemas publicados que lo hacen bien
+(LocAgent, RepoGraph, el repo map de Aider) usan grafos justamente de este tipo,
+gruesos pero limpios. Medido sobre sitios de llamada etiquetados a mano: Java 20
+de 25 correctos (19 de 19 `high`), TypeScript 20 de 20, Python 26 de 27, Rust 26
+de 26.
+
+Las alternativas, y por qué no ahora:
+
+| Alternativa | Por qué no |
+|---|---|
+| stack-graphs | Archivado upstream, con un aviso abierto (RUSTSEC-2026-0303); su lenguaje de reglas igual habría que escribirlo por lenguaje |
+| Un servidor LSP a demanda | Un servidor y una toolchain por lenguaje, un proyecto que compile, segundos de arranque en frío, un segundo ciclo de vida de proceso (otra vez el costo de ADR-01) y latencia por consulta |
+| SCIP | Precisión de compilador, pero es un índice que produce el indexador de cada lenguaje dentro de un build (`scip-java` compila el proyecto). Queda como vía de importación futura: la columna `edges.edge_source` está reservada para eso |
+| Kythe, universal-ctags | Kythe necesita una integración de build por lenguaje; ctags da definiciones, no referencias resueltas |
+
+**Costo.** No es un compilador. No hay inferencia de tipos más allá de
+declaraciones e inicializadores, las sobrecargas se eligen por aridad, no hay
+análisis de flujo; las llamadas por callbacks o reflexión no dejan arista; Go
+está cubierto solo con fixtures y Kotlin para nada. Las reglas son código que
+mantener por lenguaje, y la salida del extractor está fijada por un test golden,
+así que cada cambio suyo es un `EXTRACTOR_VERSION` y un `devctx index --full`
+para cada usuario.
+
+## ADR-20: El grafo de símbolos es aditivo; la tabla de llamadas vieja se queda una versión
+
+**Decisión.** 0.10 agrega `symbols` y `edges` (sin clave primaria ni `UNIQUE`:
+el escritor reemplaza las filas de un archivo) y sigue escribiendo
+`graph_edges` de 0.9 en su formato viejo. Una rama todavía no reconstruida la
+responden los lectores de 0.9 con un aviso; las herramientas que solo existen
+sobre el grafo nuevo se niegan con un error que nombra el arreglo. Un
+reindexado se pide, nunca se hace a espaldas del usuario.
+
+**Por qué.** Una migración en sitio sería la primera del índice, y el único
+lugar donde un corte a mitad de camino corrompe lo que ya estaba. Sin claves no
+hay índice ART que perder al reproducir el WAL (ADR-05). Mantener `graph_edges`
+hace que volver a 0.9.0 deje un grafo que funciona, y que una rama sin
+reconstruir conserve sus respuestas viejas en vez de perderlas. Un reindexado
+completo es honesto sobre lo que cambió, y reusar los vectores de los chunks sin
+cambios hace que cueste el parseo y no el embedding.
+
+**Costo.** `devctx index --full` una vez por repositorio y por rama. La base
+crece — las tablas nuevas, y bloques libres que DuckDB no recupera — y dos
+caminos de lectura conviven hasta que `graph_edges` se borre en una versión
+posterior.
+
+## ADR-21: Las señales de grafo en el ranking son opt-in hasta medir que ayudan
+
+**Decisión.** En 0.10, la centralidad de símbolos en la búsqueda híbrida
+(`search.centrality_weight: 0`) y las firmas relacionadas de `build_context`
+(`related: false`) vienen apagadas por defecto. El dispatch por interfaces en
+`impact_analysis`, que cierra un falso negativo, viene encendido.
+
+**Por qué.** Medición, como en ADR-15. La centralidad movió un caso de
+evaluación de doce — dentro del ruido del arnés — y el único caso en español que
+se movió empeoró. Las firmas relacionadas subieron el acierto del brief 3,8
+puntos contra los 10 que el plan exigía para un default, por una ruta en una
+línea `called by`. Apagadas, no cuestan ni cambian nada: ningún bonus, ninguna
+lectura extra del grafo, y el brief armado como lo armaba 0.9.
+
+**Costo.** Quien nunca las enciende nunca se beneficia de ellas. Encendidas,
+cambian los scores híbridos y el contenido del brief, y por eso se documentan
+como cambios, no como ajuste fino.

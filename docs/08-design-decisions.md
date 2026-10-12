@@ -229,7 +229,8 @@ would be *misleading* rather than merely worse, the system says so instead: see
 envelope around code and prose spends budget on punctuation and buys structure
 nobody parses.
 
-**Cost.** Inconsistent with the other 22 tools, which return JSON.
+**Cost.** Inconsistent with most other tools, which return JSON. `repo_map` and
+`skeleton` (0.10) return text for the same reason, and so does `summarize`.
 
 ## ADR-18: A workspace root binds to its group, not to nothing
 
@@ -263,3 +264,76 @@ was left out.
 **Rejected.** Binding one member and calling it the workspace: it would attribute
 every memory to a repository nobody chose. Fanning code search across a group's
 stores: useful, but a different feature with its own ranking problem.
+
+## ADR-19: A static graph from tree-sitter and per-language rules — not stack-graphs, LSP or SCIP, yet
+
+**Decision.** Symbols and their relations come from tree-sitter queries kept in
+`languages/*.json`; resolving them across files is a link pass of ordered,
+per-language rules written in Rust (imports, lexical scopes, declared types,
+manifests). Every edge records how sure it is (`confidence`) and why
+(`resolution`), and what a rule cannot decide stays undecided rather than
+guessed.
+
+**Why.** It fits ADR-01: one binary, no compiler, language server or JVM/Node
+runtime on the user's machine, and it works on any checkout — a repository that
+does not build, a branch half way through a refactor — file by file, in the
+same pass that chunks it, incrementally. What a coding agent needs from the
+graph is localization (where is it, what is around it, what does it reach),
+and published systems that do that well (LocAgent, RepoGraph, Aider's repo map)
+use graphs of exactly this kind, coarse but clean. Measured on hand-labelled
+call sites: Java 20 of 25 right (19 of 19 `high`), TypeScript 20 of 20, Python
+26 of 27, Rust 26 of 26.
+
+The alternatives, and why not now:
+
+| Alternative | Why not |
+|---|---|
+| stack-graphs | Archived upstream, with an open advisory (RUSTSEC-2026-0303); its rule language would still have to be written per language |
+| An LSP server on demand | One server and one toolchain per language, a project that builds, seconds of cold start, a second process lifecycle (ADR-01's cost again) and per-query latency |
+| SCIP | Compiler-grade, but an index produced by each language's own indexer inside a build (`scip-java` compiles the project). Kept as a future import path: the `edges.edge_source` column is reserved for it |
+| Kythe, universal-ctags | Kythe needs a build integration per language; ctags gives definitions, not resolved references |
+
+**Cost.** It is not a compiler. No type inference beyond declarations and
+initializers, overloads chosen by arity, no flow analysis; calls through
+callbacks or reflection leave no edge; Go is covered by fixtures only and
+Kotlin not at all. Rules are code to maintain per language, and the extractor's
+output is pinned by a golden test, so every change of it is an
+`EXTRACTOR_VERSION` and a `devctx index --full` for every user.
+
+## ADR-20: The symbol graph is additive; the old call table stays a release
+
+**Decision.** 0.10 adds `symbols` and `edges` (no primary key, no `UNIQUE`: the
+writer replaces a file's rows) and keeps writing 0.9's `graph_edges` in its old
+format. A branch not yet rebuilt is answered by 0.9's readers with a warning;
+the tools that only exist on the new graph refuse with an error that names the
+fix. A reindex is asked for, never done behind the user's back.
+
+**Why.** An in-place migration would be the index's first, and the one place a
+crash mid-way corrupts what was already there. Without keys there is no ART
+index to lose on WAL replay (ADR-05). Keeping `graph_edges` means going back to
+0.9.0 leaves a working graph, and an un-rebuilt branch keeps its old answers
+instead of losing them. A full reindex is honest about what changed, and reusing
+the vectors of unchanged chunks makes it cost parsing rather than embedding.
+
+**Cost.** `devctx index --full` once per repository and per branch. The
+database grows — the new tables, and free blocks DuckDB does not reclaim — and
+two read paths live side by side until `graph_edges` is dropped in a later
+release.
+
+## ADR-21: Graph signals in ranking are opt-in until they are measured to help
+
+**Decision.** In 0.10, symbol centrality in hybrid search
+(`search.centrality_weight: 0`) and the related signatures of `build_context`
+(`related: false`) are off by default. Dispatch through interfaces in
+`impact_analysis`, which closes a false negative, is on.
+
+**Why.** Measurement, as in ADR-15. Centrality moved one evaluation case out of
+twelve — within the harness's noise — and the one Spanish case that moved got
+worse. Related signatures raised the brief's hit rate 3.8 points against the 10
+the plan required for a default, by a path in a `called by` line. Off, they cost
+nothing and change nothing: no bonus, no extra read of the graph, and the brief
+laid out as 0.9 laid it out.
+
+**Cost.** Users who never turn them on never benefit from them. Turned on, they
+change hybrid scores and the brief's contents, which is why they are documented
+as changes, not as tuning.

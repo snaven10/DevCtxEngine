@@ -97,6 +97,70 @@ La búsqueda por palabra clave (BM25) y la híbrida no se midieron por separado.
 La híbrida corre los dos recuperadores, así que tratala como al menos el costo
 del camino vectorial.
 
+## El grafo de símbolos (0.10)
+
+Medido mientras se construía 0.10, en octubre de 2026, en la misma máquina solo
+CPU — muchas veces cargada por otro trabajo, así que leé las cifras como órdenes
+de magnitud. Los repositorios: este (≈440 archivos en ese momento), dos
+repositorios Java privados (1 250 y 216 archivos), un subconjunto de un
+workspace Angular privado y, para `build_context`, ese workspace entero. Las
+herramientas de grafo se midieron en caliente, cada llamada abriendo el store
+como lo hace el servidor, 40 llamadas por caso.
+
+**`impact_analysis`** (2026-10-08 a 2026-10-10), p95 con los defaults
+(llamadas high/medium, sin tests ni llamados de librerías, 200 por dirección,
+dispatch encendido), contra el recorrido de 0.9 sobre el mismo índice:
+
+| Caso | 0.10 | 0.9 |
+|---|---|---|
+| `get`, repositorio Java de 1 250 archivos | 40,7 ms | 4 165 ms (1 855 nombres recorridos) |
+| `map`, mismo repositorio | 85,9 ms | 5 724 ms (2 571 nombres) |
+| peor de 8 casos ahí, con dispatch, máquina tranquila | 117,9 ms | — |
+| peor de todos los casos, con carga | 242 ms | — |
+| `get` / `new`, este repositorio, antes de que existiera el dispatch | 43,5 / 61,1 ms | 805 / 1 550 ms |
+
+Dos causas, medidas por separado: una consulta por nivel en vez de una por
+nombre, y que un nombre pelado signifique las definiciones del repositorio en
+vez de cada llamada escrita con él. Seguir el dispatch cuesta 2–15 ms, y hasta
+70 ms donde una interfaz tiene varias implementaciones.
+
+**`traverse`** (2026-10-09): p95 a profundidad 2 entre 16,8 y 47,5 ms en 16
+casos sobre el repositorio Java de 1 250 archivos (calls, references, imports,
+contains, implements/inherits, instantiates, todas las relaciones); un peor caso
+sintético (3 000 definiciones de un nombre, 1 000 implementando una interfaz)
+93–126 ms tras un arreglo que lo bajó de 2,2–3,5 s (2026-10-10).
+
+**`repo_map`** (2026-10-09/10), presupuesto de 1 024 tokens: p50 / p95 en
+caliente 20,9 / 34,3 ms en el repositorio Java de 1 250 archivos (22 801
+símbolos; primera carga 104 ms para leer y armar la adyacencia cacheada,
+≈7,4 MB), 19,2 / 26,7 ms en el subconjunto Angular, 12,0 / 16,5 ms en este
+repositorio. Nunca pasa el presupuesto (el mapa más grande, 996 tokens); con un
+archivo vecino como foco, el archivo esperado estuvo en el mapa en 16 de 17
+casos.
+
+**`skeleton`** (2026-10-11): 4,9–10,2 % de los tokens del archivo en 12 archivos
+de 623–4 684 líneas de cuatro repositorios; p95 ≤ 26 ms.
+
+**`build_context` con `related: true`** (2026-10-12), brief de 4 096 tokens, p50
+sin → con la sección: este repositorio 92 → 116 ms, el Java de 216 archivos
+78 → 87 ms, el de 1 250 archivos 142 → 179 ms, el workspace Angular 132 →
+186 ms (carga de la máquina 14–16). Archivo esperado en el brief: 21 → 22 de 26
+casos.
+
+**Ranks** (2026-10-09): el PageRank global suma 21–165 ms a un link pass (de
+3 000 a 22 876 símbolos), y la búsqueda híbrida con la centralidad encendida
+0–6 ms de p50.
+
+### Costo de indexado de 0.10 contra 0.9.0
+
+Todavía no medido en igualdad de condiciones: el indexado desde cero, el tamaño
+de la base y el pico de memoria de 0.10.0 contra 0.9.0, el arnés de evaluación
+con los 30 casos (con los pesos de centralidad y por idioma) y el paso de
+índices 0.9.0 reales son la verificación de campo antes del release (PLAN-009
+TASK-016). *Se completa en TASK-016.* Las cifras parciales medidas hasta ahora
+— reuso de vectores, el link pass, el crecimiento de la base — están en
+[Mantener el índice al día → Cuánto cuesta](13-mantener-el-indice-al-dia.md#cuánto-cuesta).
+
 ## Almacenamiento
 
 Cifras reales del store de este repositorio:
