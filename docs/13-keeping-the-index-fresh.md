@@ -203,11 +203,133 @@ Two honest signals, both on `index_status`:
 
 - `up_to_date: false` — the recorded commit is not `HEAD`.
 - `extractor_stale: true` — the index was produced by an older parser/extractor
-  than this binary (or by one that left no record). The graph tools add a
-  `warning` to every answer and the fix is `devctx index --full`; incremental
-  runs never clear it. **After upgrading from 0.8.2 or earlier every index is in
-  this state once**, and until you reindex, a *new* branch re-embeds all of its
-  files instead of copying them from one already indexed — correct, but slow.
+  than this binary (or by one that left no record), or its symbol graph is out
+  of step with its files (below). The graph tools add a `warning` to every
+  answer and the fix is `devctx index --full`; incremental runs never clear it.
+  **After upgrading from 0.8.2 or earlier, and again after upgrading to 0.10,
+  every index is in this state once**, and until you reindex, a *new* branch
+  re-embeds all of its files instead of copying them from one already indexed —
+  correct, but slow.
+
+`extractor_stale` is per branch, and it is the sum of two checks:
+
+- **The stamp.** Every `--full` run records, in `index_meta`, the extractor
+  that built the branch: `EXTRACTOR_VERSION` (21 in 0.10) and a hash of the
+  language definitions. A different stamp, or none, is stale.
+- **`graph_out_of_step`.** The stamp alone can lie: a binary that does not
+  write the symbol graph (0.9.0 after a downgrade) can index incrementally
+  under a 0.10 stamp. So the branch is also stale when a file of a parsed
+  language has no file symbol (added by such a binary), when a file symbol's
+  file is gone (deleted by it), or when a file symbol's content hash is not
+  the file's (modified by it). A branch in that state is never a source for the
+  cross-branch copy. The answer is cached per branch until something writes
+  it, since every graph tool asks.
+
+The link rules have a version of their own (`LINK_VERSION`, 21 in 0.10): when it
+changes, the next `devctx index` — incremental is enough — relinks and re-ranks
+the branch, with nothing re-parsed or re-embedded, and nothing reports stale.
+
+## Upgrading to 0.10: the symbol graph
+
+0.10 indexes a symbol graph — symbols with stable ids, seven kinds of
+relations, a link pass that resolves them — that no 0.9 index has (see
+[Symbol Graph](03-core-concepts/symbol-graph.md#what-is-in-the-graph)). So after
+the upgrade every indexed branch reports `extractor_stale: true` until it is
+rebuilt once.
+
+### What to run
+
+```bash
+devctx serve --stop                    # a running server keeps the old code
+devctx index --full                    # this repository: the branch it indexes by default
+devctx index --full --branch release   # each other branch you query
+devctx reindex --all --full            # or every registered project (its default branch)
+```
+
+- **Per repository and per branch.** The stamp is per branch, and a run
+  re-stamps only the branch it indexes. A branch you never rebuild keeps
+  answering the 0.9 way. Once one branch is rebuilt, the others copy the files
+  they share with it instead of parsing them again.
+- **Only `--full` clears it.** Hooks, `watch` and a plain `devctx index` write
+  the new tables for the files they touch, but never re-stamp the branch.
+- **Restart your AI sessions** after installing the binary: an MCP keeps the
+  code it started with (`index_status` says `mcp.binary_replaced`).
+
+### What it costs
+
+The full run parses every file again and runs the link pass, but **reuses the
+stored vector of every chunk whose text did not change** (same content hash,
+same embedding setup), so it does not pay the embedder again; when no chunk
+needs embedding it does not even load the model. A few chunks do change text in
+0.10 and are re-embedded: constructors become chunks of their own, a class's
+list of methods gains them, and the context header of a generic `impl`'s
+methods loses its type arguments (`Cache<T>` → `Cache`).
+
+Measured in a sandbox, release build, `minilm-l6`, while the extractor was
+being built — so each row is one step of it, not 0.9.0 → 0.10.0 in one go:
+
+| Date | Repository | From scratch | `--full` after the extractor changed | Chunks reused |
+|---|---|---|---|---|
+| 2026-10-06 | this one, 281 files, 4 928 chunks | 278 s | 54.9 s (19.7 %) | all |
+| 2026-10-06 | this one, over an index with 0.9.0's extraction | 345 s | 31.4 s | 4 888 of 4 928 (40 re-embedded) |
+| 2026-10-06 | a Java repository, 216 files, 3 253 chunks | 442 s | 36.9 s (8.3 %) | all |
+| 2026-10-07 | the same Java repository, with the 7 relations | — | 24.8 s | 3 204 of 3 284 |
+| 2026-10-06 | a `--full` with nothing changed: this one / the Java one | 240 s / 169 s | 4.4 s / 2.4 s (1.8 % / 1.4 %) | all, model not loaded |
+
+The link pass and the ranks on top of that: 0.2–0.4 s on this repository, and
+on a 1 250-file Java repository 1.9–2.6 s with the machine quiet and up to
+5.6 s under load (the ranks are 69–165 ms of it), measured 2026-10-07 to
+2026-10-09; it holds the branch's symbols in memory while it runs (+114 MiB
+peak on that Java repository).
+
+The database grows. With the full 0.10 graph, a 216-file Java repository went
+from 79 to 112 used blocks of 256 KiB, plus 66 free (2026-10-07); a rewrite
+leaves blocks free that DuckDB does not reuse on its own in this pattern, so
+the file does not shrink back.
+
+The upgrade of a real 0.9.0 index with the final 0.10.0 binary is measured in
+the field verification before the release (PLAN-009 TASK-016); its figures will
+be added here.
+
+### What the tools answer meanwhile
+
+Nothing breaks while a branch waits for its `--full`:
+
+| Tool | Answers |
+|---|---|
+| `index_status` | `extractor_stale: true` and a `hint` that says to run `devctx index --full` |
+| `read_symbol`, `get_references`, `search` (`keyword`/`hybrid`), the web graph view | As 0.9 did, by name over `graph_edges`, with a `warning` |
+| `impact_analysis` | The 0.9 walk — by name, no confidence, no filters, no cap — with the `warning`, which adds, when filters were passed, that they were not applied |
+| `build_context` with `related: true` | No section, and `[devctx] related: not shown: …` |
+| `traverse`, `repo_map`, `skeleton` | **An error**: `… reads the symbol graph, and this branch's index predates it (an older extractor, or no symbol rows): reindex with devctx index --full (vectors are reused)`. They have no 0.9 answer to fall back to |
+| hybrid search with `search.centrality_weight` > 0 | Vector + keyword only |
+| a new branch indexed from a stale one | Re-embeds its files instead of copying them |
+
+A branch indexed by 0.10 whose language has no symbol extraction (only text
+files) has no symbol rows either: the old tools answer the 0.9 way with a
+`warning` of their own, and `skeleton` sends to `read_file` instead of asking
+for a reindex that would change nothing.
+
+### Going back to 0.9.0
+
+Install the 0.9.0 binary, run `devctx serve --stop` and restart your AI
+sessions. Then:
+
+- The 0.10 tables (`symbols`, `edges`, the `live_edges` view, extra `index_meta`
+  keys) stay in the database, unread and harmless. Nothing is migrated or
+  rewritten.
+- `graph_edges` was kept up to date in its 0.9 format, so 0.9.0's
+  `read_symbol`, `get_references` and `impact_analysis` answer from it. Checked
+  with a build whose read path is 0.9.0's — the same `impact` answer, byte for
+  byte, as the 0.10 binary on the same database (2026-10-06); the field
+  verification repeats it with the released binary.
+- 0.9.0 sees a stamp it did not write and reports `extractor_stale` with its own
+  warning. It works anyway; its `--full` would re-embed every chunk (0.9.0 does
+  not reuse vectors), and is not needed for it to answer.
+- **Coming back to 0.10** after 0.9.0 indexed files: those files have no symbol
+  rows, so `graph_out_of_step` marks the branch stale and asks for `devctx index
+  --full` again — with vectors reused.
+- The file keeps its size: free blocks are not reclaimed.
 
 ## What is never indexed
 

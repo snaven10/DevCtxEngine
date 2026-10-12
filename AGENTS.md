@@ -233,6 +233,21 @@ Reckon **an hour per ~1400 files** on 8 cores. Things to know:
   file as it is writes nothing for it, even if another branch holds it too.
   A `--full` over unchanged source rewrites nothing, loads no model and rebuilds
   no HNSW/BM25 index.
+- **Upgrading from 0.9.x to 0.10: run `devctx index --full` once per
+  repository and per branch you query** (`devctx index --full --branch <b>`,
+  or `devctx reindex --all --full` for every registered project's default
+  branch), after `devctx serve --stop`. 0.10 writes a symbol graph a 0.9 index
+  lacks; until then `index_status` says `extractor_stale: true`, the old graph
+  tools answer the 0.9 way with a `warning`, and `traverse`, `repo_map` and
+  `skeleton` answer an error asking for it. Hooks and incremental runs never
+  clear it. Thanks to the vector reuse above it costs parsing plus the link
+  pass, not the embedder: measured while 0.10 was built (2026-10-06/07,
+  release, `minilm-l6`), 24.8–54.9 s per `--full` after an extractor change
+  against 278–442 s from scratch on repositories of 216–281 files, with
+  97.5–100 % of chunks reused. The figures for a real 0.9.0 index and the
+  final binary come from the release's field verification. Details, what each
+  tool answers meanwhile and how to go back to 0.9.0:
+  `docs/13-keeping-the-index-fresh.md` (§ *Upgrading to 0.10*).
 - **A database that has no HNSW index pays for building it at the first run
   after `storage.hnsw` is on** — over every vector, even if that run only
   changes three files (the run says so). Existing repositories indexed without

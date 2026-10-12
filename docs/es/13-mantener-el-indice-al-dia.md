@@ -212,12 +212,138 @@ Dos señales honestas, ambas en `index_status`:
 
 - `up_to_date: false` — el commit registrado no es `HEAD`.
 - `extractor_stale: true` — el índice lo produjo un parser/extractor más viejo que
-  este binario (o uno que no dejó registro). Las tools de grafo agregan un
-  `warning` a cada respuesta y el arreglo es `devctx index --full`; las
-  ejecuciones incrementales nunca lo limpian. **Tras actualizar desde 0.8.2 o
-  anterior, todo índice está así una vez**, y hasta que reindexes, una rama
-  *nueva* re-embebe todos sus ficheros en vez de copiarlos de una ya indexada —
-  correcto, pero lento.
+  este binario (o uno que no dejó registro), o su grafo de símbolos está
+  desfasado de sus ficheros (abajo). Las tools de grafo agregan un `warning` a
+  cada respuesta y el arreglo es `devctx index --full`; las ejecuciones
+  incrementales nunca lo limpian. **Tras actualizar desde 0.8.2 o anterior, y
+  de nuevo tras pasar a 0.10, todo índice está así una vez**, y hasta que
+  reindexes, una rama *nueva* re-embebe todos sus ficheros en vez de copiarlos
+  de una ya indexada — correcto, pero lento.
+
+`extractor_stale` es por rama, y es la suma de dos chequeos:
+
+- **El sello.** Cada ejecución `--full` registra en `index_meta` el extractor
+  que construyó la rama: `EXTRACTOR_VERSION` (21 en 0.10) y un hash de las
+  definiciones de lenguaje. Un sello distinto, o ninguno, es viejo.
+- **`graph_out_of_step`.** El sello solo puede mentir: un binario que no escribe
+  el grafo de símbolos (0.9.0 tras un downgrade) puede indexar de forma
+  incremental bajo un sello de 0.10. Así que la rama también está vieja cuando
+  un fichero de un lenguaje parseado no tiene símbolo de archivo (lo agregó ese
+  binario), cuando el fichero de un símbolo de archivo ya no está (lo borró), o
+  cuando el hash de contenido de un símbolo de archivo no es el del fichero (lo
+  modificó). Una rama en ese estado nunca es fuente de la copia entre ramas. La
+  respuesta se cachea por rama hasta que algo la escribe, porque cada tool de
+  grafo pregunta.
+
+Las reglas de enlace tienen versión propia (`LINK_VERSION`, 21 en 0.10): cuando
+cambia, el próximo `devctx index` — alcanza con uno incremental — reenlaza y
+re-rankea la rama, sin re-parsear ni re-embeber nada, y nada se informa como
+viejo.
+
+## Pasar a 0.10: el grafo de símbolos
+
+0.10 indexa un grafo de símbolos — símbolos con ids estables, siete clases de
+relaciones, un link pass que las resuelve — que ningún índice de 0.9 tiene (ver
+[Grafo de símbolos](03-conceptos-fundamentales/grafo-de-simbolos.md#qué-hay-en-el-grafo)).
+Así que, tras actualizar, cada rama indexada informa `extractor_stale: true`
+hasta que se reconstruye una vez.
+
+### Qué correr
+
+```bash
+devctx serve --stop                    # un servidor en marcha conserva el código viejo
+devctx index --full                    # este repositorio: la rama que indexa por defecto
+devctx index --full --branch release   # cada otra rama que consultes
+devctx reindex --all --full            # o cada proyecto registrado (su rama por defecto)
+```
+
+- **Por repositorio y por rama.** El sello es por rama, y una ejecución vuelve
+  a sellar solo la rama que indexa. Una rama que nunca reconstruís sigue
+  respondiendo a la manera de 0.9. Una vez reconstruida una rama, las otras
+  copian de ella los ficheros que comparten en vez de volver a parsearlos.
+- **Solo `--full` lo limpia.** Los hooks, `watch` y un `devctx index` común
+  escriben las tablas nuevas de los ficheros que tocan, pero nunca vuelven a
+  sellar la rama.
+- **Reiniciá tus sesiones de IA** después de instalar el binario: un MCP
+  conserva el código con el que arrancó (`index_status` dice
+  `mcp.binary_replaced`).
+
+### Cuánto cuesta
+
+La ejecución completa vuelve a parsear cada fichero y corre el link pass, pero
+**reusa el vector guardado de cada chunk cuyo texto no cambió** (mismo hash de
+contenido, misma configuración de embedding), así que no vuelve a pagar el
+embedder; cuando ningún chunk necesita embedding ni siquiera carga el modelo.
+Unos pocos chunks sí cambian de texto en 0.10 y se re-embeben: los
+constructores pasan a ser chunks propios, la lista de métodos de una clase los
+suma, y el header de contexto de los métodos de un `impl` genérico pierde sus
+argumentos de tipo (`Cache<T>` → `Cache`).
+
+Medido en un sandbox, build release, `minilm-l6`, mientras se construía el
+extractor — así que cada fila es un paso, no 0.9.0 → 0.10.0 de una vez:
+
+| Fecha | Repositorio | Desde cero | `--full` tras cambiar el extractor | Chunks reusados |
+|---|---|---|---|---|
+| 2026-10-06 | este, 281 ficheros, 4 928 chunks | 278 s | 54,9 s (19,7 %) | todos |
+| 2026-10-06 | este, sobre un índice con la extracción de 0.9.0 | 345 s | 31,4 s | 4 888 de 4 928 (40 re-embebidos) |
+| 2026-10-06 | un repositorio Java, 216 ficheros, 3 253 chunks | 442 s | 36,9 s (8,3 %) | todos |
+| 2026-10-07 | el mismo repositorio Java, con las 7 relaciones | — | 24,8 s | 3 204 de 3 284 |
+| 2026-10-06 | un `--full` sin nada que cambiar: este / el Java | 240 s / 169 s | 4,4 s / 2,4 s (1,8 % / 1,4 %) | todos, sin cargar el modelo |
+
+El link pass y los ranks encima de eso: 0,2–0,4 s en este repositorio, y en un
+repositorio Java de 1 250 ficheros 1,9–2,6 s con la máquina tranquila y hasta
+5,6 s con carga (los ranks son 69–165 ms de eso), medido entre el 2026-10-07 y
+el 2026-10-09; mientras corre tiene en memoria los símbolos de la rama (+114 MiB
+de pico en ese repositorio Java).
+
+La base crece. Con el grafo completo de 0.10, un repositorio Java de 216
+ficheros pasó de 79 a 112 bloques usados de 256 KiB, más 66 libres
+(2026-10-07); una reescritura deja bloques libres que DuckDB no reutiliza por sí
+solo en este patrón, así que el fichero no vuelve a achicarse.
+
+El paso de un índice 0.9.0 real con el binario final 0.10.0 se mide en la
+verificación de campo antes del release (PLAN-009 TASK-016); sus cifras se
+agregan acá.
+
+### Qué responden las herramientas mientras tanto
+
+Nada se rompe mientras una rama espera su `--full`:
+
+| Herramienta | Responde |
+|---|---|
+| `index_status` | `extractor_stale: true` y un `hint` que dice que corras `devctx index --full` |
+| `read_symbol`, `get_references`, `search` (`keyword`/`hybrid`), la vista web del grafo | Como 0.9, por nombre sobre `graph_edges`, con un `warning` |
+| `impact_analysis` | El recorrido de 0.9 — por nombre, sin confianza, sin filtros, sin tope — con el `warning`, que agrega, si se pasaron filtros, que no se aplicaron |
+| `build_context` con `related: true` | Sin sección, y `[devctx] related: not shown: …` |
+| `traverse`, `repo_map`, `skeleton` | **Un error**: `… reads the symbol graph, and this branch's index predates it (an older extractor, or no symbol rows): reindex with devctx index --full (vectors are reused)`. No tienen una respuesta de 0.9 a la que volver |
+| búsqueda híbrida con `search.centrality_weight` > 0 | Solo vector + palabra clave |
+| una rama nueva indexada desde una vieja | Re-embebe sus ficheros en vez de copiarlos |
+
+Una rama indexada por 0.10 cuyo lenguaje no tiene extracción de símbolos (solo
+ficheros de texto) tampoco tiene filas de símbolos: las herramientas viejas
+responden a la manera de 0.9 con un `warning` propio, y `skeleton` manda a
+`read_file` en vez de pedir un reindexado que no cambiaría nada.
+
+### Volver a 0.9.0
+
+Instalá el binario 0.9.0, corré `devctx serve --stop` y reiniciá tus sesiones
+de IA. Después:
+
+- Las tablas de 0.10 (`symbols`, `edges`, la vista `live_edges`, claves extra
+  de `index_meta`) quedan en la base, sin leerse e inocuas. Nada se migra ni se
+  reescribe.
+- `graph_edges` se mantuvo al día en su formato de 0.9, así que `read_symbol`,
+  `get_references` e `impact_analysis` de 0.9.0 responden desde ahí.
+  Verificado con un build cuyo camino de lectura es el de 0.9.0 — la misma
+  respuesta de `impact`, byte a byte, que el binario 0.10 sobre la misma base
+  (2026-10-06); la verificación de campo lo repite con el binario publicado.
+- 0.9.0 ve un sello que no escribió e informa `extractor_stale` con su propio
+  aviso. Funciona igual; su `--full` volvería a embeber cada chunk (0.9.0 no
+  reusa vectores), y no hace falta para que responda.
+- **Volver a 0.10** después de que 0.9.0 indexó ficheros: esos ficheros no
+  tienen filas de símbolos, así que `graph_out_of_step` marca la rama como vieja
+  y pide `devctx index --full` otra vez — con los vectores reusados.
+- El fichero conserva su tamaño: los bloques libres no se recuperan.
 
 ## Lo que nunca se indexa
 
