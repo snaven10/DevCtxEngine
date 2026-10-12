@@ -138,8 +138,9 @@ el grafo antes de tocarla. Implementa DD-15 y DD-18.
   | 6 | frontend | frontend (defines un identificador) | frontend |
   | 7 | frontend | frontend | frontend |
 
-  5/7 hoy y con la variante; solo el caso 6 tiene un `defines`, y ya ganaba. No mejora nada: la
-  fórmula no cambia (DD-18).
+  5/7 hoy y con la variante; solo el caso 6 tiene un `defines`, y ya ganaba: la variante actuó en
+  1 de 7 casos, así que es **no evaluable** con estos casos (revisión, m10); la fórmula no cambia
+  (DD-18).
 - **Hallazgos de §2:** H7 (el grafo no participa del contexto): ahora puede, a pedido. Sin
   cambios en H1-H6.
 - **Archivos tocados:** `crates/devctx-store/src/{related.rs (nuevo), lib.rs}`,
@@ -209,3 +210,60 @@ el grafo antes de tocarla. Implementa DD-15 y DD-18.
   `edge_level` en backend-a (60 ms el nivel hacia arriba) es del filtro por rama y el join con
   `symbols`; mejorarlo ayuda también a `impact` y `traverse`. (3) Hop 2 no aportó: se puede
   retirar si TASK-016 tampoco lo justifica.
+- **Revisión (APROBADA CON CAMBIOS, sin BLOCKER), resuelta en 40d01c6 encima de 19f95c8:**
+  - *M1 (el total podía pasarse del presupuesto) y M2 (el acomodo greedy no es monótono: un grupo
+    podía quedar sin el código de su hit):* el acomodo ahora itera hasta un punto fijo. El código
+    se acomoda en lo que deja la sección; se retienen solo las líneas cuyo hit sigue en ese código
+    y cuyo vecino ese código no muestra (*m3*); el render nunca supera el anterior (no readmite lo
+    que cortó), así que la sección solo achica y el ciclo termina; con el texto final el código
+    queda acomodado para ese largo. *m1:* si la sección sacara al mejor hit, no hay sección
+    (`not shown: N neighbor(s) would push out the best hit`). *m2:* la línea de nota entra en el
+    presupuesto (el código le hace lugar) salvo que eso sacara al mejor hit; ahí cierra el brief
+    sin presupuesto, como `omitted`. NIT: `none fitted` (pasan el 20 %) y `none shown` (sus hits
+    ya no entran) se distinguen.
+  - *Re-medido con el binario corregido* (mismos 26 casos): archivo en el brief 21/26 sin, 22/26
+    con y con hop 2, igual que antes por repo e idioma. Ningún brief pasa de 16 384 bytes antes
+    de la línea `omitted` (máximo 16 383). El 4 105 de backend-b era la estimación del arnés
+    (caracteres / 4 de toda la salida, con la línea `omitted` y la de `branch_fallback`, que no
+    están presupuestadas), no un desborde del brief; el desborde de M1 sí era posible (lo muestra
+    el test de tabla, que fallaba). **Archivo en el código contra archivo solo citado:** sin 21 / 0,
+    con 21 / 1, hop 2 21 / 1: el +1 es solo una ruta en una línea `called by`.
+  - *Tests que fallaban antes del fix:*
+    `related_never_passes_the_budget_and_never_shows_a_line_without_its_hit` (tabla determinista
+    de 400 briefs: presupuesto y líneas sin hit), `a_greedy_layout_never_leaves_a_group_without_its_hit`
+    (el ejemplo de M2), `related_never_pushes_out_the_best_hit` (m1, 170 tokens),
+    `a_neighbor_the_final_code_shows_is_not_repeated` (m3). Con el fix escrito y verificados por
+    mutación: `the_related_note_is_part_of_the_budget` (m2: falla sin el lugar para la nota),
+    `a_section_that_shrinks_gives_the_room_back` (falla con una sola pasada), el guardia del mejor
+    hit, el retain por hit y por "ya mostrado". La regla "el render solo achica" no tiene un test
+    que la distinga: con readmisión el ciclo igual respeta el presupuesto y las líneas; lo que
+    asegura es que termina.
+  - *m7:* `nothing_is_read_unless_the_section_is_on` llama con `ContextOpts::default()` y exige 0
+    lecturas y nada de la sección (verificado: con `DEFAULT_RELATED = true` falla). Se usa el
+    contador `GATHERS` del MCP: `LEVEL_STATEMENTS` es `cfg(test)` del crate del store y no se ve
+    desde `devctx-mcp`; `GATHERS` cuenta la única entrada al grafo.
+  - *m8:* segundo golden de 0.9.0 (`without_related_a_quoted_hit_and_a_long_doc_are_the_old_brief`:
+    un hit que una memoria cita y un javadoc de 12 líneas), capturado ejecutando `compose_context`
+    en un checkout de cb350bb.
+  - *NITs:* test de una anotación sin cerrar después de otras (la firma queda como está
+    guardada); el doc-comment huérfano de `group_pick_chooses_the_member_that_matches` vuelve a
+    su test; `devctx context --hops` sin `--related` avisa por stderr; test propio del filtro de
+    externos (`an_external_neighbor_is_left_out`, verificado por mutación).
+  - *Gate de 40d01c6:* fmt, clippy con y sin `gpu`, `cargo test --workspace`: 1 245 pasan, 0
+    fallan.
+  - **Para TASK-016 (anotado, no hecho):**
+    - *m4:* hop 2 se consulta siempre que se pide y no aportó nada (+30-60 ms): expandir solo las
+      semillas con menos de `per_seed` vecinos, o retirarlo.
+    - *m5:* `dispatch_index` lee todas las aristas de supertipo en cada brief (19 ms en
+      backend-a): cachearlo por generación del índice.
+    - *m6:* `do_build_context_with` descarta el `Reader` de la búsqueda, abre un segundo store y
+      `gather` repite `has_symbol_graph`.
+    - *m9:* `note_unapplied_related` detecta la sección por substring; buscar al inicio de línea.
+    - *m10:* la variante de DD-18 actuó en 1 de 7 casos: **no evaluable**, no "no mejora". Hallazgo:
+      la selección de hoy acertó 5/7 en estos casos (los dos fallos marcados `ambiguous`) contra
+      el 7/7 de la calibración de PLAN-008; las consultas no son las mismas ni el grupo.
+    - *Perf:* `edge_level` filtra por `repo`/`branch` y hace el join con `symbols` sin índices:
+      leer las aristas por id y resolver los extremos después, `UNION ALL` de las dos
+      direcciones, `ListParam` con `prepare_cached`. El +159 ms medido bajo carga incumple la meta.
+    - *Evaluación:* sumar al arnés la métrica "archivo en el código" contra "archivo solo citado";
+      el +3,8 pp es un caso de 26, por una ruta en una línea `called by`.

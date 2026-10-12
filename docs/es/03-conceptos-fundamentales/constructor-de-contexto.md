@@ -112,16 +112,22 @@ remember:
 ```
 
 - **A lo sumo el 20 % del presupuesto, tomado del código.** El código se vuelve
-  a acomodar en lo que la sección deja; el vecino de un hit que ya no entra se
-  va con él. Toda línea o hit que queda afuera se cuenta en la única línea
-  `[devctx] omitted`.
+  a acomodar en lo que la sección deja, y la sección se revisa contra ese código
+  hasta que ninguno de los dos cambia: el vecino de un hit que ya no entra se va
+  con él, un vecino que el código final muestra no se repite, la sección solo
+  achica y el lugar que devuelve vuelve al código. Nunca saca al mejor hit del
+  brief: entonces no hay sección y una línea lo dice. El brief entero, esa línea
+  incluida, queda dentro del presupuesto, y toda línea o hit que queda afuera se
+  cuenta en la única línea `[devctx] omitted`.
 - **Se lee una vez por brief**: un lote sobre el grafo (una sentencia por
   dirección y salto, sin importar cuántos hits), y nada cuando la sección está
   apagada.
 - **La ausencia se dice, nunca en silencio.** Una rama indexada por un extractor
   viejo recibe `[devctx] related: not shown: … run devctx index --full`; un
   brief cuyos hits no tienen vecinos que pasen los filtros, `[devctx] related:
-  none: …`. Un servidor más viejo que el cliente ignora el campo; el cliente
+  none: …`; `none fitted` (pasan el 20 %), `none shown` (sus hits ya no entran) y
+  `not shown: … would push out the best hit` dicen por qué hubo líneas leídas que
+  no se muestran. Un servidor más viejo que el cliente ignora el campo; el cliente
   agrega entonces `[devctx] related: not applied: … restart it`.
 
 En esta versión viene **apagada por defecto**: en el set de evaluación no subió

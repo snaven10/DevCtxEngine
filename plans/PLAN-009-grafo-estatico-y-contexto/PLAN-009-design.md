@@ -1100,6 +1100,13 @@ src/main/java/com/example/app/service/OfficeService.java
   (+3,8 pp; el criterio era +10 pp), sin ningún caso de acierto a fallo; la tabla está en el
   Resultado de TASK-012. Apagado no se lee nada del grafo y el brief es el de 0.9.0 byte a byte
   (golden).
+- **Revisión de TASK-012 (M1, M2, m1-m3):** el acomodo itera hasta un punto fijo — código en lo
+  que deja la sección; solo quedan las líneas cuyo hit sigue en el código y cuyo vecino ese código
+  no muestra; el render nunca crece —, nunca saca al mejor hit (si no, no hay sección y una línea
+  lo dice) y la línea de nota entra en el presupuesto salvo que sacara al mejor hit. Pendientes
+  para TASK-016 (Resultado de TASK-012): hop 2 sin aporte (m4), caché de `dispatch_index` (m5),
+  reader y store repetidos (m6), detección de la sección al inicio de línea (m9), el costo de
+  `edge_level` (+159 ms bajo carga) y la métrica "archivo en el código" contra "solo citado".
 - Costo (p50 de `POST /context`, serve caliente, 4 096 tokens, sin memorias, máquina con carga
   14-16): DevCtxEngine 92 → 116 ms (hop 2: 145), backend-b 78 → 87 (96), backend-a 142 → 179
   (238), frontend 132 → 186 (229). Meta ≤ +150 ms: cumplida.
@@ -1252,7 +1259,9 @@ miembros con serve vivo). Las 7 consultas de PLAN-008 TASK-016 no quedaron regis
 7 casos del arnés elegidos antes de medir (los 3 primeros de backend-a, los 2 de backend-b y los 2
 primeros de frontend; miembro esperado = el repo del caso; grupo de 3 miembros). Hoy y con la
 variante: **5/7 iguales en los 7 casos** (los dos fallos, marcados `ambiguous`, siguen igual); solo
-un caso tiene un miembro que define un identificador, y ya ganaba. No mejora nada: no entra.
+un caso tiene un miembro que define un identificador, y ya ganaba. La variante actuó en 1 de 7: con
+estos casos es **no evaluable** (revisión, m10), y no entra. Hallazgo para TASK-016: la selección
+de hoy acertó 5/7 aquí contra el 7/7 calibrado en PLAN-008 (otras consultas, otro grupo).
 
 ## DD-19 — Rollout: `EXTRACTOR_VERSION` 1 → 2 y reindex guiado
 

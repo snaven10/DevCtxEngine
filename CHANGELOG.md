@@ -15,8 +15,10 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
   signatures with their relation and `file:line`, never bodies — `high`/`medium`
   edges only, no tests or libraries, nothing already shown, by PageRank, 4 per
   hit. `graph_hops: 2` (`--hops 2`) adds the neighbors' neighbors. The section
-  takes at most 20 % of the budget from the code, and what it leaves out is
-  counted in the brief's `omitted` line. Read once per brief, as one batch;
+  takes at most 20 % of the budget from the code but never the best hit, no
+  line stands without its hit in the code, the whole brief (its note included)
+  stays within the budget, and what is left out is counted in the brief's
+  `omitted` line. Read once per brief, as one batch;
   **off by default** (`--no-related` turns it off explicitly), and off it reads
   nothing and the brief is byte for byte the 0.9 one. A branch without a
   current symbol graph says so (`[devctx] related: not shown: …`) instead of an

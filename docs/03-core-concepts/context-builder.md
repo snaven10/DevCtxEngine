@@ -110,16 +110,22 @@ remember:
 ```
 
 - **At most 20 % of the budget, taken from the code.** The code is laid out
-  again within what the section leaves; a neighbor of a hit that no longer
-  fits goes with it. Every line or hit left out is counted in the one
-  `[devctx] omitted` line.
+  again within what the section leaves, and the section is checked again
+  against that code until neither changes: a neighbor of a hit that no longer
+  fits goes with it, a neighbor the final code shows is not repeated, the
+  section only ever shrinks, and the room it gives back goes to the code. It
+  never pushes out the brief's best hit — then there is no section, and a line
+  says so. The whole brief, that line included, stays within the budget, and
+  every line or hit left out is counted in the one `[devctx] omitted` line.
 - **Read once per brief**: one batch over the graph (a statement per
   direction and hop, whatever the number of hits), and nothing at all when the
   section is off.
 - **No section is said, never silent.** A branch indexed by an older extractor
   gets `[devctx] related: not shown: … run devctx index --full`; a brief whose
   hits have no neighbor that passes the filters gets `[devctx] related: none:
-  …`. A server older than the client ignores the field; the client then adds
+  …`; `none fitted` (over the 20 % share), `none shown` (their hits no longer
+  fit) and `not shown: … would push out the best hit` say why lines were read
+  and not shown. A server older than the client ignores the field; the client then adds
   `[devctx] related: not applied: … restart it`.
 
 It is **off by default** in this version: on the evaluation set it did not
