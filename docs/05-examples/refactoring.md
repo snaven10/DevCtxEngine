@@ -31,8 +31,12 @@ Two directions:
 
 ### Read the first line of the report
 
-The graph is keyed by qualified name. A bare `getUser` expands to every
-`Class.getUser` that exists, and the report opens by listing what it merged.
+A bare `getUser` means every symbol of the repository named `getUser`, and the
+report lists which ones it stood for (`resolved_symbols`). By default it follows
+only calls it is sure of (`high`/`medium`), leaves test code and library calls
+out, and lists 200 symbols per direction; what that leaves out is counted
+(`below_confidence`, `undecided_calls`, `excluded`, `omitted`). A caller that
+holds the service by its interface is in the radius too, as `via: "dispatch"`.
 
 | What you see | What it means |
 |---|---|
@@ -42,9 +46,9 @@ The graph is keyed by qualified name. A bare `getUser` expands to every
 
 | Limit | Consequence for you |
 |---|---|
-| Dynamic dispatch leaves no edge | Callbacks, reflection and string-keyed registries are **invisible**. |
+| Some dynamic calls leave no edge | Calls through an interface are followed (`dispatch`); callbacks, reflection and string-keyed registries are **invisible**. |
 | Only 7 languages produce edges | In a polyglot repository, part of it is not in the graph. |
-| A call made outside any function | Module-level code has no source symbol, so the edge is dropped. |
+| A call on a receiver nothing types | Counted in `undecided_calls`, not walked; `min_confidence: "low"` lists the callers. |
 | A stale index | Looks exactly like code that does not exist. Check `index_status`. |
 
 So a report **with** edges you can act on. A **clean** one proves nothing —

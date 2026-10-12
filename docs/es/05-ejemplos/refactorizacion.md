@@ -32,8 +32,13 @@ Dos direcciones:
 
 ### Leé la primera línea del reporte
 
-El grafo se indexa por nombre calificado. Un `getUser` pelado se expande a cada
-`Clase.getUser` que exista, y el reporte arranca listando lo que fundió.
+Un `getUser` pelado significa cada símbolo del repositorio llamado `getUser`, y
+el reporte lista cuáles representó (`resolved_symbols`). Por defecto sigue solo
+las llamadas de las que está seguro (`high`/`medium`), deja afuera el código de
+test y las llamadas a librerías, y lista 200 símbolos por dirección; lo que eso
+deja afuera se cuenta (`below_confidence`, `undecided_calls`, `excluded`,
+`omitted`). Un llamador que tiene el servicio por su interfaz también entra en
+el radio, como `via: "dispatch"`.
 
 | Lo que ves | Qué significa |
 |---|---|
@@ -43,9 +48,9 @@ El grafo se indexa por nombre calificado. Un `getUser` pelado se expande a cada
 
 | Límite | Consecuencia para vos |
 |---|---|
-| El despacho dinámico no deja arista | Callbacks, reflexión y registros llaveados por strings son **invisibles**. |
+| Algunas llamadas dinámicas no dejan arista | Las llamadas por una interfaz se siguen (`dispatch`); callbacks, reflexión y registros llaveados por strings son **invisibles**. |
 | Solo 7 lenguajes producen aristas | En un repositorio políglota, parte no está en el grafo. |
-| Una llamada fuera de toda función | El código a nivel de módulo no tiene símbolo origen, así que la arista se descarta. |
+| Una llamada sobre un receptor que nada tipa | Se cuenta en `undecided_calls`, no se recorre; `min_confidence: "low"` lista los llamadores. |
 | Un índice desactualizado | Se ve exactamente igual que código que no existe. Revisá `index_status`. |
 
 O sea: un reporte **con** aristas sirve para actuar. Uno **limpio** no prueba
