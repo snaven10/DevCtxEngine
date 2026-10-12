@@ -14,6 +14,7 @@ mod lookup;
 mod memory;
 mod memory_refs;
 mod projects;
+mod related;
 mod routes;
 mod schema;
 mod skeleton;
@@ -39,6 +40,7 @@ pub use lookup::{
 pub use memory::{Memory, MemoryStats};
 pub use memory_refs::{short_label, FileIndex, LinkedMemory, SymbolRef};
 pub use projects::{ProjectIndexStats, ProjectRecord};
+pub use related::{ChunkRef, RelatedNeighbor, Relation, RELATED_MAX_HOPS, RELATED_PER_SEED};
 pub use routes::StoredRoute;
 pub use schema::init_schema;
 pub use skeleton::{rank_file_suggestions, FileImports};
