@@ -7,6 +7,22 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
 
 ### Added
 
+- **Related signatures in `build_context`** (PLAN-009 TASK-012): with
+  `related: true` (MCP and `POST /context`; `devctx context --related`) the
+  brief adds `## Related (signatures)` between the code and *Recorded against
+  this code*: the callers, callees, instantiations and supertypes (and the
+  supertype method a method overrides) of its first 5 code hits, as
+  signatures with their relation and `file:line`, never bodies — `high`/`medium`
+  edges only, no tests or libraries, nothing already shown, by PageRank, 4 per
+  hit. `graph_hops: 2` (`--hops 2`) adds the neighbors' neighbors. The section
+  takes at most 20 % of the budget from the code, and what it leaves out is
+  counted in the brief's `omitted` line. Read once per brief, as one batch;
+  **off by default** (`--no-related` turns it off explicitly), and off it reads
+  nothing and the brief is byte for byte the 0.9 one. A branch without a
+  current symbol graph says so (`[devctx] related: not shown: …`) instead of an
+  empty section, and a server older than the client gets `[devctx] related: not
+  applied: … restart it` from the client.
+
 - **`traverse`** (PLAN-009 TASK-013): a new tool (MCP, `POST /traverse`,
   `devctx traverse`) to walk the symbol graph hop by hop from a symbol — a bare,
   qualified or `file::name` symbol, a file path, or one `sym` — along the
@@ -417,6 +433,9 @@ is `plans/PLAN-008-robustez-y-salida-para-agentes/`.
 
 ### Fixed
 
+- Signatures in `repo_map` and `skeleton` lose a leading annotation whose
+  string literal holds a bracket (`@Pattern(regexp = "^\\(")`): they are read
+  with the parser's own rule, which skips literals.
 - `file::symbol` subjects (`memories_by_symbol`, `read_symbol`) take the left
   part as a file only with a `/` or a known language extension: `Foo.Bar::baz`
   is the member `baz` of `Foo.Bar`, no longer the file `Foo.Bar`; an npm scope

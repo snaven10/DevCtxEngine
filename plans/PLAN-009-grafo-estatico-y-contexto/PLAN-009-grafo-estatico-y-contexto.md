@@ -249,7 +249,7 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-009 | `impact_analysis` por lotes, con tope, confianza y marcas | general-purpose (Rust) | TASK-008 | `done` |
 | TASK-010 | PageRank global al indexar y centralidad como señal en `search` híbrido | general-purpose (Rust) | TASK-006, TASK-007, TASK-008 | `done` |
 | TASK-011 | Tool `repo_map` con PageRank personalizado bajo presupuesto | general-purpose (Rust) | TASK-010 | `done` |
-| TASK-012 | Ego-graph en `build_context` y evaluación de la selección de grupo | general-purpose (Rust) | TASK-009, TASK-010 | `pending` |
+| TASK-012 | Ego-graph en `build_context` y evaluación de la selección de grupo | general-purpose (Rust) | TASK-009, TASK-010 | `done` |
 | TASK-013 | Tool `traverse` | general-purpose (Rust) | TASK-009, TASK-017 | `done` |
 | TASK-014 | Tool `skeleton` por archivo | general-purpose (Rust) | TASK-004 | `done` |
 | TASK-015 | Docs EN + ES y guía de reindex | general-purpose (Rust) | TASK-002, TASK-011, TASK-012, TASK-013, TASK-014 | `pending` |

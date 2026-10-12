@@ -81,6 +81,54 @@ La etiqueta está ahí para que quien lea pueda ponderarla.
 Los duplicados entre archivos se descartan por id de memoria. Solo las memorias
 que entraron al brief aportan sus `files`.
 
+## Firmas relacionadas (opcional)
+
+Con `related: true` (CLI `--related`) el brief suma una cuarta parte, **`## Related
+(signatures)`**, entre el código y *Registrado contra este código*: lo que rodea
+a los mejores hits de código en el [grafo de símbolos](grafo-de-simbolos.md) — el
+código que no comparte palabras con la pregunta, y que por eso ninguna búsqueda
+trae.
+
+- **Semillas.** Los primeros 5 hits de código que el brief muestra y que caen en
+  un símbolo (el más interno que contiene el chunk; un chunk de doc, el símbolo
+  que documenta). Los tests —un archivo de test, o un `mod tests` de Rust dentro
+  de un archivo de código— no son semillas.
+- **Vecinos.** `calls` e `instantiates` en ambas direcciones (`called by`,
+  `calls`, `instantiated by`, `instantiates`) y hacia arriba en la jerarquía de
+  tipos (`extends`, `implements`, y el método del supertipo que un método
+  `overrides`). Solo aristas `high` o `medium`, sin tests, sin librerías, nada
+  que el brief ya muestre; por PageRank; a lo sumo 4 por semilla. `graph_hops: 2`
+  (`--hops 2`) suma los vecinos de esos vecinos, después de ellos.
+- **Firmas, nunca cuerpos**, como las muestra [`repo_map`](grafo-de-simbolos.md),
+  cada una con su relación y `archivo:línea`, agrupadas bajo el hit que rodean:
+
+```
+## Related (signatures)
+
+remember:
+- instantiates `pub struct Memory` · crates/devctx-store/src/memory.rs:14
+- calls `pub fn checkpoint(&self)` · crates/devctx-store/src/store.rs:580
+- called by `pub fn do_memory_move(state: &AppState, id: &str, to: &str) -> Result<String, String>` · crates/devctx-mcp/src/state.rs:4090
+```
+
+- **A lo sumo el 20 % del presupuesto, tomado del código.** El código se vuelve
+  a acomodar en lo que la sección deja; el vecino de un hit que ya no entra se
+  va con él. Toda línea o hit que queda afuera se cuenta en la única línea
+  `[devctx] omitted`.
+- **Se lee una vez por brief**: un lote sobre el grafo (una sentencia por
+  dirección y salto, sin importar cuántos hits), y nada cuando la sección está
+  apagada.
+- **La ausencia se dice, nunca en silencio.** Una rama indexada por un extractor
+  viejo recibe `[devctx] related: not shown: … run devctx index --full`; un
+  brief cuyos hits no tienen vecinos que pasen los filtros, `[devctx] related:
+  none: …`. Un servidor más viejo que el cliente ignora el campo; el cliente
+  agrega entonces `[devctx] related: not applied: … restart it`.
+
+En esta versión viene **apagada por defecto**: en el set de evaluación no subió
+la relevancia del brief los 10 puntos que el plan pide para encenderla por
+defecto (PLAN-009 TASK-012), y cuesta un lote de consultas por brief. Encendela
+por llamada cuando la pregunta es cómo se usa un código o de qué depende.
+
 ## De qué repositorio
 
 `build_context` acepta un **`project`** opcional — un nombre registrado o
@@ -195,11 +243,15 @@ Las secciones sin contenido no aparecen del todo.
 |---|---|---|
 | `--max-tokens` | 4096 | Techo duro para todo el brief |
 | `--no-memories` | apagado | Solo código — saltea las pasadas 1 y 3 |
+| `--related` / `--no-related` | apagado | Suma (o deja afuera) las firmas relacionadas |
+| `--hops` | 1 | Saltos de la sección relacionada: 1 o 2 |
 
 `--no-memories` es para cuando querés recuperación cruda sin la capa de opinión.
 
 La tool MCP además acepta `project`, `kind` e `include_tests` (e
-`include_memories` para `--no-memories`); el CLI no.
+`include_memories` para `--no-memories`, `related` y `graph_hops` para los dos
+últimos); el CLI no acepta los tres primeros. `POST /context` también acepta
+`related` y `graph_hops`.
 
 ## Modelo mental
 

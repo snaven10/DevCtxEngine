@@ -4,7 +4,7 @@
 - **Especialista:** general-purpose (Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama local `feat/plan-009-grafo`, remota `fix/plan-009-grafo`
 - **Depende de:** TASK-009, TASK-010
-- **Estado:** `pending`
+- **Estado:** `done`
 
 ---
 
@@ -43,30 +43,30 @@ el grafo antes de tocarla. Implementa DD-15 y DD-18.
 
 ## Pasos
 
-- [ ] **Paso 1 — tests que fallan** (sobre `compose_context`, puro): (a) la sección de firmas nunca
+- [x] **Paso 1 — tests que fallan** (sobre `compose_context`, puro): (a) la sección de firmas nunca
       supera 20 % del presupuesto; (b) va después de `## Code` y antes de "Recorded against this
       code"; (c) lo que no entra suma al `omitted` existente; (d) nunca un cuerpo, solo firma +
       relación + `archivo:línea`; (e) con `related: false` la salida es idéntica a la de 0.9.0.
-- [ ] **Paso 2 — vecinos.** Para los primeros 5 hits de código con símbolo (DD-4): `calls`/
+- [x] **Paso 2 — vecinos.** Para los primeros 5 hits de código con símbolo (DD-4): `calls`/
       `instantiates` en ambas direcciones e `inherits`/`implements` hacia arriba, `≥ medium`, sin
       tests ni externos, por `rank`, hasta 4 por hit, sin repetir lo que ya está en `## Code`. Una
       consulta por lote, no por hit.
-- [ ] **Paso 3 — parámetros** `related` (default según Q-4) y `graph_hops` (1, máx. 2).
-- [ ] **Paso 4 — medir** con el arnés: relevancia del brief (archivo/símbolo esperado presente) con y
+- [x] **Paso 3 — parámetros** `related` (default según Q-4) y `graph_hops` (1, máx. 2).
+- [x] **Paso 4 — medir** con el arnés: relevancia del brief (archivo/símbolo esperado presente) con y
       sin `related`, tokens usados, latencia p50. Decidir el default con esos números.
-- [ ] **Paso 5 — selección de grupo (DD-18).** Variante experimental: bonus por `rank` del símbolo
+- [x] **Paso 5 — selección de grupo (DD-18).** Variante experimental: bonus por `rank` del símbolo
       que el miembro define. Correr los 7 casos de PLAN-008 TASK-016 con y sin la variante. Solo se
       adopta si mejora sin romper ninguno; si no, se deja documentado en el Resultado y no se cambia
       la fórmula.
 
 ## Criterios de aceptación
 
-- [ ] Tests (a)-(e) verdes; tests existentes de `compose_context` y `group_pick_*` verdes sin
+- [x] Tests (a)-(e) verdes; tests existentes de `compose_context` y `group_pick_*` verdes sin
       modificar.
-- [ ] Arnés: relevancia de `build_context` ≥ base 0.9.0 + 10 pp (criterio global de §6), o el
+- [x] Arnés: relevancia de `build_context` ≥ base 0.9.0 + 10 pp (criterio global de §6), o el
       default queda en `related: false` con la tabla que lo justifica.
-- [ ] `build_context` p50 ≤ +150 ms sobre la base.
-- [ ] Tabla de los 7 casos de grupo con y sin variante en el Resultado.
+- [x] `build_context` p50 ≤ +150 ms sobre la base.
+- [x] Tabla de los 7 casos de grupo con y sin variante en el Resultado.
 
 ## Riesgos
 
@@ -76,10 +76,136 @@ el grafo antes de tocarla. Implementa DD-15 y DD-18.
 
 ## Resultado
 
-<!-- SE LLENA AL CERRAR (estado done/skipped). Contrato: PLAN-009 §11 -->
-- **Estado final:**
-- **Resumen:**
-- **Archivos tocados:**
-- **Verificado por:**
+<!-- Contrato: PLAN-009 §11 -->
+- **Estado final:** `done`. La sección `## Related (signatures)` queda **apagada por defecto**
+  (`related: false`, Q-4): subió la relevancia del brief 3,8 pp, no los 10 que pide §6. La
+  variante de selección de grupo (DD-18) no cambió ningún caso: **no se adopta**.
+- **Resumen:** `build_context` puede sumar, entre `## Code` y "Recorded against this code", las
+  firmas de los vecinos en el grafo de sus primeros 5 hits de código (DD-15), leídos en un lote;
+  `related` y `graph_hops` en MCP, `POST /context`, `devctx context` (`--related`,
+  `--no-related`, `--hops`) y `Backend` local y remoto. Primer commit: el MINOR de TASK-014
+  (`clean_signature` con `leading_annotations` del parser).
+- **Commits** (rama `feat/plan-009-grafo`, sin push): 4594c63 (`clean_signature`), 18c1b02
+  (vecinos en el store), 3822474 (sección, parámetros, cliente, medición de grupo), 193507c
+  (`DEVCTX_EVAL_CONTEXT_ARGS` del arnés) y el de esta documentación.
+- **Números** (sandbox `mktemp -d -p /var/tmp`; copias sin `.devctx` verificadas con `find`;
+  índices **con modelo** `ml-granite`, de a uno: DevCtxEngine 2 199 s, backend-b 1 108 s,
+  backend-a y frontend —los tiempos de estos dos no sirven: el reloj de la máquina saltó durante
+  la corrida—; frontend 17 761 símbolos, 14 812 chunks). Arnés de TASK-001 (`run.sh` paso
+  `relevance`, brief de 4 096 tokens sin memorias), mismo binario, sin / con `--related` / con
+  `--related --hops 2`. legacy-migration (4 casos) no se indexó: no estaba en la autorización.
+
+  | Repo (casos) | brief: archivo sin · con · hop 2 | brief: símbolo sin · con | tokens est. medios sin · con · hop 2 |
+  |---|---|---|---|
+  | DevCtxEngine (10) | 9/10 · 9/10 · 9/10 | 4/4 · 4/4 | 4 038 · 4 039 · 4 069 |
+  | backend-b (2) | 1/2 · **2/2** · 2/2 | 2/2 · 2/2 | 4 095 · 4 105 · 4 090 |
+  | backend-a (8) | 7/8 · 7/8 · 7/8 | 7/8 · 7/8 | 4 035 · 4 062 · 4 073 |
+  | frontend (6) | 4/6 · 4/6 · 4/6 | 5/6 · 5/6 | 4 078 · 4 074 · 4 055 |
+  | **Total (26)** | **21/26 = 80,8 % · 22/26 = 84,6 % · 22/26** | 18/20 · 18/20 | |
+  | inglés (15) | 15/15 · 15/15 · 15/15 | 11/11 · 11/11 | |
+  | español (11) | 6/11 · **7/11** · 7/11 | 7/9 · 7/9 | |
+
+  Base 0.9.0 (TASK-001, 30 casos): archivo 24/30 = 80,0 %, símbolo 17/24. Con la sección: +3,8 pp
+  sobre esta misma rama sin ella; **ningún caso pasa de acierto a fallo**. El único caso que
+  gana (backend-b, español) encuentra el archivo esperado en una línea `called by` de la sección,
+  no en el código. Hop 2 no suma nada a hop 1. Por eso el default queda apagado.
+- **Latencia** (`POST /context` sobre el serve caliente, los casos de cada repo × 5 rondas
+  intercaladas sin / con / hop 2; 4 096 tokens, sin memorias), p50 / p95 en ms:
+
+  | Repo | sin | con | hop 2 | Δ p50 con |
+  |---|---|---|---|---|
+  | DevCtxEngine | 92 / 120 | 116 / 148 | 145 / 182 | +24 |
+  | backend-b | 78 / 95 | 87 / 123 | 96 / 122 | +9 |
+  | backend-a | 142 / 170 | 179 / 231 | 238 / 281 | +37 |
+  | frontend | 132 / 164 | 186 / 236 | 229 / 268 | +54 |
+
+  Máquina con carga 14-16. **Meta ≤ +150 ms: cumplida.** Medido antes con carga 30-47 (otro
+  índice corriendo): DevCtxEngine 232 → 333, backend-b 186 → 243, backend-a 284 → 443 (+159, por
+  encima). Sobre una copia de backend-a (210 567 aristas): el nivel hacia arriba de `edge_level`
+  60 ms, hacia abajo 39, el índice de dispatch 19 (el `IN` sobre ids es barato; el filtro por
+  `repo`/`branch` y el join con `symbols` son el costo).
+- **Selección de grupo (DD-18)**, `group_pick_rank_variant_eval` (`score_member` y
+  `choose_member` reales sobre 3 miembros con serve vivo; la variante suma `PICK_MARGIN ×
+  percentil del rank` de la definición al miembro que define un identificador):
+
+  | Caso | esperado | hoy | variante |
+  |---|---|---|---|
+  | 1 | backend-a | backend-a | backend-a |
+  | 2 | backend-a | backend-a | backend-a |
+  | 3 | backend-a | frontend (ambiguous) | frontend (ambiguous) |
+  | 4 | backend-b | backend-a (ambiguous) | backend-a (ambiguous) |
+  | 5 | backend-b | backend-b (ambiguous) | backend-b (ambiguous) |
+  | 6 | frontend | frontend (defines un identificador) | frontend |
+  | 7 | frontend | frontend | frontend |
+
+  5/7 hoy y con la variante; solo el caso 6 tiene un `defines`, y ya ganaba. No mejora nada: la
+  fórmula no cambia (DD-18).
+- **Hallazgos de §2:** H7 (el grafo no participa del contexto): ahora puede, a pedido. Sin
+  cambios en H1-H6.
+- **Archivos tocados:** `crates/devctx-store/src/{related.rs (nuevo), lib.rs}`,
+  `crates/devctx-mcp/src/{state.rs, state/related.rs (nuevo), backend.rs, lib.rs, repo_map.rs}`,
+  `crates/devctx-api/src/lib.rs`, `crates/devctx-cli/src/{main.rs, remote.rs}`,
+  `crates/devctx-parse/src/{parser.rs, lib.rs}`, `crates/devctx-index/src/lib.rs`,
+  `scripts/graph-eval/{run.sh, README.md}`, `CHANGELOG.md`, docs EN/ES del constructor de
+  contexto, el design (DD-15, DD-18) y el master. Públicos nuevos: `devctx_store::{ChunkRef,
+  RelatedNeighbor, Relation, RELATED_PER_SEED, RELATED_MAX_HOPS}`, `Store::{chunk_symbols,
+  related_neighbors}`, `devctx_parse::leading_annotations` (y reexportada por `devctx_index`),
+  `devctx_mcp::state::{ContextOpts, DEFAULT_RELATED, DEFAULT_GRAPH_HOPS, RELATED_HEADING,
+  RELATED_NOTE, do_build_context_with}`, `devctx_mcp::backend::{note_unapplied_related,
+  RELATED_OLD_SERVER_NOTE}`. **Cambiadas:** `Backend::build_context` y
+  `RemoteClient::build_context` (CLI) toman `&ContextOpts`. Sin schema, sin `languages/*.json`,
+  sin config nueva, sin `EXTRACTOR_VERSION`/`LINK_VERSION`: un índice de TASK-010 en adelante
+  sirve sin reindexar.
+- **Tests** (gate completo antes de cada commit de código, en una copia del árbol con su propio
+  `target`: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D
+  warnings` con y sin `--features gpu`, `TMPDIR=<sandbox>/tmp cargo test --workspace --locked
+  --no-fail-fast`: 1 214, 1 223 y 1 237 pasan, 0 fallan; el tercero falló una vez en clippy por
+  `type_complexity` antes de commitear, corregido con un alias):
+  - *Fallaban antes del cambio* (escritos y corridos primero): los 9 de `related::tests` del
+    store (stubs vacíos); `an_annotation_with_a_bracket_in_a_literal_is_stripped` (la anotación
+    quedaba delante); (a) `related_keeps_to_its_share_and_counts_what_does_not_fit`, (b)
+    `related_goes_between_the_code_and_the_linked_memories`, (d)
+    `related_lines_are_a_signature_a_relation_and_a_place`,
+    `related_reads_the_hits_the_brief_shows`, `no_related_section_says_why` (con el stub que
+    ignoraba la sección); `a_hit_shows_its_caller_and_its_callee`,
+    `nothing_is_read_unless_the_section_is_on`, `an_old_index_says_why_there_is_no_section` (con
+    `gather` vacío); `related_on_an_old_server_says_it_was_not_applied` (sin la nota);
+    `the_first_five_code_hits_are_the_seeds` con el test en línea (era semilla);
+    `related_takes_its_room_from_the_code` y `a_neighbor_of_a_hit_pushed_out_goes_with_it` (con
+    la sección leída después del código; el segundo, además, contó mal las líneas que se van con
+    su hit).
+  - (e) `without_related_the_brief_is_the_old_one_byte_for_byte`: golden capturado del
+    `compose_context` de 0.9.0 antes de tocarlo.
+  - *Verificados por mutación* (revertir la regla, `touch`, correr): filtro de confianza, de
+    tests/`file`, semillas excluidas, "ya mostrado", "tomado por otra semilla", orden por rank,
+    desempate por nombre (el fixture se cambió para que el archivo no ordene igual), cadena de
+    dispatch `high`/`medium`, chunk `doc`; tope del 20 %, suma al `omitted`, aplanado de la
+    firma, semillas de lo que el brief muestra, tope de 5 semillas, solo código, `related:false`
+    sin lecturas, aviso de índice viejo, ubicación entre código y memorias ligadas, re-acomodo
+    del código, devolución del lugar, retiro de las líneas de un hit que se fue y su conteo.
+    Todos fallan con la mutación.
+  - Tests existentes de `compose_context`, `group_pick_*`, `build_context` y `mcp_tools`:
+    **verdes sin tocar ningún assert** (`compose_context` queda como referencia de 0.9.0 en
+    tests, con la misma firma).
+- **Contrato JSON / texto:** `build_context` (MCP) y `POST /context` aceptan `related` y
+  `graph_hops` (aditivo); `graph_hops` fuera de 1..=2 es un error. El brief solo cambia con la
+  sección pedida: `## Related (signatures)` o una línea `[devctx] related: …`.
 - **Desviaciones:**
-- **Riesgos abiertos / siguiente:**
+  1. La sección **toma su lugar del código** (hasta el 20 %) en vez de usar lo que el código deja:
+     así como estaba en el diseño casi nunca entraba (DD-15).
+  2. Un símbolo de test dentro de un archivo de código no es semilla.
+  3. `inherits`/`implements` "hacia arriba" incluye, para una semilla método, el método del
+     supertipo que sobrescribe (`overrides`, por el índice de dispatch de TASK-017).
+  4. Los 7 casos de grupo no son los de PLAN-008 TASK-016 (no quedaron registrados): 7 del arnés
+     elegidos antes de medir, con 3 miembros.
+  5. 26 de los 30 casos (sin legacy-migration).
+  6. La medición de grupo quedó como test ignorado (`group_pick_rank_variant_eval`) en
+     `state.rs`; la variante no está en el código de producción.
+- **No verificado:** legacy-migration; macOS/Windows (solo CI); el grupo real de ACME (más
+  miembros) y las 7 consultas originales; la latencia con la máquina libre (carga 14-16 en la
+  medición buena).
+- **Riesgos abiertos / siguiente:** (1) TASK-016 puede volver a medir el default con los 30
+  casos; la sección ayuda en español (6/11 → 7/11) y no toca inglés. (2) El costo de
+  `edge_level` en backend-a (60 ms el nivel hacia arriba) es del filtro por rama y el join con
+  `symbols`; mejorarlo ayuda también a `impact` y `traverse`. (3) Hop 2 no aportó: se puede
+  retirar si TASK-016 tampoco lo justifica.

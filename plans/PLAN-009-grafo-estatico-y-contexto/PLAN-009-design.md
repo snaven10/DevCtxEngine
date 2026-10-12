@@ -1068,6 +1068,42 @@ src/main/java/com/example/app/service/OfficeService.java
   `state.rs:4205-4303`): primero lo que contesta, después lo que lo rodea.
 - `k` configurable (`graph_hops`, default 1, máx. 2) y desactivable (`related: false`).
 
+**Implementado en TASK-012, con estas diferencias:**
+- `crates/devctx-store/src/related.rs`: `Store::chunk_symbols` (chunk → símbolo más interno por
+  rango, DD-4; un chunk `doc` → el símbolo que empieza donde termina; nunca `file`; una sentencia)
+  y `Store::related_neighbors` (hop 1: `edge_level` hacia arriba sobre `calls`/`instantiates` y
+  hacia abajo sobre esas más `inherits`/`implements`; para una semilla método, el método del
+  supertipo que sobrescribe por el índice de dispatch de TASK-017 —`overrides`, solo con cadena
+  `high`/`medium`—; hop 2 con `graph_hops: 2`: llamadores de llamadores y llamados de llamados;
+  firmas al final, solo de los que quedan). Por lote: 2 sentencias de nivel + índice de dispatch
+  y equivalentes solo si una semilla es método de un tipo con supertipo + 1 de firmas (+2 con hop
+  2), igual con 1 que con 5 semillas (test). Orden por semilla: salto, `rank`, confianza, nombre,
+  archivo, línea, id; nada que el brief ya muestre (archivo y línea dentro de un hit) ni otra
+  semilla; un vecino de dos semillas va con la primera; el tope de 4 se aplica después.
+- Semillas: los primeros 5 hits **de código** que el brief muestra y que caen en un símbolo; un
+  símbolo de test dentro de un archivo de código (el `mod tests` de Rust) no es semilla (lo
+  encontró la medición: un test en línea traía cuatro llamadas de test).
+- **La sección toma su lugar del código (hasta 20 %).** Leída después de acomodar el código,
+  como decía el diseño, no encontraba lugar: el código llena el presupuesto (brief medio 4 038 de
+  4 096 tokens) y en DevCtxEngine 6 de 10 briefs quedaban en "none fitted". Ahora el código se
+  acomoda de nuevo en lo que deja la sección, el vecino de un hit que ya no entra se va con él y,
+  si eso achica la sección, el código recupera ese lugar. Toda línea o hit que queda afuera suma
+  al único `omitted`.
+- Formato: `## Related (signatures)`, el nombre del hit y debajo `- <relación>[ (2 hops)]
+  \`<firma>\` · archivo:línea` (`called by`, `calls`, `instantiated by`, `instantiates`,
+  `extends`, `implements`, `overrides`); firma de `clean_signature`, en una línea.
+- Sin sección no hay silencio: `[devctx] related: not shown: …` (índice viejo, con `devctx
+  index --full`; sin filas de símbolos; error de lectura), `[devctx] related: none: …` (ningún
+  vecino pasa los filtros) o `none fitted` (ninguno entra en el 20 %). Un serve más viejo ignora
+  el campo y el cliente (Backend remoto y CLI) agrega `[devctx] related: not applied: …`.
+- **Default `related: false` (Q-4):** en el arnés el brief pasa de 21/26 a 22/26 archivos
+  (+3,8 pp; el criterio era +10 pp), sin ningún caso de acierto a fallo; la tabla está en el
+  Resultado de TASK-012. Apagado no se lee nada del grafo y el brief es el de 0.9.0 byte a byte
+  (golden).
+- Costo (p50 de `POST /context`, serve caliente, 4 096 tokens, sin memorias, máquina con carga
+  14-16): DevCtxEngine 92 → 116 ms (hop 2: 145), backend-b 78 → 87 (96), backend-a 142 → 179
+  (238), frontend 132 → 186 (229). Meta ≤ +150 ms: cumplida.
+
 ## DD-16 — Tool `traverse`
 
 `traverse(symbol | sym, edge_types=["calls"], direction="out"|"in"|"both", depth=1 (máx. 4),
@@ -1207,6 +1243,16 @@ sufijo); la fórmula de selección **no cambia** en este plan. Se mide en TASK-0
 bonus por `rank` del símbolo definido; solo entra si el arnés muestra mejora en los 7 casos de
 PLAN-008 TASK-016 sin romper ninguno. Razón: la selección se calibró en campo (7/7) y es barata de
 romper.
+
+**Medido en TASK-012: la variante no se adopta; la fórmula no cambia.** Variante: a un miembro que
+define un identificador de la consulta se le suma, además del `PICK_MARGIN` de hoy,
+`PICK_MARGIN × percentil` del mejor `rank` entre las definiciones de ese nombre en su rama
+(`group_pick_rank_variant_eval`, ignorado: corre `score_member` y `choose_member` reales sobre
+miembros con serve vivo). Las 7 consultas de PLAN-008 TASK-016 no quedaron registradas; se usaron
+7 casos del arnés elegidos antes de medir (los 3 primeros de backend-a, los 2 de backend-b y los 2
+primeros de frontend; miembro esperado = el repo del caso; grupo de 3 miembros). Hoy y con la
+variante: **5/7 iguales en los 7 casos** (los dos fallos, marcados `ambiguous`, siguen igual); solo
+un caso tiene un miembro que define un identificador, y ya ganaba. No mejora nada: no entra.
 
 ## DD-19 — Rollout: `EXTRACTOR_VERSION` 1 → 2 y reindex guiado
 

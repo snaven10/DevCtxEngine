@@ -80,6 +80,53 @@ there so the reader can weigh it.
 Duplicates across files are dropped by memory id. Only memories that made it
 into the brief contribute their `files`.
 
+## Related signatures (opt-in)
+
+With `related: true` (CLI `--related`) the brief adds a fourth part, **`## Related
+(signatures)`**, between the code and *Recorded against this code*: what
+surrounds the best code hits in the [symbol graph](symbol-graph.md) — the code
+that does not share words with the question, so no search would bring it.
+
+- **Seeds.** The first 5 code hits the brief shows that map to a symbol (the
+  innermost symbol holding the chunk; a doc chunk maps to the symbol it
+  documents). Tests — a test file, or a Rust `mod tests` inside a code file —
+  are not seeds.
+- **Neighbors.** `calls` and `instantiates` both ways (`called by`, `calls`,
+  `instantiated by`, `instantiates`), and up the type hierarchy (`extends`,
+  `implements`, and the supertype method a method `overrides`). Only `high` or
+  `medium` edges, no tests, no libraries, nothing the brief already shows; by
+  PageRank; at most 4 per seed. `graph_hops: 2` (`--hops 2`) adds the
+  neighbors of those neighbors, after them.
+- **Signatures, never bodies**, as [`repo_map`](symbol-graph.md) shows them,
+  each with its relation and `file:line`, grouped under the hit they surround:
+
+```
+## Related (signatures)
+
+remember:
+- instantiates `pub struct Memory` · crates/devctx-store/src/memory.rs:14
+- calls `pub fn checkpoint(&self)` · crates/devctx-store/src/store.rs:580
+- called by `pub fn do_memory_move(state: &AppState, id: &str, to: &str) -> Result<String, String>` · crates/devctx-mcp/src/state.rs:4090
+```
+
+- **At most 20 % of the budget, taken from the code.** The code is laid out
+  again within what the section leaves; a neighbor of a hit that no longer
+  fits goes with it. Every line or hit left out is counted in the one
+  `[devctx] omitted` line.
+- **Read once per brief**: one batch over the graph (a statement per
+  direction and hop, whatever the number of hits), and nothing at all when the
+  section is off.
+- **No section is said, never silent.** A branch indexed by an older extractor
+  gets `[devctx] related: not shown: … run devctx index --full`; a brief whose
+  hits have no neighbor that passes the filters gets `[devctx] related: none:
+  …`. A server older than the client ignores the field; the client then adds
+  `[devctx] related: not applied: … restart it`.
+
+It is **off by default** in this version: on the evaluation set it did not
+raise the relevance of the brief by the 10 points the plan asks for a default
+(PLAN-009 TASK-012), and it costs a query batch per brief. Turn it on per call
+when the question is about how a piece of code is used or what it relies on.
+
 ## Which repository
 
 `build_context` takes an optional **`project`** — a registered name or any path
@@ -188,9 +235,13 @@ Sections with no content do not appear at all.
 |---|---|---|
 | `--max-tokens` | 4096 | Hard ceiling for the whole brief |
 | `--no-memories` | off | Code only — skips passes 1 and 3 |
+| `--related` / `--no-related` | off | Add (or leave out) the related signatures |
+| `--hops` | 1 | Hops of the related section: 1 or 2 |
 
 The MCP tool also takes `project`, `kind` and `include_tests` (and
-`include_memories` for `--no-memories`); the CLI does not.
+`include_memories` for `--no-memories`, `related` and `graph_hops` for the
+last two); the CLI does not take the first three. `POST /context` takes
+`related` and `graph_hops` too.
 
 `--no-memories` is for when you want raw retrieval without the opinion layer.
 
