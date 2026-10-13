@@ -25,3 +25,6 @@
 # Environment
 .env
 .env.local
+
+# Python bytecode (scripts/graph-eval)
+__pycache__/
