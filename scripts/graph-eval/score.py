@@ -372,14 +372,16 @@ def judge_new(site: dict, rows: list[dict], tol: int) -> tuple[str, dict | None]
         if q and (q == want or q.endswith("." + want)
                   or (field and (q == field or q.endswith("." + field)))):
             return "correct", r
-    # Un destino calificado por módulo (Python `mod.f`, el `qualified` guardado es `f`) cuenta
-    # si el nombre coincide y el archivo del destino es el de la columna 5 del gold (el criterio
-    # con que TASK-007 juzgó sus sitios); sin esa columna, o un `edges_new.tsv` viejo sin
-    # `dst_file`, no se usa.
-    if site.get("dst_file"):
+    # Solo Python: un destino calificado por módulo (`mod.f`; el `qualified` guardado de una
+    # función de módulo es `f`, sin el módulo) cuenta si el `qualified` resuelto es exactamente
+    # ese nombre y el archivo del destino es el de la columna 5 del gold (el criterio con que
+    # TASK-007 juzgó sus sitios). Exacto y no por último segmento: `Clase.f` del mismo archivo
+    # (un homónimo, un método) no es `mod.f`. Sin la columna 5, o con un `edges_new.tsv` viejo
+    # sin `dst_file`, no se usa.
+    if site.get("dst_file") and lang_of(site["file"]) == "Python":
         for r in same:
             q = norm_target(r["dst_qualified"]) if r["dst_qualified"] else ""
-            if q and leaf(q) == wl and r.get("dst_file") == site["dst_file"]:
+            if q and q == wl and r.get("dst_file") == site["dst_file"]:
                 return "correct", r
     for r in same:
         if r["dst_qualified"] or ext(r):
