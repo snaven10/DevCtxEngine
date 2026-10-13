@@ -14,6 +14,12 @@ Medir, con el binario candidato y el arnés de TASK-001, cada fila de los criter
 master (§6) contra la línea base 0.9.0, reproducir los casos de campo y dejar asentado qué se
 verificó y qué no, antes del cross-check y del tag.
 
+**Alcance (2026-10-13).** Esta task queda acotada a lo ya medido: la verificación de campo del
+candidato **sin** compactación (Pasos 1-6 y 8, Resultado). Su hallazgo 5 motivó TASK-018; las
+mediciones finales sobre el binario con compactación, el cierre de la tabla de §6, el cross-check y
+el informe son **TASK-019** (que depende de TASK-018). Los dos criterios de aceptación de cierre
+(cross-check verde, `plan-status` sin warnings) pasan a TASK-019.
+
 ## Contexto verificado
 
 - Arnés: `scripts/graph-eval/` (TASK-001); casos de ACME en `$DEVCTX_EVAL_CASES` (fuera del repo).
@@ -52,7 +58,8 @@ verificó y qué no, antes del cross-check y del tag.
       diferencias aditivas o mejoras justificadas.
 - [x] **Paso 6 — rama v1.** Un repo sin reindexar con el candidato: aviso de índice viejo, tools
       viejas contestan, tools nuevas piden `index --full`.
-- [ ] **Paso 7 — cross-check** Windows/macOS empujando una rama `fix/**`; anotar el run.
+- [ ] **Paso 7 — cross-check** — **movido a TASK-019** (2026-10-13): corre sobre el binario con la
+      compactación de TASK-018.
 - [x] **Paso 8 — cierre del plan** (§13 del master) con lo verificado y lo no verificado.
 
 ## Criterios de aceptación
