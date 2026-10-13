@@ -206,7 +206,7 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | DD-18 | Selección de miembro de grupo: `/symbol` sobre `symbols`; la fórmula solo cambia si el arnés lo justifica |
 | DD-19 | Rollout por `EXTRACTOR_VERSION` 1 → 2: aviso de índice viejo, camino viejo en ramas sin reindexar, tools nuevas piden `index --full` |
 | DD-20 | Reindex barato: reusar vectores por `content_hash` del chunk (mismo modelo) |
-| DD-21 | Presupuesto de rendimiento (tiempo, tamaño, RAM, latencias) como criterio, no como deseo |
+| DD-21 | Presupuesto de rendimiento (tiempo, tamaño, RAM, latencias) como criterio, no como deseo; el upgrade en sitio se compacta **una vez** (TASK-018) |
 
 ## 4. Fuera de alcance
 
@@ -255,8 +255,23 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-015 | Docs EN + ES y guía de reindex | general-purpose (Rust) | TASK-002, TASK-011, TASK-012, TASK-013, TASK-014 | `done` |
 | TASK-016 | Verificación de campo contra §6 | — (orquestador, con aprobación del usuario) | TASK-015 | `in_progress` |
 | TASK-017 | Dispatch por interfaz en `impact_analysis` (y `traverse`): override-equivalentes vía `implements`/`inherits`, `medium`, `via: "dispatch"` | general-purpose (Rust) | TASK-009 | `done` |
+| TASK-018 | Compactar la base una vez tras el upgrade 0.9.0 → 0.10 (copia verificada + rename atómico) y comando `devctx compact` | general-purpose (Rust) | TASK-016 | `pending` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
+
+**Orden de cierre (decisión del 2026-10-13, §12).** TASK-016 **no** depende de TASK-018, pero su
+cierre sí espera por ella. TASK-018 depende de la medición de TASK-016, que ya está escrita:
+
+1. **TASK-016, etapa A** (hecha): medición de campo con el candidato sin compactación; el
+   hallazgo 5 (el upgrade en sitio crece +46-58 % en bloques usados y deja el archivo en ~2×)
+   motivó TASK-018.
+2. **TASK-018**: spike, compactación única tras el upgrade, `devctx compact`, tests, docs.
+3. **TASK-016, etapa B**: mediciones finales sobre el binario **con** compactación (tamaño antes
+   y después en backend-a y frontend contra ≤ +30 %, tiempo, RAM, downgrade sobre la base
+   compactada), cross-check de Windows/macOS (su Paso 7) y cierre del plan (§13).
+
+La columna "Depende de" de TASK-018 nombra a TASK-016 por la etapa A; si `plan_status` la
+muestra bloqueada mientras TASK-016 siga `in_progress`, es por esto y no por trabajo pendiente.
 
 **Paralelizables:**
 - **TASK-001 y TASK-002 arrancan juntas**: una solo agrega `scripts/graph-eval/` y mide con el
@@ -313,7 +328,7 @@ DevCtxEngine (Rust).
 | Contratos JSON de `search`, `read_symbol`, `get_references`, `impact_analysis`, `build_context` | 0.9.0 | solo cambios aditivos (`sym`, `confidence`, `via`…); tests de `mcp_tools` verdes |
 | `index --full` desde cero | DevCtxEngine 276 archivos / 4 796 chunks: 2 393 s; backend-b 216 / 3 253: 2 489 s; Legacy 62 / 312: 572 s — **con la máquina a carga 50-125 y 3-5 índices a la vez: NO comparables**; BackEnd y FrontEnd no reindexados (ver Resultado) | ≤ +10 % |
 | `index --full` tras subir `EXTRACTOR_VERSION` (con TASK-002) | = desde cero | ≤ 20 % del tiempo de 0.9.0 desde cero |
-| Tamaño del DB | DevCtxEngine 28.1 MB, backend-b 21.0 MB, Legacy 6.8 MB, BackEnd 622 MB (1 623 archivos, 19 306 chunks), FrontEnd 2.34 GB (2 ramas indexadas) | ≤ +30 % |
+| Tamaño del DB | DevCtxEngine 28.1 MB, backend-b 21.0 MB, Legacy 6.8 MB, BackEnd 622 MB (1 623 archivos, 19 306 chunks), FrontEnd 2.34 GB (2 ramas indexadas) | ≤ +30 %. **Nota (2026-10-13):** desde cero cumple (+4-17 % en bloques usados); el **upgrade en sitio** de un índice 0.9.0 midió +46-58 % en usados y ~2× en archivo (backend-a 153 → 296 MiB), fuera de la meta. La meta vale también para el upgrade: lo resuelve TASK-018 (compactación única) y se re-mide en la etapa B de TASK-016 |
 | Pico de RAM al indexar (`VmHWM`, frontend) | **FrontEnd no medido** (> 25 min con la máquina cargada según PLAN-008 TASK-016; aquí la carga de 50-125 lo hizo inviable). Medido: DevCtxEngine 840 MiB, backend-b 727 MiB, Legacy 826 MiB | ≤ +200 MB |
 | Índice viejo tras actualizar | — (0.9.0 ya avisa: `extractor_stale: true` + `hint` en `status`, y `warning` en `symbol`) | `extractor_stale: true` + aviso en `index_status` y en tools de grafo; tools nuevas piden `index --full` |
 
@@ -419,6 +434,28 @@ Cada TASK llena su `## Resultado` con:
   de TASK-017.
 - **Merge a `main` por squash** (§10).
 
+**Decidido por el usuario el 2026-10-13** (tras la medición de TASK-016):
+- **Compactar al actualizar → TASK-018.** El `index --full` en sitio sobre un índice 0.9.0 hace
+  crecer la base +46-58 % en bloques usados y deja el archivo en ~2× (backend-a 153 → 296 MiB),
+  contra la meta de ≤ +30 % de §6. La 0.10.0 lleva un paso que reescribe la base **una vez**
+  después del primer `--full` sobre un índice 0.9.0, y un comando explícito (`devctx compact`).
+  DD-21 deja de decir "medir y no tocar". Requisitos de la revisora, en la spec de TASK-018:
+  disparo automático solo sobre un umbral de bloques libres y una sola vez (`index_meta`); copia
+  a un archivo nuevo y rename atómico solo si verifica; base original intacta ante cualquier
+  fallo; nunca dos procesos; ~1× de disco verificado antes; tests de corte, disco, HNSW y
+  memorias; medición en backend-a y frontend. PLAN-010 TASK-012 sigue midiendo el crecimiento
+  con el uso normal y reusa el mecanismo.
+- **Downgrade a 0.9.0: aceptado, con la condición de que no pierda llamadores.** Las respuestas
+  de grafo de un 0.9.0 sobre un índice actualizado no son las de antes del upgrade (los nombres
+  los escribe el extractor nuevo; TASK-016, "Downgrade"); se acepta y se documenta. La pérdida
+  de llamadores de Rust por ruta era un bug y está arreglada (`fb1707c`, `3712ae5`). TASK-018
+  mantiene la condición: la base compactada lleva `graph_edges` y la lee 0.9.0.
+- **Filas 1, 3 y 15 de §6: limitaciones conocidas de 0.10.0**, no bloquean el release y van al
+  CHANGELOG (*Known issues*) y a los docs: (1) tipos de arista — 5 en el repo Python (no hay
+  `implements`; `Clase()` se guarda como `calls`); (3) `calls` sin decidir — 16,0 % en Rust
+  contra ≤ 15 %; (15) relevancia de `build_context` — +10,0 pp en un índice nuevo y +6,7 pp en
+  uno actualizado, contra ≥ +10 pp.
+
 Texto original de las preguntas:
 
 - **Q-1 — Número de release.** `0.10.0` si PLAN-010 queda en su TASK-001; `0.11.0` si sale antes.
@@ -440,7 +477,9 @@ Texto original de las preguntas:
 ## 13. Cierre
 
 <!-- Borrador de TASK-016 (2026-10-13): se cierra con el cross-check verde y las decisiones de abajo. -->
-- **Cerrado:** no todavía. La medición de campo está hecha (TASK-016, Resultado); faltan el
+- **Cerrado:** no todavía. La medición de campo está hecha (TASK-016, Resultado, etapa A); faltan
+  TASK-018 (compactación tras el upgrade, decisión del 2026-10-13) y la etapa B de TASK-016
+  (re-medir tamaño y tiempo con ella), el
   cross-check de Windows/macOS (push de `fix/plan-009-grafo`), la revisión de `fb1707c` (bug de
   `graph_edges` con `::`) y de `e91a8b9` (criterio del gold para destinos `mod.f`), subir la
   versión de los crates a 0.10.0 y el OK del usuario para el tag.
@@ -457,8 +496,9 @@ Texto original de las preguntas:
   +101/+139 MiB, aviso de índice viejo. **No cumplen:** `calls` sin decidir en Rust 16,0 % (≤ 15 %);
   brief +6,7 pp en índice actualizado (+10,0 pp en uno nuevo); 5 tipos de arista en el repo Python.
   **No medido:** `memories_by_symbol` de campo, DD-18 de grupo.
-- **Quedó afuera (pendiente de decisión del usuario):** las tres filas que no cumplen; retirar o no
-  `graph_hops: 2`; el crecimiento de la base en el upgrade en sitio (+52-58 % de bloques usados);
+- **Quedó afuera:** las tres filas que no cumplen (1, 3 y 15: limitaciones conocidas, decisión del
+  2026-10-13, §12); el crecimiento de la base en el upgrade en sitio (+46-58 % de bloques usados)
+  **ya no queda afuera: lo resuelve TASK-018**. Pendiente de decisión: retirar o no `graph_hops: 2`;
   los pendientes de código anotados en el Resultado de TASK-016 (m5, m6, m9, `edge_level`, empates
   de percentil, caché de `local_centrality`, follow-ups de la 2.ª pasada de TASK-012, métrica
   `from_test_coherente`).

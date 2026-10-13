@@ -1296,25 +1296,67 @@ sus chunks cambiados). Guardas: mismo modelo y dimensión que los registrados en
 Efecto esperado: el `index --full` que exige este plan cuesta parse + link + los chunks nuevos
 (arrow-consts, constructores), no el repo entero. Meta en el master §6.
 
-## DD-21 — Presupuesto de rendimiento
+## DD-21 — Presupuesto de rendimiento (y compactación única tras el upgrade)
 
 | Recurso | Presupuesto | Dónde se mide |
 |---|---|---|
 | `index --full` desde cero | ≤ +10 % sobre 0.9.0 (el embedding domina; parse + link ≤ +30 % de la fase de parse) | TASK-001 vs TASK-016 |
 | `index --full` tras subir `EXTRACTOR_VERSION` (con DD-20) | ≤ 20 % del tiempo de 0.9.0 desde cero | TASK-002, TASK-016 |
 | Link pass incremental (1 archivo) | < 2 s en backend-a | TASK-005 |
-| Tamaño del DB | ≤ +30 % en **bloques usados** (`total_blocks - free_blocks` de `pragma_database_size()`), índice desde cero, con `graph_edges` todavía escrito | TASK-003, TASK-016 |
+| Tamaño del DB | ≤ +30 % en **bloques usados** (`total_blocks - free_blocks` de `pragma_database_size()`), índice desde cero, con `graph_edges` todavía escrito; **y tras el upgrade en sitio de un índice 0.9.0**, en usados y en bytes, después de la compactación única | TASK-003, TASK-016, TASK-018 |
 | Pico de RAM del indexado (`VmHWM`) | ≤ +200 MB sobre 0.9.0 en frontend | TASK-005, TASK-016 (coordina con PLAN-010) |
 | `impact` sobre `get`/`map` | p95 ≤ 300 ms (serve caliente) | TASK-009 |
 | `traverse` depth 2, `repo_map` 1k tokens | p95 ≤ 200 ms / ≤ 500 ms | TASK-011, TASK-013 |
 | `build_context` | ≤ +150 ms p50 por el ego-graph y la centralidad | TASK-012 |
 
-**Tamaño: decidido (usuario, revisión de TASK-003).** El presupuesto se mide en bloques usados, no
-en bytes del archivo: TASK-003 dio +7,2 % (111 → 119 bloques de 256 KiB en DevCtxEngine). Los
-bloques libres se **miden y no se tocan**: no se compacta al final del `--full` y `graph_edges` se
-sigue escribiendo (el downgrade a 0.9.0 depende de él). Medido en los follow-ups de TASK-003
-(DevCtxEngine, sandbox, índice 0.9.0 → `--full` del binario nuevo): 111 usados / 0 libres →
-167 / 75 (27,7 → 60,5 MiB; hipótesis no verificada: la reescritura deja filas borradas y bloques libres); un segundo
-`--full` y un incremental que no escriben nada no los cambian (167/75, 166/76); un `--full` que
-reescribe 40 archivos los **sube** (178 usados / 95 libres, 68,2 MiB): DuckDB no reutiliza esos
-bloques libres por sí solo en este patrón de escritura. Lo vigila TASK-016.
+**Tamaño: decidido (usuario, revisión de TASK-003), y cambiado el 2026-10-13.** El presupuesto se
+mide en bloques usados, no en bytes del archivo: TASK-003 dio +7,2 % (111 → 119 bloques de 256 KiB
+en DevCtxEngine) y TASK-016 +4-17 % en los cinco repos, índice desde cero. `graph_edges` se sigue
+escribiendo (el downgrade a 0.9.0 depende de él).
+
+*Historia (hasta el 2026-10-13): "medir y no tocar".* No se compactaba al final del `--full`.
+Medido en los follow-ups de TASK-003 (DevCtxEngine, sandbox, índice 0.9.0 → `--full` del binario
+nuevo): 111 usados / 0 libres → 167 / 75 (27,7 → 60,5 MiB; hipótesis no verificada: la reescritura
+deja filas borradas y bloques libres); un segundo `--full` y un incremental que no escriben nada no
+los cambian (167/75, 166/76); un `--full` que reescribe 40 archivos los **sube** (178 usados / 95
+libres, 68,2 MiB): DuckDB no reutiliza esos bloques libres por sí solo en este patrón de escritura.
+Quedó "vigilado" por TASK-016.
+
+**Compactación única tras el upgrade (usuario, 2026-10-13; TASK-018).** TASK-016 midió el upgrade
+real: el `--full` en sitio sobre un índice 0.9.0 crece +46-58 % en bloques usados (backend-a
+504 → 786, frontend 293 → 463) y deja el archivo en ~2× (153 → 296 MiB, 83 → 171 MiB), contra +9-13 %
+del mismo contenido indexado desde cero. Eso es lo que ve cada usuario que actualiza, y no cumple el
+≤ +30 %. Decisión:
+
+- La 0.10.0 **reescribe la base una vez** después del primer `--full` que migra un índice sin grafo
+  (≤ 0.9.x), y existe un comando explícito, `devctx compact`.
+- **Método.** Ni `VACUUM` ni `CHECKPOINT` alcanzan: `VACUUM` no recupera espacio y el checkpoint
+  solo trunca los bloques libres del final del archivo (`SingleFileBlockManager::Truncate`, DuckDB
+  v1.5.5). Se copia a un archivo nuevo (`<db>.compact.tmp`), se reconstruyen HNSW y FTS en la copia,
+  se verifica (conteos y checksum por tabla; HNSW y FTS consultables tras reabrir en frío) y se
+  reemplaza con `rename` atómico. La base original no se modifica nunca; ante cualquier fallo queda
+  ella. El método exacto de copia (schema propio + `INSERT … SELECT` desde la fuente adjunta en solo
+  lectura, recomendado, contra `COPY FROM DATABASE`) lo fija el spike de TASK-018.
+- **Disparo.** Automático solo si el upgrade dejó bloques libres sobre un umbral (propuesto: ≥ 25 %
+  del archivo y ≥ 16 MiB; se calibra en el spike) y una sola vez por base, registrada en
+  `index_meta` (`compaction`, clave de toda la base). Lo ejecuta **el CLI con el serve parado**,
+  nunca el serve (reparte clones del store y no puede cerrar el archivo); incrementales, hooks,
+  `watch` y la tool MCP no compactan: dejan la nota y `status` lo dice.
+- **Costo aceptado:** ~1× la base de disco libre durante la copia (se verifica antes), el tiempo de
+  reconstruir HNSW y FTS una vez más, y parar el serve del proyecto durante la compactación.
+- **Meta.** La fila "Tamaño del DB" vale también para el upgrade en sitio: ≤ +30 % sobre el índice
+  0.9.0 de partida, en bloques usados y en bytes del archivo, medido en backend-a y frontend
+  (TASK-018, y etapa B de TASK-016). Riesgo abierto: que la reescritura no baje los *usados* (786
+  contra 523 desde cero en backend-a) — es la compuerta del spike.
+- **Lo que no cambia.** El crecimiento con el uso normal (reindexados que reescriben) sigue siendo
+  de PLAN-010 TASK-012, que mide la curva y reusa este mecanismo. `graph_edges` se sigue
+  escribiendo y viaja en la copia: el downgrade a 0.9.0 lee la base compactada (mismo DuckDB).
+
+| Alternativa | Por qué no |
+|---|---|
+| Seguir con "medir y no tocar" | incumple §6 para todo el que actualiza (~2× de archivo) |
+| `CHECKPOINT` / `VACUUM` al final del `--full` | no achican el archivo salvo libres al final (medido en TASK-003: 167/75 no se mueve) |
+| Compactar dentro del serve al terminar el index | el serve no puede cerrar y reemplazar el archivo que sirve (`pipeline.rs`, comentario del aviso de bloat) |
+| Reconstruir en sitio (`Store::rebuild_indexes`, lo que hace `devctx repair`) | no es atómico (un corte entre `DROP` e `INSERT` pierde la tabla), tira HNSW/FTS y no garantiza que el archivo baje |
+| `EXPORT`/`IMPORT DATABASE` | archivos intermedios (más disco) y los vectores por un formato de intercambio; sin ventaja sobre adjuntar y copiar |
+| Indexar a una base nueva en cada upgrade | pierde el reuso de vectores de DD-20 o lo complica; las memorias locales habría que migrarlas igual |
