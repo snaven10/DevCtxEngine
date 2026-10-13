@@ -4350,75 +4350,103 @@ public class A extends B implements C {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A Rust call through a module path (`crate::util::helper()`,
-    /// `util::helper()`) is written to `graph_edges` as 0.9.0 wrote it: the
-    /// last segment. 0.9.0 expands only the name asked for (by `= name` or a
-    /// `.name` suffix) and then walks the graph by exact name, and a free
-    /// function is the source `helper`; a target `crate::util::helper` (the
-    /// path the extractor keeps since PLAN-009) or `crate.util.helper` would
-    /// hide the caller or cut the walk one level later (PLAN-009 TASK-016,
-    /// downgrade over a real index). A call through a type (`Self::new()`,
-    /// `Foo::bar()`) keeps `Type.method`, which is also its source's name.
+    /// What a downgraded 0.9.0 finds in `graph_edges` for every shape of a
+    /// Rust path call. 0.9.0 expands only the name asked for (`= name` or a
+    /// `.name` suffix) and then walks by exact name; it wrote every path
+    /// call as its last segment (measured with the v0.9.0 binary on this
+    /// fixture, PLAN-009 TASK-016: `helper`, `open`, `new`, `m`, `Variant`).
+    ///
+    /// - A **module** path (`crate::util::helper()`, `util::helper()`) is
+    ///   written the same way, `helper`: it is the name the free function has
+    ///   as a source, so the walk goes on. The path the extractor keeps since
+    ///   PLAN-009 (`crate::util::helper`) hid the caller, and
+    ///   `crate.util.helper` cut the walk one level later.
+    /// - A path through a **type** (`Store::open`, `store::Store::open`,
+    ///   `crate::store::Store::open`, `Self::new`, `Kind::Variant`,
+    ///   `Vec::<u8>::new`) is `Type.name`, not 0.9.0's bare name: the bare
+    ///   name still finds it by suffix, and `Store.open` is the method's
+    ///   source, so the walk now passes through it where 0.9.0's own rows
+    ///   stopped (`open` was no source).
+    /// - `<T as Trait>::m()` stays `m`, as in 0.9.0.
     #[test]
     fn rust_path_calls_stay_walkable_by_0_9_0() {
         let (dir, repo) = graph_repo(
             "compat_rust_path",
             &[
-                (
-                    "src/lib.rs",
-                    "mod util;\n\npub struct Svc;\n\nimpl Svc {\n    pub fn new() -> Self {\n        Svc\n    }\n\n    pub fn run(&self) {\n        crate::util::helper();\n        util::helper();\n        let _ = Self::new();\n    }\n}\n",
-                ),
-                (
-                    "src/util.rs",
-                    "pub fn helper() {\n    leaf();\n}\n\npub fn leaf() {}\n",
-                ),
+                ("src/lib.rs", "mod store;\nmod util;\n\nuse store::Store;\n\npub enum Kind {\n    Variant(u8),\n    Other,\n}\n\npub trait Named {\n    fn m(&self) -> u8;\n}\n\npub struct Svc;\n\nimpl Named for Svc {\n    fn m(&self) -> u8 {\n        1\n    }\n}\n\nimpl Svc {\n    pub fn new() -> Self {\n        Svc\n    }\n\n    pub fn by_self() -> Self {\n        Self::new()\n    }\n}\n\npub fn mod_crate() {\n    crate::util::helper();\n}\n\npub fn mod_rel() {\n    util::helper();\n}\n\npub fn type_mod(p: &str) -> Store {\n    store::Store::open(p)\n}\n\npub fn type_crate(p: &str) -> Store {\n    crate::store::Store::open(p)\n}\n\npub fn type_used(p: &str) -> Store {\n    Store::open(p)\n}\n\npub fn ufcs(s: &Svc) -> u8 {\n    <Svc as Named>::m(s)\n}\n\npub fn variant() -> Kind {\n    Kind::Variant(1)\n}\n\npub fn turbofish() -> Vec<u8> {\n    Vec::<u8>::new()\n}\n"),
+                ("src/store.rs", "pub struct Store;\n\nimpl Store {\n    pub fn open(_p: &str) -> Self {\n        crate::util::leaf();\n        Store\n    }\n}\n"),
+                ("src/util.rs", "pub fn helper() {\n    leaf();\n}\n\npub fn leaf() {}\n"),
             ],
         );
         let store = Store::open_in_memory(DIM).unwrap();
         index_branch(&store, &dir, "main", true);
         // The walk, as 0.9.0 does it (`impact_analysis` here is 0.9.0's
         // reader: only the seed expands, the rest goes by exact name).
-        let impact = store.impact_analysis(&repo, "main", "leaf", 2).unwrap();
-        assert_eq!(
-            impact.upstream,
-            vec![("helper".to_string(), 1), ("Svc.run".to_string(), 2)]
-        );
-        let impact = store.impact_analysis(&repo, "main", "Svc.run", 2).unwrap();
-        let mut down = impact.downstream;
+        let mut up = store
+            .impact_analysis(&repo, "main", "leaf", 2)
+            .unwrap()
+            .upstream;
+        up.sort();
+        let want: Vec<(String, usize)> = [
+            ("Store.open", 1),
+            ("helper", 1),
+            ("mod_crate", 2),
+            ("mod_rel", 2),
+            ("type_crate", 2),
+            ("type_mod", 2),
+            ("type_used", 2),
+        ]
+        .iter()
+        .map(|(n, d)| (n.to_string(), *d))
+        .collect();
+        assert_eq!(up, want);
+        let mut down = store
+            .impact_analysis(&repo, "main", "mod_crate", 2)
+            .unwrap()
+            .downstream;
         down.sort();
         assert_eq!(
             down,
-            vec![
-                ("Svc.new".to_string(), 1),
-                ("helper".to_string(), 1),
-                ("leaf".to_string(), 2),
-            ]
+            vec![("helper".to_string(), 1), ("leaf".to_string(), 2)]
         );
-        // One hop: the caller of the bare name.
-        let refs = store.find_references(&repo, "main", "helper").unwrap();
-        let lines: Vec<i32> = refs.iter().map(|r| r.line).collect();
-        assert_eq!(lines, vec![11], "{refs:?}");
+        // One hop, by the bare name, for every shape.
+        let callers = |name: &str| -> Vec<String> {
+            let mut v: Vec<String> = store
+                .find_references(&repo, "main", name)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.source)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(callers("helper"), ["mod_crate", "mod_rel"]);
+        assert_eq!(callers("open"), ["type_crate", "type_mod", "type_used"]);
+        assert_eq!(callers("new"), ["Svc.by_self", "turbofish"]);
+        assert_eq!(callers("m"), ["ufcs"]);
+        assert_eq!(callers("Variant"), ["variant"]);
         // What is stored, pinned: the extractor's golden shows the path
-        // (`store::open`), `graph_edges` holds the 0.9.0 form.
+        // (`store::open`), `graph_edges` holds these rows.
         let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
-        let mut rows: Vec<(&str, &str, &str, i32)> = old
+        let mut rows: Vec<(&str, &str)> = old
             .iter()
-            .map(|e| {
-                (
-                    e.source.as_str(),
-                    e.target.as_str(),
-                    e.source_file.as_str(),
-                    e.line,
-                )
-            })
+            .map(|e| (e.source.as_str(), e.target.as_str()))
             .collect();
         rows.sort();
         assert_eq!(
             rows,
             vec![
-                ("Svc.run", "Svc.new", "src/lib.rs", 13),
-                ("Svc.run", "helper", "src/lib.rs", 11),
-                ("helper", "leaf", "src/util.rs", 2),
+                ("Store.open", "leaf"),
+                ("Svc.by_self", "Svc.new"),
+                ("helper", "leaf"),
+                ("mod_crate", "helper"),
+                ("mod_rel", "helper"),
+                ("turbofish", "Vec.new"),
+                ("type_crate", "Store.open"),
+                ("type_mod", "Store.open"),
+                ("type_used", "Store.open"),
+                ("ufcs", "m"),
+                ("variant", "Kind.Variant"),
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
