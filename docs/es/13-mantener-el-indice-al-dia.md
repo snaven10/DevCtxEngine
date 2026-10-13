@@ -303,9 +303,25 @@ ficheros pasó de 79 a 112 bloques usados de 256 KiB, más 66 libres
 (2026-10-07); una reescritura deja bloques libres que DuckDB no reutiliza por sí
 solo en este patrón, así que el fichero no vuelve a achicarse.
 
-El paso de un índice 0.9.0 real con el binario final 0.10.0 se mide en la
-verificación de campo antes del release (PLAN-009 TASK-016); sus cifras se
-agregan acá.
+El paso de un índice 0.9.0 real con el candidato 0.10.0 (verificación de campo,
+PLAN-009 TASK-016, 2026-10-12, `ml-granite` en CPU, en sitio sobre el índice
+que hizo 0.9.0 en el mismo sandbox):
+
+| Repositorio | 0.9.0 desde cero | `--full` de 0.10 encima | Chunks reusados | Bloques usados antes → después | Fichero |
+|---|---|---|---|---|---|
+| este, 277 ficheros en un commit anterior | 566 s | 53 s (9,4 %) | 4 737 de 4 806 | 114 → 173 | 28,5 → 61,3 MiB |
+| un repositorio Java, 216 ficheros | 529 s | 38 s (7,1 %) | 3 204 de 3 284 | 85 → 124 | 21,3 → 43,8 MiB |
+| un repositorio Python, 62 ficheros | 59 s | 4 s (7,1 %) | los 312 | 30 → 36 | 7,5 → 11,8 MiB |
+| un repositorio Java grande, 1 625 ficheros | 3 415 s | 330 s (9,7 %) | 20 242 de 21 615 | 504 → 786 | 153 → 296 MiB |
+| un workspace Angular, 1 581 ficheros | 1 466 s | 274 s (18,7 %) | 13 309 de 14 167 | 293 → 463 | 83 → 171 MiB |
+
+Los chunks re-embebidos son los que cambiaron de texto (constructores y
+funciones flecha exportadas que 0.9.0 no cortaba, un chunk de clase que ahora
+lista sus métodos). La base actualizada es más grande que una hecha desde cero
+por 0.10 (el Java grande: 523 bloques usados desde cero, 786 actualizada): la
+reescritura deja bloques que DuckDB no reutiliza. El reuso exige que el índice
+siga donde se construyó: el registro va por la ruta del repositorio, así que un
+repositorio copiado (otro directorio) vuelve a embeber todo.
 
 ### Qué responden las herramientas mientras tanto
 
@@ -337,9 +353,16 @@ de IA. Después:
   reescribe.
 - `graph_edges` se mantuvo al día en su formato de 0.9, así que `read_symbol`,
   `get_references` e `impact_analysis` de 0.9.0 responden desde ahí.
-  Verificado con un build cuyo camino de lectura es el de 0.9.0 — la misma
-  respuesta de `impact`, byte a byte, que el binario 0.10 sobre la misma base
-  (2026-10-06); la verificación de campo lo repite con el binario publicado.
+  Verificado con el binario 0.9.0 sobre cinco índices actualizados
+  (2026-10-13): cada llamada responde, con su aviso `extractor_stale`, y su
+  búsqueda vectorial devuelve lo mismo que 0.10 sobre la misma base. Las
+  respuestas no son las que daba 0.9.0 antes del paso: las filas vienen del
+  extractor de 0.10 — las clases anidadas van calificadas por su clase
+  exterior, desaparecen `var.*` y las constantes tomadas por tipo, una llamada
+  de Rust por ruta se escribe con `.` entre segmentos (`crate.util.helper`, que
+  0.9.0 encuentra por su sufijo `.helper`) —, así que algunos llamadores
+  aparecen con un nombre más largo y un recorrido por una clase anidada puede
+  cortarse un nivel antes.
 - 0.9.0 ve un sello que no escribió e informa `extractor_stale` con su propio
   aviso. Funciona igual; su `--full` volvería a embeber cada chunk (0.9.0 no
   reusa vectores), y no hace falta para que responda.

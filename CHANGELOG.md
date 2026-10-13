@@ -63,9 +63,10 @@ The guide, with the measurements and what each tool answers meanwhile:
 Install 0.9.0, `devctx serve --stop`, restart the AI sessions. The new tables
 stay in the database, unread and harmless; nothing is migrated or rewritten.
 `graph_edges` was kept current in its 0.9 format, so 0.9.0's graph tools answer
-from it (verified with a build that has 0.9.0's read path: the same `impact`
-answer byte for byte; the field verification repeats it with the released
-binary). 0.9.0 reports `extractor_stale` and works anyway; its `--full` would
+from it (field verification: the 0.9.0 binary over five upgraded indexes answers
+every call, with its `extractor_stale` warning; the answers come from 0.10's
+extractor — nested classes qualified, a Rust path call written as `a.b.f` —, so
+they are not exactly the ones 0.9.0 gave before the upgrade). 0.9.0 reports `extractor_stale` and works anyway; its `--full` would
 re-embed everything (0.9.0 does not reuse vectors). Coming back to 0.10 after
 0.9.0 indexed files: the branch reads as stale (`graph_out_of_step`) and asks
 for `devctx index --full` again, with vectors reused.
@@ -309,9 +310,12 @@ for `devctx index --full` again, with vectors reused.
 - 0.8.3 – 0.9.0: the first open of an HNSW database created with 0.8.2 or
   earlier fails once with "unknown index type 'HNSW'"; retrying resolves it.
   Fixed in this release (see above); there is no 0.9.1.
-- Not measured yet on equal terms against 0.9.0: indexing from scratch,
-  database size and peak memory, and the upgrade of real 0.9.0 indexes with the
-  final binary (field verification before the tag).
+- Upgrading a 0.9.0 index in place grows the database more than indexing from
+  scratch (field verification: a 1 625-file Java repository 504 → 786 used
+  blocks, 153 → 296 MiB; from scratch 0.10 uses 523): the rewrite leaves free
+  blocks DuckDB does not reuse. Indexing from scratch, database size, peak
+  memory and the upgrade time are in
+  [Performance → Indexing cost of 0.10 against 0.9.0](docs/07-performance.md#indexing-cost-of-010-against-090).
 
 ## 0.9.0 — 2026-10-05
 

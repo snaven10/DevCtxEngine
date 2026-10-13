@@ -151,12 +151,56 @@ without → with the section: this repository 92 → 116 ms, the 216-file Java o
 
 ### Indexing cost of 0.10 against 0.9.0
 
-Not measured yet on equal terms: indexing from scratch, database size and peak
-memory of 0.10.0 against 0.9.0, the evaluation harness on all 30 cases (with the
-centrality weights and by language) and the upgrade of real 0.9.0 indexes are
-the field verification before the release (PLAN-009 TASK-016). *To be
-completed in TASK-016.* The partial figures measured so far — vector reuse, the
-link pass, database growth — are in
+Measured in the field verification (PLAN-009 TASK-016, 2026-10-12/13): five
+repositories copied into a sandbox, `ml-granite` on CPU, `nice -n 10`, the
+direct path (`DEVCTX_NO_AUTOSERVE=1`), the 0.9.0 binary built from its tag and
+the 0.10.0 candidate run one after the other on the same copy of the code, so
+both see the same machine. The machine was shared (load average 4–42), so a
+single pair moves by up to ±20 %; the CPU seconds are the steadier figure.
+
+| Repository | Files / chunks (0.10) | From scratch, 0.9.0 → 0.10 | CPU s | Peak memory (`VmHWM`) | Used blocks (256 KiB) |
+|---|---|---|---|---|---|
+| this one, at an older commit | 277 / 4 806 | 566 → 558 s | 9 463 → 9 254 | 889 → 913 MiB | 106 → 116 (+9 %) |
+| a Java repository | 216 / 3 284 | 529 → 496 s | 8 703 → 8 508 | 718 → 740 MiB | 76 → 89 (+17 %) |
+| a Python repository | 62 / 312 | 59 → 63 s | 957 → 1 014 | 826 → 845 MiB | 25 → 26 (+4 %) |
+| a large Java repository | 1 625 / 21 615 | 3 415 → 2 587 s | 50 486 → 43 969 | 797 → 1 034 MiB | 479 → 523 (+9 %) |
+| an Angular workspace | 1 581 / 14 167 | 1 466 → 1 804 s, repeated: 1 727 → 1 629 s | 24 777 → 30 124, repeated: 28 564 → 27 489 | 791 → 930, repeated: 787 → 888 MiB | 279 → 316 (+13 %) |
+
+Over the five repositories, indexing from scratch took 8.7 % less wall time and
+1.6 % fewer CPU seconds with 0.10 (the first Angular pair was 23 % slower, the
+repeated one 6 % faster: noise of the shared machine, not a trend). 0.10 stores
+up to 3 % more chunks (constructors, exported arrow functions) and writes the
+symbol graph; the database file is larger than the used blocks suggest because
+DuckDB leaves free blocks behind (the large Java repository: 153 → 174 MiB).
+
+**Upgrading a real 0.9.0 index** (`devctx index --full` of 0.10 over the
+index 0.9.0 built, in place): this repository 53 s, the Java one 38 s, the
+Python one 4 s, the large Java one 330 s, the Angular workspace 274 s — 7–19 %
+of 0.9.0's time from scratch, with 94–100 % of the chunks reused. The database
+grows more on this path than from scratch, because the rewrite leaves free
+blocks DuckDB does not reuse: the large Java repository went from 504 to 786
+used blocks and from 153 to 296 MiB on disk, the Angular workspace from 293 to
+463 used blocks and from 83 to 171 MiB. Peak memory of the upgrade: 169–1 083
+MiB, the same order as from scratch.
+
+**The evaluation harness** (30 cases over the five repositories, median of
+three rounds, `search --no-rerank --limit 20`, a 4 096-token brief): vector
+search Hit@5 21 → 21–22 of 30 and MRR 0.571 → 0.575; hybrid Hit@5 21 → 22–23,
+MRR 0.616 → 0.647–0.653; expected file in the brief 24 → 26–27 of 30 (0.9.0 →
+0.10 on an upgraded and on a fresh index). With the same vectors (0.9.0 and
+0.10 reading the same upgraded index) vector search returns the same results
+in all 30 cases. Search with the centrality weight at 0.15, 0.3 and 0.5 and
+the brief with `related: true` did not improve the brief and moved Spanish
+queries in both directions, so both stay off; see
+[Search → Centrality](03-core-concepts/search.md#centrality-hybrid-only-opt-in).
+
+`impact_analysis` on `get` and `map` in the large Java repository: p95 90 ms
+and 179–197 ms through the CLI, against 3.6 s and 5.1 s for 0.9.0 on the same
+machine. `build_context` with `related: true` adds 14–27 ms to the p50 (two
+hops: 22–51 ms).
+
+The partial figures measured while building the graph — vector reuse, the link
+pass, database growth — are in
 [Keeping the index fresh → What it costs](13-keeping-the-index-fresh.md#what-it-costs).
 
 ## Storage

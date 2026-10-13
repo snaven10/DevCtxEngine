@@ -289,9 +289,25 @@ from 79 to 112 used blocks of 256 KiB, plus 66 free (2026-10-07); a rewrite
 leaves blocks free that DuckDB does not reuse on its own in this pattern, so
 the file does not shrink back.
 
-The upgrade of a real 0.9.0 index with the final 0.10.0 binary is measured in
-the field verification before the release (PLAN-009 TASK-016); its figures will
-be added here.
+The upgrade of a real 0.9.0 index with the 0.10.0 candidate (field
+verification, PLAN-009 TASK-016, 2026-10-12, `ml-granite` on CPU, in place over
+the index 0.9.0 built in the same sandbox):
+
+| Repository | 0.9.0 from scratch | `--full` of 0.10 over it | Chunks reused | Used blocks before → after | File |
+|---|---|---|---|---|---|
+| this one, 277 files at an older commit | 566 s | 53 s (9.4 %) | 4 737 of 4 806 | 114 → 173 | 28.5 → 61.3 MiB |
+| a Java repository, 216 files | 529 s | 38 s (7.1 %) | 3 204 of 3 284 | 85 → 124 | 21.3 → 43.8 MiB |
+| a Python repository, 62 files | 59 s | 4 s (7.1 %) | all 312 | 30 → 36 | 7.5 → 11.8 MiB |
+| a large Java repository, 1 625 files | 3 415 s | 330 s (9.7 %) | 20 242 of 21 615 | 504 → 786 | 153 → 296 MiB |
+| an Angular workspace, 1 581 files | 1 466 s | 274 s (18.7 %) | 13 309 of 14 167 | 293 → 463 | 83 → 171 MiB |
+
+The re-embedded chunks are the ones whose text changed (constructors and
+exported arrow functions that 0.9.0 did not cut out, a class chunk that now
+lists its methods). The upgraded database is larger than one built from
+scratch by 0.10 (the large Java repository: 523 used blocks from scratch, 786
+upgraded): the rewrite leaves blocks DuckDB does not reuse. Reuse needs the
+index to stay where it was built: the record is keyed by the repository's path,
+so a copied repository (another directory) re-embeds everything.
 
 ### What the tools answer meanwhile
 
@@ -323,9 +339,15 @@ sessions. Then:
   rewritten.
 - `graph_edges` was kept up to date in its 0.9 format, so 0.9.0's
   `read_symbol`, `get_references` and `impact_analysis` answer from it. Checked
-  with a build whose read path is 0.9.0's — the same `impact` answer, byte for
-  byte, as the 0.10 binary on the same database (2026-10-06); the field
-  verification repeats it with the released binary.
+  with the 0.9.0 binary over five upgraded indexes (2026-10-13): every call
+  answers, with its `extractor_stale` warning, and its vector search returns
+  the same results as 0.10 on the same database. The answers are not the ones
+  0.9.0 gave before the upgrade: the rows come from 0.10's extractor — nested
+  classes are qualified by their outer class, `var.*` and constants taken for
+  types are gone, a Rust call through a path is written with `.` between the
+  segments (`crate.util.helper`, which 0.9.0 finds by its `.helper` suffix) —
+  so some callers appear under a longer name and a walk through a nested class
+  can stop one level earlier.
 - 0.9.0 sees a stamp it did not write and reports `extractor_stale` with its own
   warning. It works anyway; its `--full` would re-embed every chunk (0.9.0 does
   not reuse vectors), and is not needed for it to answer.

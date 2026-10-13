@@ -253,7 +253,7 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-013 | Tool `traverse` | general-purpose (Rust) | TASK-009, TASK-017 | `done` |
 | TASK-014 | Tool `skeleton` por archivo | general-purpose (Rust) | TASK-004 | `done` |
 | TASK-015 | Docs EN + ES y guía de reindex | general-purpose (Rust) | TASK-002, TASK-011, TASK-012, TASK-013, TASK-014 | `done` |
-| TASK-016 | Verificación de campo contra §6 | — (orquestador, con aprobación del usuario) | TASK-015 | `pending` |
+| TASK-016 | Verificación de campo contra §6 | — (orquestador, con aprobación del usuario) | TASK-015 | `in_progress` |
 | TASK-017 | Dispatch por interfaz en `impact_analysis` (y `traverse`): override-equivalentes vía `implements`/`inherits`, `medium`, `via: "dispatch"` | general-purpose (Rust) | TASK-009 | `done` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
@@ -439,9 +439,28 @@ Texto original de las preguntas:
 
 ## 13. Cierre
 
-<!-- SE LLENA AL CERRAR EL PLAN -->
-- **Cerrado:**
-- **Shipeó:**
-- **Verificación:**
-- **Quedó afuera:**
-- **Continúa en:**
+<!-- Borrador de TASK-016 (2026-10-13): se cierra con el cross-check verde y las decisiones de abajo. -->
+- **Cerrado:** no todavía. La medición de campo está hecha (TASK-016, Resultado); faltan el
+  cross-check de Windows/macOS (push de `fix/plan-009-grafo`), la revisión de `fb1707c` (bug de
+  `graph_edges` con `::`) y de `e91a8b9` (criterio del gold para destinos `mod.f`), subir la
+  versión de los crates a 0.10.0 y el OK del usuario para el tag.
+- **Shipeó (candidato `e0b8937` + `fb1707c`):** grafo de símbolos (`symbols`/`edges`, 7
+  relaciones, `confidence`/`resolution`, `external`, `from_test`), resolvers Java/TS/Python/Rust/Go,
+  lookups por símbolo, `impact_analysis` por niveles con tope y dispatch por interfaz, PageRank
+  (centralidad opt-in, `w` = 0), `repo_map`, `traverse`, `skeleton`, sección `related` opt-in en
+  `build_context`, reuso de vectores por `content_hash`, rollout por `EXTRACTOR_VERSION`.
+- **Verificación (TASK-016, 5 repos, `ml-granite`, CPU):** cumplen basura 0, externos y `from_test`
+  marcados, gold 40/42 (`high` 40/40; 38/42 con el criterio viejo), ocurrencias repetidas,
+  `DraftResource` (`ctor_inject`), `tokenInterceptor`, `impact` p95 ≤ 197 ms, `external`
+  calificado, `Foo::new`, `repo_map`, híbrido ≥ base, vectorial idéntico, contratos aditivos,
+  indexado desde cero (−8,7 % en suma), upgrade 7-19 %, tamaño desde cero +4-17 %, RAM de frontend
+  +101/+139 MiB, aviso de índice viejo. **No cumplen:** `calls` sin decidir en Rust 16,0 % (≤ 15 %);
+  brief +6,7 pp en índice actualizado (+10,0 pp en uno nuevo); 5 tipos de arista en el repo Python.
+  **No medido:** `memories_by_symbol` de campo, DD-18 de grupo.
+- **Quedó afuera (pendiente de decisión del usuario):** las tres filas que no cumplen; retirar o no
+  `graph_hops: 2`; el crecimiento de la base en el upgrade en sitio (+52-58 % de bloques usados);
+  los pendientes de código anotados en el Resultado de TASK-016 (m5, m6, m9, `edge_level`, empates
+  de percentil, caché de `local_centrality`, follow-ups de la 2.ª pasada de TASK-012, métrica
+  `from_test_coherente`).
+- **Continúa en:** el plan que borre `graph_edges` y el camino viejo (DD-2, DD-19), SCIP, y los
+  pendientes post-009 (§4).
