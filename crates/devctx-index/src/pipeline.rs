@@ -1436,7 +1436,12 @@ impl Ctx<'_> {
             .iter()
             .map(|e| StoredEdge {
                 source: e.source.clone(),
-                target: e.target.clone(),
+                // `graph_edges` is what a downgraded 0.9.0 reads: it finds a
+                // bare name by `= name` or a `.name` suffix, and wrote a Rust
+                // path call as the bare name. A `::` target (the extractor
+                // keeps the path since PLAN-009) would hide the caller from
+                // it; `.` between segments keeps the suffix match working.
+                target: e.target.replace("::", "."),
                 kind: e.kind.clone(),
                 source_file: file.to_string(),
                 line: e.line as i32,

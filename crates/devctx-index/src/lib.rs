@@ -4350,6 +4350,38 @@ public class A extends B implements C {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A Rust call through a path (`crate::util::helper()`, `util::helper()`,
+    /// `Self::new()`) is written to `graph_edges` with `.` between segments:
+    /// 0.9.0 wrote the bare name there and resolves a bare name by `= name`
+    /// or a `.name` suffix, so a `::` target made a downgraded 0.9.0 lose
+    /// those callers (PLAN-009 TASK-016, downgrade over a real index).
+    #[test]
+    fn rust_path_calls_stay_findable_by_0_9_0() {
+        let (dir, repo) = graph_repo(
+            "compat_rust_path",
+            &[
+                (
+                    "src/lib.rs",
+                    "mod util;\n\npub struct Svc;\n\nimpl Svc {\n    pub fn new() -> Self {\n        Svc\n    }\n\n    pub fn run(&self) {\n        crate::util::helper();\n        util::helper();\n        let _ = Self::new();\n    }\n}\n",
+                ),
+                ("src/util.rs", "pub fn helper() {}\n"),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        assert!(
+            old.iter().all(|e| !e.target.contains("::")),
+            "a `::` target is unreadable by 0.9.0: {old:?}"
+        );
+        let refs = store.find_references(&repo, "main", "helper").unwrap();
+        let lines: Vec<i32> = refs.iter().map(|r| r.line).collect();
+        assert_eq!(lines, vec![11, 12], "{refs:?}");
+        let refs = store.find_references(&repo, "main", "new").unwrap();
+        assert!(refs.iter().any(|r| r.line == 13), "{refs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The 0.9.0 assert of [`graph_edges_stays_readable_by_0_9_0`] on
     /// `impact_analysis`, over the symbol graph of the same index (TASK-009):
     /// two calls from one method are one caller.
