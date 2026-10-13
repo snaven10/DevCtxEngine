@@ -1436,12 +1436,18 @@ impl Ctx<'_> {
             .iter()
             .map(|e| StoredEdge {
                 source: e.source.clone(),
-                // `graph_edges` is what a downgraded 0.9.0 reads: it finds a
-                // bare name by `= name` or a `.name` suffix, and wrote a Rust
-                // path call as the bare name. A `::` target (the extractor
-                // keeps the path since PLAN-009) would hide the caller from
-                // it; `.` between segments keeps the suffix match working.
-                target: e.target.replace("::", "."),
+                // `graph_edges` is what a downgraded 0.9.0 reads. It expands
+                // only the name asked for and then walks by exact name, and
+                // it wrote a Rust call through a module path as its last
+                // segment (`crate::util::helper()` → `helper`, the name the
+                // function has as a source). The extractor keeps the path
+                // since PLAN-009; here it goes back to that segment, or the
+                // caller is hidden from 0.9.0 and its walk stops there. A
+                // call through a type is already `Type.method`.
+                target: match e.target.rsplit_once("::") {
+                    Some((_, last)) => last.to_string(),
+                    None => e.target.clone(),
+                },
                 kind: e.kind.clone(),
                 source_file: file.to_string(),
                 line: e.line as i32,
