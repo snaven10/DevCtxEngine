@@ -411,7 +411,14 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
             .get_index_meta(&repo_path, &branch, EXTRACTOR_META_KEY)?;
         let pre_graph = stamp.as_deref().is_none_or(|s| s.starts_with("v1-"));
         let existed = prev.is_some() || !prev_files.is_empty();
-        if pre_graph && existed {
+        // A failed verification stays visible until `devctx compact` settles
+        // it (review T2): a later migration owes the same compaction anyway.
+        let failed = req
+            .store
+            .get_index_meta("", "", devctx_store::compact::COMPACTION_META_KEY)?
+            .as_deref()
+            == Some(devctx_store::compact::COMPACTION_OWED_FAILED_VERIFY);
+        if pre_graph && existed && !failed {
             req.store.set_index_meta(
                 "",
                 "",

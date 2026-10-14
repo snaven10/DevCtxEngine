@@ -1026,8 +1026,17 @@ pub fn compact(db: &Path, opts: &CompactOptions<'_>) -> CResult<CompactReport> {
             std::mem::forget(lock);
             return out;
         }
-        Err(_) => remove_temporaries(&paths),
-        Ok(_) => {}
+        Err(e) => {
+            remove_temporaries(&paths);
+            if e.kind == FailKind::Verify {
+                // The note goes in the database, which this run never writes:
+                // the next open writes it from this marker (review T7).
+                let _ = std::fs::write(&paths.failed_marker, b"");
+            }
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(&paths.failed_marker);
+        }
     }
     drop(lock);
     out

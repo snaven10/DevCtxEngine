@@ -949,7 +949,7 @@ fn reindex_one(root: &std::path::Path, full: bool) -> Result<String> {
     if let Some(warning) = remote::index_cancelled(&raw) {
         bail!("{warning}");
     }
-    compact_after_served_index(&cfg, &r, &raw);
+    compact_after_served_index(&cfg, &r, &raw, full);
     let v: serde_json::Value = serde_json::from_str(&raw).context("parsing the index result")?;
     Ok(format!(
         "{} @ {} — {} files, {} symbols, {} chunks ({} skipped)",
@@ -4104,7 +4104,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
                 if let Some(warning) = remote::index_cancelled(&report) {
                     bail!("{warning}");
                 }
-                compact_after_served_index(&cfg, &r, &report);
+                compact_after_served_index(&cfg, &r, &report, full);
             }
             Err(e) => return Err(still_running_or(&r, e)),
         }
@@ -4225,14 +4225,19 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         let hnsw = (report.hnsw_estimated_bytes(), report.hnsw_present);
         // The compaction needs the file to itself.
         drop(store);
-        compact_cli::after_full_index(&cfg, res.compaction.as_deref(), None, hnsw);
+        compact_cli::after_full_index(&cfg, full, res.compaction.as_deref(), None, hnsw);
     }
     Ok(())
 }
 
 /// After a full run on the server: compact if it left the upgrade's note
 /// (PLAN-009 TASK-018). Never fails the run.
-fn compact_after_served_index(cfg: &ProjectConfig, r: &remote::Remote, report: &str) {
+fn compact_after_served_index(
+    cfg: &ProjectConfig,
+    r: &remote::Remote,
+    report: &str,
+    requested_full: bool,
+) {
     let v: serde_json::Value = serde_json::from_str(report).unwrap_or_default();
     if !v["full_reindex"].as_bool().unwrap_or(false) {
         return;
@@ -4241,7 +4246,7 @@ fn compact_after_served_index(cfg: &ProjectConfig, r: &remote::Remote, report: &
         .status()
         .map(|raw| compact_cli::hnsw_from_status(&raw))
         .unwrap_or((None, false));
-    compact_cli::after_full_index(cfg, v["compaction"].as_str(), Some(r), hnsw);
+    compact_cli::after_full_index(cfg, requested_full, v["compaction"].as_str(), Some(r), hnsw);
 }
 
 /// `devctx repair` — rebuild an index whose constraints no longer match its rows.

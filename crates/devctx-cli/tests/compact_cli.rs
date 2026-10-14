@@ -466,3 +466,33 @@ fn a_memory_is_restored_from_the_sidecar() {
     assert_eq!(m.content, "the token interceptor retries once on 401");
     assert!(s.vector_by_id(&id).unwrap().is_some(), "embedded again");
 }
+
+/// Review T1: a plain `devctx index` the pipeline promotes to a full run
+/// (here: the indexed commit is gone from the history) migrates the branch
+/// and leaves the compaction owed, but does not compact — only a `--full`
+/// that was asked for does.
+#[test]
+fn a_run_promoted_to_full_does_not_compact() {
+    let tmp = Tmp::new("promoted");
+    let root = project(&tmp);
+    let ep = fake_embedder();
+    let first = devctx(&tmp, &root, &ep, &[], &["index", "--full"]);
+    assert!(first.status.success(), "{}", text(&first));
+    make_pre_graph(&root);
+    git(&root, &["commit", "-q", "--amend", "-m", "rewritten"]);
+    git(&root, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&root, &["gc", "-q", "--prune=now"]);
+    let run = devctx(
+        &tmp,
+        &root,
+        &ep,
+        &[("DEVCTX_TEST_ASSUME_TTY", "1")],
+        &["index"],
+    );
+    let said = text(&run);
+    assert!(run.status.success(), "{said}");
+    assert!(said.contains("full reindex"), "not promoted: {said}");
+    assert!(!said.contains("· compacted"), "{said}");
+    assert!(said.lines().any(|l| l == "devctx compact"), "{said}");
+    assert_eq!(note(&root).as_deref(), Some("owed:upgrade"));
+}

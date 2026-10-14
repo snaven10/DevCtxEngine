@@ -34,10 +34,36 @@ pub(crate) enum AutoDecision {
     Run,
 }
 
-/// The automatic compaction runs only for an upgrade's note, never when it
-/// is switched off, and only with a terminal to announce it on — an agent or
-/// a script gets the line to run instead (D3).
-pub(crate) fn auto_decision(note: Option<&str>, disabled: bool, tty: bool) -> AutoDecision {
+/// What the session that ran the index says about itself.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Session {
+    /// `--full` was asked for: a run the pipeline promoted to full (a
+    /// rebased history, another model, a new branch) does not count (T1).
+    pub requested_full: bool,
+    /// `DEVCTX_NO_AUTO_COMPACT` is set.
+    pub disabled: bool,
+    /// A terminal is attached.
+    pub tty: bool,
+    /// This is Windows, where the replacement is not verified yet (T5).
+    pub windows: bool,
+}
+
+impl Session {
+    fn here(requested_full: bool) -> Self {
+        Self {
+            requested_full,
+            disabled: std::env::var_os(NO_AUTO_COMPACT_ENV).is_some(),
+            tty: is_tty(),
+            windows: cfg!(windows),
+        }
+    }
+}
+
+/// The automatic compaction runs only for an upgrade's note, after a
+/// `--full` that was asked for, never when it is switched off, never on
+/// Windows until the cross-check, and only with a terminal to announce it on
+/// — an agent or a script gets the line to run instead (D3).
+pub(crate) fn auto_decision(note: Option<&str>, s: Session) -> AutoDecision {
     match note {
         Some(COMPACTION_OWED_UPGRADE) => {}
         Some(COMPACTION_OWED_FAILED_VERIFY) => {
@@ -48,10 +74,22 @@ pub(crate) fn auto_decision(note: Option<&str>, disabled: bool, tty: bool) -> Au
         }
         _ => return AutoDecision::NotOwed,
     }
-    if disabled {
+    if !s.requested_full {
+        return AutoDecision::Skip(
+            "only a `devctx index --full` that was asked for compacts by itself".into(),
+        );
+    }
+    if s.disabled {
         return AutoDecision::Skip(format!("{NO_AUTO_COMPACT_ENV} is set"));
     }
-    if !tty {
+    if s.windows {
+        return AutoDecision::Skip(
+            "the automatic compaction is not verified on Windows yet; stop the server and run \
+             it yourself"
+                .into(),
+        );
+    }
+    if !s.tty {
         return AutoDecision::Skip(
             "no terminal to announce it on (run from an agent or a script)".into(),
         );
@@ -76,7 +114,8 @@ pub(crate) fn after_stop(reclaim: &Reclaim, wal_bytes: u64) -> Result<(), String
 
 fn is_tty() -> bool {
     use std::io::IsTerminal;
-    std::env::var_os(ASSUME_TTY_ENV).is_some()
+    // The test override exists only in debug builds (T3).
+    (cfg!(debug_assertions) && std::env::var_os(ASSUME_TTY_ENV).is_some())
         || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
 }
 
@@ -121,15 +160,12 @@ pub(crate) fn hnsw_from_status(raw: &str) -> (Option<u64>, bool) {
 /// upgrade's note and this session may. Never fails the run that called it.
 pub fn after_full_index(
     cfg: &ProjectConfig,
+    requested_full: bool,
     note: Option<&str>,
     server: Option<&Remote>,
     hnsw: (Option<u64>, bool),
 ) {
-    let decision = auto_decision(
-        note,
-        std::env::var_os(NO_AUTO_COMPACT_ENV).is_some(),
-        is_tty(),
-    );
+    let decision = auto_decision(note, Session::here(requested_full));
     match decision {
         AutoDecision::NotOwed => {}
         AutoDecision::Skip(why) => print_owed(&why),
@@ -197,8 +233,19 @@ fn record_failure(cfg: &ProjectConfig, db: &Path, e: &CompactError) {
         return;
     };
     let dim = devctx_embed::dimension_for(&cfg.embeddings.provider, &cfg.embeddings.model);
-    if let Ok(store) = devctx_store::Store::open(db, dim) {
-        let _ = store.set_index_meta("", "", COMPACTION_META_KEY, note);
+    let written = devctx_store::Store::open(db, dim)
+        .map_err(|e| e.to_string())
+        .and_then(|s| {
+            s.set_index_meta("", "", COMPACTION_META_KEY, note)
+                .map_err(|e| e.to_string())
+        });
+    if let Err(e) = written {
+        // The run left a marker next to the index; the next open writes the
+        // note from it (T7).
+        eprintln!(
+            "· could not record `{note}` in the index now ({e}); the next open of the index \
+             records it"
+        );
     }
 }
 
@@ -252,26 +299,54 @@ mod tests {
     /// the compaction owed; a failed verification is never retried by itself.
     #[test]
     fn the_automatic_compaction_needs_the_note_a_terminal_and_no_switch() {
-        assert_eq!(auto_decision(None, false, true), AutoDecision::NotOwed);
+        let ok = Session {
+            requested_full: true,
+            disabled: false,
+            tty: true,
+            windows: false,
+        };
+        assert_eq!(auto_decision(None, ok), AutoDecision::NotOwed);
         assert_eq!(
-            auto_decision(Some("done:0.10.0:1:upgrade"), false, true),
+            auto_decision(Some("done:0.10.0:1:upgrade"), ok),
             AutoDecision::NotOwed
         );
         assert_eq!(
-            auto_decision(Some(COMPACTION_OWED_UPGRADE), false, true),
+            auto_decision(Some(COMPACTION_OWED_UPGRADE), ok),
             AutoDecision::Run
         );
-        for (disabled, tty, needle) in [
-            (true, true, NO_AUTO_COMPACT_ENV),
-            (false, false, "no terminal"),
+        for (s, needle) in [
+            (
+                Session {
+                    disabled: true,
+                    ..ok
+                },
+                NO_AUTO_COMPACT_ENV,
+            ),
+            (Session { tty: false, ..ok }, "no terminal"),
+            // T1: a run the pipeline promoted to full.
+            (
+                Session {
+                    requested_full: false,
+                    ..ok
+                },
+                "--full",
+            ),
+            // T5.
+            (
+                Session {
+                    windows: true,
+                    ..ok
+                },
+                "Windows",
+            ),
         ] {
-            match auto_decision(Some(COMPACTION_OWED_UPGRADE), disabled, tty) {
+            match auto_decision(Some(COMPACTION_OWED_UPGRADE), s) {
                 AutoDecision::Skip(why) => assert!(why.contains(needle), "{why}"),
                 other => panic!("{other:?}"),
             }
         }
         assert!(matches!(
-            auto_decision(Some(COMPACTION_OWED_FAILED_VERIFY), false, true),
+            auto_decision(Some(COMPACTION_OWED_FAILED_VERIFY), ok),
             AutoDecision::Skip(_)
         ));
     }

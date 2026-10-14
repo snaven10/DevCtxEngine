@@ -4632,6 +4632,24 @@ public class A extends B implements C {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Review T2: a failed verification is not hidden by a later migration:
+    /// `owed:failed-verify` stays until `devctx compact` settles it.
+    #[test]
+    fn a_failed_verification_is_not_overwritten_by_a_migration() {
+        let dir = five_file_repo("compact_failed");
+        let store = Store::open_in_memory(8).unwrap();
+        index(&store, &dir);
+        set_note(&store, "owed:failed-verify");
+        stamp_pre_graph(&store, &dir, "main");
+        let res = index_branch(&store, &dir, "main", true);
+        assert_eq!(
+            compaction_note(&store).as_deref(),
+            Some("owed:failed-verify")
+        );
+        assert_eq!(res.compaction.as_deref(), Some("owed:failed-verify"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The store and the index agree on the names of the notes a compaction
     /// clears.
     #[test]

@@ -49,6 +49,9 @@ pub struct CompactPaths {
     pub original: PathBuf,
     /// `<db>.compact.tmpdir`: where DuckDB spills during a compaction.
     pub tmp_dir: PathBuf,
+    /// `<db>.compact.failed-verify`: left by a compaction whose copy failed
+    /// verification, until an open writes the note (review T7).
+    pub failed_marker: PathBuf,
 }
 
 impl CompactPaths {
@@ -80,6 +83,7 @@ impl CompactPaths {
             side_tmp_wal: with(".pre-compact.duckdb.tmp.wal"),
             original: with(".pre-compact"),
             tmp_dir: with(".compact.tmpdir"),
+            failed_marker: with(".compact.failed-verify"),
             db: real,
         }
     }

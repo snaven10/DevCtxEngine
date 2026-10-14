@@ -218,7 +218,26 @@ impl Store {
             }
         }
         let lock = crate::oslock::guard_open(path)?;
-        Self::open_with_lock(path, dim, lock)
+        let held = lock.is_some();
+        let store = Self::open_with_lock(path, dim, lock)?;
+        if held {
+            // A compaction whose copy failed verification could not write its
+            // note into a database it never writes (PLAN-009 TASK-018, T7).
+            let marker = crate::oslock::CompactPaths::for_db(path).failed_marker;
+            if marker.exists()
+                && store
+                    .set_index_meta(
+                        "",
+                        "",
+                        crate::compact::COMPACTION_META_KEY,
+                        crate::compact::COMPACTION_OWED_FAILED_VERIFY,
+                    )
+                    .is_ok()
+            {
+                let _ = std::fs::remove_file(&marker);
+            }
+        }
+        Ok(store)
     }
 
     /// [`open`](Self::open) without the compaction lock: the compactor's own

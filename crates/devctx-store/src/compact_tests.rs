@@ -1252,6 +1252,29 @@ fn a_restore_cut_by_the_embedder_is_finished_by_the_next_one() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Review T7: a failed verification is recorded even when nobody can open
+/// the index right after it: the run leaves a marker, and the next open
+/// turns it into the note.
+#[test]
+fn a_failed_verification_reaches_the_note_through_the_next_open() {
+    let dir = scratch("failed_marker");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let e = failing_run(&db, &|p, h| {
+        if p == Phase::Copied {
+            h.execute_batch("DELETE FROM dst.main.vectors WHERE id = 'code_00001'")
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    });
+    assert_eq!(e.kind, FailKind::Verify);
+    let marker = CompactPaths::for_db(&db).failed_marker;
+    assert!(marker.exists(), "no marker left");
+    assert_eq!(note_of(&db).as_deref(), Some(COMPACTION_OWED_FAILED_VERIFY));
+    assert!(!marker.exists(), "the open did not settle the marker");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- a rename a power cut reverted (review D1) --------------------------------
 
 /// Put the directory back as a power cut can leave it after a `rename` whose
