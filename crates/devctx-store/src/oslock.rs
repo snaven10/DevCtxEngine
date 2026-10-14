@@ -250,7 +250,14 @@ pub(crate) fn guard_open(db: &Path) -> crate::Result<Option<FileLock>> {
         Ok(None) => return Err(crate::StoreError::Compacting(paths.db)),
         // No lock file can be made (a read-only directory): no compaction can
         // run there either, since it needs to write its copy next to the base.
-        Err(_) => None,
+        // Said, not silent.
+        Err(e) => {
+            eprintln!(
+                "· could not open {} ({e}); opening the index without the compaction lock",
+                paths.lock.display()
+            );
+            None
+        }
     };
     if held.is_some() && paths.db.exists() {
         // A finished copy can be the file that was really in use, if a power

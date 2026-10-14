@@ -361,6 +361,17 @@ pub struct Preflight {
 /// The checks that must pass before anything is stopped or written
 /// (protocol, point 1). `hnsw_bytes`: the server's estimate of the index.
 pub fn preflight(db: &Path, hnsw_bytes: Option<u64>, probe: &SystemProbe) -> CResult<Preflight> {
+    preflight_for(db, hnsw_bytes, probe, false)
+}
+
+/// [`preflight`], for a run that keeps the original (`--keep-original`):
+/// the old file stays allocated next to the new one.
+pub fn preflight_for(
+    db: &Path,
+    hnsw_bytes: Option<u64>,
+    probe: &SystemProbe,
+    keep_original: bool,
+) -> CResult<Preflight> {
     let pre = |m: String| CompactError::new(FailKind::Preflight, m);
     let paths = CompactPaths::for_db(db);
     let meta = std::fs::metadata(&paths.db)
@@ -374,12 +385,23 @@ pub fn preflight(db: &Path, hnsw_bytes: Option<u64>, probe: &SystemProbe) -> CRe
     }
     let db_bytes = meta.len();
     let disk_available = (probe.available_disk)(dir);
+    // With `--keep-original` the old file stays allocated next to the copy.
+    let needed = if keep_original {
+        db_bytes.saturating_mul(2)
+    } else {
+        db_bytes
+    };
     if let Some(avail) = disk_available {
-        if avail < db_bytes {
+        if avail < needed {
             return Err(pre(format!(
-                "not enough disk next to the index: the copy needs up to {} MiB and {} MiB are \
-                 available to you",
-                mib(db_bytes),
+                "not enough disk next to the index: the copy needs up to {} MiB{} and {} MiB \
+                 are available to you",
+                mib(needed),
+                if keep_original {
+                    " (twice the file, with --keep-original)"
+                } else {
+                    ""
+                },
                 mib(avail)
             )));
         }
@@ -794,6 +816,9 @@ fn fsync_file(p: &Path) -> CResult<()> {
         .read(true)
         .write(true)
         .open(p)
+        // A file already made read-only (a 0400 index): fsync works on a
+        // read-only descriptor on Unix.
+        .or_else(|_| std::fs::File::open(p))
         .and_then(|f| f.sync_all())
         .map_err(|e| CompactError::new(FailKind::Engine, format!("fsync {}: {e}", p.display())))
 }
@@ -1017,6 +1042,9 @@ pub fn compact(db: &Path, opts: &CompactOptions<'_>) -> CResult<CompactReport> {
             ))
         }
     }
+    // The checks again, now that nothing can change under them, whoever the
+    // caller is and whatever it checked before.
+    preflight_for(&paths.db, opts.hnsw_bytes, &opts.probe, opts.keep_original)?;
     remove_temporaries(&paths);
     let out = run(&paths, opts);
     match &out {
@@ -1099,9 +1127,18 @@ fn run(paths: &CompactPaths, opts: &CompactOptions<'_>) -> CResult<CompactReport
     // Point 2, preparation: fold a WAL with a normal open, before the source
     // is adjoined — only when asked to (`devctx compact`).
     if opts.fold_wal && std::fs::metadata(&paths.wal).is_ok_and(|m| m.len() > 0) {
-        let s = Store::open_unlocked(&paths.db, opts.dim_hint).map_err(engine)?;
-        s.try_checkpoint().map_err(engine)?;
-        drop(s);
+        // A bare checkpoint, with the extensions loaded first so the replay
+        // can bind an HNSW index — not a `Store` open, whose `init_schema`
+        // writes (and may drop a legacy `memory_symbol_references`).
+        let c = Connection::open_in_memory().map_err(engine)?;
+        let _ = c.execute_batch(&crate::store::resource_limits_sql());
+        let _ = load_extensions(&c);
+        c.execute_batch(&format!(
+            "ATTACH {} AS w; CHECKPOINT w; DETACH w;",
+            lit(&paths.db)?
+        ))
+        .map_err(engine)?;
+        drop(c);
         clock.lap("fold_wal");
     }
     assert_no_wal(paths)?;
@@ -1296,6 +1333,7 @@ fn run(paths: &CompactPaths, opts: &CompactOptions<'_>) -> CResult<CompactReport
 
     // Point 10: in place.
     let mode = std::fs::metadata(&paths.db).map_err(engine)?.permissions();
+    fsync_file(&paths.tmp)?;
     std::fs::set_permissions(&paths.tmp, mode).map_err(engine)?;
     fsync_file(&paths.tmp)?;
     let bytes_after = std::fs::metadata(&paths.tmp).map_err(engine)?.len();
@@ -1553,6 +1591,16 @@ fn write_sidecar(h: &Connection, paths: &CompactPaths) -> CResult<Option<PathBuf
                 t = q(t)
             ))
             .map_err(engine)?;
+            let (a, b) = (
+                query_u64(h, &format!("SELECT count(*) FROM src.main.{}", q(t)))?,
+                query_u64(h, &format!("SELECT count(*) FROM side.main.{}", q(t)))?,
+            );
+            if a != b {
+                return Err(CompactError::new(
+                    FailKind::Verify,
+                    format!("the sidecar's `{t}` has {b} rows and the index {a}"),
+                ));
+            }
         }
     }
     h.execute_batch("CHECKPOINT side; DETACH side;")
@@ -1573,20 +1621,49 @@ fn write_sidecar(h: &Connection, paths: &CompactPaths) -> CResult<Option<PathBuf
             ))
             .map_err(engine)
             .and_then(|()| {
-                let n = if query_u64(
+                let old = query_strings(
                     h,
-                    "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'oldside' \
-                     AND table_name = 'memories'",
-                )? > 0
-                {
-                    query_u64(
+                    "SELECT table_name FROM duckdb_tables() WHERE database_name = 'oldside' \
+                     AND schema_name = 'main'",
+                )?;
+                let has = |t: &str| old.iter().any(|o| o == t) && present.iter().any(|p| p == t);
+                let mut n = 0;
+                // Rows of the old sidecar the index no longer has: memories
+                // and sessions by id, references row by row.
+                if has("memories") {
+                    n += query_u64(
                         h,
                         "SELECT count(*) FROM oldside.main.memories WHERE id NOT IN \
                          (SELECT id FROM src.main.memories)",
-                    )?
-                } else {
-                    0
-                };
+                    )?;
+                }
+                if has("sessions") {
+                    n += query_u64(
+                        h,
+                        "SELECT count(*) FROM oldside.main.sessions WHERE id NOT IN \
+                         (SELECT id FROM src.main.sessions)",
+                    )?;
+                }
+                if has("memory_symbol_references") {
+                    let src_cols: Vec<String> = columns(h, "src", "memory_symbol_references")?
+                        .into_iter()
+                        .map(|(c, _)| c)
+                        .collect();
+                    let cols: Vec<String> = columns(h, "oldside", "memory_symbol_references")?
+                        .into_iter()
+                        .map(|(c, _)| c)
+                        .filter(|c| src_cols.contains(c))
+                        .collect();
+                    let list = cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+                    n += query_u64(
+                        h,
+                        &format!(
+                            "SELECT count(*) FROM (SELECT {list} FROM \
+                             oldside.main.memory_symbol_references EXCEPT SELECT {list} FROM \
+                             src.main.memory_symbol_references)"
+                        ),
+                    )?;
+                }
                 let _ = h.execute_batch("DETACH oldside;");
                 Ok(n)
             })
@@ -1594,7 +1671,7 @@ fn write_sidecar(h: &Connection, paths: &CompactPaths) -> CResult<Option<PathBuf
             .unwrap_or(1);
         if lost > 0 {
             let mut name = paths.db.clone().into_os_string();
-            name.push(format!(".pre-compact.{}.duckdb", epoch()));
+            name.push(format!(".pre-compact.{}.duckdb", epoch_millis()));
             let to = PathBuf::from(name);
             std::fs::rename(&paths.side, &to).map_err(engine)?;
             kept = Some(to);

@@ -296,11 +296,17 @@ impl Store {
     /// whether another process holds it — without loading a model or touching
     /// the schema. A file that does not exist yet is not a conflict.
     pub fn check_unlocked(path: &Path) -> Result<()> {
-        if crate::oslock::compaction_running(path) {
-            return Err(StoreError::Compacting(
-                crate::oslock::CompactPaths::for_db(path).db,
-            ));
-        }
+        let paths = crate::oslock::CompactPaths::for_db(path);
+        // Held shared through the probe, like any open: no compaction may
+        // start while this process has the file open.
+        let _held = match crate::oslock::FileLock::try_acquire(
+            &paths.lock,
+            crate::oslock::LockMode::Shared,
+        ) {
+            Ok(Some(l)) => Some(l),
+            Ok(None) => return Err(StoreError::Compacting(paths.db)),
+            Err(_) => None,
+        };
         if path.exists() {
             drop(Connection::open(path)?);
         }

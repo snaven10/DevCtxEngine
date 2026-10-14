@@ -1275,6 +1275,101 @@ fn a_failed_verification_reaches_the_note_through_the_next_open() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Review: a WAL that appears right after the `ATTACH` is caught before the
+/// `rename`; the original and that WAL are left byte for byte.
+#[test]
+fn a_wal_right_after_the_attach_aborts() {
+    let dir = scratch("walattach");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let wal = CompactPaths::for_db(&db).wal;
+    let sum = sha(&db);
+    let e = failing_run(&db, &|p, _| {
+        if p == Phase::Attached {
+            std::fs::write(&wal, b"appeared").map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    });
+    assert_eq!(e.kind, FailKind::WalPresent, "{e}");
+    assert_eq!(sha(&db), sum);
+    assert_eq!(std::fs::read(&wal).unwrap(), b"appeared");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review (NIT): a read-only database (0400) compacts and stays 0400.
+#[cfg(unix)]
+#[test]
+fn a_read_only_database_compacts_and_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("ro0400");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o400)).unwrap();
+    compact(&db, &opts()).expect("compacts");
+    assert_eq!(
+        std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review: the old sidecar is kept when the index lost a session or a
+/// symbol reference since, not only a memory.
+#[test]
+fn the_old_sidecar_is_kept_for_a_lost_session_or_reference() {
+    for sql in [
+        "DELETE FROM sessions",
+        "DELETE FROM memory_symbol_references WHERE memory_id = 'mem_b'",
+    ] {
+        let dir = scratch("side_lost");
+        let db = dir.join("index.duckdb");
+        fixture(&db, Fx::default());
+        compact(&db, &opts()).unwrap();
+        {
+            let s = Store::open(&db, DIM).unwrap();
+            s.conn.execute_batch(sql).unwrap();
+            s.checkpoint();
+        }
+        let r = compact(&db, &opts()).unwrap();
+        assert!(
+            r.kept_sidecar.is_some(),
+            "{sql}: the old sidecar was replaced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Review: `compact()` runs the preflight itself, whoever calls it, and with
+/// `--keep-original` it asks for disk for two copies.
+#[test]
+fn compact_runs_its_own_preflight_and_keep_original_needs_twice_the_disk() {
+    let dir = scratch("own_preflight");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let size = std::fs::metadata(&db).unwrap().len();
+    let mut o = opts();
+    o.probe = SystemProbe {
+        available_disk: |_| Some(10),
+        ..SystemProbe::default()
+    };
+    let e = compact(&db, &o).unwrap_err();
+    assert_eq!(e.kind, FailKind::Preflight, "{e}");
+    assert!(!CompactPaths::for_db(&db).tmp.exists());
+    let probe = SystemProbe {
+        available_disk: |p| {
+            let db = p.join("index.duckdb");
+            Some(std::fs::metadata(db).unwrap().len() * 3 / 2)
+        },
+        ..SystemProbe::default()
+    };
+    assert!(preflight_for(&db, None, &probe, false).is_ok());
+    let e = preflight_for(&db, None, &probe, true).unwrap_err();
+    assert!(e.message.contains("--keep-original"), "{e}");
+    let _ = size;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- a rename a power cut reverted (review D1) --------------------------------
 
 /// Put the directory back as a power cut can leave it after a `rename` whose

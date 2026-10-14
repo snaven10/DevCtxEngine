@@ -4403,7 +4403,18 @@ fn cmd_compact(dry_run: bool, force: bool, keep_original: bool) -> Result<()> {
         "  a compaction would leave about {} MiB",
         (usage.used * usage.block_size).div_ceil(1 << 20)
     );
-    let pre = compact::preflight(&db, hnsw_bytes, &compact::SystemProbe::default());
+    let pre = compact::preflight_for(
+        &db,
+        hnsw_bytes,
+        &compact::SystemProbe::default(),
+        keep_original,
+    );
+    if !keep_original {
+        println!(
+            "  with --keep-original the original stays allocated too: about {} MiB of disk",
+            bytes.saturating_mul(2).div_ceil(1 << 20)
+        );
+    }
     match &pre {
         Ok(p) => println!(
             "  checks pass: {} MiB of disk available{}, about {} MiB of memory needed",
@@ -4415,7 +4426,9 @@ fn cmd_compact(dry_run: bool, force: bool, keep_original: bool) -> Result<()> {
             )),
             p.memory_needed.div_ceil(1 << 20)
         ),
-        Err(e) => println!("  it would not run: {e}"),
+        // Said once: outside --dry-run the error itself ends the command.
+        Err(e) if dry_run => println!("  it would not run: {e}"),
+        Err(_) => {}
     }
     if dry_run {
         println!("--dry-run: nothing was changed.");
