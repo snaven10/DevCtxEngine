@@ -262,7 +262,9 @@ fn the_upgrade_compacts_once_and_only_with_a_terminal() {
     assert!(tty.status.success(), "{said}");
     assert!(said.contains("compacted"), "{said}");
     let n = note(&root).unwrap();
-    assert!(n.starts_with("done:") && n.ends_with(":upgrade"), "{n}");
+    // The note names the binary that compacted: the workspace version.
+    let done = format!("done:{}:", env!("CARGO_PKG_VERSION"));
+    assert!(n.starts_with(&done) && n.ends_with(":upgrade"), "{n}");
     assert!(devctx_store::CompactPaths::for_db(&db(&root)).side.exists());
 
     let again = devctx(
