@@ -1033,41 +1033,92 @@ fn a_binary_that_ignores_the_lock_file_still_stops_the_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 29 and M-E.1 (I2, I4): with the compaction paused after its auxiliary
-/// connections closed, another process that skips the lock file cannot open
-/// the database for writing — DuckDB's lock, held by `H`, stops it. And the
-/// reason for the descriptor rule: one open and close of the file in the
-/// compacting process is enough to drop that lock.
+/// 29 and M-E.1 (I2, I4): paused after its auxiliary connections closed —
+/// at `Verified` and again right before the `rename` — the compacting process
+/// has exactly one descriptor on the source (`H`'s), and another process that
+/// skips the lock file cannot open it for writing: DuckDB's lock stops it.
 #[test]
-fn only_h_holds_the_source_and_one_stray_descriptor_breaks_that() {
-    for (mode, writer_fails) in [("pause", true), ("pause-fdclose", false)] {
-        let dir = scratch(mode);
-        let db = dir.join("index.duckdb");
-        fixture(&db, Fx::default());
-        let sum = sha(&db);
-        let mut compactor = spawn_child(&db, mode);
-        wait_for(&db, "ready");
-        let opened = Connection::open(&db).map(drop);
-        std::fs::write(signal(&db, "go"), b"").unwrap();
-        let status = compactor.wait().unwrap();
-        match opened {
-            Err(e) if writer_fails => {
-                let t = e.to_string();
-                assert!(t.contains("lock"), "{t}");
-            }
-            Ok(()) if !writer_fails => {}
-            other => panic!("{mode}: the writer {:?}", other.map_err(|e| e.to_string())),
+fn only_h_holds_the_source() {
+    let dir = scratch("pause");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let sum = sha(&db);
+    let mut compactor = spawn_child(&db, "pause");
+    for at in ["verified", "rename"] {
+        wait_for(&db, &format!("ready-{at}"));
+        match Connection::open(&db) {
+            Err(e) => assert!(e.to_string().contains("lock"), "{at}: {e}"),
+            Ok(_) => panic!("{at}: a writer opened the source during the compaction"),
         }
-        if writer_fails {
-            assert!(status.success(), "{mode}: the compaction failed");
-        } else {
-            // The broken exclusion is caught later (the file changed under
-            // it, or DuckDB says so): either way, nothing was replaced.
-            assert_ne!(sha(&db), "");
-        }
-        let _ = sum;
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(signal(&db, &format!("go-{at}")), b"").unwrap();
     }
+    let status = compactor.wait().unwrap();
+    assert!(
+        status.success(),
+        "the compaction (or its descriptor check) failed"
+    );
+    assert_ne!(sha(&db), sum, "the copy is in place");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 29, the reason for the rule: one open and close of the source in the
+/// compacting process drops DuckDB's lock, a writer gets in and changes the
+/// file — and the run, which must catch that, aborts without replacing it:
+/// the writer's row is in the index afterwards.
+#[test]
+fn one_stray_descriptor_breaks_the_exclusion_and_the_run_catches_it() {
+    let dir = scratch("pause_fdclose");
+    let db = dir.join("index.duckdb");
+    // No HNSW index: the writer below opens without VSS.
+    fixture(
+        &db,
+        Fx {
+            hnsw: None,
+            ..Fx::default()
+        },
+    );
+    let mut compactor = spawn_child(&db, "pause-fdclose");
+    wait_for(&db, "ready-verified");
+    {
+        let c = Connection::open(&db).expect("the stray close let the writer in");
+        c.execute_batch("INSERT INTO index_meta VALUES ('stray', 'writer', 'k', 'v'); CHECKPOINT;")
+            .unwrap();
+    }
+    std::fs::write(signal(&db, "go-verified"), b"").unwrap();
+    let _ = compactor.wait().unwrap();
+    let outcome = std::fs::read_to_string(signal(&db, "outcome")).unwrap();
+    assert!(
+        outcome.contains("SourceChanged") || outcome.contains("WalPresent"),
+        "{outcome}"
+    );
+    let s = Store::open(&db, DIM).unwrap();
+    assert_eq!(
+        s.get_index_meta("stray", "writer", "k").unwrap().as_deref(),
+        Some("v"),
+        "the writer's row was lost"
+    );
+    assert_eq!(
+        s.get_index_meta("", "", COMPACTION_META_KEY)
+            .unwrap()
+            .as_deref(),
+        Some(COMPACTION_OWED_UPGRADE)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Descriptors of this process on the file at `p` (Linux: `/proc/self/fd`).
+#[cfg(target_os = "linux")]
+fn descriptors_on(p: &Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let want = std::fs::metadata(p).unwrap();
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            std::fs::metadata(e.path())
+                .is_ok_and(|m| m.ino() == want.ino() && m.dev() == want.dev())
+        })
+        .count()
 }
 
 // --- cuts and Ctrl-C (1, 2) ---------------------------------------------------
@@ -1332,13 +1383,20 @@ fn compact_child() {
     let pause = |stray_fd: bool| {
         let db = db.clone();
         move |p: Phase, _: &Connection| {
-            if p == Phase::Verified {
-                if stray_fd {
-                    drop(std::fs::File::open(&db).unwrap());
-                }
-                std::fs::write(signal(&db, "ready"), b"").unwrap();
-                wait_for(&db, "go");
+            let at = match p {
+                Phase::Verified => "verified",
+                Phase::BeforeRename if !stray_fd => "rename",
+                _ => return Ok(()),
+            };
+            if stray_fd {
+                drop(std::fs::File::open(&db).unwrap());
+            } else {
+                // I2: `H`'s descriptor, and no other.
+                #[cfg(target_os = "linux")]
+                assert_eq!(descriptors_on(&db), 1, "{at}: descriptors on the source");
             }
+            std::fs::write(signal(&db, &format!("ready-{at}")), b"").unwrap();
+            wait_for(&db, &format!("go-{at}"));
             Ok(())
         }
     };
@@ -1367,7 +1425,8 @@ fn compact_child() {
             run(&pause(false)).unwrap();
         }
         "pause-fdclose" => {
-            let _ = run(&pause(true));
+            let out = run(&pause(true)).map(|_| ()).map_err(|e| e.kind);
+            std::fs::write(signal(&db, "outcome"), format!("{out:?}")).unwrap();
         }
         "abort-copied2" => {
             let _ = run(&abort_at(Phase::CopiedTable(2)));
