@@ -316,9 +316,9 @@ instead of losing them. A full reindex is honest about what changed, and reusing
 the vectors of unchanged chunks makes it cost parsing rather than embedding.
 
 **Cost.** `devctx index --full` once per repository and per branch. The
-database grows — the new tables, and free blocks DuckDB does not reclaim — and
-two read paths live side by side until `graph_edges` is dropped in a later
-release.
+database grows — the new tables, and free blocks DuckDB does not reclaim until
+the compaction of ADR-22 — and two read paths live side by side until
+`graph_edges` is dropped in a later release.
 
 ## ADR-21: Graph signals in ranking are opt-in until they are measured to help
 
@@ -337,3 +337,40 @@ laid out as 0.9 laid it out.
 **Cost.** Users who never turn them on never benefit from them. Turned on, they
 change hybrid scores and the brief's contents, which is why they are documented
 as changes, not as tuning.
+
+## ADR-22: Space is given back by a verified copy and an atomic `rename`
+
+**Decision.** After the `devctx index --full` that migrates an index made
+before the graph, and on `devctx compact`, the database is copied row by row
+into `<index>.compact.tmp` with this binary's schema, its HNSW and BM25 indexes
+are rebuilt there, the copy is checked against the original (row counts, a
+checksum of every column of every row, and `EXCEPT ALL` both ways for the
+memories, their references and the sessions), and it replaces the original with
+one `rename`. The client does it with the project's server stopped, never the
+server.
+
+**Why.** A reusing full run deletes and writes again every row of `vectors`,
+and an upgraded index ends at about twice its content. `VACUUM` gives nothing
+back, and a checkpoint only truncates free blocks at the very end of the file.
+DuckDB's `COPY FROM DATABASE` was measured and rejected: it recreates the HNSW
+index with the `l2sq` metric, which the queries then stop using. Copying keeps
+the original untouched until the `rename`, so any failure leaves it as it was.
+
+**Exclusion.** An operating-system lock on a file of its own,
+`<index>.compact.lock`: every `Store::open` holds it shared for as long as the
+store lives, a compaction holds it exclusively. Not DuckDB's lock on the
+database, which is an `fcntl` lock and vanishes the moment the process closes
+*any* descriptor of the file. That lock still does its part: one in-memory
+connection holds the original attached read-only from before the copy until
+after the `rename`, which is what keeps out a binary that does not know the
+lock file (0.9.0), and the compacting process never opens another descriptor of
+the original. Its write-ahead log must be absent, and its size, mtime and inode
+unchanged, both right after the attach and right before the `rename` — DuckDB
+applies a log it finds next to a file without checking it belongs there.
+
+**Cost.** As much free disk as the file while it runs, the server of the
+project stopped for those seconds (announced; only with a terminal, and
+switched off by `DEVCTX_NO_AUTO_COMPACT`), and the HNSW index rebuilt a second
+time on the upgrade. A rebuilt HNSW index is not the same graph, so its
+approximate top-k can differ in a few results; the data and the exact top-k do
+not. Group, ACLs and extended attributes of the file are not carried over.

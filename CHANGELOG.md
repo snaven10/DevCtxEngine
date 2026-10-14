@@ -52,8 +52,18 @@ index --full`**, which reuses the stored vectors.
    not exist is no longer `external` because some `new` is called — it gets
    `suggestions` instead; a `file::name` miss is never `external`; an `external`
    answer carries no `suggestions`. JSON contracts only grew.
-5. **The database grows** (on a 216-file Java repository, 79 → 112 used blocks
-   of 256 KiB, plus 66 free that DuckDB does not reclaim).
+5. **The upgrade compacts the database once.** The `--full` deletes and writes
+   again every vector row and leaves the file at about twice its content; at
+   its end, with a terminal, the CLI announces it, stops the project's server
+   and rewrites the database into a new file (verified against the original,
+   put in place with an atomic `rename`): measured on the two largest upgraded
+   indexes, +8–12 % used blocks and −1 to −10 % bytes against the 0.9.0 index,
+   in 4–9 s. Without a terminal (an agent, a script), with
+   `DEVCTX_NO_AUTO_COMPACT=1`, or if the server had to be killed, it stays owed:
+   the run ends with the line `devctx compact` and `status` reports
+   `compaction.state: "owed"`. It needs as much free disk as the file.
+   Before the `rename` the memories are saved to `<index>.pre-compact.duckdb`
+   (`devctx memories import` restores from it).
 
 The guide, with the measurements and what each tool answers meanwhile:
 `docs/13-keeping-the-index-fresh.md`, *Upgrading to 0.10*.
@@ -73,6 +83,19 @@ for `devctx index --full` again, with vectors reused.
 
 ### Added
 
+- **`devctx compact`** and the compaction after the upgrade (PLAN-009 TASK-018):
+  a copy row by row into a new file with this binary's schema, the HNSW and
+  BM25 indexes rebuilt on it, verified against the original (row counts, a
+  checksum of every column, `EXCEPT ALL` for the memories) and put in place
+  with an atomic `rename`; the original is untouched on any failure. `--dry-run`
+  writes nothing, `--keep-original` keeps a hard link of the original, `--force`
+  rewrites with no free blocks. The memories, their references and the sessions
+  are saved to a sidecar first, and `devctx memories import <sidecar>.duckdb`
+  restores from it. `status` / `index_status` gain a `compaction` block. Every
+  `Store::open` holds a shared lock on `<index>.compact.lock` while it lives
+  and refuses to open during a compaction ("being compacted; retry"). The
+  warning at the end of a full run now fires at 25 % free (and 64 blocks) and
+  recommends `devctx compact`.
 - **The symbol graph** (`symbols` and `edges`, PLAN-009 TASK-003 to TASK-007).
   One row per definition with a stable, branch-free id (`sym`, 16 hex digits),
   its kind (`file`, `module`, `class`, `interface`, `enum`, `record`, `struct`,
@@ -313,9 +336,19 @@ for `devctx index --full` again, with vectors reused.
 - Upgrading a 0.9.0 index in place grows the database more than indexing from
   scratch (field verification: a 1 625-file Java repository 504 → 786 used
   blocks, 153 → 296 MiB; from scratch 0.10 uses 523): the rewrite leaves free
-  blocks DuckDB does not reuse. Indexing from scratch, database size, peak
-  memory and the upgrade time are in
+  blocks DuckDB does not reuse. The compaction after the upgrade gives them
+  back (545–550 blocks, 137–138 MiB); until it runs, `status` says it is owed.
+  Indexing from scratch, database size, peak memory and the upgrade time are in
   [Performance → Indexing cost of 0.10 against 0.9.0](docs/07-performance.md#indexing-cost-of-010-against-090).
+- **Windows: the compaction is not verified there.** devctx cannot stop a
+  server on Windows, so `devctx compact` asks you to stop it, and a file open
+  elsewhere cannot be renamed over; the lock uses the open's share mode,
+  unchecked on a Windows machine (the cross-check of PLAN-009 TASK-019).
+- `devctx repair` can destroy the only copy of a table: cut between its two
+  steps it leaves the rows in `devctx_repair_<table>`, and running it again
+  drops that table first. Do not retry a `repair` that was cut short; the
+  compaction refuses to run while such a table has rows, and says how to copy
+  them back. A fix is planned after 0.10.
 
 ## 0.9.0 — 2026-10-05
 

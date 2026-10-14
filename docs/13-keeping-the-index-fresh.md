@@ -286,8 +286,9 @@ peak on that Java repository).
 
 The database grows. With the full 0.10 graph, a 216-file Java repository went
 from 79 to 112 used blocks of 256 KiB, plus 66 free (2026-10-07); a rewrite
-leaves blocks free that DuckDB does not reuse on its own in this pattern, so
-the file does not shrink back.
+leaves blocks free that DuckDB does not reuse on its own in this pattern, and
+neither `VACUUM` nor a checkpoint gives them back — the compaction below
+does.
 
 The upgrade of a real 0.9.0 index with the 0.10.0 candidate (field
 verification, PLAN-009 TASK-016, 2026-10-12, `ml-granite` on CPU, in place over
@@ -305,9 +306,99 @@ The re-embedded chunks are the ones whose text changed (constructors and
 exported arrow functions that 0.9.0 did not cut out, a class chunk that now
 lists its methods). The upgraded database is larger than one built from
 scratch by 0.10 (the large Java repository: 523 used blocks from scratch, 786
-upgraded): the rewrite leaves blocks DuckDB does not reuse. Reuse needs the
+upgraded): the rewrite deletes and writes again every row of `vectors`, and
+DuckDB does not reuse those blocks — until the compaction. Reuse needs the
 index to stay where it was built: the record is keyed by the repository's path,
 so a copied repository (another directory) re-embeds everything.
+
+### The compaction after the upgrade
+
+Rewriting every vector row leaves the file of an upgraded index at about twice
+what it holds (table above). So, once, after the `devctx index --full` that
+migrates a branch indexed before the graph, devctx **compacts** the database:
+it copies it row by row into a new file next to it, rebuilds the HNSW and BM25
+indexes there, checks the copy against the original, and puts it in place with
+an atomic `rename`.
+
+Measured on copies of the two largest upgraded indexes above (PLAN-009
+TASK-018, 2026-10-13, release build, machine shared, load 3–4):
+
+| Repository | 0.9.0 before the upgrade | After the `--full` | After the compaction | Against 0.9.0 | Time | Peak memory | Extra disk |
+|---|---|---|---|---|---|---|---|
+| a large Java repository | 504 used blocks, 153 MiB | 786, 296 MiB | 545–550, 137–138 MiB | +8–9 % used, −10 % bytes | 7.3–8.5 s | 364–383 MiB | 186 MiB |
+| an Angular workspace | 293, 83 MiB | 463, 171 MiB | 323–327, 81–82 MiB | +10–12 % used, −1 % bytes | 4.4–5.7 s | 267–303 MiB | 104 MiB |
+
+Most of the time is rebuilding the HNSW index (≈45 %) and the BM25 one
+(≈25 %); copying the rows is ≈20 %, verifying the copy under 10 %.
+
+**When it runs by itself.** Only at the end of a `devctx index --full` (or of
+each project of `devctx reindex --full`) that was not cancelled and left the
+note owed, and only:
+
+- with a terminal. Run from an agent or a script it never compacts: it ends
+  with the exact line `devctx compact`, to run later;
+- with `DEVCTX_NO_AUTO_COMPACT` unset;
+- when the checks pass: the file is yours, its directory writable, as much disk
+  available to you as the file's size, and memory for DuckDB's limit plus the
+  HNSW index within 80 % of what is available;
+- with no other indexing run in flight on the server;
+- and if the server it stops leaves cleanly (on SIGTERM, its write-ahead log
+  folded). A server that had to be killed, or a log left behind, leaves the
+  compaction owed.
+
+It says so before stopping the server. Anything that asks for the index
+meanwhile gets "the index is being compacted; retry", and the next request
+starts a new server. Incremental runs, hooks, `watch` and the MCP tool
+`index_repo` never compact: they leave the note, and `status` shows it.
+
+**Owed.** `status` and `index_status` carry a `compaction` block (`state`:
+`none`, `owed`, `owed:failed-verify`, `done`; the used and free blocks; a
+`hint`), and an owed compaction leads the `hint`, in capitals. Run `devctx
+compact`. `owed:failed-verify` means a copy did not match the original, so the
+copy was dropped and the original kept; only `devctx compact` retries it.
+
+**`devctx compact`.** Compacts this project's index on request. `--dry-run`
+shows the blocks, what it would leave and the checks, and writes nothing;
+`--keep-original` keeps the original as `<index>.pre-compact` (a hard link:
+the disk of a second copy); with no free blocks it does nothing unless
+`--force`. It stops the server the same way, and if the server had to be
+killed it folds the write-ahead log first instead of giving up. On Windows
+devctx cannot stop a server: stop it yourself and then run it.
+
+**What "answers the same" means.** The copy holds the same data: every table
+compared by row count and by a checksum of every column of every row, and the
+memories, their symbol references and the sessions also row by row, both ways.
+Exact (brute-force) nearest neighbours are identical. The HNSW index is
+rebuilt, and an approximate index built twice is not the same graph: its top-k
+can differ in a few results (measured: 216 of 300 top-10 lists identical
+between the original and the copy, 260 of 300 between two builds of the same
+copy; recall@10 about 0.96 in all three). Ties in `impact_analysis` may come
+out in another order.
+
+**Safety.** Nothing writes to the original until the `rename`. A failure, a
+Ctrl-C or a crash before it leaves the original as it was; a temporary left
+behind (`<index>.compact.tmp`) is removed by the next open — never while the
+index itself is missing. The file keeps its mode; its group, ACLs and extended
+attributes are not carried over. The lock file `<index>.compact.lock` stays
+next to the index on purpose: deleting a lock file races with whoever has just
+opened it. A filesystem that does not honour file locks (some network and FUSE
+mounts) makes it refuse.
+
+**The memories sidecar.** Before the `rename`, the memories, their symbol
+references and the sessions — what no reindex can rebuild — are saved to
+`<index>.pre-compact.duckdb`, without vectors. The next open removes it after
+30 days, and the next compaction replaces it; if the old one held a memory the
+index no longer has, it is kept as `<index>.pre-compact.<epoch>.duckdb`
+instead, which nothing deletes. To restore from it:
+
+```bash
+devctx serve --stop
+devctx memories import .devctx/state/index.duckdb.pre-compact.duckdb
+```
+
+It adds the memories the index lacks — never overwrites one — with their
+references and sessions, and embeds each again (the sidecar has no vectors, so
+this loads the model).
 
 ### What the tools answer meanwhile
 
@@ -354,7 +445,9 @@ sessions. Then:
 - **Coming back to 0.10** after 0.9.0 indexed files: those files have no symbol
   rows, so `graph_out_of_step` marks the branch stale and asks for `devctx index
   --full` again — with vectors reused.
-- The file keeps its size: free blocks are not reclaimed.
+- A compacted index opens the same way: same DuckDB, every table copied,
+  `graph_edges` included. 0.9.0 does not know the compaction lock; while a
+  compaction runs, DuckDB's own lock on the original keeps it out.
 
 ## What is never indexed
 

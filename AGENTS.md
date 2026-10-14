@@ -248,6 +248,14 @@ Reckon **an hour per ~1400 files** on 8 cores. Things to know:
   final binary come from the release's field verification. Details, what each
   tool answers meanwhile and how to go back to 0.9.0:
   `docs/13-keeping-the-index-fresh.md` (§ *Upgrading to 0.10*).
+- **The `--full` of the upgrade leaves the database file at about twice its
+  content, and the compaction that fixes it never runs without a terminal** —
+  which is your case. The run ends with the line `devctx compact`, and
+  `status` shows `compaction.state: "owed"`. Run `devctx compact` when nothing
+  else needs this project's server: it stops it for the seconds the rewrite
+  takes (7–9 s for a 1 625-file repository), needs as much free disk as the
+  file, and keeps the original intact on any failure. `DEVCTX_NO_AUTO_COMPACT=1`
+  keeps a person's terminal from running it too.
 - **A database that has no HNSW index pays for building it at the first run
   after `storage.hnsw` is on** — over every vector, even if that run only
   changes three files (the run says so). Existing repositories indexed without
@@ -309,6 +317,11 @@ different value.
 **Two `model_dir` keys exist**, under `embeddings:` and under `reranking:`, for
 models of completely different kinds. Setting the reranking one to an embedding
 model makes every search fail with `no output named 'logits'`.
+
+**"The index is being compacted; retry"** is not an error to work around: a
+`devctx compact` holds `<index>.compact.lock` for a few seconds. Wait and
+retry. Do not delete that file — it is meant to stay, and deleting it breaks
+the exclusion it provides.
 
 **Killing processes by matching their command line kills the shell doing the
 matching**, because its own command line contains the pattern. Use

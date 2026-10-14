@@ -157,6 +157,7 @@ la copia del registro.
 | `DEVCTX_EMBED_BATCH_SIZE` | Textos por lote del encoder. Default `8` (era `32` antes de 0.8.5); los lotes corren uno tras otro, así que el pico de memoria escala con este valor. `0` o un valor no numérico vuelve al default. |
 | `DEVCTX_DB_MEMORY_LIMIT` | Presupuesto de memoria de DuckDB por proceso, cualquier literal de tamaño de DuckDB. Default `2GB`. |
 | `DEVCTX_DB_THREADS` | Hilos de trabajo de DuckDB. Default `4`. |
+| `DEVCTX_NO_AUTO_COMPACT` | Nunca compactar sola después del `devctx index --full` que actualiza un índice 0.9; la compactación queda debida (`status` lo dice) hasta `devctx compact`. Sin terminal nunca corre sola de todos modos. |
 | `DEVCTX_MODEL_IDLE_SECS` | Cuánto se mantiene cargado un modelo sin uso, en los servidores de proyecto y en el daemon central (que suelta su embedder y lo recarga en el siguiente `remember` / `recall`). Default `300`; `0` lo mantiene mientras viva el proceso. La adyacencia que cachea `repo_map` se suelta con el mismo plazo. |
 | `DEVCTX_MODEL_STALL_SECS` | Segundos sin crecimiento de la caché de modelos antes de dar una descarga por atascada y fallar (el modelo queda rechazado hasta reiniciar el servidor). Default `120`; `0` desactiva la guardia. |
 | `DEVCTX_INDEX_STALL_SECS` | Cuánto puede pasar una corrida de indexado sin llegar a un archivo nuevo y aun así evitar la salida por inactividad del servidor. Default `900`. |

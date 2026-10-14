@@ -178,7 +178,7 @@ más lento y el repetido 6 % más rápido: ruido de la máquina compartida, no u
 tendencia). 0.10 guarda hasta 3 % más chunks (constructores, funciones flecha
 exportadas) y escribe el grafo de símbolos; el fichero de la base es más grande
 de lo que dicen los bloques usados porque DuckDB deja bloques libres (el Java
-grande: 153 → 174 MiB).
+grande: 153 → 174 MiB; `devctx compact` los devuelve).
 
 **Paso de un índice 0.9.0 real** (`devctx index --full` de 0.10 sobre el índice
 que hizo 0.9.0, en sitio): este repositorio 53 s, el Java 38 s, el Python 4 s,
@@ -188,6 +188,15 @@ camino que desde cero, porque la reescritura deja bloques libres que DuckDB no
 reutiliza: el Java grande pasó de 504 a 786 bloques usados y de 153 a 296 MiB
 en disco, el workspace Angular de 293 a 463 bloques usados y de 83 a 171 MiB.
 Pico de memoria del paso: 169–1 083 MiB, del mismo orden que desde cero.
+
+**La compactación después del paso** (PLAN-009 TASK-018, 2026-10-13, release,
+sobre copias de esos dos índices actualizados) los devuelve: el Java grande a
+545–550 bloques usados y 137–138 MiB (+8–9 % de bloques usados y −10 % de
+bytes contra el índice 0.9.0 de antes del paso), en 7,3–8,5 s con un pico de
+364–383 MiB y 186 MiB de disco extra; el workspace Angular a 323–327 bloques y
+81–82 MiB (+10–12 %, −1 %), en 4,4–5,7 s, 267–303 MiB y 104 MiB. Reconstruir
+los índices HNSW y BM25 es alrededor del 70 % de ese tiempo. Ver
+[La compactación después del paso](13-mantener-el-indice-al-dia.md#la-compactación-después-del-paso).
 
 **El arnés de evaluación** (30 casos sobre los cinco repositorios, mediana de
 tres rondas, `search --no-rerank --limit 20`, brief de 4 096 tokens): búsqueda

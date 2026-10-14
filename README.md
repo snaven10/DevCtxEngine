@@ -189,7 +189,9 @@ away. See [Keeping the index fresh](docs/13-keeping-the-index-fresh.md).
 and a sharper `impact_analysis`) that a 0.9 index does not have: run `devctx
 serve --stop` and then `devctx index --full` once per repository and branch.
 It reuses the stored vectors, so it costs parsing, not embedding; until then the
-graph tools answer the 0.9 way and say so. Details and how to go back: [Upgrading
+graph tools answer the 0.9 way and say so. Its rewrite leaves the database at
+about twice its size, so at the end, from a terminal, it compacts it once
+(seconds; the server is stopped meanwhile); otherwise run `devctx compact`. Details and how to go back: [Upgrading
 to 0.10](docs/13-keeping-the-index-fresh.md#upgrading-to-010-the-symbol-graph).
 
 ## Server mode

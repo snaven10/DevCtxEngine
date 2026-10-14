@@ -342,9 +342,9 @@ completo es honesto sobre lo que cambió, y reusar los vectores de los chunks si
 cambios hace que cueste el parseo y no el embedding.
 
 **Costo.** `devctx index --full` una vez por repositorio y por rama. La base
-crece — las tablas nuevas, y bloques libres que DuckDB no recupera — y dos
-caminos de lectura conviven hasta que `graph_edges` se borre en una versión
-posterior.
+crece — las tablas nuevas, y bloques libres que DuckDB no recupera hasta la
+compactación del ADR-22 — y dos caminos de lectura conviven hasta que
+`graph_edges` se borre en una versión posterior.
 
 ## ADR-21: Las señales de grafo en el ranking son opt-in hasta medir que ayudan
 
@@ -363,3 +363,42 @@ lectura extra del grafo, y el brief armado como lo armaba 0.9.
 **Costo.** Quien nunca las enciende nunca se beneficia de ellas. Encendidas,
 cambian los scores híbridos y el contenido del brief, y por eso se documentan
 como cambios, no como ajuste fino.
+
+## ADR-22: El espacio se devuelve con una copia verificada y un `rename` atómico
+
+**Decisión.** Después del `devctx index --full` que migra un índice hecho antes
+del grafo, y con `devctx compact`, la base se copia fila por fila a
+`<índice>.compact.tmp` con el schema de este binario, se reconstruyen ahí sus
+índices HNSW y BM25, la copia se verifica contra la original (cantidad de
+filas, un checksum de cada columna de cada fila, y `EXCEPT ALL` en los dos
+sentidos para las memorias, sus referencias y las sesiones), y reemplaza a la
+original con un `rename`. Lo hace el cliente con el servidor del proyecto
+parado, nunca el servidor.
+
+**Por qué.** Un `--full` que reusa vectores borra y vuelve a escribir cada fila
+de `vectors`, y un índice actualizado termina en alrededor del doble de su
+contenido. `VACUUM` no devuelve nada, y un checkpoint solo trunca los bloques
+libres del final del fichero. `COPY FROM DATABASE` de DuckDB se midió y se
+descartó: recrea el índice HNSW con la métrica `l2sq`, que las consultas dejan
+de usar. Copiar deja la original intacta hasta el `rename`, así que cualquier
+fallo la deja como estaba.
+
+**Exclusión.** Un lock del sistema operativo sobre un fichero propio,
+`<índice>.compact.lock`: cada `Store::open` lo tiene compartido mientras el
+store vive, una compactación lo tiene en exclusivo. No el lock de DuckDB sobre
+la base, que es un lock `fcntl` y desaparece en cuanto el proceso cierra
+*cualquier* descriptor del fichero. Ese lock igual cumple su parte: una conexión
+en memoria tiene la original adjunta en solo lectura desde antes de la copia
+hasta después del `rename`, que es lo que deja afuera a un binario que no
+conoce el fichero de lock (0.9.0), y el proceso que compacta nunca abre otro
+descriptor de la original. Su write-ahead log tiene que estar ausente, y su
+tamaño, mtime e inodo sin cambios, justo después de adjuntarla y justo antes
+del `rename` — DuckDB aplica un log que encuentra junto a un fichero sin
+comprobar que sea suyo.
+
+**Costo.** Tanto disco libre como el fichero mientras corre, el servidor del
+proyecto parado esos segundos (anunciado; solo con terminal, y apagable con
+`DEVCTX_NO_AUTO_COMPACT`), y el índice HNSW reconstruido una segunda vez en el
+paso. Un HNSW reconstruido no es el mismo grafo, así que su top-k aproximado
+puede cambiar en algunos resultados; los datos y el top-k exacto no. El grupo,
+las ACL y los atributos extendidos del fichero no se copian.
