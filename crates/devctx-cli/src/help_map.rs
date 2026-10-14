@@ -50,7 +50,7 @@ pub fn text(lang: Language) -> String {
 const EN: &str = "\
 Commands by job:
   Set up        init · models · mcp configure · projects add
-  Index         index · reindex · watch · hooks install · status · repair
+  Index         index · reindex · watch · hooks install · status · repair · compact
   Read code     search · symbol · context · map · skeleton · impact · traverse · routes · summarize
   Memory        remember · recall · memory-stats · memory-forget · memories export|import
   Interfaces    tui · web · api · mcp · serve
@@ -77,7 +77,7 @@ Set DEVCTX_LANG=es for this summary in Spanish.";
 const ES: &str = "\
 Comandos por tarea:
   Configurar    init · models · mcp configure · projects add
-  Indexar       index · reindex · watch · hooks install · status · repair
+  Indexar       index · reindex · watch · hooks install · status · repair · compact
   Leer código   search · symbol · context · map · skeleton · impact · traverse · routes · summarize
   Memoria       remember · recall · memory-stats · memory-forget · memories export|import
   Interfaces    tui · web · api · mcp · serve
@@ -122,6 +122,15 @@ mod tests {
             ] {
                 assert!(t.contains(cmd), "{cmd} missing from the {lang:?} map");
             }
+        }
+    }
+
+    /// PLAN-009 TASK-018: `compact` is what `status` and the upgrade tell
+    /// people to run; the map lists it in both languages.
+    #[test]
+    fn the_map_lists_compact() {
+        for lang in [Language::En, Language::Es] {
+            assert!(text(lang).contains("repair · compact"), "{lang:?}");
         }
     }
 
