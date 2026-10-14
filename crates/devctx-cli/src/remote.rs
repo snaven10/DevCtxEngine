@@ -781,29 +781,78 @@ pub fn reclaim_db(cfg: &ProjectConfig) -> bool {
 }
 
 fn reclaim_db_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> bool {
+    reclaim_db_report_with(cfg, term, kill).stopped()
+}
+
+/// How [`reclaim_db_report`] left this project's server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reclaim {
+    /// None was advertised, or the advertised one was already gone.
+    NoServer,
+    /// It left on SIGTERM: it had the chance to fold its WAL.
+    Stopped,
+    /// It left only on SIGKILL: it may have left a WAL behind.
+    Killed,
+    /// It is still there (or cannot be vouched for), with the reason.
+    NotStopped(String),
+}
+
+impl Reclaim {
+    /// A server was there and is gone now, however it left.
+    pub fn stopped(&self) -> bool {
+        matches!(self, Reclaim::Stopped | Reclaim::Killed)
+    }
+
+    /// Nothing holds the database any more, and nothing was killed to get
+    /// there: what a compaction needs (PLAN-009 TASK-018).
+    #[allow(dead_code)] // the compaction trigger lands in a later commit
+    pub fn clean(&self) -> bool {
+        matches!(self, Reclaim::NoServer | Reclaim::Stopped)
+    }
+}
+
+/// [`reclaim_db`], saying how the server left: a compaction must not replace
+/// the file after one that had to be killed (PLAN-009 TASK-018).
+#[allow(dead_code)] // the compaction trigger lands in a later commit
+pub fn reclaim_db_report(cfg: &ProjectConfig) -> Reclaim {
+    reclaim_db_report_with(cfg, TERM_WAIT, KILL_WAIT)
+}
+
+fn reclaim_db_report_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> Reclaim {
     let Ok(raw) = std::fs::read(serve_file(cfg)) else {
-        return false;
+        return Reclaim::NoServer;
     };
     let Ok(info) = serde_json::from_slice::<ServeInfo>(&raw) else {
-        return false;
+        return Reclaim::NoServer;
     };
     match ownership(cfg, &info) {
         Ownership::Gone => {
             // Dead, or recycled into something else: the advertisement is stale.
             remove_serve_file(cfg);
-            false
+            Reclaim::NoServer
         }
         // A live server we cannot vouch for keeps its own file.
-        Ownership::Unverified => false,
+        Ownership::Unverified => Reclaim::NotStopped(unverified_message(
+            info.pid.unwrap_or_default(),
+            &serve_file(cfg),
+            "devctx server",
+        )),
         Ownership::Ours => {
             // The file goes only with the process: dropping it while the server
             // lives leaves it unadvertised and holding the lock.
             let term = term_wait_for(&info, term);
-            if terminate_ours(cfg, &info, term, kill).is_gone() {
+            let out = terminate_ours(cfg, &info, term, kill);
+            if out.is_gone() {
                 remove_serve_file(cfg);
-                true
-            } else {
-                false
+            }
+            match out {
+                procown::Termination::Gone => Reclaim::Stopped,
+                procown::Termination::Killed => Reclaim::Killed,
+                other => Reclaim::NotStopped(
+                    other
+                        .failure("server", info.pid.unwrap_or_default())
+                        .unwrap_or_default(),
+                ),
             }
         }
     }
@@ -2257,6 +2306,61 @@ mod tests {
         ));
         assert!(!child.wait().unwrap().success(), "it must have been killed");
         assert!(!serve_file(&cfg).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-018: a compaction replaces the file only after a server
+    /// that left on SIGTERM; one that had to be killed may have left a WAL.
+    /// The report says which.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reclaim_reports_a_killed_server_apart_from_a_clean_stop() {
+        let dir = scratch("reclaim_report_kill");
+        let cfg = cfg_at(&dir);
+        let mut child = fake_server(
+            &dir.join("srv"),
+            "trap '' TERM\nwhile :; do sleep 1; done\n",
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        advertise_at(
+            &cfg,
+            closed_port(),
+            child.id(),
+            procown::start_time(child.id()),
+        );
+        let out = reclaim_db_report_with(&cfg, Duration::from_millis(400), Duration::from_secs(3));
+        assert_eq!(out, Reclaim::Killed);
+        assert!(out.stopped() && !out.clean());
+        let _ = child.wait();
+        assert!(!serve_file(&cfg).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("reclaim_report_clean");
+        let cfg = cfg_at(&dir);
+        let mut child = fake_server(
+            &dir.join("srv"),
+            "trap 'exit 0' TERM\nwhile :; do sleep 0.1; done\n",
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        advertise_at(
+            &cfg,
+            closed_port(),
+            child.id(),
+            procown::start_time(child.id()),
+        );
+        let out = reclaim_db_report_with(&cfg, Duration::from_secs(3), Duration::from_secs(3));
+        assert_eq!(out, Reclaim::Stopped);
+        assert!(out.clean());
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Nothing advertised: nothing to stop.
+        let dir = scratch("reclaim_report_none");
+        let cfg = cfg_at(&dir);
+        assert_eq!(
+            reclaim_db_report_with(&cfg, Duration::from_millis(100), Duration::from_millis(100)),
+            Reclaim::NoServer
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

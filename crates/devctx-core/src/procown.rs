@@ -702,8 +702,13 @@ fn wait_until(mut done: impl FnMut() -> bool, limit: Duration) -> bool {
 /// How [`terminate`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Termination {
-    /// The process has exited (or was never ours to stop).
+    /// The process has exited on its own after SIGTERM (or was never ours to
+    /// stop): it had the chance to fold its WAL.
     Gone,
+    /// The process has exited, but only after SIGKILL: whatever it was doing
+    /// was cut short, and a database it held may have kept a WAL (PLAN-009
+    /// TASK-018). Gone all the same — [`is_gone`](Self::is_gone) says so.
+    Killed,
     /// Still alive after SIGTERM and SIGKILL.
     Survived,
     /// The kernel refused the signal (`EPERM`): another user's or a `sudo`
@@ -716,14 +721,20 @@ pub enum Termination {
 }
 
 impl Termination {
+    /// The process is gone, however it left.
     pub fn is_gone(self) -> bool {
+        matches!(self, Termination::Gone | Termination::Killed)
+    }
+
+    /// The process left on SIGTERM, without needing SIGKILL.
+    pub fn exited_cleanly(self) -> bool {
         self == Termination::Gone
     }
 
     /// The sentence for a stop that did not stop it; `None` when it did.
     pub fn failure(self, what: &str, pid: u32) -> Option<String> {
         match self {
-            Termination::Gone => None,
+            Termination::Gone | Termination::Killed => None,
             Termination::Survived => Some(format!("{what} {pid} survived SIGTERM and SIGKILL")),
             Termination::NoPermission => Some(format!(
                 "no permission to signal PID {pid} (it belongs to another user, or runs as root)"
@@ -850,7 +861,7 @@ fn terminate_with(
     #[cfg(unix)]
     {
         if wait(handle, kill_wait, &owns) {
-            Termination::Gone
+            Termination::Killed
         } else {
             Termination::Survived
         }
@@ -1302,6 +1313,71 @@ mod tests {
             started.elapsed()
         );
         assert!(exited(pid, t0), "the process must be dead on return");
+        let _ = c.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-018: whoever replaces the database file after a stop
+    /// must know whether the process left on SIGTERM (it folded its WAL) or
+    /// had to be killed (it may have left one). Both are gone; only one is
+    /// clean.
+    #[test]
+    fn a_process_ended_by_sigkill_is_reported_as_killed_not_as_a_clean_exit() {
+        let handle = Handle::open(u32::MAX - 1);
+        let sent = std::cell::RefCell::new(Vec::new());
+        let out = terminate_with(
+            &handle,
+            || true,
+            Duration::from_millis(100),
+            (&|| false, Duration::ZERO),
+            Duration::from_millis(100),
+            // It exits only once SIGKILL has been sent.
+            |_, _, _| sent.borrow().contains(&libc::SIGKILL),
+            |_, sig| {
+                sent.borrow_mut().push(sig);
+                Ok(())
+            },
+        );
+        assert_eq!(out, Termination::Killed);
+        assert!(out.is_gone(), "killed is still gone");
+        assert!(!out.exited_cleanly());
+        assert!(out.failure("server", 7).is_none(), "the stop did stop it");
+
+        // The same process leaving on SIGTERM is a clean exit.
+        let sent = std::cell::RefCell::new(Vec::new());
+        let out = terminate_with(
+            &handle,
+            || true,
+            Duration::from_millis(100),
+            (&|| false, Duration::ZERO),
+            Duration::from_millis(100),
+            |_, _, _| sent.borrow().contains(&libc::SIGTERM),
+            |_, sig| {
+                sent.borrow_mut().push(sig);
+                Ok(())
+            },
+        );
+        assert_eq!(out, Termination::Gone);
+        assert!(out.exited_cleanly());
+    }
+
+    /// The same, with a real process that ignores SIGTERM.
+    #[test]
+    fn a_real_process_that_ignores_sigterm_is_reported_killed() {
+        let dir = tmp("killed");
+        let mut c = fake_server(&dir, "trap '' TERM\nwhile :; do sleep 1; done\n");
+        let pid = c.id();
+        assert!(wait_until(|| is_server_pid(pid), Duration::from_secs(3)));
+        let t = start_time(pid);
+        std::thread::sleep(Duration::from_millis(300));
+        let owns = || classify(pid, t, |_| false) == Ownership::Ours;
+        let out = terminate(
+            pid,
+            owns,
+            Duration::from_millis(500),
+            Duration::from_secs(3),
+        );
+        assert_eq!(out, Termination::Killed);
         let _ = c.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
