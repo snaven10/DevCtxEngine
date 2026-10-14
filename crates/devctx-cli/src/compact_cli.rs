@@ -212,6 +212,14 @@ fn print_report(r: &CompactReport) {
         r.before.used,
         r.after.used
     );
+    eprintln!(
+        "  {}",
+        r.phases
+            .iter()
+            .map(|(name, s)| format!("{name} {s:.1} s"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    );
     if !r.null_filled.is_empty() {
         eprintln!(
             "  columns this version added, left empty: {}",
