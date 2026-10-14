@@ -10,6 +10,7 @@ pub mod exe;
 pub mod fallback;
 pub mod gitenv;
 pub mod hits;
+pub mod interrupt;
 pub mod kind;
 pub mod modelload;
 pub mod plans;

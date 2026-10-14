@@ -4485,4 +4485,161 @@ public class A extends B implements C {
         assert_eq!(upstream[1..], [("svc.py".to_string(), 2)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // --- PLAN-009 TASK-018: the compaction note (tests 20-24) ---------------
+
+    fn compaction_note(store: &Store) -> Option<String> {
+        store
+            .get_index_meta("", "", devctx_store::compact::COMPACTION_META_KEY)
+            .unwrap()
+    }
+
+    /// Make a branch look as 0.9.0 left it: an extractor stamp of before the
+    /// graph (`v1-…`, what 0.8.3-0.9.x wrote).
+    fn stamp_pre_graph(store: &Store, root: &Path, branch: &str) {
+        let repo_path = crate::git::GitRepo::open(root)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .into_owned();
+        store
+            .set_index_meta(
+                &repo_path,
+                branch,
+                devctx_store::EXTRACTOR_META_KEY,
+                "v1-0123456789abcdef",
+            )
+            .unwrap();
+    }
+
+    fn set_note(store: &Store, value: &str) {
+        store
+            .set_index_meta("", "", devctx_store::compact::COMPACTION_META_KEY, value)
+            .unwrap();
+    }
+
+    /// 20: a full run over a pre-graph branch that already existed owes a
+    /// compaction, and says so; an incremental run over it does not touch the
+    /// note, nor does a full run over a 0.10 index.
+    #[test]
+    fn a_full_run_over_a_pre_graph_branch_owes_a_compaction() {
+        let dir = five_file_repo("compact_owed");
+        let store = Store::open_in_memory(8).unwrap();
+        let first = index(&store, &dir);
+        assert!(first.full_reindex);
+        assert_eq!(compaction_note(&store), None, "a new index owes nothing");
+        assert_eq!(first.compaction, None);
+
+        stamp_pre_graph(&store, &dir, "main");
+        write(&dir, "m0.py", "def f0():\n    return 10\n");
+        commit_all(&dir, "change");
+        let inc = index(&store, &dir);
+        assert!(!inc.full_reindex);
+        assert_eq!(compaction_note(&store), None, "incremental");
+
+        let full = index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        assert_eq!(full.compaction.as_deref(), Some("owed:upgrade"));
+
+        set_note(&store, "done:0.10.0:1:upgrade");
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(
+            compaction_note(&store).as_deref(),
+            Some("done:0.10.0:1:upgrade"),
+            "a full run over a 0.10 index"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 21: a new branch on a 0.9.0 database does not touch the note (nor burn
+    /// the `done`); the migration of the branch that existed does.
+    #[test]
+    fn a_new_branch_does_not_touch_the_note() {
+        let dir = two_branch_repo("compact_newbranch");
+        let store = Store::open_in_memory(8).unwrap();
+        index_branch(&store, &dir, "main", true);
+        stamp_pre_graph(&store, &dir, "main");
+        set_note(&store, "done:0.10.0:1:upgrade");
+        index_branch(&store, &dir, "feature", true);
+        assert_eq!(
+            compaction_note(&store).as_deref(),
+            Some("done:0.10.0:1:upgrade")
+        );
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 22: a `done` does not block a later migration; and a repository with no
+    /// parseable file (no `symbols` rows) does not owe one on every full run.
+    #[test]
+    fn a_done_note_is_rearmed_and_a_graphless_repo_owes_nothing() {
+        let dir = five_file_repo("compact_rearm");
+        let store = Store::open_in_memory(8).unwrap();
+        index(&store, &dir);
+        stamp_pre_graph(&store, &dir, "main");
+        index_branch(&store, &dir, "main", true);
+        set_note(&store, "done:0.10.0:1:upgrade");
+        stamp_pre_graph(&store, &dir, "main");
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_compact_docs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write(&dir, "README.md", "# notes\n");
+        commit_all(&dir, "docs");
+        let store = Store::open_in_memory(8).unwrap();
+        index(&store, &dir);
+        index_branch(&store, &dir, "main", true);
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 23: the note is written when the run starts, so a cancelled migration
+    /// leaves it owed.
+    #[test]
+    fn a_cancelled_migration_leaves_the_compaction_owed() {
+        let dir = five_file_repo("compact_cancel");
+        let store = Store::open_in_memory(8).unwrap();
+        index(&store, &dir);
+        stamp_pre_graph(&store, &dir, "main");
+        let sink = CancelAfter::new(1);
+        let res = run_with(&store, &dir, true, &sink);
+        assert!(res.cancelled);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 24: two pre-graph branches: each migration rearms the note.
+    #[test]
+    fn each_pre_graph_branch_rearms_the_note() {
+        let dir = two_branch_repo("compact_two");
+        let store = Store::open_in_memory(8).unwrap();
+        index_branch(&store, &dir, "main", true);
+        index_branch(&store, &dir, "feature", true);
+        stamp_pre_graph(&store, &dir, "main");
+        stamp_pre_graph(&store, &dir, "feature");
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        set_note(&store, "done:0.10.0:1:upgrade");
+        index_branch(&store, &dir, "feature", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The store and the index agree on the names of the notes a compaction
+    /// clears.
+    #[test]
+    fn the_pending_notes_are_named_alike_in_both_crates() {
+        assert_eq!(
+            devctx_store::compact::PENDING_HNSW_KEY,
+            PENDING_HNSW_META_KEY
+        );
+        assert_eq!(devctx_store::compact::PENDING_FTS_KEY, PENDING_FTS_META_KEY);
+    }
 }

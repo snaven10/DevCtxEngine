@@ -240,6 +240,11 @@ pub struct IndexResult {
     /// starts from the same commit and the content-hash check skips the files
     /// this one already did.
     pub cancelled: bool,
+    /// The database's compaction note after the run (PLAN-009 TASK-018):
+    /// `owed:upgrade` once a full run migrated a pre-graph branch that already
+    /// existed, until `devctx compact` (or the automatic one after `devctx
+    /// index --full`) rewrites the file.
+    pub compaction: Option<String>,
 }
 
 /// Run the indexing pipeline against the repository containing `repo_root`.
@@ -391,6 +396,30 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     } else {
         Vec::new()
     };
+
+    // PLAN-009 TASK-018: a full run that migrates a branch indexed before the
+    // graph — one that already existed (a record or file rows) and whose
+    // extractor stamp is of before it (`v1-…`, 0.8.3-0.9.x) or absent (up to
+    // 0.8.2) — leaves the database owing one compaction: rewriting every
+    // vector row leaves the file at ~2x. Written when the run *starts*, so a
+    // cancelled migration leaves it owed, and over any `done` (a later
+    // migration of another branch rearms it). A new branch, or one a 0.10
+    // binary stamped, never touches it.
+    if full_reindex {
+        let stamp = req
+            .store
+            .get_index_meta(&repo_path, &branch, EXTRACTOR_META_KEY)?;
+        let pre_graph = stamp.as_deref().is_none_or(|s| s.starts_with("v1-"));
+        let existed = prev.is_some() || !prev_files.is_empty();
+        if pre_graph && existed {
+            req.store.set_index_meta(
+                "",
+                "",
+                devctx_store::compact::COMPACTION_META_KEY,
+                devctx_store::compact::COMPACTION_OWED_UPGRADE,
+            )?;
+        }
+    }
 
     let mut ctx = Ctx {
         store: req.store,
@@ -863,12 +892,24 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
     // Rebuilding here is not an option — it needs exclusive access to a database
     // this process is serving — so say it instead. Silence is what let a
     // thirteen-fold file go unremarked.
-    if !req.incremental {
-        if let Some(ratio) = req.store.bloat_ratio() {
-            if ratio >= BLOAT_WARN_RATIO {
+    result.compaction = req
+        .store
+        .get_index_meta("", "", devctx_store::compact::COMPACTION_META_KEY)
+        .ok()
+        .flatten();
+    // Owed after an upgrade: the command that ran this says what to do.
+    let owed = result
+        .compaction
+        .as_deref()
+        .is_some_and(|n| n.starts_with("owed:"));
+    if !req.incremental && !owed {
+        if let Some(u) = req.store.block_usage() {
+            if u.worth_compacting() {
                 eprintln!(
-                    "· the index file is about {ratio:.0}× the size of what it holds; \
-                     `devctx repair` rebuilds it and gives the space back"
+                    "· {} MiB of the index file ({:.0} %) are free space a full run left \
+                     behind; `devctx compact` gives it back",
+                    (u.free * u.block_size) >> 20,
+                    100.0 * u.free as f64 / (u.used + u.free) as f64
                 );
             }
         }
@@ -876,12 +917,6 @@ pub fn run(req: IndexRequest) -> Result<IndexResult> {
 
     Ok(result)
 }
-
-/// How much bigger than its contents the file has to be before saying so.
-///
-/// Some overhead is normal — indexes, page alignment, a little slack. Three is
-/// past all of that and into "a full run left its old rows behind".
-const BLOAT_WARN_RATIO: f64 = 3.0;
 
 /// DevCtxEngine's own working directories, which must never be indexed.
 ///

@@ -103,6 +103,28 @@ impl BlockUsage {
     }
 }
 
+impl Store {
+    /// Used and free blocks of this database, `None` in memory or when
+    /// DuckDB will not say.
+    pub fn block_usage(&self) -> Option<BlockUsage> {
+        self.conn
+            .query_row(
+                "SELECT block_size, used_blocks, free_blocks FROM pragma_database_size() \
+                 WHERE database_name = current_database()",
+                [],
+                |r| {
+                    Ok(BlockUsage {
+                        block_size: r.get::<_, i64>(0)?.max(0) as u64,
+                        used: r.get::<_, i64>(1)?.max(0) as u64,
+                        free: r.get::<_, i64>(2)?.max(0) as u64,
+                    })
+                },
+            )
+            .ok()
+            .filter(|u| u.used > 0)
+    }
+}
+
 /// Where a compaction is. The hooks of the tests stop, break or cancel it at
 /// each of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

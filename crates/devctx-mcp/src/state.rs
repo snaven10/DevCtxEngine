@@ -1385,6 +1385,11 @@ fn do_index_inner(
         "symbols": res.symbols,
         "chunks": res.chunks,
     });
+    // PLAN-009 TASK-018: the client that asked for this run decides whether
+    // to compact (never this server), from this note.
+    if let Some(note) = &res.compaction {
+        report["compaction"] = json!(note);
+    }
     if res.extractor_stale {
         report["extractor_stale"] = json!(true);
         report["hint"] = json!(
@@ -1550,6 +1555,60 @@ fn no_record_hint(indexed_branches: &[String], chosen: &BranchChoice, current: &
     }
 }
 
+/// The `compaction` block of `status` / `index_status` (PLAN-009 TASK-018):
+/// the database's note, its used and free blocks, and a hint when a
+/// compaction is owed (loud: it starts in capitals) or would give space back.
+pub fn compaction_json(store: &Store) -> serde_json::Value {
+    use devctx_store::compact::{
+        COMPACTION_META_KEY, COMPACTION_OWED_FAILED_VERIFY, COMPACTION_OWED_UPGRADE,
+    };
+    let note = store
+        .get_index_meta("", "", COMPACTION_META_KEY)
+        .ok()
+        .flatten();
+    let usage = store.block_usage();
+    let state = match note.as_deref() {
+        None => "none".to_string(),
+        Some(COMPACTION_OWED_UPGRADE) => "owed".to_string(),
+        Some(COMPACTION_OWED_FAILED_VERIFY) => COMPACTION_OWED_FAILED_VERIFY.to_string(),
+        Some(n) if n.starts_with("done:") => "done".to_string(),
+        Some(other) => other.to_string(),
+    };
+    let free_mib = usage.map(|u| (u.free * u.block_size) >> 20);
+    let file_mib = usage.map(|u| ((u.used + u.free) * u.block_size) >> 20);
+    let about = match (free_mib, file_mib) {
+        (Some(f), Some(t)) => format!(" ({f} of its {t} MiB are free space)"),
+        _ => String::new(),
+    };
+    let hint = match state.as_str() {
+        "owed" => Some(format!(
+            "COMPACTION OWED: this index was upgraded from a version without the symbol graph, \
+             and the upgrade left its file at about twice what it holds{about}. Run `devctx \
+             compact`: it stops this project's server for the few seconds the rewrite takes and \
+             needs as much free disk as the file"
+        )),
+        "owed:failed-verify" => Some(
+            "COMPACTION FAILED VERIFICATION: the last compaction's copy failed verification \
+             against the index, so it was dropped and the index left as it was. Run `devctx compact` to retry; if \
+             it fails again, report it"
+                .to_string(),
+        ),
+        _ if usage.is_some_and(|u| u.worth_compacting()) => Some(format!(
+            "the index file has free space a full run left behind{about}; `devctx compact` \
+             gives it back"
+        )),
+        _ => None,
+    };
+    json!({
+        "state": state,
+        "note": note,
+        "used_blocks": usage.map(|u| u.used),
+        "free_blocks": usage.map(|u| u.free),
+        "block_size": usage.map(|u| u.block_size),
+        "hint": hint,
+    })
+}
+
 /// `index_status` tool: report the last-indexed record for the repo/branch.
 pub fn do_index_status(state: &AppState) -> Result<String, String> {
     let store = state.open_store()?;
@@ -1631,6 +1690,19 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
     };
     // Aditive (PLAN-010 DD-1); reads state, loads nothing.
     value["memory"] = state.memory_json(&store);
+    // Aditive (PLAN-009 TASK-018). An owed compaction also leads the hint.
+    let compaction = compaction_json(&store);
+    if compaction["state"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("owed"))
+    {
+        let lead = compaction["hint"].as_str().unwrap_or_default().to_string();
+        value["hint"] = json!(match value["hint"].as_str() {
+            Some(rest) => format!("{lead}. Also: {rest}"),
+            None => lead,
+        });
+    }
+    value["compaction"] = compaction;
     Ok(value.to_string())
 }
 
@@ -7451,6 +7523,42 @@ mod tests {
         cfg.project.path = root.to_string_lossy().into_owned();
         cfg.state_dir = root.join(".devctx/state").to_string_lossy().into_owned();
         (AppState::build(cfg).unwrap(), root)
+    }
+
+    /// PLAN-009 TASK-018 test 28: `status` tells apart a compaction owed by an
+    /// upgrade, one whose verification failed, one done, and none — each
+    /// with its own hint, the owed ones loud.
+    #[test]
+    fn status_tells_the_compaction_states_apart() {
+        let store = Store::open_in_memory(GRAPH_DIM).unwrap();
+        let key = devctx_store::compact::COMPACTION_META_KEY;
+        let none = compaction_json(&store);
+        assert_eq!(none["state"], "none", "{none}");
+        assert!(none["hint"].is_null(), "{none}");
+
+        store.set_index_meta("", "", key, "owed:upgrade").unwrap();
+        let owed = compaction_json(&store);
+        assert_eq!(owed["state"], "owed", "{owed}");
+        let h = owed["hint"].as_str().unwrap();
+        assert!(h.starts_with("COMPACTION OWED"), "{h}");
+        assert!(h.contains("devctx compact"), "{h}");
+
+        store
+            .set_index_meta("", "", key, "owed:failed-verify")
+            .unwrap();
+        let failed = compaction_json(&store);
+        assert_eq!(failed["state"], "owed:failed-verify", "{failed}");
+        let h = failed["hint"].as_str().unwrap();
+        assert!(h.contains("failed verification"), "{h}");
+        assert!(h.contains("devctx compact"), "{h}");
+
+        store
+            .set_index_meta("", "", key, "done:0.10.0:1700000000:upgrade")
+            .unwrap();
+        let done = compaction_json(&store);
+        assert_eq!(done["state"], "done", "{done}");
+        assert_eq!(done["note"], "done:0.10.0:1700000000:upgrade");
+        assert!(done["hint"].is_null(), "{done}");
     }
 
     /// PLAN-009 TASK-018 test 4: the server (and every tool that rebuilds its

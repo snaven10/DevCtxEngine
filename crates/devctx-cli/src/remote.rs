@@ -813,7 +813,6 @@ impl Reclaim {
 
 /// [`reclaim_db`], saying how the server left: a compaction must not replace
 /// the file after one that had to be killed (PLAN-009 TASK-018).
-#[allow(dead_code)] // the compaction trigger lands in a later commit
 pub fn reclaim_db_report(cfg: &ProjectConfig) -> Reclaim {
     reclaim_db_report_with(cfg, TERM_WAIT, KILL_WAIT)
 }
