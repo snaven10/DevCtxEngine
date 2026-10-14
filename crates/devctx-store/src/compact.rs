@@ -1414,6 +1414,92 @@ fn write_sidecar(h: &Connection, paths: &CompactPaths) -> CResult<Option<PathBuf
     Ok(kept)
 }
 
+/// What a database is, read without writing anything (`devctx compact
+/// --dry-run`, and the numbers before a compaction when no server runs).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct Inspection {
+    /// Blocks.
+    pub usage: BlockUsage,
+    /// Bytes of the file.
+    pub bytes: u64,
+    /// Metric of its HNSW index, if any.
+    pub hnsw: Option<String>,
+    /// The HNSW index's estimated size (vectors x width x 4).
+    pub hnsw_bytes: Option<u64>,
+    /// Whether it has a BM25 index.
+    pub fts: bool,
+    /// Its compaction note.
+    pub note: Option<String>,
+}
+
+/// Read `db` through a read-only `ATTACH` from an in-memory connection:
+/// creates no file next to it and writes nothing. Fails while another
+/// process holds it for writing (ask its server instead).
+pub fn inspect(db: &Path) -> CResult<Inspection> {
+    let paths = CompactPaths::for_db(db);
+    let bytes = std::fs::metadata(&paths.db)
+        .map_err(|_| {
+            CompactError::new(
+                FailKind::Preflight,
+                format!("there is no index at {}", paths.db.display()),
+            )
+        })?
+        .len();
+    let c = Connection::open_in_memory().map_err(engine)?;
+    let _ = load_extensions(&c);
+    c.execute_batch(&format!("ATTACH {} AS src (READ_ONLY);", lit(&paths.db)?))
+        .map_err(engine)?;
+    let usage = usage(&c, "src")?;
+    let hnsw = query_strings(
+        &c,
+        "SELECT index_name FROM duckdb_indexes() WHERE database_name = 'src' \
+         AND table_name = 'vectors' AND index_name LIKE 'idx_vectors_hnsw%'",
+    )?
+    .first()
+    .map(|n| match n.rsplit_once("hnsw_") {
+        Some((_, m)) => m.to_string(),
+        None => "cosine".to_string(),
+    });
+    let width = query_strings(
+        &c,
+        "SELECT data_type FROM duckdb_columns() WHERE database_name = 'src' \
+         AND table_name = 'vectors' AND column_name = 'vector'",
+    )?
+    .first()
+    .and_then(|t| {
+        let open = t.find('[')?;
+        let close = t[open..].find(']')?;
+        t[open + 1..open + close].trim().parse::<u64>().ok()
+    })
+    .unwrap_or(0);
+    let rows = query_u64(&c, "SELECT count(*) FROM src.main.vectors").unwrap_or(0);
+    let fts = query_u64(
+        &c,
+        &format!(
+            "SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'src' \
+             AND schema_name = '{FTS_SCHEMA}'"
+        ),
+    )? > 0;
+    let note = query_strings(
+        &c,
+        &format!(
+            "SELECT value FROM src.main.index_meta WHERE repo_path = '' AND branch = '' \
+             AND key = '{COMPACTION_META_KEY}'"
+        ),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .next();
+    Ok(Inspection {
+        usage,
+        bytes,
+        hnsw_bytes: hnsw.as_ref().map(|_| rows * width * 4),
+        hnsw,
+        fts,
+        note,
+    })
+}
+
 /// What [`restore_from_sidecar`] put back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreReport {

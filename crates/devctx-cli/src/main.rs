@@ -104,6 +104,22 @@ enum Command {
     },
     /// Repair an index left inconsistent by an unclean shutdown.
     Repair,
+    /// Rewrite the index into a new file to give back the space full runs
+    /// leave behind (stops this project's server while it runs). The original
+    /// stays in place on any failure; the memories are saved next to it first.
+    Compact {
+        /// Show what it would do (blocks, free space, the checks), and do
+        /// nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Rewrite it even with no free space to give back.
+        #[arg(long)]
+        force: bool,
+        /// Keep the original as `<index>.pre-compact` (a hard link: needs as
+        /// much disk again).
+        #[arg(long)]
+        keep_original: bool,
+    },
     /// Semantic search across the indexed code.
     Search {
         /// The search query.
@@ -616,6 +632,11 @@ fn main() -> Result<()> {
         Command::Status => cmd_status(),
         Command::Index { full, branch } => cmd_index(full, branch),
         Command::Repair => cmd_repair(),
+        Command::Compact {
+            dry_run,
+            force,
+            keep_original,
+        } => cmd_compact(dry_run, force, keep_original),
         Command::Search {
             query,
             limit,
@@ -3214,6 +3235,10 @@ fn cmd_memories_export(scope: &str, repo: Option<&str>) -> Result<()> {
 /// `devctx memories import` — add memories from a JSONL file.
 fn cmd_memories_import(file: &std::path::Path, scope: Option<&str>, dry_run: bool) -> Result<()> {
     let cfg = load_project()?;
+    // A compaction's sidecar (PLAN-009 TASK-018): a DuckDB file, not JSONL.
+    if file.extension().is_some_and(|e| e == "duckdb") {
+        return restore_memories_from_sidecar(&cfg, file, dry_run);
+    }
     let raw =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
 
@@ -3316,6 +3341,42 @@ fn cmd_memories_import(file: &std::path::Path, scope: Option<&str>, dry_run: boo
             }
         }
     }
+    Ok(())
+}
+
+/// `devctx memories import <index>.pre-compact.duckdb`: put back the memories
+/// a compaction saved that the index lacks, embedding each again (the
+/// sidecar has no vectors). Only ever adds.
+fn restore_memories_from_sidecar(
+    cfg: &ProjectConfig,
+    side: &std::path::Path,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        bail!("--dry-run is for JSONL files; a sidecar restore only ever adds, run it without");
+    }
+    let store = open_store(cfg, configured_dimension(cfg))
+        .context("opening the store (stop a running server first: `devctx serve --stop`)")?;
+    let mut embedder: Option<Box<dyn EmbeddingProvider>> = None;
+    let report = devctx_store::compact::restore_from_sidecar(&store, side, &mut |m| {
+        if embedder.is_none() {
+            embedder = Some(
+                build_embedder(cfg)
+                    .map_err(|e| devctx_store::StoreError::Decode(format!("{e:#}")))?,
+            );
+        }
+        let e = embedder.as_deref().expect("just built");
+        devctx_memory::index_memory_vectors(&store, e, m)
+            .map_err(|e| devctx_store::StoreError::Decode(e.to_string()))
+    })?;
+    println!(
+        "restored {} memories from {} · {} already present · {} symbol references · {} sessions",
+        report.added,
+        side.display(),
+        report.already,
+        report.refs,
+        report.sessions
+    );
     Ok(())
 }
 
@@ -4263,6 +4324,121 @@ fn cmd_repair() -> Result<()> {
         None => println!("  no vectors table was present"),
     }
     println!("Run `devctx index` to confirm.");
+    Ok(())
+}
+
+/// `devctx compact` (PLAN-009 TASK-018, Paso 4).
+fn cmd_compact(dry_run: bool, force: bool, keep_original: bool) -> Result<()> {
+    use devctx_store::compact;
+    let cfg = load_project()?;
+    let db = cfg.db_path();
+    if !db.exists() {
+        println!("Nothing to compact: no index at {}.", db.display());
+        return Ok(());
+    }
+    // The numbers come from the server when one holds the file (opening it
+    // here would fail), or from a read-only look that writes nothing.
+    let server = remote::discover(&cfg);
+    let (usage, bytes, hnsw_bytes, hnsw, fts, note) = match &server {
+        Some(r) => {
+            let v: serde_json::Value =
+                serde_json::from_str(&r.status()?).context("parsing the server's status")?;
+            let c = &v["compaction"];
+            let usage = compact::BlockUsage {
+                block_size: c["block_size"].as_u64().unwrap_or(0),
+                used: c["used_blocks"].as_u64().unwrap_or(0),
+                free: c["free_blocks"].as_u64().unwrap_or(0),
+            };
+            let (hb, hp) = compact_cli::hnsw_from_status(&v.to_string());
+            (
+                usage,
+                std::fs::metadata(&db)?.len(),
+                hb,
+                hp,
+                false,
+                c["note"].as_str().map(str::to_string),
+            )
+        }
+        None => {
+            let i = compact::inspect(&db).map_err(|e| anyhow!("{e}"))?;
+            (
+                i.usage,
+                i.bytes,
+                i.hnsw_bytes,
+                i.hnsw.is_some(),
+                i.fts,
+                i.note,
+            )
+        }
+    };
+    let total = usage.used + usage.free;
+    println!(
+        "{}: {} MiB, {} blocks in use and {} free ({:.0} %){}",
+        db.display(),
+        bytes.div_ceil(1 << 20),
+        usage.used,
+        usage.free,
+        if total > 0 {
+            100.0 * usage.free as f64 / total as f64
+        } else {
+            0.0
+        },
+        note.map(|n| format!(", compaction note: {n}"))
+            .unwrap_or_default()
+    );
+    println!(
+        "  a compaction would leave about {} MiB",
+        (usage.used * usage.block_size).div_ceil(1 << 20)
+    );
+    let pre = compact::preflight(&db, hnsw_bytes, &compact::SystemProbe::default());
+    match &pre {
+        Ok(p) => println!(
+            "  checks pass: {} MiB of disk available{}, about {} MiB of memory needed",
+            p.disk_available
+                .map_or("?".into(), |d| d.div_ceil(1 << 20).to_string()),
+            p.memory_available.map_or(String::new(), |m| format!(
+                " and {} MiB of memory",
+                m.div_ceil(1 << 20)
+            )),
+            p.memory_needed.div_ceil(1 << 20)
+        ),
+        Err(e) => println!("  it would not run: {e}"),
+    }
+    if dry_run {
+        println!("--dry-run: nothing was changed.");
+        return Ok(());
+    }
+    if usage.free == 0 && !force {
+        println!(
+            "Nothing to give back (no free blocks); `devctx compact --force` rewrites it anyway."
+        );
+        return Ok(());
+    }
+    pre.map_err(|e| anyhow!("{e}"))?;
+    compact::check_extensions(hnsw, fts).map_err(|e| anyhow!("{e}"))?;
+    if server.is_some() {
+        println!(
+            "Stopping the server of {} while the index is rewritten…",
+            cfg.project.name
+        );
+    }
+    match remote::reclaim_db_report(&cfg) {
+        remote::Reclaim::NotStopped(why) => bail!(
+            "the server holding the index could not be stopped ({why}); stop it with `devctx              serve --stop` (or by hand) and run `devctx compact` again"
+        ),
+        remote::Reclaim::Killed => eprintln!(
+            "· the server had to be killed; its write-ahead log is folded in before compacting"
+        ),
+        remote::Reclaim::Stopped | remote::Reclaim::NoServer => {}
+    }
+    let mut opts = compact::CompactOptions::new("manual");
+    // Asked for explicitly: a WAL left behind is folded first (the preparation
+    // of the protocol's point 2), not a reason to stop.
+    opts.fold_wal = true;
+    opts.keep_original = keep_original;
+    opts.hnsw_bytes = hnsw_bytes;
+    opts.dim_hint = configured_dimension(&cfg);
+    compact_cli::run(&cfg, &db, opts).map_err(|e| anyhow!("{e}"))?;
     Ok(())
 }
 

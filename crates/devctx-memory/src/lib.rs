@@ -228,8 +228,14 @@ pub fn remember(
     Ok(RememberResult { memory, status })
 }
 
-/// Embed a memory into the vectors table (intro + body-window chunks).
-fn index_memory_vectors(store: &Store, embedder: &dyn EmbeddingProvider, m: &Memory) -> Result<()> {
+/// Embed a memory into the vectors table (intro + body-window chunks):
+/// what `remember` does after writing the row, and what restoring a memory
+/// from a compaction's sidecar (which has no vectors) needs.
+pub fn index_memory_vectors(
+    store: &Store,
+    embedder: &dyn EmbeddingProvider,
+    m: &Memory,
+) -> Result<()> {
     store.delete_memory_vectors(&m.id)?;
 
     let chunks = memory_chunks(&m.title, &m.content, &MemoryChunkConfig::default());

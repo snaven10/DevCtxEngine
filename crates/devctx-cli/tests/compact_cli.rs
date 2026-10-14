@@ -328,3 +328,141 @@ fn through_the_server_the_upgrade_stops_it_cleanly_and_compacts() {
     assert!(said.contains(r#""compaction":{"#), "{said}");
     assert!(said.contains(r#""state":"done""#), "{said}");
 }
+
+fn sha(p: &Path) -> String {
+    let out = Command::new("sha256sum").arg(p).output().unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Every file under `dir`, with its size and sha256.
+fn listing(dir: &Path) -> Vec<(String, u64, String)> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_file() {
+            out.push((
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::metadata(&p).unwrap().len(),
+                sha(&p),
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 28 and the Paso 4 command: `--dry-run` creates and changes nothing;
+/// `devctx compact` compacts with or without a note, `--keep-original` keeps
+/// a hard link of the original, and with nothing to give back it says so
+/// unless `--force`.
+#[test]
+fn devctx_compact_dry_run_keep_original_and_force() {
+    let tmp = Tmp::new("command");
+    let root = project(&tmp);
+    let ep = fake_embedder();
+    let first = devctx(&tmp, &root, &ep, &[], &["index", "--full"]);
+    assert!(first.status.success(), "{}", text(&first));
+    // Free space to give back: a full run that rewrites everything.
+    for i in 0..12 {
+        std::fs::write(
+            root.join(format!("m{i:02}.rs")),
+            format!("pub fn g{i}() -> u32 {{\n    other_{i}()\n}}\n"),
+        )
+        .unwrap();
+    }
+    git(&root, &["commit", "-q", "-am", "rewrite"]);
+    let second = devctx(&tmp, &root, &ep, &[], &["index", "--full"]);
+    assert!(second.status.success(), "{}", text(&second));
+    assert_eq!(note(&root), None);
+
+    let state = root.join(".devctx/state");
+    let before = listing(&state);
+    let dry = devctx(&tmp, &root, &ep, &[], &["compact", "--dry-run"]);
+    let said = text(&dry);
+    assert!(dry.status.success(), "{said}");
+    assert!(said.contains("blocks"), "{said}");
+    assert!(said.contains("nothing was changed"), "{said}");
+    assert_eq!(before, listing(&state), "--dry-run touched the state");
+
+    let run = devctx(&tmp, &root, &ep, &[], &["compact", "--keep-original"]);
+    let said = text(&run);
+    assert!(run.status.success(), "{said}");
+    assert!(said.contains("compacted"), "{said}");
+    let original = state.join("index.duckdb.pre-compact");
+    assert!(original.exists(), "{said}");
+    let n = note(&root).unwrap();
+    assert!(n.starts_with("done:") && n.ends_with(":manual"), "{n}");
+
+    let nothing = devctx(&tmp, &root, &ep, &[], &["compact"]);
+    let said = text(&nothing);
+    assert!(nothing.status.success(), "{said}");
+    assert!(said.contains("Nothing to give back"), "{said}");
+    std::fs::remove_file(&original).unwrap();
+    let forced = devctx(&tmp, &root, &ep, &[], &["compact", "--force"]);
+    let said = text(&forced);
+    assert!(forced.status.success(), "{said}");
+    assert!(said.contains("compacted"), "{said}");
+}
+
+/// M-D restoration: a memory lost after a compaction comes back from the
+/// sidecar with `devctx memories import`, embedded again.
+#[test]
+fn a_memory_is_restored_from_the_sidecar() {
+    let tmp = Tmp::new("restore");
+    let root = project(&tmp);
+    let ep = fake_embedder();
+    let first = devctx(&tmp, &root, &ep, &[], &["index", "--full"]);
+    assert!(first.status.success(), "{}", text(&first));
+    let rem = devctx(
+        &tmp,
+        &root,
+        &ep,
+        &[],
+        &[
+            "remember",
+            "--title",
+            "Interceptor retries",
+            "--type",
+            "decision",
+            "--scope",
+            "local",
+            "the token interceptor retries once on 401",
+        ],
+    );
+    assert!(rem.status.success(), "{}", text(&rem));
+    let id = {
+        let s = devctx_store::Store::open(&db(&root), DIM).unwrap();
+        let all = s.all_memories("alpha").unwrap();
+        assert_eq!(all.len(), 1, "{all:?}");
+        all[0].id.clone()
+    };
+    let run = devctx(&tmp, &root, &ep, &[], &["compact", "--force"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let side = devctx_store::CompactPaths::for_db(&db(&root)).side;
+    assert!(side.exists());
+
+    // Lost (here: forgotten for good) after the compaction.
+    {
+        let s = devctx_store::Store::open(&db(&root), DIM).unwrap();
+        assert!(s.forget_memory(&id).unwrap());
+        assert!(s.get_memory(&id).unwrap().is_none());
+    }
+    let imp = devctx(
+        &tmp,
+        &root,
+        &ep,
+        &[],
+        &["memories", "import", side.to_str().unwrap()],
+    );
+    let said = text(&imp);
+    assert!(imp.status.success(), "{said}");
+    assert!(said.contains("restored 1"), "{said}");
+    let s = devctx_store::Store::open(&db(&root), DIM).unwrap();
+    let m = s.get_memory(&id).unwrap().expect("restored");
+    assert_eq!(m.content, "the token interceptor retries once on 401");
+    assert!(s.vector_by_id(&id).unwrap().is_some(), "embedded again");
+}
