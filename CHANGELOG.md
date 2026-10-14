@@ -90,13 +90,16 @@ The downgrade contract:
 - **Calls through a type stay `Type.method`** (`Store::open()` →
   `Store.open`). 0.9.0 still finds them by name (the `.open` suffix), and
   since `Type.method` is also the method's name as a caller, its `impact` walk
-  goes one level further than over its own rows. No caller is lost (test
-  `rust_path_calls_stay_walkable_by_0_9_0`; the 60 field cases over a
-  compacted index: pending, PLAN-009 TASK-019).
+  goes one level further than over its own rows. For these Rust path calls no
+  caller is lost (test `rust_path_calls_stay_walkable_by_0_9_0`).
 - **Answers can differ in details**, because the rows come from 0.10's
   extractor: nested classes qualified by their outer class, `var.*` and
-  constants taken for types gone, a walk through a nested class that stops one
-  level earlier.
+  constants taken for types gone.
+- **Pending (PLAN-009 TASK-019): calls into nested classes.** The field
+  verification saw a 0.9.0 `impact` walk through a nested class stop one level
+  earlier than 0.9.0 did over its own index. That would be callers lost, so it
+  is being reproduced against the original 0.9.0 and is not part of this
+  contract until then; so are the 60 field cases over a compacted index.
 - **To be identical to 0.9.0 again, index again with 0.9.0** (`devctx index
   --full`, which re-embeds everything).
 

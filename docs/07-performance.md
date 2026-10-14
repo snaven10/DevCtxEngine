@@ -204,6 +204,15 @@ the brief with `related: true` did not improve the brief and moved Spanish
 queries in both directions, so both stay off; see
 [Search → Centrality](03-core-concepts/search.md#centrality-hybrid-only-opt-in).
 
+**Known limitation: the brief on an upgraded index.** The goal was +10
+percentage points of "expected file in the brief" over 0.9.0 (24 of 30,
+80.0 %). A fresh index meets it: 27 of 30, 90.0 % (+10.0 pp). An index upgraded
+with `--full` does not: 26 of 30, 86.7 % (+6.7 pp). The difference is one case
+that depends on the vectors (the upgrade keeps 0.9.0's, a fresh index embeds
+again, and the same text does not always get the same vector), not on the
+ranking; no case goes from found to missed. Accepted by the maintainer on
+2026-10-13 as a limitation of 0.10.0.
+
 `impact_analysis` on `get` and `map` in the large Java repository: p95 90 ms
 and 179–197 ms through the CLI, against 3.6 s and 5.1 s for 0.9.0 on the same
 machine. `build_context` with `related: true` adds 14–27 ms to the p50 (two

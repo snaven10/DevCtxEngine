@@ -441,15 +441,21 @@ sessions. Then:
   call through a type is written `Type.method` (`Store::open()` →
   `Store.open`): 0.9.0 still finds it by name (its `.open` suffix), and since
   `Store.open` is also the method's name as a caller, its `impact` walk goes
-  one level further than over its own rows, where `open` led nowhere. No
-  caller is lost (a test walks both shapes with 0.9.0's reader; the 60 field
-  cases over a compacted index are re-checked by PLAN-009 TASK-019).
+  one level further than over its own rows, where `open` led nowhere. For
+  these Rust path calls no caller is lost: a test
+  (`rust_path_calls_stay_walkable_by_0_9_0`) walks both shapes with 0.9.0's
+  reader.
 - **The answers can differ in details** from the ones 0.9.0 gave before the
   upgrade, because the rows come from 0.10's extractor: nested classes are
-  qualified by their outer class, `var.*` and constants taken for types are
-  gone, and a walk through a nested class can stop one level earlier. To get
-  exactly the 0.9.0 answers back, index again with 0.9.0 (`devctx index
-  --full`, which re-embeds everything).
+  qualified by their outer class, and `var.*` and constants taken for types
+  are gone. To get exactly the 0.9.0 answers back, index again with 0.9.0
+  (`devctx index --full`, which re-embeds everything).
+- **Pending (PLAN-009 TASK-019): calls into nested classes.** The field
+  verification saw a 0.9.0 `impact` walk through a nested class stop one
+  level earlier than 0.9.0 did over its own index. That would be callers
+  lost, so it is being reproduced against the original 0.9.0 and is not
+  covered by the paragraphs above until then; neither are the 60 field cases
+  over a compacted index.
 - 0.9.0 sees a stamp it did not write and reports `extractor_stale` with its own
   warning. It works anyway; its `--full` would re-embed every chunk (0.9.0 does
   not reuse vectors), and is not needed for it to answer.

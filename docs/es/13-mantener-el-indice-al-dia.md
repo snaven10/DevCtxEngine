@@ -459,16 +459,21 @@ de IA. Después:
   `Store.open`): 0.9.0 la sigue encontrando por nombre (por su sufijo
   `.open`), y como `Store.open` es también el nombre del método como
   llamador, su recorrido de `impact` llega un nivel más lejos que sobre sus
-  propias filas, donde `open` no llevaba a ningún lado. No se pierde ningún
-  llamador (un test recorre las dos formas con el lector de 0.9.0; los 60
-  casos de campo sobre un índice compactado los vuelve a medir PLAN-009
-  TASK-019).
+  propias filas, donde `open` no llevaba a ningún lado. Para estas llamadas
+  de Rust por ruta no se pierde ningún llamador: un test
+  (`rust_path_calls_stay_walkable_by_0_9_0`) recorre las dos formas con el
+  lector de 0.9.0.
 - **Las respuestas pueden diferir en detalles** de las que daba 0.9.0 antes del
   paso, porque las filas vienen del extractor de 0.10: las clases anidadas van
-  calificadas por su clase exterior, desaparecen `var.*` y las constantes
-  tomadas por tipo, y un recorrido por una clase anidada puede cortarse un
-  nivel antes. Para volver exactamente a las respuestas de 0.9.0, reindexá con
-  0.9.0 (`devctx index --full`, que vuelve a embeber todo).
+  calificadas por su clase exterior, y desaparecen `var.*` y las constantes
+  tomadas por tipo. Para volver exactamente a las respuestas de 0.9.0,
+  reindexá con 0.9.0 (`devctx index --full`, que vuelve a embeber todo).
+- **Pendiente (PLAN-009 TASK-019): llamadas a clases anidadas.** La
+  verificación de campo vio un recorrido de `impact` de 0.9.0 por una clase
+  anidada cortarse un nivel antes que el de 0.9.0 sobre su propio índice. Eso
+  sería perder llamadores, así que se está reproduciendo contra el 0.9.0
+  original y hasta entonces no lo cubren los párrafos de arriba; tampoco los
+  60 casos de campo sobre un índice compactado.
 - 0.9.0 ve un sello que no escribió e informa `extractor_stale` con su propio
   aviso. Funciona igual; su `--full` volvería a embeber cada chunk (0.9.0 no
   reusa vectores), y no hace falta para que responda.

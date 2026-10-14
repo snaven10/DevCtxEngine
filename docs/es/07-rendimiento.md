@@ -209,6 +209,15 @@ centralidad 0,15, 0,3 y 0,5 y el brief con `related: true` no mejoraron el brief
 y movieron las consultas en español en los dos sentidos, así que los dos siguen
 apagados; ver [Búsqueda → Centralidad](03-conceptos-fundamentales/busqueda.md#centralidad-solo-híbrida-opt-in).
 
+**Limitación conocida: el brief en un índice actualizado.** La meta era +10
+puntos porcentuales de "archivo esperado en el brief" sobre 0.9.0 (24 de 30,
+80,0 %). Un índice nuevo la cumple: 27 de 30, 90,0 % (+10,0 pp). Un índice
+actualizado con `--full` no: 26 de 30, 86,7 % (+6,7 pp). La diferencia es un
+caso que depende de los vectores (el paso conserva los de 0.9.0, un índice
+nuevo vuelve a embeber, y el mismo texto no siempre da el mismo vector), no del
+ranking; ningún caso pasa de acierto a fallo. Aceptada por el mantenedor el
+2026-10-13 como limitación de 0.10.0.
+
 `impact_analysis` sobre `get` y `map` en el repositorio Java grande: p95 90 ms y
 179–197 ms por el CLI, contra 3,6 s y 5,1 s de 0.9.0 en la misma máquina.
 `build_context` con `related: true` suma 14–27 ms al p50 (dos saltos: 22–51 ms).

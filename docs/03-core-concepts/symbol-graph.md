@@ -194,6 +194,20 @@ repository also defines, undecided on purpose. Go was checked with fixtures
 only. These are a few dozen sites per language: an order of magnitude, not a
 guarantee.
 
+**Known limitations of 0.10.0** (field verification, PLAN-009 TASK-016;
+accepted by the maintainer on 2026-10-13):
+
+- **Python records 5 of the 7 relations.** There is no `implements` (Python
+  declares no interfaces), and a call to a class, `Klass()`, is recorded as
+  `calls` to the class, not as `instantiates`. The Java, TypeScript and Rust
+  repositories measured record all 7.
+- **Rust leaves 16.0 % of its calls undecided** (no resolved target and no
+  `external` mark), against a goal of at most 15 %; the Java, TypeScript and
+  Python repositories measured 1.6–14.7 %. What is left is chains after a
+  library call to a name the repository also defines, and receivers with no
+  known type: undecided on purpose, because marking them external would hide
+  callers from `impact_analysis`.
+
 ## Supported languages
 
 **Full parsing — symbols and edges (7):**

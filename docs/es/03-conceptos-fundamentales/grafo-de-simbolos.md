@@ -198,6 +198,20 @@ llamada a una librería con un nombre que el repositorio también define, sin
 decidir a propósito. Go se verificó solo con fixtures. Son unas pocas decenas
 de sitios por lenguaje: un orden de magnitud, no una garantía.
 
+**Limitaciones conocidas de 0.10.0** (verificación de campo, PLAN-009
+TASK-016; aceptadas por el mantenedor el 2026-10-13):
+
+- **Python registra 5 de las 7 relaciones.** No hay `implements` (Python no
+  declara interfaces), y una llamada a una clase, `Clase()`, se guarda como
+  `calls` a la clase, no como `instantiates`. Los repositorios Java,
+  TypeScript y Rust medidos registran las 7.
+- **Rust deja sin decidir el 16,0 % de sus llamadas** (sin destino resuelto ni
+  marca `external`), contra una meta de 15 % como máximo; los repositorios
+  Java, TypeScript y Python midieron 1,6–14,7 %. Lo que queda son cadenas tras
+  una llamada a una librería con un nombre que el repositorio también define,
+  y receptores sin tipo conocido: sin decidir a propósito, porque marcarlos
+  externos le escondería llamadores a `impact_analysis`.
+
 ## Lenguajes soportados
 
 **Parseo completo — símbolos y aristas (7):**
