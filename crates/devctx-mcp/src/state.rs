@@ -7569,9 +7569,16 @@ mod tests {
         let (state, root) = lifecycle_state("compacting");
         let cfg = state.cfg.clone();
         drop(state);
-        let held = devctx_store::try_lock_exclusive(&cfg.db_path())
-            .unwrap()
-            .expect("nobody holds it");
+        // A child another test forks in this process holds a copy of a
+        // just-closed descriptor until it execs: give the lock that moment.
+        let t0 = Instant::now();
+        let held = loop {
+            if let Some(l) = devctx_store::try_lock_exclusive(&cfg.db_path()).unwrap() {
+                break l;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "nobody holds it");
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let err = match AppState::build(cfg.clone()) {
             Err(e) => e,
             Ok(_) => panic!("built during a compaction"),

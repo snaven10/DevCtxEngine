@@ -202,6 +202,7 @@ pub struct CompactOptions<'a> {
     pub probe: SystemProbe,
     pub(crate) hook: Option<Hook<'a>>,
     pub(crate) lock_probe: Option<fn(&Path) -> bool>,
+    pub(crate) dir_sync: Option<fn(&Path) -> std::io::Result<()>>,
 }
 
 impl CompactOptions<'_> {
@@ -218,6 +219,7 @@ impl CompactOptions<'_> {
             probe: SystemProbe::default(),
             hook: None,
             lock_probe: None,
+            dir_sync: None,
         }
     }
 }
@@ -251,6 +253,12 @@ pub enum FailKind {
     Rename,
     /// DuckDB or the filesystem failed.
     Engine,
+    /// A finished copy next to the database holds what the database lacks
+    /// (a reverted `rename`): nothing is touched (review D1).
+    Unreconciled,
+    /// The copy is in place but its directory entry could not be made
+    /// durable; the lock is kept until the process ends (review D1).
+    Durability,
 }
 
 /// A compaction that did not happen, and why.
@@ -791,16 +799,149 @@ fn fsync_file(p: &Path) -> CResult<()> {
 }
 
 /// fsync of a directory, so a `rename` in it survives a power cut. Unix only:
-/// Windows cannot open a directory this way.
-fn fsync_dir(dir: &Path) {
+/// Windows cannot open a directory this way, and there the replacement is
+/// made with `MOVEFILE_WRITE_THROUGH` instead (see [`replace_file`]).
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        std::fs::File::open(dir)?.sync_all()
     }
     #[cfg(not(unix))]
-    let _ = dir;
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Replace `to` with `from` atomically.
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// Windows: `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING |
+/// MOVEFILE_WRITE_THROUGH`, which returns only once the move is on disk —
+/// there is no directory to fsync. Not verified on a Windows machine
+/// (PLAN-009 TASK-019).
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (a, b) = (wide(from), wide(to));
+    // SAFETY: two NUL-terminated wide strings that outlive the call.
+    let ok = unsafe {
+        MoveFileExW(
+            a.as_ptr(),
+            b.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// What to do with a `<tmp>` found next to the database before a run (or an
+/// open) starts (review D1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TmpVerdict {
+    /// It holds nothing the database lacks: a run that died before its
+    /// `rename`, or a reverted `rename` nothing wrote to. It may go.
+    Disposable,
+    /// A finished copy holding memories, references or sessions the database
+    /// lacks: a reverted `rename` something wrote to. Touch neither.
+    Keep(String),
+    /// It could not be compared. It is not deleted.
+    Unsure(String),
+}
+
+/// Compare `<tmp>` with `<db>` on what no reindex can rebuild. Reads both
+/// through read-only `ATTACH`es of an in-memory connection.
+pub(crate) fn tmp_verdict(paths: &CompactPaths) -> TmpVerdict {
+    if !paths.tmp.exists() {
+        return TmpVerdict::Disposable;
+    }
+    let Ok(c) = Connection::open_in_memory() else {
+        return TmpVerdict::Unsure("no in-memory database".into());
+    };
+    let _ = load_extensions(&c);
+    let attach = |path: &Path, alias: &str| -> std::result::Result<(), String> {
+        let l = lit(path).map_err(|e| e.message)?;
+        c.execute_batch(&format!("ATTACH {l} AS {alias} (READ_ONLY);"))
+            .map_err(|e| e.to_string())
+    };
+    if let Err(e) = attach(&paths.tmp, "t") {
+        return TmpVerdict::Unsure(format!("the copy cannot be read: {e}"));
+    }
+    let note = query_strings(
+        &c,
+        &format!(
+            "SELECT value FROM t.main.index_meta WHERE repo_path = '' AND branch = '' \
+             AND key = '{COMPACTION_META_KEY}'"
+        ),
+    )
+    .unwrap_or_default();
+    if !note.iter().any(|n| n.starts_with("done:")) {
+        // Cut before its note was written: a partial copy, nothing more.
+        return TmpVerdict::Disposable;
+    }
+    if let Err(e) = attach(&paths.db, "d") {
+        return TmpVerdict::Unsure(format!("the index cannot be read to compare: {e}"));
+    }
+    let tables = |alias: &str| {
+        query_strings(
+            &c,
+            &format!(
+                "SELECT table_name FROM duckdb_tables() WHERE database_name = '{alias}' \
+                 AND schema_name = 'main'"
+            ),
+        )
+        .unwrap_or_default()
+    };
+    let (in_t, in_d) = (tables("t"), tables("d"));
+    for table in IRREPLACEABLE {
+        if !in_t.iter().any(|t| t == table) {
+            continue;
+        }
+        let extra = if in_d.iter().any(|t| t == table) {
+            let d_cols: Vec<String> = columns(&c, "d", table)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            let cols: Vec<String> = columns(&c, "t", table)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(n, _)| n)
+                .filter(|n| d_cols.contains(n))
+                .collect();
+            except_all(&c, "t", "d", table, &cols)
+        } else {
+            query_u64(&c, &format!("SELECT count(*) FROM t.main.{}", q(table)))
+        };
+        match extra {
+            Ok(0) => {}
+            Ok(n) => return TmpVerdict::Keep(format!("{n} rows of `{table}` the index lacks")),
+            Err(e) => return TmpVerdict::Unsure(format!("comparing `{table}`: {e}")),
+        }
+    }
+    TmpVerdict::Disposable
+}
+
+/// Milliseconds since the epoch, for names that must not collide.
+pub(crate) fn epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn epoch() -> u64 {
@@ -859,10 +1000,34 @@ pub fn compact(db: &Path, opts: &CompactOptions<'_>) -> CResult<CompactReport> {
             ),
         ));
     }
+    // A `<tmp>` left from before is deleted only when it holds nothing the
+    // database lacks (review D1): after a power cut it can be the file that
+    // was really in use.
+    match tmp_verdict(&paths) {
+        TmpVerdict::Disposable => {}
+        TmpVerdict::Keep(why) | TmpVerdict::Unsure(why) => {
+            return Err(CompactError::new(
+                FailKind::Unreconciled,
+                crate::StoreError::UnreconciledCompaction {
+                    db: paths.db.clone(),
+                    tmp: paths.tmp.clone(),
+                    reason: why,
+                }
+                .to_string(),
+            ))
+        }
+    }
     remove_temporaries(&paths);
     let out = run(&paths, opts);
-    if out.is_err() {
-        remove_temporaries(&paths);
+    match &out {
+        // The copy is in place but its name may not be durable: no writer may
+        // open it before the process ends, so the lock is not released.
+        Err(e) if e.kind == FailKind::Durability => {
+            std::mem::forget(lock);
+            return out;
+        }
+        Err(_) => remove_temporaries(&paths),
+        Ok(_) => {}
     }
     drop(lock);
     out
@@ -1170,16 +1335,35 @@ fn run(paths: &CompactPaths, opts: &CompactOptions<'_>) -> CResult<CompactReport
     // right before (not safe by construction; I1 covers every 0.10 binary).
     #[cfg(windows)]
     h.execute_batch("DETACH src;").map_err(engine)?;
-    std::fs::rename(&paths.tmp, &paths.db).map_err(|e| {
+    replace_file(&paths.tmp, &paths.db).map_err(|e| {
         CompactError::new(
             FailKind::Rename,
             format!("could not put the copy in place: {e}"),
         )
     })?;
-    // From here on the copy is the database: nothing below may fail the run.
+    // From here on the copy is the database: nothing below deletes anything.
     let _ = step(opts, Phase::Renamed, &h);
     if let Some(dir) = paths.db.parent() {
-        fsync_dir(dir);
+        let sync = opts.dir_sync.unwrap_or(fsync_dir);
+        let mut last = Ok(());
+        for _ in 0..3 {
+            last = sync(dir);
+            if last.is_ok() {
+                break;
+            }
+        }
+        if let Err(e) = last {
+            return Err(CompactError::new(
+                FailKind::Durability,
+                format!(
+                    "the compacted index is in place at {}, but its directory could not be \
+                     synced to disk ({e}): a power cut now could bring the old file back. \
+                     This process keeps the index locked until it ends; run `sync` (or wait \
+                     a few seconds) before using it",
+                    paths.db.display()
+                ),
+            ));
+        }
     }
     #[cfg(not(windows))]
     let _ = h.execute_batch("DETACH src;");
@@ -1409,7 +1593,7 @@ fn write_sidecar(h: &Connection, paths: &CompactPaths) -> CResult<Option<PathBuf
     }
     std::fs::rename(&paths.side_tmp, &paths.side).map_err(engine)?;
     if let Some(dir) = paths.side.parent() {
-        fsync_dir(dir);
+        fsync_dir(dir).map_err(engine)?;
     }
     Ok(kept)
 }

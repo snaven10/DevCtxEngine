@@ -249,6 +249,33 @@ pub(crate) fn guard_open(db: &Path) -> crate::Result<Option<FileLock>> {
         Err(_) => None,
     };
     if held.is_some() && paths.db.exists() {
+        // A finished copy can be the file that was really in use, if a power
+        // cut undid its `rename` (review D1): it goes only when it holds
+        // nothing the database lacks.
+        match crate::compact::tmp_verdict(&paths) {
+            crate::compact::TmpVerdict::Disposable => {}
+            crate::compact::TmpVerdict::Keep(reason) => {
+                return Err(crate::StoreError::UnreconciledCompaction {
+                    db: paths.db,
+                    tmp: paths.tmp,
+                    reason,
+                })
+            }
+            crate::compact::TmpVerdict::Unsure(why) => {
+                // Kept, out of the way: never deleted on a doubt.
+                let mut aside = paths.tmp.clone().into_os_string();
+                aside.push(format!(".kept-{}", crate::compact::epoch_millis()));
+                let aside = PathBuf::from(aside);
+                if std::fs::rename(&paths.tmp, &aside).is_ok() {
+                    eprintln!(
+                        "· kept {} as {}: it could not be compared with the index ({why}); \
+                         delete it once you know it is not needed",
+                        paths.tmp.display(),
+                        aside.display()
+                    );
+                }
+            }
+        }
         for leftover in [
             &paths.tmp,
             &paths.tmp_wal,
@@ -393,6 +420,31 @@ mod tests {
         }
         assert!(p.side.exists(), "a fresh sidecar is kept");
         assert!(p.db.exists() && p.lock.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review D1: a `<tmp>` that cannot be read is not deleted on a doubt; it
+    /// is moved aside, and the open goes on.
+    #[test]
+    fn an_unreadable_temporary_is_moved_aside_not_deleted() {
+        let dir = scratch("unreadable");
+        let db = dir.join("index.duckdb");
+        drop(Store::open(&db, DIM).unwrap());
+        let p = CompactPaths::for_db(&db);
+        std::fs::write(&p.tmp, b"not a database").unwrap();
+        drop(Store::open(&db, DIM).unwrap());
+        assert!(!p.tmp.exists());
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".compact.tmp.kept-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"not a database");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

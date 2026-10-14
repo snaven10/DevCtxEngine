@@ -273,10 +273,16 @@ fn assert_clean(db: &Path) {
         assert!(!f.exists(), "{} was left behind", f.display());
     }
     assert!(p.lock.exists(), "the lock file is never deleted (M-C)");
-    assert!(
-        try_lock_exclusive(db).unwrap().is_some(),
-        "the lock was not released"
-    );
+    // A child forked by another test of this process holds a copy of a
+    // just-closed descriptor until it execs: give the lock that moment.
+    let t0 = Instant::now();
+    while try_lock_exclusive(db).unwrap().is_none() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the lock was not released"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn note_of(db: &Path) -> Option<String> {
@@ -1157,6 +1163,87 @@ fn a_failed_run_does_not_delete_its_copy_when_the_database_is_gone() {
     assert!(
         dir.join("index.duckdb.compact.tmp").exists(),
         "the copy was deleted while the database was missing (I5)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- a rename a power cut reverted (review D1) --------------------------------
+
+/// Put the directory back as a power cut can leave it after a `rename` whose
+/// directory entry never reached the disk: `<db>` is the original again and
+/// the verified copy — which a server may have written to meanwhile — is
+/// back under `<tmp>`. Returns the copy's path.
+fn revert_rename(db: &Path) -> PathBuf {
+    let p = CompactPaths::for_db(db);
+    std::fs::rename(&p.db, &p.tmp).unwrap();
+    std::fs::rename(&p.original, &p.db).unwrap();
+    p.tmp
+}
+
+/// D1: a copy that holds memories the database lacks is never deleted, by an
+/// open or by the next compaction: the open is refused, naming it.
+#[test]
+fn a_reverted_rename_with_new_memories_is_never_deleted() {
+    let dir = scratch("reverted");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let mut o = opts();
+    o.keep_original = true;
+    compact(&db, &o).unwrap();
+    let tmp = revert_rename(&db);
+    {
+        // What the server wrote after the rename, into the new inode.
+        let s = Store::open_unlocked(&tmp, DIM).unwrap();
+        s.upsert_memory(&memory("mem_after", "written after the rename"))
+            .unwrap();
+        s.checkpoint();
+    }
+    let sum = sha(&tmp);
+    match Store::open(&db, DIM) {
+        Err(crate::StoreError::UnreconciledCompaction { tmp: t, .. }) => assert_eq!(t, tmp),
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("opened over a copy that holds memories the index lacks"),
+    }
+    assert_eq!(sha(&tmp), sum, "the copy was touched");
+    let e = compact(&db, &opts()).unwrap_err();
+    assert_eq!(e.kind, FailKind::Unreconciled, "{e}");
+    assert_eq!(sha(&tmp), sum, "the copy was touched");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D1, the other side: a copy with nothing the database lacks (a run killed
+/// after it was written, or a reverted rename nobody wrote to) still goes at
+/// the next open, as before.
+#[test]
+fn a_finished_copy_with_nothing_new_is_still_cleaned_up() {
+    let dir = scratch("reverted_clean");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let mut o = opts();
+    o.keep_original = true;
+    compact(&db, &o).unwrap();
+    let tmp = revert_rename(&db);
+    drop(Store::open(&db, DIM).expect("opens"));
+    assert!(!tmp.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D1 (b): if the directory cannot be synced after the `rename`, the run
+/// reports it and keeps the lock: nothing may write to the new file until
+/// its name is durable.
+#[test]
+fn a_failed_directory_sync_keeps_the_lock_and_says_so() {
+    let dir = scratch("dirsync");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let mut o = opts();
+    o.dir_sync = Some(|_| Err(std::io::Error::other("injected")));
+    let e = compact(&db, &o).unwrap_err();
+    assert_eq!(e.kind, FailKind::Durability, "{e}");
+    assert!(e.message.contains("injected"), "{e}");
+    assert!(
+        try_lock_exclusive(&db).unwrap().is_none(),
+        "the lock was released"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
