@@ -115,7 +115,7 @@ until someone killed it by hand. So the MCP does not own anything:
   then the runtime gets 1 s).
 - **Reports a stale binary instead of dying.** `index_status` and
   `list_projects` carry
-  `"mcp": {"version": "0.9.0", "binary_replaced": false}`. After you reinstall
+  `"mcp": {"version": "0.10.0", "binary_replaced": false}`. After you reinstall
   `devctx` while a session is open, `binary_replaced` is `true` and the object
   adds `installed_version` and a `hint`: *restart the AI session to pick it
   up*. The old process keeps working with the code it started with — nothing is

@@ -58,7 +58,9 @@ index --full`**, which reuses the stored vectors.
    and rewrites the database into a new file (verified against the original,
    put in place with an atomic `rename`): measured on the two largest upgraded
    indexes, +8–12 % used blocks and −1 to −10 % bytes against the 0.9.0 index,
-   in 4–9 s. Without a terminal (an agent, a script), with
+   in 4–9 s for the compaction itself (the whole upgrade, `--full` and
+   compaction through the server, is pending measurement: PLAN-009 TASK-019).
+   Without a terminal (an agent, a script), with
    `DEVCTX_NO_AUTO_COMPACT=1`, or if the server had to be killed, it stays owed:
    the run ends with the line `devctx compact` and `status` reports
    `compaction.state: "owed"`. It needs as much free disk as the file.
@@ -74,12 +76,29 @@ Install 0.9.0, `devctx serve --stop`, restart the AI sessions. The new tables
 stay in the database, unread and harmless; nothing is migrated or rewritten.
 `graph_edges` was kept current in its 0.9 format, so 0.9.0's graph tools answer
 from it (field verification: the 0.9.0 binary over five upgraded indexes answers
-every call, with its `extractor_stale` warning; the answers come from 0.10's
-extractor — nested classes qualified, a Rust path call written as `a.b.f` —, so
-they are not exactly the ones 0.9.0 gave before the upgrade). 0.9.0 reports `extractor_stale` and works anyway; its `--full` would
-re-embed everything (0.9.0 does not reuse vectors). Coming back to 0.10 after
-0.9.0 indexed files: the branch reads as stale (`graph_out_of_step`) and asks
-for `devctx index --full` again, with vectors reused.
+every call, with its `extractor_stale` warning). 0.9.0 reports `extractor_stale`
+and works anyway; its `--full` would re-embed everything (0.9.0 does not reuse
+vectors). Coming back to 0.10 after 0.9.0 indexed files: the branch reads as
+stale (`graph_out_of_step`) and asks for `devctx index --full` again, with
+vectors reused.
+
+The downgrade contract:
+
+- **Module paths stay as in 0.9.0.** A Rust call through a module path is
+  written in `graph_edges` by its last segment, as 0.9.0 wrote it
+  (`crate::util::helper()` → `helper`).
+- **Calls through a type stay `Type.method`** (`Store::open()` →
+  `Store.open`). 0.9.0 still finds them by name (the `.open` suffix), and
+  since `Type.method` is also the method's name as a caller, its `impact` walk
+  goes one level further than over its own rows. No caller is lost (test
+  `rust_path_calls_stay_walkable_by_0_9_0`; the 60 field cases over a
+  compacted index: pending, PLAN-009 TASK-019).
+- **Answers can differ in details**, because the rows come from 0.10's
+  extractor: nested classes qualified by their outer class, `var.*` and
+  constants taken for types gone, a walk through a nested class that stops one
+  level earlier.
+- **To be identical to 0.9.0 again, index again with 0.9.0** (`devctx index
+  --full`, which re-embeds everything).
 
 ### Added
 
@@ -328,8 +347,36 @@ for `devctx index --full` again, with vectors reused.
 - Indexing a TypeScript repository no longer panics on a type whose `>` (an
   arrow's) comes before its first `<`.
 
+### Known limitations
+
+Three acceptance criteria of PLAN-009 are not met; accepted by the maintainer
+on 2026-10-13 as limitations of 0.10.0, not release blockers. Figures from the
+field verification (PLAN-009 TASK-016, five repositories):
+
+- **Relation kinds: 5 in Python, against at least 6.** The Java, TypeScript and
+  Rust repositories record 7; the Python one has no `implements`, and a class
+  instantiation `Klass()` is recorded as `calls`, not `instantiates`.
+- **Undecided calls: 16.0 % in Rust, against at most 15 %** (`calls` with no
+  resolved target and no `external` mark; the other four repositories 1.6 –
+  14.7 %). What is left is chains after an external call to a name the
+  repository also defines, and receivers with no known type: undecided by
+  design, since marking more of them external risks missing callers in
+  `impact_analysis`.
+- **`build_context` relevance: +6.7 pp on an upgraded index, against
+  +10 pp.** The expected file is in the brief in 26 of 30 cases on an index
+  upgraded with `--full` (80.0 % → 86.7 %), and in 27 of 30 on one built from
+  scratch (+10.0 pp, which meets it). The difference is one case that depends
+  on the noise of the vectors, not on the ranking.
+
 ### Known issues
 
+- **Rebuilding the HNSW index changes the approximate top-k; the exact top-k
+  does not.** The compaction (and any rebuild) builds a new HNSW graph, which
+  is not the same graph: measured in PLAN-009 TASK-018, 216 of 300 top-10
+  lists identical between the original and the compacted copy, 260 of 300
+  between two builds of the same copy, recall@10 about 0.96 in all three; the
+  exact (brute-force) top-10 identical in 20 of 20 and 15 of 15 queries over
+  the two largest upgraded indexes.
 - 0.8.3 – 0.9.0: the first open of an HNSW database created with 0.8.2 or
   earlier fails once with "unknown index type 'HNSW'"; retrying resolves it.
   Fixed in this release (see above); there is no 0.9.1.

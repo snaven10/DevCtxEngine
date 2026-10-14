@@ -452,14 +452,23 @@ de IA. Después:
   `get_references` e `impact_analysis` de 0.9.0 responden desde ahí.
   Verificado con el binario 0.9.0 sobre cinco índices actualizados
   (2026-10-13): cada llamada responde, con su aviso `extractor_stale`, y su
-  búsqueda vectorial devuelve lo mismo que 0.10 sobre la misma base. Las
-  respuestas no son las que daba 0.9.0 antes del paso: las filas vienen del
-  extractor de 0.10 — las clases anidadas van calificadas por su clase
-  exterior, desaparecen `var.*` y las constantes tomadas por tipo, una llamada
-  de Rust por ruta se escribe con `.` entre segmentos (`crate.util.helper`, que
-  0.9.0 encuentra por su sufijo `.helper`) —, así que algunos llamadores
-  aparecen con un nombre más largo y un recorrido por una clase anidada puede
-  cortarse un nivel antes.
+  búsqueda vectorial devuelve lo mismo que 0.10 sobre la misma base.
+- **Lo que 0.9.0 lee ahí.** Una llamada de Rust por ruta de módulo se escribe
+  como la escribía 0.9.0, con su último segmento (`crate::util::helper()` →
+  `helper`). Una llamada por tipo se escribe `Tipo.metodo` (`Store::open()` →
+  `Store.open`): 0.9.0 la sigue encontrando por nombre (por su sufijo
+  `.open`), y como `Store.open` es también el nombre del método como
+  llamador, su recorrido de `impact` llega un nivel más lejos que sobre sus
+  propias filas, donde `open` no llevaba a ningún lado. No se pierde ningún
+  llamador (un test recorre las dos formas con el lector de 0.9.0; los 60
+  casos de campo sobre un índice compactado los vuelve a medir PLAN-009
+  TASK-019).
+- **Las respuestas pueden diferir en detalles** de las que daba 0.9.0 antes del
+  paso, porque las filas vienen del extractor de 0.10: las clases anidadas van
+  calificadas por su clase exterior, desaparecen `var.*` y las constantes
+  tomadas por tipo, y un recorrido por una clase anidada puede cortarse un
+  nivel antes. Para volver exactamente a las respuestas de 0.9.0, reindexá con
+  0.9.0 (`devctx index --full`, que vuelve a embeber todo).
 - 0.9.0 ve un sello que no escribió e informa `extractor_stale` con su propio
   aviso. Funciona igual; su `--full` volvería a embeber cada chunk (0.9.0 no
   reusa vectores), y no hace falta para que responda.

@@ -122,7 +122,7 @@ posee nada:
   runtime tiene 1 s).
 - **Reporta un binario desactualizado en vez de morir.** `index_status` y
   `list_projects` llevan
-  `"mcp": {"version": "0.9.0", "binary_replaced": false}`. Si reinstalás
+  `"mcp": {"version": "0.10.0", "binary_replaced": false}`. Si reinstalás
   `devctx` con una sesión abierta, `binary_replaced` pasa a `true` y el objeto
   suma `installed_version` y un `hint`: *reiniciá la sesión de IA para tomarlo*.
   El proceso viejo sigue funcionando con el código con el que arrancó — nada se
