@@ -4452,6 +4452,92 @@ public class A extends B implements C {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A caller nested in another symbol keeps, in `graph_edges`, the source
+    /// name 0.9.0 gave it: its innermost container and its name
+    /// (`Deeper.deep`, `C.f`), or the bare name (`inner`, a Rust `helper` in
+    /// `mod tests`) — never the qualified name the symbol graph uses
+    /// (`Outer.Testable.Deeper.deep`, `outer.inner`, `tests.helper`). 0.9.0
+    /// walks by exact name, and a call names its callee the 0.9.0 way
+    /// (`t.invoke()` → `Testable.invoke`), so a longer source cut the walk
+    /// there: a downgraded 0.9.0 lost the callers 0.9.0 found (PLAN-009
+    /// TASK-019, a test helper in a nested class of a Java repository, at
+    /// depth 2). The rows below are what the v0.9.0 binary wrote for this
+    /// fixture.
+    #[test]
+    fn nested_callers_stay_walkable_by_0_9_0() {
+        let (dir, repo) = graph_repo(
+            "compat_nested",
+            &[
+                ("src/main/java/p/Svc.java", "package p;\n\npublic class Svc {\n    public static int calc() {\n        return 1;\n    }\n}\n"),
+                ("src/main/java/p/Outer.java", "package p;\n\npublic class Outer {\n    static class Testable {\n        int invoke() {\n            return Svc.calc();\n        }\n\n        int again() {\n            return this.invoke();\n        }\n\n        static class Deeper {\n            int deep() {\n                return Svc.calc();\n            }\n        }\n    }\n\n    void run() {\n        Testable t = new Testable();\n        t.invoke();\n    }\n\n    void runDeep() {\n        Testable.Deeper d = new Testable.Deeper();\n        d.deep();\n    }\n}\n"),
+                ("a.py", "class C:\n    def m(self):\n        def f():\n            leaf()\n        f()\n\n\ndef outer():\n    def inner():\n        leaf()\n    inner()\n\n\ndef leaf():\n    pass\n"),
+                ("Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+                ("src/lib.rs", "pub fn leaf() {}\n\npub fn top() {\n    leaf();\n}\n\n#[cfg(test)]\nmod tests {\n    fn helper() {\n        super::leaf();\n    }\n\n    #[test]\n    fn t() {\n        helper();\n    }\n}\n"),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        let mut sources: Vec<&str> = old.iter().map(|e| e.source.as_str()).collect();
+        sources.sort();
+        sources.dedup();
+        assert_eq!(
+            sources,
+            [
+                "C.f",
+                "C.m",
+                "Deeper.deep",
+                "Outer.run",
+                "Outer.runDeep",
+                "Testable.again",
+                "Testable.invoke",
+                "helper",
+                "inner",
+                "outer",
+                "t",
+                "top",
+            ],
+            "{old:?}"
+        );
+        // The walk, as 0.9.0 does it: every caller the v0.9.0 binary found
+        // on this fixture (`devctx impact calc|leaf --depth 3`).
+        let up = |name: &str| -> Vec<(String, usize)> {
+            let mut v = store
+                .impact_analysis(&repo, "main", name, 3)
+                .unwrap()
+                .upstream;
+            v.sort();
+            v
+        };
+        let calc = up("calc");
+        for want in [
+            ("Testable.invoke", 1),
+            ("Deeper.deep", 1),
+            ("Outer.run", 2),
+            ("Testable.again", 2),
+        ] {
+            assert!(
+                calc.contains(&(want.0.to_string(), want.1)),
+                "{want:?} not in {calc:?}"
+            );
+        }
+        let leaf = up("leaf");
+        for want in [
+            ("C.f", 1),
+            ("top", 1),
+            ("helper", 1),
+            ("inner", 1),
+            ("t", 2),
+            ("outer", 2),
+        ] {
+            assert!(
+                leaf.contains(&(want.0.to_string(), want.1)),
+                "{want:?} not in {leaf:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The 0.9.0 assert of [`graph_edges_stays_readable_by_0_9_0`] on
     /// `impact_analysis`, over the symbol graph of the same index (TASK-009):
     /// two calls from one method are one caller.

@@ -1477,7 +1477,7 @@ impl Ctx<'_> {
             .edges
             .iter()
             .map(|e| StoredEdge {
-                source: e.source.clone(),
+                source: legacy_source(parsed, e),
                 // `graph_edges` is what a downgraded 0.9.0 reads. It expands
                 // only the name asked for and then walks by exact name, and
                 // it wrote a Rust call through a module path as its last
@@ -1519,6 +1519,28 @@ impl Ctx<'_> {
         self.store
             .replace_file_routes(self.repo_short, self.branch, file, &routes, &now_stamp())
     }
+}
+
+/// The source of a `graph_edges` row: the name 0.9.0 gave the caller, its
+/// innermost container and its name (`Deeper.deep`, `C.f`, `Store.open`) or
+/// the bare name (`inner`, a Rust `helper` in `mod tests`, a Go method) — not
+/// the qualified name the symbol graph uses (`Outer.Testable.Deeper.deep`,
+/// `outer.inner`, `tests.helper`). A downgraded 0.9.0 walks `graph_edges` by
+/// exact name, and calls name their callee the 0.9.0 way (`t.invoke()` →
+/// `Testable.invoke`), so a longer source cut its walk there and lost the
+/// callers 0.9.0 found (PLAN-009 TASK-019). The symbol is the one the source
+/// was taken from (same qualified name, same start); without one, the source
+/// as extracted.
+fn legacy_source(parsed: &devctx_parse::ParsedFile, e: &devctx_parse::GraphEdge) -> String {
+    parsed
+        .symbols
+        .iter()
+        .find(|s| Some(s.start_byte) == e.source_byte && s.qualified == e.source)
+        .map(|s| match &s.parent {
+            Some(parent) => format!("{parent}.{}", s.name),
+            None => s.name.clone(),
+        })
+        .unwrap_or_else(|| e.source.clone())
 }
 
 /// The `symbols` and `edges` rows of one parsed file (ids already assigned):
