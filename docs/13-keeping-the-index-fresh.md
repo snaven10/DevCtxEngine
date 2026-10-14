@@ -398,7 +398,10 @@ devctx memories import .devctx/state/index.duckdb.pre-compact.duckdb
 
 It adds the memories the index lacks — never overwrites one — with their
 references and sessions, and embeds each again (the sidecar has no vectors, so
-this loads the model).
+this loads the model); run again after a failure, it embeds whatever the first
+run left without a vector. Two things to know: it takes any `.duckdb` file that
+has those tables (another index's sidecar included), and it brings back a
+memory you forgot on purpose after the compaction — forget it again if so.
 
 ### What the tools answer meanwhile
 

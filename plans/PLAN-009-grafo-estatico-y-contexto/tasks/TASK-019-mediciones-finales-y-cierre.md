@@ -44,7 +44,15 @@ compactación.
 
 - [ ] **Paso 1 — aprobación.** Confirmar con el usuario los repos (mínimo backend-a y frontend;
       DevCtxEngine de control) y que el binario a medir es el candidato final (versión ya subida a
-      0.10.0).
+      0.10.0). Antes de medir, y asignado a esta task por la revisión de TASK-018:
+      - **el bump a 0.10.0** del workspace: hoy la nota de compactación escribe `done:0.9.0:…`;
+      - en el `CHANGELOG.md`, como *Known limitations*, las filas 1, 3 y 15 de §6 (decisión del
+        usuario del 2026-10-13);
+      - el **contrato de downgrade**, en el CHANGELOG y en `docs/13` + ES: las rutas de módulo quedan
+        como en 0.9.0 y las llamadas por tipo como `Tipo.metodo`; 0.9.0 las sigue encontrando por
+        nombre y recorre un nivel más;
+      - el **known issue de HNSW**: reconstruir el índice cambia el top-k aproximado (el exacto no;
+        medido en TASK-018).
 - [ ] **Paso 2 — upgrade con compactación.** Por repo, sobre una copia del índice 0.9.0 real:
       medir `B0`; `devctx index --full` por el serve con el disparo automático; registrar bloques
       usados/libres y bytes tras el `--full` y tras compactar, segundos de cada parte y total,

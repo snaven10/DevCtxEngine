@@ -414,7 +414,11 @@ devctx memories import .devctx/state/index.duckdb.pre-compact.duckdb
 
 Agrega las memorias que le falten al índice — nunca pisa una — con sus
 referencias y sesiones, y embebe cada una otra vez (el sidecar no tiene
-vectores, así que esto carga el modelo).
+vectores, así que esto carga el modelo); corrido otra vez tras un fallo, embebe
+lo que la primera corrida dejó sin vector. Dos cosas a saber: acepta cualquier
+fichero `.duckdb` que tenga esas tablas (el sidecar de otro índice incluido), y
+devuelve una memoria que olvidaste a propósito después de la compactación —
+olvidala otra vez si es el caso.
 
 ### Qué responden las herramientas mientras tanto
 
