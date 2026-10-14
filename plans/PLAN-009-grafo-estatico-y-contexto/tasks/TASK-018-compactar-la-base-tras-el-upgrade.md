@@ -4,7 +4,7 @@
 - **Especialista:** general-purpose (Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama local `feat/plan-009-grafo`, remota `fix/plan-009-grafo`
 - **Depende de:** —
-- **Estado:** `in_progress`
+- **Estado:** `done`
 
 (La motivó la medición de TASK-016, que ya está escrita; no espera trabajo de esa task. Las
 mediciones finales y el cierre del plan son TASK-019, que depende de esta.)
@@ -414,12 +414,12 @@ nota como estaba.
         compactada (los 60 casos del downgrade de TASK-016).
       - **0.i — calibrar** el umbral del disparo y el criterio de RAM con los números reales.
 
-- [ ] **Paso 1 — tests que fallan** (lista en "Tests"), antes del código.
+- [x] **Paso 1 — tests que fallan** (lista en "Tests"), antes del código.
 
-- [ ] **Paso 2 — `compact.rs` y el lock en `Store::open`:** el protocolo de arriba con sus cinco
+- [x] **Paso 2 — `compact.rs` y el lock en `Store::open`:** el protocolo de arriba con sus cinco
       invariantes.
 
-- [ ] **Paso 3 — el disparo automático.**
+- [x] **Paso 3 — el disparo automático.**
       - **Quién marca, y cuándo.** `index_run`, **al empezar** una corrida `full_reindex` sobre una
         rama que (a) **ya existía** —filas en `index_state` o `file_state` para ese
         `(repo_path, branch)` antes de la corrida— y (b) es **pre-grafo**: sin sello de extractor
@@ -454,26 +454,26 @@ nota como estaba.
         propio cada uno, muy visible. El aviso de bloat de `pipeline.rs:856-875` baja de 3,0× al
         umbral de arriba y recomienda `devctx compact` (`repair` queda para ART rotos).
 
-- [ ] **Paso 4 — `devctx compact`.** `Command::Compact { dry_run, force, keep_original }`. Corre los
+- [x] **Paso 4 — `devctx compact`.** `Command::Compact { dry_run, force, keep_original }`. Corre los
       previos, anuncia, para el serve con la misma regla de cierre limpio (si lo mató SIGKILL hace
       la *preparación* del punto 2 en vez de abortar: el usuario lo pidió explícitamente), ejecuta
       el protocolo y muestra el reporte. Sin umbral, salvo "0 bloques libres" sin `--force`.
       `--dry-run`: usados/libres, lo que se espera recuperar, previos, nada escrito. Funciona con o
       sin la clave `compaction` y con `PENDING_*` presentes. Solo la base del proyecto.
 
-- [ ] **Paso 5 — limpieza al arrancar.** En `Store::open` (así la heredan `open_store`, el serve,
+- [x] **Paso 5 — limpieza al arrancar.** En `Store::open` (así la heredan `open_store`, el serve,
       el MCP y la TUI), con el lock compartido de `<lock>` en mano (I1: quien lo tiene sabe que no
       hay compactación viva): si hay `<tmp>*` o `<side>.tmp*` **y `<db>` existe**, borrarlos (una
       línea por stderr). Si `<db>` no existe y hay un `<tmp>`, no se borra nada **y no se crea una
       base nueva encima**: error que nombra el temporal (I5). `<lock>` no se borra nunca (M-C). Un
       `<side>` de más de 30 días se quita (M-D). Nunca tocar `<db>` ni `<db>.wal`.
 
-- [ ] **Paso 6 — medición propia** (tabla en "Medición") para el Resultado; la medición final del
+- [x] **Paso 6 — medición propia** (tabla en "Medición") para el Resultado; la medición final del
       plan es TASK-019.
 
-- [ ] **Paso 7 — docs EN + ES y CHANGELOG** (ver "Docs").
+- [x] **Paso 7 — docs EN + ES y CHANGELOG** (ver "Docs").
 
-- [ ] **Paso 8 — gate y cierre.** `cargo fmt --check`, `clippy --all-targets --locked -D warnings`
+- [x] **Paso 8 — gate y cierre.** `cargo fmt --check`, `clippy --all-targets --locked -D warnings`
       (con y sin `--features gpu`), `cargo test --workspace --locked`; barrido de privacidad;
       `## Resultado`. El cross-check de Windows/macOS es de TASK-019.
 
@@ -684,7 +684,119 @@ el Paso 0 con el motor del repo.
 
 ## Resultado
 <!-- SE LLENA AL CERRAR (estado done/skipped). Vacío mientras esté pending. Contrato: PLAN-009 §11 -->
-- **Estado final:**
-- **Resumen:**
-- **Archivos tocados:**
-- **Verificado por:**
+- **Estado final:** `done`. Lo que queda para TASK-019: el cross-check de Windows/macOS (el
+  `rename` y el lock en Windows, sin máquina), los 60 casos del downgrade sobre la base compactada,
+  el recorrido completo `index --full` + compactación sobre los índices 0.9.0 reales con el modelo,
+  y los casos de campo de su Paso 5.
+- **Resumen.** La 0.10.0 compacta la base una vez tras el `--full` que migra una rama de antes del
+  grafo, y tiene `devctx compact`. Método A (spike): schema de `init_schema` en un `Store` propio
+  sobre `<tmp>`, cerrado y recién después adjuntado; inventario por catálogo filtrado por base;
+  `INSERT … BY NAME` por tabla; HNSW (métrica del nombre del índice) y FTS en otra conexión;
+  verificación en frío y contra la fuente (conteo, `sum(hash())::HUGEINT` de todas las columnas,
+  `EXCEPT ALL` en los dos sentidos para `memories`, `memory_symbol_references` y `sessions`);
+  sidecar sin vectores; `rename` con la fuente adjunta por `H`. Lock propio `<db>.compact.lock`
+  (`flock`; modo de compartición en Windows) que `Store::open` mantiene compartido mientras vive y
+  que nunca se borra. El disparo va por la nota (`owed:upgrade`), solo en el CLI, con TTY, sin
+  `DEVCTX_NO_AUTO_COMPACT`, con los previos pasados y si el serve salió por SIGTERM sin WAL; si no,
+  queda debida y la corrida termina con la línea `devctx compact`.
+- **Números** (binario release de esta task, copias de los índices actualizados en sitio de
+  TASK-016, máquina compartida con carga 3-4; `B0` = el 0.9.0 justo antes del `--full`, de
+  TASK-016):
+
+  | Repo | `B0` usados / bytes | tras `--full` | tras compactar (2 corridas) | contra `B0` | tiempo | `VmHWM` | disco temporal máx. |
+  |---|---|---|---|---|---|---|---|
+  | backend-a | 504 / 160 182 272 (152,8 MiB) | 786 / 296 MiB | 545-550 / 137-138 MiB | usados **1,08-1,09×**, bytes **0,90×** | 7,3-8,5 s | 364-383 MiB | 186 MiB |
+  | frontend | 293 / 87 044 096 (83,0 MiB) | 463 / 171 MiB | 323-327 / 81-82 MiB | usados **1,10-1,12×**, bytes **0,98-0,99×** | 4,4-5,7 s | 267-303 MiB | 104 MiB |
+
+  Meta ≤ 1,30 × `B0` en usados y en bytes: **cumple** en los dos. Desglose (backend-a): inventario
+  0,2 s · copia 1,7-1,8 · HNSW 3,4-3,9 · FTS 1,6-2,0 · verificación en frío 0,2-0,3 · contra la
+  fuente 0,2 · sidecar y reemplazo < 0,1. Condición 4: el método con `init_schema` da lo mismo que
+  el spike (backend-a 545-550 contra 547; frontend 323-327 contra 323); la variación de ±5 bloques
+  es la serialización del HNSW. Condición 2 sobre las bases reales: top-10 **exacto** idéntico en
+  20/20 consultas (backend-a) y 15/15 (frontend), conteos iguales en todas las tablas, HNSW
+  `cosine` y FTS presentes. `v0.9.0` abre la base compactada (comando `routes`, salida 0) y deja
+  los datos intactos — humo, no los 60 casos (TASK-019). El recorrido completo `index --full` +
+  compactación por el serve no se midió sobre los repos reales (pide el modelo y los repos: TASK-019);
+  sí sobre un proyecto de prueba (test `through_the_server_the_upgrade_stops_it_cleanly_and_compacts`).
+- **Hallazgos.** (1) La causa del bloat la confirmó el spike (el `--full` con reuso reescribe cada
+  fila de `vectors`; anotado en PLAN-010 TASK-012). (2) Un índice creado por 0.10 cuyo primer `--full`
+  murió antes de sellar queda "pre-grafo" (sin sello y con filas en `file_state`): el `--full`
+  siguiente deja `owed` y compacta una vez de más. Inofensivo; anotado. (3) Un `--full` que reusa
+  vectores hace crecer los usados sin dejar libres al final cuando nada se escribe después (los
+  bloques libres quedan en el medio solo si otras tablas crecen detrás): de ahí que el umbral del
+  aviso use libres y no `bloat_ratio` solo.
+- **Archivos tocados.** Nuevos: `crates/devctx-store/src/{oslock.rs,compact.rs,compact_tests.rs}`,
+  `crates/devctx-core/src/interrupt.rs`, `crates/devctx-cli/src/compact_cli.rs`,
+  `crates/devctx-cli/tests/compact_cli.rs`. Modificados: `crates/devctx-store/{Cargo.toml,src/lib.rs,
+  src/store.rs,src/error.rs}`, `crates/devctx-core/src/{procown.rs,lib.rs}`,
+  `crates/devctx-cli/src/{main.rs,remote.rs,help_map.rs}`, `crates/devctx-cli/tests/serve_lifecycle.rs`
+  (un test nuevo), `crates/devctx-index/src/{pipeline.rs,lib.rs}`, `crates/devctx-mcp/src/state.rs`,
+  `crates/devctx-memory/src/lib.rs`, `Cargo.lock` (`libc` en devctx-store); docs EN/ES 07, 08, 11, 13,
+  `AGENTS.md`, `README.md`, `CHANGELOG.md`.
+  Símbolos públicos nuevos: `devctx_store::compact::{compact, preflight, check_extensions, inspect,
+  restore_from_sidecar, CompactOptions, CompactReport, CompactError, FailKind, BlockUsage,
+  SystemProbe, Preflight, Inspection, RestoreReport, COMPACTION_*}`, `Store::block_usage`,
+  `devctx_store::{CompactPaths, FileLock, LockMode, try_lock_exclusive, compaction_running,
+  SIDECAR_TTL}`, `StoreError::{Compacting, OrphanCompaction}`, `procown::Termination::Killed` y
+  `exited_cleanly()`, `remote::{Reclaim, reclaim_db_report}`, `devctx_core::interrupt::Interrupts`,
+  `IndexResult.compaction`, `devctx_mcp::state::compaction_json`, `devctx_memory::index_memory_vectors`
+  (pasa a `pub`). Config: `DEVCTX_NO_AUTO_COMPACT`; `DEVCTX_TEST_ASSUME_TTY` solo para los tests de
+  integración. CLI: `devctx compact [--dry-run] [--force] [--keep-original]`; `devctx memories import
+  <sidecar>.duckdb`.
+- **Contrato JSON (aditivo).** `status`/`index_status`: bloque `compaction { state, note,
+  used_blocks, free_blocks, block_size, hint }`; con `owed*` el `hint` de nivel superior empieza por
+  el de la compactación. Reporte de `/index` del serve: `compaction` (la nota) cuando existe.
+- **Tests** (`cargo test --workspace --locked --no-fail-fast -j 8 -- --test-threads=8`, verde en cada
+  commit de código). Los 28 de la spec y los 29-36 de las condiciones, por número: 1
+  `a_kill_at_any_phase_leaves_a_whole_database`; 2 `a_cancel_at_any_phase_leaves_the_original`; 3
+  `a_wal_before_starting_refuses_or_is_folded`, `a_wal_or_a_touch_before_the_rename_aborts`; 4
+  `an_open_is_refused_while_a_compaction_holds_the_lock`,
+  `building_the_state_is_refused_while_the_database_is_compacted`,
+  `serve_refuses_to_start_while_the_database_is_compacted`; 5
+  `a_held_lock_or_a_lockless_filesystem_stops_the_run`,
+  `a_binary_that_ignores_the_lock_file_still_stops_the_run`; 6
+  `verification_catches_a_missing_a_duplicated_and_a_changed_row`; 7
+  `the_checksum_sees_duplicates_and_nulls_and_ignores_column_order`; 8
+  `a_temporary_without_its_database_is_neither_deleted_nor_covered`,
+  `a_failed_run_does_not_delete_its_copy_when_the_database_is_gone`; 9 y 34
+  `each_preflight_refusal_creates_nothing`; 10
+  `a_symlinked_database_is_replaced_in_place_and_keeps_its_mode`,
+  `the_names_of_a_symlinked_database_are_next_to_the_real_file`; 11
+  `a_repair_leftover_with_rows_aborts_and_an_empty_one_is_ignored`; 12 y 30
+  `unknown_objects_abort_by_name_and_a_missing_column_is_null_filled`; 13, 14, 15, 19
+  `a_compaction_keeps_every_row_and_gives_the_space_back`, `ip_survives_and_the_exact_top_k_is_identical`
+  (también 35 y `--keep-original`); 16 `a_database_of_memories_only_compacts`; 17
+  `the_sidecar_is_replaced_kept_or_restored_from`, `an_expired_sidecar_goes_at_the_next_open`,
+  `an_open_removes_the_leftovers_of_a_dead_compaction`, `a_memory_is_restored_from_the_sidecar` (CLI);
+  18 `owed_indexes_are_built_and_their_notes_cleared`; 20-24 en `devctx-index`
+  (`a_full_run_over_a_pre_graph_branch_owes_a_compaction`, `a_new_branch_does_not_touch_the_note`,
+  `a_done_note_is_rearmed_and_a_graphless_repo_owes_nothing`,
+  `a_cancelled_migration_leaves_the_compaction_owed`, `each_pre_graph_branch_rearms_the_note`); 25,
+  27 y 36 `the_upgrade_compacts_once_and_only_with_a_terminal` (CLI) y
+  `the_automatic_compaction_needs_the_note_a_terminal_and_no_switch`; 26
+  `reclaim_reports_a_killed_server_apart_from_a_clean_stop`,
+  `a_process_ended_by_sigkill_is_reported_as_killed_not_as_a_clean_exit`,
+  `a_real_process_that_ignores_sigterm_is_reported_killed`,
+  `only_a_clean_stop_lets_the_file_be_replaced`,
+  `through_the_server_the_upgrade_stops_it_cleanly_and_compacts`; 28
+  `devctx_compact_dry_run_keep_original_and_force`, `status_tells_the_compaction_states_apart`; 29
+  `only_h_holds_the_source_and_one_stray_descriptor_breaks_that`; 31 los de 5 y 3; 32
+  `an_open_store_keeps_the_shared_lock_until_its_last_clone_goes`,
+  `a_second_exclusive_lock_fails_while_the_first_is_held`; 33 el sha256 (por `sha256sum`, otro
+  proceso) en cada test de fallo; más `the_copy_is_about_the_size_of_the_same_content_written_once`
+  (condición 4), `a_sigint_sets_the_flag_and_the_old_handler_comes_back`,
+  `the_pending_notes_are_named_alike_in_both_crates`, `the_map_lists_compact`.
+  Fallaron antes del arreglo (rojo visto): los de `Termination::Killed` y `Reclaim`, los siete de
+  `oslock` (cinco en rojo de comportamiento con el módulo cableado sin usar), el de
+  `AppState::build` (por mutación: sin la guarda, falla), los de la nota 20 y 23 (rojo de
+  comportamiento con el campo sin escribir), `status_tells_…`, y los cuatro de `compact_cli.rs`.
+  **`compact.rs` se escribió antes que sus tests**; se verificó por mutación: sin la I3 antes del
+  `rename`, sin la comprobación de tamaño/mtime/inodo, soltando `src` antes de `Verified`, borrando
+  temporales sin mirar si existe la base, y con `bit_xor` en vez de `sum`: cada mutación hace fallar
+  su test.
+- **Lo que NO se verificó.** Windows y macOS: solo compila en Linux aquí; el lock por modo de
+  compartición, el `rename` sobre un archivo abierto y `available_disk`/`available_memory` (que en
+  Windows devuelven "desconocido" y no frenan) son de TASK-019. Los locks sobre 9p/NFS/FUSE reales
+  (la guarda M-B.1 está probada con una sonda inyectada). El downgrade completo. El test temporizado
+  `a_foreign_lock_still_fails_fast` (meta de 2 s) falló una vez en el gate del commit 1 con la
+  máquina cargada (6,1 s); la base sin cambios también falla 1 de 4 con esa carga: preexistente.
