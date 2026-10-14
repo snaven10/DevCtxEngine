@@ -1353,10 +1353,13 @@ del mismo contenido indexado desde cero. Eso es lo que ve cada usuario que actua
   fuente que el destino no tiene aborta nombrándolo, y un resto `devctx_repair_*` con filas
   también (puede ser la única copia de una tabla tras un `repair` cortado).
 - **Red.** Antes del `rename`, `memories`, `memory_symbol_references` y `sessions` se exportan a un
-  sidecar junto a la base, que se borra tras la próxima corrida exitosa. No hay copia de la base
+  sidecar junto a la base, sin vectores (restaurar re-embebe), que vence a los 30 días o lo
+  reemplaza la próxima compactación. No hay copia de la base
   entera (`--keep-original` opcional en `devctx compact`).
-- **Disparo.** Automático solo sobre un umbral de bloques libres (propuesto: ≥ 25 % del archivo y
-  ≥ 16 MiB; se calibra en el spike). La nota vive en `index_meta` (`compaction`, clave de toda la
+- **Disparo.** Automático **por la nota, no por un umbral** (condición de la revisora tras el
+  spike): un umbral de bloques libres (≥ 25 % del archivo y ≥ 16 MiB) solo decide el aviso que
+  recomienda `devctx compact` y es el punto de partida del disparo periódico de PLAN-010 TASK-012.
+  La nota vive en `index_meta` (`compaction`, clave de toda la
   base) y **se rearma** con cada `--full` que migra una rama pre-grafo **que ya existía** (una rama
   nueva no la toca; un "no llegó al umbral" no bloquea una migración posterior). Lo ejecuta **el
   CLI con el serve parado**, nunca el serve, y solo desde `index --full` / `reindex --full`, con

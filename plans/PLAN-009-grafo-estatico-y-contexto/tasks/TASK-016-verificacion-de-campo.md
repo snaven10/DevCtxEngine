@@ -4,7 +4,7 @@
 - **Especialista:** — (orquestador, con aprobación del usuario; la sesión revisora mide)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama local `feat/plan-009-grafo`, remota `fix/plan-009-grafo`
 - **Depende de:** TASK-015
-- **Estado:** `in_progress`
+- **Estado:** `done`
 
 ---
 
@@ -77,7 +77,8 @@ el informe son **TASK-019** (que depende de TASK-018). Los dos criterios de acep
 ## Resultado
 
 <!-- Contrato: PLAN-009 §11 -->
-- **Estado final:** `in_progress` — medición completa (Pasos 1-6 y 8 escritos); falta el Paso 7
+- **Estado final:** `done` con el alcance acotado del 2026-10-13 (lo medido + la etapa A; condición
+  de la revisión de TASK-018). Lo que sigue es de **TASK-019**: el Paso 7
   (cross-check en CI, lo dispara un push que esta sesión no hace), la revisión del commit de bug
   `fb1707c` y del cambio de criterio del gold `e91a8b9`, y las decisiones del usuario sobre las
   filas que no cumplen (abajo, "Pendiente de decisión").

@@ -4,7 +4,7 @@
 - **Especialista:** general-purpose (Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama local `feat/plan-009-grafo`, remota `fix/plan-009-grafo`
 - **Depende de:** —
-- **Estado:** `pending`
+- **Estado:** `in_progress`
 
 (La motivó la medición de TASK-016, que ya está escrita; no espera trabajo de esa task. Las
 mediciones finales y el cierre del plan son TASK-019, que depende de esta.)
@@ -40,11 +40,103 @@ TASK-016. Cambia DD-21 (que decía "medir y no tocar").
 | # | Decisión |
 |---|---|
 | D1 | Esta task no depende de TASK-016. La "etapa B" (mediciones finales, cierre de §6, cross-check, informe) es **TASK-019**, que depende de esta |
-| D2 | La nota de compactación es **por base**, pero se **rearma** con cada migración de una rama pre-grafo **que ya existía**, y siempre sujeta al umbral |
+| D2 | La nota de compactación es **por base**, y se **rearma** con cada migración de una rama pre-grafo **que ya existía**. El disparo automático va **por la nota**, no por el umbral (condición 1 de la revisora) |
 | D3 | Disparo automático solo desde `devctx index --full` / `devctx reindex --full`, y solo si: se anuncia antes de parar el serve, el serve cierra limpio, no hay corrida en vuelo y hay TTY. Si no, queda `owed` |
 | D4 | Apagado en 0.10.0: solo `DEVCTX_NO_AUTO_COMPACT=1`. La clave de config llega con el disparo periódico de PLAN-010 TASK-012 |
-| D5 | Sin copia de la base entera, pero con red: antes del `rename`, lo no regenerable (`memories`, `memory_symbol_references`, `sessions`) se exporta a un sidecar junto a la base, que se borra tras la próxima corrida exitosa. `--keep-original` es opcional en `devctx compact` |
+| D5 | Sin copia de la base entera, pero con red: antes del `rename`, lo no regenerable (`memories`, `memory_symbol_references`, `sessions`) se exporta a un sidecar junto a la base. **No lleva vectores** (restaurar re-embebe) y no lo borra la próxima corrida de index: vence a los 30 días o lo reemplaza la próxima compactación (M-D). `--keep-original` es opcional en `devctx compact` |
 | D6 | Se acepta reconstruir HNSW y FTS dos veces en el upgrade (el `--full` y la compactación) en la 0.10.0; se mide |
+
+## Condiciones de la revisora (2026-10-13, tras el spike)
+
+Aprobadas con la spec; **mandan sobre cualquier texto anterior de este archivo que las contradiga**.
+La revisora las verifica al revisar el código.
+
+1. **Disparo único por NOTA.** El disparo tras el upgrade lo decide la nota de `index_meta` (un
+   índice que venía de ≤ 0.9.x), **no el umbral** de bloques libres. El umbral (libres ≥ 25 % y
+   ≥ 64 bloques) queda para el aviso que recomienda `devctx compact` y para el disparo periódico de
+   PLAN-010 TASK-012. No existe el estado `skipped-below-threshold`.
+2. **Qué significa "contesta igual".** Mismos **datos** (conteos + checksum + `EXCEPT ALL`) y mismo
+   top-k **exacto** (búsqueda por fuerza bruta). **No** se exige identidad del top-k *aproximado*
+   del HNSW (reconstruir el índice cambia el grafo: medido, 216 de 300 listas idénticas entre la
+   fuente y la copia, 260 de 300 entre dos reconstrucciones de la misma copia; recall@10 ≈ 0,96 en
+   las tres) ni del orden de `impact` entre empates. Se documenta también para el usuario.
+3. **Regla dura de descriptores.** El proceso que tiene la fuente adjunta **no abre ni cierra
+   ningún otro descriptor sobre `<db>`**: el lock `fcntl` de DuckDB se suelta al cerrar
+   *cualquier* descriptor del archivo dentro del proceso. `stat` siempre por **ruta**, nunca por
+   fd; nada de hash ni de copia por archivo de `<db>` (el hard link de `--keep-original` es por
+   ruta). Test: un open/close simulado rompe la exclusión.
+4. **Método A con `init_schema`.** El schema del destino sale de `init_schema` del binario, no del
+   `sql` del catálogo de la fuente. Se verifica que dé el mismo resultado que el spike (usados
+   dentro de 1,03-1,10 × el 0.9.0 de partida).
+
+**MAJOR**
+
+- **M-A — los helpers de schema no filtran por base.** `init_schema` y los helpers de `schema.rs`
+  (`table_exists`, `column_exists`, `view_exists`, `stored_dimension`, `read_hnsw_metric`,
+  `checkpoint_is_safe`) consultan `duckdb_tables()`/`duckdb_views()` **sin** filtrar por base: con
+  `src` adjunta, `view_exists("live_edges")` da `true` por la fuente y `dst` quedaría sin la
+  vista; y el inventario creería que toda tabla de `src` existe y nunca abortaría. **Fix:**
+  `<tmp>` se crea con un `Store` propio (entrada interna), se cierra, y **recién después** se
+  adjunta. Toda consulta de catálogo del protocolo lleva `database_name = 'src' | 'dst'`. El test
+  de inventario corre con las dos adjuntas.
+- **M-B — los locks tienen que funcionar en ese filesystem** (9p, NFS, FUSE). Dos guardas:
+  1. tras tomar `<lock>`, un segundo intento de lock (otro descriptor) tiene que **fallar**; si no
+     falla: abortar con "este filesystem no soporta locks". `<lock>` usa `flock` (por descripción
+     de archivo abierto, sobre un archivo aparte que no es la base), vía `libc` (`File::try_lock`
+     es de Rust 1.89 y el MSRV es 1.82). En Windows: el modo de compartición al abrir `<lock>`
+     (`share_mode(0)` para el exclusivo), solo con `std`;
+  2. tamaño + mtime + inodo de `<db>`, **por ruta**, tomados tras el `ATTACH` y sin cambios justo
+     antes del `rename`, junto a I3.
+- **M-C — borrar el archivo de lock es una carrera.** `<lock>` **no se borra nunca** (queda junto
+  a la base, vacío). `Store::open` **mantiene** el lock compartido mientras el store (y sus
+  clones) viven: no lo prueba y lo suelta.
+- **M-D — sidecar.** `fsync` del directorio después de su `rename`. **No lleva vectores:**
+  restaurar re-embebe. No lo borra la próxima corrida de index: vence a los **30 días** (lo quita
+  el siguiente open) o lo reemplaza la próxima compactación; antes de pisar un sidecar viejo se
+  comprueba que todos sus ids de memoria están en la fuente, y si no, se conserva con otro nombre
+  (`<db>.pre-compact.<epoch>.duckdb`, que nada borra). `<side>.tmp` y su `.wal` entran en la
+  limpieza de arranque, con test. **Restauración** escrita en los docs y probada (procedimiento
+  en "Docs").
+- **M-E — I2 e I4 con test de producto.** (1) Con `compact` pausado tras cerrar las conexiones
+  auxiliares, otro proceso que abre `<db>` en escritura **salteando `<lock>`** falla con el error
+  de lock de DuckDB. (2) En todo camino de fallo, los bytes (sha256) de `<db>` son los de antes;
+  se calculan en otro proceso, o antes y después, nunca dentro del proceso mientras tiene la base.
+
+**MINOR**
+
+- **M1(b)** — la condición "pre-grafo" es *sin sello de extractor vigente y sin sello 0.10
+  previo*: el sello guardado de la rama es de antes del grafo (`v1-…`, lo que escribían
+  0.8.3-0.9.x; 0.10 escribe `v2` o más) o no hay sello. "Sin filas en `symbols`" no sirve: con el
+  disparo por nota, un repo sin archivos parseables compactaría en cada `--full`.
+- Sin TTY (un agente) **nunca** compacta solo. El `hint` de `status` tiene que ser muy visible, y
+  `devctx index --full` imprime al final la línea exacta `devctx compact`.
+- Los previos que dependen de la base (bytes del HNSW, usados/libres) salen del **reporte del
+  serve** (`status`), no de leer el archivo.
+- `EXCEPT ALL` con lista explícita de columnas; `sessions` también por `EXCEPT ALL`.
+- Reafirmar la ausencia de `<tmp>.wal` justo antes del `rename`.
+- Documentar que grupo, ACL y xattrs del archivo **no** se preservan (sí el modo).
+- Abortar si el dueño ≠ usuario efectivo. Sin `chown`.
+- TASK-016 pasa a `done` con el alcance acotado (lo medido + etapa A); lo demás es TASK-019.
+
+## Resultado del spike (Paso 0; medido, DuckDB v1.5.5)
+
+- **Compuerta 0.a: pasa.** Método A sobre los índices actualizados en sitio: usados
+  **1,03-1,10 ×** los del 0.9.0 de partida (backend-a 786 → 547; frontend 463 → 323).
+- **Método A:** schema nuevo + `ATTACH src (READ_ONLY)` + `INSERT INTO t BY NAME SELECT … FROM
+  src.t` por tabla + vista + ART + checkpoint + HNSW (métrica sacada del **nombre** del índice,
+  como `enable_hnsw`) + FTS + checkpoint. backend-a: 5,4 s, pico de 676 MiB, `.wal` del destino de
+  hasta 65 MiB; al cerrar no queda `.wal`.
+- **`COPY FROM DATABASE` descartado:** recrea el HNSW con métrica `l2sq` (la consulta deja de
+  usarlo).
+- **DuckDB no detecta un `.wal` ajeno:** lo aplica en silencio. De ahí I3 en los dos puntos.
+- **El lock `fcntl` se suelta al cerrar cualquier descriptor** del archivo dentro del proceso
+  (condición 3). Con la fuente adjunta en lectura, un escritor de otro proceso falla; tras el
+  `rename`, el lock sigue sobre el inodo viejo.
+- **`sum(hash(cols)::HUGEINT)`** distingue NULL de `''` y acepta `FLOAT[n]`; 0,33 s en backend-a
+  con `vector` incluido: la columna `vector` entra **siempre**, en todas las filas.
+- **Reconstruir el HNSW cambia el top-k aproximado; el exacto es idéntico** (condición 2).
+- **Causa del bloat (0.a'):** el `--full` con reuso **borra y reescribe** cada fila de `vectors`
+  (backend-a: 42 606 filas almacenadas, 21 615 vivas). Anotado en PLAN-010 TASK-012.
 
 ## Contexto verificado
 
@@ -169,18 +261,23 @@ temporales van junto al archivo real, en el mismo filesystem); `<tmp>` = `<db>.c
 
 - **I1 — lock propio, de sistema operativo.** `<lock>` es un archivo con un lock exclusivo del SO
   (no PID + start time: fuera de Linux no hay start time), tomado antes de tocar nada y soltado al
-  final. `Store::open` de una base en archivo y el arranque del serve intentan ese lock en modo
-  compartido y sin esperar; si está tomado **se niegan a abrir** con un error tipado ("la base se
+  final; el archivo **no se borra nunca** (M-C). `Store::open` de una base en archivo y el
+  arranque del serve toman ese lock en modo compartido, sin esperar, y **lo mantienen mientras el
+  store vive**; si está tomado en exclusivo **se niegan a abrir** con un error tipado ("la base se
   está compactando; reintentá"), que `open_store`, `AppState::build` y la TUI muestran tal cual.
-  El compactador abre `<tmp>` por una entrada interna que no pasa por esa comprobación.
+  El compactador abre `<tmp>` por una entrada interna que no pasa por esa comprobación. Tras
+  tomarlo, comprueba que un segundo intento falla (M-B.1); con un `Store` abierto en cualquier
+  proceso el exclusivo no se consigue: "la base está en uso".
 - **I2 — una sola conexión sostiene la fuente.** La conexión `H` adjunta `<db>` como `src`
   (`READ_ONLY`) antes de leer nada y **no la suelta hasta después del `rename`**. Todo lo que se lee
-  de la fuente pasa por `H`. El proceso no abre `<db>` por ningún otro lado (un lock `fcntl` se
-  suelta al cerrar *cualquier* descriptor del archivo). El lock de DuckDB que `H` mantiene es lo que
+  de la fuente pasa por `H`. El proceso no abre **ni cierra** ningún otro descriptor sobre `<db>`
+  (un lock `fcntl` se suelta al cerrar *cualquier* descriptor del archivo): `stat` por ruta, sin
+  hash ni copia por archivo (condición 3). El lock de DuckDB que `H` mantiene es lo que
   frena a un binario que no conoce `<lock>` (0.9.0, un 0.10 viejo).
 - **I3 — sin WAL ajeno.** Con `src` adjunta se afirma que `<db>.wal` no existe o mide 0 bytes:
   **justo después del `ATTACH` y justo antes del `rename`**. Si existe, se aborta. Un `rename`
-  nunca deja un WAL viejo junto a un archivo nuevo.
+  nunca deja un WAL viejo junto a un archivo nuevo. En los mismos dos puntos: tamaño + mtime +
+  inodo de `<db>` por ruta, sin cambios (M-B.2); y antes del `rename`, `<tmp>.wal` ausente.
 - **I4 — la fuente no se escribe.** Desde I1 hasta el `rename`, nada escribe en `<db>`.
   (El único open normal de la fuente es la *preparación* opcional del punto 2, antes de adjuntarla
   y declarada.)
@@ -197,17 +294,21 @@ temporales van junto al archivo real, en el mismo filesystem); `<tmp>` = `<db>.c
    disponible (umbral a calibrar con el `VmHWM` del Paso 0); VSS y FTS se pueden cargar si la base
    los usa. Cualquier "no": no se empieza y se dice qué falta.
 2. **Lock y limpieza.** Tomar `<lock>` (I1); si está tomado: "ya hay una compactación en curso".
-   Con el lock en mano, borrar `<tmp>`, `<tmp>.wal` y el directorio temporal de una corrida muerta
+   Comprobar que un segundo intento de lock falla (M-B.1). Con el lock en mano, borrar `<tmp>`,
+   `<tmp>.wal`, `<side>.tmp`, `<side>.tmp.wal` y el directorio temporal de una corrida muerta
    (respetando I5). *Preparación* (solo si `<db>.wal` existe con contenido, y solo en `devctx
    compact`; el disparo automático no llega aquí con WAL, ver Paso 3): un `Store::open` normal por
    la entrada interna, `try_checkpoint`, cerrar. Es un open como el de cualquier comando (replay,
    `init_schema`); si falla o el WAL sigue ahí, abortar.
 3. **Sostener la fuente.** `H` = conexión en memoria; **primero** `apply_resource_limits` y carga
    de VSS + FTS (como `Store::open`: sin VSS, adjuntar una base con HNSW es el fallo fatal de
-   TASK-003), después `ATTACH '<db>' AS src (READ_ONLY)`. Afirmar I3.
-4. **Inventario y compatibilidad.** Crear el destino: `ATTACH '<tmp>' AS dst`, `USE dst`,
-   `init_schema(dim guardada en la fuente)`. El set de objetos conocidos **sale del catálogo de
-   `dst` recién creado**, no de una lista a mano. Contra él, por `duckdb_tables()`,
+   TASK-003), después `ATTACH '<db>' AS src (READ_ONLY)`. Afirmar I3 y tomar tamaño + mtime + inodo
+   de `<db>` por ruta (M-B.2).
+4. **Inventario y compatibilidad.** Crear el destino **con un `Store` propio** (entrada interna)
+   sobre `<tmp>` —`init_schema(dim guardada en la fuente)`—, cerrarlo, y recién después
+   `ATTACH '<tmp>' AS dst` en `H` (M-A: los helpers de `schema.rs` no filtran por base). Toda
+   consulta de catálogo lleva `database_name = 'src' | 'dst'`. El set de objetos conocidos **sale
+   del catálogo de `dst` recién creado**, no de una lista a mano. Contra él, por `duckdb_tables()`,
    `duckdb_columns()`, `duckdb_views()`, `duckdb_sequences()`, `duckdb_functions()` (macros),
    `duckdb_indexes()` y `duckdb_schemas()` de `src`:
    - tabla de `src` que no está en `dst` → **abortar nombrándola**, salvo `devctx_repair_*`
@@ -226,13 +327,11 @@ temporales van junto al archivo real, en el mismo filesystem); `<tmp>` = `<db>.c
    FROM src.<t>` (lista explícita). Checkpoint de `dst` entre tablas grandes si 0.e lo pide.
    En `dst.index_meta`: escribir `('','','compaction') = 'done:<versión>:<epoch>:<motivo>'` (sin
    tamaños: el "después" no se conoce todavía; van en el reporte) y, si los índices se van a
-   construir, borrar `PENDING_HNSW`/`PENDING_FTS`. `CHECKPOINT dst`; `USE memory`; `DETACH dst`.
-   `src` sigue adjunta.
+   construir, borrar `PENDING_HNSW`/`PENDING_FTS`. `CHECKPOINT dst`; `DETACH dst`.
+   `src` sigue adjunta (todo nombre va calificado con su base: no hace falta `USE`).
 6. **Índices derivados**, en otra conexión `B` = `Store` sobre `<tmp>` (entrada interna):
    `enable_hnsw(métrica)` si la fuente lo tenía o lo debía, `rebuild_fts()` ídem; si devuelven
-   `false` y la fuente lo tenía → abortar. Checkpoint, cerrar. (Si el Paso 0 muestra que
-   `init_schema` sobre un catálogo adjunto no sirve, el punto 4 crea `<tmp>` con `B` y lo cierra
-   antes de adjuntarlo; `src` no se suelta en ningún caso.)
+   `false` y la fuente lo tenía → abortar. Checkpoint, cerrar. `src` no se suelta en ningún caso.
 7. **Verificación en frío**, en otra conexión `V` = `Store` nuevo sobre `<tmp>`: HNSW presente, con
    la misma métrica y usado por la consulta; FTS consultable; una búsqueda vectorial y una por
    palabra devuelven filas; checkpoint y cerrar: no queda `<tmp>.wal`.
@@ -242,23 +341,27 @@ temporales van junto al archivo real, en el mismo filesystem); `<tmp>` = `<db>.c
    - `sum(hash(<columnas explícitas, ordenadas por nombre>)::HUGEINT)` igual. `sum`, no
      `bit_xor`: `symbols`, `edges` y `memory_symbol_references` no tienen PK y dos filas
      duplicadas se anulan con xor;
-   - `vectors`: la columna `vector` entra **siempre** para las filas de memoria (`memory_type IS
-     NOT NULL`; re-verificar el predicado contra cómo se guardan los chunks de memoria) y para las
-     de código según el costo medido en 0.g (como mínimo `id` + `content_hash` + el resto);
-   - `memories` y `memory_symbol_references`, además: `src EXCEPT ALL chk` y `chk EXCEPT ALL src`
-     dan **0 filas**;
+   - `vectors`: la columna `vector` entra **siempre**, en todas las filas (0.g: 0,33 s en
+     backend-a);
+   - `memories`, `memory_symbol_references` y `sessions`, además: `src EXCEPT ALL chk` y
+     `chk EXCEPT ALL src`, con lista explícita de columnas, dan **0 filas**;
    - **única exclusión, declarada:** en `index_meta`, exactamente la fila `('','','compaction')` y
      las filas `('','', PENDING_HNSW_META_KEY)` / `('','', PENDING_FTS_META_KEY)` cuando el punto 5
      las borró. Todo lo demás de `index_meta` (sellos de extractor, fingerprints de embedding,
      excludes, generación, notas de link) se compara.
    `DETACH chk`.
-9. **Red de memorias (D5).** Desde `H`: `ATTACH '<side>.tmp'`, `CREATE TABLE … AS SELECT * FROM
-   src.{memories, memory_symbol_references, sessions}`, checkpoint, `DETACH`, `fsync`, `rename` a
-   `<side>`. Son KB-MB. Lo borra la próxima corrida de index que termine bien sobre la base nueva
-   (o `devctx compact`); los docs dicen cómo restaurar desde él.
-10. **Reemplazo.** Copiar el modo de `<db>` a `<tmp>`; `fsync(<tmp>)`; **afirmar I3 otra vez**;
-    `rename(<tmp>, <db>)` con `src` adjunta (Unix: el lock sigue sobre el inodo viejo); `fsync` del
-    directorio; `DETACH src`; soltar y borrar `<lock>`. Con `--keep-original`: antes del `rename`,
+9. **Red de memorias (D5, M-D).** Desde `H`: `ATTACH '<side>.tmp'`, `CREATE TABLE … AS SELECT …
+   FROM src.{memories, memory_symbol_references, sessions}`, checkpoint, `DETACH`, `fsync`. Si ya
+   hay un `<side>` viejo: se adjunta en lectura y se comprueba que todos sus ids de `memories`
+   están en `src.memories`; si falta alguno, se conserva renombrado a
+   `<db>.pre-compact.<epoch>.duckdb`. `rename` a `<side>` y `fsync` del directorio. Son KB-MB y
+   **no lleva vectores**. Vence a los 30 días (lo quita el siguiente open) o lo reemplaza la
+   próxima compactación; los docs dicen cómo restaurar desde él.
+10. **Reemplazo.** Copiar el modo de `<db>` a `<tmp>` (por ruta; grupo, ACL y xattrs **no** se
+    preservan; el dueño ya se comprobó en los previos: sin `chown`); `fsync(<tmp>)`; **afirmar I3
+    otra vez**, que tamaño + mtime + inodo de `<db>` no cambiaron (M-B.2) y que `<tmp>.wal` no
+    existe; `rename(<tmp>, <db>)` con `src` adjunta (Unix: el lock sigue sobre el inodo viejo);
+    `fsync` del directorio; `DETACH src`; soltar `<lock>` (**no se borra**, M-C). Con `--keep-original`: antes del `rename`,
     un hard link de `<db>` a `<db>.pre-compact` (pide ~2× de disco; solo en `devctx compact`).
     Windows: ver "Interacciones".
 11. **Reporte:** bloques y bytes antes/después (leídos de la base nueva), segundos por fase, filas
@@ -269,7 +372,8 @@ nota como estaba.
 
 ## Pasos
 
-- [ ] **Paso 0 — spike (decide el método; sin código de producto).** Sandbox como el de TASK-016
+- [x] **Paso 0 — spike (decide el método; sin código de producto).** Hecho: "Resultado del
+      spike". Sandbox como el de TASK-016
       (`mktemp -d` fuera de `/tmp`, `DEVCTX_HOME`/`HOME`/`XDG_*` propios), copias de los índices
       0.9.0 (`B0`) y de los actualizados en sitio de backend-a, frontend y DevCtxEngine, con el
       DuckDB del repo (binario de prueba o test `#[ignore]`). Por variante: usados/libres, bytes,
@@ -318,22 +422,23 @@ nota como estaba.
 - [ ] **Paso 3 — el disparo automático.**
       - **Quién marca, y cuándo.** `index_run`, **al empezar** una corrida `full_reindex` sobre una
         rama que (a) **ya existía** —filas en `index_state` o `file_state` para ese
-        `(repo_path, branch)` antes de la corrida— y (b) es **pre-grafo**: sin filas en `symbols`
-        para esa rama y sin sello de extractor vigente. Escribe `index_meta('','','compaction') =
+        `(repo_path, branch)` antes de la corrida— y (b) es **pre-grafo**: sin sello de extractor
+        vigente y sin sello 0.10 previo (M1(b): el sello guardado es `v1-…`, o no hay sello). Escribe `index_meta('','','compaction') =
         'owed:upgrade'`, **pisando cualquier `done:*`** (rearme, D2). Una rama nueva sobre una base
         0.9.0 no cumple (a) y **no toca la nota**; un índice creado por 0.10 no cumple (b). Marcar
         al empezar hace que una corrida cancelada deje `owed` y que la que la termina se evalúe.
       - **Estados de la nota** (clave de toda la base): ausente · `owed:upgrade` ·
-        `owed:failed-verify` · `done:<versión>:<epoch>:compacted` ·
-        `done:<versión>:<epoch>:skipped-below-threshold`. Ningún `done` bloquea un `owed` posterior.
-      - **Umbral (propuesto, se calibra en 0.i):** `libres ≥ 25 %` de los bloques totales
-        (`bloat_ratio() ≥ 1,33`) **y** `libres ≥ 64` bloques (16 MiB). Los upgrades medidos dan
-        31-34 % (cuenta derivada, a confirmar); el piso evita reescribir bases chicas. Con `owed` y
-        bajo el umbral: `done:…:skipped-below-threshold`.
+        `owed:failed-verify` · `done:<versión>:<epoch>:<motivo>` (`upgrade` | `manual`). Ningún
+        `done` bloquea un `owed` posterior.
+      - **El umbral no decide el disparo tras el upgrade** (condición 1). `libres ≥ 25 %` de los
+        bloques totales **y** `libres ≥ 64` bloques (16 MiB) es el umbral del **aviso** al final de
+        un `--full` y del `hint` de `status` sin nota, que recomiendan `devctx compact`; y el punto
+        de partida del disparo periódico de PLAN-010 TASK-012.
       - **Quién ejecuta: el CLI, nunca el serve**, y solo al terminar **sin cancelación** un
         `devctx index --full` o cada proyecto de `devctx reindex --full`. Condiciones, todas (D3):
-        nota `owed:upgrade`; umbral; `DEVCTX_NO_AUTO_COMPACT` sin definir; **hay TTY**; los previos
-        del punto 1 del protocolo pasan; no hay corrida en vuelo (`/index/progress`); se **anuncia**
+        nota `owed:upgrade`; `DEVCTX_NO_AUTO_COMPACT` sin definir; **hay TTY** (sin TTY nunca
+        compacta solo: imprime al final la línea exacta `devctx compact`); los previos del punto 1
+        pasan, con los datos de la base sacados del reporte del serve; no hay corrida en vuelo (`/index/progress`); se **anuncia**
         ("voy a parar el serve de este proyecto para compactar; ~N MiB, ~T s") antes de parar; y el
         serve **cierra limpio**: salió por SIGTERM y no dejó `<db>.wal`. Para eso
         `procown::Termination` distingue "salió tras SIGTERM" de "hubo que matarlo", y
@@ -346,8 +451,8 @@ nota como estaba.
       - **`owed:failed-verify` no se reintenta solo:** solo `devctx compact`.
       - **Visibilidad.** `status` / `index_status`: `compaction: { state, free_blocks, used_blocks,
         hint }` (aditivo), con `owed` y `owed:failed-verify` como estados **distintos** y `hint`
-        propio cada uno. El aviso de bloat de `pipeline.rs:856-875` baja de 3,0× al mismo umbral
-        del disparo y recomienda `devctx compact` (`repair` queda para ART rotos).
+        propio cada uno, muy visible. El aviso de bloat de `pipeline.rs:856-875` baja de 3,0× al
+        umbral de arriba y recomienda `devctx compact` (`repair` queda para ART rotos).
 
 - [ ] **Paso 4 — `devctx compact`.** `Command::Compact { dry_run, force, keep_original }`. Corre los
       previos, anuncia, para el serve con la misma regla de cierre limpio (si lo mató SIGKILL hace
@@ -356,10 +461,12 @@ nota como estaba.
       `--dry-run`: usados/libres, lo que se espera recuperar, previos, nada escrito. Funciona con o
       sin la clave `compaction` y con `PENDING_*` presentes. Solo la base del proyecto.
 
-- [ ] **Paso 5 — limpieza al arrancar.** En `open_store` y al arrancar `serve`, tras comprobar
-      `<lock>` (I1): si hay `<tmp>*` sin compactación viva **y `<db>` existe**, borrarlos (una
-      línea por stderr). Si `<db>` no existe, no se borra nada y se avisa (I5). Un `<lock>` sin
-      dueño se borra. Nunca tocar `<db>`, `<db>.wal` ni `<side>`.
+- [ ] **Paso 5 — limpieza al arrancar.** En `Store::open` (así la heredan `open_store`, el serve,
+      el MCP y la TUI), con el lock compartido de `<lock>` en mano (I1: quien lo tiene sabe que no
+      hay compactación viva): si hay `<tmp>*` o `<side>.tmp*` **y `<db>` existe**, borrarlos (una
+      línea por stderr). Si `<db>` no existe y hay un `<tmp>`, no se borra nada **y no se crea una
+      base nueva encima**: error que nombra el temporal (I5). `<lock>` no se borra nunca (M-C). Un
+      `<side>` de más de 30 días se quita (M-D). Nunca tocar `<db>` ni `<db>.wal`.
 
 - [ ] **Paso 6 — medición propia** (tabla en "Medición") para el Resultado; la medición final del
       plan es TASK-019.
@@ -376,7 +483,8 @@ nota como estaba.
 |---|---|---|---|
 | Un previo no pasa (disco, solo lectura, dueño, RAM, extensión) | original; nada creado; **el serve no se paró** | qué falta y cuánto | `owed` |
 | El serve no cerró limpio (SIGKILL, no paró, Windows) o hay corrida en vuelo | original | por qué no se compactó | `owed` |
-| `<lock>` tomado | original | "ya hay una compactación" | sin cambio |
+| `<lock>` tomado | original | "ya hay una compactación" o "la base está en uso" | sin cambio |
+| El filesystem no soporta locks (M-B.1), o `<db>` cambió de tamaño/mtime/inodo (M-B.2) | original; temporales borrados | qué guarda falló | `owed` |
 | Otro proceso tiene la base (binario viejo) | original | error de lock con PID | `owed` |
 | `<db>.wal` con contenido tras el `ATTACH` o antes del `rename` (I3) | original **y su WAL, sin tocar**; temporales borrados | "hay escrituras sin plegar; corré `devctx compact`" | `owed` |
 | Tabla, columna, vista, macro, secuencia, índice o schema desconocido | original; temporales borrados | el nombre | `owed` |
@@ -385,7 +493,7 @@ nota como estaba.
 | Error de DuckDB (OOM, I/O) | original; temporales borrados | el error | `owed` |
 | La verificación no coincide | original; temporales borrados | qué tabla o índice | `owed:failed-verify` |
 | Corte entre el `rename` y el `fsync` del directorio | la original o la copia verificada, completas | nada | según cuál quedó |
-| Corte entre el `rename` y el borrado de `<lock>` | la copia verificada + `<lock>` sin dueño | el próximo arranque lo borra | `done` |
+| Corte entre el `rename` y soltar `<lock>` | la copia verificada; el kernel suelta el lock al morir el proceso (el archivo queda: no se borra nunca) | nada | `done` |
 | Falla el `rename` | original; `<tmp>` borrado (I5: `<db>` existe) | el error | `owed` |
 | Éxito | la copia verificada + `<side>` | reporte | `done:…:compacted` |
 
@@ -452,8 +560,10 @@ Primero fallan, después pasan. En `compact.rs` salvo donde se indica. Los que p
 15. **Memorias:** `memories`, `memory_symbol_references`, `sessions` y los chunks de memoria de
     `vectors` idénticos; **`recall` semántico** de una memoria conocida la encuentra tras compactar.
 16. **Memorias con cero vectores de código** (una base solo con memorias): compacta y conserva todo.
-17. **Sidecar:** existe tras compactar, con las tres tablas completas; la siguiente corrida exitosa
-    lo borra; una que falla, no.
+17. **Sidecar (M-D):** existe tras compactar, con las tres tablas completas y sin vectores; una
+    corrida de index posterior **no** lo borra; vence a los 30 días; la siguiente compactación lo
+    reemplaza si todos sus ids están en la fuente y lo conserva con otro nombre si no;
+    `<side>.tmp` y su `.wal` entran en la limpieza de arranque; **restauración** probada.
 18. **`compact` sin la clave `compaction`, y con `PENDING_HNSW`/`PENDING_FTS`:** termina, construye
     los índices debidos y las notas `PENDING_*` no quedan en la base nueva.
 19. **`index_meta`:** sellos y fingerprints idénticos tras compactar; solo cambia la fila
@@ -463,11 +573,12 @@ Primero fallan, después pasan. En `compact.rs` salvo donde se indica. Los que p
 20. Un `--full` sobre una rama pre-grafo que ya existía deja `owed:upgrade`; un incremental, un
     `--full` sobre un índice 0.10 y **una rama nueva** no tocan la nota.
 21. **Una rama nueva no quema el `done`:** base 0.9.0 con rama `main`; `--full` de una rama nueva
-    (bajo el umbral) → nota intacta; después el `--full` de `main` → `owed` → compacta.
-22. **`skipped-below-threshold` no bloquea:** tras un `skipped`, otra migración vuelve a `owed`.
+    → nota intacta; después el `--full` de `main` → `owed` → compacta.
+22. **Un `done` no bloquea:** tras un `done`, otra migración vuelve a `owed`. Un repo sin archivos
+    parseables no queda `owed` en cada `--full` (M1(b)).
 23. **Corrida cancelada:** deja `owed`; la que la termina dispara.
-24. **Dos ramas** pre-grafo: cada migración rearma; con el umbral cumplido se compacta dos veces,
-    y sin él no.
+24. **Dos ramas** pre-grafo: cada migración rearma y se compacta dos veces (por nota, no por
+    umbral).
 25. **Una sola vez por migración** (vía directa, `DEVCTX_NO_AUTOSERVE`): fixture de forma 0.9.0 →
     `index --full` → compactada y `done`; un segundo `index --full` no compacta.
 26. **Serve con SIGKILL deja `owed`** (`remote.rs`, con el servidor de prueba que ignora SIGTERM
@@ -475,6 +586,23 @@ Primero fallan, después pasan. En `compact.rs` salvo donde se indica. Los que p
 27. **Sin TTY** y con `DEVCTX_NO_AUTO_COMPACT=1`: queda `owed` y se avisa.
 28. **`devctx compact --dry-run`** no crea ni cambia archivos; **`status`** muestra `owed`,
     `owed:failed-verify` y `done` como estados distintos.
+
+*Condiciones de la revisora*
+29. **Regla de descriptores (condición 3):** con la fuente adjunta, un open/close de `<db>` en el
+    proceso que compacta **rompe** la exclusión (fija el motivo de la regla). M-E.1: sin ese
+    open/close, con `compact` pausado tras cerrar las conexiones auxiliares, otro proceso que abre
+    `<db>` en escritura salteando `<lock>` **falla** con el error de lock de DuckDB.
+30. **M-A:** el inventario corre con `src` y `dst` adjuntas: la copia lleva la vista `live_edges`
+    y una tabla de más en la fuente aborta.
+31. **M-B:** un filesystem donde el segundo lock no falla (inyectado) aborta con "no soporta
+    locks"; un `<db>` cuyo tamaño/mtime/inodo cambia entre el `ATTACH` y el `rename` aborta.
+32. **M-C:** `<lock>` sigue existiendo tras compactar (con éxito y con fallo); un `Store` abierto
+    mantiene el lock compartido: con él vivo el exclusivo no se consigue, y al soltarlo sí.
+33. **M-E.2:** en todo camino de fallo los bytes de `<db>` son los de antes (sha256 antes y
+    después, fuera del proceso que la tiene).
+34. **Dueño distinto** aborta sin `chown`; **el modo** se conserva.
+35. **"Contesta igual" (condición 2):** top-k exacto idéntico entre la fuente y la copia.
+36. **Sin TTY:** `devctx index --full` termina con la línea exacta `devctx compact`.
 
 ## Medición
 
@@ -495,8 +623,13 @@ Con el binario de esta task, sandbox y método de TASK-016, sobre los índices 0
 
 - `docs/13-keeping-the-index-fresh.md` + ES: en *Upgrading to 0.10*, la compactación (cuándo corre
   sola, que anuncia y para el serve, cuánto disco y RAM pide, cuánto tarda, cómo apagarla, cuándo
-  queda `owed` y qué hacer, el sidecar y cómo restaurar desde él, `devctx compact`); corregir
-  `:357`.
+  queda `owed` y qué hacer, el sidecar y cómo restaurar desde él, `devctx compact`, qué significa
+  "contesta igual" —condición 2—, que grupo/ACL/xattrs no se preservan); corregir `:357`.
+- **Restauración desde el sidecar** (M-D): `devctx serve --stop`, después `devctx memories import
+  <db>.pre-compact.duckdb`. El importador reconoce un sidecar por su extensión `.duckdb`, solo
+  agrega (lo que ya está se salta), **re-embebe** el contenido de cada memoria agregada (el sidecar
+  no lleva vectores) y repone sus filas de `memory_symbol_references` y las de `sessions` que
+  falten.
 - `docs/07-performance.md` + ES: tamaños y tiempos medidos.
 - `docs/08-design-decisions.md` + ES: el ADR (`:319`); por qué copia + `rename` y no
   `VACUUM`/`CHECKPOINT`; el lock.

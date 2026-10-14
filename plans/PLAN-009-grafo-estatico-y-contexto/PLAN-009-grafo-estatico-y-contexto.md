@@ -262,9 +262,9 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-013 | Tool `traverse` | general-purpose (Rust) | TASK-009, TASK-017 | `done` |
 | TASK-014 | Tool `skeleton` por archivo | general-purpose (Rust) | TASK-004 | `done` |
 | TASK-015 | Docs EN + ES y guía de reindex | general-purpose (Rust) | TASK-002, TASK-011, TASK-012, TASK-013, TASK-014 | `done` |
-| TASK-016 | Verificación de campo contra §6 (medición sobre el candidato sin compactación) | — (orquestador, con aprobación del usuario) | TASK-015 | `in_progress` |
+| TASK-016 | Verificación de campo contra §6 (medición sobre el candidato sin compactación) | — (orquestador, con aprobación del usuario) | TASK-015 | `done` |
 | TASK-017 | Dispatch por interfaz en `impact_analysis` (y `traverse`): override-equivalentes vía `implements`/`inherits`, `medium`, `via: "dispatch"` | general-purpose (Rust) | TASK-009 | `done` |
-| TASK-018 | Compactar la base una vez tras el upgrade 0.9.0 → 0.10 (copia verificada + rename atómico) y comando `devctx compact` | general-purpose (Rust) | — | `pending` |
+| TASK-018 | Compactar la base una vez tras el upgrade 0.9.0 → 0.10 (copia verificada + rename atómico) y comando `devctx compact` | general-purpose (Rust) | — | `in_progress` |
 | TASK-019 | Mediciones finales con compactación, cierre de §6, cross-check e informe (la "etapa B" separada de TASK-016) | — (orquestador, con aprobación del usuario) | TASK-018 | `pending` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)

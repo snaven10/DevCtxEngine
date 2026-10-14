@@ -58,7 +58,10 @@ compactación.
 - [ ] **Paso 5 — casos límite de campo.** Una base con dos ramas (frontend); una base con memorias
       locales reales (copia, solo lectura sobre el original): `recall` antes y después; un upgrade
       sin TTY y uno con `DEVCTX_NO_AUTO_COMPACT=1` (quedan `owed`, `status` lo dice) seguidos de
-      `devctx compact`.
+      `devctx compact`. Además (revisión de TASK-018): un **ensayo de restauración** desde el
+      sidecar (`<db>.pre-compact.duckdb`, `devctx memories import`); una **sesión MCP activa**
+      durante la compactación (el `remember` recibe "se está compactando" y entra al reintentar);
+      y la **comprobación de lock de M-B** (el segundo `flock` falla) sobre el filesystem real.
 - [ ] **Paso 6 — tabla de §6** completa con veredicto por fila: las filas medidas en TASK-016 se
       citan; la de tamaño lleva los dos números (desde cero y upgrade + compactación); las filas 1,
       3 y 15 van como limitaciones conocidas con su decisión.

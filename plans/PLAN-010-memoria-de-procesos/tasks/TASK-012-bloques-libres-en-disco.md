@@ -29,6 +29,11 @@ por decisión del usuario (2026-10-07). No bloquea la 0.10.0.
     libres no bajan);
   - un `--full` que reescribió 40 archivos: **178/95** — los libres crecen con las reescrituras.
 - Esa última cifra cumple la condición que se había puesto para reabrir el tema.
+- **Causa raíz (PLAN-009 TASK-018, spike del 2026-10-13):** el `--full` con reuso de vectores
+  (DD-20) **borra y reescribe cada fila de `vectors`**, aunque el vector y el texto no cambien:
+  en backend-a quedaron 42 606 filas almacenadas para 21 615 vivas. Si el reuso no reescribiera
+  las filas que no cambian, no habría bloat. PLAN-009 TASK-018 entrega el mecanismo de copia
+  verificada + `rename` (`devctx compact`) que esta task reusa.
 - DuckDB no achica el archivo con `VACUUM`; recuperar espacio exige reescribir la base (p. ej.
   `EXPORT`/`IMPORT DATABASE` o `ATTACH` + `COPY FROM DATABASE` a un archivo nuevo y reemplazo
   atómico), con el riesgo conocido sobre índices HNSW (extensión VSS) y sobre el WAL.
