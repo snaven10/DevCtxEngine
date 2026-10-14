@@ -1167,6 +1167,40 @@ fn a_failed_run_does_not_delete_its_copy_when_the_database_is_gone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Review D2: an embedder that fails half way leaves the restored rows in
+/// place; running the restore again embeds every one still without a vector,
+/// instead of skipping them as "already present".
+#[test]
+fn a_restore_cut_by_the_embedder_is_finished_by_the_next_one() {
+    let dir = scratch("restore_retry");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let r = compact(&db, &opts()).unwrap();
+    let s = Store::open(&db, DIM).unwrap();
+    for id in ["mem_a", "mem_b"] {
+        s.forget_memory(id).unwrap();
+        s.delete_memory_vectors(id).unwrap();
+    }
+    let mut calls = 0;
+    let first = restore_from_sidecar(&s, &r.sidecar, &mut |m| {
+        calls += 1;
+        if calls == 2 {
+            return Err(crate::StoreError::Decode("the embedder went away".into()));
+        }
+        s.upsert(&[memory_point(&m.id, 1)])
+    });
+    assert!(first.is_err());
+    let again =
+        restore_from_sidecar(&s, &r.sidecar, &mut |m| s.upsert(&[memory_point(&m.id, 1)])).unwrap();
+    assert_eq!(again.added, 0, "the rows were already restored");
+    assert_eq!(again.embedded, 1, "the one left without a vector");
+    for id in ["mem_a", "mem_b"] {
+        assert!(s.get_memory(id).unwrap().is_some(), "{id}");
+        assert!(s.vector_by_id(id).unwrap().is_some(), "{id} has no vector");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- a rename a power cut reverted (review D1) --------------------------------
 
 /// Put the directory back as a power cut can leave it after a `rename` whose

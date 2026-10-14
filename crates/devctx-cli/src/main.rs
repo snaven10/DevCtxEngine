@@ -3357,23 +3357,31 @@ fn restore_memories_from_sidecar(
     }
     let store = open_store(cfg, configured_dimension(cfg))
         .context("opening the store (stop a running server first: `devctx serve --stop`)")?;
-    let mut embedder: Option<Box<dyn EmbeddingProvider>> = None;
-    let report = devctx_store::compact::restore_from_sidecar(&store, side, &mut |m| {
-        if embedder.is_none() {
-            embedder = Some(
-                build_embedder(cfg)
-                    .map_err(|e| devctx_store::StoreError::Decode(format!("{e:#}")))?,
+    // The embedder first, and its width against the index's: a restore whose
+    // embedding cannot work must not start writing rows (review D2). A run
+    // cut anyway is finished by the next one, which embeds every restored
+    // memory still without a vector.
+    let embedder = build_embedder(cfg)?;
+    if let Some(stored) = store.stored_dimension()? {
+        if stored != embedder.dimension() {
+            bail!(
+                "the index stores vectors of width {stored} and the configured model makes {}; \
+                 nothing was restored",
+                embedder.dimension()
             );
         }
-        let e = embedder.as_deref().expect("just built");
-        devctx_memory::index_memory_vectors(&store, e, m)
+    }
+    let report = devctx_store::compact::restore_from_sidecar(&store, side, &mut |m| {
+        devctx_memory::index_memory_vectors(&store, embedder.as_ref(), m)
             .map_err(|e| devctx_store::StoreError::Decode(e.to_string()))
     })?;
     println!(
-        "restored {} memories from {} · {} already present · {} symbol references · {} sessions",
+        "restored {} memories from {} · {} already present · {} embedded · {} symbol \
+         references · {} sessions",
         report.added,
         side.display(),
         report.already,
+        report.embedded,
         report.refs,
         report.sessions
     );

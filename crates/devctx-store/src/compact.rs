@@ -1695,6 +1695,9 @@ pub struct RestoreReport {
     pub refs: usize,
     /// `sessions` rows added.
     pub sessions: usize,
+    /// Memories embedded again: the added ones, and any restored earlier
+    /// that still has no vector (an embedder that failed half way).
+    pub embedded: usize,
 }
 
 /// Put back, from a compaction's sidecar, the memories the index lacks — with
@@ -1755,11 +1758,25 @@ pub fn restore_from_sidecar(
                 Ok(())
             })?;
             report.added = added.len();
-            for id in &added {
+            // Every memory of the sidecar that is in the index, alive, and
+            // has no vector — the ones just added, and any an earlier restore
+            // added before its embedder failed (review D2). Embedded one by
+            // one, so a failure here leaves the rest for the next run.
+            let pending: Vec<String> = {
+                let mut st = store.conn.prepare(
+                    "SELECT m.id FROM main.memories m \
+                     WHERE m.id IN (SELECT id FROM devctx_restore.main.memories) \
+                       AND m.deleted_at IS NULL \
+                       AND m.id NOT IN (SELECT id FROM main.vectors) \
+                     ORDER BY m.id",
+                )?;
+                let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            for id in &pending {
                 if let Some(m) = store.get_memory(id)? {
-                    if m.deleted_at.is_none() {
-                        reindex(&m)?;
-                    }
+                    reindex(&m)?;
+                    report.embedded += 1;
                 }
             }
         }
