@@ -210,6 +210,17 @@ fn fixture(db: &Path, fx: Fx) {
         assert!(store.rebuild_fts().unwrap(), "FTS is needed by these tests");
     }
     store.checkpoint();
+    drop(store);
+    // A child another test forks meanwhile can hold a copy of the lock's
+    // descriptor until it execs: let it go before the test compacts.
+    let t0 = Instant::now();
+    while try_lock_exclusive(db).unwrap().is_none() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the lock stayed held"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Every table's row count and checksum, read from a fresh in-memory
@@ -1414,6 +1425,88 @@ fn a_reverted_rename_with_new_memories_is_never_deleted() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Review (pass 3): a memory changed, or forgotten, after a reverted rename
+/// keeps the copy too — `t EXCEPT ALL d` and `d EXCEPT ALL t`.
+#[test]
+fn a_reverted_rename_with_a_changed_or_forgotten_memory_is_kept() {
+    for (what, sql) in [
+        (
+            "update",
+            "UPDATE memories SET content = 'changed after' WHERE id = 'mem_a'",
+        ),
+        ("forget", "DELETE FROM memories WHERE id = 'mem_b'"),
+    ] {
+        let dir = scratch(what);
+        let db = dir.join("index.duckdb");
+        fixture(&db, Fx::default());
+        let mut o = opts();
+        o.keep_original = true;
+        compact(&db, &o).unwrap();
+        let tmp = revert_rename(&db);
+        {
+            let s = Store::open_unlocked(&tmp, DIM).unwrap();
+            s.conn.execute_batch(sql).unwrap();
+            s.checkpoint();
+        }
+        let sum = sha(&tmp);
+        assert!(
+            matches!(
+                Store::open(&db, DIM),
+                Err(crate::StoreError::UnreconciledCompaction { .. })
+            ),
+            "{what}"
+        );
+        assert_eq!(sha(&tmp), sum, "{what}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Review (pass 3): a catalog that cannot be read is a doubt, never "nothing
+/// to compare".
+#[test]
+fn an_unreadable_catalog_is_unsure_not_disposable() {
+    let dir = scratch("catalog");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let mut o = opts();
+    o.keep_original = true;
+    compact(&db, &o).unwrap();
+    let _ = revert_rename(&db);
+    let paths = CompactPaths::for_db(&db);
+    let v = tmp_verdict_with(&paths, &|_, alias| {
+        if alias == "t" {
+            Err(CompactError::new(FailKind::Engine, "catalog unreadable"))
+        } else {
+            Ok(vec!["memories".into()])
+        }
+    });
+    assert!(matches!(v, TmpVerdict::Unsure(_)), "{v:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review (pass 3): folding a WAL over an index with an HNSW index needs VSS;
+/// without it the fold refuses before any checkpoint, and the index and its
+/// WAL are left byte for byte.
+#[test]
+fn folding_a_wal_without_vss_over_hnsw_refuses() {
+    let dir = scratch("fold_novss");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let wal = CompactPaths::for_db(&db).wal;
+    // A WAL of a few appends to a table the HNSW index does not cover.
+    child(&db, "leave-wal-meta");
+    assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+    let (sum, wal_sum) = (sha(&db), sha(&wal));
+    let mut o = opts();
+    o.fold_wal = true;
+    o.extensions = Some(|c| (false, c.execute_batch("INSTALL fts; LOAD fts;").is_ok()));
+    let e = compact(&db, &o).unwrap_err();
+    assert_eq!(e.kind, FailKind::Preflight, "{e}");
+    assert!(e.message.contains("VSS"), "{e}");
+    assert_eq!((sha(&db), sha(&wal)), (sum, wal_sum));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// D1, the other side: a copy with nothing the database lacks (a run killed
 /// after it was written, or a reverted rename nobody wrote to) still goes at
 /// the next open, as before.
@@ -1531,6 +1624,11 @@ fn compact_child() {
                 ..code_point(1)
             }])
             .unwrap();
+            std::process::abort();
+        }
+        "leave-wal-meta" => {
+            let s = Store::open(&db, DIM).unwrap();
+            s.set_index_meta("wal", "only", "k", "v").unwrap();
             std::process::abort();
         }
         "hold-raw" => {

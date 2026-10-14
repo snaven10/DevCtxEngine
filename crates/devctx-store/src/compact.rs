@@ -153,6 +153,10 @@ pub(crate) enum Phase {
     Renamed,
 }
 
+/// How the extensions are loaded on a connection: whether VSS and FTS
+/// loaded. Injectable so a machine without VSS can be modelled.
+pub(crate) type LoadExtensions = fn(&Connection) -> (bool, bool);
+
 /// A hook of the tests: may stop the run (`Err`), or do anything to it.
 pub(crate) type Hook<'a> = &'a dyn Fn(Phase, &Connection) -> std::result::Result<(), String>;
 
@@ -203,6 +207,7 @@ pub struct CompactOptions<'a> {
     pub(crate) hook: Option<Hook<'a>>,
     pub(crate) lock_probe: Option<fn(&Path) -> bool>,
     pub(crate) dir_sync: Option<fn(&Path) -> std::io::Result<()>>,
+    pub(crate) extensions: Option<LoadExtensions>,
 }
 
 impl CompactOptions<'_> {
@@ -220,6 +225,7 @@ impl CompactOptions<'_> {
             hook: None,
             lock_probe: None,
             dir_sync: None,
+            extensions: None,
         }
     }
 }
@@ -891,6 +897,22 @@ pub(crate) enum TmpVerdict {
 /// Compare `<tmp>` with `<db>` on what no reindex can rebuild. Reads both
 /// through read-only `ATTACH`es of an in-memory connection.
 pub(crate) fn tmp_verdict(paths: &CompactPaths) -> TmpVerdict {
+    tmp_verdict_with(paths, &|c, alias| {
+        query_strings(
+            c,
+            &format!(
+                "SELECT table_name FROM duckdb_tables() WHERE database_name = '{alias}' \
+                 AND schema_name = 'main'"
+            ),
+        )
+    })
+}
+
+/// The catalog read of [`tmp_verdict`], injectable.
+type Catalog<'a> = &'a dyn Fn(&Connection, &str) -> CResult<Vec<String>>;
+
+/// [`tmp_verdict`] with the table list read through `catalog`.
+pub(crate) fn tmp_verdict_with(paths: &CompactPaths, catalog: Catalog<'_>) -> TmpVerdict {
     if !paths.tmp.exists() {
         return TmpVerdict::Disposable;
     }
@@ -921,40 +943,42 @@ pub(crate) fn tmp_verdict(paths: &CompactPaths) -> TmpVerdict {
     if let Err(e) = attach(&paths.db, "d") {
         return TmpVerdict::Unsure(format!("the index cannot be read to compare: {e}"));
     }
-    let tables = |alias: &str| {
-        query_strings(
-            &c,
-            &format!(
-                "SELECT table_name FROM duckdb_tables() WHERE database_name = '{alias}' \
-                 AND schema_name = 'main'"
-            ),
-        )
-        .unwrap_or_default()
+    // A catalog that cannot be read is a doubt, never "nothing to compare".
+    let (in_t, in_d) = match (catalog(&c, "t"), catalog(&c, "d")) {
+        (Ok(t), Ok(d)) => (t, d),
+        (Err(e), _) | (_, Err(e)) => {
+            return TmpVerdict::Unsure(format!("the catalogs cannot be read: {e}"))
+        }
     };
-    let (in_t, in_d) = (tables("t"), tables("d"));
     for table in IRREPLACEABLE {
         if !in_t.iter().any(|t| t == table) {
             continue;
         }
         let extra = if in_d.iter().any(|t| t == table) {
-            let d_cols: Vec<String> = columns(&c, "d", table)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(n, _)| n)
-                .collect();
-            let cols: Vec<String> = columns(&c, "t", table)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(n, _)| n)
-                .filter(|n| d_cols.contains(n))
-                .collect();
-            except_all(&c, "t", "d", table, &cols)
+            match (columns(&c, "d", table), columns(&c, "t", table)) {
+                (Ok(d_cols), Ok(t_cols)) => {
+                    let cols: Vec<String> = t_cols
+                        .into_iter()
+                        .map(|(n, _)| n)
+                        .filter(|n| d_cols.iter().any(|(d, _)| d == n))
+                        .collect();
+                    // Both ways: a row added or changed after a reverted
+                    // `rename` is in `t` only; one forgotten is in `d` only.
+                    except_all(&c, "t", "d", table, &cols)
+                        .and_then(|a| except_all(&c, "d", "t", table, &cols).map(|b| a + b))
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
         } else {
             query_u64(&c, &format!("SELECT count(*) FROM t.main.{}", q(table)))
         };
         match extra {
             Ok(0) => {}
-            Ok(n) => return TmpVerdict::Keep(format!("{n} rows of `{table}` the index lacks")),
+            Ok(n) => {
+                return TmpVerdict::Keep(format!(
+                    "{n} rows of `{table}` differ between the copy and the index"
+                ))
+            }
             Err(e) => return TmpVerdict::Unsure(format!("comparing `{table}`: {e}")),
         }
     }
@@ -1132,7 +1156,27 @@ fn run(paths: &CompactPaths, opts: &CompactOptions<'_>) -> CResult<CompactReport
         // writes (and may drop a legacy `memory_symbol_references`).
         let c = Connection::open_in_memory().map_err(engine)?;
         let _ = c.execute_batch(&crate::store::resource_limits_sql());
-        let _ = load_extensions(&c);
+        let (vss, _) = opts.extensions.unwrap_or(load_extensions)(&c);
+        if !vss {
+            // Without VSS a checkpoint that must bind an HNSW index fails
+            // fatally (PLAN-009 TASK-003): look first, read-only.
+            c.execute_batch(&format!("ATTACH {} AS r (READ_ONLY);", lit(&paths.db)?))
+                .map_err(engine)?;
+            let hnsw = query_u64(
+                &c,
+                "SELECT count(*) FROM duckdb_indexes() WHERE database_name = 'r' \
+                 AND upper(sql) LIKE '%USING HNSW%'",
+            );
+            let _ = c.execute_batch("DETACH r;");
+            if hnsw.map_or(true, |n| n > 0) {
+                return Err(CompactError::new(
+                    FailKind::Preflight,
+                    "the index has an HNSW index and a write-ahead log to fold, and the DuckDB \
+                     VSS extension cannot be loaded here; folding it without VSS would \
+                     invalidate the index, so nothing was changed",
+                ));
+            }
+        }
         c.execute_batch(&format!(
             "ATTACH {} AS w; CHECKPOINT w; DETACH w;",
             lit(&paths.db)?
@@ -1149,7 +1193,7 @@ fn run(paths: &CompactPaths, opts: &CompactOptions<'_>) -> CResult<CompactReport
     let h = Connection::open_in_memory().map_err(engine)?;
     let _ = h.execute_batch(&crate::store::resource_limits_sql());
     let _ = h.execute_batch(&format!("SET temp_directory = {};", lit(&paths.tmp_dir)?));
-    let (vss, fts_ext) = load_extensions(&h);
+    let (vss, fts_ext) = opts.extensions.unwrap_or(load_extensions)(&h);
     h.execute_batch(&format!("ATTACH {} AS src (READ_ONLY);", lit(&paths.db)?))
         .map_err(engine)?;
     assert_no_wal(paths)?;

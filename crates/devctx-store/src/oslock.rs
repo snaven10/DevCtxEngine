@@ -238,6 +238,14 @@ pub const SIDECAR_TTL: std::time::Duration = std::time::Duration::from_secs(30 *
 /// creating an empty database over the evidence. Never touches `<db>`,
 /// `<db>.wal`, the lock file or a sidecar younger than [`SIDECAR_TTL`].
 pub(crate) fn guard_open(db: &Path) -> crate::Result<Option<FileLock>> {
+    guard_open_with(db, |from, to| std::fs::rename(from, to))
+}
+
+/// [`guard_open`] with the move aside of an uncomparable `<tmp>` injectable.
+pub(crate) fn guard_open_with(
+    db: &Path,
+    rename: fn(&Path, &Path) -> io::Result<()>,
+) -> crate::Result<Option<FileLock>> {
     let paths = CompactPaths::for_db(db);
     if !paths.db.exists() && paths.tmp.exists() {
         return Err(crate::StoreError::OrphanCompaction {
@@ -277,13 +285,24 @@ pub(crate) fn guard_open(db: &Path) -> crate::Result<Option<FileLock>> {
                 let mut aside = paths.tmp.clone().into_os_string();
                 aside.push(format!(".kept-{}", crate::compact::epoch_millis()));
                 let aside = PathBuf::from(aside);
-                if std::fs::rename(&paths.tmp, &aside).is_ok() {
-                    eprintln!(
+                match rename(&paths.tmp, &aside) {
+                    Ok(()) => eprintln!(
                         "· kept {} as {}: it could not be compared with the index ({why}); \
                          delete it once you know it is not needed",
                         paths.tmp.display(),
                         aside.display()
-                    );
+                    ),
+                    // Not moved: not deleted either, and the open stops here.
+                    Err(e) => {
+                        return Err(crate::StoreError::UnreconciledCompaction {
+                            db: paths.db,
+                            tmp: paths.tmp,
+                            reason: format!(
+                                "it could not be compared with the index ({why}) nor moved \
+                                 aside ({e})"
+                            ),
+                        })
+                    }
                 }
             }
         }
@@ -456,6 +475,24 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 1);
         assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"not a database");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review (pass 3): when an unreadable `<tmp>` cannot be moved aside
+    /// either, the open is refused and nothing is deleted.
+    #[test]
+    fn a_temporary_that_cannot_be_moved_aside_is_not_deleted() {
+        let dir = scratch("noaside");
+        let db = dir.join("index.duckdb");
+        drop(Store::open(&db, DIM).unwrap());
+        let p = CompactPaths::for_db(&db);
+        std::fs::write(&p.tmp, b"not a database").unwrap();
+        let r = guard_open_with(&db, |_, _| Err(io::Error::other("injected")));
+        assert!(
+            matches!(r, Err(StoreError::UnreconciledCompaction { .. })),
+            "{r:?}"
+        );
+        assert_eq!(std::fs::read(&p.tmp).unwrap(), b"not a database");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
