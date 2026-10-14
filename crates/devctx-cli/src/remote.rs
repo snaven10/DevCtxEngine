@@ -802,13 +802,6 @@ impl Reclaim {
     pub fn stopped(&self) -> bool {
         matches!(self, Reclaim::Stopped | Reclaim::Killed)
     }
-
-    /// Nothing holds the database any more, and nothing was killed to get
-    /// there: what a compaction needs (PLAN-009 TASK-018).
-    #[allow(dead_code)] // the compaction trigger lands in a later commit
-    pub fn clean(&self) -> bool {
-        matches!(self, Reclaim::NoServer | Reclaim::Stopped)
-    }
 }
 
 /// [`reclaim_db`], saying how the server left: a compaction must not replace
@@ -860,10 +853,15 @@ fn reclaim_db_report_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -
 /// What to tell someone whose `--stop` refused because the pid cannot be tied
 /// to the file: why nothing was signalled, and the manual way out.
 pub fn unverified_message(pid: u32, serve_json: &Path, what: &str) -> String {
+    let how = if cfg!(windows) {
+        format!("`taskkill /PID {pid}` (or Task Manager)")
+    } else {
+        format!("`kill {pid}`")
+    };
     format!(
         "pid {pid} looks like a {what} but cannot be tied to {} (it predates start times, or \
          this platform cannot confirm the process); not signalling it and keeping the file. \
-         If it is yours, stop it yourself with `kill {pid}` and delete {}.",
+         If it is yours, stop it yourself with {how} and delete {}.",
         serve_json.display(),
         serve_json.display()
     )
@@ -2329,7 +2327,7 @@ mod tests {
         );
         let out = reclaim_db_report_with(&cfg, Duration::from_millis(400), Duration::from_secs(3));
         assert_eq!(out, Reclaim::Killed);
-        assert!(out.stopped() && !out.clean());
+        assert!(out.stopped());
         let _ = child.wait();
         assert!(!serve_file(&cfg).exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2349,7 +2347,6 @@ mod tests {
         );
         let out = reclaim_db_report_with(&cfg, Duration::from_secs(3), Duration::from_secs(3));
         assert_eq!(out, Reclaim::Stopped);
-        assert!(out.clean());
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
 

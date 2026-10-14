@@ -4450,7 +4450,8 @@ fn cmd_compact(dry_run: bool, force: bool, keep_original: bool) -> Result<()> {
     }
     match remote::reclaim_db_report(&cfg) {
         remote::Reclaim::NotStopped(why) => bail!(
-            "the server holding the index could not be stopped ({why}); stop it with `devctx              serve --stop` (or by hand) and run `devctx compact` again"
+            "the server holding the index could not be stopped ({why}); stop it with \
+             `devctx serve --stop` (or by hand) and run `devctx compact` again"
         ),
         remote::Reclaim::Killed => eprintln!(
             "· the server had to be killed; its write-ahead log is folded in before compacting"
