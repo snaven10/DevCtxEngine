@@ -40,6 +40,32 @@ pub enum StoreError {
     )]
     CheckpointUnsafe,
 
+    /// The database is being compacted (PLAN-009 TASK-018): its compaction
+    /// lock is held, and nothing opens it until the compaction ends.
+    #[error(
+        "the index at {} is being compacted (`devctx compact`); nothing can open it until that \
+         finishes — retry in a moment",
+        .0.display()
+    )]
+    Compacting(std::path::PathBuf),
+
+    /// A compaction's temporary copy sits next to a database that is not
+    /// there. It may be the only copy left, so nothing deletes it and no empty
+    /// database is created over it (PLAN-009 TASK-018, invariant I5).
+    #[error(
+        "{} is left from a compaction that did not finish, and the database it was copying \
+         ({}) is missing; nothing was deleted and no new index was created. Put the database \
+         back, or move the temporary aside once you know it is not needed",
+        tmp.display(),
+        db.display()
+    )]
+    OrphanCompaction {
+        /// The missing database.
+        db: std::path::PathBuf,
+        /// The temporary found next to it.
+        tmp: std::path::PathBuf,
+    },
+
     /// An I/O failure (e.g. creating the database directory).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

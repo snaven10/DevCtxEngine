@@ -131,6 +131,11 @@ struct Shared {
     /// the network when the extension is not on disk, so a machine without it
     /// would pay that on every run; the failure is remembered instead.
     vss_unavailable: AtomicBool,
+    /// The compaction lock, held shared for as long as any connection of this
+    /// open lives (PLAN-009 TASK-018, I1 and M-C): no compaction can start
+    /// under an open store. `None` for an in-memory store, for the compactor's
+    /// own opens, and where the lock file cannot be created.
+    _compact_lock: Option<crate::oslock::FileLock>,
     /// [`Store::graph_out_of_step`] answers, per `(repo, repo_path, branch)`,
     /// with the branch's `index_state.indexed_at` they were computed under
     /// (see [`Store::graph_out_of_step_cached`]).
@@ -185,18 +190,44 @@ impl Drop for TxGuard<'_> {
 
 impl Store {
     /// Open (creating if needed) a store at `path` with vector dimension `dim`.
+    ///
+    /// Takes the compaction lock shared and keeps it while the store lives;
+    /// refused with [`StoreError::Compacting`] while a compaction runs, and
+    /// with [`StoreError::OrphanCompaction`] when a compaction's temporary
+    /// sits next to a missing database. Removes what a dead compaction left
+    /// (see [`crate::oslock`]).
     pub fn open(path: &Path, dim: usize) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        let lock = crate::oslock::guard_open(path)?;
+        Self::open_with_lock(path, dim, lock)
+    }
+
+    /// [`open`](Self::open) without the compaction lock: the compactor's own
+    /// opens of its copy and of the source it is about to adjoin, which run
+    /// while it holds the lock exclusively.
+    #[allow(dead_code)] // the compactor lands in the next commit
+    pub(crate) fn open_unlocked(path: &Path, dim: usize) -> Result<Self> {
+        Self::open_with_lock(path, dim, None)
+    }
+
+    fn open_with_lock(
+        path: &Path,
+        dim: usize,
+        compact_lock: Option<crate::oslock::FileLock>,
+    ) -> Result<Self> {
         let conn = Connection::open(path)?;
         let store = Self {
             conn,
             dim,
             metric_cache: std::sync::Mutex::new(None),
-            shared: Arc::new(Shared::default()),
+            shared: Arc::new(Shared {
+                _compact_lock: compact_lock,
+                ..Shared::default()
+            }),
             in_tx: AtomicBool::new(false),
             tx_graph_dirty: AtomicBool::new(false),
         };
@@ -232,6 +263,11 @@ impl Store {
     /// whether another process holds it — without loading a model or touching
     /// the schema. A file that does not exist yet is not a conflict.
     pub fn check_unlocked(path: &Path) -> Result<()> {
+        if crate::oslock::compaction_running(path) {
+            return Err(StoreError::Compacting(
+                crate::oslock::CompactPaths::for_db(path).db,
+            ));
+        }
         if path.exists() {
             drop(Connection::open(path)?);
         }

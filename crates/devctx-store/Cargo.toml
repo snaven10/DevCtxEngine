@@ -18,3 +18,6 @@ devctx-core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 duckdb = { version = "1", features = ["bundled"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

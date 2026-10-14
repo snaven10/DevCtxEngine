@@ -13,6 +13,7 @@ mod impact;
 mod lookup;
 mod memory;
 mod memory_refs;
+mod oslock;
 mod projects;
 mod related;
 mod routes;
@@ -39,6 +40,9 @@ pub use lookup::{
 };
 pub use memory::{Memory, MemoryStats};
 pub use memory_refs::{short_label, FileIndex, LinkedMemory, SymbolRef};
+pub use oslock::{
+    compaction_running, try_lock_exclusive, CompactPaths, FileLock, LockMode, SIDECAR_TTL,
+};
 pub use projects::{ProjectIndexStats, ProjectRecord};
 pub use related::{ChunkRef, RelatedNeighbor, Relation, RELATED_MAX_HOPS, RELATED_PER_SEED};
 pub use routes::StoredRoute;

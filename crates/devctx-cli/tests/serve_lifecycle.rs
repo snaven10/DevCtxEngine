@@ -1294,3 +1294,43 @@ fn a_forced_exit_mid_index_leaves_a_sound_database() {
     assert!(inc.status.success(), "an incremental run failed: {out}");
     assert!(!out.contains("Failed to delete all rows"), "{out}");
 }
+
+/// PLAN-009 TASK-018 test 4: `devctx serve` does not start over a database
+/// whose compaction lock is held; it exits saying so. And a command run
+/// meanwhile says the same, not a lock error naming a PID.
+#[test]
+fn serve_refuses_to_start_while_the_database_is_compacted() {
+    let tmp = Tmp::new("compacting");
+    let root = project(&tmp);
+    let db = db_path(&root);
+    drop(devctx_store::Store::open(&db, 384).unwrap());
+    let held = devctx_store::try_lock_exclusive(&db)
+        .unwrap()
+        .expect("nobody holds it");
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_MODEL_CACHE", tmp.cache())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{}", free_port())])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "it started: {said}");
+    assert!(said.contains("being compacted"), "{said}");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_MODEL_CACHE", tmp.cache())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .args(["memory-stats"])
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "it opened: {said}");
+    assert!(said.contains("being compacted"), "{said}");
+    drop(held);
+    assert!(common::servers_under(&tmp.0).is_empty());
+}

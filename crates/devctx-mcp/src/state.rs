@@ -7453,6 +7453,33 @@ mod tests {
         (AppState::build(cfg).unwrap(), root)
     }
 
+    /// PLAN-009 TASK-018 test 4: the server (and every tool that rebuilds its
+    /// state) refuses to open a database while a compaction holds its lock,
+    /// with the store's typed error, and opens it once the lock is released.
+    #[test]
+    fn building_the_state_is_refused_while_the_database_is_compacted() {
+        let (state, root) = lifecycle_state("compacting");
+        let cfg = state.cfg.clone();
+        drop(state);
+        let held = devctx_store::try_lock_exclusive(&cfg.db_path())
+            .unwrap()
+            .expect("nobody holds it");
+        let err = match AppState::build(cfg.clone()) {
+            Err(e) => e,
+            Ok(_) => panic!("built during a compaction"),
+        };
+        assert!(
+            matches!(
+                err.downcast_ref::<devctx_store::StoreError>(),
+                Some(devctx_store::StoreError::Compacting(_))
+            ),
+            "{err:#}"
+        );
+        drop(held);
+        AppState::build(cfg).expect("builds once the lock is released");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// PLAN-010 TASK-001: `memory` has its four blocks, and asking for it loads
     /// no model (a `status` poll must not be what makes a serve big).
     #[test]
