@@ -47,6 +47,8 @@ pub struct CompactPaths {
     pub side_tmp_wal: PathBuf,
     /// `<db>.pre-compact`: the hard link `--keep-original` leaves.
     pub original: PathBuf,
+    /// `<db>.compact.tmpdir`: where DuckDB spills during a compaction.
+    pub tmp_dir: PathBuf,
 }
 
 impl CompactPaths {
@@ -77,6 +79,7 @@ impl CompactPaths {
             side_tmp: with(".pre-compact.duckdb.tmp"),
             side_tmp_wal: with(".pre-compact.duckdb.tmp.wal"),
             original: with(".pre-compact"),
+            tmp_dir: with(".compact.tmpdir"),
             db: real,
         }
     }
@@ -258,6 +261,12 @@ pub(crate) fn guard_open(db: &Path) -> crate::Result<Option<FileLock>> {
                     leftover.display()
                 );
             }
+        }
+        if paths.tmp_dir.is_dir() && std::fs::remove_dir_all(&paths.tmp_dir).is_ok() {
+            eprintln!(
+                "· removed {}, left by a compaction that did not finish",
+                paths.tmp_dir.display()
+            );
         }
         let expired = std::fs::metadata(&paths.side)
             .and_then(|m| m.modified())

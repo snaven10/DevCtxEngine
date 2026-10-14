@@ -98,6 +98,21 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// The `memory_limit` every database instance of this process gets.
+pub(crate) fn memory_limit_setting() -> String {
+    std::env::var("DEVCTX_DB_MEMORY_LIMIT")
+        .ok()
+        .filter(|v| is_size_literal(v))
+        .unwrap_or_else(|| DEFAULT_MEMORY_LIMIT.to_string())
+}
+
+/// The statements that cap a database instance (see [`DEFAULT_MEMORY_LIMIT`]).
+pub(crate) fn resource_limits_sql() -> String {
+    let limit = memory_limit_setting();
+    let threads = env_usize("DEVCTX_DB_THREADS", DEFAULT_THREADS).max(1);
+    format!("SET memory_limit = '{limit}'; SET threads = {threads};")
+}
+
 /// A DuckDB-backed store. Holds one connection and the fixed vector dimension.
 pub struct Store {
     pub(crate) conn: Connection,
@@ -209,7 +224,6 @@ impl Store {
     /// [`open`](Self::open) without the compaction lock: the compactor's own
     /// opens of its copy and of the source it is about to adjoin, which run
     /// while it holds the lock exclusively.
-    #[allow(dead_code)] // the compactor lands in the next commit
     pub(crate) fn open_unlocked(path: &Path, dim: usize) -> Result<Self> {
         Self::open_with_lock(path, dim, None)
     }
@@ -361,14 +375,7 @@ impl Store {
     /// and inherits both settings, so it pays for no extra statements per
     /// request.
     fn apply_resource_limits(&self) {
-        let limit = std::env::var("DEVCTX_DB_MEMORY_LIMIT")
-            .ok()
-            .filter(|v| is_size_literal(v))
-            .unwrap_or_else(|| DEFAULT_MEMORY_LIMIT.to_string());
-        let threads = env_usize("DEVCTX_DB_THREADS", DEFAULT_THREADS).max(1);
-        let _ = self.conn.execute_batch(&format!(
-            "SET memory_limit = '{limit}'; SET threads = {threads};"
-        ));
+        let _ = self.conn.execute_batch(&resource_limits_sql());
     }
 
     /// Best-effort load of the optional DuckDB extensions (VSS for HNSW, FTS for

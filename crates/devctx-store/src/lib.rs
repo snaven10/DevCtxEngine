@@ -6,6 +6,7 @@
 //! (FTS) indexes are opt-in accelerators, dropped before a bulk load and
 //! rebuilt after.
 
+pub mod compact;
 mod dispatch;
 mod error;
 mod graph;
