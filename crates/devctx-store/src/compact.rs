@@ -1871,8 +1871,17 @@ pub fn restore_from_sidecar(
             let refs = has("memory_symbol_references")?;
             store.in_transaction(|| {
                 // The references first: "added" is read off what `memories`
-                // lacks, which the next statement changes.
+                // lacks, which the INSERT of memories changes. Any row the
+                // index still holds for an added memory (left by a forget
+                // before 0.10, an orphan) goes before its copy comes in, so
+                // nothing is doubled (PLAN-009 TASK-019).
                 if refs {
+                    store.w()?.execute(
+                        "DELETE FROM main.memory_symbol_references \
+                         WHERE memory_id IN (SELECT id FROM devctx_restore.main.memories \
+                                             WHERE id NOT IN (SELECT id FROM main.memories))",
+                        [],
+                    )?;
                     report.refs = store.w()?.execute(
                         "INSERT INTO main.memory_symbol_references BY NAME \
                          SELECT * FROM devctx_restore.main.memory_symbol_references \

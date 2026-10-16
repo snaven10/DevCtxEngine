@@ -638,6 +638,75 @@ fn the_sidecar_is_replaced_kept_or_restored_from() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn refs_of(s: &Store, id: &str) -> i64 {
+    s.conn
+        .query_row(
+            "SELECT count(*) FROM memory_symbol_references WHERE memory_id = ?",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// PLAN-009 TASK-019: forgetting a memory takes its symbol references with
+/// it. They used to stay behind as orphans (0.9.0 did the same), and a
+/// restore from a sidecar then added them a second time.
+#[test]
+fn forgetting_a_memory_leaves_no_references() {
+    let dir = scratch("forget_refs");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let s = Store::open(&db, DIM).unwrap();
+    assert_eq!(refs_of(&s, "mem_b"), 1);
+    assert!(s.forget_memory("mem_b").unwrap());
+    assert_eq!(refs_of(&s, "mem_b"), 0);
+    assert!(s.get_memory("mem_b").unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A restore over a reference left behind by an older forget (seeded here
+/// as it was) brings the memory back with its references once, not twice;
+/// and a second restore adds no memory and no reference.
+#[test]
+fn a_restore_over_an_orphan_reference_doubles_nothing_and_twice_adds_nothing() {
+    let dir = scratch("restore_orphan");
+    let db = dir.join("index.duckdb");
+    fixture(&db, Fx::default());
+    let r = compact(&db, &opts()).unwrap();
+    let s = Store::open(&db, DIM).unwrap();
+    let total = |s: &Store| -> i64 {
+        s.conn
+            .query_row("SELECT count(*) FROM memory_symbol_references", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let before = total(&s);
+    // What a forget before this fix left: the memory gone, its reference not.
+    s.w()
+        .unwrap()
+        .execute_batch(
+            "CREATE TEMP TABLE kept AS SELECT * FROM memory_symbol_references \
+             WHERE memory_id = 'mem_b';",
+        )
+        .unwrap();
+    s.forget_memory("mem_b").unwrap();
+    s.w()
+        .unwrap()
+        .execute_batch("INSERT INTO memory_symbol_references SELECT * FROM kept;")
+        .unwrap();
+    assert_eq!(refs_of(&s, "mem_b"), 1, "the orphan is seeded");
+    let first =
+        restore_from_sidecar(&s, &r.sidecar, &mut |m| s.upsert(&[memory_point(&m.id, 2)])).unwrap();
+    assert_eq!(first.added, 1);
+    assert_eq!(refs_of(&s, "mem_b"), 1, "not doubled");
+    assert_eq!(total(&s), before);
+    let second = restore_from_sidecar(&s, &r.sidecar, &mut |_| panic!("nothing to embed")).unwrap();
+    assert_eq!((second.added, second.refs), (0, 0));
+    assert_eq!(total(&s), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- the copy is checked (6, 7, 11, 12, 30) -----------------------------------
 
 fn failing_run(db: &Path, hook: Hook<'_>) -> CompactError {
