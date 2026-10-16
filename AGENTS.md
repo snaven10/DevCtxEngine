@@ -196,18 +196,70 @@ Both commands open the databases directly, so stop the servers first:
 ```bash
 cd ~/code/api
 devctx serve --stop
-DEVCTX_NO_AUTOSERVE=1 devctx index          # see below for why
+devctx index
 devctx status                               # "indexed": true, "up_to_date": true
 ```
 
-Reckon **an hour per ~1400 files** on 8 cores. Two things to know:
+Reckon **an hour per ~1400 files** on 8 cores. Things to know:
 
 - The work happens inside the server, and the client's HTTP read times out at
   about an hour. **The error is the client giving up, not the index failing** —
   poll `devctx status` instead of believing it.
-- Building the HNSW index only happens on the direct path, hence
-  `DEVCTX_NO_AUTOSERVE=1`. Without it the index is never created and searches
-  fall back to a full scan (~5× slower).
+- With `storage.hnsw: true` the run itself leaves the HNSW index behind, through
+  the server or directly. Before 0.10 only the direct path
+  (`DEVCTX_NO_AUTOSERVE=1`) created it, and a server-built index searched by
+  full scan (~5× slower); to repair one built that way, run `devctx index`
+  again.
+- A reindex reuses the stored vector of every chunk whose text is unchanged
+  (same `content_hash`, same model), so `index --full` after an extractor
+  upgrade pays for parsing and the changed chunks, not for the embedder again.
+  A different model embeds everything.
+  Reuse needs the branch's stored *embedding fingerprint* (provider, model,
+  width, engine, character cap, normalization) to equal the active one; a
+  different setup embeds everything, and an interrupted run under another setup
+  leaves the branch marked "transition" so it is never reused by mistake.
+  The engine part is read from `Cargo.lock` at build time (`fastembed-<v>/ort-<v>`),
+  so a `cargo update` of either one makes every index re-embed once (a build outside the
+  workspace has no lock: it uses the crate version and the manifest's pinned specs, which
+  cannot see a different resolved engine); for an
+  HTTP provider the endpoint (`scheme://host` and a hash of the path, no credentials) is part of it. The device
+  (CPU or CUDA) is not: it moves vectors only at the rounding level.
+  An index **from before fingerprints** is reused only if its recorded model
+  *and* width equal the active ones and no run left it in "transition"; the run
+  seals it with the active fingerprint (every such index came from the one engine
+  that existed). The same rule decides whether another branch may be a source for
+  the cross-branch copy: its fingerprint must equal the active one, or be absent
+  with the same model and width. A `--full` over a branch that already holds a
+  file as it is writes nothing for it, even if another branch holds it too.
+  A `--full` over unchanged source rewrites nothing, loads no model and rebuilds
+  no HNSW/BM25 index.
+- **Upgrading from 0.9.x to 0.10: run `devctx index --full` once per
+  repository and per branch you query** (`devctx index --full --branch <b>`,
+  or `devctx reindex --all --full` for every registered project's default
+  branch), after `devctx serve --stop`. 0.10 writes a symbol graph a 0.9 index
+  lacks; until then `index_status` says `extractor_stale: true`, the old graph
+  tools answer the 0.9 way with a `warning`, and `traverse`, `repo_map` and
+  `skeleton` answer an error asking for it. Hooks and incremental runs never
+  clear it. Thanks to the vector reuse above it costs parsing plus the link
+  pass, not the embedder: measured while 0.10 was built (2026-10-06/07,
+  release, `minilm-l6`), 24.8–54.9 s per `--full` after an extractor change
+  against 278–442 s from scratch on repositories of 216–281 files, with
+  97.5–100 % of chunks reused. The figures for a real 0.9.0 index and the
+  final binary come from the release's field verification. Details, what each
+  tool answers meanwhile and how to go back to 0.9.0:
+  `docs/13-keeping-the-index-fresh.md` (§ *Upgrading to 0.10*).
+- **The `--full` of the upgrade leaves the database file at about twice its
+  content, and the compaction that fixes it never runs without a terminal** —
+  which is your case. The run ends with the line `devctx compact`, and
+  `status` shows `compaction.state: "owed"`. Run `devctx compact` when nothing
+  else needs this project's server: it stops it for the seconds the rewrite
+  takes (7–9 s for a 1 625-file repository), needs as much free disk as the
+  file, and keeps the original intact on any failure. `DEVCTX_NO_AUTO_COMPACT=1`
+  keeps a person's terminal from running it too.
+- **A database that has no HNSW index pays for building it at the first run
+  after `storage.hnsw` is on** — over every vector, even if that run only
+  changes three files (the run says so). Existing repositories indexed without
+  the index (the usual case before 0.10) hit this once.
 
 Enable HNSW first, in `.devctx/config.yaml`:
 
@@ -265,6 +317,11 @@ different value.
 **Two `model_dir` keys exist**, under `embeddings:` and under `reranking:`, for
 models of completely different kinds. Setting the reranking one to an embedding
 model makes every search fail with `no output named 'logits'`.
+
+**"The index is being compacted; retry"** is not an error to work around: a
+`devctx compact` holds `<index>.compact.lock` for a few seconds. Wait and
+retry. Do not delete that file — it is meant to stay, and deleting it breaks
+the exclusion it provides.
 
 **Killing processes by matching their command line kills the shell doing the
 matching**, because its own command line contains the pattern. Use

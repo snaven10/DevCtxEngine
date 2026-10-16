@@ -46,8 +46,10 @@ by default.
 symbol boundaries rather than arbitrary line windows. Vector, keyword (BM25) or
 hybrid.
 
-**Symbol graph.** Call and import edges extracted from the AST, so "what breaks
-if I change this" is a query rather than a guess.
+**Symbol graph.** Symbols and how they relate — calls, instantiations, imports,
+supertypes, type uses — extracted from the AST and resolved across files, each
+edge with how sure it is, so "what breaks if I change this" is a query rather
+than a guess.
 
 **Persistent memory.** Decisions, insights and gotchas survive sessions,
 deduplicated so saving the same thing twice does not accumulate noise. A memory
@@ -117,7 +119,7 @@ devctx mcp configure --client claude-code --scope project
 ## How it works, in thirty seconds
 
 `devctx index` asks git what changed, parses those files with tree-sitter into
-symbols and call edges, chunks them along symbol boundaries, embeds each chunk
+symbols and their relations, chunks them along symbol boundaries, embeds each chunk
 with a local ONNX model, and stores the vectors, graph and per-file hashes in one
 DuckDB file inside the repository. Unchanged files are skipped by hash, so
 re-indexing is cheap enough to run after every commit.

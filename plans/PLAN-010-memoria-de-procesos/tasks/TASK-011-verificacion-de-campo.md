@@ -5,6 +5,7 @@
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`) + lectura/medición en
   `/home/you/acme`
 - **Depende de:** TASK-010
+- **Nota (2026-10-11):** con el bloque de calidad (TASK-013…019) suma la verificación de calidad y la migración opcional de vectores (pasos al final).
 - **Estado:** `pending`
 
 ---
@@ -45,11 +46,22 @@ fase de verify del plan.
 - [ ] **`provider: central`** (si TASK-009 `done`): un repo de prueba con el modo activo, RSS en
       reposo y `search` OK; central detenido → error explícito.
 - [ ] **Zombies.** `ps` sin `<defunct>` hijos de procesos ≥ 0.8.3.
+- [ ] **Calidad (TASK-013…019).** Arnés de TASK-014 completo (3 corridas, mediana) con el binario
+      nuevo **antes** de migrar nada: FTS nuevo, `queries` y reranker nuevo contra la línea base de
+      TASK-014; filas de calidad de §6 con su veredicto.
+- [ ] **Huella.** En cada repo del grupo, el primer `index` con el binario nuevo es incremental y no
+      re-embebe (huella v1 → v2 re-sellada); `status` muestra `upgrade_available` si aplica.
+- [ ] **Migración declarada (solo con aprobación explícita del usuario, después de lo anterior).**
+      `memories export` de los tres tiers → `memories reembed` → `index --full --upgrade-embeddings`
+      repo por repo (15 repos, ~4-4.5 h). Re-correr el arnés después y anotar el antes/después por
+      idioma. Si el usuario no la aprueba, se documenta y queda como paso del usuario.
 
 ## Criterios de aceptación
 
 - [ ] Cada fila de PLAN-010 §6 con su número real y veredicto; desviaciones explicadas.
 - [ ] `git status` limpio en los repos de acme (solo lectura).
+- [ ] Sin vectores de dos espacios en ningún store: cada rama y cada store de memorias con una sola
+      huella (consulta a `index_meta`).
 - [ ] `## 13. Cierre` del master redactado con lo verificado **y lo no verificado** (CUDA, macOS en
       runtime, Windows en runtime).
 

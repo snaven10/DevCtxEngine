@@ -3,7 +3,8 @@
 - **Plan:** PLAN-010 — Memoria de procesos
 - **Especialista:** general-purpose (Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
-- **Depende de:** TASK-003
+- **Depende de:** TASK-003, TASK-013
+- **Nota (2026-10-11):** TASK-013 se agregó como dependencia porque la huella completa decide el campo `eng=` (Paso 9).
 - **Estado:** `pending`
 
 ---
@@ -71,9 +72,19 @@ PLAN-010 DD-2, DD-3.
       `EmbedSettings::offline`.
 - [ ] **Paso 6 — CUDA.** `CudaFallback` + `init_on` intactos; `cuda_providers()` sin cambios.
 - [ ] **Paso 7 — equivalencia.** Pasar el arnés de TASK-003 para `minilm-l6`, `bge-small` y
-      `ml-granite`. Si no pasa: `blocked` con el peor coseno y el texto que lo produce.
-- [ ] **Paso 8 — `index_meta`.** Registrar `embed_engine = ort-direct/1` como diagnóstico (no
-      dispara reindex, DD-3).
+      `ml-granite`. Si no pasa: `blocked` con el peor coseno y el texto que lo produce. **No hay
+      camino automático de salida**: seguir con un motor no equivalente (clase numérica nueva y
+      `--full` en todos los repos) solo existe si el usuario lo aprueba explícitamente después del
+      `blocked`, y se registra en el master (PLAN-010 DD-3/PLAN-010 DD-11).
+- [ ] **Paso 8 — `index_meta`.** Registrar `embed_runtime = devctx-onnx/1` como diagnóstico (no
+      dispara reindex, DD-3). Es solo informativo y **no** comparte string ni papel con el `eng=` de
+      la huella (Paso 9).
+- [ ] **Paso 9 — huella (`eng=`, TASK-013 / PLAN-010 DD-11).** TASK-013 ya sella `eng=fe-compat/1`
+      con el mapa `fastembed-4.9.1/ort-2.0.0-rc.9` → `fe-compat/1`. Con el Paso 7 en verde, esta task
+      **solo agrega su motor al mapa con la misma clase**: la huella guardada no cambia, no hay
+      `transition` ni `--full`, y `remember`/`recall` contra el central siguen funcionando. Si el
+      Paso 7 no pasa, el mapa no se toca (ver Paso 7). Pooling sigue en Mean para Granite: la
+      corrección a CLS es TASK-017, no esta.
 
 ## Criterios de aceptación
 

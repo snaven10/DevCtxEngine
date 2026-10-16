@@ -1,0 +1,54 @@
+# Gold edges de Java de PLAN-009 TASK-005, ANONIMIZADOS para auditoría (no se pueden correr).
+#
+# Los sitios reales viven fuera del repo (DEVCTX_EVAL_GOLD, Q-5) porque nombran código de un
+# cliente. Esta copia los lista con alias opacos —repo (backend-a / backend-b), clase (ClassA,
+# ClassB…) y método (m1, m2…), sin rutas ni números de línea—, el caso que muestrea cada uno y el
+# resultado medido sobre la tabla `edges` (`score.py gold --new-edges`, tolerancia ±2 líneas):
+# d9ffc04 = TASK-005 antes de su revisión, ahora = con la revisión y sus follow-ups
+# (LINK_VERSION 2, EXTRACTOR_VERSION 8). Un mismo alias dentro de esta lista es la misma clase o
+# el mismo método. Los 20 primeros se etiquetaron en TASK-001 y los 5 últimos en la revisión de
+# TASK-005, siempre leyendo el código antes de medir.
+#
+# Formato: repo | sitio (alias) | destino esperado (alias) | external? | caso | d9ffc04 | ahora
+#   resultado: correct / undecided (sin destino ni marca) / missing (sin arista: descartada) +
+#   confidence/resolution de la arista elegida.
+backend-b|ClassA|ClassB.m1|-|campo de una clase interna|correct high/ctor_inject|correct high/ctor_inject
+backend-b|ClassA|ClassC.m1|-|campo de otra clase interna con el mismo nombre|correct high/ctor_inject|correct high/ctor_inject
+backend-b|ClassA|ClassD.m1|-|campo de una tercera clase interna|correct high/ctor_inject|correct high/ctor_inject
+backend-b|ClassA|ClassA.Inner1|-|new de una clase interna|correct high/same_file|correct high/same_file
+backend-a|ClassE|ClassE.m2|-|llamada sin receptor al propio método|correct high/self|correct high/self
+backend-a|ClassE|ClassF.m3|-|estático de una entidad importada|correct high/import|correct high/import
+backend-a|ClassE|ClassF.m4|external|estático heredado de un supertipo externo (Panache)|correct high/inherited|correct high/inherited
+backend-a|ClassE|ClassG.m5|-|estático de una utilidad importada|correct high/import|correct high/import
+backend-a|ClassH|ClassH.m6|-|llamada sin receptor al propio método|correct high/self|correct high/self
+backend-a|ClassH|Logger.m7|external|constante en mayúsculas tipada por su declaración|correct high/external_known|correct high/external_known
+backend-a|ClassH|ClassI|-|new de una entidad importada|correct high/import|correct high/import
+backend-a|ClassH|ClassJ.m8|-|campo inyectado|correct high/field|correct high/field
+backend-a|ClassH|Session.m9|external|parámetro de tipo externo|correct high/external_known|correct high/external_known
+backend-a|ClassK|Session.m10|external|parámetro de lambda sin tipo|missing|missing
+backend-a|ClassL|ClassE.m11|-|campo inyectado|correct high/field|correct high/field
+backend-a|ClassM|ClassN.m12|-|parámetro de lambda sobre un Stream|undecided low/name_only|undecided low/name_only
+backend-a|ClassO|ClassO.m13|-|llamada sin receptor al propio método|correct high/self|correct high/self
+backend-a|ClassO|ClassP.m14|-|campo inyectado|correct high/field|correct high/field
+backend-a|ClassQ|Math.m15|external|estático de java.lang|correct high/external_known|correct high/external_known
+backend-a|ClassR|List.m16|external|estático de un tipo importado del JDK|correct high/external_known|correct high/external_known
+backend-a|ClassP|Long.equals|external|obj.campo.m() con obj parámetro de lambda|correct high/external_known (por la heurística de paquete equivocada)|correct medium/inherited (Object)
+backend-a|ClassS|String.m17|external|obj.campo.m() con obj tipado|correct high/external_known|correct high/external_known
+backend-a|ClassT|ClassU.getX|-|list.get(0).getX() con getter de Lombok|undecided low/name_only|undecided low/name_only
+backend-a|ClassV|ClassW.m18|external|Optional.get() encadenado (var desde un estático)|missing|missing
+backend-a|ClassX|Session.m19|external|parámetro de lambda sin tipo|missing|missing
+# Total: 20/25 correctos en ambos; en `high` 20/20 (d9ffc04) y 19/19 (ahora: el sitio de
+# `Long.equals` pasó a `medium`). No hay en los repos medidos una lambda que sombree un campo: ese
+# caso lo cubre `lambda_parameters_and_patterns_bind_their_names` (link_java.rs).
+#
+# Dispatch por interfaz (PLAN-009 TASK-017), con los mismos alias (ClassA.Inner2..4, m20..m22 y
+# ClassY, ClassZ, ClassAA son nuevos). No es una arista sino un nodo de `impact_analysis`: el
+# símbolo pedido, la dirección y el nodo que tiene que aparecer, medido con la tool (defaults) sobre
+# un índice de cada repo del binario de TASK-017.
+# Formato: repo | símbolo pedido | dirección | nodo esperado | caso | sin dispatch (TASK-009) | con dispatch
+backend-b|ClassA.Inner1.m20|upstream|ClassA.m20 (through ClassA.Inner4.m20, prof. 1)|adaptador elegido en tiempo de ejecución y llamado por su interfaz interna (receptor tipado por el retorno de un método)|ausente|correct medium/dispatch
+backend-b|ClassB.m20|upstream|ClassA.m20 (through ClassA.Inner4.m20, prof. 2)|dispatch en profundidad 2: al servicio lo llama el adaptador, al adaptador su interfaz|ausente (el recorrido se cortaba en ClassA.Inner1.m20)|correct medium/dispatch
+backend-b|ClassA.Inner4.m20|downstream|ClassA.Inner1.m20, ClassA.Inner2.m20, ClassA.Inner3.m20 (prof. 1)|las tres implementaciones de la interfaz interna|ausentes|correct 3/3 medium/dispatch
+backend-a|ClassZ.m21|upstream|ClassAA.m22 (through ClassY.m21, prof. 1)|handler elegido por tipo y llamado por su interfaz|ausente|correct medium/dispatch
+backend-a|ClassY.m21|downstream|sus 7 implementaciones (prof. 1)|interfaz con siete implementaciones|ausentes|correct 7/7 medium/dispatch (5 listadas; 2 en omitted_for_budget, el presupuesto de salida)
+# Total dispatch: 5/5 casos (13/13 nodos esperados), ninguno `high`.

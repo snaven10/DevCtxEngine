@@ -7,13 +7,16 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::repo_map::RepoMapQuery;
+use crate::skeleton::SkeletonQuery;
 use crate::state::{
-    do_backfill_links, do_build_context, do_impact, do_index, do_index_status, do_list_projects,
-    do_memories_by_file, do_memories_by_symbol, do_memory_context, do_memory_forget,
-    do_memory_move, do_memory_refs, do_memory_stats, do_plan_status, do_read_file, do_read_symbol,
-    do_recall_scoped, do_references, do_remember, do_remember_shared, do_routes_for_handler,
-    do_search, do_search_project, do_search_routes, do_summarize, parse_mode, AppState,
-    MemoriesOpts, Page, PlanListOpts,
+    do_backfill_links, do_build_context_with, do_impact_with, do_index, do_index_status,
+    do_list_projects, do_memories_by_file, do_memories_by_symbol, do_memory_context,
+    do_memory_forget, do_memory_move, do_memory_refs, do_memory_stats, do_plan_status,
+    do_read_file, do_read_symbol, do_recall_scoped, do_references_with, do_remember,
+    do_remember_shared, do_repo_map, do_routes_for_handler, do_search, do_search_project,
+    do_search_routes, do_skeleton, do_summarize, do_traverse, parse_mode, AppState, ContextOpts,
+    MemoriesOpts, Page, PlanListOpts, TraverseQuery,
 };
 
 /// Connection to a shared server the MCP routes through.
@@ -297,6 +300,48 @@ impl RemoteClient {
 
     fn post(&self, path: &str, body: Value) -> Result<String, String> {
         self.post_timed(path, body, default_timeout())
+    }
+
+    /// GET a route a server older than the client may not have: `Ok(None)`
+    /// when it answered 404 or 405, read from the status code (as
+    /// [`post_route`](Self::post_route)).
+    fn get_route(&self, path: &str) -> Result<Option<String>, String> {
+        let missing = std::cell::Cell::new(false);
+        let agent = self.agent(default_timeout());
+        let answer = self.request(|base, token| {
+            let r = Self::auth(agent.get(&format!("{base}{path}")), token)
+                .call()
+                .map_err(Box::new);
+            if let Err(e) = &r {
+                missing.set(matches!(&**e, ureq::Error::Status(404 | 405, _)));
+            }
+            r
+        });
+        match answer {
+            Err(_) if missing.get() => Ok(None),
+            other => other.map(Some),
+        }
+    }
+
+    /// POST to a route a server older than the client may not have:
+    /// `Ok(None)` when it answered 404 or 405 — read from the status code,
+    /// not from the text of the error (review of TASK-013, MINOR 4).
+    fn post_route(&self, path: &str, body: Value) -> Result<Option<String>, String> {
+        let missing = std::cell::Cell::new(false);
+        let agent = self.agent(default_timeout());
+        let answer = self.request(|base, token| {
+            let r = Self::auth(agent.post(&format!("{base}{path}")), token)
+                .send_json(body.clone())
+                .map_err(Box::new);
+            if let Err(e) = &r {
+                missing.set(matches!(&**e, ureq::Error::Status(404 | 405, _)));
+            }
+            r
+        });
+        match answer {
+            Err(_) if missing.get() => Ok(None),
+            other => other.map(Some),
+        }
     }
 
     fn post_timed(&self, path: &str, body: Value, timeout: Duration) -> Result<String, String> {
@@ -594,10 +639,72 @@ impl Backend {
         }
     }
 
-    pub fn impact(&self, symbol: &str, depth: usize) -> Result<String, String> {
+    pub fn impact(
+        &self,
+        symbol: &str,
+        depth: usize,
+        q: &crate::state::ImpactQuery,
+    ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_impact(s, symbol, depth),
-            Backend::Remote(r, _) => r.get(&format!("/impact/{}?depth={depth}", urlencode(symbol))),
+            Backend::Local(s) => do_impact_with(s, symbol, depth, q),
+            Backend::Remote(r, _) => {
+                let mut path = format!("/impact/{}?depth={depth}", urlencode(symbol));
+                let pairs = q.query_pairs();
+                for (k, v) in &pairs {
+                    path.push_str(&format!("&{k}={}", urlencode(v)));
+                }
+                let raw = r.get(&path)?;
+                Ok(if pairs.is_empty() {
+                    raw
+                } else {
+                    note_unapplied_impact_filters(raw)
+                })
+            }
+        }
+    }
+
+    /// Walk the symbol graph from a symbol (`traverse`, PLAN-009 TASK-013).
+    /// A server older than the tool has no `POST /traverse`: its 404 is told
+    /// as such, with what to do, never as a bare status.
+    pub fn traverse(&self, q: &TraverseQuery) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_traverse(s, q),
+            Backend::Remote(r, _) => {
+                let body = serde_json::to_value(q).map_err(|e| e.to_string())?;
+                r.post_route("/traverse", body)?
+                    .ok_or_else(|| TRAVERSE_OLD_SERVER.to_string())
+            }
+        }
+    }
+
+    /// A map of the repository for orientation (`repo_map`, PLAN-009
+    /// TASK-011). A server older than the tool has no `GET /repo-map`: its
+    /// 404 is told as such, with what to do.
+    pub fn repo_map(&self, q: &RepoMapQuery) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_repo_map(s, q),
+            Backend::Remote(r, _) => r
+                .get_route(&repo_map_path(q))?
+                .ok_or_else(|| REPO_MAP_OLD_SERVER.to_string()),
+        }
+    }
+
+    /// The structure of one file, to locate where something is
+    /// (`skeleton`, PLAN-009 TASK-014). A server older than the tool has no
+    /// `GET /skeleton`: its 404 is told as such, with what to do.
+    pub fn skeleton(&self, q: &SkeletonQuery) -> Result<String, String> {
+        match self {
+            Backend::Local(s) => do_skeleton(s, q),
+            Backend::Remote(r, _) => {
+                let text = r
+                    .get_route(&skeleton_path(q))?
+                    .ok_or_else(|| SKELETON_OLD_SERVER.to_string())?;
+                // The label is the MCP's: not sent, put in front here.
+                Ok(match q.label.as_deref().filter(|l| !l.trim().is_empty()) {
+                    Some(l) => format!("{l}\n{text}"),
+                    None => text,
+                })
+            }
         }
     }
 
@@ -644,22 +751,36 @@ impl Backend {
         }
     }
 
-    /// One budgeted brief assembled for a question.
+    /// One budgeted brief assembled for a question. `opts` asks for the
+    /// related section (PLAN-009 TASK-012); a server older than it ignores
+    /// the fields, and when the call wanted the section the brief says so.
     pub fn build_context(
         &self,
         query: &str,
         max_tokens: usize,
         include_memories: bool,
         sel: &devctx_search::KindSel,
+        opts: &ContextOpts,
     ) -> Result<String, String> {
+        opts.resolve()?;
         match self {
-            Backend::Local(s) => do_build_context(s, query, max_tokens, include_memories, sel),
-            Backend::Remote(r, _) => r.post(
-                "/context",
-                json!({ "query": query, "max_tokens": max_tokens,
+            Backend::Local(s) => {
+                do_build_context_with(s, query, max_tokens, include_memories, sel, opts)
+            }
+            Backend::Remote(r, _) => {
+                let mut body = json!({ "query": query, "max_tokens": max_tokens,
                         "include_memories": include_memories,
-                        "kind": sel.kind, "include_tests": sel.include_tests }),
-            ),
+                        "kind": sel.kind, "include_tests": sel.include_tests });
+                // Only what the call set: an unset field is the server's default.
+                if let Some(v) = opts.related {
+                    body["related"] = json!(v);
+                }
+                if let Some(h) = opts.graph_hops {
+                    body["graph_hops"] = json!(h);
+                }
+                let out = r.post("/context", body)?;
+                Ok(note_unapplied_related(out, opts))
+            }
         }
     }
 
@@ -695,10 +816,34 @@ impl Backend {
         }
     }
 
-    pub fn references(&self, symbol: &str) -> Result<String, String> {
+    pub fn references(
+        &self,
+        symbol: &str,
+        min_confidence: Option<&str>,
+        kinds: Option<&str>,
+    ) -> Result<String, String> {
         match self {
-            Backend::Local(s) => do_references(s, symbol),
-            Backend::Remote(r, _) => r.get(&format!("/references/{}", urlencode(symbol))),
+            Backend::Local(s) => do_references_with(s, symbol, min_confidence, kinds),
+            Backend::Remote(r, _) => {
+                let mut query = Vec::new();
+                if let Some(m) = min_confidence {
+                    query.push(format!("min_confidence={}", urlencode(m)));
+                }
+                if let Some(k) = kinds {
+                    query.push(format!("kinds={}", urlencode(k)));
+                }
+                let mut path = format!("/references/{}", urlencode(symbol));
+                if !query.is_empty() {
+                    path.push('?');
+                    path.push_str(&query.join("&"));
+                }
+                let raw = r.get(&path)?;
+                Ok(if query.is_empty() {
+                    raw
+                } else {
+                    note_unapplied_filters(raw)
+                })
+            }
         }
     }
 
@@ -961,6 +1106,182 @@ mod tests {
         assert_eq!(client.get("/status").unwrap(), "ok");
     }
 
+    /// PLAN-009 TASK-012: a server older than the related section ignores
+    /// `related`; when the call wanted it, the brief says so and how to
+    /// restart the server. A server that applied it (section or note), or a
+    /// call that did not want it, is passed through.
+    #[test]
+    fn related_on_an_old_server_says_it_was_not_applied() {
+        let backend_for = |reply: &'static str| {
+            let base = serve_fixed(reply);
+            let connect: Connector = Arc::new(move || {
+                Ok(ServerConn {
+                    base: base.clone(),
+                    token: None,
+                })
+            });
+            Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default())
+        };
+        let sel = devctx_search::KindSel::default();
+        let on = crate::state::ContextOpts {
+            related: Some(true),
+            graph_hops: None,
+        };
+        let off = crate::state::ContextOpts {
+            related: Some(false),
+            graph_hops: None,
+        };
+        const OLD: &str = "HTTP/1.1 200 OK\r\nContent-Length: 29\r\nConnection: close\r\n\r\n## Code\n\n// a.rs:1\nfn a() {}\n";
+        let out = backend_for(OLD)
+            .build_context("q", 4096, false, &sel, &on)
+            .unwrap();
+        assert!(out.starts_with("## Code"), "{out}");
+        assert!(out.contains("[devctx] related: not applied"), "{out}");
+        assert!(out.contains("devctx serve --stop"), "{out}");
+        let out = backend_for(OLD)
+            .build_context("q", 4096, false, &sel, &off)
+            .unwrap();
+        assert!(!out.contains("related"), "{out}");
+        const NEW: &str = "HTTP/1.1 200 OK\r\nContent-Length: 56\r\nConnection: close\r\n\r\n## Code\n\nfn a() {}\n\n## Related (signatures)\n\nx:\n- calls\n";
+        let out = backend_for(NEW)
+            .build_context("q", 4096, false, &sel, &on)
+            .unwrap();
+        assert!(!out.contains("not applied"), "{out}");
+        // An invalid `graph_hops` is refused before anything is sent.
+        let bad = crate::state::ContextOpts {
+            related: Some(true),
+            graph_hops: Some(3),
+        };
+        let e = backend_for(OLD)
+            .build_context("q", 4096, false, &sel, &bad)
+            .unwrap_err();
+        assert!(e.contains("graph_hops"), "{e}");
+    }
+
+    /// PLAN-009 TASK-013: a server older than `traverse` answers its route
+    /// with a 404; the client says the server is old and how to restart it.
+    #[test]
+    fn traverse_on_an_old_server_says_to_restart_it() {
+        let old =
+            serve_fixed("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: old.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        let q = crate::state::TraverseQuery {
+            symbol: Some("f".into()),
+            ..Default::default()
+        };
+        let e = backend.traverse(&q).unwrap_err();
+        assert!(e.contains("predates traverse"), "{e}");
+        assert!(e.contains("devctx serve --stop"), "{e}");
+        // Any other failure is passed through: a 500 with its message.
+        let failing = serve_fixed(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+             Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}",
+        );
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: failing.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        assert_eq!(backend.traverse(&q).unwrap_err(), "boom");
+    }
+
+    /// PLAN-009 TASK-011: a server older than `repo_map` answers its route
+    /// with a 404; the client says the server is old and how to restart it;
+    /// any other failure keeps its message.
+    #[test]
+    fn repo_map_on_an_old_server_says_to_restart_it() {
+        let old =
+            serve_fixed("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: old.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        let q = RepoMapQuery {
+            focus_files: vec!["src/a b.rs".into()],
+            ..Default::default()
+        };
+        let e = backend.repo_map(&q).unwrap_err();
+        assert!(e.contains("predates repo_map"), "{e}");
+        assert!(e.contains("devctx serve --stop"), "{e}");
+        let failing = serve_fixed(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+             Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}",
+        );
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: failing.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        assert_eq!(backend.repo_map(&q).unwrap_err(), "boom");
+        assert_eq!(repo_map_path(&q), "/repo-map?focus_files=src%2Fa%20b.rs");
+    }
+
+    /// PLAN-009 TASK-014: a server older than `skeleton` answers its route
+    /// with a 404; the client says the server is old and how to restart it;
+    /// any other failure keeps its message (a file not indexed is a 500).
+    #[test]
+    fn skeleton_on_an_old_server_says_to_restart_it() {
+        let old =
+            serve_fixed("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: old.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        let q = SkeletonQuery::of("src/a b.rs");
+        let e = backend.skeleton(&q).unwrap_err();
+        assert!(e.contains("predates skeleton"), "{e}");
+        assert!(e.contains("devctx serve --stop"), "{e}");
+        let failing = serve_fixed(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+             Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}",
+        );
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: failing.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        assert_eq!(backend.skeleton(&q).unwrap_err(), "boom");
+        assert_eq!(skeleton_path(&q), "/skeleton?file=src%2Fa%20b.rs");
+        // The MCP's label goes first, added here: it is not sent.
+        let ok = serve_fixed(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\n\
+             Connection: close\r\n\r\na.rs: 1 symbols",
+        );
+        let connect: Connector = Arc::new(move || {
+            Ok(ServerConn {
+                base: ok.clone(),
+                token: None,
+            })
+        });
+        let backend = Backend::Remote(RemoteClient::new(connect), ProjectIdentity::default());
+        let labelled = SkeletonQuery {
+            label: Some("[devctx] skeleton from x".into()),
+            ..SkeletonQuery::of("a.rs")
+        };
+        assert_eq!(
+            backend.skeleton(&labelled).unwrap(),
+            "[devctx] skeleton from x\na.rs: 1 symbols"
+        );
+    }
+
     #[test]
     fn a_plain_503_is_a_final_answer() {
         let plain = serve_fixed(PLAIN_503);
@@ -1098,5 +1419,165 @@ mod tests {
         // 30 s request deadline. A few seconds of slack for a loaded machine.
         assert!(CONNECT_TIMEOUT <= Duration::from_secs(2));
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+}
+
+/// What a routed `traverse` says when the server answered 404: it predates
+/// the tool (the route does not exist), so the agent learns how to get one
+/// that has it rather than "status 404".
+pub const TRAVERSE_OLD_SERVER: &str =
+    "the running devctx serve predates traverse (it has no POST /traverse): restart it with \
+     devctx serve --stop, and the next call starts the installed binary";
+
+/// What a routed `repo_map` says when the server answered 404: it predates
+/// the tool.
+pub const REPO_MAP_OLD_SERVER: &str =
+    "the running devctx serve predates repo_map (it has no GET /repo-map): restart it with \
+     devctx serve --stop, and the next call starts the installed binary";
+
+/// What a routed `skeleton` says when the server answered 404: it predates
+/// the tool.
+pub const SKELETON_OLD_SERVER: &str =
+    "the running devctx serve predates skeleton (it has no GET /skeleton): restart it with \
+     devctx serve --stop, and the next call starts the installed binary";
+
+/// The path and query string of `GET /skeleton` for `q`.
+pub fn skeleton_path(q: &SkeletonQuery) -> String {
+    let pairs: Vec<String> = q
+        .query_pairs()
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", urlencode(&v)))
+        .collect();
+    format!("/skeleton?{}", pairs.join("&"))
+}
+
+/// The path and query string of `GET /repo-map` for `q`.
+pub fn repo_map_path(q: &RepoMapQuery) -> String {
+    let pairs: Vec<String> = q
+        .query_pairs()
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", urlencode(&v)))
+        .collect();
+    if pairs.is_empty() {
+        "/repo-map".to_string()
+    } else {
+        format!("/repo-map?{}", pairs.join("&"))
+    }
+}
+
+/// A server older than 0.10 (or one answering from an index without the
+/// symbol graph) ignores `min_confidence` and `kinds` without a word: its
+/// references carry no `confidence`. Say so in `warning` instead of letting
+/// the caller believe the filter applied.
+fn note_unapplied_filters(raw: String) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+    let refs = v.get("references").and_then(|r| r.as_array());
+    let unfiltered =
+        refs.is_some_and(|r| !r.is_empty() && r.iter().all(|x| x.get("confidence").is_none()));
+    if !unfiltered {
+        return raw;
+    }
+    const NOTE: &str = "min_confidence/kinds were not applied: the server (or its index) \
+        predates confidence on references, so this is its unfiltered answer";
+    let warning = match v.get("warning").and_then(|w| w.as_str()) {
+        Some(w) => format!("{w}; {NOTE}"),
+        None => NOTE.to_string(),
+    };
+    v["warning"] = serde_json::Value::String(warning);
+    v.to_string()
+}
+
+/// The line a brief from a server older than the related section gets when
+/// the call wanted the section (PLAN-009 TASK-012).
+pub const RELATED_OLD_SERVER_NOTE: &str = "[devctx] related: not applied: the running server \
+     predates the related section and ignored `related`/`graph_hops`; restart it (`devctx \
+     serve --stop`, the next command starts the new one)";
+
+/// `out`, a brief from a server, with [`RELATED_OLD_SERVER_NOTE`] at its end
+/// when `opts` wanted the related section and the server answered with code
+/// but neither the section nor the line that says why it has none: it did
+/// not know the fields. A brief with no code (nothing matched) is left as
+/// it is.
+pub fn note_unapplied_related(out: String, opts: &ContextOpts) -> String {
+    let applied =
+        out.contains(crate::state::RELATED_HEADING) || out.contains(crate::state::RELATED_NOTE);
+    if !opts.wants_related() || applied || !out.contains("## Code") {
+        return out;
+    }
+    format!("{}\n\n{RELATED_OLD_SERVER_NOTE}\n", out.trim_end())
+}
+
+/// [`note_unapplied_filters`] for `impact_analysis`, for an answer to a
+/// request that passed filters: a server that applied them says which in
+/// `filters`; one older than them (or answering from an index older than
+/// the symbol graph) does not, also with empty lists (review m2).
+pub fn note_unapplied_impact_filters(raw: String) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+    if add_unapplied_impact_note(&mut v) {
+        v.to_string()
+    } else {
+        raw
+    }
+}
+
+/// The note of [`note_unapplied_impact_filters`] on a parsed answer, also
+/// for the local old path (review of TASK-009, NIT 3): added once, and only
+/// to an answer that does not say which filters it applied. Whether it was
+/// added.
+pub fn add_unapplied_impact_note(v: &mut serde_json::Value) -> bool {
+    const NOTE: &str = "min_confidence/include_tests/include_external/max_nodes/dispatch were not \
+        applied: the server, or the index it answered from, predates them, so this is its \
+        unfiltered answer";
+    let current = v.get("warning").and_then(|w| w.as_str());
+    if v.get("filters").is_some() || current.is_some_and(|w| w.contains(NOTE)) {
+        return false;
+    }
+    let warning = match current {
+        Some(w) => format!("{w}; {NOTE}"),
+        None => NOTE.to_string(),
+    };
+    v["warning"] = serde_json::Value::String(warning);
+    true
+}
+
+#[cfg(test)]
+mod filter_note_tests {
+    use super::note_unapplied_filters;
+
+    #[test]
+    fn an_answer_without_confidence_says_the_filter_was_not_applied() {
+        let old = r#"{"symbol":"f","references":[{"file":"a.rs","line":1,"source":"g"}]}"#;
+        let v: serde_json::Value =
+            serde_json::from_str(&note_unapplied_filters(old.into())).unwrap();
+        assert!(
+            v["warning"].as_str().unwrap().contains("not applied"),
+            "{v}"
+        );
+        let new = r#"{"symbol":"f","references":[{"file":"a.rs","line":1,"source":"g","confidence":"high"}]}"#;
+        assert_eq!(note_unapplied_filters(new.into()), new);
+    }
+
+    #[test]
+    fn an_impact_without_confidence_says_the_filters_were_not_applied() {
+        use super::note_unapplied_impact_filters as note;
+        let old = r#"{"symbol":"f","upstream":[{"symbol":"g","depth":1}],"downstream":[]}"#;
+        let v: serde_json::Value = serde_json::from_str(&note(old.into())).unwrap();
+        assert!(
+            v["warning"].as_str().unwrap().contains("not applied"),
+            "{v}"
+        );
+        let new = r#"{"symbol":"f","upstream":[{"symbol":"g","depth":1,"confidence":"high"}],"downstream":[],"filters":{"max_nodes":200}}"#;
+        assert_eq!(note(new.into()), new);
+        // m2: an old server with nothing to list says nothing either.
+        let empty = r#"{"symbol":"f","upstream":[],"downstream":[]}"#;
+        let v: serde_json::Value = serde_json::from_str(&note(empty.into())).unwrap();
+        assert!(
+            v["warning"].as_str().unwrap().contains("not applied"),
+            "{v}"
+        );
     }
 }

@@ -97,6 +97,137 @@ La búsqueda por palabra clave (BM25) y la híbrida no se midieron por separado.
 La híbrida corre los dos recuperadores, así que tratala como al menos el costo
 del camino vectorial.
 
+## El grafo de símbolos (0.10)
+
+Medido mientras se construía 0.10, en octubre de 2026, en la misma máquina solo
+CPU — muchas veces cargada por otro trabajo, así que leé las cifras como órdenes
+de magnitud. Los repositorios: este (≈440 archivos en ese momento; tenía 128
+cuando se tomaron las cifras de búsqueda y almacenamiento de arriba, en agosto,
+y 281 en las del reindexado de
+[Mantener el índice al día](13-mantener-el-indice-al-dia.md#cuánto-cuesta), el
+6 de octubre), dos
+repositorios Java privados (1 250 y 216 archivos), un subconjunto de un
+workspace Angular privado y, para `build_context`, ese workspace entero. Las
+herramientas de grafo se midieron en caliente, cada llamada abriendo el store
+como lo hace el servidor, 40 llamadas por caso.
+
+**`impact_analysis`** (2026-10-08 a 2026-10-10), p95 con los defaults
+(llamadas high/medium, sin tests ni llamados de librerías, 200 por dirección,
+dispatch encendido), contra el recorrido de 0.9 sobre el mismo índice:
+
+| Caso | 0.10 | 0.9 |
+|---|---|---|
+| `get`, repositorio Java de 1 250 archivos | 40,7 ms | 4 165 ms (1 855 nombres recorridos) |
+| `map`, mismo repositorio | 85,9 ms | 5 724 ms (2 571 nombres) |
+| peor de 8 casos ahí, con dispatch, máquina tranquila | 117,9 ms | — |
+| peor de todos los casos, con carga | 242 ms | — |
+| `get` / `new`, este repositorio, antes de que existiera el dispatch | 43,5 / 61,1 ms | 805 / 1 550 ms |
+
+Dos causas, medidas por separado: una consulta por nivel en vez de una por
+nombre, y que un nombre pelado signifique las definiciones del repositorio en
+vez de cada llamada escrita con él. Seguir el dispatch cuesta 2–15 ms, y hasta
+70 ms donde una interfaz tiene varias implementaciones.
+
+**`traverse`** (2026-10-09): p95 a profundidad 2 entre 16,8 y 47,5 ms en 16
+casos sobre el repositorio Java de 1 250 archivos (calls, references, imports,
+contains, implements/inherits, instantiates, todas las relaciones); un peor caso
+sintético (3 000 definiciones de un nombre, 1 000 implementando una interfaz)
+93–126 ms tras un arreglo que lo bajó de 2,2–3,5 s (2026-10-10).
+
+**`repo_map`** (2026-10-09/10), presupuesto de 1 024 tokens: p50 / p95 en
+caliente 20,9 / 34,3 ms en el repositorio Java de 1 250 archivos (22 801
+símbolos; primera carga 104 ms para leer y armar la adyacencia cacheada,
+≈7,4 MB), 19,2 / 26,7 ms en el subconjunto Angular, 12,0 / 16,5 ms en este
+repositorio. Nunca pasa el presupuesto (el mapa más grande, 996 tokens); con un
+archivo vecino como foco, el archivo esperado estuvo en el mapa en 16 de 17
+casos.
+
+**`skeleton`** (2026-10-11): 4,9–10,2 % de los tokens del archivo en 12 archivos
+de 623–4 684 líneas de cuatro repositorios; p95 ≤ 26 ms.
+
+**`build_context` con `related: true`** (2026-10-12), brief de 4 096 tokens, p50
+sin → con la sección: este repositorio 92 → 116 ms, el Java de 216 archivos
+78 → 87 ms, el de 1 250 archivos 142 → 179 ms, el workspace Angular 132 →
+186 ms (carga de la máquina 14–16). Archivo esperado en el brief: 21 → 22 de 26
+casos.
+
+**Ranks** (2026-10-09): el PageRank global suma 21–165 ms a un link pass (de
+3 000 a 22 876 símbolos), y la búsqueda híbrida con la centralidad encendida
+0–6 ms de p50.
+
+### Costo de indexado de 0.10 contra 0.9.0
+
+Medido en la verificación de campo (PLAN-009 TASK-016, 2026-10-12/13): cinco
+repositorios copiados a un sandbox, `ml-granite` en CPU, `nice -n 10`, la vía
+directa (`DEVCTX_NO_AUTOSERVE=1`), el binario 0.9.0 compilado desde su tag y el
+candidato 0.10.0 uno después del otro sobre la misma copia del código, así los
+dos ven la misma máquina. La máquina estaba compartida (carga 4–42), así que un
+par suelto se mueve hasta ±20 %; los segundos de CPU son la cifra más estable.
+
+| Repositorio | Ficheros / chunks (0.10) | Desde cero, 0.9.0 → 0.10 | s de CPU | Pico de memoria (`VmHWM`) | Bloques usados (256 KiB) |
+|---|---|---|---|---|---|
+| este, en un commit anterior | 277 / 4 806 | 566 → 558 s | 9 463 → 9 254 | 889 → 913 MiB | 106 → 116 (+9 %) |
+| un repositorio Java | 216 / 3 284 | 529 → 496 s | 8 703 → 8 508 | 718 → 740 MiB | 76 → 89 (+17 %) |
+| un repositorio Python | 62 / 312 | 59 → 63 s | 957 → 1 014 | 826 → 845 MiB | 25 → 26 (+4 %) |
+| un repositorio Java grande | 1 625 / 21 615 | 3 415 → 2 587 s | 50 486 → 43 969 | 797 → 1 034 MiB | 479 → 523 (+9 %) |
+| un workspace Angular | 1 581 / 14 167 | 1 466 → 1 804 s, repetido: 1 727 → 1 629 s | 24 777 → 30 124, repetido: 28 564 → 27 489 | 791 → 930, repetido: 787 → 888 MiB | 279 → 316 (+13 %) |
+
+Sobre los cinco repositorios, el indexado desde cero tardó 8,7 % menos de tiempo
+de reloj y 1,6 % menos segundos de CPU con 0.10 (el primer par Angular fue 23 %
+más lento y el repetido 6 % más rápido: ruido de la máquina compartida, no una
+tendencia). 0.10 guarda hasta 3 % más chunks (constructores, funciones flecha
+exportadas) y escribe el grafo de símbolos; el fichero de la base es más grande
+de lo que dicen los bloques usados porque DuckDB deja bloques libres (el Java
+grande: 153 → 174 MiB; `devctx compact` los devuelve).
+
+**Paso de un índice 0.9.0 real** (`devctx index --full` de 0.10 sobre el índice
+que hizo 0.9.0, en sitio): este repositorio 53 s, el Java 38 s, el Python 4 s,
+el Java grande 330 s, el workspace Angular 274 s — 7–19 % del tiempo de 0.9.0
+desde cero, con 94–100 % de los chunks reusados. La base crece más por este
+camino que desde cero, porque la reescritura deja bloques libres que DuckDB no
+reutiliza: el Java grande pasó de 504 a 786 bloques usados y de 153 a 296 MiB
+en disco, el workspace Angular de 293 a 463 bloques usados y de 83 a 171 MiB.
+Pico de memoria del paso: 169–1 083 MiB, del mismo orden que desde cero.
+
+**La compactación después del paso** los devuelve. Medido con el binario
+final en los cinco (PLAN-009 TASK-019, 2026-10-16, cada índice 0.9.0
+reconstruido en el mismo commit y actualizado en sitio con terminal): +0 a
++10 % de bloques usados y −14 a +6 % de bytes contra el índice 0.9.0, la
+compactación en sí en 0,6–7,3 s, y el paso completo — el `--full`, parar el
+servidor, la compactación — en 3–301 s (el Java grande 301 s, el workspace
+Angular 227 s, con carga 8–13); pico de memoria del proceso que compacta
+95–370 MiB, disco extra como mucho el tamaño del fichero (157 MiB el más
+grande). Ver
+[La compactación después del paso](13-mantener-el-indice-al-dia.md#la-compactación-después-del-paso).
+
+**El arnés de evaluación** (30 casos sobre los cinco repositorios, mediana de
+tres rondas, `search --no-rerank --limit 20`, brief de 4 096 tokens): búsqueda
+vectorial Hit@5 21 → 21–22 de 30 y MRR 0,571 → 0,575; híbrida Hit@5 21 →
+22–23, MRR 0,616 → 0,647–0,653; archivo esperado en el brief 24 → 26–27 de 30
+(0.9.0 → 0.10 sobre un índice actualizado y sobre uno nuevo). Con los mismos
+vectores (0.9.0 y 0.10 leyendo el mismo índice actualizado) la búsqueda
+vectorial devuelve lo mismo en los 30 casos. La búsqueda con peso de
+centralidad 0,15, 0,3 y 0,5 y el brief con `related: true` no mejoraron el brief
+y movieron las consultas en español en los dos sentidos, así que los dos siguen
+apagados; ver [Búsqueda → Centralidad](03-conceptos-fundamentales/busqueda.md#centralidad-solo-híbrida-opt-in).
+
+**Limitación conocida: el brief en un índice actualizado.** La meta era +10
+puntos porcentuales de "archivo esperado en el brief" sobre 0.9.0 (24 de 30,
+80,0 %). Un índice nuevo la cumple: 27 de 30, 90,0 % (+10,0 pp). Un índice
+actualizado con `--full` no: 26 de 30, 86,7 % (+6,7 pp). La diferencia es un
+caso que depende de los vectores (el paso conserva los de 0.9.0, un índice
+nuevo vuelve a embeber, y el mismo texto no siempre da el mismo vector), no del
+ranking; ningún caso pasa de acierto a fallo. Aceptada por el mantenedor el
+2026-10-13 como limitación de 0.10.0.
+
+`impact_analysis` sobre `get` y `map` en el repositorio Java grande: p95 90 ms y
+179–197 ms por el CLI, contra 3,6 s y 5,1 s de 0.9.0 en la misma máquina.
+`build_context` con `related: true` suma 14–27 ms al p50 (dos saltos: 22–51 ms).
+
+Las cifras parciales medidas mientras se construía el grafo — reuso de
+vectores, el link pass, el crecimiento de la base — están en
+[Mantener el índice al día → Cuánto cuesta](13-mantener-el-indice-al-dia.md#cuánto-cuesta).
+
 ## Almacenamiento
 
 Cifras reales del store de este repositorio:

@@ -1,0 +1,19 @@
+# Casos de relevancia de DevCtxEngine (PLAN-009 TASK-001, DD-1).
+#
+# Formato (una línea por caso, campos separados por `|`):
+#   consulta | archivo(s) esperado(s), separados por coma | símbolo esperado (o -) | repo | idioma (en|es)
+#
+# Los targets se escribieron ANTES de medir y no se editan después, salvo error de
+# transcripción (que se anota en el Resultado de la task). Los 7 primeros reusan
+# scripts/bench-queries.txt; los 3 últimos son de identificador (consulta = el nombre).
+# `archivo esperado` se compara por substring contra la ruta que devuelve search/context.
+where do we run the indexing pipeline|crates/devctx-index/src/pipeline.rs|-|DevCtxEngine|en
+how are memories deduplicated|crates/devctx-memory/src/lib.rs|-|DevCtxEngine|en
+what happens when two processes open the same database|crates/devctx-cli/src/remote.rs|-|DevCtxEngine|en
+how are ranked lists fused together|crates/devctx-search/src/lib.rs|-|DevCtxEngine|en
+cómo se configura el modelo de embeddings|crates/devctx-core/src/config.rs|-|DevCtxEngine|es
+dónde se guardan los modelos descargados|crates/devctx-core/src/dirs.rs|model_cache_dir|DevCtxEngine|es
+cómo se calcula el hash de una memoria|crates/devctx-memory/src/lib.rs|-|DevCtxEngine|es
+search_ranked|crates/devctx-search/src/lib.rs|search_ranked|DevCtxEngine|en
+replace_file_edges|crates/devctx-store/src/graph.rs|replace_file_edges|DevCtxEngine|en
+Cached|crates/devctx-mcp/src/state.rs|Cached|DevCtxEngine|en

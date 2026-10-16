@@ -96,6 +96,134 @@ answer from first place to twenty-first. See
 Keyword (BM25) and hybrid search were not separately benchmarked. Hybrid runs
 both retrievers, so treat it as at least the cost of the vector path.
 
+## The symbol graph (0.10)
+
+Measured while 0.10 was built, October 2026, on the same CPU-only machine —
+often loaded by other work, so read the figures as orders of magnitude. The
+repositories: this one (≈440 files at the time; it had 128 when the search and
+storage figures above were taken, in August, and 281 in the reindex figures of
+[Keeping the index fresh](13-keeping-the-index-fresh.md#what-it-costs), on
+October 6), two private Java repositories
+(1 250 and 216 files), a subset of a private Angular workspace and, for
+`build_context`, that workspace whole. Graph tools were measured warm, each call
+opening the store as the server does, 40 calls per case.
+
+**`impact_analysis`** (2026-10-08 to 2026-10-10), p95 with the defaults
+(high/medium calls, no tests or library callees, 200 per direction, dispatch on),
+against the 0.9 walk on the same index:
+
+| Case | 0.10 | 0.9 |
+|---|---|---|
+| `get`, 1 250-file Java repository | 40.7 ms | 4 165 ms (1 855 names walked) |
+| `map`, same repository | 85.9 ms | 5 724 ms (2 571 names) |
+| worst of 8 cases there, dispatch on, quiet machine | 117.9 ms | — |
+| worst of every case, under load | 242 ms | — |
+| `get` / `new`, this repository, before dispatch existed | 43.5 / 61.1 ms | 805 / 1 550 ms |
+
+Two causes, measured apart: one query per level instead of one per name, and a
+bare name meaning the repository's definitions instead of every call written
+with it. Following dispatch costs 2–15 ms, and up to 70 ms where an interface
+has several implementations.
+
+**`traverse`** (2026-10-09): p95 at depth 2 between 16.8 and 47.5 ms over 16
+cases on the 1 250-file Java repository (calls, references, imports, contains,
+implements/inherits, instantiates, all relations); a synthetic worst case
+(3 000 definitions of one name, 1 000 implementing an interface) 93–126 ms after
+a fix that brought it down from 2.2–3.5 s (2026-10-10).
+
+**`repo_map`** (2026-10-09/10), 1 024-token budget: warm p50 / p95 20.9 /
+34.3 ms on the 1 250-file Java repository (22 801 symbols; first load 104 ms to
+read and build the cached adjacency, ≈7.4 MB), 19.2 / 26.7 ms on the Angular
+subset, 12.0 / 16.5 ms on this repository. Never over the budget (largest map
+996 tokens); with a neighbouring file as the focus, the expected file was in
+the map in 16 of 17 cases.
+
+**`skeleton`** (2026-10-11): 4.9–10.2 % of the file's tokens on 12 files of
+623–4 684 lines in four repositories; p95 ≤ 26 ms.
+
+**`build_context` with `related: true`** (2026-10-12), 4 096-token brief, p50
+without → with the section: this repository 92 → 116 ms, the 216-file Java one
+78 → 87 ms, the 1 250-file one 142 → 179 ms, the Angular workspace 132 →
+186 ms (machine load 14–16). Expected file in the brief: 21 → 22 of 26 cases.
+
+**Ranks** (2026-10-09): the global PageRank adds 21–165 ms to a link pass
+(3 000 to 22 876 symbols), and hybrid search with centrality on 0–6 ms of p50.
+
+### Indexing cost of 0.10 against 0.9.0
+
+Measured in the field verification (PLAN-009 TASK-016, 2026-10-12/13): five
+repositories copied into a sandbox, `ml-granite` on CPU, `nice -n 10`, the
+direct path (`DEVCTX_NO_AUTOSERVE=1`), the 0.9.0 binary built from its tag and
+the 0.10.0 candidate run one after the other on the same copy of the code, so
+both see the same machine. The machine was shared (load average 4–42), so a
+single pair moves by up to ±20 %; the CPU seconds are the steadier figure.
+
+| Repository | Files / chunks (0.10) | From scratch, 0.9.0 → 0.10 | CPU s | Peak memory (`VmHWM`) | Used blocks (256 KiB) |
+|---|---|---|---|---|---|
+| this one, at an older commit | 277 / 4 806 | 566 → 558 s | 9 463 → 9 254 | 889 → 913 MiB | 106 → 116 (+9 %) |
+| a Java repository | 216 / 3 284 | 529 → 496 s | 8 703 → 8 508 | 718 → 740 MiB | 76 → 89 (+17 %) |
+| a Python repository | 62 / 312 | 59 → 63 s | 957 → 1 014 | 826 → 845 MiB | 25 → 26 (+4 %) |
+| a large Java repository | 1 625 / 21 615 | 3 415 → 2 587 s | 50 486 → 43 969 | 797 → 1 034 MiB | 479 → 523 (+9 %) |
+| an Angular workspace | 1 581 / 14 167 | 1 466 → 1 804 s, repeated: 1 727 → 1 629 s | 24 777 → 30 124, repeated: 28 564 → 27 489 | 791 → 930, repeated: 787 → 888 MiB | 279 → 316 (+13 %) |
+
+Over the five repositories, indexing from scratch took 8.7 % less wall time and
+1.6 % fewer CPU seconds with 0.10 (the first Angular pair was 23 % slower, the
+repeated one 6 % faster: noise of the shared machine, not a trend). 0.10 stores
+up to 3 % more chunks (constructors, exported arrow functions) and writes the
+symbol graph; the database file is larger than the used blocks suggest because
+DuckDB leaves free blocks behind (the large Java repository: 153 → 174 MiB;
+`devctx compact` gives them back).
+
+**Upgrading a real 0.9.0 index** (`devctx index --full` of 0.10 over the
+index 0.9.0 built, in place): this repository 53 s, the Java one 38 s, the
+Python one 4 s, the large Java one 330 s, the Angular workspace 274 s — 7–19 %
+of 0.9.0's time from scratch, with 94–100 % of the chunks reused. The database
+grows more on this path than from scratch, because the rewrite leaves free
+blocks DuckDB does not reuse: the large Java repository went from 504 to 786
+used blocks and from 153 to 296 MiB on disk, the Angular workspace from 293 to
+463 used blocks and from 83 to 171 MiB. Peak memory of the upgrade: 169–1 083
+MiB, the same order as from scratch.
+
+**The compaction after the upgrade** brings them back. Measured with the
+final binary on all five (PLAN-009 TASK-019, 2026-10-16, each 0.9.0 index
+rebuilt at the same commit and upgraded in place with a terminal): +0 to +10 %
+used blocks and −14 to +6 % bytes against the 0.9.0 index, the compaction
+itself in 0.6–7.3 s, and the whole upgrade — the `--full`, stopping the
+server, the compaction — in 3–301 s (the large Java repository 301 s, the
+Angular workspace 227 s, at load 8–13); peak memory of the process that
+compacts 95–370 MiB, extra disk at most the size of the file (157 MiB for the
+largest). See
+[The compaction after the upgrade](13-keeping-the-index-fresh.md#the-compaction-after-the-upgrade).
+
+**The evaluation harness** (30 cases over the five repositories, median of
+three rounds, `search --no-rerank --limit 20`, a 4 096-token brief): vector
+search Hit@5 21 → 21–22 of 30 and MRR 0.571 → 0.575; hybrid Hit@5 21 → 22–23,
+MRR 0.616 → 0.647–0.653; expected file in the brief 24 → 26–27 of 30 (0.9.0 →
+0.10 on an upgraded and on a fresh index). With the same vectors (0.9.0 and
+0.10 reading the same upgraded index) vector search returns the same results
+in all 30 cases. Search with the centrality weight at 0.15, 0.3 and 0.5 and
+the brief with `related: true` did not improve the brief and moved Spanish
+queries in both directions, so both stay off; see
+[Search → Centrality](03-core-concepts/search.md#centrality-hybrid-only-opt-in).
+
+**Known limitation: the brief on an upgraded index.** The goal was +10
+percentage points of "expected file in the brief" over 0.9.0 (24 of 30,
+80.0 %). A fresh index meets it: 27 of 30, 90.0 % (+10.0 pp). An index upgraded
+with `--full` does not: 26 of 30, 86.7 % (+6.7 pp). The difference is one case
+that depends on the vectors (the upgrade keeps 0.9.0's, a fresh index embeds
+again, and the same text does not always get the same vector), not on the
+ranking; no case goes from found to missed. Accepted by the maintainer on
+2026-10-13 as a limitation of 0.10.0.
+
+`impact_analysis` on `get` and `map` in the large Java repository: p95 90 ms
+and 179–197 ms through the CLI, against 3.6 s and 5.1 s for 0.9.0 on the same
+machine. `build_context` with `related: true` adds 14–27 ms to the p50 (two
+hops: 22–51 ms).
+
+The partial figures measured while building the graph — vector reuse, the link
+pass, database growth — are in
+[Keeping the index fresh → What it costs](13-keeping-the-index-fresh.md#what-it-costs).
+
 ## Storage
 
 Real figures from this repository's store:

@@ -4,6 +4,7 @@
 //! embedder pulls in fastembed/ort (the `local` provider) and downloads the
 //! model on first use.
 
+mod compact_cli;
 mod help_map;
 mod hooks;
 mod init_wizard;
@@ -103,6 +104,22 @@ enum Command {
     },
     /// Repair an index left inconsistent by an unclean shutdown.
     Repair,
+    /// Rewrite the index into a new file to give back the space full runs
+    /// leave behind (stops this project's server while it runs). The original
+    /// stays in place on any failure; the memories are saved next to it first.
+    Compact {
+        /// Show what it would do (blocks, free space, the checks), and do
+        /// nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Rewrite it even with no free space to give back.
+        #[arg(long)]
+        force: bool,
+        /// Keep the original as `<index>.pre-compact` (a hard link: needs as
+        /// much disk again).
+        #[arg(long)]
+        keep_original: bool,
+    },
     /// Semantic search across the indexed code.
     Search {
         /// The search query.
@@ -238,6 +255,16 @@ enum Command {
         /// Leave memories out and return code only.
         #[arg(long)]
         no_memories: bool,
+        /// Add the related section: callers, callees and supertypes of the
+        /// best code hits, as signatures (off by default in this version).
+        #[arg(long, conflicts_with = "no_related")]
+        related: bool,
+        /// Leave the related section out.
+        #[arg(long)]
+        no_related: bool,
+        /// Hops of the related section: 1 (default) or 2.
+        #[arg(long)]
+        hops: Option<u8>,
     },
     /// Show the blast radius (transitive callers/callees) of a symbol.
     Impact {
@@ -246,6 +273,87 @@ enum Command {
         /// Traversal depth.
         #[arg(long, default_value_t = 3)]
         depth: usize,
+        /// Lowest confidence of the calls followed: high, medium (default) or low.
+        /// What it leaves out is counted, not listed.
+        #[arg(long)]
+        min_confidence: Option<String>,
+        /// List symbols of test files too (by default they are counted only).
+        #[arg(long)]
+        include_tests: bool,
+        /// List external (library) callees too (by default they are counted only).
+        #[arg(long)]
+        include_external: bool,
+        /// Symbols per direction (default 200; 0 = no cap).
+        #[arg(long)]
+        max_nodes: Option<usize>,
+        /// Follow direct calls only: no dispatch through interfaces, abstract
+        /// classes or traits (callers of the method an implementation
+        /// overrides, implementations of an interface method).
+        #[arg(long)]
+        no_dispatch: bool,
+    },
+    /// Walk the symbol graph from a symbol, along the relations asked (calls,
+    /// instantiates, imports, inherits, implements, contains, references).
+    Traverse {
+        /// Where to start: a bare, qualified or `file::name` symbol, or a file
+        /// path. Omit it to start from `--sym`.
+        symbol: Option<String>,
+        /// Start from exactly this definition (the hex `sym` of a node).
+        #[arg(long)]
+        sym: Option<String>,
+        /// Relations, comma-separated, or `all` (default calls).
+        #[arg(long)]
+        kinds: Option<String>,
+        /// in, out (default) or both.
+        #[arg(long = "dir", alias = "direction")]
+        direction: Option<String>,
+        /// Levels, 1 to 4.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Lowest confidence of the edges followed: high, medium (default) or low.
+        #[arg(long)]
+        min_confidence: Option<String>,
+        /// List symbols of test files too (by default they are counted only).
+        #[arg(long)]
+        include_tests: bool,
+        /// List external (library) destinations too (by default they are counted only).
+        #[arg(long)]
+        include_external: bool,
+        /// With calls: no dispatch through interfaces, abstract classes or traits.
+        #[arg(long)]
+        no_dispatch: bool,
+        /// Nodes per page (default 50).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Skip this many nodes (the next_offset of the previous page).
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Print the tool's JSON answer instead of the listing.
+        #[arg(long)]
+        json: bool,
+    },
+    /// A map of the repository for orientation: the signatures of the symbols
+    /// most relevant to a focus, grouped by file, within a token budget.
+    Map {
+        /// Tokens the map may take (default 1024; at least 256 is used).
+        #[arg(long)]
+        budget: Option<usize>,
+        /// Files you have open or are editing (repeatable, or comma-separated):
+        /// what they use ranks first; they are not listed themselves.
+        #[arg(long, value_delimiter = ',')]
+        focus: Vec<String>,
+        /// Symbols the task is about (repeatable, or comma-separated).
+        #[arg(long = "symbol", value_delimiter = ',')]
+        symbols: Vec<String>,
+        /// The task in words: its identifiers count as focus symbols.
+        #[arg(long)]
+        query: Option<String>,
+    },
+    /// The structure of one file, to locate where something is: its symbols
+    /// with signatures and line ranges, nested, without bodies.
+    Skeleton {
+        /// The file: relative to the working directory (or absolute).
+        file: String,
     },
     /// Progress on the plans under `plans/` (markdown, source of truth). No daemon, no store:
     /// reads markdown from disk. Fast enough for a shell-startup hook.
@@ -524,6 +632,11 @@ fn main() -> Result<()> {
         Command::Status => cmd_status(),
         Command::Index { full, branch } => cmd_index(full, branch),
         Command::Repair => cmd_repair(),
+        Command::Compact {
+            dry_run,
+            force,
+            keep_original,
+        } => cmd_compact(dry_run, force, keep_original),
         Command::Search {
             query,
             limit,
@@ -598,8 +711,88 @@ fn main() -> Result<()> {
             query,
             max_tokens,
             no_memories,
-        } => cmd_context(query, max_tokens, !no_memories),
-        Command::Impact { symbol, depth } => cmd_impact(symbol, depth),
+            related,
+            no_related,
+            hops,
+        } => {
+            if hops.is_some() && !related && (no_related || !devctx_mcp::state::DEFAULT_RELATED) {
+                eprintln!("[devctx] --hops has no effect without --related");
+            }
+            cmd_context(
+                query,
+                max_tokens,
+                !no_memories,
+                devctx_mcp::state::ContextOpts {
+                    related: match (related, no_related) {
+                        (true, _) => Some(true),
+                        (_, true) => Some(false),
+                        _ => None,
+                    },
+                    graph_hops: hops,
+                },
+            )
+        }
+        Command::Impact {
+            symbol,
+            depth,
+            min_confidence,
+            include_tests,
+            include_external,
+            max_nodes,
+            no_dispatch,
+        } => cmd_impact(
+            symbol,
+            depth,
+            devctx_mcp::state::ImpactQuery {
+                min_confidence,
+                include_tests: include_tests.then_some(true),
+                include_external: include_external.then_some(true),
+                max_nodes,
+                dispatch: no_dispatch.then_some(false),
+            },
+        ),
+        Command::Traverse {
+            symbol,
+            sym,
+            kinds,
+            direction,
+            depth,
+            min_confidence,
+            include_tests,
+            include_external,
+            no_dispatch,
+            limit,
+            offset,
+            json,
+        } => cmd_traverse(
+            devctx_mcp::state::TraverseQuery {
+                symbol,
+                sym,
+                kinds,
+                direction,
+                depth: Some(depth),
+                min_confidence,
+                include_tests: include_tests.then_some(true),
+                include_external: include_external.then_some(true),
+                dispatch: no_dispatch.then_some(false),
+                limit,
+                offset,
+            },
+            json,
+        ),
+        Command::Map {
+            budget,
+            focus,
+            symbols,
+            query,
+        } => cmd_map(devctx_mcp::repo_map::RepoMapQuery {
+            budget,
+            focus_files: focus,
+            focus_symbols: symbols,
+            query,
+            label: None,
+        }),
+        Command::Skeleton { file } => cmd_skeleton(file),
         Command::PlanStatus { plan, format } => cmd_plan_status(plan, format),
         Command::Routes { method, path } => cmd_routes(method, path),
         Command::Summarize {
@@ -756,6 +949,7 @@ fn reindex_one(root: &std::path::Path, full: bool) -> Result<String> {
     if let Some(warning) = remote::index_cancelled(&raw) {
         bail!("{warning}");
     }
+    compact_after_served_index(&cfg, &r, &raw, full);
     let v: serde_json::Value = serde_json::from_str(&raw).context("parsing the index result")?;
     Ok(format!(
         "{} @ {} — {} files, {} symbols, {} chunks ({} skipped)",
@@ -765,7 +959,7 @@ fn reindex_one(root: &std::path::Path, full: bool) -> Result<String> {
             "incremental"
         },
         short_commit(&field(&v, "commit")),
-        num(&v, "files_indexed"),
+        v["files_indexed"].as_u64().unwrap_or(0) + v["files_unchanged"].as_u64().unwrap_or(0),
         num(&v, "symbols"),
         num(&v, "chunks"),
         num(&v, "files_skipped"),
@@ -2186,24 +2380,17 @@ fn cmd_symbol(name: String, limit: usize) -> Result<()> {
         Some(r) => r.read_symbol(&name, limit)?,
         None => {
             let store = open_store(&cfg, configured_dimension(&cfg))?;
-            let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
-            let branch = git.state().branch;
-            let found = store.symbol_definitions(&git.short_name(), &branch, &name, limit)?;
-            if found.is_empty() {
-                println!("No definition of `{name}` is indexed.");
-                return Ok(());
-            }
-            for p in &found {
-                println!(
-                    "\n{} ({}) — {}:{}-{}",
-                    p.metadata.symbol,
-                    p.metadata.symbol_type,
-                    p.metadata.file,
-                    p.metadata.start_line,
-                    p.metadata.end_line
-                );
-                println!("{}", p.text);
-            }
+            // The same answer as the tool (symbol graph or 0.9.0 path,
+            // branch fallback, warnings, suggestions/external on a miss).
+            let v = devctx_mcp::state::read_symbol_at(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+                &name,
+                limit,
+            )
+            .map_err(|e| anyhow!(e))?;
+            print_read_symbol(&name, &v);
             return Ok(());
         }
     };
@@ -2211,12 +2398,78 @@ fn cmd_symbol(name: String, limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// Human output of a `read_symbol` answer: notes on stderr, definitions (or
+/// the miss with its suggestions or external call sites) on stdout.
+fn print_read_symbol(name: &str, v: &serde_json::Value) {
+    let s = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    if let Some(why) = v
+        .get("branch_fallback")
+        .and_then(|f| f.get("why"))
+        .and_then(|w| w.as_str())
+    {
+        eprintln!("· branch_fallback: {why}");
+    }
+    if let Some(w) = v.get("warning").and_then(|w| w.as_str()) {
+        eprintln!("· warning: {w}");
+    }
+    let defs = v
+        .get("definitions")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if defs.is_empty() {
+        println!("No definition of `{name}` is indexed.");
+        if v.get("external").and_then(|e| e.as_bool()) == Some(true) {
+            println!("{}", s(v, "next_step"));
+        }
+        let sugg: Vec<String> = v
+            .get("suggestions")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !sugg.is_empty() {
+            println!("Did you mean: {}", sugg.join(", "));
+        }
+        return;
+    }
+    for d in &defs {
+        let shown = d
+            .get("qualified")
+            .and_then(|q| q.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| s(d, "symbol"));
+        println!(
+            "\n{} ({}) — {}:{}-{}",
+            shown,
+            s(d, "type"),
+            s(d, "file"),
+            d.get("start_line").and_then(|x| x.as_i64()).unwrap_or(0),
+            d.get("end_line").and_then(|x| x.as_i64()).unwrap_or(0),
+        );
+        println!("{}", s(d, "code"));
+    }
+}
+
 /// `devctx context` — one budgeted brief for a question.
 ///
 /// Always routed through the server when one is up: the brief needs the
 /// embedder, the central store and this project's graph at once, and the server
 /// is the process that already holds all three.
-fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Result<()> {
+fn cmd_context(
+    query: String,
+    max_tokens: usize,
+    include_memories: bool,
+    opts: devctx_mcp::state::ContextOpts,
+) -> Result<()> {
     let cfg = load_project()?;
     let Some(r) = remote::ensure_cli(&cfg)? else {
         bail!(
@@ -2230,48 +2483,307 @@ fn cmd_context(query: String, max_tokens: usize, include_memories: bool) -> Resu
             &query,
             max_tokens,
             include_memories,
-            &devctx_search::KindSel::default()
+            &devctx_search::KindSel::default(),
+            &opts,
         )?
     );
     Ok(())
 }
 
-fn cmd_impact(symbol: String, depth: usize) -> Result<()> {
+fn cmd_impact(symbol: String, depth: usize, q: devctx_mcp::state::ImpactQuery) -> Result<()> {
     let cfg = load_project()?;
-    if let Some(r) = remote::ensure_cli(&cfg)? {
-        let json: serde_json::Value = serde_json::from_str(&r.impact(&symbol, depth)?)?;
-        println!("Impact of `{symbol}` (depth {depth}):");
-        let merged: Vec<String> = json["resolved_symbols"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        print_expansion(&symbol, &merged);
-        print_impact("callers (upstream)", &json_depth_pairs(&json["upstream"]));
-        print_impact(
-            "callees (downstream)",
-            &json_depth_pairs(&json["downstream"]),
-        );
-        return Ok(());
-    }
-    let store = open_store(&cfg, configured_dimension(&cfg))?;
-    let git = devctx_index::GitRepo::open(&project_root(&cfg)?)?;
-    let branch = git.state().branch;
-    let repo = git.short_name();
-    let resolved = store.resolve_symbol(&repo, &branch, &symbol)?;
-    let impact = store.impact_analysis(&repo, &branch, &symbol, depth)?;
-
-    println!("Impact of `{symbol}` (depth {depth}):");
-    print_expansion(
-        &symbol,
-        &devctx_mcp::state::merged_declarations(&symbol, &resolved).unwrap_or_default(),
-    );
-    print_impact("callers (upstream)", &impact.upstream);
-    print_impact("callees (downstream)", &impact.downstream);
+    let json: serde_json::Value = match remote::ensure_cli(&cfg)? {
+        Some(r) => serde_json::from_str(&r.impact(&symbol, depth, &q)?)?,
+        None => {
+            let store = open_store(&cfg, configured_dimension(&cfg))?;
+            // The same answer as the tool: symbol graph or 0.9.0 path,
+            // branch fallback, warnings, filters and what they left out.
+            devctx_mcp::state::impact_at(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+                &symbol,
+                depth,
+                &q,
+            )
+            .map_err(|e| anyhow!(e))?
+        }
+    };
+    print_impact_answer(&symbol, depth, &json);
     Ok(())
+}
+
+/// `devctx map` — the repo map (PLAN-009 TASK-011): the same text as the
+/// `repo_map` tool, through the server when there is one.
+fn cmd_map(q: devctx_mcp::repo_map::RepoMapQuery) -> Result<()> {
+    // A bad parameter is refused before a server or a store is touched.
+    q.validate().map_err(|e| anyhow!(e))?;
+    let cfg = load_project()?;
+    let text = match remote::ensure_cli(&cfg)? {
+        Some(r) => r.repo_map(&q)?,
+        None => {
+            let store = open_store(&cfg, configured_dimension(&cfg))?;
+            devctx_mcp::state::repo_map_at(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+                &q,
+            )
+            .map_err(|e| anyhow!(e))?
+        }
+    };
+    print!("{text}");
+    Ok(())
+}
+
+/// `devctx skeleton <file>` — the file's structure (PLAN-009 TASK-014): the
+/// same text as the `skeleton` tool, through the server when there is one.
+fn cmd_skeleton(file: String) -> Result<()> {
+    // A bad parameter is refused before a server or a store is touched.
+    devctx_mcp::skeleton::SkeletonQuery::of(file.clone())
+        .validate()
+        .map_err(|e| anyhow!(e))?;
+    let cfg = load_project()?;
+    let cwd = std::env::current_dir()?;
+    let q = devctx_mcp::skeleton::SkeletonQuery::of(skeleton_file_arg(
+        &cwd,
+        &project_root(&cfg)?,
+        &file,
+    ));
+    let text = match remote::ensure_cli(&cfg)? {
+        Some(r) => r.skeleton(&q)?,
+        None => {
+            let store = open_store(&cfg, configured_dimension(&cfg))?;
+            devctx_mcp::state::skeleton_at(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+                &q,
+            )
+            .map_err(|e| anyhow!(e))?
+        }
+    };
+    print!("{text}");
+    Ok(())
+}
+
+/// `file` as `devctx skeleton` sends it: a relative path is the shell's,
+/// relative to `cwd`; when that lands inside `root` (lexically, `..`
+/// resolved against `cwd`), it is sent relative to the root. Anything else
+/// goes as typed and the tool decides.
+fn skeleton_file_arg(cwd: &std::path::Path, root: &std::path::Path, file: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+    if Path::new(file).is_absolute() {
+        return file.to_string();
+    }
+    let mut abs = PathBuf::new();
+    for c in cwd.join(file).components() {
+        match c {
+            Component::ParentDir => {
+                abs.pop();
+            }
+            Component::CurDir => {}
+            other => abs.push(other),
+        }
+    }
+    let roots = [Some(root.to_path_buf()), root.canonicalize().ok()];
+    let cwds = [
+        abs.clone(),
+        cwd.canonicalize().map_or(abs.clone(), |c| {
+            c.join(abs.strip_prefix(cwd).unwrap_or(&abs))
+        }),
+    ];
+    for r in roots.iter().flatten() {
+        for a in &cwds {
+            if let Ok(rel) = a.strip_prefix(r) {
+                let parts: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                if !parts.is_empty() {
+                    return parts.join("/");
+                }
+            }
+        }
+    }
+    file.to_string()
+}
+
+/// `devctx traverse` — walk the symbol graph from a symbol.
+fn cmd_traverse(q: devctx_mcp::state::TraverseQuery, as_json: bool) -> Result<()> {
+    // A bad parameter is refused before a server or a store is touched.
+    q.options().map_err(|e| anyhow!(e))?;
+    let cfg = load_project()?;
+    let json: serde_json::Value = match remote::ensure_cli(&cfg)? {
+        Some(r) => serde_json::from_str(&r.traverse(&q)?)?,
+        None => {
+            let store = open_store(&cfg, configured_dimension(&cfg))?;
+            devctx_mcp::state::traverse_at(
+                &store,
+                &project_root(&cfg)?,
+                cfg.indexing.default_branch(),
+                &q,
+            )
+            .map_err(|e| anyhow!(e))?
+        }
+    };
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&json)?);
+    } else {
+        print_traverse_answer(&json);
+    }
+    Ok(())
+}
+
+/// Human output of a `traverse` answer: the root (or the candidates), each
+/// node by depth with the relation that reached it, and the notes on stderr.
+fn print_traverse_answer(json: &serde_json::Value) {
+    if let Some(why) = json["branch_fallback"]["why"].as_str() {
+        eprintln!("· branch_fallback: {why}");
+    }
+    let root = &json["root"];
+    println!(
+        "Traverse from `{}`{}:",
+        root["symbol"].as_str().unwrap_or(""),
+        root["file"]
+            .as_str()
+            .map(|f| format!(" ({f}:{})", root["line"]))
+            .unwrap_or_default()
+    );
+    if let Some(c) = json["candidates"].as_array() {
+        println!("  {} definitions (pass --sym to start from one):", c.len());
+        for c in c {
+            println!(
+                "    {} {} — {}:{}",
+                c["sym"].as_str().unwrap_or(""),
+                c["symbol"].as_str().unwrap_or(""),
+                c["file"].as_str().unwrap_or(""),
+                c["line"]
+            );
+        }
+    }
+    let nodes = json["nodes"].as_array().cloned().unwrap_or_default();
+    if nodes.is_empty() {
+        println!("  (none)");
+    }
+    for n in &nodes {
+        let mut line = format!(
+            "  [{}] {} ({}, {}, {})",
+            n["depth"],
+            n["symbol"].as_str().unwrap_or(""),
+            n["kind"].as_str().unwrap_or("?"),
+            n["via"].as_str().unwrap_or(""),
+            n["confidence"].as_str().unwrap_or("")
+        );
+        for mark in ["test", "external", "undecided"] {
+            if n[mark].as_bool() == Some(true) {
+                line.push_str(&format!(" [{mark}]"));
+            }
+        }
+        if let (Some(f), Some(l)) = (n["file"].as_str(), n["line"].as_i64()) {
+            line.push_str(&format!(" — {f}:{l}"));
+        }
+        println!("{line}");
+    }
+    if let Some(note) = traverse_page_note(json) {
+        eprintln!("{note}");
+    }
+    if let Some(d) = json["partial"]["from_depth"].as_u64() {
+        eprintln!("· depth {d} and below were not read: the page was already full");
+    }
+    if let Some(n) = json["below_confidence"]["count"].as_u64() {
+        eprintln!("· {n} symbol(s) below the confidence shown (--min-confidence low lists them)");
+    }
+    let (tests, external) = (
+        json["excluded"]["tests"].as_u64().unwrap_or(0),
+        json["excluded"]["external"].as_u64().unwrap_or(0),
+    );
+    if tests + external > 0 {
+        eprintln!(
+            "· left out: {tests} test symbol(s), {external} external destination(s) \
+             (--include-tests / --include-external list them)"
+        );
+    }
+    if let Some(r) = json["dispatch"]["reason"].as_str() {
+        eprintln!("· dispatch was not followed ({r})");
+    }
+    if let Some(n) = json["omitted_for_budget"]["count"].as_u64() {
+        eprintln!("· {n} node(s) did not fit the output budget");
+    }
+}
+
+/// The paging line of a `traverse` answer, when there is a next page: with
+/// `partial` the total is a floor (`>= N`, review of TASK-013, MINOR 3).
+fn traverse_page_note(json: &serde_json::Value) -> Option<String> {
+    let next = json["next_offset"].as_u64()?;
+    let total = json["total"].as_u64().unwrap_or(0);
+    let at_least = if json["total_is_lower_bound"].as_bool() == Some(true) {
+        ">= "
+    } else {
+        ""
+    };
+    Some(format!(
+        "· {at_least}{total} node(s) in all; --offset {next} shows the next page"
+    ))
+}
+
+/// Human output of an `impact_analysis` answer: notes on stderr, the two
+/// directions on stdout, each symbol with its confidence and marks.
+fn print_impact_answer(symbol: &str, depth: usize, json: &serde_json::Value) {
+    let note = |k: &str, sub: &str| {
+        json.get(k)
+            .and_then(|v| v.get(sub))
+            .and_then(|w| w.as_str())
+            .map(str::to_string)
+    };
+    if let Some(why) = note("branch_fallback", "why") {
+        eprintln!("· branch_fallback: {why}");
+    }
+    if let Some(w) = json.get("warning").and_then(|w| w.as_str()) {
+        eprintln!("· warning: {w}");
+    }
+    println!("Impact of `{symbol}` (depth {depth}):");
+    let merged: Vec<String> = json["resolved_symbols"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    print_expansion(symbol, &merged);
+    print_impact("callers (upstream)", &json["upstream"]);
+    print_impact("callees (downstream)", &json["downstream"]);
+    let count = |k: &str, sub: &str| {
+        json.get(k)
+            .and_then(|v| v.get(sub))
+            .and_then(|c| c.as_u64())
+    };
+    if let Some(n) = count("below_confidence", "count") {
+        eprintln!("· {n} symbol(s) below the confidence shown (--min-confidence low lists them)");
+    }
+    if let Some(n) = count("undecided_calls", "count") {
+        eprintln!(
+            "· {n} call(s) to the name the index could not decide, outside tests and listed \
+             callers (--min-confidence low lists their callers)"
+        );
+    }
+    let (tests, external) = (
+        count("excluded", "tests").unwrap_or(0),
+        count("excluded", "external").unwrap_or(0),
+    );
+    if tests + external > 0 {
+        eprintln!(
+            "· left out: {tests} test symbol(s), {external} external callee(s) \
+             (--include-tests / --include-external list them)"
+        );
+    }
+    if let Some(n) = count("omitted_by_limit", "count") {
+        eprintln!("· {n} symbol(s) past --max-nodes were counted, not listed or walked");
+    }
+    if let Some(n) = count("omitted_for_budget", "count") {
+        eprintln!("· {n} symbol(s) did not fit the output budget");
+    }
 }
 
 /// Root to read `plans/` from (PLAN-007 DD-2): inside a DevCtxEngine project, its own root — or,
@@ -2450,31 +2962,36 @@ fn print_expansion(symbol: &str, merged: &[String]) {
 }
 
 /// Extract `[{symbol, depth}]` from a server JSON array into `(symbol, depth)`.
-fn json_depth_pairs(v: &serde_json::Value) -> Vec<(String, usize)> {
-    v.as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|e| {
-                    (
-                        e["symbol"].as_str().unwrap_or("").to_string(),
-                        e["depth"].as_u64().unwrap_or(0) as usize,
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn print_impact(label: &str, items: &[(String, usize)]) {
+fn print_impact(label: &str, items: &serde_json::Value) {
     println!("  {label}:");
+    let items = items.as_array().cloned().unwrap_or_default();
     if items.is_empty() {
         println!("    (none)");
         return;
     }
-    let mut sorted = items.to_vec();
-    sorted.sort_by_key(|(_, d)| *d);
-    for (sym, d) in &sorted {
-        println!("    {sym} (depth {d})");
+    // The answer is already by depth (and within a depth by confidence,
+    // rank and name); a stable sort keeps that order.
+    let mut sorted = items;
+    sorted.sort_by_key(|e| e["depth"].as_u64().unwrap_or(0));
+    for e in &sorted {
+        let mut line = format!(
+            "    {} (depth {}",
+            e["symbol"].as_str().unwrap_or(""),
+            e["depth"].as_u64().unwrap_or(0)
+        );
+        if let Some(c) = e.get("confidence").and_then(|c| c.as_str()) {
+            line.push_str(&format!(", {c}"));
+        }
+        line.push(')');
+        for mark in ["test", "external", "undecided"] {
+            if e.get(mark).and_then(|m| m.as_bool()) == Some(true) {
+                line.push_str(&format!(" [{mark}]"));
+            }
+        }
+        if let (Some(f), Some(l)) = (e.get("file").and_then(|f| f.as_str()), e.get("line")) {
+            line.push_str(&format!(" — {f}:{l}"));
+        }
+        println!("{line}");
     }
 }
 
@@ -2718,6 +3235,10 @@ fn cmd_memories_export(scope: &str, repo: Option<&str>) -> Result<()> {
 /// `devctx memories import` — add memories from a JSONL file.
 fn cmd_memories_import(file: &std::path::Path, scope: Option<&str>, dry_run: bool) -> Result<()> {
     let cfg = load_project()?;
+    // A compaction's sidecar (PLAN-009 TASK-018): a DuckDB file, not JSONL.
+    if file.extension().is_some_and(|e| e == "duckdb") {
+        return restore_memories_from_sidecar(&cfg, file, dry_run);
+    }
     let raw =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
 
@@ -2820,6 +3341,50 @@ fn cmd_memories_import(file: &std::path::Path, scope: Option<&str>, dry_run: boo
             }
         }
     }
+    Ok(())
+}
+
+/// `devctx memories import <index>.pre-compact.duckdb`: put back the memories
+/// a compaction saved that the index lacks, embedding each again (the
+/// sidecar has no vectors). Only ever adds.
+fn restore_memories_from_sidecar(
+    cfg: &ProjectConfig,
+    side: &std::path::Path,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        bail!("--dry-run is for JSONL files; a sidecar restore only ever adds, run it without");
+    }
+    let store = open_store(cfg, configured_dimension(cfg))
+        .context("opening the store (stop a running server first: `devctx serve --stop`)")?;
+    // The embedder first, and its width against the index's: a restore whose
+    // embedding cannot work must not start writing rows (review D2). A run
+    // cut anyway is finished by the next one, which embeds every restored
+    // memory still without a vector.
+    let embedder = build_embedder(cfg)?;
+    if let Some(stored) = store.stored_dimension()? {
+        if stored != embedder.dimension() {
+            bail!(
+                "the index stores vectors of width {stored} and the configured model makes {}; \
+                 nothing was restored",
+                embedder.dimension()
+            );
+        }
+    }
+    let report = devctx_store::compact::restore_from_sidecar(&store, side, &mut |m| {
+        devctx_memory::index_memory_vectors(&store, embedder.as_ref(), m)
+            .map_err(|e| devctx_store::StoreError::Decode(e.to_string()))
+    })?;
+    println!(
+        "restored {} memories from {} · {} already present · {} embedded · {} symbol \
+         references · {} sessions",
+        report.added,
+        side.display(),
+        report.already,
+        report.embedded,
+        report.refs,
+        report.sessions
+    );
     Ok(())
 }
 
@@ -3539,40 +4104,32 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
                 if let Some(warning) = remote::index_cancelled(&report) {
                     bail!("{warning}");
                 }
+                compact_after_served_index(&cfg, &r, &report, full);
             }
             Err(e) => return Err(still_running_or(&r, e)),
         }
         return Ok(());
     }
     let root = project_root(&cfg)?;
-    eprintln!(
-        "Loading embedder ({} / {})…",
-        cfg.embeddings.model, cfg.embeddings.provider
-    );
-    let embedder = build_embedder(&cfg)?;
-    let store = open_store(&cfg, embedder.dimension())?;
-
-    // Golden rule for bulk loads: don't maintain the HNSW index row-by-row.
-    // For a full reindex, drop it up front and rebuild once after the load —
-    // noted as owed *before* the drop, like the pipeline's own drop, so a
-    // process killed mid-run leaves the rebuild to the next run instead of
-    // losing the index for good. With the note in place the pipeline rebuilds
-    // it at the end of the run (once), and the rebuild below only covers
-    // what it could not.
-    if full && cfg.storage.hnsw {
-        store.set_index_meta(
-            "",
-            "",
-            devctx_index::PENDING_HNSW_META_KEY,
-            &cfg.storage.metric,
-        )?;
-        store.drop_hnsw()?;
-    }
+    // The model loads only if a chunk needs embedding: a run that finds every
+    // vector reusable (a `--full` over unchanged source) never pays the load.
+    // The store's width and the model name are known from the registry.
+    let settings = EmbedSettings::from_config(&cfg.embeddings);
+    let dimension = configured_dimension(&cfg);
+    let embedder = devctx_embed::LazyEmbedder::new(dimension, cfg.embeddings.model.clone(), || {
+        eprintln!(
+            "Loading embedder ({} / {})…",
+            cfg.embeddings.model, cfg.embeddings.provider
+        );
+        Ok(Arc::from(create_provider(&settings)?))
+    });
+    let store = open_store(&cfg, dimension)?;
+    let fingerprint = devctx_embed::embedding_fingerprint(&settings, dimension);
 
     let progress = IndexBar::new();
     let res = index_run(IndexRequest {
         store: &store,
-        embedder: embedder.as_ref(),
+        embedder: &embedder,
         repo_root: &root,
         incremental: !full,
         model_name: &cfg.embeddings.model,
@@ -3580,6 +4137,8 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         paths: None,
         exclude: &cfg.indexing.effective_excludes(),
         branch: branch.as_deref(),
+        hnsw: cfg.storage.hnsw.then_some(cfg.storage.metric.as_str()),
+        embed_fingerprint: &fingerprint,
     })?;
     progress.finish();
     devctx_mcp::state::report_index(&store, &root, &res);
@@ -3597,7 +4156,7 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
         } else {
             "incremental"
         },
-        res.files_indexed,
+        res.files_indexed + res.files_unchanged,
         res.files_skipped,
         res.files_deleted,
         res.files_pruned,
@@ -3612,36 +4171,42 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
             res.files_copied
         );
     }
+    if res.files_unchanged > 0 {
+        println!(
+            "  {} of those were unchanged, nothing written for them",
+            res.files_unchanged
+        );
+    }
+    if res.chunks_reused > 0 {
+        println!(
+            "  {} chunks reused without re-embedding (same text, same model)",
+            res.chunks_reused
+        );
+    }
     println!("  {} symbols, {} chunks stored", res.symbols, res.chunks);
+    if res.edges_discarded > 0 || res.edges_unresolved > 0 {
+        println!(
+            "  graph: {} calls discarded in the branch (untypable receiver, name not in the \
+             repository), \
+             {} calls undecided",
+            res.edges_discarded, res.edges_unresolved
+        );
+    }
     if res.extractor_stale {
         println!("  index built by an older extractor; run `devctx index --full` to rebuild it");
     }
 
-    let wanted_metric = if cfg.storage.metric.trim().eq_ignore_ascii_case("ip")
-        || cfg
-            .storage
-            .metric
-            .trim()
-            .eq_ignore_ascii_case("inner_product")
-    {
-        "ip"
-    } else {
-        "cosine"
-    };
-    if cfg.storage.hnsw && store.hnsw_metric().as_deref() == Some(wanted_metric) {
-        println!("  HNSW index ready (VSS, metric {wanted_metric})");
-    } else if cfg.storage.hnsw {
-        if store.enable_hnsw(&cfg.storage.metric)? {
-            println!(
-                "  HNSW index ready (VSS, metric {})",
-                if cfg.storage.metric.is_empty() {
-                    "cosine"
-                } else {
-                    &cfg.storage.metric
-                }
-            );
+    // The pipeline owns the HNSW index (`IndexRequest.hnsw`): it creates it when
+    // missing and rebuilds it when this run took it down. Here, only say so.
+    if cfg.storage.hnsw {
+        let wanted = devctx_store::normalize_metric(&cfg.storage.metric);
+        if store.hnsw_metric().as_deref() == Some(wanted) {
+            println!("  HNSW index ready (VSS, metric {wanted})");
         } else {
-            eprintln!("  HNSW requested but the VSS extension is unavailable; using brute-force");
+            eprintln!(
+                "  HNSW requested but not built (the VSS extension is unavailable, or the \
+                 server is stopping); using brute-force"
+            );
         }
     }
     // The pipeline rebuilds a BM25 index it took down; build one here only
@@ -3655,7 +4220,33 @@ fn cmd_index(full: bool, branch: Option<String>) -> Result<()> {
             eprintln!("  FTS requested but the FTS extension is unavailable");
         }
     }
+    if res.full_reindex && !res.cancelled {
+        let report = store.memory_report();
+        let hnsw = (report.hnsw_estimated_bytes(), report.hnsw_present);
+        // The compaction needs the file to itself.
+        drop(store);
+        compact_cli::after_full_index(&cfg, full, res.compaction.as_deref(), None, hnsw);
+    }
     Ok(())
+}
+
+/// After a full run on the server: compact if it left the upgrade's note
+/// (PLAN-009 TASK-018). Never fails the run.
+fn compact_after_served_index(
+    cfg: &ProjectConfig,
+    r: &remote::Remote,
+    report: &str,
+    requested_full: bool,
+) {
+    let v: serde_json::Value = serde_json::from_str(report).unwrap_or_default();
+    if !v["full_reindex"].as_bool().unwrap_or(false) {
+        return;
+    }
+    let hnsw = r
+        .status()
+        .map(|raw| compact_cli::hnsw_from_status(&raw))
+        .unwrap_or((None, false));
+    compact_cli::after_full_index(cfg, requested_full, v["compaction"].as_str(), Some(r), hnsw);
 }
 
 /// `devctx repair` — rebuild an index whose constraints no longer match its rows.
@@ -3749,6 +4340,135 @@ fn cmd_repair() -> Result<()> {
     Ok(())
 }
 
+/// `devctx compact` (PLAN-009 TASK-018, Paso 4).
+fn cmd_compact(dry_run: bool, force: bool, keep_original: bool) -> Result<()> {
+    use devctx_store::compact;
+    let cfg = load_project()?;
+    let db = cfg.db_path();
+    if !db.exists() {
+        println!("Nothing to compact: no index at {}.", db.display());
+        return Ok(());
+    }
+    // The numbers come from the server when one holds the file (opening it
+    // here would fail), or from a read-only look that writes nothing.
+    let server = remote::discover(&cfg);
+    let (usage, bytes, hnsw_bytes, hnsw, fts, note) = match &server {
+        Some(r) => {
+            let v: serde_json::Value =
+                serde_json::from_str(&r.status()?).context("parsing the server's status")?;
+            let c = &v["compaction"];
+            let usage = compact::BlockUsage {
+                block_size: c["block_size"].as_u64().unwrap_or(0),
+                used: c["used_blocks"].as_u64().unwrap_or(0),
+                free: c["free_blocks"].as_u64().unwrap_or(0),
+            };
+            let (hb, hp) = compact_cli::hnsw_from_status(&v.to_string());
+            (
+                usage,
+                std::fs::metadata(&db)?.len(),
+                hb,
+                hp,
+                false,
+                c["note"].as_str().map(str::to_string),
+            )
+        }
+        None => {
+            let i = compact::inspect(&db).map_err(|e| anyhow!("{e}"))?;
+            (
+                i.usage,
+                i.bytes,
+                i.hnsw_bytes,
+                i.hnsw.is_some(),
+                i.fts,
+                i.note,
+            )
+        }
+    };
+    let total = usage.used + usage.free;
+    println!(
+        "{}: {} MiB, {} blocks in use and {} free ({:.0} %){}",
+        db.display(),
+        bytes.div_ceil(1 << 20),
+        usage.used,
+        usage.free,
+        if total > 0 {
+            100.0 * usage.free as f64 / total as f64
+        } else {
+            0.0
+        },
+        note.map(|n| format!(", compaction note: {n}"))
+            .unwrap_or_default()
+    );
+    println!(
+        "  a compaction would leave about {} MiB",
+        (usage.used * usage.block_size).div_ceil(1 << 20)
+    );
+    let pre = compact::preflight_for(
+        &db,
+        hnsw_bytes,
+        &compact::SystemProbe::default(),
+        keep_original,
+    );
+    if !keep_original {
+        println!(
+            "  with --keep-original the original stays allocated too: about {} MiB of disk",
+            bytes.saturating_mul(2).div_ceil(1 << 20)
+        );
+    }
+    match &pre {
+        Ok(p) => println!(
+            "  checks pass: {} MiB of disk available{}, about {} MiB of memory needed",
+            p.disk_available
+                .map_or("?".into(), |d| d.div_ceil(1 << 20).to_string()),
+            p.memory_available.map_or(String::new(), |m| format!(
+                " and {} MiB of memory",
+                m.div_ceil(1 << 20)
+            )),
+            p.memory_needed.div_ceil(1 << 20)
+        ),
+        // Said once: outside --dry-run the error itself ends the command.
+        Err(e) if dry_run => println!("  it would not run: {e}"),
+        Err(_) => {}
+    }
+    if dry_run {
+        println!("--dry-run: nothing was changed.");
+        return Ok(());
+    }
+    if usage.free == 0 && !force {
+        println!(
+            "Nothing to give back (no free blocks); `devctx compact --force` rewrites it anyway."
+        );
+        return Ok(());
+    }
+    pre.map_err(|e| anyhow!("{e}"))?;
+    compact::check_extensions(hnsw, fts).map_err(|e| anyhow!("{e}"))?;
+    if server.is_some() {
+        println!(
+            "Stopping the server of {} while the index is rewritten…",
+            cfg.project.name
+        );
+    }
+    match remote::reclaim_db_report(&cfg) {
+        remote::Reclaim::NotStopped(why) => bail!(
+            "the server holding the index could not be stopped ({why}); stop it with \
+             `devctx serve --stop` (or by hand) and run `devctx compact` again"
+        ),
+        remote::Reclaim::Killed => eprintln!(
+            "· the server had to be killed; its write-ahead log is folded in before compacting"
+        ),
+        remote::Reclaim::Stopped | remote::Reclaim::NoServer => {}
+    }
+    let mut opts = compact::CompactOptions::new("manual");
+    // Asked for explicitly: a WAL left behind is folded first (the preparation
+    // of the protocol's point 2), not a reason to stop.
+    opts.fold_wal = true;
+    opts.keep_original = keep_original;
+    opts.hnsw_bytes = hnsw_bytes;
+    opts.dim_hint = configured_dimension(&cfg);
+    compact_cli::run(&cfg, &db, opts).map_err(|e| anyhow!("{e}"))?;
+    Ok(())
+}
+
 /// Placeholder width for opening a database that already exists. The schema is
 /// created only when absent, so this never reaches disk in that case.
 const DEFAULT_DIM: usize = 768;
@@ -3767,7 +4487,7 @@ fn cmd_search(
 ) -> Result<()> {
     let cfg = load_project()?;
     // Validate before anything starts a server or loads a model.
-    let rank = sel
+    let mut rank = sel
         .options(cfg.search.penalty)
         .map_err(|e| anyhow::anyhow!(e))?;
     if let Some(r) = remote::ensure_cli(&cfg)? {
@@ -3807,6 +4527,16 @@ fn cmd_search(
         .map(|e| e.dimension())
         .unwrap_or_else(|| configured_dimension(&cfg));
     let store = open_store(&cfg, dim)?;
+    // Hybrid centrality (PLAN-009 TASK-010) under the MCP's rule: only from
+    // a current symbol graph (review of TASK-010, MINOR 1).
+    if mode == SearchMode::Hybrid {
+        rank.centrality = devctx_mcp::state::local_centrality(
+            &store,
+            &project_root(&cfg)?,
+            cfg.indexing.default_branch(),
+            cfg.search.centrality(),
+        );
+    }
 
     // Rerank vector/hybrid results when enabled; keep keyword lightweight.
     let reranker = if !no_rerank && cfg.reranking.enabled && mode != SearchMode::Keyword {
@@ -4058,6 +4788,53 @@ fn render_table(hits: &[SearchResult]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Review of TASK-014, MINOR 6: `devctx skeleton <file>` reads `file`
+    /// from where it is typed, like any shell command: relative to the
+    /// working directory, sent relative to the repository root.
+    #[test]
+    fn a_skeleton_path_is_relative_to_the_working_directory() {
+        use std::path::Path;
+        let root = Path::new("/r/repo");
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo/web"), root, "src/x.ts"),
+            "web/src/x.ts"
+        );
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo/web"), root, "../crates/a.rs"),
+            "crates/a.rs"
+        );
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo"), root, "./a.rs"),
+            "a.rs"
+        );
+        // Outside the repository, or absolute: as typed (the tool decides).
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/elsewhere"), root, "a.rs"),
+            "a.rs"
+        );
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo/web"), root, "/r/repo/a.rs"),
+            "/r/repo/a.rs"
+        );
+        assert_eq!(
+            super::skeleton_file_arg(Path::new("/r/repo/web"), root, "../../x.rs"),
+            "../../x.rs"
+        );
+    }
+
+    /// Review of TASK-013, MINOR 3: a lower-bound total reads `>= N`.
+    #[test]
+    fn a_partial_traverse_total_reads_as_a_floor() {
+        let v = serde_json::json!({ "total": 300, "next_offset": 50 });
+        assert_eq!(
+            traverse_page_note(&v).unwrap(),
+            "· 300 node(s) in all; --offset 50 shows the next page"
+        );
+        let v =
+            serde_json::json!({ "total": 300, "next_offset": 50, "total_is_lower_bound": true });
+        assert!(traverse_page_note(&v).unwrap().contains(">= 300"));
+        assert!(traverse_page_note(&serde_json::json!({ "total": 3 })).is_none());
+    }
     /// TASK-017 item 6: the rule for the `model_dir` `init` records.
     #[test]
     fn a_model_that_needs_files_never_gets_an_empty_model_dir() {

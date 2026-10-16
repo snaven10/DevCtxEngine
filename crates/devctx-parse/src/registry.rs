@@ -45,21 +45,88 @@ pub struct LangDef {
     /// because the distinction is a grammar detail and nobody searches for it.
     #[serde(default)]
     pub store_language: Option<String>,
-    /// Query capturing definitions; the capture name is the symbol kind.
-    pub symbols: String,
-    /// Query capturing call callees as `@callee`.
-    pub calls: String,
-    /// Query capturing `@name`/`@type` pairs to resolve a receiver's type.
-    /// Absent for untyped languages.
+    /// Query capturing definitions, `tags.scm` style (PLAN-009 DD-5): the
+    /// definition node as `@definition.<kind>` and its name as `@name`. One
+    /// node captured by several patterns keeps the first pattern's kind (an
+    /// arrow-valued field is a `method`, not a `field`).
+    pub definitions: String,
+    /// Query capturing references: `@reference.call` with the callee as
+    /// `@name` (and, for a path call like Rust's `Foo::bar`, the path as
+    /// `@path`); `@reference.new` with the instantiated type as `@type`;
+    /// `@reference.type` around a type use (a field's, a parameter's, a
+    /// variable's or a return type), the node itself or its `@type` child,
+    /// whose type names ([`type_names`](Self::type_names)) are each one
+    /// reference.
+    pub references: String,
+    /// Query capturing supertypes inside a type definition:
+    /// `@inherit.extends` / `@inherit.implements` on the supertype node.
+    #[serde(default)]
+    pub inherits: Option<String>,
+    /// Query capturing declarations, to type a call's receiver (PLAN-009
+    /// TASK-005): the bound `@name` and its written `@type`; `@init` (the
+    /// initializer a `var` takes its type from) and `@iter` (what a for-each
+    /// iterates, whose element it binds); the declaration as
+    /// `@bind.field`/`@bind.param`/`@bind.local` (how an edge it types is
+    /// resolved), or `@bind.assign` for a `this.x = x` whose right side is a
+    /// constructor parameter; `@bind.inject` for a constructor parameter
+    /// property, `@bind.func` for a function bound to its name (a function
+    /// of a class body is its method, no bare name), `@bind.attr` for a
+    /// Python `self.x = v` in a method (an attribute of the class, typed by
+    /// `v`), `@bind.receiver` for a Go method's receiver (`self`). A capture
+    /// named `@_x` is only a predicate's. Of several
+    /// patterns capturing one name in one scope, the first in the query
+    /// wins. Absent for untyped languages.
     #[serde(default)]
     pub types: Option<String>,
-    /// Query capturing whole import statements as `@import`.
+    /// Node kinds that open a lexical scope for those declarations (a class
+    /// body, a method, a block, a lambda, a `for`): a binding belongs to the
+    /// innermost one around its name. Empty: one scope, the file, where the
+    /// first declaration of a name wins.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Query capturing imports: the statement as `@import`, and what it
+    /// brings in as `@import.path` (module or full path), `@import.name`,
+    /// `@import.alias`, `@import.wildcard`, `@import.default` (a default
+    /// import's local name), `@import.namespace` (`* as x`), or
+    /// `@import.tree` for a language whose import is a tree the resolver
+    /// expands (a Rust `use`).
     pub imports: String,
+    /// Query capturing the file's declared package as `@package` (Java,
+    /// Go). The others derive it from the path.
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Node kinds that name a type inside a `@reference.type` capture: each
+    /// outermost one is a reference (`List<Foo>` is `List` and `Foo`).
+    #[serde(default)]
+    pub type_names: Vec<String>,
     /// Node kinds that define a callable, for resolving an edge's source.
     pub function_kinds: Vec<String>,
     /// Node kinds that act as symbol containers, for the parent of a symbol and
     /// for telling a method from a function.
     pub container_kinds: Vec<String>,
+    /// Node kinds that are not symbols but name a scope (a TypeScript
+    /// `namespace`): they enter the qualified name of what they enclose, as
+    /// every enclosing symbol and container does (PLAN-009 DD-3).
+    #[serde(default)]
+    pub scope_kinds: Vec<String>,
+    /// Whether the language overloads callables by parameter types with
+    /// separate bodies (Java), so that a symbol's id carries them (PLAN-009
+    /// DD-3). Not TypeScript: its overload signatures are not symbols.
+    #[serde(default)]
+    pub overloads: bool,
+    /// Prefixes of names that belong to the platform (JDK, `std`, the Go
+    /// standard library) — evidence for `external` (PLAN-009 DD-9).
+    #[serde(default)]
+    pub platform_prefixes: Vec<String>,
+    /// Bare names that belong to the platform (Python builtins, JS globals,
+    /// `java.lang` types): evidence for `external` too.
+    #[serde(default)]
+    pub builtins: Vec<String>,
+    /// Top-level modules of the platform (Python's standard library, Rust's
+    /// `std`/`core`/`alloc`): an import whose first segment is one of them is
+    /// from outside the repository (PLAN-009 TASK-007, DD-9).
+    #[serde(default)]
+    pub platform_modules: Vec<String>,
 }
 
 impl LangDef {
@@ -68,6 +135,31 @@ impl LangDef {
         self.store_language.as_deref().unwrap_or(&self.name)
     }
 }
+
+/// Every kind a definitions query may capture (`@definition.<kind>`).
+///
+/// A kind is part of the symbol id through its class
+/// ([`devctx_core::symbol_id::kind_class`]): a misspelt one
+/// (`@definition.contructor`) would be a class of its own and move every id
+/// it touches without anything failing, so `every_definition_compiles`
+/// rejects any kind not listed here. `method` and `constructor` are also
+/// derived at parse time (a `function` in a container, a JS `constructor`).
+pub const DEFINITION_KINDS: &[&str] = &[
+    "function",
+    "method",
+    "constructor",
+    "class",
+    "interface",
+    "enum",
+    "record",
+    "struct",
+    "trait",
+    "type",
+    "module",
+    "impl",
+    "field",
+    "const",
+];
 
 /// The embedded definitions, in registry order.
 const SOURCES: &[&str] = &[
@@ -90,7 +182,94 @@ const SOURCES: &[&str] = &[
 /// `devctx-index`'s `routes.rs`. A change to either needs a manual bump here,
 /// or existing indexes keep reading as fresh. Only a full run (`index --full`)
 /// stamps the fingerprint; incremental runs never re-stamp an older index.
-pub const EXTRACTOR_VERSION: u32 = 1;
+///
+/// 2: the `symbols` and `edges` tables (PLAN-009 TASK-003) — an index made
+/// before them has neither, so it must read as stale.
+/// 3: structured extraction (PLAN-009 TASK-004) — new symbol kinds, `impl`
+/// symbols, the Java overload shape in ids, every edge kind.
+/// 4: review of TASK-004 — a Rust `impl`'s generic arguments and `where`
+/// clause without trailing commas (ids stable under `rustfmt`); a named
+/// callable's `graph_edges` source is its symbol's qualified name
+/// (`traced.wrapper`, `C.init.run`, `C.m.f`; `const x = function named()`
+/// is `x`); `export default name;` exports `name`.
+/// 5: review of 3ad7d54 — comments inside an `impl`'s `where` clause or
+/// generic arguments are no part of its id; `(u8,)` keeps its comma (a
+/// one-element tuple is not `u8`); `export default (name);` exports `name`.
+/// 6: the link pass's inputs (PLAN-009 TASK-005) — every call carries the
+/// receiver `hint` (`typed field Foo`, `name Office`, `chain find …`), typed
+/// by lexical scope (Java `scopes`: each inner class its own fields, `var`
+/// from its initializer, for-each elements, `this.x = x` injection); a
+/// constant (`LOG`) is never taken for a type; literals type their receiver.
+/// 7: review of TASK-005 — a dotted receiver whose first segment a scope binds
+/// is `member <fields> <hint>`, never a package; a bare or `this` call in an
+/// anonymous class is `anon <Type> …`; lambda parameters and pattern
+/// variables are bindings (untyped, or typed by the pattern); a constructor
+/// injection keeps the field's declared type; a trailing comma before `)`
+/// folds unless the group has one element.
+/// 8: the `>` of a `->` inside an `impl`'s generic arguments or `where`
+/// clause closes no group (`Fn(A, Box<dyn Fn() -> u8>,)` folds its comma).
+/// 9: TypeScript/JavaScript `types` and `scopes` (PLAN-009 TASK-006):
+/// constructor parameter properties and `inject(T)` are injected fields,
+/// parameters, destructured names and catch variables are bindings that
+/// shadow fields, a bare name is never a member (no implicit `this`), `this`
+/// outside a declared class is untyped; an import records whether it is a
+/// re-export.
+/// 10: TASK-006 review — only Angular's `inject` (imported from
+/// `@angular/core`) injects; a TS/JS function in scope is a binding
+/// (`function f` hoisted, `const f = () => …`), and a bare call no scope
+/// binds, or bound to the module's own function, is `free` (a function bound
+/// in a sibling block is not in scope).
+/// 11: TASK-006 second review — a receiver bound to a function or a class
+/// (`fn.call()`, `Klass.make()` with `const Klass = class {…}`) is that
+/// name, not an untyped value.
+/// 12: Python `types` and `scopes` (PLAN-009 TASK-007): parameters, lambda
+/// and comprehension variables, loop and `with`/`except` targets are
+/// bindings that shadow attributes; `self.x = v` in a method types the
+/// attribute (`ctor_inject` from a typed parameter of `__init__`, else by
+/// `v`: `x = Foo()` and `x = make()` hold what calling it returns, `typed
+/// <via> Foo()`); an attribute no scope binds is `member x this`; a literal
+/// receiver is its builtin type; `super().m()` is `super`; a module binding
+/// is seen from any function; a `from … import` row's hint says `from`.
+/// 13: Rust `types` and `scopes` (TASK-007): parameters of any type (`&T`,
+/// `impl T`, `dyn T`, `Arc<T>` → `T`, a type parameter its first bound),
+/// closure parameters and every pattern binding (`let`, `if let`, `match`,
+/// `for`) are bindings; `let x = T::f()?` holds what the call returns; a
+/// trait method without a body is a symbol; a path call's hint is `path
+/// <prefix>` (generic arguments out: `Vec::<u8>::new` → `Vec.new`), also as
+/// a chain's previous call; `f()?.g()` is `chain f? …`; a bare name is never
+/// a method; a field of `self` is `member f this`; `pub use` re-exports.
+/// 14: Go `types` and `scopes` (TASK-007): the receiver is `this` (and the
+/// `graph_edges` target of `s.m()` is `Type.m`); parameters, closure
+/// parameters, `:=`, `var`, `range` and type-switch variables are bindings;
+/// `x := New()` holds what the call returns, `&T{}` is `T`; an interface's
+/// method is a symbol.
+/// 15: TASK-007 review — a Rust type parameter (and `dyn A + B`) is typed
+/// by every bound (`Clone+Named`), `Arc::new(x)`/`Box::new(x)` hold what
+/// `x` does, `x = f()` with `f` a local value holds nothing; Go `var a, err
+/// = f()` types `a` only, an anonymous interface's method is no symbol.
+/// 16: TASK-007 review, Python — `Any`, `object` and a union of several
+/// types type nothing; `type[X]` is `X`.
+/// 17: TASK-007 second review — a Rust `use` inside a block keeps the
+/// block's lines in its row's hint (`in 12-20`): it reaches only them.
+/// 18: TASK-010 review, MAJOR 4 — Rust test code inside a source file
+/// (`#[cfg(test)]`, `mod tests`, `#[test]`) is reported as `test_lines`:
+/// its symbols are tests and its calls `from_test`.
+/// 19: TASK-010 second review — a `cfg` is test code only when `test` is
+/// required (alone or in an `all(…)`), never under `any`/`not` nor as a
+/// feature name; `#[tokio::test(…)]`, `#[rstest]`, a comment after the
+/// attribute and an inner `#![cfg(test)]` are recognised.
+/// 20: TASK-017 — a method a TypeScript interface declares and an abstract
+/// method of an abstract class are symbols (as a Java interface's or a Rust
+/// trait's): a call through a receiver typed by the interface resolves to
+/// it, and dispatch reaches the classes that implement it.
+///
+/// The fingerprint hashes the JSON, not the Rust code, on purpose: a
+/// refactor, a comment or `rustfmt` must not make every user run `--full`.
+/// What is versioned is the *output*: `tests/extractor_golden.rs` pins the
+/// kinds, qualified names and ids the extractor produces for a fixture in
+/// every language, together with the version they were produced under, and
+/// fails when the output changes without a bump here.
+pub const EXTRACTOR_VERSION: u32 = 21;
 
 /// FNV-1a 64-bit — stable across platforms and releases, unlike `DefaultHasher`.
 fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
@@ -175,24 +354,127 @@ mod tests {
     ///
     /// Moving the queries into JSON traded a compile error for a runtime one.
     /// This is the trade being paid back: every embedded definition resolves its
-    /// grammar and compiles all four of its queries, so a bad node kind fails
-    /// here — naming the language and the query — rather than in somebody's
-    /// index run.
+    /// grammar and compiles every query it has (definitions, references,
+    /// inherits, imports, package, types), with only the captures the parser
+    /// reads, and every node kind it names exists — so a bad node kind or a
+    /// misspelt capture fails here, naming the language and the query, rather
+    /// than in somebody's index run.
+    const DEFINITION_CAPTURES: &[&str] = &["name"];
+    const REFERENCE_CAPTURES: &[&str] = &[
+        "reference.call",
+        "reference.new",
+        "reference.type",
+        "name",
+        "path",
+        "type",
+    ];
+    const INHERIT_CAPTURES: &[&str] = &["inherit.extends", "inherit.implements"];
+    const TYPE_CAPTURES: &[&str] = &[
+        "name",
+        "type",
+        "init",
+        "iter",
+        "bind.field",
+        "bind.param",
+        "bind.local",
+        "bind.assign",
+        "bind.inject",
+        "bind.func",
+        "bind.attr",
+        "bind.receiver",
+    ];
+    const IMPORT_CAPTURES: &[&str] = &[
+        "import",
+        "import.path",
+        "import.name",
+        "import.alias",
+        "import.wildcard",
+        "import.default",
+        "import.namespace",
+        "import.tree",
+    ];
+
     #[test]
     fn every_definition_compiles() {
         for def in ALL.iter() {
+            check(def);
+        }
+    }
+
+    /// A misspelt definition kind or node kind is caught, not silently
+    /// turned into a new id class or a scope that never matches.
+    #[test]
+    fn a_misspelt_kind_is_rejected() {
+        let java = by_name("java").unwrap();
+        let mut typo = java.clone();
+        typo.definitions = typo
+            .definitions
+            .replace("@definition.constructor", "@definition.contructor");
+        let err = std::panic::catch_unwind(|| check(&typo)).unwrap_err();
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("contructor"), "{msg}");
+        for field in ["container", "scope"] {
+            let mut typo = java.clone();
+            let list = if field == "container" {
+                &mut typo.container_kinds
+            } else {
+                &mut typo.scope_kinds
+            };
+            list.push("class_declaraton".into());
+            let err = std::panic::catch_unwind(|| check(&typo)).unwrap_err();
+            let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(msg.contains("class_declaraton"), "{field}: {msg}");
+        }
+        check(java);
+    }
+
+    /// Every check of `every_definition_compiles` on one definition.
+    fn check(def: &LangDef) {
+        {
             let grammar = grammar_for(&def.grammar)
                 .unwrap_or_else(|| panic!("`{}`: no grammar named `{}`", def.name, def.grammar));
-            for (label, src) in [
-                ("symbols", Some(&def.symbols)),
-                ("calls", Some(&def.calls)),
-                ("imports", Some(&def.imports)),
-                ("types", def.types.as_ref()),
+            for (label, src, allowed) in [
+                ("definitions", Some(&def.definitions), DEFINITION_CAPTURES),
+                ("references", Some(&def.references), REFERENCE_CAPTURES),
+                ("inherits", def.inherits.as_ref(), INHERIT_CAPTURES),
+                ("imports", Some(&def.imports), IMPORT_CAPTURES),
+                ("package", def.package.as_ref(), &["package"][..]),
+                ("types", def.types.as_ref(), TYPE_CAPTURES),
             ] {
                 let Some(src) = src else { continue };
-                if let Err(e) = Query::new(&grammar, src) {
-                    panic!("`{}`: the `{label}` query does not compile: {e}", def.name);
+                let query = Query::new(&grammar, src).unwrap_or_else(|e| {
+                    panic!("`{}`: the `{label}` query does not compile: {e}", def.name)
+                });
+                // A capture the parser does not read is a typo that would
+                // silently match nothing useful.
+                for name in query.capture_names() {
+                    // `@_x`: only a predicate reads it (`#eq? @_self "self"`).
+                    let known = allowed.contains(name)
+                        || name.starts_with('_')
+                        || (label == "definitions"
+                            && name
+                                .strip_prefix("definition.")
+                                .is_some_and(|k| DEFINITION_KINDS.contains(&k)));
+                    assert!(
+                        known,
+                        "`{}`: `{label}` captures unknown `@{name}`",
+                        def.name
+                    );
                 }
+            }
+            for kind in def
+                .type_names
+                .iter()
+                .chain(&def.function_kinds)
+                .chain(&def.container_kinds)
+                .chain(&def.scope_kinds)
+                .chain(&def.scopes)
+            {
+                assert!(
+                    grammar.id_for_node_kind(kind, true) != 0,
+                    "`{}`: no node kind `{kind}`",
+                    def.name
+                );
             }
         }
     }
@@ -212,6 +494,18 @@ mod tests {
         }
     }
 
+    /// The store tells a file a graph-less binary wrote by its language: the
+    /// list it uses must be exactly the languages parsed here.
+    #[test]
+    fn the_graph_languages_are_the_parsed_ones() {
+        let parsed: std::collections::BTreeSet<&str> = ALL.iter().map(LangDef::language).collect();
+        let listed: std::collections::BTreeSet<&str> = devctx_core::symbol_id::GRAPH_LANGUAGES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(parsed, listed);
+    }
+
     #[test]
     fn tsx_is_recorded_as_typescript() {
         assert_eq!(by_name("tsx").unwrap().language(), "typescript");
@@ -226,7 +520,7 @@ mod fingerprint_tests {
     #[test]
     fn the_fingerprint_is_stable_between_calls() {
         assert_eq!(extractor_fingerprint(), extractor_fingerprint());
-        assert!(extractor_fingerprint().starts_with("v1-"));
+        assert!(extractor_fingerprint().starts_with(&format!("v{EXTRACTOR_VERSION}-")));
     }
 
     #[test]

@@ -31,6 +31,9 @@ rara existe por un incidente en producción.
 | Sé el nombre — mostrame la cosa | `read_symbol` |
 | ¿Qué llama a esto? | `get_references` |
 | ¿Qué se rompe si lo cambio? | `impact_analysis` |
+| ¿Qué contiene esta clase, qué la implementa, quién usa este tipo? | `traverse` |
+| ¿Por dónde empiezo en este repositorio? | `repo_map` (con un foco) |
+| ¿Dónde está, en este archivo, lo que busco? | `skeleton` |
 | ¿Por qué está escrito así? | `memories_by_symbol` / `memories_by_file` |
 | ¿Qué sabemos de X? | `recall` |
 | ¿Qué debería leer antes de responder? | `build_context` |
@@ -72,15 +75,29 @@ get_references("verify_token")   → cada sitio de llamada
 impact_analysis("verify_token")  → el radio de impacto, transitivo
 ```
 
-**El grafo se indexa por nombre calificado.** Un nombre pelado se expande a cada
-`Clase.metodo` que lo lleva, y el reporte dice qué declaraciones fundió — en un
-repositorio Quarkus, `actualizar` son veintiún métodos distintos. Preguntá con el
-nombre calificado cuando querés decir uno solo.
+Para ubicarte antes de eso: `repo_map(query: "verify_token")` lista las firmas
+que lo rodean, rankeadas; `skeleton("src/auth/token.rs")` muestra dónde está cada
+cosa en un archivo; `traverse` recorre las relaciones que `impact_analysis` no
+recorre (qué contiene un tipo, qué lo implementa, quién lo importa).
+
+**Un nombre pelado es cada definición con ese nombre.** `verify_token` significa
+cada símbolo del repositorio con ese nombre, y el reporte dice cuáles representó
+— un nombre común como `update` puede ser unas cuantas decenas de métodos
+distintos.
+Preguntá con el nombre calificado, `archivo::nombre` o un `sym` cuando querés
+decir uno solo.
+
+**Leé los conteos.** `impact_analysis` y `get_references` dejan afuera por
+defecto lo que no es seguro (confianza `low`, llamadas que el índice no pudo
+decidir), el código de test y las llamadas a librerías (`impact_analysis`), y
+dicen cuánto en `below_confidence`, `undecided_calls`, `excluded` y `omitted`.
+Un conteo grande es motivo para volver a preguntar con `min_confidence: "low"`
+o `include_tests: true`.
 
 **El vacío sigue sin ser prueba.** Un reporte limpio significa "no encontré",
-nunca "no hay": el despacho dinámico no deja arista, solo 7 lenguajes las
-producen, y un índice desactualizado se ve idéntico a código ausente. Cruzá un
-vacío con `search --keyword` antes de tocar nada.
+nunca "no hay": una llamada por un callback o por reflexión no deja arista, solo
+7 lenguajes las producen, y un índice desactualizado se ve idéntico a código
+ausente. Cruzá un vacío con `search --keyword` antes de tocar nada.
 
 ### Antes de decidir que el código está mal
 
@@ -237,6 +254,14 @@ cambio, corré `devctx serve --stop`.
 `index_status` reporta el último commit indexado y si el índice está al día. Si
 está atrasado, `index_repo` lo pone al día de forma incremental — solo lo que
 cambió.
+
+`extractor_stale: true` es otra cosa: el índice lo construyó una versión más
+vieja (tras pasar a 0.10, todo índice está en ese estado una vez). Una corrida
+incremental no lo limpia; `index_repo` con `full: true` sí, reusando los
+vectores guardados. Hasta entonces las herramientas de grafo responden a la
+manera vieja con un `warning`, y `traverse`, `repo_map` y `skeleton` responden
+un error que la pide — ver
+[Mantener el índice al día](13-mantener-el-indice-al-dia.md#pasar-a-010-el-grafo-de-símbolos).
 
 El índice refleja el **árbol de trabajo**, no el último commit, así que el
 código sin commitear es buscable. Lo que git ignora no lo es, que es la razón

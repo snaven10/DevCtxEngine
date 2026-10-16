@@ -17,12 +17,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use devctx_core::config::ProjectConfig;
 use devctx_mcp::state::{
-    do_backfill_links, do_build_context, do_graph, do_impact, do_index_on, do_index_paths,
-    do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
+    do_backfill_links, do_build_context_with, do_graph, do_impact_with, do_index_on,
+    do_index_paths, do_index_progress, do_index_status, do_list_projects, do_memories_by_file,
     do_memories_by_symbol, do_memory_context, do_memory_forget, do_memory_move, do_memory_refs,
     do_memory_stats, do_plan_graph, do_plan_status, do_read_file, do_read_symbol, do_recall_scoped,
-    do_references, do_remember, do_remember_shared, do_routes_for_handler, do_search,
-    do_search_routes, do_summarize, parse_mode, AppState, MemoriesOpts, Page, PlanListOpts,
+    do_references_with, do_remember, do_remember_shared, do_routes_for_handler, do_search,
+    do_search_routes, do_summarize, parse_mode, AppState, ContextOpts, MemoriesOpts, Page,
+    PlanListOpts,
 };
 use serde::Deserialize;
 
@@ -61,6 +62,9 @@ fn router(api: Api) -> Router {
         .route("/plans/graph", get(plans_graph))
         .route("/impact/:symbol", get(impact))
         .route("/references/:symbol", get(references))
+        .route("/traverse", post(traverse))
+        .route("/repo-map", get(repo_map))
+        .route("/skeleton", get(skeleton))
         .route("/memories/by-symbol/:symbol", get(memories_by_symbol))
         .route("/memories/by-file/:file", get(memories_by_file))
         .route("/memory/:id/refs", get(memory_refs))
@@ -924,10 +928,24 @@ struct RoutesQuery {
     offset: Option<usize>,
 }
 
+/// `GET /impact/:symbol` (PLAN-009 TASK-009): `depth` (3), and the filters
+/// of `impact_analysis` — `min_confidence` (`medium`), `include_tests`
+/// (false), `include_external` (false), `max_nodes` (200; 0 = no cap),
+/// `dispatch` (true: through supertypes, TASK-017).
 #[derive(Deserialize)]
 struct ImpactQuery {
     #[serde(default)]
     depth: Option<usize>,
+    #[serde(default)]
+    min_confidence: Option<String>,
+    #[serde(default)]
+    include_tests: Option<bool>,
+    #[serde(default)]
+    include_external: Option<bool>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    #[serde(default)]
+    dispatch: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -972,6 +990,12 @@ struct ContextBody {
     kind: Option<String>,
     #[serde(default)]
     include_tests: Option<bool>,
+    /// The related section (PLAN-009 TASK-012); unset is the default.
+    #[serde(default)]
+    related: Option<bool>,
+    /// Its hops: 1 or 2.
+    #[serde(default)]
+    graph_hops: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -1189,9 +1213,74 @@ async fn impact(
     Query(q): Query<ImpactQuery>,
 ) -> Response {
     run(api.state, move |s| {
-        do_impact(s, &symbol, q.depth.unwrap_or(3))
+        let filters = devctx_mcp::state::ImpactQuery {
+            min_confidence: q.min_confidence,
+            include_tests: q.include_tests,
+            include_external: q.include_external,
+            max_nodes: q.max_nodes,
+            dispatch: q.dispatch,
+        };
+        do_impact_with(s, &symbol, q.depth.unwrap_or(3), &filters)
     })
     .await
+}
+
+/// `POST /traverse` (PLAN-009 TASK-013): the `traverse` tool, its parameters
+/// as the JSON body (`symbol` or `sym`, `kinds`, `direction`, `depth`, the
+/// filters, `limit`, `offset`). A bad parameter is a 400; an old index is
+/// refused as every tool error (a 500 with `error`).
+async fn traverse(
+    State(api): State<Api>,
+    Json(q): Json<devctx_mcp::state::TraverseQuery>,
+) -> Response {
+    // A bad parameter is the caller's: 400, before anything is opened
+    // (review of TASK-013, NIT).
+    if let Err(e) = q.options() {
+        return json_err(StatusCode::BAD_REQUEST, e);
+    }
+    run(api.state, move |s| devctx_mcp::state::do_traverse(s, &q)).await
+}
+
+/// The query string of `GET /repo-map`: lists comma-separated.
+#[derive(Debug, Default, serde::Deserialize)]
+struct RepoMapParams {
+    budget: Option<usize>,
+    focus_files: Option<String>,
+    focus_symbols: Option<String>,
+    query: Option<String>,
+    label: Option<String>,
+}
+
+/// `GET /repo-map` (PLAN-009 TASK-011): the `repo_map` tool, its parameters
+/// in the query string (`budget`, `focus_files` and `focus_symbols`
+/// comma-separated, `query`). The map is text. A bad parameter is a 400; an
+/// old index is refused as every tool error (a 500 with `error`).
+async fn repo_map(State(api): State<Api>, Query(p): Query<RepoMapParams>) -> Response {
+    let q = devctx_mcp::repo_map::RepoMapQuery::from_params(
+        p.budget,
+        p.focus_files.as_deref(),
+        p.focus_symbols.as_deref(),
+        p.query,
+        p.label,
+    );
+    if let Err(e) = q.validate() {
+        return json_err(StatusCode::BAD_REQUEST, e);
+    }
+    run(api.state, move |s| devctx_mcp::state::do_repo_map(s, &q)).await
+}
+
+/// `GET /skeleton?file=…` (PLAN-009 TASK-014): the `skeleton` tool, text. A
+/// missing `file` is a 400; an old index or a file the index does not hold is
+/// refused as every tool error (a 500 with `error`), never a 404, which
+/// clients read as "this server predates the route".
+async fn skeleton(
+    State(api): State<Api>,
+    Query(q): Query<devctx_mcp::skeleton::SkeletonQuery>,
+) -> Response {
+    if let Err(e) = q.validate() {
+        return json_err(StatusCode::BAD_REQUEST, e);
+    }
+    run(api.state, move |s| devctx_mcp::state::do_skeleton(s, &q)).await
 }
 
 /// Link memories saved before the junction existed.
@@ -1229,7 +1318,7 @@ async fn read_symbol(
 /// One budgeted brief assembled for a question.
 async fn build_context(State(api): State<Api>, Json(b): Json<ContextBody>) -> Response {
     run(api.state, move |s| {
-        do_build_context(
+        do_build_context_with(
             s,
             &b.query,
             b.max_tokens.unwrap_or(4096),
@@ -1237,6 +1326,10 @@ async fn build_context(State(api): State<Api>, Json(b): Json<ContextBody>) -> Re
             &devctx_search::KindSel {
                 kind: b.kind,
                 include_tests: b.include_tests,
+            },
+            &ContextOpts {
+                related: b.related,
+                graph_hops: b.graph_hops,
             },
         )
     })
@@ -1295,8 +1388,23 @@ async fn memory_move(State(api): State<Api>, Json(b): Json<MemoryMoveBody>) -> R
     run(api.state, move |s| do_memory_move(s, &b.id, &b.to)).await
 }
 
-async fn references(State(api): State<Api>, Path(symbol): Path<String>) -> Response {
-    run(api.state, move |s| do_references(s, &symbol)).await
+#[derive(Deserialize)]
+struct ReferencesQuery {
+    #[serde(default)]
+    min_confidence: Option<String>,
+    #[serde(default)]
+    kinds: Option<String>,
+}
+
+async fn references(
+    State(api): State<Api>,
+    Path(symbol): Path<String>,
+    Query(q): Query<ReferencesQuery>,
+) -> Response {
+    run(api.state, move |s| {
+        do_references_with(s, &symbol, q.min_confidence.as_deref(), q.kinds.as_deref())
+    })
+    .await
 }
 
 async fn routes(State(api): State<Api>, Query(q): Query<RoutesQuery>) -> Response {
@@ -1532,6 +1640,136 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["forgotten"], serde_json::json!(true), "{v}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-009: `GET /impact` takes the filters of
+    /// `impact_analysis` from the query string; a bad one is refused, named
+    /// (as every tool error, a 500 with `error`), before any store is read.
+    #[tokio::test]
+    async fn impact_takes_its_filters_from_the_query_string() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_impact_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .uri("/impact/f?depth=2&min_confidence=most&include_tests=true&max_nodes=5")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("min_confidence"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-013: `POST /traverse` exists and takes the tool's
+    /// parameters as its body; a depth over 4 is refused with its message,
+    /// as a 400 (review NIT).
+    #[tokio::test]
+    async fn traverse_takes_its_parameters_from_the_body() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_traverse_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/traverse")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"symbol":"f","kinds":"calls","depth":9}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("between 1 and 4"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-011: `GET /repo-map` exists and takes the tool's
+    /// parameters from the query string; a budget of 0 is a 400 with its
+    /// message; a project with nothing indexed is an error, never an empty
+    /// map.
+    #[tokio::test]
+    async fn repo_map_takes_its_parameters_from_the_query() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_repo_map_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .uri("/repo-map?budget=0&focus_files=a.rs,b.rs&query=why")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("budget"), "{text}");
+        let req = Request::builder()
+            .uri("/repo-map?budget=512&focus_symbols=Store.open")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!v["error"].as_str().unwrap().is_empty(), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-014: `GET /skeleton` exists and takes `file` from the
+    /// query string; an empty one is a 400 with its message; a project with
+    /// nothing indexed is an error (a 500, never the 404 a client reads as
+    /// "old server"), never an empty skeleton.
+    #[tokio::test]
+    async fn skeleton_takes_its_file_from_the_query() {
+        let dir =
+            std::env::temp_dir().join(format!("devctx_api_skeleton_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DEVCTX_NO_AUTOSERVE", "1");
+        let state = Arc::new(AppState::build(test_cfg(&dir)).expect("build test AppState"));
+        let app = router(Api { state, token: None });
+        let req = Request::builder()
+            .uri("/skeleton?file=%20")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("file is required"), "{text}");
+        let req = Request::builder()
+            .uri("/skeleton?file=src%2Fa.rs")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!v["error"].as_str().unwrap().is_empty(), "{v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

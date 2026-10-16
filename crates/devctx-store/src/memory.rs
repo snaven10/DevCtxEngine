@@ -194,8 +194,9 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Permanently remove one memory and the vectors that belong to it — its
-    /// own row and its `<id>_cN` body chunks. Returns whether it existed.
+    /// Permanently remove one memory, the vectors that belong to it — its
+    /// own row and its `<id>_cN` body chunks — and its symbol references, in
+    /// one transaction. Returns whether it existed.
     ///
     /// Distinct from [`delete_memory`](Self::delete_memory), which only writes a
     /// tombstone: a memory saved by mistake should leave nothing behind, and a
@@ -210,13 +211,21 @@ impl Store {
         if existed == 0 {
             return Ok(false);
         }
-        self.w()?.execute(
-            "DELETE FROM vectors WHERE id = ? OR id LIKE ? || '_c%'",
-            params![id, id],
-        )?;
-        self.w()?
-            .execute("DELETE FROM memories WHERE id = ?", params![id])?;
-        Ok(true)
+        self.in_transaction(|| {
+            // The references too: left behind they are orphans, and a restore
+            // from a sidecar would add them a second time (PLAN-009 TASK-019).
+            self.w()?.execute(
+                "DELETE FROM memory_symbol_references WHERE memory_id = ?",
+                params![id],
+            )?;
+            self.w()?.execute(
+                "DELETE FROM vectors WHERE id = ? OR id LIKE ? || '_c%'",
+                params![id, id],
+            )?;
+            self.w()?
+                .execute("DELETE FROM memories WHERE id = ?", params![id])?;
+            Ok(true)
+        })
     }
 
     /// How many memories are stored under `project`, deleted ones included.
@@ -230,7 +239,8 @@ impl Store {
     }
 
     /// Permanently remove every memory stored under `project`, with the vectors
-    /// that belong to them — the memory's own row and its `<id>_cN` chunks.
+    /// that belong to them — the memory's own row and its `<id>_cN` chunks —
+    /// and their symbol references, in one transaction.
     ///
     /// Unlike [`Store::delete_memory`] this is not a soft delete: it exists for
     /// rows that should never have been written to this store at all, where a
@@ -241,17 +251,26 @@ impl Store {
         if n == 0 {
             return Ok(0);
         }
-        self.w()?.execute(
-            "DELETE FROM vectors WHERE EXISTS (
-                 SELECT 1 FROM memories m
-                 WHERE m.project = ?
-                   AND (vectors.id = m.id OR vectors.id LIKE m.id || '_c%')
-             )",
-            params![project],
-        )?;
-        self.w()?
-            .execute("DELETE FROM memories WHERE project = ?", params![project])?;
-        Ok(n)
+        self.in_transaction(|| {
+            // The references first: they are found through the memories the
+            // last statement deletes.
+            self.w()?.execute(
+                "DELETE FROM memory_symbol_references
+                 WHERE memory_id IN (SELECT id FROM memories WHERE project = ?)",
+                params![project],
+            )?;
+            self.w()?.execute(
+                "DELETE FROM vectors WHERE EXISTS (
+                     SELECT 1 FROM memories m
+                     WHERE m.project = ?
+                       AND (vectors.id = m.id OR vectors.id LIKE m.id || '_c%')
+                 )",
+                params![project],
+            )?;
+            self.w()?
+                .execute("DELETE FROM memories WHERE project = ?", params![project])?;
+            Ok(n)
+        })
     }
 
     /// Live memory counts for a project (total + per type).
@@ -436,6 +455,39 @@ mod tests {
 
         // Purging a key with nothing under it is a no-op, not an error.
         assert_eq!(store.purge_memories_for_project("@global").unwrap(), 0);
+    }
+
+    /// PLAN-009 TASK-019: a purge takes the purged memories' symbol
+    /// references with them, and leaves the others'.
+    #[test]
+    fn purge_leaves_no_references_of_the_purged_memories() {
+        let store = Store::open_in_memory(4).unwrap();
+        let mut stray = mem("mem_stray", "", "note");
+        stray.project = "@global".into();
+        let mut keep = mem("mem_keep", "", "note");
+        keep.project = "proj".into();
+        store.upsert_memory(&stray).unwrap();
+        store.upsert_memory(&keep).unwrap();
+        store
+            .w()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO memory_symbol_references (memory_id, symbol, file, line, repo, branch, source)
+                 VALUES ('mem_stray', 'f', 'a.rs', 1, 'r', 'main', 'content-mention'),
+                        ('mem_stray', '', 'a.rs', 0, 'r', 'main', 'files-field'),
+                        ('mem_keep', 'g', 'b.rs', 2, 'r', 'main', 'content-mention');",
+            )
+            .unwrap();
+        assert_eq!(store.purge_memories_for_project("@global").unwrap(), 1);
+        let left: Vec<String> = store
+            .conn
+            .prepare("SELECT memory_id FROM memory_symbol_references ORDER BY memory_id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, vec!["mem_keep".to_string()]);
     }
 
     #[test]

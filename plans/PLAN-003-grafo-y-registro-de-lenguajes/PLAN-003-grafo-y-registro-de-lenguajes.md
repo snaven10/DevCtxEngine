@@ -48,7 +48,7 @@ distingue de antemano"*. Sí hay algo que los distingue y es determinista.
 
 Dos defectos secundarios salieron en la misma corrida:
 
-- **Receptores basura.** Targets reales medidos: `Office.findByCodigo(codigo).flatMap`
+- **Receptores basura.** Targets reales medidos: `Office.findByCode(code).flatMap`
   y una expresión de 3 líneas con un lambda adentro. `receiver_of` toma el texto
   crudo del nodo `object`, que en una cadena fluida es toda la expresión previa.
 - **Constructores Java invisibles.** `constructor_declaration` no está en

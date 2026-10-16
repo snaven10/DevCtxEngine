@@ -15,8 +15,8 @@ Un workspace de Cargo con crates enfocados, cada uno dueño de una preocupación
 | Crate | De qué es dueño |
 |---|---|
 | `devctx-core` | Tipos compartidos, esquema de config, resolución de rutas, fusión por rango |
-| `devctx-store` | DuckDB: vectores, grafo de llamadas, rutas, memorias, estado de índice, registro |
-| `devctx-parse` | tree-sitter: símbolos, imports, aristas de llamada, rutas de frameworks |
+| `devctx-store` | DuckDB: vectores, grafo de símbolos, rutas, memorias, estado de índice, registro |
+| `devctx-parse` | tree-sitter: símbolos y sus relaciones, los resolvers por lenguaje del link pass, rutas de frameworks |
 | `devctx-chunk` | Chunking semántico: fichero / clase / función / bloque, y ventanas de memoria |
 | `devctx-embed` | Embeddings: ONNX local vía fastembed, u OpenAI / Voyage / custom |
 | `devctx-rerank` | Reranking con cross-encoder, con alternativa no-op |
@@ -87,13 +87,26 @@ no mueve ningún commit, así que un diff de commits saldría vacío.
 **El salto** ocurre por fichero, mediante hash de contenido. Reindexar un fichero
 sin cambios cuesta una lectura y un hash, no un embedding. Es lo que hace que el
 hook post-commit y el watcher sean lo bastante baratos como para correr
-constantemente.
+constantemente. Una ejecución `--full` además reusa el vector guardado de cada
+chunk cuyo texto no cambió, así que paga el parseo, no el embedder.
+
+**El link pass** corre después de los ficheros, una vez por ejecución y por
+rama: carga los símbolos de la rama y resuelve las aristas que la ejecución
+tocó (o todas, cuando cambió un quinto de la rama, cambiaron las reglas de
+enlace o cambió un manifiesto como `tsconfig.json`, `package.json`, `Cargo.toml`
+o `go.mod`) a la definición que alcanza cada una, y después recalcula el
+PageRank de la rama. Ver
+[Grafo de símbolos](03-conceptos-fundamentales/grafo-de-simbolos.md#qué-hay-en-el-grafo).
 
 **El estado** vive en dos tablas indexadas por `(repo_path, branch)`:
 `index_state` (último commit indexado, modelo y su dimensión) y `file_state`
 (hash por fichero, lenguaje, cuentas de símbolos y chunks). Un cambio de modelo se
 detecta aquí y fuerza un reindexado completo en vez de mezclar vectores
-incompatibles.
+incompatibles. `index_meta` registra, por rama, qué extractor y qué reglas de
+enlace construyeron el grafo y qué configuración de embedding hizo los
+vectores. Otro extractor es lo que informa `extractor_stale`; otras reglas de
+enlace hacen que la próxima ejecución reenlace la rama; otra configuración de
+embedding vuelve a embeber en vez de reusar.
 
 ## 4. Almacenamiento
 
@@ -102,10 +115,12 @@ Un fichero DuckDB por proyecto lo guarda todo:
 | Tabla | Contiene |
 |---|---|
 | `vectors` | Embeddings de chunks (`FLOAT[n]`) y sus metadatos — la única tabla atada a la dimensión |
-| `graph_edges` | Aristas de llamada e import, para el análisis de impacto |
+| `symbols` | Una fila por definición: id estable, kind, nombre calificado, padre, firma, rank |
+| `edges` | Una fila por ocurrencia de una relación (calls, instantiates, imports, inherits, implements, references, contains), resuelta por el link pass; las herramientas leen la vista `live_edges` |
+| `graph_edges` | Las aristas de llamada de 0.9, por nombre; se siguen escribiendo para que 0.9.0 pueda leer un índice 0.10 |
 | `routes` | Rutas HTTP extraídas del framework y sus handlers |
 | `memories` | Decisiones, ideas y notas guardadas |
-| `index_state`, `file_state` | Contabilidad incremental |
+| `index_state`, `file_state`, `index_meta` | Contabilidad incremental, y qué extractor, reglas de enlace y configuración de embedding construyeron cada rama |
 | `projects` | El registro — solo se puebla en el store central |
 
 La búsqueda vectorial es `array_cosine_distance` sobre `FLOAT[n]`, una función

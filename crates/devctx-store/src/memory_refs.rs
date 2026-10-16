@@ -389,6 +389,7 @@ impl Store {
             })?
             .collect::<std::result::Result<_, _>>()?;
         self.replace_file_edges(repo, to_branch, file, &edges)?;
+        self.copy_file_graph(repo, from_branch, to_branch, file)?;
 
         let mut stmt = self.conn.prepare(
             "SELECT framework, http_method, path, handler_class, handler_method,
@@ -418,7 +419,8 @@ impl Store {
         Ok((language, symbols.len(), chunks))
     }
 
-    /// Remove every trace of a branch: its chunks, edges, routes and file state.
+    /// Remove every trace of a branch: its chunks, edges, symbols, routes and
+    /// file state.
     ///
     /// The counterpart of a declared branch list. Without it the index only
     /// grows: a branch merged and deleted six weeks ago keeps its rows for
@@ -428,6 +430,7 @@ impl Store {
         // One transaction: a cut half-way (an error, a process that ends) used
         // to leave the branch half-deleted, repaired only by the next prune.
         self.in_transaction(|| {
+            self.forget_graph_step(Some(branch));
             let n: i64 = self.conn.query_row(
                 "SELECT count(*) FROM vectors WHERE repo = ? AND branch = ?",
                 params![repo, branch],
@@ -439,6 +442,14 @@ impl Store {
             )?;
             self.w()?.execute(
                 "DELETE FROM graph_edges WHERE repo = ? AND branch = ?",
+                params![repo, branch],
+            )?;
+            self.w()?.execute(
+                "DELETE FROM symbols WHERE repo = ? AND branch = ?",
+                params![repo, branch],
+            )?;
+            self.w()?.execute(
+                "DELETE FROM edges WHERE repo = ? AND branch = ?",
                 params![repo, branch],
             )?;
             self.w()?.execute(

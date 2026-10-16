@@ -28,7 +28,8 @@ El resto — `store`, `index`, `chunk`, `search`, `memory`, `summarize`, `api`,
 
 ## 1. Un lenguaje nuevo
 
-Tres ediciones en `crates/devctx-parse/src/lang.rs`, más una dependencia.
+Un lenguaje es un archivo JSON bajo `crates/devctx-parse/languages/`, embebido en
+el binario al compilar, más su gramática. Para agregar uno:
 
 **Agregá la gramática** a `crates/devctx-parse/Cargo.toml`:
 
@@ -36,44 +37,46 @@ Tres ediciones en `crates/devctx-parse/src/lang.rs`, más una dependencia.
 tree-sitter-ruby = "0.23"
 ```
 
-**Agregá la variante** y su gramática:
+**Conectala** en `grammar_for` (`crates/devctx-parse/src/registry.rs`), la única
+tabla escrita a mano que queda, y listá el JSON en `SOURCES`, al lado:
 
 ```rust
-pub enum Lang {
-    // ...
-    Ruby,
-}
-
-pub fn grammar(self) -> Language {
-    match self {
-        // ...
-        Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-    }
-}
+"ruby" => tree_sitter_ruby::LANGUAGE.into(),
 ```
 
-**Mapeá las extensiones:**
+**Escribí `languages/ruby.json`.** Las extensiones viven acá, y también las
+consultas — estilo `tags.scm` — que son el trabajo real:
 
-```rust
-pub fn lang_for_extension(ext: &str) -> Option<Lang> {
-    Some(match ext {
-        // ...
-        "rb" => Lang::Ruby,
-        _ => return None,
-    })
-}
-```
-
-**Escribí las consultas.** Este es el trabajo real. Cada lenguaje necesita:
-
-| Consulta | Propósito | Obligatoria |
+| Clave | Captura | Obligatoria |
 |---|---|---|
-| `symbol_query` | Captura declaraciones como `@function`, `@method`, `@class`, `@struct`, `@enum`, `@interface`, `@type` | Sí |
-| `calls_query` | Captura expresiones de llamada — estas se vuelven las aristas del grafo | Sí |
-| `import_query` | Imports, usados para resolver destinos de llamada | Sí |
-| `type_bindings_query` | Variable → tipo, afina la resolución de llamadas a métodos | Opcional (`None`) |
+| `definitions` | Cada definición como `@definition.<kind>` (`function`, `method`, `class`, `field`… — los kinds de `DEFINITION_KINDS`) con su `@name` | Sí |
+| `references` | Llamadas (`@reference.call` + `@name`), instanciaciones (`@reference.new` + `@type`), usos de tipo (`@reference.type`) — las aristas del grafo | Sí |
+| `imports` | `@import` con `@import.path`, `.name`, `.alias`, `.wildcard`, `.default`, `.namespace` | Sí |
+| `inherits` | Supertipos dentro de una definición: `@inherit.extends`, `@inherit.implements` | No |
+| `types`, `scopes` | Declaraciones que tipan un receptor (`@name`, `@type`, `@init`, `@bind.field|param|local…`) y los node kinds que abren un scope | No (sin ellas, un solo scope por archivo) |
+| `package`, `type_names`, `function_kinds`, `container_kinds`, `scope_kinds`, `overloads` | La cláusula de paquete; qué nombra un tipo; qué nodos son invocables, contenedores o scopes con nombre; si los tipos de parámetro entran al id | En parte |
+| `platform_prefixes`, `builtins`, `platform_modules` | Lo que es de la plataforma: la evidencia de `external` | No |
 
-Los nombres de captura importan: el chunker y el grafo se guían por ellos.
+`every_definition_compiles` compila cada consulta y rechaza una captura o un node
+kind desconocidos, así que la CI atrapa una consulta mal formada. Lo que no puede
+atrapar es una consulta válida que no encuentra nada — la falla que una vez hizo
+que el grafo de llamadas pareciera vacío durante meses.
+
+**La resolución entre archivos** es Rust, no JSON: un `LangResolver` en
+`crates/devctx-parse/src/resolve/` (`resolver_for` le asigna un lenguaje). Un
+lenguaje sin uno recibe solo las reglas genéricas del link pass, así que sus
+aristas quedan sin decidir más seguido. Agregá también el lenguaje a
+`GRAPH_LANGUAGES` (`crates/devctx-core/src/symbol_id.rs`), que es como se
+detecta un grafo desfasado.
+
+**Fijalo.** `tests/extractor_golden.rs` dibuja todo lo que el índice guarda de un
+fixture por lenguaje en `tests/golden/extractor.txt`. Un cambio en lo que escribe
+el extractor tiene que subir `EXTRACTOR_VERSION` (`registry.rs`) y regenerar el
+golden (`DEVCTX_UPDATE_GOLDEN=1 cargo test -p devctx-parse --test
+extractor_golden`): los índices existentes informan entonces `extractor_stale`
+hasta un `devctx index --full`. Un cambio en las reglas de enlace sube en cambio
+`LINK_VERSION` (`crates/devctx-index/src/link.rs`), y la próxima ejecución
+reenlaza sin reindexar.
 
 **Probá con un archivo real**, no con un snippet. Las gramáticas discrepan de la
 intuición sobre los nombres de nodo, y una consulta que anda con un ejemplo de

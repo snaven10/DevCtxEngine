@@ -6,25 +6,56 @@
 //! (FTS) indexes are opt-in accelerators, dropped before a bulk load and
 //! rebuilt after.
 
+pub mod compact;
+mod dispatch;
 mod error;
 mod graph;
+mod impact;
+mod lookup;
 mod memory;
 mod memory_refs;
+mod oslock;
 mod projects;
+mod related;
 mod routes;
 mod schema;
+mod skeleton;
 mod state;
 mod store;
+mod symbols;
+mod traverse;
 
+pub use dispatch::{
+    DISPATCH_DEPTH, DISPATCH_MAX_ORIGINS_PER_EQUIVALENT, DISPATCH_MAX_PER_NODE, DISPATCH_MAX_ROWS,
+};
 pub use error::{Result, StoreError};
 pub use graph::{GraphEdge, ImpactResult, Reference, StoredEdge};
+#[cfg(feature = "bench")]
+pub use impact::FrontierSql;
+pub use impact::{
+    ImpactNode, ImpactOptions, ImpactSide, SymbolImpact, DEFAULT_IMPACT_DEPTH,
+    DEFAULT_IMPACT_MAX_NODES, DISPATCH_VIA,
+};
+pub use lookup::{
+    sym_hex, ExternalSites, MinConfidence, SymbolDefinition, SymbolReference, ViewEdge,
+};
 pub use memory::{Memory, MemoryStats};
 pub use memory_refs::{short_label, FileIndex, LinkedMemory, SymbolRef};
+pub use oslock::{
+    compaction_running, try_lock_exclusive, CompactPaths, FileLock, LockMode, SIDECAR_TTL,
+};
 pub use projects::{ProjectIndexStats, ProjectRecord};
+pub use related::{ChunkRef, RelatedNeighbor, Relation, RELATED_MAX_HOPS, RELATED_PER_SEED};
 pub use routes::StoredRoute;
 pub use schema::init_schema;
-pub use state::{FileState, IndexRecord, EXTRACTOR_META_KEY};
-pub use store::{MemoryReport, Store};
+pub use skeleton::{rank_file_suggestions, FileImports};
+pub use state::{CopySetup, FileState, IndexRecord, EMBED_FP_META_KEY, EXTRACTOR_META_KEY};
+pub use store::{normalize_metric, MemoryReport, Store};
+pub use symbols::{MapSymbol, RankConfidence, RankEdge, RankKind, StoredSymbol, StoredSymbolEdge};
+pub use traverse::{
+    Traversal, TraverseDirection, TraverseEdge, TraverseEnd, TraverseNode, TraverseOptions,
+    TRAVERSE_KINDS, TRAVERSE_MAX_DEPTH,
+};
 
 #[cfg(test)]
 mod tests {

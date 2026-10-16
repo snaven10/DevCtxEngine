@@ -1,0 +1,897 @@
+//! Dispatch through a supertype in `impact_analysis` (PLAN-009 TASK-017): a
+//! method is also reached through the methods it overrides, or that override
+//! it, along the `inherits`/`implements` edges the link pass resolved.
+//!
+//! - **Upstream** (callers): `Impl.m` → the override-equivalent methods of its
+//!   supertypes (`IService.m`, `Base.m`), whose callers may run `Impl.m`.
+//! - **Downstream** (callees): an interface or abstract method → the methods
+//!   of its subtypes that implement it.
+//!
+//! Override-equivalent = the same name, a callable kind, and an arity that can
+//! match (the parameter lists of both signatures, when they can be read; a
+//! default, an optional or a variadic parameter widens the range; in
+//! TypeScript and JavaScript the subtype's method may take fewer parameters
+//! than the supertype's). The chain
+//! of supertypes is transitive up to [`DISPATCH_DEPTH`] levels. A private or
+//! static method overrides nothing. Go is left out: embedding promotes
+//! methods, it does not override them, and an interface is satisfied without
+//! an edge the index could follow.
+//!
+//! An edge reached through dispatch is never surer than `medium` and never
+//! surer than the edge it stands for: `min(medium, original)`, with the
+//! weakest `inherits`/`implements` edge of the chain counted too.
+
+use std::collections::{HashMap, HashSet};
+
+use duckdb::params_from_iter;
+
+use crate::error::Result;
+use crate::impact::{count_statement, Direction, FrontierSql};
+use crate::store::Store;
+
+/// Supertype levels a dispatch climbs (upstream) or descends (downstream):
+/// `Impl` → `Base` → `IService` → its own super-interface.
+pub const DISPATCH_DEPTH: usize = 4;
+
+/// Override-equivalent methods one node of a level is expanded into, at
+/// most; the rest are counted (`omitted_by_limit.dispatch`), not followed.
+pub const DISPATCH_MAX_PER_NODE: usize = 16;
+
+/// Origins one override-equivalent is attributed to, at most (review of
+/// TASK-011): the callers of an interface method implemented by a thousand
+/// walked methods were cloned once per implementation. Past it the callers
+/// are still reached, through the first origins; the rest are counted
+/// (`omitted_by_limit.dispatch.origins_capped`).
+pub const DISPATCH_MAX_ORIGINS_PER_EQUIVALENT: usize = 16;
+
+/// Dispatch rows one call builds, at most (review of TASK-011): the last
+/// safety net; past it rows are counted (`rows_capped`), not built.
+pub const DISPATCH_MAX_ROWS: usize = 8192;
+
+/// The relations a dispatch follows between types.
+const SUPER_KINDS: &str = "('inherits', 'implements')";
+
+/// The kinds a method that can be overridden has.
+const CALLABLE_KINDS: &str = "('method', 'function')";
+
+/// One override-equivalent method of a frontier node.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Equivalent {
+    /// The frontier node it stands for.
+    pub origin: u64,
+    /// Qualified name of the frontier node.
+    pub origin_symbol: String,
+    /// The equivalent method.
+    pub id: u64,
+    /// Its type.
+    pub parent: u64,
+    /// Its qualified name.
+    pub symbol: String,
+    /// Its symbol kind.
+    pub kind: String,
+    /// File of its definition.
+    pub file: Option<String>,
+    /// First line of its definition.
+    pub line: Option<i32>,
+    /// Its rank (PageRank).
+    pub rank: Option<f64>,
+    /// A symbol of a test file.
+    pub test: bool,
+    /// The weakest `inherits`/`implements` edge of the chain: 3 high, 2
+    /// medium, 1 anything else.
+    pub chain: u8,
+}
+
+/// The override-equivalents of a frontier, capped per node.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Equivalents {
+    /// The ones followed, by origin and then by rank and name.
+    pub kept: Vec<Equivalent>,
+    /// Ids of the ones past [`DISPATCH_MAX_PER_NODE`] for some origin.
+    pub cut: Vec<u64>,
+    /// Ids of the ones in a type past [`DISPATCH_DEPTH`] supertype levels:
+    /// counted, not followed.
+    pub beyond: Vec<u64>,
+}
+
+/// `min(medium, c)`, and no surer than the chain: a dispatch is never
+/// `high`, and a `low` edge stays `low`. An undecided edge stays undecided.
+pub(crate) fn dispatch_confidence(c: Option<&str>, chain: u8) -> Option<String> {
+    let rank = match c? {
+        "high" | "medium" => 2,
+        _ => 1,
+    }
+    .min(chain.max(1));
+    Some(if rank >= 2 { "medium" } else { "low" }.to_string())
+}
+
+/// The range of arities a signature accepts: `(min, max)`, `max` `None` for
+/// a variadic list. `None` when no parameter list follows `name`.
+pub(crate) fn arity(signature: &str, name: &str) -> Option<(usize, Option<usize>)> {
+    let params = parameter_list(signature, name)?;
+    let parts = split_top_level(params);
+    let (mut min, mut variadic) = (0, false);
+    let mut count = 0;
+    for p in &parts {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        count += 1;
+        let head = p.trim_start_matches(|c: char| c == '@' || c.is_whitespace());
+        if p.contains("...") || head.starts_with('*') {
+            variadic = true;
+            count -= 1;
+            continue;
+        }
+        // `x = 1` (Python, TS), `x?: T` (TS): optional.
+        let optional = top_level_contains(p, '=') || p.contains("?:") || p.ends_with('?');
+        if !optional {
+            min += 1;
+        }
+    }
+    Some((min, (!variadic).then_some(count)))
+}
+
+/// The simple types of the parameters of `name` in `signature` (`a.b.User`
+/// → `User`, generic arguments, annotations, `final`, references and
+/// lifetimes out), as Java (`Type name`), TypeScript, Rust and Python
+/// (`name: Type`) write them; `None` when some parameter has no readable
+/// type (an untyped Python one).
+fn parameter_types(signature: &str, name: &str) -> Option<Vec<String>> {
+    let params = parameter_list(signature, name)?;
+    let mut out = Vec::new();
+    for p in split_top_level(params) {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        // Annotations (`@Named("x")`) and default values out.
+        let mut text = String::new();
+        let mut depth = 0i32;
+        let mut skip_word = false;
+        for ch in p.chars() {
+            match ch {
+                '@' if depth == 0 => skip_word = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if depth > 0 => {}
+                c if skip_word && (c.is_alphanumeric() || c == '_' || c == '.') => {}
+                c => {
+                    skip_word = false;
+                    text.push(c);
+                }
+            }
+        }
+        let text = text.split('=').next().unwrap_or("").trim();
+        let ty = match text.split_once(':') {
+            Some((_, ty)) if !text.contains("::") || text.find(':') < text.find("::") => {
+                ty.trim().to_string()
+            }
+            _ => {
+                // Java: every token but the last (the name).
+                let words: Vec<&str> = text.split_whitespace().filter(|w| *w != "final").collect();
+                // A receiver (`self`, `&self`, `&mut self`) is no parameter type.
+                if words
+                    .last()
+                    .is_some_and(|w| w.trim_start_matches('&') == "self")
+                {
+                    continue;
+                }
+                if words.len() < 2 {
+                    return None;
+                }
+                words[..words.len() - 1].join(" ")
+            }
+        };
+        let ty = ty
+            .split('<')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+        let simple = ty.rsplit(['.', ':']).next().unwrap_or(ty).trim();
+        if simple.is_empty() || simple == "self" {
+            continue;
+        }
+        out.push(simple.to_string());
+    }
+    Some(out)
+}
+
+/// Whether two arity ranges can meet; an unreadable one meets anything.
+fn arities_meet(a: Option<(usize, Option<usize>)>, b: Option<(usize, Option<usize>)>) -> bool {
+    let (Some((amin, amax)), Some((bmin, bmax))) = (a, b) else {
+        return true;
+    };
+    amin <= bmax.unwrap_or(usize::MAX) && bmin <= amax.unwrap_or(usize::MAX)
+}
+
+/// A file of TypeScript or JavaScript, where a method with fewer parameters
+/// implements one with more (review of TASK-017, point 4).
+fn lax_arity(file: Option<&str>) -> bool {
+    file.and_then(|f| f.rsplit_once('.')).is_some_and(|(_, e)| {
+        matches!(
+            e,
+            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"
+        )
+    })
+}
+
+/// Whether a method of arity `origin` and one of arity `candidate` can stand
+/// for each other in direction `dir` (upstream the origin is the subtype's
+/// method, downstream the candidate is). Strict languages need the ranges to
+/// meet; with `lax` (TypeScript, JavaScript) the subtype's method only needs
+/// no more required parameters than the supertype's can take.
+fn arities_fit(
+    origin: Option<(usize, Option<usize>)>,
+    candidate: Option<(usize, Option<usize>)>,
+    dir: Direction,
+    lax: bool,
+) -> bool {
+    if !lax {
+        return arities_meet(origin, candidate);
+    }
+    let (sub, sup) = match dir {
+        Direction::Upstream => (origin, candidate),
+        Direction::Downstream => (candidate, origin),
+    };
+    match (sub, sup) {
+        (Some((min, _)), Some((_, max))) => min <= max.unwrap_or(usize::MAX),
+        _ => true,
+    }
+}
+
+/// A method that overrides nothing and nothing overrides: private or static.
+/// Only the modifiers before the name count, and a lifetime is none: a Rust
+/// `-> &'static str` or `T: 'static` is no `static` method (review MAJOR 1).
+fn never_overrides(signature: &str, name: &str) -> bool {
+    let head = name_in(signature, name).map_or(signature, |(start, _)| &signature[..start]);
+    let bytes = head.as_bytes();
+    let mut start = 0;
+    let mut words = Vec::new();
+    for (i, &b) in bytes
+        .iter()
+        .enumerate()
+        .chain(std::iter::once((bytes.len(), &b' ')))
+    {
+        if !(b.is_ascii_alphanumeric() || b == b'_') {
+            if i > start && (start == 0 || bytes[start - 1] != b'\'') {
+                words.push(&head[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    words.iter().any(|w| *w == "private" || *w == "static")
+}
+
+/// The text between the parentheses that follow `name` in `signature` (as a
+/// whole word, past generic parameters): `fn m<T>(a: T, b: u8)` → `a: T, b: u8`.
+fn parameter_list<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
+    name_in(signature, name).map(|(_, params)| params)
+}
+
+/// Where `name` starts in `signature` as the name of what the parameter list
+/// after it belongs to, and that list's text.
+fn name_in<'a>(signature: &'a str, name: &str) -> Option<(usize, &'a str)> {
+    let bytes = signature.as_bytes();
+    let mut from = 0;
+    while let Some(at) = signature[from..].find(name) {
+        let start = from + at;
+        let end = start + name.len();
+        from = end;
+        let word_before = start > 0 && is_word(bytes[start - 1]);
+        let word_after = end < bytes.len() && is_word(bytes[end]);
+        if word_before || word_after {
+            continue;
+        }
+        let mut i = end;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'<' {
+            i = close_of(bytes, i, b'<', b'>')? + 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+        if i < bytes.len() && bytes[i] == b'(' {
+            let close = close_of(bytes, i, b'(', b')')?;
+            return Some((start, &signature[i + 1..close]));
+        }
+    }
+    None
+}
+
+fn is_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// The index of the bracket closing the one at `open`; a `>` of `->`/`=>`
+/// closes nothing.
+fn close_of(bytes: &[u8], open: usize, o: u8, c: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        if b == b'>' && i > 0 && matches!(bytes[i - 1], b'-' | b'=') {
+            continue;
+        }
+        if b == o {
+            depth += 1;
+        } else if b == c {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// `params` split at the commas outside any bracket or string.
+fn split_top_level(params: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, 0);
+    let mut quote: Option<u8> = None;
+    let bytes = params.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = quote {
+            if b == q && (i == 0 || bytes[i - 1] != b'\\') {
+                quote = None;
+            }
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => quote = Some(b),
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b'>' if i > 0 && matches!(bytes[i - 1], b'-' | b'=') => {}
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&params[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&params[start..]);
+    out
+}
+
+/// Whether `ch` appears in `p` outside any bracket (a default value, not a
+/// generic default or a lambda inside a type).
+fn top_level_contains(p: &str, ch: char) -> bool {
+    let mut depth = 0i32;
+    let bytes = p.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'>' if i > 0 && bytes[i - 1] == b'=' => {}
+            b'>' => depth -= 1,
+            _ if depth == 0 && b as char == ch => {
+                // `=>`, `==`, `>=`, `<=`, `!=` are no default.
+                let next = bytes.get(i + 1).copied();
+                let prev = i.checked_sub(1).map(|j| bytes[j]);
+                if next != Some(b'>')
+                    && next != Some(b'=')
+                    && !matches!(prev, Some(b'=' | b'!' | b'<' | b'>'))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The supertype graph of a branch, read once per walk as id pairs (one
+/// statement): every resolved `inherits`/`implements` edge of `live_edges`
+/// outside Go. The methods are read per level, only those with the name of a
+/// frontier method in a type of this graph (review of TASK-017, MAJOR 2).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct DispatchIndex {
+    /// Type → its supertypes, with the edge's confidence (3 high, 2
+    /// medium, 1 anything else).
+    supers: HashMap<u64, Vec<(u64, u8)>>,
+    /// Type → its subtypes.
+    subs: HashMap<u64, Vec<(u64, u8)>>,
+    /// Every type at either end, sorted.
+    types: Vec<u64>,
+}
+
+impl DispatchIndex {
+    /// Whether `t` has a supertype or a subtype here.
+    pub(crate) fn has_type(&self, t: u64) -> bool {
+        self.types.binary_search(&t).is_ok()
+    }
+
+    /// The types reachable from `from` in direction `dir` within
+    /// [`DISPATCH_DEPTH`] levels, each with its surest chain, and the types
+    /// reachable only past that cap (counted, never followed: review of
+    /// TASK-017, point 6). A cycle ends: no type is visited twice for the
+    /// same chain.
+    fn reach(&self, from: u64, dir: Direction) -> (HashMap<u64, u8>, HashSet<u64>) {
+        let graph = match dir {
+            Direction::Upstream => &self.supers,
+            Direction::Downstream => &self.subs,
+        };
+        let mut best: HashMap<u64, u8> = HashMap::new();
+        let mut layer: Vec<(u64, u8)> = vec![(from, 3)];
+        for _ in 0..DISPATCH_DEPTH {
+            let mut next = Vec::new();
+            for (t, conf) in layer {
+                for &(s, c) in graph.get(&t).into_iter().flatten() {
+                    let c = conf.min(c);
+                    if s != from && best.get(&s).is_none_or(|&b| c > b) {
+                        best.insert(s, c);
+                        next.push((s, c));
+                    }
+                }
+            }
+            layer = next;
+        }
+        // Past the cap: the rest of the hierarchy, by plain reachability.
+        let mut past: HashSet<u64> = HashSet::new();
+        let mut layer: Vec<u64> = layer.into_iter().map(|(t, _)| t).collect();
+        while !layer.is_empty() {
+            let mut next = Vec::new();
+            for t in layer {
+                for &(s, _) in graph.get(&t).into_iter().flatten() {
+                    if s != from && !best.contains_key(&s) && past.insert(s) {
+                        next.push(s);
+                    }
+                }
+            }
+            layer = next;
+        }
+        (best, past)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// (origin, candidate) rows the equivalents query read on this thread.
+    pub(crate) static EQUIVALENT_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A frontier method, as the dispatch query reads it.
+struct Origin {
+    parent: u64,
+    name: String,
+    symbol: String,
+    signature: String,
+}
+
+/// An origin, the types it reaches (with their chain) and past the depth cap,
+/// and its candidates in each.
+type OriginFound = (
+    Origin,
+    (HashMap<u64, u8>, HashSet<u64>),
+    Vec<(Candidate, u8)>,
+    Vec<Candidate>,
+);
+
+/// A method of the same name in a type of the supertype graph.
+struct Candidate {
+    id: u64,
+    parent: u64,
+    symbol: String,
+    kind: String,
+    file: Option<String>,
+    line: Option<i32>,
+    signature: String,
+    rank: Option<f64>,
+    test: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Times the supertype graph was read on this thread (once per walk).
+    pub(crate) static INDEX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 3 high, 2 medium, 1 anything else.
+fn confidence_rank(c: Option<&str>) -> u8 {
+    match c {
+        Some("high") => 3,
+        Some("medium") => 2,
+        _ => 1,
+    }
+}
+
+/// The equivalents of one origin among its candidates (already reachable,
+/// with their chain): override-equivalent ones, ordered and capped.
+#[allow(clippy::too_many_arguments)]
+fn select(
+    origin: u64,
+    o: &Origin,
+    found: Vec<(Candidate, u8)>,
+    past: Vec<Candidate>,
+    dir: Direction,
+    include_tests: bool,
+    out: &mut Equivalents,
+) {
+    if never_overrides(&o.signature, &o.name) {
+        return;
+    }
+    let mine = arity(&o.signature, &o.name);
+    let equivalent = |c: &Candidate| {
+        !never_overrides(&c.signature, &o.name)
+            && arities_fit(
+                mine,
+                arity(&c.signature, &o.name),
+                dir,
+                lax_arity(c.file.as_deref()),
+            )
+    };
+    // Past the depth cap: counted (not tests the walk leaves out anyway),
+    // never followed.
+    out.beyond.extend(
+        past.iter()
+            .filter(|c| (include_tests || !c.test) && equivalent(c))
+            .map(|c| c.id),
+    );
+    let mut found: Vec<(Candidate, u8)> =
+        found.into_iter().filter(|(c, _)| equivalent(c)).collect();
+    // Overloads of one arity in one type (`save(User)`, `save(Order)`): the
+    // one whose simple parameter types match exactly, when there is one;
+    // otherwise (a generic parameter) the arity decides (review MINOR 3).
+    if let Some(types) = parameter_types(&o.signature, &o.name) {
+        let mut per_type: HashMap<u64, usize> = HashMap::new();
+        for (c, _) in &found {
+            *per_type.entry(c.parent).or_default() += 1;
+        }
+        let exact: Vec<(u64, bool)> = found
+            .iter()
+            .map(|(c, _)| {
+                let same = parameter_types(&c.signature, &o.name).as_ref() == Some(&types);
+                (c.parent, same)
+            })
+            .collect();
+        let has_exact: HashSet<u64> = exact
+            .iter()
+            .filter(|(p, same)| *same && per_type[p] > 1)
+            .map(|(p, _)| *p)
+            .collect();
+        let mut keep = exact
+            .iter()
+            .map(|(p, same)| !has_exact.contains(p) || *same);
+        found.retain(|_| keep.next().unwrap_or(true));
+    }
+    let mut list: Vec<Equivalent> = found
+        .into_iter()
+        .map(|(c, chain)| Equivalent {
+            origin,
+            origin_symbol: o.symbol.clone(),
+            id: c.id,
+            parent: c.parent,
+            symbol: c.symbol,
+            kind: c.kind,
+            file: c.file,
+            line: c.line,
+            rank: c.rank,
+            test: c.test,
+            chain,
+        })
+        .collect();
+    // Production first (review MINOR 5): a fake that ranks higher never
+    // takes the place of a real implementation under the cap.
+    list.sort_by(|a, b| {
+        a.test
+            .cmp(&b.test)
+            .then_with(|| {
+                b.rank
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .partial_cmp(&a.rank.unwrap_or(f64::NEG_INFINITY))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.symbol.cmp(&b.symbol))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    // Tests the walk leaves out (and counts as tests) are not capped: the cap
+    // is for what is listed.
+    let tests: Vec<Equivalent> = if include_tests {
+        Vec::new()
+    } else {
+        let at = list.iter().position(|e| e.test).unwrap_or(list.len());
+        list.split_off(at)
+    };
+    if list.len() > DISPATCH_MAX_PER_NODE {
+        out.cut
+            .extend(list.drain(DISPATCH_MAX_PER_NODE..).map(|e| e.id));
+    }
+    out.kept.extend(list);
+    out.kept.extend(tests);
+}
+
+impl Store {
+    /// The supertype graph of `branch` ([`DispatchIndex`]) as id pairs, one
+    /// statement; `None` when it has no resolved supertype edge (then no
+    /// level pays for dispatch). Go's files are left out (embedding promotes,
+    /// it does not override).
+    pub(crate) fn dispatch_index(&self, repo: &str, branch: &str) -> Result<Option<DispatchIndex>> {
+        #[cfg(test)]
+        INDEX_READS.with(|c| c.set(c.get() + 1));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT e.src_id, e.dst_id, e.confidence FROM live_edges e
+              WHERE e.repo = ? AND e.branch = ? AND e.kind IN {SUPER_KINDS}
+                AND e.dst_id IS NOT NULL AND NOT ends_with(e.file, '.go')"
+        ))?;
+        let edges = stmt
+            .query_map(duckdb::params![repo, branch], |r| {
+                Ok((
+                    r.get::<_, u64>(0)?,
+                    r.get::<_, u64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if edges.is_empty() {
+            return Ok(None);
+        }
+        let mut idx = DispatchIndex::default();
+        for (src, dst, conf) in edges {
+            let c = confidence_rank(conf.as_deref());
+            idx.supers.entry(src).or_default().push((dst, c));
+            idx.subs.entry(dst).or_default().push((src, c));
+            idx.types.extend([src, dst]);
+        }
+        idx.types.sort_unstable();
+        idx.types.dedup();
+        Ok(Some(idx))
+    }
+
+    /// The override-equivalent methods of the methods of `frontier` (one
+    /// statement per level): the frontier methods whose type is in the
+    /// supertype graph, and the methods with their name in another type of
+    /// it; then, in memory, the ones whose type is reachable (supertypes
+    /// upstream, subtypes downstream, up to [`DISPATCH_DEPTH`] levels),
+    /// override-equivalent, at most [`DISPATCH_MAX_PER_NODE`] per node.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn override_equivalents(
+        &self,
+        repo: &str,
+        branch: &str,
+        frontier: &[u64],
+        parents: &HashMap<u64, u64>,
+        dir: Direction,
+        mode: FrontierSql,
+        index: &DispatchIndex,
+        include_tests: bool,
+    ) -> Result<Equivalents> {
+        let mut out = Equivalents::default();
+        if frontier.is_empty() {
+            return Ok(out);
+        }
+        // The types each frontier method's type reaches (within the depth
+        // cap, and past it), computed here once per type: the query joins
+        // only those pairs (review of TASK-011: joining every method of the
+        // same name in every type of the graph read a million rows for a
+        // thousand implementations of one interface).
+        let mut reach: HashMap<u64, (HashMap<u64, u8>, HashSet<u64>)> = HashMap::new();
+        for id in frontier {
+            if let Some(&p) = parents.get(id) {
+                reach.entry(p).or_insert_with(|| index.reach(p, dir));
+            }
+        }
+        let mut owners: Vec<u64> = reach.keys().copied().collect();
+        owners.sort_unstable();
+        let (mut ps, mut ts): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        for p in &owners {
+            let (best, past) = &reach[p];
+            let mut types: Vec<u64> = best.keys().chain(past.iter()).copied().collect();
+            types.sort_unstable();
+            for t in types {
+                ps.push(p.to_string());
+                ts.push(t.to_string());
+            }
+        }
+        if ps.is_empty() {
+            return Ok(out);
+        }
+        let mut args: Vec<duckdb::types::Value> = vec![
+            format!("[{}]", ps.join(", ")).into(),
+            format!("[{}]", ts.join(", ")).into(),
+            repo.to_string().into(),
+            branch.to_string().into(),
+        ];
+        let set = self.frontier_set(frontier, mode, &mut args)?;
+        args.extend([repo.to_string().into(), branch.to_string().into()]);
+        let sql = format!(
+            "WITH pairs AS (SELECT unnest(CAST(? AS UBIGINT[])) AS p,
+                                   unnest(CAST(? AS UBIGINT[])) AS t),
+             f AS (
+               SELECT s.id, s.parent_id, s.name, s.qualified, s.signature FROM symbols s
+                WHERE s.repo = ? AND s.branch = ? AND s.id IN {set}
+                  AND s.kind IN {CALLABLE_KINDS} AND NOT ends_with(s.file, '.go')
+             )
+             SELECT f.id, f.parent_id, f.name, f.qualified, f.signature,
+                    m.id, m.parent_id, m.qualified, m.file, m.start_line, m.signature,
+                    m.rank, coalesce(m.is_test, false), m.kind
+               FROM f
+               JOIN pairs ON pairs.p = f.parent_id
+               JOIN symbols m ON m.repo = ? AND m.branch = ? AND m.name = f.name
+                             AND m.parent_id = pairs.t
+                             AND m.id <> f.id AND m.kind IN {CALLABLE_KINDS}
+                             AND NOT ends_with(m.file, '.go')"
+        );
+        count_statement();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((
+                r.get::<_, u64>(0)?,
+                Origin {
+                    parent: r.get(1)?,
+                    name: r.get(2)?,
+                    symbol: r.get(3)?,
+                    signature: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                },
+                Candidate {
+                    id: r.get(5)?,
+                    parent: r.get(6)?,
+                    symbol: r.get(7)?,
+                    file: r.get(8)?,
+                    line: r.get(9)?,
+                    signature: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                    rank: r.get(11)?,
+                    test: r.get(12)?,
+                    kind: r.get(13)?,
+                },
+            ))
+        })?;
+        let mut origins: HashMap<u64, OriginFound> = HashMap::new();
+        for row in rows {
+            let (id, o, c) = row?;
+            #[cfg(test)]
+            EQUIVALENT_ROWS.with(|n| n.set(n.get() + 1));
+            let entry = origins.entry(id).or_insert_with(|| {
+                let r = reach.get(&o.parent).cloned().unwrap_or_default();
+                (o, r, Vec::new(), Vec::new())
+            });
+            if let Some(&chain) = entry.1 .0.get(&c.parent) {
+                entry.2.push((c, chain));
+            } else if entry.1 .1.contains(&c.parent) {
+                entry.3.push(c);
+            }
+        }
+        let mut ids: Vec<u64> = origins.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let (o, _, found, past) = origins.remove(&id).expect("listed");
+            select(id, &o, found, past, dir, include_tests, &mut out);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arity_reads_each_language_signature() {
+        assert_eq!(
+            arity("@Override public void update(String id)", "update"),
+            Some((1, Some(1)))
+        );
+        assert_eq!(
+            arity("void update(String id);", "update"),
+            Some((1, Some(1)))
+        );
+        assert_eq!(
+            arity(
+                "@Path(\"x\") public R get(@PathParam(\"id\") Long id, Map<String, List<X>> m)",
+                "get"
+            ),
+            Some((2, Some(2)))
+        );
+        assert_eq!(
+            arity("public void log(String fmt, Object... args)", "log"),
+            Some((1, None))
+        );
+        assert_eq!(
+            arity("update(id: string, opts?: Opts): void", "update"),
+            Some((1, Some(2)))
+        );
+        assert_eq!(
+            arity("handle(cb: (x: number) => void, n = 2)", "handle"),
+            Some((1, Some(2)))
+        );
+        assert_eq!(
+            arity("fn update(&self, id: &str);", "update"),
+            Some((2, Some(2)))
+        );
+        assert_eq!(
+            arity("pub fn map<T, F: Fn(T) -> T>(&self, f: F) -> T", "map"),
+            Some((2, Some(2)))
+        );
+        assert_eq!(
+            arity("def run(self, x, y=None, *args, **kw):", "run"),
+            Some((2, None))
+        );
+        assert_eq!(arity("handle(): void", "handle"), Some((0, Some(0))));
+        assert_eq!(arity("handle = (e: Event) =>", "handle"), None);
+    }
+
+    #[test]
+    fn parameter_types_are_the_simple_types() {
+        let t = |s: &str, n: &str| parameter_types(s, n);
+        let v = |x: &[&str]| Some(x.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            t("@Override public void save(final User user)", "save"),
+            v(&["User"])
+        );
+        assert_eq!(
+            t(
+                "void find(@Named(\"x\") a.b.Order o, Map<String, Long> m)",
+                "find"
+            ),
+            v(&["Order", "Map"])
+        );
+        assert_eq!(
+            t("update(id: string, opts?: Opts): void", "update"),
+            v(&["string", "Opts"])
+        );
+        assert_eq!(t("fn write(&self, line: &str)", "write"), v(&["str"]));
+        assert_eq!(t("fn put(&mut self, v: Vec<u8>)", "put"), v(&["Vec"]));
+        assert_eq!(t("def run(self, x):", "run"), None);
+        assert_eq!(t("handle(): void", "handle"), v(&[]));
+    }
+
+    #[test]
+    fn arities_meet_when_their_ranges_overlap() {
+        assert!(arities_meet(Some((1, Some(1))), Some((1, Some(2)))));
+        assert!(!arities_meet(Some((1, Some(1))), Some((2, Some(2)))));
+        assert!(arities_meet(Some((1, None)), Some((3, Some(3)))));
+        assert!(arities_meet(None, Some((3, Some(3)))));
+    }
+
+    #[test]
+    fn a_typescript_implementation_may_take_fewer_parameters() {
+        let (one, two) = (Some((1, Some(1))), Some((2, Some(2))));
+        // Upstream the origin is the implementation; downstream, the candidate.
+        assert!(arities_fit(one, two, Direction::Upstream, true));
+        assert!(arities_fit(two, one, Direction::Downstream, true));
+        assert!(!arities_fit(two, one, Direction::Upstream, true));
+        assert!(!arities_fit(one, two, Direction::Downstream, true));
+        // Java: the ranges must meet.
+        assert!(!arities_fit(one, two, Direction::Upstream, false));
+        assert!(lax_arity(Some("web/a.ts")) && lax_arity(Some("b.mjs")));
+        assert!(!lax_arity(Some("A.java")) && !lax_arity(None));
+    }
+
+    #[test]
+    fn dispatch_is_never_surer_than_medium_nor_than_its_edge() {
+        assert_eq!(
+            dispatch_confidence(Some("high"), 3).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            dispatch_confidence(Some("medium"), 3).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(dispatch_confidence(Some("low"), 3).as_deref(), Some("low"));
+        assert_eq!(dispatch_confidence(Some("high"), 1).as_deref(), Some("low"));
+        assert_eq!(dispatch_confidence(None, 3), None);
+    }
+
+    #[test]
+    fn private_and_static_methods_override_nothing() {
+        assert!(never_overrides("private void update(String id)", "update"));
+        assert!(never_overrides("public static Foo of(String s)", "of"));
+        assert!(!never_overrides(
+            "public void update(String staticId)",
+            "update"
+        ));
+        assert!(!never_overrides("fn name(&self) -> &'static str", "name"));
+        assert!(!never_overrides(
+            "fn spawn<T: 'static>(&self, t: T)",
+            "spawn"
+        ));
+        assert!(!never_overrides(
+            "public void run(@Named(\"static\") String s)",
+            "run"
+        ));
+    }
+}

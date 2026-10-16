@@ -91,7 +91,7 @@ cadena fluida —que en Quarkus reactivo es la norma— eso es **toda la expresi
 anterior, saltos de línea incluidos**. Targets reales medidos hoy:
 
 ```
-Office.findByCodigo(codigo).flatMap
+Office.findByCode(code).flatMap
 Office
         .persist(office).replaceWith(
             () -> OfficeDTO.from(office)).invoke

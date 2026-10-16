@@ -781,29 +781,70 @@ pub fn reclaim_db(cfg: &ProjectConfig) -> bool {
 }
 
 fn reclaim_db_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> bool {
+    reclaim_db_report_with(cfg, term, kill).stopped()
+}
+
+/// How [`reclaim_db_report`] left this project's server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reclaim {
+    /// None was advertised, or the advertised one was already gone.
+    NoServer,
+    /// It left on SIGTERM: it had the chance to fold its WAL.
+    Stopped,
+    /// It left only on SIGKILL: it may have left a WAL behind.
+    Killed,
+    /// It is still there (or cannot be vouched for), with the reason.
+    NotStopped(String),
+}
+
+impl Reclaim {
+    /// A server was there and is gone now, however it left.
+    pub fn stopped(&self) -> bool {
+        matches!(self, Reclaim::Stopped | Reclaim::Killed)
+    }
+}
+
+/// [`reclaim_db`], saying how the server left: a compaction must not replace
+/// the file after one that had to be killed (PLAN-009 TASK-018).
+pub fn reclaim_db_report(cfg: &ProjectConfig) -> Reclaim {
+    reclaim_db_report_with(cfg, TERM_WAIT, KILL_WAIT)
+}
+
+fn reclaim_db_report_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> Reclaim {
     let Ok(raw) = std::fs::read(serve_file(cfg)) else {
-        return false;
+        return Reclaim::NoServer;
     };
     let Ok(info) = serde_json::from_slice::<ServeInfo>(&raw) else {
-        return false;
+        return Reclaim::NoServer;
     };
     match ownership(cfg, &info) {
         Ownership::Gone => {
             // Dead, or recycled into something else: the advertisement is stale.
             remove_serve_file(cfg);
-            false
+            Reclaim::NoServer
         }
         // A live server we cannot vouch for keeps its own file.
-        Ownership::Unverified => false,
+        Ownership::Unverified => Reclaim::NotStopped(unverified_message(
+            info.pid.unwrap_or_default(),
+            &serve_file(cfg),
+            "devctx server",
+        )),
         Ownership::Ours => {
             // The file goes only with the process: dropping it while the server
             // lives leaves it unadvertised and holding the lock.
             let term = term_wait_for(&info, term);
-            if terminate_ours(cfg, &info, term, kill).is_gone() {
+            let out = terminate_ours(cfg, &info, term, kill);
+            if out.is_gone() {
                 remove_serve_file(cfg);
-                true
-            } else {
-                false
+            }
+            match out {
+                procown::Termination::Gone => Reclaim::Stopped,
+                procown::Termination::Killed => Reclaim::Killed,
+                other => Reclaim::NotStopped(
+                    other
+                        .failure("server", info.pid.unwrap_or_default())
+                        .unwrap_or_default(),
+                ),
             }
         }
     }
@@ -812,10 +853,15 @@ fn reclaim_db_with(cfg: &ProjectConfig, term: Duration, kill: Duration) -> bool 
 /// What to tell someone whose `--stop` refused because the pid cannot be tied
 /// to the file: why nothing was signalled, and the manual way out.
 pub fn unverified_message(pid: u32, serve_json: &Path, what: &str) -> String {
+    let how = if cfg!(windows) {
+        format!("`taskkill /PID {pid}` (or Task Manager)")
+    } else {
+        format!("`kill {pid}`")
+    };
     format!(
         "pid {pid} looks like a {what} but cannot be tied to {} (it predates start times, or \
          this platform cannot confirm the process); not signalling it and keeping the file. \
-         If it is yours, stop it yourself with `kill {pid}` and delete {}.",
+         If it is yours, stop it yourself with {how} and delete {}.",
         serve_json.display(),
         serve_json.display()
     )
@@ -1198,8 +1244,89 @@ impl Remote {
         self.get("/memory/stats")
     }
 
-    pub fn impact(&self, symbol: &str, depth: usize) -> Result<String> {
-        self.get(&format!("/impact/{}?depth={depth}", urlencode(symbol)))
+    pub fn impact(
+        &self,
+        symbol: &str,
+        depth: usize,
+        q: &devctx_mcp::state::ImpactQuery,
+    ) -> Result<String> {
+        let mut path = format!("/impact/{}?depth={depth}", urlencode(symbol));
+        for (k, v) in q.query_pairs() {
+            path.push_str(&format!("&{k}={}", urlencode(&v)));
+        }
+        Ok(impact_answer(self.get(&path)?, q))
+    }
+
+    /// `POST /traverse`; a server older than the tool answers 404 (405), read
+    /// from the status code, and is told as such (review of TASK-013, MINOR 4).
+    pub fn traverse(&self, q: &devctx_mcp::state::TraverseQuery) -> Result<String> {
+        let body = serde_json::to_value(q)?;
+        let missing = std::cell::Cell::new(false);
+        self.send(|r| {
+            let res = r
+                .auth(r.agent().post(&format!("{}/traverse", r.base)))
+                .send_json(body.clone())
+                .map_err(Box::new);
+            if let Err(e) = &res {
+                missing.set(matches!(&**e, ureq::Error::Status(404 | 405, _)));
+            }
+            res
+        })
+        .map_err(|e| {
+            if missing.get() {
+                anyhow::anyhow!(devctx_mcp::backend::TRAVERSE_OLD_SERVER)
+            } else {
+                e
+            }
+        })
+    }
+
+    /// `GET /repo-map`; a server older than the tool answers 404 (405), read
+    /// from the status code, and is told as such. The map is text.
+    pub fn repo_map(&self, q: &devctx_mcp::repo_map::RepoMapQuery) -> Result<String> {
+        let path = devctx_mcp::backend::repo_map_path(q);
+        let missing = std::cell::Cell::new(false);
+        self.send(|r| {
+            let res = r
+                .auth(r.agent().get(&format!("{}{path}", r.base)))
+                .call()
+                .map_err(Box::new);
+            if let Err(e) = &res {
+                missing.set(matches!(&**e, ureq::Error::Status(404 | 405, _)));
+            }
+            res
+        })
+        .map_err(|e| {
+            if missing.get() {
+                anyhow::anyhow!(devctx_mcp::backend::REPO_MAP_OLD_SERVER)
+            } else {
+                e
+            }
+        })
+    }
+
+    /// `GET /skeleton`; a server older than the tool answers 404 (405), read
+    /// from the status code, and is told as such. The skeleton is text.
+    pub fn skeleton(&self, q: &devctx_mcp::skeleton::SkeletonQuery) -> Result<String> {
+        let path = devctx_mcp::backend::skeleton_path(q);
+        let missing = std::cell::Cell::new(false);
+        self.send(|r| {
+            let res = r
+                .auth(r.agent().get(&format!("{}{path}", r.base)))
+                .call()
+                .map_err(Box::new);
+            if let Err(e) = &res {
+                missing.set(matches!(&**e, ureq::Error::Status(404 | 405, _)));
+            }
+            res
+        })
+        .map_err(|e| {
+            if missing.get() {
+                anyhow::anyhow!(devctx_mcp::backend::SKELETON_OLD_SERVER)
+            } else {
+                e
+            }
+        })
     }
 
     pub fn backfill_links(&self, dry_run: bool, from_text: bool) -> Result<String> {
@@ -1213,19 +1340,29 @@ impl Remote {
         self.get(&format!("/symbol/{}?limit={limit}", urlencode(name)))
     }
 
+    /// A brief from the server; `opts` asks for the related section, and a
+    /// server older than it gets a line saying it was not applied
+    /// (`note_unapplied_related`).
     pub fn build_context(
         &self,
         query: &str,
         max_tokens: usize,
         include_memories: bool,
         sel: &devctx_search::KindSel,
+        opts: &devctx_mcp::state::ContextOpts,
     ) -> Result<String> {
-        self.post(
-            "/context",
-            serde_json::json!({ "query": query, "max_tokens": max_tokens,
+        opts.resolve().map_err(|e| anyhow::anyhow!(e))?;
+        let mut body = serde_json::json!({ "query": query, "max_tokens": max_tokens,
                                 "include_memories": include_memories,
-                                "kind": sel.kind, "include_tests": sel.include_tests }),
-        )
+                                "kind": sel.kind, "include_tests": sel.include_tests });
+        if let Some(v) = opts.related {
+            body["related"] = serde_json::json!(v);
+        }
+        if let Some(h) = opts.graph_hops {
+            body["graph_hops"] = serde_json::json!(h);
+        }
+        let out = self.post("/context", body)?;
+        Ok(devctx_mcp::backend::note_unapplied_related(out, opts))
     }
 
     pub fn routes(&self, method: Option<&str>, path: Option<&str>) -> Result<String> {
@@ -1312,6 +1449,17 @@ fn describe_transport_failure(e: ureq::Error) -> anyhow::Error {
 }
 
 /// Minimal percent-encoding for a path/query segment.
+/// The `impact` answer as the CLI shows it: when filters were passed and
+/// the server did not apply them (a 0.9 server, or an index older than the
+/// symbol graph), a `warning` says so (review m1).
+fn impact_answer(raw: String, q: &devctx_mcp::state::ImpactQuery) -> String {
+    if q.query_pairs().is_empty() {
+        raw
+    } else {
+        devctx_mcp::backend::note_unapplied_impact_filters(raw)
+    }
+}
+
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -1327,6 +1475,25 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Review m1: `devctx impact --include-tests` against a server that
+    /// ignores the filters says so; without filters, the answer as is.
+    #[test]
+    fn an_impact_with_unapplied_filters_says_so() {
+        let old = r#"{"symbol":"f","upstream":[],"downstream":[]}"#.to_string();
+        let q = devctx_mcp::state::ImpactQuery {
+            include_tests: Some(true),
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&super::impact_answer(old.clone(), &q)).unwrap();
+        assert!(
+            v["warning"].as_str().unwrap().contains("not applied"),
+            "{v}"
+        );
+        let plain = devctx_mcp::state::ImpactQuery::default();
+        assert_eq!(super::impact_answer(old.clone(), &plain), old);
+    }
+
     #[test]
     fn the_failure_hint_skips_a_backtrace_and_keeps_the_cause() {
         let dir = std::env::temp_dir().join(format!("devctx-hint-bt-{}", std::process::id()));
@@ -1524,6 +1691,108 @@ mod tests {
         assert!(plain.status().is_err());
         assert!(started.elapsed() < Duration::from_secs(2), "not retried");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of TASK-013, MINOR 4: `devctx traverse` against a server older
+    /// than the tool (404 on the route) says to restart it; a 500 keeps the
+    /// server's own message.
+    #[test]
+    fn traverse_on_an_old_server_says_to_restart_it() {
+        let q = devctx_mcp::state::TraverseQuery {
+            symbol: Some("f".into()),
+            ..Default::default()
+        };
+        let old = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = old.traverse(&q).unwrap_err().to_string();
+        assert!(e.contains("predates traverse"), "{e}");
+        let failing = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                     Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = failing.traverse(&q).unwrap_err().to_string();
+        assert!(e.contains("boom") && !e.contains("predates"), "{e}");
+    }
+
+    /// PLAN-009 TASK-011: `devctx map` against a server older than the tool
+    /// (404 on `GET /repo-map`) says to restart it; a 500 keeps the server's
+    /// own message.
+    #[test]
+    fn repo_map_on_an_old_server_says_to_restart_it() {
+        let q = devctx_mcp::repo_map::RepoMapQuery::default();
+        let old = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = old.repo_map(&q).unwrap_err().to_string();
+        assert!(e.contains("predates repo_map"), "{e}");
+        let failing = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                     Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = failing.repo_map(&q).unwrap_err().to_string();
+        assert!(e.contains("boom") && !e.contains("predates"), "{e}");
+    }
+
+    /// PLAN-009 TASK-014: `devctx skeleton` against a server older than the
+    /// tool (404 on `GET /skeleton`) says to restart it; a 500 keeps the
+    /// server's own message.
+    #[test]
+    fn skeleton_on_an_old_server_says_to_restart_it() {
+        let q = devctx_mcp::skeleton::SkeletonQuery::of("src/a.rs");
+        let old = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = old.skeleton(&q).unwrap_err().to_string();
+        assert!(e.contains("predates skeleton"), "{e}");
+        let failing = Remote {
+            base: format!(
+                "http://{}",
+                serve_fixed(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                     Content-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"boom\"}"
+                )
+            ),
+            token: None,
+            cfg: None,
+        };
+        let e = failing.skeleton(&q).unwrap_err().to_string();
+        assert!(e.contains("boom") && !e.contains("predates"), "{e}");
     }
 
     #[test]
@@ -2034,6 +2303,60 @@ mod tests {
         ));
         assert!(!child.wait().unwrap().success(), "it must have been killed");
         assert!(!serve_file(&cfg).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-018: a compaction replaces the file only after a server
+    /// that left on SIGTERM; one that had to be killed may have left a WAL.
+    /// The report says which.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reclaim_reports_a_killed_server_apart_from_a_clean_stop() {
+        let dir = scratch("reclaim_report_kill");
+        let cfg = cfg_at(&dir);
+        let mut child = fake_server(
+            &dir.join("srv"),
+            "trap '' TERM\nwhile :; do sleep 1; done\n",
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        advertise_at(
+            &cfg,
+            closed_port(),
+            child.id(),
+            procown::start_time(child.id()),
+        );
+        let out = reclaim_db_report_with(&cfg, Duration::from_millis(400), Duration::from_secs(3));
+        assert_eq!(out, Reclaim::Killed);
+        assert!(out.stopped());
+        let _ = child.wait();
+        assert!(!serve_file(&cfg).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("reclaim_report_clean");
+        let cfg = cfg_at(&dir);
+        let mut child = fake_server(
+            &dir.join("srv"),
+            "trap 'exit 0' TERM\nwhile :; do sleep 0.1; done\n",
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        advertise_at(
+            &cfg,
+            closed_port(),
+            child.id(),
+            procown::start_time(child.id()),
+        );
+        let out = reclaim_db_report_with(&cfg, Duration::from_secs(3), Duration::from_secs(3));
+        assert_eq!(out, Reclaim::Stopped);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Nothing advertised: nothing to stop.
+        let dir = scratch("reclaim_report_none");
+        let cfg = cfg_at(&dir);
+        assert_eq!(
+            reclaim_db_report_with(&cfg, Duration::from_millis(100), Duration::from_millis(100)),
+            Reclaim::NoServer
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

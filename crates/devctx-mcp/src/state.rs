@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,21 @@ use devctx_search::SearchMode;
 use devctx_store::Store;
 use devctx_summarize::{create_summarizer, SummarizeSettings};
 use serde_json::{json, Value};
+
+mod impact;
+mod lookup;
+mod related;
+mod repo_map;
+mod skeleton;
+mod traverse;
+
+pub use impact::ImpactQuery;
+pub use related::{
+    ContextOpts, DEFAULT_GRAPH_HOPS, DEFAULT_RELATED, RELATED_HEADING, RELATED_NOTE,
+};
+pub use repo_map::REPO_MAP_NEEDS_REINDEX;
+pub use skeleton::SKELETON_NEEDS_REINDEX;
+pub use traverse::{TraverseQuery, DEFAULT_TRAVERSE_LIMIT, TRAVERSE_NEEDS_REINDEX};
 
 /// How far an indexing run has got, for anyone who asks while it runs.
 ///
@@ -269,6 +284,17 @@ pub struct AppState {
     /// Consecutive polls that found the project's `.devctx/` missing; see
     /// [`AppState::project_vanished`].
     vanish_strikes: AtomicU32,
+    /// The adjacency `repo_map` ranks over (PLAN-009 TASK-011): one branch,
+    /// by index generation; dropped when an `index` ends and when unused
+    /// (see [`AppState::release_idle_models`]). One slot: maps of two
+    /// branches asked alternately rebuild it each time (review of TASK-011,
+    /// m4; an LRU if TASK-016 sees it matter).
+    repo_map: Mutex<Option<repo_map::CachedMap>>,
+    /// Times that adjacency was read from the database.
+    repo_map_loads: AtomicUsize,
+    /// Times it was dropped because an `index` ended: a graph read across
+    /// one is not kept.
+    repo_map_drops: AtomicUsize,
 }
 
 impl AppState {
@@ -312,6 +338,9 @@ impl AppState {
             index_progress: Arc::new(Mutex::new(IndexProgress::default())),
             index_cancel: Arc::new(AtomicBool::new(false)),
             vanish_strikes: AtomicU32::new(0),
+            repo_map: Mutex::new(None),
+            repo_map_loads: AtomicUsize::new(0),
+            repo_map_drops: AtomicUsize::new(0),
         })
     }
 
@@ -400,6 +429,12 @@ impl AppState {
                 released.push("reranker");
             }
         }
+        // The repo map's adjacency follows the same policy (DD-12): megabytes
+        // on a large repository, rebuilt in under a second.
+        if self.release_idle_repo_map(max_idle) {
+            keys.push("repo map graph".to_string());
+            released.push("repo map graph");
+        }
         if !released.is_empty() {
             trim_allocator();
             log_model_event("released", &keys.join(", "), None, rss_before);
@@ -453,6 +488,7 @@ impl AppState {
                 "database_size": report.database_size,
                 "notes": report.notes,
             },
+            "repo_map": self.repo_map_json(),
             "hnsw": {
                 "present": report.hnsw_present,
                 "metric": report.hnsw_metric,
@@ -649,7 +685,8 @@ pub fn do_search(
     rerank: bool,
     sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
-    let (items, fallback) = search_items(state, query, limit, language, mode, rerank, sel, true)?;
+    let (items, fallback, reader) =
+        search_items_with(state, query, limit, language, mode, rerank, sel, true)?;
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     let (kept, dropped) = fit_json_array(items, budget, Some("text"), |v| {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
@@ -667,6 +704,11 @@ pub fn do_search(
     if let Some(f) = &fallback {
         out["branch_fallback"] = f.to_json();
     }
+    // Identifiers anchored by name, not through the symbol graph (DD-19):
+    // say why, as the graph tools do.
+    if let Some(w) = reader.and_then(lookup::Reader::search_warning) {
+        out["warning"] = json!(w);
+    }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
@@ -679,6 +721,9 @@ pub fn do_search(
 /// takes as long as the corpus is big, and a brief must not pay that on its
 /// first call. There hybrid without the index degrades to vector search plus
 /// identifier anchoring (`search_ranked` treats a failed keyword leg as empty).
+/// (`build_context` reads the branch too, through `search_items_full`; the
+/// lookup tests read this.)
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn search_items(
     state: &AppState,
@@ -690,9 +735,55 @@ fn search_items(
     sel: &devctx_search::KindSel,
     build_fts: bool,
 ) -> Result<(Vec<Value>, Option<BranchFallback>), String> {
-    let opts = sel.options(state.cfg.search.penalty)?;
+    search_items_with(state, query, limit, language, mode, rerank, sel, build_fts)
+        .map(|(items, fallback, _)| (items, fallback))
+}
+
+/// Rows of a search, its branch fallback and how it anchored identifiers.
+type SearchRows = (Vec<Value>, Option<BranchFallback>, Option<lookup::Reader>);
+
+/// [`search_items`], plus how identifiers were anchored: the reader of the
+/// searched branch in `keyword`/`hybrid` (`None` in `vector`, which does not
+/// anchor, or with no branch indexed).
+#[allow(clippy::too_many_arguments)]
+fn search_items_with(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    language: Option<String>,
+    mode: SearchMode,
+    rerank: bool,
+    sel: &devctx_search::KindSel,
+    build_fts: bool,
+) -> Result<SearchRows, String> {
+    search_items_full(state, query, limit, language, mode, rerank, sel, build_fts)
+        .map(|(items, fallback, reader, _)| (items, fallback, reader))
+}
+
+/// [`SearchRows`] and the branch they came from.
+type SearchRowsFrom = (
+    Vec<Value>,
+    Option<BranchFallback>,
+    Option<lookup::Reader>,
+    Option<BranchChoice>,
+);
+
+/// [`search_items_with`], plus the branch the rows came from (what
+/// `build_context`'s related section reads the graph of).
+#[allow(clippy::too_many_arguments)]
+fn search_items_full(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    language: Option<String>,
+    mode: SearchMode,
+    rerank: bool,
+    sel: &devctx_search::KindSel,
+    build_fts: bool,
+) -> Result<SearchRowsFrom, String> {
+    let mut opts = sel.options(state.cfg.search.penalty)?;
     let store = state.open_store()?;
-    let (branch_filter, fallback) = search_branch(state, &store);
+    let (branch_filter, fallback, choice) = search_scope(state, &store);
     let filter = SearchFilter {
         languages: language.into_iter().collect(),
         exclude_deletions: true,
@@ -733,7 +824,23 @@ fn search_items(
     } else {
         None
     };
-    let hits = devctx_search::search_ranked(
+    // Identifiers are anchored through the symbol graph when the searched
+    // branch has a current one (PLAN-009 DD-10), by name otherwise.
+    let reader = choice
+        .as_ref()
+        .filter(|_| mode != SearchMode::Vector)
+        .map(|c| lookup::Reader::of(c, &store));
+    let by_symbol = reader == Some(lookup::Reader::SymbolGraph);
+    // Centrality (PLAN-009 TASK-010) only from a current symbol graph: a
+    // branch indexed by another extractor, out of step or without symbol
+    // rows has no rank worth trusting, and hybrid search there fuses vector
+    // and keyword alone.
+    opts.centrality = if by_symbol {
+        state.cfg.search.centrality()
+    } else {
+        0.0
+    };
+    let anchored = devctx_search::search_anchored(
         &store,
         query,
         &filter,
@@ -742,15 +849,33 @@ fn search_items(
         embedder.as_deref(),
         reranker.as_deref(),
         &opts,
+        if by_symbol {
+            devctx_search::AnchorLookup::Symbols
+        } else {
+            devctx_search::AnchorLookup::Names
+        },
     )
     .map_err(|e| e.to_string())?;
+    let hits = anchored.hits;
     let mut items = match hits_to_json(&hits) {
         Value::Array(a) => a,
         _ => Vec::new(),
     };
     // Hits pinned because the query named their symbol say so, so an agent can
-    // tell "ranked first" from "is the definition of what you typed".
-    if mode != SearchMode::Vector {
+    // tell "ranked first" from "is the definition of what you typed". Over the
+    // symbol graph a hit is anchored when it is a chunk of a definition the
+    // lookup found (by id, `sym` says which); by name, when its symbol is the
+    // identifier or ends in it.
+    if by_symbol {
+        for (item, hit) in items.iter_mut().zip(&hits) {
+            if let Some(sym) = anchored.definitions.get(&hit.point.id) {
+                item["anchored"] = json!(true);
+                if let Some(id) = sym {
+                    item["sym"] = json!(devctx_store::sym_hex(*id));
+                }
+            }
+        }
+    } else if mode != SearchMode::Vector {
         let idents = devctx_search::anchor_tokens(query);
         for (item, hit) in items.iter_mut().zip(&hits) {
             if is_anchored_definition(&hit.point.metadata, &idents) {
@@ -758,7 +883,7 @@ fn search_items(
             }
         }
     }
-    Ok((items, fallback))
+    Ok((items, fallback, reader, choice))
 }
 
 /// Whether a hit is the definition of one of the identifiers anchoring looked
@@ -814,21 +939,33 @@ fn prune_untracked_branches(state: &AppState, store: &devctx_store::Store) -> us
 /// has rows, else the most recently indexed branch with rows (the same rule as
 /// the graph tools, via `pick_graph_branch`), else no filter — which is exactly
 /// the behaviour of every version before branches were tracked.
+#[cfg(test)]
 fn search_branch(
     state: &AppState,
     store: &devctx_store::Store,
 ) -> (SearchFilter, Option<BranchFallback>) {
+    let (filter, fallback, _) = search_scope(state, store);
+    (filter, fallback)
+}
+
+/// [`search_branch`] plus the branch choice it was made from (when a branch
+/// has rows), so a search decides how to anchor identifiers without picking
+/// the branch a second time (review of TASK-008, M3).
+fn search_scope(
+    state: &AppState,
+    store: &devctx_store::Store,
+) -> (SearchFilter, Option<BranchFallback>, Option<BranchChoice>) {
     // One rule for search and graph: see `pick_graph_branch`.
     match pick_branch(state, store) {
         Ok(c) if c.indexed => {
             let filter = SearchFilter {
-                repo: Some(c.repo),
-                branch: Some(c.branch),
+                repo: Some(c.repo.clone()),
+                branch: Some(c.branch.clone()),
                 ..SearchFilter::default()
             };
-            (filter, c.fallback)
+            (filter, c.fallback.clone(), Some(c))
         }
-        _ => (SearchFilter::default(), None),
+        _ => (SearchFilter::default(), None, None),
     }
 }
 
@@ -939,7 +1076,12 @@ fn pick_graph_branch(
         // A failed read counts as unknown, which is stale: never a silent "fine".
         extractor_stale: indexed
             && store
-                .extractor_stale(repo_path, branch, &devctx_index::extractor_fingerprint())
+                .extractor_stale(
+                    repo,
+                    repo_path,
+                    branch,
+                    &devctx_index::extractor_fingerprint(),
+                )
                 .unwrap_or(true),
     };
     if has(current) {
@@ -1142,14 +1284,28 @@ fn do_index_inner(
     let store = state.open_store()?;
     let sink =
         SharedProgress::with_cancel(state.index_progress.clone(), state.index_cancel.clone());
-    sink.begin(LOADING_MODEL);
-    let embedder = match embedder_reporting(state, &sink) {
-        Ok(e) => e,
-        Err(e) => {
-            sink.finish();
-            return Err(e);
-        }
-    };
+    sink.begin("starting");
+    // Lazy: the model is loaded (through the server's cache, with its idle
+    // release) only when a chunk needs embedding. A run that finds every vector
+    // reusable never reintroduces the load transient.
+    let dimension = configured_dimension(&state.cfg);
+    let embedder =
+        devctx_embed::LazyEmbedder::new(dimension, state.cfg.embeddings.model.clone(), || {
+            sink.phase(LOADING_MODEL);
+            let loaded = embedder_reporting(state, &sink).map_err(|e| {
+                // `Backend` prints its own prefix; do not stack a second one.
+                const PREFIX: &str = "local embedding backend: ";
+                let head = e.get(..PREFIX.len());
+                let e = match head {
+                    Some(h) if h.eq_ignore_ascii_case(PREFIX) => &e[PREFIX.len()..],
+                    _ => e.as_str(),
+                };
+                devctx_embed::EmbedError::Backend(e.to_string())
+            });
+            sink.phase("files");
+            loaded
+        });
+    let fingerprint = devctx_embed::embedding_fingerprint(&state.embed_settings, dimension);
     // Which branch this run is about. Declared config wins over what happens to
     // be checked out, so running `index` from a linked worktree keeps the
     // repository's trunk fresh instead of quietly indexing the worktree's
@@ -1170,7 +1326,7 @@ fn do_index_inner(
     let _finish = Finish(&sink);
     let run = index_run(IndexRequest {
         store: &store,
-        embedder: embedder.as_ref(),
+        embedder: &embedder,
         repo_root: &state.root,
         incremental: !full,
         model_name: &state.cfg.embeddings.model,
@@ -1178,7 +1334,16 @@ fn do_index_inner(
         paths,
         exclude: &state.cfg.indexing.effective_excludes(),
         branch: target_branch.as_deref(),
+        hnsw: state
+            .cfg
+            .storage
+            .hnsw
+            .then_some(state.cfg.storage.metric.as_str()),
+        embed_fingerprint: &fingerprint,
     });
+    // Whatever the run wrote, the repo map's adjacency is of before it
+    // (DD-12): dropped on every outcome, an error included.
+    state.drop_repo_map();
     let res = run.map_err(|e| e.to_string())?;
     if res.cancelled {
         // The server is going away: say what happened and touch nothing else
@@ -1213,9 +1378,18 @@ fn do_index_inner(
         "files_pruned": res.files_pruned,
         "files_renamed": res.files_renamed,
         "files_copied": res.files_copied,
+        "files_unchanged": res.files_unchanged,
+        "chunks_reused": res.chunks_reused,
+        "edges_discarded": res.edges_discarded,
+        "edges_unresolved": res.edges_unresolved,
         "symbols": res.symbols,
         "chunks": res.chunks,
     });
+    // PLAN-009 TASK-018: the client that asked for this run decides whether
+    // to compact (never this server), from this note.
+    if let Some(note) = &res.compaction {
+        report["compaction"] = json!(note);
+    }
     if res.extractor_stale {
         report["extractor_stale"] = json!(true);
         report["hint"] = json!(
@@ -1381,6 +1555,60 @@ fn no_record_hint(indexed_branches: &[String], chosen: &BranchChoice, current: &
     }
 }
 
+/// The `compaction` block of `status` / `index_status` (PLAN-009 TASK-018):
+/// the database's note, its used and free blocks, and a hint when a
+/// compaction is owed (loud: it starts in capitals) or would give space back.
+pub fn compaction_json(store: &Store) -> serde_json::Value {
+    use devctx_store::compact::{
+        COMPACTION_META_KEY, COMPACTION_OWED_FAILED_VERIFY, COMPACTION_OWED_UPGRADE,
+    };
+    let note = store
+        .get_index_meta("", "", COMPACTION_META_KEY)
+        .ok()
+        .flatten();
+    let usage = store.block_usage();
+    let state = match note.as_deref() {
+        None => "none".to_string(),
+        Some(COMPACTION_OWED_UPGRADE) => "owed".to_string(),
+        Some(COMPACTION_OWED_FAILED_VERIFY) => COMPACTION_OWED_FAILED_VERIFY.to_string(),
+        Some(n) if n.starts_with("done:") => "done".to_string(),
+        Some(other) => other.to_string(),
+    };
+    let free_mib = usage.map(|u| (u.free * u.block_size) >> 20);
+    let file_mib = usage.map(|u| ((u.used + u.free) * u.block_size) >> 20);
+    let about = match (free_mib, file_mib) {
+        (Some(f), Some(t)) => format!(" ({f} of its {t} MiB are free space)"),
+        _ => String::new(),
+    };
+    let hint = match state.as_str() {
+        "owed" => Some(format!(
+            "COMPACTION OWED: this index was upgraded from a version without the symbol graph, \
+             and the upgrade left its file at about twice what it holds{about}. Run `devctx \
+             compact`: it stops this project's server for the few seconds the rewrite takes and \
+             needs as much free disk as the file"
+        )),
+        "owed:failed-verify" => Some(
+            "COMPACTION FAILED VERIFICATION: the last compaction's copy failed verification \
+             against the index, so it was dropped and the index left as it was. Run `devctx compact` to retry; if \
+             it fails again, report it"
+                .to_string(),
+        ),
+        _ if usage.is_some_and(|u| u.worth_compacting()) => Some(format!(
+            "the index file has free space a full run left behind{about}; `devctx compact` \
+             gives it back"
+        )),
+        _ => None,
+    };
+    json!({
+        "state": state,
+        "note": note,
+        "used_blocks": usage.map(|u| u.used),
+        "free_blocks": usage.map(|u| u.free),
+        "block_size": usage.map(|u| u.block_size),
+        "hint": hint,
+    })
+}
+
 /// `index_status` tool: report the last-indexed record for the repo/branch.
 pub fn do_index_status(state: &AppState) -> Result<String, String> {
     let store = state.open_store()?;
@@ -1411,6 +1639,7 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
         Some(r) => {
             let stale = store
                 .extractor_stale(
+                    &git.short_name(),
                     &repo_path,
                     &r.branch,
                     &devctx_index::extractor_fingerprint(),
@@ -1461,6 +1690,19 @@ pub fn do_index_status(state: &AppState) -> Result<String, String> {
     };
     // Aditive (PLAN-010 DD-1); reads state, loads nothing.
     value["memory"] = state.memory_json(&store);
+    // Aditive (PLAN-009 TASK-018). An owed compaction also leads the hint.
+    let compaction = compaction_json(&store);
+    if compaction["state"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("owed"))
+    {
+        let lead = compaction["hint"].as_str().unwrap_or_default().to_string();
+        value["hint"] = json!(match value["hint"].as_str() {
+            Some(rest) => format!("{lead}. Also: {rest}"),
+            None => lead,
+        });
+    }
+    value["compaction"] = compaction;
     Ok(value.to_string())
 }
 
@@ -1962,8 +2204,12 @@ pub fn do_recall(state: &AppState, query: &str, limit: usize) -> Result<String, 
 
 /// `graph` tool: cytoscape-shaped `{nodes, edges}` for the call-graph.
 ///
-/// A node is *external* when it is called but never defined locally (never a
-/// source). `hide_external`/`hide_synthetic` drop those before assembly.
+/// On a branch with a current symbol graph, every relation but `contains`
+/// (or only `kind`) from `live_edges`, and a node is *external* when the link
+/// pass marked an edge to it external (DD-9); edges carry `confidence` and
+/// `test`. Otherwise the 0.9.0 view over `graph_edges`, where a node is
+/// *external* when it is called but never defined locally (never a source).
+/// `hide_external`/`hide_synthetic` drop those before assembly.
 pub fn do_graph(
     state: &AppState,
     kind: Option<String>,
@@ -1974,6 +2220,21 @@ pub fn do_graph(
 ) -> Result<String, String> {
     let store = state.open_store()?;
     let chosen = pick_branch(state, &store)?;
+    let reader = lookup::Reader::of(&chosen, &store);
+    if reader == lookup::Reader::SymbolGraph {
+        let edges = store
+            .lookup_graph_view(
+                &chosen.repo,
+                &chosen.branch,
+                kind.as_deref(),
+                file.as_deref(),
+                limit,
+            )
+            .map_err(|e| e.to_string())?;
+        let mut out = lookup::graph_view(&chosen, &edges, hide_external, hide_synthetic);
+        chosen.annotate(&mut out);
+        return Ok(out.to_string());
+    }
     let (repo, branch) = (chosen.repo.clone(), chosen.branch.clone());
     let edges = store
         .graph_edges(&repo, &branch, kind.as_deref(), file.as_deref(), limit)
@@ -2044,6 +2305,9 @@ pub fn do_graph(
         "edges": out_edges,
     });
     chosen.annotate(&mut out);
+    if chosen.indexed {
+        reader.annotate(&mut out);
+    }
     Ok(out.to_string())
 }
 
@@ -4121,59 +4385,192 @@ pub fn do_memory_context(state: &AppState, scope: &str, limit: usize) -> Result<
     Ok(resp.to_string())
 }
 
-/// `impact_analysis` tool: blast radius (transitive callers/callees) of a symbol.
+/// `impact_analysis` tool: blast radius (transitive callers/callees) of a
+/// symbol, with the default filters (see [`do_impact_with`]).
 pub fn do_impact(state: &AppState, symbol: &str, depth: usize) -> Result<String, String> {
+    do_impact_with(state, symbol, depth, &ImpactQuery::default())
+}
+
+/// `impact_analysis` with its filters (PLAN-009 TASK-009, DD-11): over the
+/// symbol graph by id — `high`/`medium`, no tests, no externals, 200 nodes
+/// per direction unless `q` says otherwise, what was left out counted — or,
+/// on a branch the current extractor has not indexed, the 0.9.0 walk with a
+/// warning.
+pub fn do_impact_with(
+    state: &AppState,
+    symbol: &str,
+    depth: usize,
+    q: &ImpactQuery,
+) -> Result<String, String> {
+    // A bad filter is the caller's error, before anything is opened.
+    q.options(depth)?;
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
-    let (repo, branch) = (&chosen.repo, &chosen.branch);
-    let resolved = store
-        .resolve_symbol(repo, branch, symbol)
-        .map_err(|e| e.to_string())?;
-    let impact = store
-        .impact_analysis(repo, branch, symbol, depth)
-        .map_err(|e| e.to_string())?;
-    let to_json = |v: &[(String, usize)]| -> Vec<Value> {
-        v.iter()
-            .map(|(s, d)| json!({ "symbol": s, "depth": d }))
-            .collect()
-    };
     let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
-    // Each direction gets half the budget: a symbol with a huge upstream and a
-    // tiny downstream (or the reverse) is common, and a single shared pool
-    // would let one side starve the other silently.
-    let half = budget / 2;
-    let label = |v: &Value| {
-        v.get("symbol")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string()
+    impact::impact_on(&store, &chosen, symbol, depth, q, budget).map(|v| v.to_string())
+}
+
+/// [`do_impact_with`] for a caller that holds a store but no [`AppState`]
+/// (the local CLI): the same answer, branch fallback and warnings included.
+pub fn impact_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    symbol: &str,
+    depth: usize,
+    q: &ImpactQuery,
+) -> Result<Value, String> {
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    impact::impact_on(store, &chosen, symbol, depth, q, budget)
+}
+
+/// `traverse` tool (PLAN-009 TASK-013, DD-16): walk the symbol graph from a
+/// symbol along the relations, direction and depth `q` asks, paged; see
+/// [`TraverseQuery`]. A bad parameter is the caller's error before anything
+/// is opened; a branch without a current symbol graph is an error that asks
+/// for `devctx index --full`.
+pub fn do_traverse(state: &AppState, q: &TraverseQuery) -> Result<String, String> {
+    q.options()?;
+    let store = state.open_store()?;
+    let chosen = graph_branch(state, &store)?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    traverse::traverse_on(&store, &chosen, q, budget).map(|v| v.to_string())
+}
+
+/// [`do_traverse`] for a caller that holds a store but no [`AppState`] (the
+/// local CLI): the same answer, branch fallback included.
+pub fn traverse_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    q: &TraverseQuery,
+) -> Result<Value, String> {
+    q.options()?;
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    traverse::traverse_on(store, &chosen, q, budget)
+}
+
+/// `skeleton` tool (PLAN-009 TASK-014, DD-17): the structure of one file —
+/// its symbols with signature and `[l1-l2]`, nested by container, no bodies —
+/// from the symbol graph, within `DEVCTX_MAX_OUTPUT_TOKENS`; see
+/// [`crate::skeleton`]. A branch without a current symbol graph is an error
+/// that asks for `devctx index --full`; a file the index does not hold, an
+/// error with the nearest indexed paths.
+pub fn do_skeleton(state: &AppState, q: &crate::skeleton::SkeletonQuery) -> Result<String, String> {
+    q.validate()?;
+    let store = state.open_store()?;
+    let chosen = graph_branch(state, &store)?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    skeleton::skeleton_on(&store, &chosen, &state.root, q, budget)
+}
+
+/// [`do_skeleton`] for a caller that holds a store but no [`AppState`] (the
+/// local CLI).
+pub fn skeleton_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    q: &crate::skeleton::SkeletonQuery,
+) -> Result<String, String> {
+    q.validate()?;
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    skeleton::skeleton_on(store, &chosen, root, q, budget)
+}
+
+/// `repo_map` tool (PLAN-009 TASK-011, DD-14): the signatures of the
+/// symbols most relevant to the focus of `q`, grouped by file, within its
+/// budget; see [`RepoMapQuery`](crate::repo_map::RepoMapQuery). Ranks over
+/// the branch's adjacency, cached per index generation. A branch without a
+/// current symbol graph is an error that asks for `devctx index --full`.
+pub fn do_repo_map(state: &AppState, q: &crate::repo_map::RepoMapQuery) -> Result<String, String> {
+    q.validate()?;
+    let store = state.open_store()?;
+    let chosen = graph_branch(state, &store)?;
+    repo_map::check(&chosen, &store)?;
+    let graph = state.repo_map_graph(&store, &chosen)?;
+    Ok(repo_map::map_on(&graph, &chosen, q))
+}
+
+/// [`do_repo_map`] for a caller that holds a store but no [`AppState`] (the
+/// local CLI): the same map, read for this one call.
+pub fn repo_map_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    q: &crate::repo_map::RepoMapQuery,
+) -> Result<String, String> {
+    q.validate()?;
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    repo_map::check(&chosen, store)?;
+    let graph = repo_map::load(store, &chosen.repo, &chosen.branch)?;
+    Ok(repo_map::map_on(&graph, &chosen, q))
+}
+
+/// The centrality weight a search without a server (the CLI's local path,
+/// the TUI's local engine) applies: `weight`, only when the branch it would
+/// answer from has a current symbol graph — the rule the MCP's `search` and
+/// `build_context` follow (review of TASK-010, MINOR 1) —, else 0.
+pub fn local_centrality(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    weight: f32,
+) -> f32 {
+    let Ok(git) = GitRepo::open(root) else {
+        return 0.0;
     };
-    let (upstream, up_dropped) = fit_json_array(to_json(&impact.upstream), half, None, label);
-    let (downstream, down_dropped) = fit_json_array(to_json(&impact.downstream), half, None, label);
-    let mut out = json!({
-        "symbol": symbol,
-        "upstream": upstream,
-        "downstream": downstream,
-    });
-    // A bare name can stand for several methods, and the radius below merges
-    // them. Say so: an unannounced merge reads as one method with a wide blast
-    // radius, which is a different and much more alarming fact.
-    if let Some(names) = merged_declarations(symbol, &resolved) {
-        out["resolved_symbols"] = json!(names);
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    );
+    if chosen.indexed && lookup::Reader::of(&chosen, store) == lookup::Reader::SymbolGraph {
+        weight
+    } else {
+        0.0
     }
-    chosen.annotate(&mut out);
-    let dropped_total = up_dropped.len() + down_dropped.len();
-    if dropped_total > 0 {
-        set_budget_omitted(
-            &mut out,
-            json!({
-                "count": dropped_total,
-                "upstream": up_dropped,
-                "downstream": down_dropped,
-            }),
-        );
-    }
-    Ok(out.to_string())
 }
 
 /// The declarations a bare name was expanded into, when that is worth telling
@@ -4212,6 +4609,29 @@ pub fn do_build_context(
     include_memories: bool,
     sel: &devctx_search::KindSel,
 ) -> Result<String, String> {
+    do_build_context_with(
+        state,
+        query,
+        max_tokens,
+        include_memories,
+        sel,
+        &ContextOpts::default(),
+    )
+}
+
+/// [`do_build_context`] with what the call asks of the related section
+/// (PLAN-009 DD-15): with it on, the graph neighbors of the brief's best code
+/// hits, as signatures, after the code; off (or not asked, with
+/// [`DEFAULT_RELATED`] off), the 0.9.0 brief and no read of the graph.
+pub fn do_build_context_with(
+    state: &AppState,
+    query: &str,
+    max_tokens: usize,
+    include_memories: bool,
+    sel: &devctx_search::KindSel,
+    opts: &ContextOpts,
+) -> Result<String, String> {
+    let (related_on, hops) = opts.resolve()?;
     let mems: Vec<Value> = if include_memories {
         // Unbudgeted on purpose: `do_recall_scoped` would shrink each memory to
         // its share of the *tool's* output budget and stamp it "truncated";
@@ -4228,7 +4648,7 @@ pub fn do_build_context(
     //
     // Hybrid without building the BM25 index when it is missing (see
     // `search_items`): the first brief of a project would otherwise wait for it.
-    let (hits, fallback) = search_items(
+    let (hits, fallback, _, choice) = search_items_full(
         state,
         query,
         30,
@@ -4243,7 +4663,20 @@ pub fn do_build_context(
     let fallback_note = fallback
         .as_ref()
         .and_then(|f| fallback_note(&json!({ "branch_fallback": f.to_json() }).to_string()));
-    Ok(compose_context(
+    // Read only when the section is on, and only once the brief knows which
+    // hits it shows.
+    let neighbors = |brief: &[&Value]| -> related::Related {
+        let Some(chosen) = choice.as_ref() else {
+            return related::Related::Unavailable("not shown: no branch is indexed".into());
+        };
+        match state.open_store() {
+            Ok(store) => related::gather(&store, chosen, brief, hops),
+            Err(e) => related::Related::Unavailable(format!(
+                "not shown: the store could not be opened ({e})"
+            )),
+        }
+    };
+    Ok(compose_context_with(
         &mems,
         &hits,
         fallback_note,
@@ -4261,6 +4694,7 @@ pub fn do_build_context(
             .map(|raw| parse_memories(&raw))
             .unwrap_or_default()
         },
+        related_on.then_some(&neighbors as RelatedSource<'_>),
     ))
 }
 
@@ -4295,7 +4729,9 @@ const QUOTE_MIN_CHARS: usize = 40;
 /// comment is shortened first, the chunk is capped, and one that still does not
 /// fit is skipped — the next, smaller one may. (Stopping at the first that did
 /// not fit lost every relevant chunk behind one big one.) What did not fit is
-/// counted and named once, at the end.
+/// counted and named once, at the end. (The 0.9.0 brief, kept as the
+/// reference the tests compare [`compose_context_with`] against.)
+#[cfg(test)]
 fn compose_context(
     mems: &[Value],
     hits: &[Value],
@@ -4303,6 +4739,40 @@ fn compose_context(
     max_tokens: usize,
     include_memories: bool,
     linked: &dyn Fn(&str) -> Vec<Value>,
+) -> String {
+    compose_context_with(
+        mems,
+        hits,
+        fallback_note,
+        max_tokens,
+        include_memories,
+        linked,
+        None,
+    )
+}
+
+/// The neighbors of a brief's code, from the hits it shows (in its order).
+type RelatedSource<'a> = &'a dyn Fn(&[&Value]) -> related::Related;
+
+/// Assemble the brief, with the related section when `related` is given
+/// (PLAN-009 DD-15; see [`compose_context`] for the rest of the rules).
+///
+/// `related` reads the graph neighbors of the hits the code shows, and is
+/// called only when it is given — `None` is the 0.9.0 brief, byte for byte.
+/// The section goes after `## Code` and before "Recorded against this
+/// code", within [`related::CTX_RELATED_SHARE_PCT`] % of the budget, and
+/// takes its room from the code: the code is laid out again within what the
+/// section leaves, a neighbor of a hit that no longer fits goes with it, and
+/// the room such lines leave goes back to the code. Every line not shown and
+/// every hit pushed out is counted in the one `omitted` line.
+fn compose_context_with(
+    mems: &[Value],
+    hits: &[Value],
+    fallback_note: Option<String>,
+    max_tokens: usize,
+    include_memories: bool,
+    linked: &dyn Fn(&str) -> Vec<Value>,
+    related: Option<RelatedSource<'_>>,
 ) -> String {
     let mut out = String::new();
     let mut dropped = 0usize;
@@ -4331,40 +4801,154 @@ fn compose_context(
         }
     }
 
-    let mut code_files: Vec<String> = Vec::new();
-    let mut head = "## Code\n\n";
+    // The code, laid out within `limit` (characters of the whole brief).
+    let code_start = out.len();
     let chunk_cap = (budget / CTX_CODE_CAP_DIV).max(CTX_CODE_CAP_MIN);
-    for h in hits {
-        let file = field(h, "file");
-        // Code a memory in the brief already quotes is not worth paying for
-        // twice.
-        let quoted = field(h, "text").trim();
-        // A short hit (`}`, `use super::*;`) is "contained" in nearly any
-        // memory: only text long enough to be a quotation may suppress code.
-        if is_quotable(quoted) && memory_text.contains(quoted) {
-            continue;
+    let lay_code = |limit: usize| -> CodeLayout {
+        let mut lay = CodeLayout::default();
+        let mut head = "## Code\n\n";
+        for (i, h) in hits.iter().enumerate() {
+            let file = field(h, "file");
+            // Code a memory in the brief already quotes is not worth paying for
+            // twice.
+            let quoted = field(h, "text").trim();
+            // A short hit (`}`, `use super::*;`) is "contained" in nearly any
+            // memory: only text long enough to be a quotation may suppress code.
+            if is_quotable(quoted) && memory_text.contains(quoted) {
+                continue;
+            }
+            let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
+            let style = comment_style(field(h, "language"), file);
+            // Only code has a doc comment to shorten: a Markdown list, a YAML
+            // block or a SQL script is the content itself.
+            let text = if hit_kind(h) == devctx_core::PathKind::Code {
+                trim_leading_doc(field(h, "text"), style)
+            } else {
+                field(h, "text").to_string()
+            };
+            let body = cap_lines(&text, chunk_cap, style);
+            let piece = format!("{head}// {file}:{line}\n{body}\n\n");
+            if code_start + lay.text.len() + piece.len() > limit {
+                lay.dropped += 1;
+                continue;
+            }
+            lay.text.push_str(&piece);
+            head = "";
+            lay.shown.push(i);
+            if !lay.files.iter().any(|f| f == file) {
+                lay.files.push(file.to_string());
+            }
         }
-        let line = h.get("start_line").and_then(|v| v.as_i64()).unwrap_or(0);
-        let style = comment_style(field(h, "language"), file);
-        // Only code has a doc comment to shorten: a Markdown list, a YAML
-        // block or a SQL script is the content itself.
-        let text = if hit_kind(h) == devctx_core::PathKind::Code {
-            trim_leading_doc(field(h, "text"), style)
-        } else {
-            field(h, "text").to_string()
+        lay
+    };
+    let mut code = lay_code(budget);
+    let best = code.shown.first().copied();
+
+    // The related section (DD-15) is read from the hits the code shows and
+    // may take up to its share of the budget from the code: the code is laid
+    // out again within what the section (and the note that stands for it)
+    // leaves, and the section is re-read against that code until neither
+    // changes — it can only shrink, every line keeps its hit in the code, no
+    // line repeats code the brief shows, and the best hit is never given up
+    // for it (review of TASK-012, M1, M2, m1, m2, m3).
+    let mut related_text = String::new();
+    let mut related_note: Option<String> = None;
+    if let Some(source) = related {
+        let brief: Vec<&Value> = code.shown.iter().map(|&i| &hits[i]).collect();
+        let lines = match source(&brief) {
+            related::Related::Unavailable(why) => {
+                related_note = Some(why);
+                Vec::new()
+            }
+            related::Related::Lines(lines) if lines.is_empty() => {
+                related_note = Some(
+                    "none: no code hit of this brief has a graph neighbor that passes the \
+                     filters (high or medium confidence, no tests, no externals, not \
+                     already shown)"
+                        .into(),
+                );
+                Vec::new()
+            }
+            related::Related::Lines(mut lines) => {
+                // `hit` indexes `brief`; from here on it indexes `hits`.
+                for l in &mut lines {
+                    l.hit = code.shown[l.hit];
+                }
+                lines
+            }
         };
-        let body = cap_lines(&text, chunk_cap, style);
-        let piece = format!("{head}// {file}:{line}\n{body}\n\n");
-        if out.len() + piece.len() > budget {
-            dropped += 1;
-            continue;
-        }
-        out.push_str(&piece);
-        head = "";
-        if !code_files.iter().any(|f| f == file) {
-            code_files.push(file.to_string());
+        if !lines.is_empty() {
+            let cap = (budget * related::CTX_RELATED_SHARE_PCT / 100)
+                .min(budget.saturating_sub(code_start));
+            let read = lines.len();
+            let mut kept = lines;
+            let (mut text, _) = render_related(&kept, cap);
+            let mut went_with_hit = false;
+            while !text.is_empty() {
+                let next = lay_code(budget - text.len());
+                if next.shown.first().copied() != best {
+                    // The section would push out the best hit: no section.
+                    text.clear();
+                    kept.clear();
+                    related_note = Some(format!(
+                        "not shown: {read} neighbor(s) would push out the best hit"
+                    ));
+                    break;
+                }
+                let before = kept.len();
+                kept.retain(|l| {
+                    next.shown.contains(&l.hit)
+                        && !next
+                            .shown
+                            .iter()
+                            .any(|&i| hit_holds(&hits[i], &l.file, l.line))
+                });
+                went_with_hit |= kept.len() < before;
+                // Only ever shrinks: a line the first render cut is not let
+                // back in by the room another one left.
+                let (again, _) = render_related(&kept, text.len());
+                code = next;
+                if again.len() == text.len() {
+                    text = again;
+                    break;
+                }
+                text = again;
+            }
+            let shown_lines = if text.is_empty() {
+                0
+            } else {
+                text.lines().filter(|l| l.starts_with("- ")).count()
+            };
+            dropped += read - shown_lines;
+            if text.is_empty() && related_note.is_none() {
+                related_note = Some(if went_with_hit {
+                    format!("none shown: {read} neighbor(s) whose hits no longer fit")
+                } else {
+                    format!(
+                        "none fitted: {read} neighbor(s) over the {}% share",
+                        related::CTX_RELATED_SHARE_PCT
+                    )
+                });
+            }
+            related_text = text;
         }
     }
+    // The note is part of the brief: the code makes room for it — unless that
+    // would push out the best hit, and then it closes the brief unbudgeted,
+    // as the `omitted` line does.
+    let mut note_room = 0;
+    if let Some(note) = &related_note {
+        let room = related_note_line(note).len();
+        let relaid = lay_code(budget.saturating_sub(room));
+        if relaid.shown.first().copied() == best {
+            code = relaid;
+            note_room = room;
+        }
+    }
+    dropped += code.dropped;
+    out.push_str(&code.text);
+    out.push_str(&related_text);
+    let code_files = code.files;
 
     if include_memories {
         let mut seen: HashSet<String> = HashSet::new();
@@ -4376,7 +4960,7 @@ fn compose_context(
                 }
                 let tag = format!("memory · {} · about {file}", field(&m, "link_sources"));
                 let piece = format!("{head}{}\n\n", memory_brief(&m, &tag));
-                if out.len() + piece.len() > budget {
+                if out.len() + piece.len() + note_room > budget {
                     dropped += 1;
                 } else {
                     out.push_str(&piece);
@@ -4386,6 +4970,9 @@ fn compose_context(
         }
     }
 
+    if let Some(note) = related_note {
+        out.push_str(&related_note_line(&note));
+    }
     if dropped > 0 {
         out.push_str(&format!(
             "\n[devctx] omitted: {dropped} item(s), reason: budget ({max_tokens} tokens). \
@@ -4394,6 +4981,71 @@ fn compose_context(
     }
     close_context(&mut out, fallback_note);
     out
+}
+
+/// The line that stands for a related section there is nothing to show in.
+fn related_note_line(note: &str) -> String {
+    format!("\n{} {note}\n", related::RELATED_NOTE)
+}
+
+/// Whether hit `h` shows line `line` of `file`.
+fn hit_holds(h: &Value, file: &str, line: i32) -> bool {
+    let at = |key: &str| h.get(key).and_then(Value::as_i64).unwrap_or(0) as i32;
+    let start = at("start_line");
+    let end = at("end_line").max(start + field(h, "text").lines().count() as i32 - 1);
+    field(h, "file") == file && start <= line && line <= end
+}
+
+/// The code part of a brief as laid out within a limit.
+#[derive(Default)]
+struct CodeLayout {
+    /// The `## Code` section.
+    text: String,
+    /// Indices into the hits of the ones it shows, in order.
+    shown: Vec<usize>,
+    /// Their files, first appearance first.
+    files: Vec<String>,
+    /// Hits that did not fit.
+    dropped: usize,
+}
+
+/// The related section (DD-15): the hit each group surrounds, then one line
+/// per neighbor — relation, signature on one line, `file:line` —, within
+/// `cap` characters (the blank line that closes it included). Returns the
+/// text (empty when no line fits) and how many lines did not fit.
+fn render_related(lines: &[related::RelatedLine], cap: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut head = format!("{}\n\n", related::RELATED_HEADING);
+    let mut around: Option<&str> = None;
+    let mut dropped = 0usize;
+    for l in lines {
+        let group = if around == Some(l.around.as_str()) {
+            String::new()
+        } else {
+            format!("{}:\n", l.around)
+        };
+        let hops = if l.hops > 1 {
+            format!(" ({} hops)", l.hops)
+        } else {
+            String::new()
+        };
+        let signature = l.signature.split_whitespace().collect::<Vec<_>>().join(" ");
+        let piece = format!(
+            "{head}{group}- {}{hops} `{signature}` · {}:{}\n",
+            l.relation, l.file, l.line
+        );
+        if out.len() + piece.len() + 1 > cap {
+            dropped += 1;
+            continue;
+        }
+        out.push_str(&piece);
+        head.clear();
+        around = Some(&l.around);
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    (out, dropped)
 }
 
 fn field<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -5640,6 +6292,46 @@ fn parse_memories(raw: &str) -> Vec<Value> {
 pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<String, String> {
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
+    read_symbol_on(&store, &chosen, name, limit).map(|v| v.to_string())
+}
+
+/// `read_symbol` for the repository at `root`, for callers that hold a store
+/// but no [`AppState`] (the local CLI): the same answer the tool gives —
+/// symbol graph or 0.9.0 path, `branch_fallback`, `warning`, and on a miss
+/// `suggestions`/`external`.
+pub fn read_symbol_at(
+    store: &devctx_store::Store,
+    root: &std::path::Path,
+    default_branch: Option<&str>,
+    name: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    let git = GitRepo::open(root).map_err(|e| e.to_string())?;
+    let repo_path = git.root().to_string_lossy().into_owned();
+    let chosen = pick_graph_branch(
+        store,
+        &git.short_name(),
+        &repo_path,
+        &git.branch(),
+        default_branch,
+    )
+    .ready()?;
+    read_symbol_on(store, &chosen, name, limit)
+}
+
+/// The `read_symbol` answer on a chosen branch.
+fn read_symbol_on(
+    store: &devctx_store::Store,
+    chosen: &BranchChoice,
+    name: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    let reader = lookup::Reader::of(chosen, store);
+    if reader == lookup::Reader::SymbolGraph {
+        let mut out = lookup::read_symbol(store, chosen, name, limit)?;
+        chosen.annotate(&mut out);
+        return Ok(out);
+    }
     let found = store
         .symbol_definitions(&chosen.repo, &chosen.branch, name, limit)
         .map_err(|e| e.to_string())?;
@@ -5658,10 +6350,11 @@ pub fn do_read_symbol(state: &AppState, name: &str, limit: usize) -> Result<Stri
     if found.is_empty() {
         // Nothing to read is not the end of the answer: say what the name was
         // probably meant to be, and whether it is code this repo does not own.
-        not_found_hints(&store, &chosen.repo, &chosen.branch, name, &mut out);
+        not_found_hints(store, &chosen.repo, &chosen.branch, name, &mut out);
     }
     chosen.annotate(&mut out);
-    Ok(out.to_string())
+    reader.annotate(&mut out);
+    Ok(out)
 }
 
 /// Fields for a `read_symbol` that found no definition: `suggestions` (up to 5 —
@@ -5712,16 +6405,33 @@ fn not_found_hints(
 }
 
 /// `file::symbol` split into its two halves when the left one is a file (it has a
-/// `/`, or an extension: `links.rs`), not a module path (`devctx_store::Store`).
-fn split_file_symbol(subject: &str) -> Option<(&str, &str)> {
+/// `/`, or a language's extension: `links.rs`), not a module path
+/// (`devctx_store::Store`) nor a qualified type (`Foo.Bar::baz`).
+pub fn split_file_symbol(subject: &str) -> Option<(&str, &str)> {
     let (file, name) = subject.rsplit_once("::")?;
     if file.is_empty() || name.is_empty() || file.contains("::") && !file.contains('/') {
         return None;
     }
-    let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    let has_ext =
-        !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric());
-    (file.contains('/') || has_ext).then_some((file, name))
+    // `@scope/pkg::fn` names a package's export, not a file.
+    let path = file.contains('/') && !file.starts_with('@');
+    (path || has_file_extension(file)).then_some((file, name))
+}
+
+/// Whether `file` ends in the extension of a language the index knows
+/// (`links.rs`, `app.component.ts`, `schema.sql`), written in lowercase as
+/// files are. `Foo.Bar` is a type and its member, not the file `Foo.Bar`
+/// (pending 1 of PLAN-008): any short alphanumeric "extension" used to do.
+fn has_file_extension(file: &str) -> bool {
+    let Some((stem, ext)) = file.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !ext.is_empty()
+        && ext
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && (devctx_index::lang_for_extension(ext).is_some()
+            || devctx_index::raw_text_language(ext).is_some())
 }
 
 /// What a `memories_by_symbol` subject looks up: the name the junction holds and
@@ -6181,10 +6891,55 @@ fn value_json(v: Value, sources: &str) -> Value {
     })
 }
 
-/// `get_references` tool: all call sites of a symbol.
+/// `get_references` tool: all call sites of a symbol, with the default
+/// confidence filter (see [`do_references_with`]).
 pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
+    do_references_with(state, symbol, None, None)
+}
+
+/// `get_references` tool: all references of a symbol.
+///
+/// On a branch with a current symbol graph, one row per occurrence over
+/// `live_edges` by id, each with `confidence` and `via`; `min_confidence`
+/// (`high`/`medium`/`low`, default `medium`) decides what is listed and
+/// `below_confidence` counts what it left out; `kinds` (comma-separated, or
+/// `all`) adds relations to the default calls and instantiations. Otherwise the 0.9.0 answer
+/// from `graph_edges`, with the warning that says why.
+pub fn do_references_with(
+    state: &AppState,
+    symbol: &str,
+    min_confidence: Option<&str>,
+    kinds: Option<&str>,
+) -> Result<String, String> {
+    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    references_budgeted(state, symbol, min_confidence, kinds, budget)
+}
+
+/// [`do_references_with`] under an explicit token budget.
+fn references_budgeted(
+    state: &AppState,
+    symbol: &str,
+    min_confidence: Option<&str>,
+    kinds: Option<&str>,
+    budget: usize,
+) -> Result<String, String> {
+    let min = lookup::parse_min_confidence(min_confidence)?;
+    let kinds = lookup::parse_kinds(kinds)?;
     let store = state.open_store()?;
     let chosen = graph_branch(state, &store)?;
+    let reader = lookup::Reader::of(&chosen, &store);
+    if reader == lookup::Reader::SymbolGraph {
+        let (arr, resolved, hidden) = lookup::references(&store, &chosen, symbol, min, &kinds)?;
+        return references_answer(
+            symbol,
+            arr,
+            &resolved,
+            &chosen,
+            reader,
+            lookup::below_confidence(hidden, min),
+            budget,
+        );
+    }
     let resolved = store
         .resolve_symbol(&chosen.repo, &chosen.branch, symbol)
         .map_err(|e| e.to_string())?;
@@ -6195,17 +6950,34 @@ pub fn do_references(state: &AppState, symbol: &str) -> Result<String, String> {
         .iter()
         .map(|r| json!({ "file": r.file, "line": r.line, "source": r.source }))
         .collect();
-    let budget = env_usize("DEVCTX_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    references_answer(symbol, arr, &resolved, &chosen, reader, None, budget)
+}
+
+/// The `get_references` object, budgeted: `{symbol, references,
+/// resolved_symbols?, below_confidence?, branch_fallback?, warning?, omitted?}`.
+fn references_answer(
+    symbol: &str,
+    arr: Vec<Value>,
+    resolved: &[String],
+    chosen: &BranchChoice,
+    reader: lookup::Reader,
+    below: Option<Value>,
+    budget: usize,
+) -> Result<String, String> {
     let (kept, dropped) = fit_json_array(arr, budget, Some("source"), |v| {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
         let line = v.get("line").and_then(|l| l.as_i64()).unwrap_or(0);
         format!("{file}:{line}")
     });
     let mut out = json!({ "symbol": symbol, "references": kept });
-    if let Some(names) = merged_declarations(symbol, &resolved) {
+    if let Some(names) = merged_declarations(symbol, resolved) {
         out["resolved_symbols"] = json!(names);
     }
+    if let Some(b) = below {
+        out["below_confidence"] = b;
+    }
     chosen.annotate(&mut out);
+    reader.annotate(&mut out);
     if !dropped.is_empty() {
         set_budget_omitted(
             &mut out,
@@ -6751,6 +7523,76 @@ mod tests {
         cfg.project.path = root.to_string_lossy().into_owned();
         cfg.state_dir = root.join(".devctx/state").to_string_lossy().into_owned();
         (AppState::build(cfg).unwrap(), root)
+    }
+
+    /// PLAN-009 TASK-018 test 28: `status` tells apart a compaction owed by an
+    /// upgrade, one whose verification failed, one done, and none — each
+    /// with its own hint, the owed ones loud.
+    #[test]
+    fn status_tells_the_compaction_states_apart() {
+        let store = Store::open_in_memory(GRAPH_DIM).unwrap();
+        let key = devctx_store::compact::COMPACTION_META_KEY;
+        let none = compaction_json(&store);
+        assert_eq!(none["state"], "none", "{none}");
+        assert!(none["hint"].is_null(), "{none}");
+
+        store.set_index_meta("", "", key, "owed:upgrade").unwrap();
+        let owed = compaction_json(&store);
+        assert_eq!(owed["state"], "owed", "{owed}");
+        let h = owed["hint"].as_str().unwrap();
+        assert!(h.starts_with("COMPACTION OWED"), "{h}");
+        assert!(h.contains("devctx compact"), "{h}");
+
+        store
+            .set_index_meta("", "", key, "owed:failed-verify")
+            .unwrap();
+        let failed = compaction_json(&store);
+        assert_eq!(failed["state"], "owed:failed-verify", "{failed}");
+        let h = failed["hint"].as_str().unwrap();
+        assert!(h.contains("failed verification"), "{h}");
+        assert!(h.contains("devctx compact"), "{h}");
+
+        store
+            .set_index_meta("", "", key, "done:0.10.0:1700000000:upgrade")
+            .unwrap();
+        let done = compaction_json(&store);
+        assert_eq!(done["state"], "done", "{done}");
+        assert_eq!(done["note"], "done:0.10.0:1700000000:upgrade");
+        assert!(done["hint"].is_null(), "{done}");
+    }
+
+    /// PLAN-009 TASK-018 test 4: the server (and every tool that rebuilds its
+    /// state) refuses to open a database while a compaction holds its lock,
+    /// with the store's typed error, and opens it once the lock is released.
+    #[test]
+    fn building_the_state_is_refused_while_the_database_is_compacted() {
+        let (state, root) = lifecycle_state("compacting");
+        let cfg = state.cfg.clone();
+        drop(state);
+        // A child another test forks in this process holds a copy of a
+        // just-closed descriptor until it execs: give the lock that moment.
+        let t0 = Instant::now();
+        let held = loop {
+            if let Some(l) = devctx_store::try_lock_exclusive(&cfg.db_path()).unwrap() {
+                break l;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "nobody holds it");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let err = match AppState::build(cfg.clone()) {
+            Err(e) => e,
+            Ok(_) => panic!("built during a compaction"),
+        };
+        assert!(
+            matches!(
+                err.downcast_ref::<devctx_store::StoreError>(),
+                Some(devctx_store::StoreError::Compacting(_))
+            ),
+            "{err:#}"
+        );
+        drop(held);
+        AppState::build(cfg).expect("builds once the lock is released");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// PLAN-010 TASK-001: `memory` has its four blocks, and asking for it loads
@@ -7748,6 +8590,641 @@ mod tests {
         Vec::new()
     }
 
+    fn golden_inputs() -> (Vec<Value>, Vec<Value>) {
+        let mems = vec![ctx_mem("m1", "Decision", "we chose X\nbecause Y")];
+        let big = (0..60)
+            .map(|i| format!("    step_{i}(input);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hits = vec![
+            ctx_hit("src/a.rs", 3, "fn a() {\n    b();\n}"),
+            ctx_hit("src/big.rs", 1, &format!("fn big() {{\n{big}\n}}")),
+            ctx_hit("src/b.rs", 9, "fn b() {}"),
+        ];
+        (mems, hits)
+    }
+
+    fn golden_linked(file: &str) -> Vec<Value> {
+        if file == "src/a.rs" {
+            vec![
+                json!({ "id": "m2", "title": "About a", "content": "a is hot",
+                         "link_sources": "files-field" }),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// (e) Without the related section the brief is the 0.9.0 brief, byte for
+    /// byte (golden captured from 0.9.0's `compose_context` on this input).
+    #[test]
+    fn without_related_the_brief_is_the_old_one_byte_for_byte() {
+        let (mems, hits) = golden_inputs();
+        let note = Some("[devctx] branch_fallback: answered from main".to_string());
+        let old = compose_context(&mems, &hits, note.clone(), 120, true, &golden_linked);
+        let none = compose_context_with(&mems, &hits, note, 120, true, &golden_linked, None);
+        assert_eq!(none, old);
+        assert_eq!(old, GOLDEN_090, "{old}");
+    }
+
+    /// (e), second input (review of TASK-012, m8): a hit a memory quotes and
+    /// a long javadoc, golden captured from `compose_context` at cb350bb.
+    #[test]
+    fn without_related_a_quoted_hit_and_a_long_doc_are_the_old_brief() {
+        let quoted = "fn charge(card: &Card) -> Result<Receipt> {\n    gateway().charge(card)\n}";
+        let mems = vec![ctx_mem(
+            "m9",
+            "Why charge goes through the gateway",
+            &format!("We route it so:\n{quoted}\nand never directly."),
+        )];
+        let doc = (0..12)
+            .map(|i| format!(" * explains step {i} of the refund"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hits = vec![
+            ctx_hit("src/pay.rs", 10, quoted),
+            ctx_hit(
+                "src/Refund.java",
+                4,
+                &format!("/**\n{doc}\n */\npublic void refund() {{ undo(); }}"),
+            ),
+            ctx_hit("src/util.rs", 2, "fn undo() {}"),
+        ];
+        let out = compose_context_with(&mems, &hits, None, 300, true, &no_linked, None);
+        assert_eq!(out, GOLDEN_090_QUOTED_AND_DOC, "{out}");
+    }
+
+    const GOLDEN_090_QUOTED_AND_DOC: &str = "## What is already known\n\n[memory] m9 — Why charge goes \
+         through the gateway\nWe route it so:\nfn charge(card: &Card) -> Result<Receipt> {\n    \
+         gateway().charge(card)\n}\nand never directly.\n\n## Code\n\n// src/Refund.java:4\n/**\n * \
+         explains step 0 of the refund\n * explains step 1 of the refund\n * … (10 doc lines \
+         trimmed)\n */\npublic void refund() { undo(); }\n\n// src/util.rs:2\nfn undo() {}\n\n";
+
+    const GOLDEN_090: &str =
+        "## What is already known\n\n[memory] m1 — Decision\nwe chose X\nbecause \
+         Y\n\n## Code\n\n// src/a.rs:3\nfn a() {\n    b();\n}\n\n// src/b.rs:9\nfn b() {}\n\n\
+         ## Recorded against this code\n\n[memory · files-field · about src/a.rs] m2 — About a\n\
+         a is hot\n\n\n[devctx] omitted: 1 item(s), reason: budget (120 tokens). Raise \
+         max_tokens, or narrow the query.\n\n[devctx] branch_fallback: answered from main";
+
+    fn rel(
+        around: &str,
+        relation: &'static str,
+        sig: &str,
+        file: &str,
+        line: i32,
+    ) -> related::RelatedLine {
+        related::RelatedLine {
+            hit: 0,
+            around: around.into(),
+            relation,
+            hops: 1,
+            signature: sig.into(),
+            file: file.into(),
+            line,
+        }
+    }
+
+    fn section(out: &str) -> &str {
+        let start = out
+            .find(related::RELATED_HEADING)
+            .expect("a related section");
+        let rest = &out[start..];
+        let end = ["\n## ", "\n[devctx]"]
+            .iter()
+            .filter_map(|m| rest[1..].find(m).map(|i| i + 1))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    fn many_lines(n: usize) -> Vec<related::RelatedLine> {
+        (0..n)
+            .map(|i| {
+                rel(
+                    "Svc.run",
+                    "called by",
+                    &format!("pub fn caller_number_{i}(input: &str) -> Result<()>"),
+                    &format!("src/callers/c{i}.rs"),
+                    10 + i as i32,
+                )
+            })
+            .collect()
+    }
+
+    /// (a) The section never takes more than 20 % of the budget, and (c)
+    /// what does not fit is counted in the brief's one `omitted` line.
+    #[test]
+    fn related_keeps_to_its_share_and_counts_what_does_not_fit() {
+        let hits = vec![ctx_hit("src/svc.rs", 5, "fn run() {}")];
+        let lines = many_lines(40);
+        let source = |_: &[&Value]| related::Related::Lines(many_lines(40));
+        let out = compose_context_with(&[], &hits, None, 1000, false, &no_linked, Some(&source));
+        let sec = section(&out);
+        let cap = 1000 * CHARS_PER_TOKEN * related::CTX_RELATED_SHARE_PCT / 100;
+        assert!(sec.len() <= cap, "{} > {cap}: {out}", sec.len());
+        let shown = sec.lines().filter(|l| l.starts_with("- ")).count();
+        assert!(shown > 0 && shown < lines.len(), "{out}");
+        assert!(
+            out.contains(&format!(
+                "omitted: {} item(s), reason: budget",
+                lines.len() - shown
+            )),
+            "{out}"
+        );
+        assert_eq!(out.matches("omitted:").count(), 1, "{out}");
+    }
+
+    /// The section takes its room from the code, up to its share: a brief
+    /// whose code fills the budget still shows the neighbors, and the code
+    /// it pushed out is counted.
+    #[test]
+    fn related_takes_its_room_from_the_code() {
+        let hits: Vec<Value> = (0..20)
+            .map(|i| {
+                let body = (0..8)
+                    .map(|k| format!("    let v{k} = work_{i}_{k}(input);"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ctx_hit(
+                    &format!("src/f{i}.rs"),
+                    1,
+                    &format!("fn f{i}() {{\n{body}\n}}"),
+                )
+            })
+            .collect();
+        let off = compose_context(&[], &hits, None, 1000, false, &no_linked);
+        assert!(off.contains("omitted:"), "the code fills the budget: {off}");
+        let source = |_: &[&Value]| {
+            related::Related::Lines(
+                (0..6)
+                    .map(|k| {
+                        rel(
+                            "f0",
+                            "called by",
+                            &format!(
+                                "pub fn caller_with_a_long_name_{k}(input: &str) -> Result<()>"
+                            ),
+                            &format!("src/callers/c{k}.rs"),
+                            3,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let on = compose_context_with(&[], &hits, None, 1000, false, &no_linked, Some(&source));
+        let sec = section(&on);
+        assert_eq!(
+            sec.lines().filter(|l| l.starts_with("- ")).count(),
+            6,
+            "{on}"
+        );
+        let shown = |out: &str| {
+            out.matches("\n// src/").count() + usize::from(out.starts_with("## Code\n\n// "))
+        };
+        assert!(shown(&on) < shown(&off), "{on}");
+        let omitted = |out: &str| -> usize {
+            out.split("omitted: ")
+                .nth(1)
+                .and_then(|r| r.split(' ').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            omitted(&on),
+            omitted(&off) + (shown(&off) - shown(&on)),
+            "{on}"
+        );
+        assert!(
+            on.find("omitted:").unwrap() <= 1000 * CHARS_PER_TOKEN + 2,
+            "{on}"
+        );
+    }
+
+    /// The brief as the tests read it: everything but the closing lines
+    /// that were never budgeted (`omitted`, `branch_fallback`).
+    fn budgeted_part(out: &str) -> &str {
+        match out.find("\n[devctx] omitted:") {
+            Some(at) => &out[..at],
+            None => out,
+        }
+    }
+
+    /// A deterministic table of briefs (hit sizes, neighbors per hit,
+    /// budgets): the whole brief, the related note included, never passes the
+    /// budget (review of TASK-012, M1 and m2), and no line of the section
+    /// stands without its hit in the code (M2).
+    #[test]
+    fn related_never_passes_the_budget_and_never_shows_a_line_without_its_hit() {
+        let mut seed = 7u64;
+        let mut next = |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        for case in 0..400 {
+            let n = 2 + next(6) as usize;
+            let hits: Vec<Value> = (0..n)
+                .map(|i| {
+                    let lines = 1 + next(70) as usize;
+                    let body = (0..lines)
+                        .map(|k| format!("    step_{k}(x);"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ctx_hit(
+                        &format!("src/h{i}.rs"),
+                        1,
+                        &format!("fn h{i}() {{\n{body}\n}}"),
+                    )
+                })
+                .collect();
+            let per_hit: Vec<usize> = (0..n).map(|_| next(5) as usize).collect();
+            let width: Vec<usize> = (0..n).map(|_| 10 + next(120) as usize).collect();
+            let source = |brief: &[&Value]| {
+                let mut v = Vec::new();
+                for (b, h) in brief.iter().enumerate() {
+                    let file = field(h, "file");
+                    let i: usize = file[5..file.len() - 3].parse().unwrap();
+                    for k in 0..per_hit[i] {
+                        let mut l = rel(
+                            &format!("h{i}"),
+                            "called by",
+                            &format!("fn n{i}_{k}({})", "a".repeat(width[i])),
+                            &format!("src/n{i}_{k}.rs"),
+                            1,
+                        );
+                        l.hit = b;
+                        v.push(l);
+                    }
+                }
+                related::Related::Lines(v)
+            };
+            let max_tokens = [300usize, 500, 700, 1000, 1500][case % 5];
+            let out = compose_context_with(
+                &[],
+                &hits,
+                None,
+                max_tokens,
+                false,
+                &no_linked,
+                Some(&source),
+            );
+            let part = budgeted_part(&out);
+            assert!(
+                part.len() <= max_tokens * CHARS_PER_TOKEN,
+                "case {case}: {} > {}: {out}",
+                part.len(),
+                max_tokens * CHARS_PER_TOKEN
+            );
+            if let Some(start) = out.find(related::RELATED_HEADING) {
+                for group in out[start..]
+                    .lines()
+                    .skip(1)
+                    .take_while(|l| !l.starts_with("[devctx]") && !l.starts_with("## "))
+                    .filter(|l| l.ends_with(':') && !l.starts_with("- "))
+                {
+                    let hit = group.trim_end_matches(':');
+                    assert!(
+                        out.contains(&format!("// src/{hit}.rs:1")),
+                        "case {case}: `{group}` without its code: {out}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The review's M2 example: four hits of 1 300, 1 300, 1 260 (four
+    /// neighbors) and 80 characters (one neighbor), 1 000 tokens. No group
+    /// stands without its code, and the brief stays within the budget.
+    #[test]
+    fn a_greedy_layout_never_leaves_a_group_without_its_hit() {
+        let sized = |i: usize, n: usize| {
+            let head = format!("fn h{i}() {{\n");
+            let fill = n.saturating_sub(head.len() + 2);
+            ctx_hit(
+                &format!("src/h{i}.rs"),
+                1,
+                &format!("{head}{}\n}}", "x".repeat(fill)),
+            )
+        };
+        let hits = vec![sized(0, 1300), sized(1, 1300), sized(2, 1260), sized(3, 80)];
+        let source = |brief: &[&Value]| {
+            let mut v = Vec::new();
+            for (b, h) in brief.iter().enumerate() {
+                let name = field(h, "file")
+                    .trim_start_matches("src/")
+                    .trim_end_matches(".rs")
+                    .to_string();
+                let n = match name.as_str() {
+                    "h2" => 4,
+                    "h3" => 1,
+                    _ => 0,
+                };
+                for k in 0..n {
+                    let mut l = rel(
+                        &name,
+                        "calls",
+                        &format!("fn {name}_dep_{k}(input: &str) -> u32"),
+                        &format!("src/d{k}.rs"),
+                        1,
+                    );
+                    l.hit = b;
+                    v.push(l);
+                }
+            }
+            related::Related::Lines(v)
+        };
+        let out = compose_context_with(&[], &hits, None, 1000, false, &no_linked, Some(&source));
+        assert!(budgeted_part(&out).len() <= 4000, "{out}");
+        for name in ["h2", "h3"] {
+            if out.contains(&format!("\n{name}:\n")) {
+                assert!(
+                    out.contains(&format!("// src/{name}.rs:1")),
+                    "{name} without its code: {out}"
+                );
+            }
+        }
+    }
+
+    /// m1: the section never pushes the best hit out of a small brief.
+    #[test]
+    fn related_never_pushes_out_the_best_hit() {
+        let best = (0..60)
+            .map(|k| format!("    step_{k}(x);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hits = vec![ctx_hit(
+            "src/best.rs",
+            1,
+            &format!("fn best() {{\n{best}\n}}"),
+        )];
+        let off = compose_context(&[], &hits, None, 170, false, &no_linked);
+        assert!(off.contains("src/best.rs:1"), "{off}");
+        let source = |_: &[&Value]| {
+            related::Related::Lines(
+                (0..4)
+                    .map(|k| {
+                        rel(
+                            "best",
+                            "called by",
+                            &format!("fn c{k}()"),
+                            &format!("src/c{k}.rs"),
+                            1,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let on = compose_context_with(&[], &hits, None, 170, false, &no_linked, Some(&source));
+        assert!(on.contains("src/best.rs:1"), "the best hit stays: {on}");
+        assert!(!on.contains(related::RELATED_HEADING), "{on}");
+        assert!(on.contains("would push out the best hit"), "{on}");
+        // The note closes the brief unbudgeted here, as `omitted` does: the
+        // rest keeps to the budget.
+        let note = on.find("\n[devctx] related:").expect("the note");
+        assert!(on[..note].len() <= 680, "{on}");
+    }
+
+    /// A section that shrinks because a hit left with its lines gives that
+    /// room back, and the hit comes back (without its lines: they were cut).
+    #[test]
+    fn a_section_that_shrinks_gives_the_room_back() {
+        let a = ctx_hit("src/a.rs", 1, "fn a() {}");
+        let b = ctx_hit("src/b.rs", 1, &"y".repeat(300));
+        let probe = compose_context(
+            &[],
+            &[a.clone(), ctx_hit("src/f.rs", 1, ""), b.clone()],
+            None,
+            250,
+            false,
+            &no_linked,
+        );
+        let slack = 120;
+        let pad = 250 * CHARS_PER_TOKEN - probe.len() - slack;
+        assert!(pad < 600, "the filler is not capped: {pad}");
+        let hits = vec![a, ctx_hit("src/f.rs", 1, &"x".repeat(pad)), b];
+        let off = compose_context(&[], &hits, None, 250, false, &no_linked);
+        assert!(
+            off.contains("src/b.rs:1") && !off.contains("omitted"),
+            "{off}"
+        );
+        let source = |brief: &[&Value]| {
+            let mut v = Vec::new();
+            for (k, h) in brief.iter().enumerate() {
+                let name = match field(h, "file") {
+                    "src/a.rs" => "a",
+                    "src/b.rs" => "b",
+                    _ => continue,
+                };
+                let mut l = rel(
+                    name,
+                    "called by",
+                    &format!("fn caller_of_{name}_with_a_long_name()"),
+                    &format!("src/c_{name}.rs"),
+                    1,
+                );
+                l.hit = k;
+                v.push(l);
+            }
+            related::Related::Lines(v)
+        };
+        let on = compose_context_with(&[], &hits, None, 250, false, &no_linked, Some(&source));
+        assert!(on.contains("src/b.rs:1"), "b got its room back: {on}");
+        let sec = section(&on);
+        assert!(
+            sec.contains("src/c_a.rs:1") && !sec.contains("src/c_b.rs"),
+            "{on}"
+        );
+        assert!(budgeted_part(&on).len() <= 1000, "{on}");
+    }
+
+    /// m2: the line that stands for a missing section is part of the
+    /// budget: the code makes room for it (here the second hit goes).
+    #[test]
+    fn the_related_note_is_part_of_the_budget() {
+        let second = ctx_hit("src/second.rs", 1, &"y".repeat(560));
+        let probe = compose_context(
+            &[],
+            &[ctx_hit("src/first.rs", 1, ""), second.clone()],
+            None,
+            300,
+            false,
+            &no_linked,
+        );
+        let pad = 300 * CHARS_PER_TOKEN - probe.len() - 30;
+        let hits = vec![ctx_hit("src/first.rs", 1, &"x".repeat(pad)), second];
+        let off = compose_context(&[], &hits, None, 300, false, &no_linked);
+        assert!(off.contains("src/second.rs:1"), "{off}");
+        let stale = |_: &[&Value]| related::Related::Unavailable("not shown: stale index".into());
+        let on = compose_context_with(&[], &hits, None, 300, false, &no_linked, Some(&stale));
+        assert!(
+            on.contains("[devctx] related: not shown: stale index"),
+            "{on}"
+        );
+        assert!(budgeted_part(&on).len() <= 1200, "{on}");
+        assert!(
+            !on.contains("src/second.rs:1") && on.contains("omitted: 1 item(s)"),
+            "{on}"
+        );
+    }
+
+    /// m3: a neighbor whose definition a hit of the final code shows is not
+    /// repeated in the section, even when the first layout did not show it.
+    #[test]
+    fn a_neighbor_the_final_code_shows_is_not_repeated() {
+        let hits = vec![
+            ctx_hit("src/a.rs", 1, "fn a() {\n    b();\n}"),
+            json!({ "file": "src/b.rs", "start_line": 1, "end_line": 3, "text": "fn b() {\n    work();\n}" }),
+        ];
+        let source = |_: &[&Value]| {
+            related::Related::Lines(vec![
+                rel("a", "calls", "fn b()", "src/b.rs", 1),
+                rel("a", "called by", "fn main()", "src/main.rs", 1),
+            ])
+        };
+        let out = compose_context_with(&[], &hits, None, 4096, false, &no_linked, Some(&source));
+        let sec = section(&out);
+        assert!(!sec.contains("src/b.rs:1"), "{out}");
+        assert!(sec.contains("src/main.rs:1"), "{out}");
+    }
+
+    /// A neighbor of a hit the section pushed out of the code goes with it,
+    /// and its room goes back to the code.
+    #[test]
+    fn a_neighbor_of_a_hit_pushed_out_goes_with_it() {
+        let big = (0..60)
+            .map(|k| format!("    step_{k}(input);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let big = ctx_hit("src/big.rs", 1, &format!("fn big() {{\n{big}\n}}"));
+        // The first hit fills the budget but for 90 characters: room for the
+        // note, not for the section.
+        let probe = compose_context(
+            &[],
+            &[ctx_hit("src/a.rs", 1, ""), big.clone()],
+            None,
+            300,
+            false,
+            &no_linked,
+        );
+        let pad = 300 * CHARS_PER_TOKEN - probe.len() - 90;
+        let hits = vec![ctx_hit("src/a.rs", 1, &"x".repeat(pad)), big];
+        let off = compose_context(&[], &hits, None, 300, false, &no_linked);
+        assert!(
+            off.contains("src/big.rs:1") && !off.contains("omitted"),
+            "{off}"
+        );
+        let source = |_: &[&Value]| {
+            let mut l = rel(
+                "big",
+                "called by",
+                "pub fn main_entry_point_of_the_program(args: Vec<String>) -> ExitCode",
+                "src/main.rs",
+                3,
+            );
+            l.hit = 1;
+            related::Related::Lines(vec![l])
+        };
+        let on = compose_context_with(&[], &hits, None, 300, false, &no_linked, Some(&source));
+        assert!(!on.contains(related::RELATED_HEADING), "{on}");
+        assert!(
+            on.contains("src/big.rs:1"),
+            "the code got its room back: {on}"
+        );
+        assert!(on.contains("[devctx] related: none shown"), "{on}");
+        assert!(
+            on.contains("omitted: 1 item(s)"),
+            "the line is counted: {on}"
+        );
+    }
+
+    /// (b) After `## Code`, before "Recorded against this code".
+    #[test]
+    fn related_goes_between_the_code_and_the_linked_memories() {
+        let (_, hits) = golden_inputs();
+        let source = |_: &[&Value]| {
+            related::Related::Lines(vec![rel("a", "calls", "fn c()", "src/c.rs", 9)])
+        };
+        let out = compose_context_with(&[], &hits, None, 4096, true, &golden_linked, Some(&source));
+        let code = out.find("## Code").expect("code");
+        let rel_at = out.find(related::RELATED_HEADING).expect("related");
+        let linked = out.find("## Recorded against this code").expect("linked");
+        assert!(code < rel_at && rel_at < linked, "{out}");
+    }
+
+    /// (d) Never a body: each line is the relation, the signature on one
+    /// line and `file:line`, under the name of the hit it surrounds.
+    #[test]
+    fn related_lines_are_a_signature_a_relation_and_a_place() {
+        let hits = vec![ctx_hit("src/svc.rs", 5, "fn run() {}")];
+        let mut two = rel(
+            "Svc.run",
+            "calls",
+            "fn helper(\n    a: u32,\n) -> u32",
+            "src/h.rs",
+            8,
+        );
+        two.hops = 2;
+        let source = move |_: &[&Value]| {
+            related::Related::Lines(vec![
+                rel("Svc.run", "called by", "pub fn main()", "src/main.rs", 3),
+                two.clone(),
+                rel("Other.go", "implements", "pub trait Runner", "src/r.rs", 1),
+            ])
+        };
+        let out = compose_context_with(&[], &hits, None, 4096, false, &no_linked, Some(&source));
+        let sec = section(&out);
+        let body: Vec<&str> = sec.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            body,
+            vec![
+                related::RELATED_HEADING,
+                "Svc.run:",
+                "- called by `pub fn main()` · src/main.rs:3",
+                "- calls (2 hops) `fn helper( a: u32, ) -> u32` · src/h.rs:8",
+                "Other.go:",
+                "- implements `pub trait Runner` · src/r.rs:1",
+            ],
+            "{out}"
+        );
+    }
+
+    /// The section is read from the hits the brief shows, in its order: a
+    /// hit the budget left out is not a seed.
+    #[test]
+    fn related_reads_the_hits_the_brief_shows() {
+        let huge = "x".repeat(5000);
+        let hits = vec![
+            ctx_hit("src/a.rs", 1, "fn a() {}"),
+            ctx_hit("src/huge.rs", 1, &huge),
+            ctx_hit("src/b.rs", 2, "fn b() {}"),
+        ];
+        let seen = std::cell::RefCell::new(Vec::new());
+        let source = |brief: &[&Value]| {
+            seen.borrow_mut()
+                .extend(brief.iter().map(|h| field(h, "file").to_string()));
+            related::Related::Lines(Vec::new())
+        };
+        compose_context_with(&[], &hits, None, 100, false, &no_linked, Some(&source));
+        assert_eq!(*seen.borrow(), vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    /// No section to show is said, never left as silence: a branch without a
+    /// current graph names why, and so does a brief with no neighbor.
+    #[test]
+    fn no_related_section_says_why() {
+        let hits = vec![ctx_hit("src/svc.rs", 5, "fn run() {}")];
+        let stale = |_: &[&Value]| related::Related::Unavailable("not shown: stale".into());
+        let out = compose_context_with(&[], &hits, None, 4096, false, &no_linked, Some(&stale));
+        assert!(!out.contains(related::RELATED_HEADING), "{out}");
+        assert!(out.contains("[devctx] related: not shown: stale"), "{out}");
+        let none = |_: &[&Value]| related::Related::Lines(Vec::new());
+        let out = compose_context_with(&[], &hits, None, 4096, false, &no_linked, Some(&none));
+        assert!(!out.contains(related::RELATED_HEADING), "{out}");
+        assert!(out.contains(related::RELATED_NOTE), "{out}");
+    }
+
     /// A first hit bigger than the whole budget no longer ends the brief: the
     /// smaller hits behind it that fit are still delivered, and the one that
     /// could not be is counted.
@@ -7992,6 +9469,145 @@ mod tests {
             all: code,
             defines: None,
         }
+    }
+
+    /// PLAN-009 TASK-012, DD-18: the group selection as it is and with the
+    /// experimental bonus for the rank of the symbol a member defines, over
+    /// members whose servers run. A measurement, not a check (ignored):
+    /// `DEVCTX_GROUP_EVAL_MEMBERS` = `name=path;…` (indexed checkouts with a
+    /// running `devctx serve`), `DEVCTX_GROUP_EVAL_CASES` = a file of
+    /// `query | expected member` lines. The variant adds, to a member that
+    /// defines an identifier of the query, `PICK_MARGIN` × the percentile of
+    /// the best rank among that identifier's definitions in its branch (read
+    /// from a copy of its database), on top of today's `PICK_MARGIN`. Prints
+    /// one row per case.
+    #[test]
+    #[ignore]
+    fn group_pick_rank_variant_eval() {
+        let members: Vec<ProjectRow> = std::env::var("DEVCTX_GROUP_EVAL_MEMBERS")
+            .expect("DEVCTX_GROUP_EVAL_MEMBERS")
+            .split(';')
+            .filter(|x| !x.trim().is_empty())
+            .map(|pair| {
+                let (name, path) = pair.split_once('=').expect("name=path");
+                let path = PathBuf::from(path.trim());
+                ProjectRow {
+                    name: name.trim().into(),
+                    path: path.clone(),
+                    group: Some("eval".into()),
+                    embed_dim: 384,
+                    embed_model: "ml-granite".into(),
+                    last_indexed_at: 1,
+                    config_path: path.join(".devctx/config.yaml"),
+                    db_path: path.join(".devctx/state/index.duckdb"),
+                    description: String::new(),
+                }
+            })
+            .collect();
+        let cases = std::fs::read_to_string(
+            std::env::var("DEVCTX_GROUP_EVAL_CASES").expect("DEVCTX_GROUP_EVAL_CASES"),
+        )
+        .unwrap();
+        let tmp = std::env::temp_dir().join(format!("group_eval_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // The percentile of the best rank among a name's definitions, per
+        // member, from a copy of its database (its server holds the file).
+        let pct_of = |m: &ProjectRow, name: &str| -> f64 {
+            let copy = tmp.join(format!("{}.duckdb", m.name));
+            if !copy.exists() {
+                std::fs::copy(&m.db_path, &copy).unwrap();
+                let wal = m.db_path.with_extension("duckdb.wal");
+                if wal.exists() {
+                    std::fs::copy(&wal, copy.with_extension("duckdb.wal")).unwrap();
+                }
+            }
+            let store = Store::open(&copy, 384).unwrap();
+            let git = GitRepo::open(&m.path).unwrap();
+            let repo = git.short_name();
+            let root = git.root().to_string_lossy().into_owned();
+            let branch = store
+                .indexed_branches(&root)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let syms = store.map_symbols(&repo, &branch).unwrap();
+            let ranked: Vec<f64> = syms.iter().filter_map(|s| s.rank).collect();
+            let best = syms
+                .iter()
+                .filter(|s| s.name == name && s.kind != "file")
+                .filter_map(|s| s.rank)
+                .fold(None, |a: Option<f64>, r| Some(a.map_or(r, |a| a.max(r))));
+            match best {
+                Some(r) if !ranked.is_empty() => {
+                    ranked.iter().filter(|x| **x < r).count() as f64 / ranked.len() as f64
+                }
+                _ => 0.0,
+            }
+        };
+        let sel = devctx_search::KindSel::default();
+        let penalty = devctx_core::KindPenalty::default();
+        println!("case | expected | today | today ambiguous | variant | variant ambiguous");
+        for (i, line) in cases
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .enumerate()
+        {
+            let (query, expected) = line.rsplit_once('|').expect("query | member");
+            let (query, expected) = (query.trim(), expected.trim());
+            let mut idents = devctx_search::identifier_tokens(query);
+            idents.truncate(PICK_IDENT_TOKENS);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let outcomes: Vec<(String, MemberOutcome)> = members
+                .iter()
+                .map(|m| {
+                    (
+                        m.name.clone(),
+                        score_member(m, query, &sel, &idents, &penalty, deadline),
+                    )
+                })
+                .collect();
+            let today = choose_member(outcomes.clone(), None, &[]).unwrap();
+            let variant_outcomes: Vec<(String, MemberOutcome)> = outcomes
+                .into_iter()
+                .map(|(name, o)| match o {
+                    MemberOutcome::Scored {
+                        code,
+                        all,
+                        defines: Some(t),
+                    } => {
+                        let m = members.iter().find(|m| m.name == name).unwrap();
+                        let extra = PICK_MARGIN * pct_of(m, &t);
+                        let up = |x: f64| if x > 0.0 { x + extra } else { x };
+                        (
+                            name,
+                            MemberOutcome::Scored {
+                                code: up(code),
+                                all: up(all),
+                                defines: Some(t),
+                            },
+                        )
+                    }
+                    other => (name, other),
+                })
+                .collect();
+            let variant = choose_member(variant_outcomes, None, &[]).unwrap();
+            let amb = |p: &GroupPick| {
+                p.warning
+                    .as_deref()
+                    .is_some_and(|w| w.contains("ambiguous"))
+            };
+            println!(
+                "{} | {expected} | {} | {} | {} | {} | {}",
+                i + 1,
+                today.member,
+                amb(&today),
+                variant.member,
+                amb(&variant),
+                today.label
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Group selection: a query that only matches the non-default member
@@ -9571,6 +11187,14 @@ mod tests {
                 )
                 .unwrap();
         }
+        check_read_symbol_not_found_suggests_and_marks_external(&state);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The asserts of [`read_symbol_not_found_suggests_and_marks_external`], shared with the variant over a real
+    /// index (`state::lookup::tests`): the 0.9.0 contract on both paths.
+    #[allow(clippy::needless_borrow)] // the asserts are the original ones, verbatim
+    pub(super) fn check_read_symbol_not_found_suggests_and_marks_external(state: &AppState) {
         let typo: Value =
             serde_json::from_str(&do_read_symbol(&state, "AuthServce", 5).unwrap()).unwrap();
         assert!(typo["definitions"].as_array().unwrap().is_empty());
@@ -9592,7 +11216,6 @@ mod tests {
         let found: Value =
             serde_json::from_str(&do_read_symbol(&state, "greet", 5).unwrap()).unwrap();
         assert!(found.get("suggestions").is_none() && found.get("external").is_none());
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// Fixup L (B2/B3): a qualified library call is external too (the edge may
@@ -9644,6 +11267,16 @@ mod tests {
                 )
                 .unwrap();
         }
+        check_qualified_externals_are_found_and_get_no_noisy_suggestions(&state);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The asserts of [`qualified_externals_are_found_and_get_no_noisy_suggestions`], shared with the variant over a real
+    /// index (`state::lookup::tests`): the 0.9.0 contract on both paths.
+    #[allow(clippy::needless_borrow)] // the asserts are the original ones, verbatim
+    pub(super) fn check_qualified_externals_are_found_and_get_no_noisy_suggestions(
+        state: &AppState,
+    ) {
         let read = |n: &str| -> Value {
             serde_json::from_str(&do_read_symbol(&state, n, 5).unwrap()).unwrap()
         };
@@ -9672,7 +11305,6 @@ mod tests {
             v["suggestions"].to_string().contains("build_context"),
             "{v}"
         );
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// Small functions are indexed together, under a symbol that lists them
@@ -9738,6 +11370,14 @@ mod tests {
                 )
                 .unwrap();
         }
+        check_a_grouped_small_function_is_found_not_external(&state);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The asserts of [`a_grouped_small_function_is_found_not_external`], shared with the variant over a real
+    /// index (`state::lookup::tests`): the 0.9.0 contract on both paths.
+    #[allow(clippy::needless_borrow)] // the asserts are the original ones, verbatim
+    pub(super) fn check_a_grouped_small_function_is_found_not_external(state: &AppState) {
         for name in ["get_age", "hidden_getter"] {
             let v: Value = serde_json::from_str(&do_read_symbol(&state, name, 5).unwrap()).unwrap();
             assert!(v.get("external").is_none(), "{name}: {v}");
@@ -9749,7 +11389,6 @@ mod tests {
         assert_eq!(v["external"], true, "{v}");
         let step = v["next_step"].as_str().unwrap();
         assert!(step.contains("no indexed definition"), "{step}");
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     fn choice(branch: &str, indexed: bool) -> BranchChoice {
@@ -10218,5 +11857,64 @@ mod tests {
         assert_eq!(first, ["m0", "m1", "m2", "m3", "m4"]);
         assert_eq!(second, ["m5", "m6", "m7", "m8", "m9"]);
         assert_eq!(third, ["m10", "m11"]);
+    }
+    /// PLAN-009 TASK-002 Paso 7: an index built through the serve path
+    /// (`do_index`) ends with the HNSW index when `storage.hnsw` is on. Before,
+    /// only the direct CLI created it, so autoserve searched by full scan.
+    #[test]
+    fn do_index_leaves_an_hnsw_index_when_the_config_wants_one() {
+        struct Fake(usize);
+        impl EmbeddingProvider for Fake {
+            fn embed(&self, texts: &[String]) -> devctx_embed::Result<Vec<Vec<f32>>> {
+                Ok(texts
+                    .iter()
+                    .map(|t| {
+                        (0..self.0)
+                            .map(|j| ((t.len() + j) % 10) as f32 / 10.0)
+                            .collect()
+                    })
+                    .collect())
+            }
+            fn dimension(&self) -> usize {
+                self.0
+            }
+            fn model_name(&self) -> &str {
+                "fake"
+            }
+        }
+        // VSS unavailable (offline): nothing to assert.
+        if !Store::open_in_memory(3)
+            .unwrap()
+            .enable_hnsw("cosine")
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let repo = std::env::temp_dir().join(format!("devctx_mcp_hnsw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.rs"), "pub fn greet() {}\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-q", "-m", "init"]);
+
+        let mut cfg = ProjectConfig::default();
+        cfg.project.path = repo.to_string_lossy().into_owned();
+        cfg.state_dir = repo.join("state").to_string_lossy().into_owned();
+        assert!(cfg.storage.hnsw, "HNSW is on by default");
+        let state = AppState::build(cfg).unwrap();
+        let dim = configured_dimension(&state.cfg);
+        *state.embedder.lock().unwrap() = Some(Cached {
+            value: Arc::new(Fake(dim)),
+            last_used: Instant::now(),
+            key: "fake/fake".into(),
+            loaded_at: procmem::unix_now(),
+        });
+
+        do_index(&state, false).unwrap();
+        let store = state.open_store().unwrap();
+        let v = state.memory_json(&store);
+        assert_eq!(v["hnsw"]["present"], true, "{v}");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

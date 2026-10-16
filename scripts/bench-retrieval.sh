@@ -28,6 +28,8 @@ import sys, json
 want = sys.argv[1]
 try: hits = json.load(sys.stdin)
 except Exception: print('err'); raise SystemExit
+# 0.9.0 wraps the rows in {"results": [...]}; older builds print the bare array.
+if isinstance(hits, dict): hits = hits.get('results', hits.get('hits', []))
 for i, h in enumerate(hits, 1):
     if want in h['file']:
         print(i); break

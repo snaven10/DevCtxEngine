@@ -80,14 +80,17 @@ impact_analysis("processPayment")
 Llamadores y llamados transitivos. Los llamadores te dicen qué podría romper un
 cambio; los llamados te dicen de qué depende esto para funcionar.
 
-**Leé la primera línea.** El grafo se indexa por nombre calificado, así que un
-`processPayment` pelado se expande a cada `Clase.processPayment` y el reporte
-dice cuáles fundió. Varias declaraciones significa que el radio es la unión de
-todas — preguntá con el nombre calificado para acotarlo.
+**Leé la primera línea.** Un `processPayment` pelado significa cada símbolo del
+repositorio con ese nombre, y el reporte dice cuáles representó. Varias
+declaraciones significa que el radio es la unión de todas — preguntá con el
+nombre calificado para acotarlo. Leé también los conteos: lo que los defaults
+dejaron afuera (tests, llamadas a librerías, llamadas que el índice no pudo
+decidir) se cuenta, no se muestra.
 
 **El vacío sigue sin ser prueba.** Un reporte limpio significa "no encontré",
-nunca "no hay": el despacho dinámico no deja arista, solo 7 lenguajes las
-producen, y un índice desactualizado se ve idéntico a código ausente.
+nunca "no hay": una llamada por un callback o por reflexión no deja arista, solo
+7 lenguajes las producen, y un índice desactualizado se ve idéntico a código
+ausente.
 
 ## Paso 6 — Antes de concluir que el código está mal
 

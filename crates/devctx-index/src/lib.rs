@@ -7,17 +7,25 @@
 //! matches an already-indexed branch are copied rather than re-embedded.
 //! See `docs/architecture-spec.md` §9.
 
+mod env;
 pub mod error;
 pub mod git;
 pub mod id;
+mod link;
+mod pagerank;
 pub mod pipeline;
+mod tsconfig;
 
-pub use devctx_parse::extractor_fingerprint;
+pub use devctx_parse::{
+    extractor_fingerprint, lang_for_extension, leading_annotations, raw_text_language,
+};
 pub use error::{IndexError, Result};
 pub use git::{Change, GitRepo, GitState};
 pub use id::chunk_id;
+pub use pagerank::{PageRankRun, RankMatrix};
 pub use pipeline::{
-    run, IndexRequest, IndexResult, ProgressSink, PENDING_FTS_META_KEY, PENDING_HNSW_META_KEY,
+    run, IndexRequest, IndexResult, ProgressSink, GENERATION_META_KEY, PENDING_FTS_META_KEY,
+    PENDING_HNSW_META_KEY,
 };
 
 #[cfg(test)]
@@ -97,6 +105,8 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap()
@@ -112,6 +122,8 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: Some(branch),
         })
         .unwrap()
@@ -236,6 +248,8 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: Some("main"),
         })
         .unwrap();
@@ -253,6 +267,8 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: Some("feature"),
         })
         .unwrap();
@@ -281,8 +297,9 @@ mod tests {
         // The pass that used to fail.
         let second = index_branch(&store, &dir, "feature", true);
         assert_eq!(
-            second.files_indexed, first.files_indexed,
-            "a repeat of the same work must produce the same result"
+            second.files_indexed + second.files_unchanged,
+            first.files_indexed,
+            "a repeat of the same work must cover the same files"
         );
 
         // And it is a replacement, not an accumulation.
@@ -312,12 +329,14 @@ mod tests {
         assert_eq!(main.files_copied, 0, "stale rows must not be copied");
         assert!(!main.extractor_stale);
         let now = extractor_fingerprint();
-        assert!(!store.extractor_stale(&repo_path, "main", &now).unwrap());
+        assert!(!store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, "main", &now)
+            .unwrap());
 
         // Control: main is now fresh, so a fresh branch may copy from it.
-        store
-            .set_index_meta(&repo_path, "feature", "extractor", &now)
-            .unwrap();
+        // (Dropped first: a branch that already holds the file copies nothing.)
+        let repo = dir.file_name().unwrap().to_string_lossy().to_string();
+        store.drop_branch(&repo, &repo_path, "feature").unwrap();
         let again = index_branch(&store, &dir, "feature", true);
         assert!(
             again.files_copied > 0,
@@ -383,7 +402,13 @@ mod tests {
                     "a.py",
                     &hash_a,
                     "main",
-                    &extractor_fingerprint()
+                    &devctx_store::CopySetup {
+                        repo: &repo_short_of(&dir),
+                        extractor: &extractor_fingerprint(),
+                        embed_fp: "test-fp",
+                        model_name: "minilm-l6",
+                        dimension: DIM as i64
+                    }
                 )
                 .unwrap(),
             None,
@@ -400,7 +425,13 @@ mod tests {
                     "a.py",
                     &hash_a,
                     "feature",
-                    &extractor_fingerprint()
+                    &devctx_store::CopySetup {
+                        repo: &repo_short_of(&dir),
+                        extractor: &extractor_fingerprint(),
+                        embed_fp: "test-fp",
+                        model_name: "minilm-l6",
+                        dimension: DIM as i64
+                    }
                 )
                 .unwrap()
                 .as_deref(),
@@ -456,6 +487,8 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: Some("no-such-branch"),
         })
         .unwrap_err();
@@ -557,12 +590,18 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
 
         assert!(r2.full_reindex);
-        assert_eq!(r2.files_indexed, 1, "only a.rs remains");
+        assert_eq!(
+            r2.files_indexed + r2.files_unchanged,
+            1,
+            "only a.rs remains"
+        );
         assert_eq!(r2.files_pruned, 1, "b.rs should be pruned");
 
         let b_hits = store
@@ -596,7 +635,9 @@ mod tests {
         let branch = r1.branch.clone();
         let now = extractor_fingerprint();
         assert!(
-            !store.extractor_stale(&repo_path, &branch, &now).unwrap(),
+            !store
+                .extractor_stale(&repo_short_of(&dir), &repo_path, &branch, &now)
+                .unwrap(),
             "a fresh index carries the current extractor"
         );
         assert!(!r1.extractor_stale);
@@ -605,13 +646,17 @@ mod tests {
         store
             .set_index_meta(&repo_path, &branch, "extractor", "v0-old")
             .unwrap();
-        assert!(store.extractor_stale(&repo_path, &branch, &now).unwrap());
+        assert!(store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, &branch, &now)
+            .unwrap());
         write(&dir, "b.rs", "pub fn b() -> i32 { 2 }\n");
         commit_all(&dir, "add b");
         let r2 = index(&store, &dir);
         assert!(!r2.full_reindex);
         assert!(r2.extractor_stale, "an incremental run must not hide it");
-        assert!(store.extractor_stale(&repo_path, &branch, &now).unwrap());
+        assert!(store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, &branch, &now)
+            .unwrap());
 
         let r3 = run(IndexRequest {
             store: &store,
@@ -622,11 +667,15 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
         assert!(r3.full_reindex && !r3.extractor_stale);
-        assert!(!store.extractor_stale(&repo_path, &branch, &now).unwrap());
+        assert!(!store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, &branch, &now)
+            .unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -717,6 +766,8 @@ mod tests {
             progress: None,
             paths: Some(paths),
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap()
@@ -839,6 +890,8 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -921,6 +974,8 @@ mod tests {
             progress: None,
             paths: None,
             exclude,
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap()
@@ -996,6 +1051,8 @@ mod tests {
             progress: None,
             paths: None,
             exclude: &["legacy/".to_string()],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -1217,6 +1274,8 @@ mod tests {
             progress: Some(sink),
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap()
@@ -1401,6 +1460,10 @@ mod tests {
         }
     }
 
+    fn repo_short_of(dir: &Path) -> String {
+        GitRepo::open(dir).unwrap().short_name()
+    }
+
     fn repo_path_of(dir: &Path) -> String {
         GitRepo::open(dir)
             .unwrap()
@@ -1556,6 +1619,8 @@ mod tests {
             progress: Some(&sink),
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .expect_err("the first write after the freeze must fail the run");
@@ -1741,6 +1806,8 @@ mod tests {
             progress: Some(&sink),
             paths: None,
             exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
             branch: None,
         })
         .unwrap();
@@ -1763,5 +1830,3115 @@ mod tests {
         assert!(!res.cancelled && !res.full_reindex, "{res:?}");
         assert_eq!(indexed_files(&store).len(), 5);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ---- vector reuse by content hash (PLAN-009 TASK-002) -------------------
+
+    /// One run with the counting embedder, `full` or incremental, under `model`.
+    fn run_counting(store: &Store, root: &Path, full: bool, model: &str) -> (IndexResult, usize) {
+        let emb = CountingEmbedder(std::sync::atomic::AtomicUsize::new(0));
+        let res = run(IndexRequest {
+            store,
+            embedder: &emb,
+            repo_root: root,
+            incremental: !full,
+            model_name: model,
+            progress: None,
+            paths: None,
+            exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
+            branch: None,
+        })
+        .unwrap();
+        (res, emb.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Three functions, each far above the minimum chunk size so none merges
+    /// into its neighbour; `beta_ret` is what the middle one returns.
+    fn three_functions(beta_ret: &str) -> String {
+        let body = |name: &str, ret: &str| {
+            let pad: String = (0..12)
+                .map(|i| format!("    step_{i} = compute_value_{name}({i}) + {i}\n"))
+                .collect();
+            format!("def {name}():\n{pad}    return {ret}\n")
+        };
+        format!(
+            "{}\n\n{}\n\n{}",
+            body("alpha", "1"),
+            body("beta", beta_ret),
+            body("gamma", "3")
+        )
+    }
+
+    fn reuse_repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("devctx_reuse_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write(&dir, "m.py", &three_functions("2"));
+        commit_all(&dir, "init");
+        dir
+    }
+
+    /// Every vector of `file`, keyed by chunk hash.
+    fn vectors_of(
+        store: &Store,
+        root: &Path,
+        file: &str,
+    ) -> std::collections::HashMap<String, Vec<f32>> {
+        let git = crate::git::GitRepo::open(root).unwrap();
+        store
+            .vectors_by_hash(&git.short_name(), &git.state().branch, file)
+            .unwrap()
+    }
+
+    /// `--full` over identical source (the rollout `EXTRACTOR_VERSION` forces)
+    /// must not pay for the embedder again, and must keep the same vectors.
+    #[test]
+    fn a_full_reindex_of_unchanged_source_embeds_nothing() {
+        let dir = reuse_repo("full");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, n1) = run_counting(&store, &dir, true, "minilm-l6");
+        assert!(n1 > 0 && first.chunks_reused == 0, "{first:?} {n1}");
+        let before = vectors_of(&store, &dir, "m.py");
+        assert!(!before.is_empty());
+
+        let (second, n2) = run_counting(&store, &dir, true, "minilm-l6");
+        assert!(second.full_reindex, "{second:?}");
+        assert_eq!(n2, 0, "unchanged chunks went to the embedder again");
+        assert_eq!(second.chunks_reused, second.chunks, "{second:?}");
+        assert_eq!(vectors_of(&store, &dir, "m.py"), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Editing one function embeds that function's chunk(s), not the file's.
+    #[test]
+    fn editing_one_function_embeds_only_its_chunks() {
+        let dir = reuse_repo("edit");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, n1) = run_counting(&store, &dir, false, "minilm-l6");
+        assert!(first.chunks >= 3 && n1 == first.chunks, "{first:?} {n1}");
+
+        write(&dir, "m.py", &three_functions("22222"));
+        commit_all(&dir, "edit beta");
+        let (second, n2) = run_counting(&store, &dir, false, "minilm-l6");
+        assert_eq!(second.files_indexed, 1, "{second:?}");
+        assert!(
+            n2 >= 1 && n2 < first.chunks,
+            "embedded {n2} of {}",
+            first.chunks
+        );
+        assert_eq!(second.chunks_reused, second.chunks - n2, "{second:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Vectors are only comparable within the model that made them.
+    #[test]
+    fn a_different_model_embeds_everything_again() {
+        let dir = reuse_repo("model");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, _) = run_counting(&store, &dir, true, "minilm-l6");
+        let (second, n2) = run_counting(&store, &dir, true, "bge-small");
+        assert_eq!(second.chunks_reused, 0, "{second:?}");
+        assert_eq!(
+            n2, first.chunks,
+            "every chunk must be embedded under a new model"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pipeline creates the HNSW index when the config wants one and the
+    /// database never had it (the server path used to leave it out for good).
+    #[test]
+    fn a_new_index_gets_hnsw_when_the_config_asks_for_it() {
+        // VSS unavailable (offline): nothing to assert.
+        if !Store::open_in_memory(DIM)
+            .unwrap()
+            .enable_hnsw("cosine")
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let dir = reuse_repo("hnsw");
+        let store = Store::open_in_memory(DIM).unwrap();
+        run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: true,
+            model_name: "minilm-l6",
+            progress: None,
+            paths: None,
+            exclude: &[],
+            hnsw: Some("cosine"),
+            embed_fingerprint: "test-fp",
+            branch: None,
+        })
+        .unwrap();
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert!(store
+            .get_index_meta("", "", PENDING_HNSW_META_KEY)
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- fixup: lazy embedder, no needless rebuilds, fingerprint ------------
+
+    /// A run under `fp` with the counting embedder, optionally watched by `sink`.
+    fn run_fp(
+        store: &Store,
+        root: &Path,
+        full: bool,
+        fp: &str,
+        hnsw: Option<&str>,
+        sink: Option<&dyn ProgressSink>,
+    ) -> (IndexResult, usize) {
+        let emb = CountingEmbedder(std::sync::atomic::AtomicUsize::new(0));
+        let res = run(IndexRequest {
+            store,
+            embedder: &emb,
+            repo_root: root,
+            incremental: !full,
+            model_name: "minilm-l6",
+            progress: sink,
+            paths: None,
+            exclude: &[],
+            hnsw,
+            embed_fingerprint: fp,
+            branch: None,
+        })
+        .unwrap();
+        (res, emb.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn vss_available() -> bool {
+        Store::open_in_memory(DIM)
+            .unwrap()
+            .enable_hnsw("cosine")
+            .unwrap_or(false)
+    }
+
+    /// A reindex that finds every vector reusable never builds the model.
+    #[test]
+    fn a_no_change_full_run_never_loads_the_embedder() {
+        let dir = reuse_repo("lazy");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let lazy = devctx_embed::LazyEmbedder::new(DIM, "minilm-l6", || {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(std::sync::Arc::new(CountingEmbedder(Default::default()))
+                as std::sync::Arc<dyn EmbeddingProvider>)
+        });
+        let go = |full: bool| {
+            run(IndexRequest {
+                store: &store,
+                embedder: &lazy,
+                repo_root: &dir,
+                incremental: !full,
+                model_name: "minilm-l6",
+                progress: None,
+                paths: None,
+                exclude: &[],
+                hnsw: None,
+                embed_fingerprint: "test-fp",
+                branch: None,
+            })
+            .unwrap()
+        };
+        let first = go(true);
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{first:?}"
+        );
+        let second = go(true);
+        assert_eq!(second.chunks_reused, second.chunks, "{second:?}");
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the model was loaded again for a run that embeds nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `--full` that changes no vector leaves the HNSW and BM25 indexes alone
+    /// (on the parent it dropped and rebuilt both, whatever it had changed).
+    #[test]
+    fn a_no_change_full_run_does_not_rebuild_the_derived_indexes() {
+        if !vss_available() {
+            return;
+        }
+        let dir = reuse_repo("norebuild");
+        let store = Store::open_in_memory(DIM).unwrap();
+        run_fp(&store, &dir, true, "test-fp", Some("cosine"), None);
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        let fts = store.rebuild_fts().unwrap();
+        let before = vectors_of(&store, &dir, "m.py");
+
+        let sink = CancelAt::new(None, usize::MAX);
+        let (res, n) = run_fp(&store, &dir, true, "test-fp", Some("cosine"), Some(&sink));
+        assert!(res.full_reindex && n == 0, "{res:?} {n}");
+        let phases = sink.phases();
+        assert!(
+            !phases.iter().any(|p| p == "hnsw" || p == "fts"),
+            "rebuilt for a run that changed nothing: {phases:?}"
+        );
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert_eq!(store.has_fts(), fts);
+        assert!(store
+            .get_index_meta("", "", PENDING_HNSW_META_KEY)
+            .unwrap()
+            .is_none());
+        assert_eq!(vectors_of(&store, &dir, "m.py"), before);
+
+        // An incremental run over nothing is the same.
+        let sink = CancelAt::new(None, usize::MAX);
+        run_fp(&store, &dir, false, "test-fp", Some("cosine"), Some(&sink));
+        assert!(!sink.phases().iter().any(|p| p == "hnsw" || p == "fts"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a run does change still rebuilds, and what is owed or missing is
+    /// still created by a run that changed nothing.
+    #[test]
+    fn owed_or_missing_indexes_are_built_even_when_nothing_changed() {
+        if !vss_available() {
+            return;
+        }
+        let dir = reuse_repo("owed");
+        let store = Store::open_in_memory(DIM).unwrap();
+        // No index ever existed; the config now wants one.
+        run_fp(&store, &dir, true, "test-fp", None, None);
+        assert!(store.hnsw_metric().is_none());
+        let sink = CancelAt::new(None, usize::MAX);
+        run_fp(&store, &dir, true, "test-fp", Some("cosine"), Some(&sink));
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert!(sink.phases().iter().any(|p| p == "hnsw"));
+
+        // An earlier run dropped it and died: the note says it is owed.
+        store.drop_hnsw().unwrap();
+        store
+            .set_index_meta("", "", PENDING_HNSW_META_KEY, "cosine")
+            .unwrap();
+        run_fp(&store, &dir, true, "test-fp", None, None);
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert!(store
+            .get_index_meta("", "", PENDING_HNSW_META_KEY)
+            .unwrap()
+            .is_none());
+
+        // A real change rebuilds.
+        write(&dir, "m.py", &three_functions("22222"));
+        commit_all(&dir, "edit");
+        let sink = CancelAt::new(None, usize::MAX);
+        run_fp(&store, &dir, false, "test-fp", Some("cosine"), Some(&sink));
+        assert!(
+            sink.phases().iter().any(|p| p == "hnsw"),
+            "{:?}",
+            sink.phases()
+        );
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Branch indexed under setup A, a run under B cut short, back to A: the
+    /// files B already re-embedded hold B's vectors, so nothing may be reused.
+    #[test]
+    fn an_interrupted_run_under_another_setup_poisons_no_reuse() {
+        let dir = five_file_repo("fp");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, n1) = run_fp(&store, &dir, true, "fp-a", None, None);
+        assert_eq!(n1, first.chunks);
+        // The same setup again does reuse.
+        let (again, n) = run_fp(&store, &dir, true, "fp-a", None, None);
+        assert!(
+            (n, again.chunks_reused) == (0, again.chunks),
+            "{again:?} {n}"
+        );
+
+        let sink = CancelAfter::new(2);
+        let (cut, _) = run_fp(&store, &dir, true, "fp-b", None, Some(&sink));
+        assert!(cut.cancelled, "{cut:?}");
+
+        let (back, n) = run_fp(&store, &dir, false, "fp-a", None, None);
+        assert_eq!(
+            back.chunks_reused, 0,
+            "reused vectors of another setup: {back:?}"
+        );
+        assert_eq!(n, back.chunks, "every chunk must be embedded again");
+        assert!(
+            back.full_reindex,
+            "an interrupted transition needs a full run"
+        );
+        // Settled: now the same setup reuses again.
+        let (settled, n) = run_fp(&store, &dir, true, "fp-a", None, None);
+        assert!(
+            n == 0 && settled.chunks_reused == settled.chunks,
+            "{settled:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index from before fingerprints, made by the same model at the same
+    /// width, is reusable (every such index came from the one engine that
+    /// existed) and is sealed with the active fingerprint by the run.
+    #[test]
+    fn a_legacy_index_with_the_same_model_is_reused_and_sealed() {
+        let dir = reuse_repo("legacy");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (first, _) = run_fp(&store, &dir, true, "test-fp", None, None);
+        let git = crate::git::GitRepo::open(&dir).unwrap();
+        let (rp, branch) = (git.root().to_string_lossy().to_string(), git.state().branch);
+        let drop_fp = || {
+            store
+                .delete_index_meta(&rp, &branch, devctx_store::EMBED_FP_META_KEY)
+                .unwrap()
+        };
+        let fp_now = || {
+            store
+                .get_index_meta(&rp, &branch, devctx_store::EMBED_FP_META_KEY)
+                .unwrap()
+        };
+        drop_fp();
+        // Incremental: not forced into a full run, sealed.
+        let (res, n) = run_fp(&store, &dir, false, "test-fp", None, None);
+        assert!(!res.full_reindex && n == 0, "{res:?} {n}");
+        assert_eq!(fp_now().as_deref(), Some("test-fp"));
+        // Full over a legacy index: reused straight away, then sealed.
+        drop_fp();
+        let (full, n) = run_fp(&store, &dir, true, "test-fp", None, None);
+        assert!(n == 0 && full.chunks_reused == first.chunks, "{full:?} {n}");
+        assert_eq!(fp_now().as_deref(), Some("test-fp"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One run under `model` / `fp`, optionally on a named branch and watched.
+    #[allow(clippy::too_many_arguments)]
+    fn run_as(
+        store: &Store,
+        root: &Path,
+        branch: Option<&str>,
+        full: bool,
+        fp: &str,
+        model: &str,
+        hnsw: Option<&str>,
+        sink: Option<&dyn ProgressSink>,
+    ) -> (IndexResult, usize) {
+        let emb = CountingEmbedder(std::sync::atomic::AtomicUsize::new(0));
+        let res = run(IndexRequest {
+            store,
+            embedder: &emb,
+            repo_root: root,
+            incremental: !full,
+            model_name: model,
+            progress: sink,
+            paths: None,
+            exclude: &[],
+            hnsw,
+            embed_fingerprint: fp,
+            branch,
+        })
+        .unwrap();
+        (res, emb.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A legacy index (no fingerprint) of another model is not reused, and an
+    /// interrupted run of another model over it leaves it unusable by the old
+    /// one (the "transition" mark is written for legacy indexes too).
+    #[test]
+    fn a_legacy_index_is_not_reused_across_models_or_after_a_transition() {
+        let dir = five_file_repo("legacy2");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let git = crate::git::GitRepo::open(&dir).unwrap();
+        let (rp, branch) = (git.root().to_string_lossy().to_string(), git.state().branch);
+        let key = devctx_store::EMBED_FP_META_KEY;
+
+        run_as(&store, &dir, None, true, "fp", "minilm-l6", None, None);
+        store.delete_index_meta(&rp, &branch, key).unwrap();
+        // Other model: nothing reusable.
+        let (other, n) = run_as(&store, &dir, None, true, "fp2", "bge-small", None, None);
+        assert_eq!(other.chunks_reused, 0, "{other:?}");
+        assert_eq!(n, other.chunks);
+
+        // Legacy again, a run under another model is cut short, then the
+        // original model comes back: files the cut run re-embedded hold the
+        // other model's vectors, so nothing may be reused.
+        store.delete_index_meta(&rp, &branch, key).unwrap();
+        let sink = CancelAfter::new(2);
+        let (cut, _) = run_as(&store, &dir, None, true, "fp", "minilm-l6", None, None);
+        assert!(!cut.cancelled);
+        store.delete_index_meta(&rp, &branch, key).unwrap();
+        let (cut, _) = run_as(
+            &store,
+            &dir,
+            None,
+            true,
+            "fp2",
+            "bge-small",
+            None,
+            Some(&sink),
+        );
+        assert!(cut.cancelled, "{cut:?}");
+        assert_eq!(
+            store.get_index_meta(&rp, &branch, key).unwrap().as_deref(),
+            Some("transition")
+        );
+        let (back, n) = run_as(&store, &dir, None, false, "fp", "minilm-l6", None, None);
+        assert_eq!(back.chunks_reused, 0, "{back:?}");
+        assert_eq!(n, back.chunks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A branch that already holds everything has nothing to copy: a `--full`
+    /// over two indexed branches writes nothing (on the parent it copied every
+    /// file the other branch holds, rewriting rows and the derived indexes).
+    #[test]
+    fn a_full_run_over_two_indexed_branches_writes_nothing() {
+        let dir = two_branch_repo("two_full");
+        let store = Store::open_in_memory(DIM).unwrap();
+        let (m, f) = ("minilm-l6", "test-fp");
+        run_as(&store, &dir, Some("main"), true, f, m, None, None);
+        run_as(&store, &dir, Some("feature"), true, f, m, None, None);
+        let before = files_on(&store, "main");
+
+        let hnsw = vss_available().then_some("cosine");
+        run_as(&store, &dir, Some("main"), true, f, m, hnsw, None);
+        let sink = CancelAt::new(None, usize::MAX);
+        let (again, n) = run_as(&store, &dir, Some("main"), true, f, m, hnsw, Some(&sink));
+        assert_eq!(again.files_copied, 0, "{again:?}");
+        assert_eq!(n, 0, "{again:?}");
+        assert_eq!(again.files_indexed, 0, "{again:?}");
+        assert!(again.files_unchanged > 0, "{again:?}");
+        assert_eq!(again.chunks_reused, again.chunks, "{again:?}");
+        assert!(
+            !sink.phases().iter().any(|p| p == "hnsw" || p == "fts"),
+            "{:?}",
+            sink.phases()
+        );
+        assert_eq!(files_on(&store, "main"), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A branch indexed under another embedding setup (or in transition) is no
+    /// source for a copy: its vectors would be sealed under this one's name.
+    /// A legacy branch (no fingerprint) is a source only for the same model.
+    #[test]
+    fn a_copy_needs_a_source_made_by_the_active_embedding_setup() {
+        let key = devctx_store::EMBED_FP_META_KEY;
+        let m = "minilm-l6";
+        let setup = |tag: &str| {
+            let dir = two_branch_repo(tag);
+            let store = Store::open_in_memory(DIM).unwrap();
+            let rp = GitRepo::open(&dir)
+                .unwrap()
+                .root()
+                .to_string_lossy()
+                .to_string();
+            (dir, store, rp)
+        };
+
+        // Another fingerprint.
+        let (dir, store, rp) = setup("cp_other");
+        run_as(&store, &dir, Some("feature"), true, "fp-a", m, None, None);
+        let (res, n) = run_as(&store, &dir, Some("main"), true, "fp-b", m, None, None);
+        assert_eq!(res.files_copied, 0, "{res:?}");
+        assert_eq!(n, res.chunks, "all embedded under the active setup");
+        assert_eq!(
+            store.get_index_meta(&rp, "main", key).unwrap().as_deref(),
+            Some("fp-b")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Source in transition.
+        let (dir, store, rp) = setup("cp_trans");
+        run_as(&store, &dir, Some("feature"), true, "fp-a", m, None, None);
+        store
+            .set_index_meta(&rp, "feature", key, "transition")
+            .unwrap();
+        let (res, _) = run_as(&store, &dir, Some("main"), true, "fp-a", m, None, None);
+        assert_eq!(res.files_copied, 0, "{res:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Same fingerprint: control, it does copy.
+        let (dir, store, _) = setup("cp_same");
+        run_as(&store, &dir, Some("feature"), true, "fp-a", m, None, None);
+        let (res, _) = run_as(&store, &dir, Some("main"), true, "fp-a", m, None, None);
+        assert!(res.files_copied > 0, "{res:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Legacy source, same model: compatible.
+        let (dir, store, rp) = setup("cp_legacy");
+        run_as(&store, &dir, Some("feature"), true, "fp-a", m, None, None);
+        store.delete_index_meta(&rp, "feature", key).unwrap();
+        let (res, _) = run_as(&store, &dir, Some("main"), true, "fp-a", m, None, None);
+        assert!(res.files_copied > 0, "{res:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Legacy source of another model: not.
+        let (dir, store, rp) = setup("cp_legacy_model");
+        run_as(
+            &store,
+            &dir,
+            Some("feature"),
+            true,
+            "fp-a",
+            "bge-small",
+            None,
+            None,
+        );
+        store.delete_index_meta(&rp, "feature", key).unwrap();
+        let (res, _) = run_as(&store, &dir, Some("main"), true, "fp-a", m, None, None);
+        assert_eq!(res.files_copied, 0, "{res:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a file the index never held changes nothing, so it must not
+    /// take the derived indexes down (and force their rebuild).
+    #[test]
+    fn deleting_a_file_never_indexed_leaves_the_derived_indexes_alone() {
+        if !vss_available() {
+            return;
+        }
+        let dir = reuse_repo("ghost");
+        let store = Store::open_in_memory(DIM).unwrap();
+        run_fp(&store, &dir, true, "test-fp", Some("cosine"), None);
+        let sink = CancelAt::new(None, usize::MAX);
+        let ghost = vec!["ghost.py".to_string()];
+        let res = run(IndexRequest {
+            store: &store,
+            embedder: &FakeEmbedder,
+            repo_root: &dir,
+            incremental: true,
+            model_name: "minilm-l6",
+            progress: Some(&sink),
+            paths: Some(&ghost),
+            exclude: &[],
+            hnsw: Some("cosine"),
+            embed_fingerprint: "test-fp",
+            branch: None,
+        })
+        .unwrap();
+        assert_eq!(res.files_deleted, 1, "{res:?}");
+        assert!(
+            !sink.phases().iter().any(|p| p == "hnsw" || p == "fts"),
+            "{:?}",
+            sink.phases()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Asking for another metric replaces the HNSW index (one exists at a time).
+    #[test]
+    fn enable_hnsw_replaces_the_index_when_the_metric_changes() {
+        if !vss_available() {
+            return;
+        }
+        let store = Store::open_in_memory(DIM).unwrap();
+        assert!(store.enable_hnsw("cosine").unwrap());
+        assert_eq!(store.hnsw_metric().as_deref(), Some("cosine"));
+        assert!(store.enable_hnsw("ip").unwrap());
+        assert_eq!(store.hnsw_metric().as_deref(), Some("ip"));
+    }
+
+    // ── PLAN-009 TASK-003: the `symbols` and `edges` tables ──────────────
+
+    /// A one-commit repository on `main` with the given files.
+    fn graph_repo(tag: &str, files: &[(&str, &str)]) -> (PathBuf, String) {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_graph_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for (rel, content) in files {
+            write(&dir, rel, content);
+        }
+        commit_all(&dir, "init");
+        let repo = dir.file_name().unwrap().to_string_lossy().to_string();
+        (dir, repo)
+    }
+
+    fn symbol<'a>(
+        syms: &'a [devctx_store::StoredSymbol],
+        qualified: &str,
+    ) -> &'a devctx_store::StoredSymbol {
+        syms.iter()
+            .find(|s| s.qualified == qualified)
+            .unwrap_or_else(|| panic!("{qualified} not in {syms:?}"))
+    }
+
+    /// Every edge's source is a symbol of its own file and branch, and every
+    /// parent is too: what "no orphan rows" means for these tables.
+    fn assert_no_orphans(store: &Store, repo: &str, branch: &str, files: &[&str]) {
+        for f in files {
+            let syms = store.file_symbols(repo, branch, f).unwrap();
+            let ids: HashSet<u64> = syms.iter().map(|s| s.id).collect();
+            for s in &syms {
+                if let Some(p) = s.parent_id {
+                    assert!(ids.contains(&p), "{f}: parent of {s:?} is not in the file");
+                }
+            }
+            for e in store.file_symbol_edges(repo, branch, f).unwrap() {
+                assert!(
+                    ids.contains(&e.src_id),
+                    "{f}: source of {e:?} is not in the file"
+                );
+            }
+        }
+    }
+    use std::collections::HashSet;
+
+    /// The bug behind `get_references` losing calls: two calls to the same
+    /// target from one method were folded into one `graph_edges` row. The
+    /// `edges` table keeps one row per occurrence.
+    #[test]
+    fn two_calls_from_one_method_are_two_edges() {
+        let (dir, repo) = graph_repo(
+            "twice",
+            &[(
+                "mig.py",
+                "def migrate_one(log):\n    log.debug('a')\n    work()\n    log.debug('b')\n",
+            )],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let syms = store.file_symbols(&repo, "main", "mig.py").unwrap();
+        let src = symbol(&syms, "migrate_one").id;
+        let debug: Vec<_> = store
+            .file_symbol_edges(&repo, "main", "mig.py")
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.dst_name == "debug")
+            .collect();
+        assert_eq!(debug.len(), 2, "{debug:?}");
+        assert!(debug.iter().all(|e| e.src_id == src && e.kind == "calls"));
+        assert_eq!((debug[0].line, debug[1].line), (2, 4));
+        assert!(debug
+            .iter()
+            .all(|e| e.dst_id.is_none() && e.edge_source == "treesitter"));
+        // `graph_edges` keeps the 0.9.0 shape: one row per pair.
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        assert_eq!(old.iter().filter(|e| e.target == "debug").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Python call at module level has no enclosing function, and used to
+    /// be dropped. It is an edge from the file symbol now.
+    #[test]
+    fn a_module_level_python_call_is_sourced_from_the_file_symbol() {
+        let (dir, repo) = graph_repo(
+            "module",
+            &[(
+                "tools/run.py",
+                "def main():\n    pass\n\nmain()\nconfigure(main)\n",
+            )],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let syms = store.file_symbols(&repo, "main", "tools/run.py").unwrap();
+        let file = &syms[0];
+        assert_eq!(file.kind, "file");
+        assert_eq!(file.qualified, "tools/run.py");
+        assert_eq!(file.name, "run.py");
+        assert_eq!(file.parent_id, None);
+        assert_eq!(symbol(&syms, "main").parent_id, Some(file.id));
+        let edges = store
+            .file_symbol_edges(&repo, "main", "tools/run.py")
+            .unwrap();
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == "calls").collect();
+        let names: Vec<_> = calls
+            .iter()
+            .map(|e| (e.dst_name.as_str(), e.line))
+            .collect();
+        assert_eq!(names, vec![("main", 4), ("configure", 5)]);
+        assert!(calls.iter().all(|e| e.src_id == file.id));
+        // `graph_edges` has no row for them: 0.9.0 has no source to give one.
+        assert!(store
+            .graph_edges(&repo, "main", None, None, 0)
+            .unwrap()
+            .iter()
+            .all(|e| !e.source.is_empty()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The id carries no branch: the same symbol on two branches — copied or
+    /// re-parsed — has one id, and a copy carries edges without resolution.
+    #[test]
+    fn a_symbol_has_one_id_on_every_branch() {
+        let dir = two_branch_repo("graph_ids");
+        let repo = dir.file_name().unwrap().to_string_lossy().to_string();
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let feat = index_branch(&store, &dir, "feature", true);
+        assert!(feat.files_copied > 0, "a.py is copied, b.py re-parsed");
+        for f in ["a.py", "b.py"] {
+            let main = store.file_symbols(&repo, "main", f).unwrap();
+            let feature = store.file_symbols(&repo, "feature", f).unwrap();
+            assert_eq!(main.len(), 2, "{main:?}");
+            let ids = |v: &[devctx_store::StoredSymbol]| v.iter().map(|s| s.id).collect::<Vec<_>>();
+            assert_eq!(ids(&main), ids(&feature), "{f}");
+        }
+        assert_eq!(
+            symbol(
+                &store.file_symbols(&repo, "feature", "b.py").unwrap(),
+                "beta"
+            )
+            .id,
+            devctx_parse::symbol_id::symbol_id(&repo, "b.py", "callable", "beta", "")
+        );
+        assert_no_orphans(&store, &repo, "feature", &["a.py", "b.py"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `copy_file_rows` replaces the destination's graph rows (no duplicate
+    /// on a second copy) and drops the resolution of the edges it carries.
+    #[test]
+    fn copying_a_file_leaves_no_orphans_or_duplicates() {
+        let (dir, repo) = graph_repo("copy", &[("c.py", "def f():\n    g()\n    g()\n")]);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        // As if the link pass had resolved one of the calls on main.
+        let syms = store.file_symbols(&repo, "main", "c.py").unwrap();
+        let mut edges = store.file_symbol_edges(&repo, "main", "c.py").unwrap();
+        let call = edges.iter().position(|e| e.kind == "calls").unwrap();
+        edges[call].dst_id = Some(syms[1].id);
+        edges[call].confidence = Some("high".into());
+        store
+            .replace_file_graph(&repo, "main", "c.py", &syms, &edges)
+            .unwrap();
+        for _ in 0..2 {
+            store.copy_file_rows(&repo, "main", "dev", "c.py").unwrap();
+        }
+        assert_eq!(store.file_symbols(&repo, "dev", "c.py").unwrap(), syms);
+        let copied = store.file_symbol_edges(&repo, "dev", "c.py").unwrap();
+        let (contains, calls): (Vec<_>, Vec<_>) = copied.iter().partition(|e| e.kind == "contains");
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|e| e.dst_id.is_none() && e.confidence.is_none()));
+        // Both ends of a `contains` are symbols of the file, the same on
+        // every branch: it keeps its destination.
+        assert_eq!(contains.len(), 1);
+        assert_eq!(contains[0].dst_id, Some(syms[1].id));
+        assert_no_orphans(&store, &repo, "dev", &["c.py"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file writes every relation it has, one row per occurrence
+    /// (PLAN-009 TASK-004): calls, imports, supertypes, instantiations, type
+    /// uses and containment, and its symbols carry their package,
+    /// signature and visibility.
+    /// The link pass of a full run (PLAN-009 TASK-005, DD-6): a call across
+    /// files reaches its definition, an external one is marked, and the
+    /// `contains` rows come out exactly as the parse wrote them (m-b: the
+    /// link pass excludes `kind = 'contains'`).
+    #[test]
+    fn the_link_pass_resolves_across_files_and_leaves_contains_alone() {
+        let (dir, repo) = graph_repo(
+            "link",
+            &[
+                ("src/a/Caller.java", LINK_CALLER),
+                ("src/b/Helper.java", LINK_HELPER),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        let res = index_branch(&store, &dir, "main", true);
+        let helper = store
+            .file_symbols(&repo, "main", "src/b/Helper.java")
+            .unwrap();
+        let run = symbol(&helper, "Helper.run");
+        let edges = store
+            .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+            .unwrap();
+        let call = edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_name == "Helper.run")
+            .unwrap();
+        assert_eq!(call.dst_id, Some(run.id));
+        assert_eq!(call.confidence.as_deref(), Some("high"));
+        assert_eq!(call.resolution.as_deref(), Some("field"));
+        assert_eq!(call.external, Some(false));
+        let log = edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_name == "Logger.info")
+            .unwrap();
+        assert_eq!((log.dst_id, log.external), (None, Some(true)));
+        // `.count()` after the external `List.stream()`: nothing types it;
+        // no repository name: a weak external.
+        let count = edges.iter().find(|e| e.dst_name == "count").unwrap();
+        assert_eq!(count.resolution.as_deref(), Some("chain_external"));
+        assert_eq!(
+            (count.external, count.confidence.as_deref()),
+            (Some(true), Some("medium"))
+        );
+        // An untyped lambda parameter calling a name the repository lacks:
+        // dropped — kept as `discarded`, out of the counts — and counted.
+        let vanish = edges.iter().find(|e| e.dst_name == "vanish").unwrap();
+        assert_eq!(vanish.resolution.as_deref(), Some("discarded"));
+        assert_eq!(res.edges_discarded, 1, "{res:?}");
+        let contains: Vec<_> = edges.iter().filter(|e| e.kind == "contains").collect();
+        assert!(!contains.is_empty());
+        for c in contains {
+            assert_eq!(c.resolution.as_deref(), Some("structural"), "{c:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN-009 TASK-010: a pass that completes ranks the branch — every
+    /// symbol gets a rank and an `in_degree` (incoming non-test calls of
+    /// `high`/`medium`), the most called function outranks one nobody calls,
+    /// the same repository indexed twice ranks the same bit for bit, and an
+    /// incremental run that rewrites a file's symbols ranks them again.
+    #[test]
+    fn the_link_pass_ranks_the_branch() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("rank", &files);
+        let ranks = |store: &Store| -> Vec<(u64, Option<u64>, Option<i32>)> {
+            let mut v: Vec<_> = store
+                .branch_symbols(&repo, "main")
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.id, s.rank.map(f64::to_bits), s.in_degree))
+                .collect();
+            v.sort();
+            v
+        };
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let all = store.branch_symbols(&repo, "main").unwrap();
+        assert!(all
+            .iter()
+            .all(|s| s.rank.is_some() && s.in_degree.is_some()));
+        let helper = store
+            .file_symbols(&repo, "main", "src/b/Helper.java")
+            .unwrap();
+        let run = symbol(&helper, "Helper.run");
+        assert_eq!(run.in_degree, Some(1));
+        let f1 = symbol(&all, "f1");
+        assert_eq!(f1.in_degree, Some(0));
+        assert!(run.rank.unwrap() > f1.rank.unwrap(), "{run:?} {f1:?}");
+        let other = Store::open_in_memory(DIM).unwrap();
+        index_branch(&other, &dir, "main", true);
+        assert_eq!(ranks(&store), ranks(&other));
+        // An incremental run rewriting `Helper.java` ranks its symbols again.
+        write(&dir, "src/b/Helper.java", &format!("{LINK_HELPER}\n"));
+        commit_all(&dir, "touch");
+        index_branch(&store, &dir, "main", false);
+        let helper = store
+            .file_symbols(&repo, "main", "src/b/Helper.java")
+            .unwrap();
+        assert!(helper.iter().all(|s| s.rank.is_some()), "{helper:?}");
+        assert_eq!(symbol(&helper, "Helper.run").in_degree, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of TASK-010, MAJOR 4: Rust tests live in the file they test.
+    /// A symbol inside `#[cfg(test)]`, a `mod tests` or a `#[test]` function
+    /// is a test symbol, and its calls are `from_test`; the rest of the file
+    /// is not.
+    #[test]
+    fn rust_inline_tests_are_test_symbols() {
+        let src = "pub fn open() {}\n\npub fn run() {\n    open();\n}\n\n#[cfg(test)]\nmod checks {\n    use super::*;\n\n    fn helper() {\n        open();\n    }\n\n    #[test]\n    fn opens() {\n        helper();\n    }\n}\n\nmod tests {\n    fn other() {\n        super::open();\n    }\n}\n\n#[test]\nfn loose() {\n    open();\n}\n\n#[cfg(not(test))]\npub fn prod_only() {}\n";
+        let (dir, repo) = graph_repo("rstests", &[("src/lib.rs", src)]);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let syms = store.file_symbols(&repo, "main", "src/lib.rs").unwrap();
+        let test_of = |q: &str| symbol(&syms, q).is_test;
+        assert!(
+            !test_of("open") && !test_of("run") && !test_of("prod_only"),
+            "{syms:?}"
+        );
+        for q in ["checks.helper", "checks.opens", "tests.other", "loose"] {
+            assert!(test_of(q), "{q}: {syms:?}");
+        }
+        let edges = store
+            .file_symbol_edges(&repo, "main", "src/lib.rs")
+            .unwrap();
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == "calls").collect();
+        let run = symbol(&syms, "run").id;
+        for e in &calls {
+            assert_eq!(e.from_test, e.src_id != run, "{e:?}");
+        }
+        assert!(calls.len() >= 5, "{calls:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of TASK-010, MINOR 5: a pass writes only the ranks that
+    /// changed; a second full pass over the same graph writes none.
+    #[test]
+    fn a_pass_over_the_same_graph_writes_no_rank() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("rankagain", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let pass = || {
+            crate::link::link_branch(
+                &store,
+                &repo,
+                "main",
+                &std::collections::HashSet::new(),
+                true,
+                &devctx_parse::resolve::env::LinkEnv::default(),
+                &|| false,
+            )
+            .unwrap()
+        };
+        let again = pass();
+        assert_eq!(again.files_written, 0, "{again:?}");
+        assert_eq!(again.ranks_written, 0, "{again:?}");
+        assert!(again.rank_converged, "{again:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index from before TASK-010 — no rank anywhere, linked under the
+    /// previous `LINK_VERSION` — is ranked by the next run, with nothing to
+    /// reindex: the new version relinks the branch, and the pass ranks it.
+    #[test]
+    fn an_index_from_before_ranks_gets_them_on_the_next_run() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("rankold", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let repo_path = GitRepo::open(&dir)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .into_owned();
+        // What a 0.10 index before TASK-010 holds: no rank, no in-degree.
+        let mut by_file: std::collections::BTreeMap<String, Vec<devctx_store::StoredSymbol>> =
+            Default::default();
+        for mut s in store.branch_symbols(&repo, "main").unwrap() {
+            (s.rank, s.in_degree) = (None, None);
+            by_file.entry(s.file.clone()).or_default().push(s);
+        }
+        for (file, syms) in &by_file {
+            store
+                .replace_file_symbols(&repo, "main", file, syms)
+                .unwrap();
+        }
+        assert!(store
+            .branch_symbols(&repo, "main")
+            .unwrap()
+            .iter()
+            .all(|s| s.rank.is_none()));
+        store
+            .set_index_meta(&repo_path, "main", crate::link::LINK_VERSION_META_KEY, "20")
+            .unwrap();
+        let res = index_branch(&store, &dir, "main", false);
+        assert_eq!(res.files_indexed, 0, "{res:?}");
+        let all = store.branch_symbols(&repo, "main").unwrap();
+        assert!(
+            all.iter()
+                .all(|s| s.rank.is_some() && s.in_degree.is_some()),
+            "{all:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const LINK_CALLER: &str = "\
+package a;
+
+import b.Helper;
+import java.util.List;
+import org.jboss.logging.Logger;
+
+public class Caller {
+    private static final Logger LOG = Logger.getLogger(Caller.class);
+    Helper helper;
+
+    long go(List<String> xs) {
+        helper.run();
+        LOG.info(\"x\");
+        xs.forEach(x -> x.vanish());
+        return xs.stream().count();
+    }
+}
+";
+
+    /// Enough files that one written file stays under the full-pass
+    /// threshold (a fifth of the branch): the incremental selection is what
+    /// is tested, not the full pass.
+    const LINK_FILLER: [(&str, &str); 6] = [
+        ("f1.py", "def f1():\n    pass\n"),
+        ("f2.py", "def f2():\n    pass\n"),
+        ("f3.py", "def f3():\n    pass\n"),
+        ("f4.py", "def f4():\n    pass\n"),
+        ("f5.py", "def f5():\n    pass\n"),
+        ("f6.py", "def f6():\n    pass\n"),
+    ];
+
+    const LINK_HELPER: &str = "\
+package b;
+
+public class Helper {
+    public void run() {}
+}
+";
+
+    /// The incremental link pass (DD-6 mode b, m-b): only `Helper.java`
+    /// changes, yet the edge of `Caller.java` into it is re-resolved — its
+    /// destination is gone (renamed), then a symbol named like it is back.
+    /// `Caller.java` is not reindexed, and its `contains` rows are never
+    /// touched by the link pass's rewrite of its edges.
+    #[test]
+    fn an_incremental_link_pass_follows_a_definition_that_moved() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkinc", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let caller = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap()
+        };
+        let before = caller(&store);
+        let contains = |edges: &[devctx_store::StoredSymbolEdge]| -> Vec<_> {
+            edges
+                .iter()
+                .filter(|e| e.kind == "contains")
+                .cloned()
+                .collect()
+        };
+        let call = |edges: &[devctx_store::StoredSymbolEdge]| {
+            edges
+                .iter()
+                .find(|e| e.kind == "calls" && e.dst_name == "Helper.run")
+                .cloned()
+                .unwrap()
+        };
+        assert!(call(&before).dst_id.is_some());
+
+        // `run` renamed: the edge's destination no longer exists.
+        write(
+            &dir,
+            "src/b/Helper.java",
+            &LINK_HELPER.replace("run()", "walk()"),
+        );
+        commit_all(&dir, "rename run");
+        let inc = index_branch(&store, &dir, "main", false);
+        assert_eq!(inc.files_indexed, 1, "only Helper.java: {inc:?}");
+        let after = caller(&store);
+        let moved = call(&after);
+        assert_eq!(moved.dst_id, None, "{moved:?}");
+        assert_eq!(moved.confidence.as_deref(), Some("low"));
+        assert_eq!(contains(&after), contains(&before), "contains untouched");
+
+        // Back under its name (an added symbol whose name the edge ends in).
+        write(
+            &dir,
+            "src/b/Helper.java",
+            &LINK_HELPER.replace("run()", "run() {}\n    public void walk()"),
+        );
+        commit_all(&dir, "run is back");
+        index_branch(&store, &dir, "main", false);
+        let helper = store
+            .file_symbols(&repo, "main", "src/b/Helper.java")
+            .unwrap();
+        let back = call(&caller(&store));
+        assert_eq!(back.dst_id, Some(symbol(&helper, "Helper.run").id));
+        assert_eq!(back.resolution.as_deref(), Some("field"));
+        assert_eq!(contains(&caller(&store)), contains(&before));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every non-`contains` edge of the branch, in a comparable order.
+    fn linked_rows(store: &Store, repo: &str) -> Vec<String> {
+        let mut rows: Vec<String> = store
+            .branch_linkable_edges(repo, "main")
+            .unwrap()
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Run the link pass over the whole branch, as a full run would, and
+    /// answer whether it changed any row: an incremental pass must leave
+    /// nothing for it to fix.
+    fn full_link_changes(store: &Store, repo: &str, dir: &Path) -> Vec<(String, String)> {
+        let before = linked_rows(store, repo);
+        let files: Vec<String> = crate::git::GitRepo::open(dir)
+            .unwrap()
+            .changes(None)
+            .unwrap()
+            .iter()
+            .map(|c| match c {
+                crate::git::Change::Added(p)
+                | crate::git::Change::Modified(p)
+                | crate::git::Change::Deleted(p) => p.clone(),
+                crate::git::Change::Renamed { to, .. } => to.clone(),
+            })
+            .collect();
+        let env = crate::env::load(
+            &|rel: &str| std::fs::read_to_string(dir.join(rel)).ok(),
+            &files,
+        )
+        .env();
+        crate::link::link_branch(
+            store,
+            repo,
+            "main",
+            &std::collections::HashSet::new(),
+            true,
+            &env,
+            &|| false,
+        )
+        .unwrap();
+        let after = linked_rows(store, repo);
+        before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .chain((before.len() != after.len()).then(|| {
+                (
+                    format!("{} rows", before.len()),
+                    format!("{} rows", after.len()),
+                )
+            }))
+            .collect()
+    }
+
+    fn index_with(
+        store: &Store,
+        dir: &Path,
+        full: bool,
+        progress: Option<&dyn ProgressSink>,
+    ) -> IndexResult {
+        run(IndexRequest {
+            store,
+            embedder: &FakeEmbedder,
+            repo_root: dir,
+            incremental: !full,
+            model_name: "minilm-l6",
+            progress,
+            paths: None,
+            exclude: &[],
+            hnsw: None,
+            embed_fingerprint: "test-fp",
+            branch: Some("main"),
+        })
+        .unwrap()
+    }
+
+    /// Review of TASK-017, point 8: scenario (e) through `impact_graph`, not
+    /// only the link pass — a class that changes its `implements` in an
+    /// incremental run is reached through the new interface and no longer
+    /// through the old one, exactly as a full index of the same tree answers.
+    #[test]
+    fn dispatch_follows_an_incremental_implements_change() {
+        let files = [
+            (
+                "p/IFirst.java",
+                "package p;\npublic interface IFirst { void run(String id); }\n",
+            ),
+            (
+                "p/ISecond.java",
+                "package p;\npublic interface ISecond { void run(String id); }\n",
+            ),
+            (
+                "p/Worker.java",
+                "package p;\npublic class Worker implements IFirst {\n    public void run(String id) {}\n}\n",
+            ),
+            (
+                "p/UsesFirst.java",
+                "package p;\npublic class UsesFirst {\n    void go(IFirst f) {\n        f.run(\"a\");\n    }\n}\n",
+            ),
+            (
+                "p/UsesSecond.java",
+                "package p;\npublic class UsesSecond {\n    void go(ISecond s) {\n        s.run(\"b\");\n    }\n}\n",
+            ),
+        ];
+        let callers = |store: &Store, repo: &str| -> Vec<(String, String)> {
+            let im = store
+                .impact_graph(
+                    repo,
+                    "main",
+                    "Worker.run",
+                    None,
+                    &devctx_store::ImpactOptions::default(),
+                )
+                .unwrap();
+            im.upstream
+                .nodes
+                .iter()
+                .map(|n| (n.symbol.clone(), n.via.clone()))
+                .collect()
+        };
+        let (dir, repo) = graph_repo("dispatch_impl_change", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        assert_eq!(
+            callers(&store, &repo),
+            [("UsesFirst.go".to_string(), "dispatch".to_string())]
+        );
+        write(
+            &dir,
+            "p/Worker.java",
+            "package p;\npublic class Worker implements ISecond {\n    public void run(String id) {}\n}\n",
+        );
+        commit_all(&dir, "p/Worker.java");
+        let inc = index_with(&store, &dir, false, None);
+        assert_eq!(inc.files_indexed, 1, "{inc:?}");
+        let after = callers(&store, &repo);
+        assert_eq!(
+            after,
+            [("UsesSecond.go".to_string(), "dispatch".to_string())]
+        );
+        // A full index of the same tree answers the same.
+        let fresh = Store::open_in_memory(DIM).unwrap();
+        index_with(&fresh, &dir, true, None);
+        assert_eq!(callers(&fresh, &repo), after);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The incremental link pass leaves the branch exactly as a full one
+    /// would (TASK-005 review, MAJOR 4): after a supertype changes, a return
+    /// type changes, `@Data` is added and a package moves — each a write of
+    /// one file whose effect reaches edges of files not written.
+    #[test]
+    fn an_incremental_link_pass_equals_a_full_one() {
+        let mut files = vec![
+            (
+                "p/A.java",
+                "package p;\npublic class A { public void m() {} }\n",
+            ),
+            (
+                "p/C.java",
+                "package p;\npublic class C { public void m() {} }\n",
+            ),
+            ("p/B.java", "package p;\npublic class B extends A {}\n"),
+            (
+                "p/X.java",
+                "package p;\npublic class X { public void doIt() {} }\n",
+            ),
+            (
+                "p/Y.java",
+                "package p;\npublic class Y { public void doIt() {} }\n",
+            ),
+            (
+                "p/R.java",
+                "package p;\npublic class R { public X find() { return null; } }\n",
+            ),
+            (
+                "p/D.java",
+                "package p;\n@lombok.Data\npublic class D { private String name; }\n",
+            ),
+            (
+                "p/H.java",
+                "package p;\npublic class H { public X item; }\n",
+            ),
+            // Only the inheritance rule reaches `m()` in `B2`: its hint is
+            // `bare`, its destination still exists, and `B.java` defines no
+            // `m`.
+            (
+                "p/B2.java",
+                "package p;\npublic class B2 extends B {\n    void go() { m(); }\n}\n",
+            ),
+            // Only the callee token `name` (a word a hint also uses) reaches
+            // `doIt` after `name()`, a static import from `Util.java`.
+            (
+                "p/Util.java",
+                "package p;\npublic class Util { public static X name() { return null; } }\n",
+            ),
+            (
+                "q/V.java",
+                "package q;\nimport static p.Util.name;\nclass V {\n    void go() {\n        \
+                 name().doIt();\n    }\n}\n",
+            ),
+            (
+                "q/U.java",
+                "package q;\nimport p.B;\nimport p.R;\nimport p.D;\nimport p.H;\n\
+                 class U {\n    void go(B b, R r, D d, H h) {\n        b.m();\n        \
+                 r.find().doIt();\n        d.getName();\n        h.item.doIt();\n    }\n}\n",
+            ),
+        ];
+        // TASK-017: what a class `implements` decides which interface's
+        // default method a caller of another file reaches (and where
+        // dispatch climbs from).
+        files.extend([
+            (
+                "p/I1.java",
+                "package p;\npublic interface I1 { default void helper() {} }\n",
+            ),
+            (
+                "p/I2.java",
+                "package p;\npublic interface I2 { default void helper() {} }\n",
+            ),
+            (
+                "p/K.java",
+                "package p;\npublic class K implements I1 { public void work() {} }\n",
+            ),
+            (
+                "q/W.java",
+                "package q;\nimport p.K;\nclass W {\n    void go(K k) {\n        k.helper();\n    }\n}\n",
+            ),
+        ]);
+        // TypeScript (TASK-006): a barrel's named re-export, an alias of the
+        // `tsconfig`, a barrel re-exporting through another barrel.
+        files.extend([
+            ("web/libs/a/svc.ts", TS_SVC),
+            ("web/libs/b/svc.ts", TS_SVC),
+            (
+                "web/libs/barrel/index.ts",
+                "export { Svc } from '../a/svc';\n",
+            ),
+            (
+                "web/app/c.ts",
+                "import { Svc } from '../libs/barrel';\nexport class C {\n  \
+                 constructor(private s: Svc) {}\n  go(): void {\n    this.s.run();\n  }\n}\n",
+            ),
+            ("tsconfig.base.json", TS_CONFIG_A),
+            (
+                "web/app/d.ts",
+                "import { Svc } from '@acme/svc';\nexport function go(s: Svc): void {\n  \
+                 s.run();\n}\n",
+            ),
+            ("web/libs/deep/index.ts", "export * from './inner';\n"),
+            (
+                "web/libs/deep/inner.ts",
+                "export { Svc } from '../a/svc';\n",
+            ),
+            // TASK-006 review: a package import whose name a written file
+            // starts to define (M3), and a chain typed by an importer's
+            // return type (m1).
+            (
+                "package.json",
+                "{ \"dependencies\": { \"rxjs\": \"7\" } }\n",
+            ),
+            (
+                "web/m3/f.ts",
+                "import { map } from 'rxjs';\nexport function useMap(): void {\n  map();\n}\n",
+            ),
+            ("web/m3/util.ts", "export function other(): void {}\n"),
+            ("web/m2/x.ts", TS_FOO),
+            ("web/m2/y.ts", TS_FOO),
+            ("web/m2/w.ts", "export { Foo } from './x';\n"),
+            (
+                "web/m2/a.ts",
+                "import { Foo } from './w';\nexport class A {\n  pipe(): Foo {\n    \
+                 return new Foo();\n  }\n}\n",
+            ),
+            (
+                "web/m2/h.ts",
+                "import { A } from './a';\nexport function get(): A {\n  return new A();\n}\n",
+            ),
+            (
+                "web/m2/c.ts",
+                "import { get } from './h';\nexport function go(): void {\n  get().pipe().g();\n}\n",
+            ),
+            ("web/m1/x.ts", TS_FOO),
+            ("web/m1/y.ts", TS_FOO),
+            ("web/m1/w.ts", "export { Foo } from './x';\n"),
+            (
+                "web/m1/a.ts",
+                "import { Foo } from './w';\nexport class A {\n  f(): Foo {\n    \
+                 return new Foo();\n  }\n}\n",
+            ),
+            (
+                "web/m1/c.ts",
+                "import { A } from './a';\nexport function go(a: A): void {\n  a.f().g();\n}\n",
+            ),
+            (
+                "web/app/e.ts",
+                "import { Svc } from '../libs/deep';\nexport function go(s: Svc): void {\n  \
+                 s.run();\n}\n",
+            ),
+        ]);
+        // Python (TASK-007): a package `__init__.py` re-exporting a class,
+        // and a module from a distribution the manifest comes to declare.
+        files.extend([
+            ("py/pkg/__init__.py", "from .a import Svc\n"),
+            ("py/pkg/a.py", PY_SVC),
+            ("py/pkg/b.py", PY_SVC),
+            (
+                "py/app.py",
+                "from pkg import Svc\n\n\ndef go():\n    Svc().run()\n",
+            ),
+            ("requirements.txt", "httpx\n"),
+            // Review P2: `import pkg.sub` binds `pkg`; a script beside a
+            // directory that becomes a package.
+            ("pp/pkg/__init__.py", "from .inner.x import f\n"),
+            ("pp/pkg/inner/x.py", "def f():\n    pass\n"),
+            ("pp/pkg/inner/y.py", "def f():\n    pass\n"),
+            ("pp/pkg/sub.py", "def s():\n    pass\n"),
+            ("pp/use.py", "import pkg.sub\n\n\ndef go():\n    pkg.f()\n"),
+            ("sc/helper.py", "def assist():\n    pass\n"),
+            ("sc/run.py", "import helper\n\nhelper.assist()\n"),
+            (
+                "py/net.py",
+                "import requests\n\n\ndef go():\n    requests.get(\"u\")\n",
+            ),
+        ]);
+        // Rust (TASK-007): a `pub use` re-export of the crate root, and a
+        // crate whose `Cargo.toml` comes to make it the workspace's.
+        files.extend([
+            ("rs/Cargo.toml", "[package]\nname = \"rlib\"\n"),
+            (
+                "rs/src/lib.rs",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod ops2;\npub mod ops3;\npub mod pre;\npub mod sub;\npub mod util2;\npub use a::Svc;\n",
+            ),
+            // A method in an `impl` of another file; a glob of a prelude
+            // that re-exports a type from `std`.
+            (
+                "rs/src/ops2.rs",
+                "use crate::a::Svc;\n\nimpl Svc {\n    pub fn save(&self) {}\n}\n",
+            ),
+            (
+                "rs/src/e.rs",
+                "use crate::a::Svc;\n\npub fn go(s: Svc) {\n    s.save();\n}\n",
+            ),
+            ("rs/src/pre.rs", "pub use std::collections::HashMap as Map;\n"),
+            // Second review: a missing derivable (external, `medium`) until an
+            // `impl` of another file defines it; a function re-exported from
+            // `std` until the module defines its own; a `const` of an
+            // importer typed by a re-exported type.
+            ("rs/src/ops3.rs", "use crate::a::Svc;\n"),
+            (
+                "rs/src/g.rs",
+                "use crate::a::Svc;\n\npub fn go() {\n    Svc::default();\n}\n",
+            ),
+            ("rs/src/util2.rs", "pub use std::mem::take;\n"),
+            (
+                "rs/src/h.rs",
+                "pub fn go(v: &mut i32) {\n    crate::util2::take(v);\n}\n",
+            ),
+            ("rs/src/sub/mod.rs", "pub mod k;\npub mod m;\n"),
+            (
+                "rs/src/sub/k.rs",
+                "use crate::Svc;\n\npub const C: Svc = Svc;\n",
+            ),
+            (
+                "rs/src/sub/m.rs",
+                "use super::k::C;\n\npub fn go() {\n    C.run();\n}\n",
+            ),
+            (
+                "rs/src/f.rs",
+                "use crate::pre::*;\n\npub fn go() {\n    Map::new();\n}\n",
+            ),
+            ("rs/src/a.rs", RS_SVC),
+            ("rs/src/b.rs", RS_SVC),
+            (
+                "rs/src/c.rs",
+                "use crate::Svc;\n\npub fn go(s: Svc) {\n    s.run();\n}\n",
+            ),
+            (
+                "rw/app/Cargo.toml",
+                "[package]\nname = \"rapp\"\n[dependencies]\nralpha = { path = \"../alpha\" }\n",
+            ),
+            (
+                "rw/app/src/main.rs",
+                "use ralpha::Thing;\n\nfn main() {\n    Thing::go();\n}\n",
+            ),
+            (
+                "rw/alpha/src/lib.rs",
+                "pub struct Thing;\n\nimpl Thing {\n    pub fn go() {}\n}\n",
+            ),
+        ]);
+        // Go (TASK-007): the `module` of `go.mod` decides which imports are
+        // the repository's.
+        files.extend([
+            ("gox/go.mod", "module example.com/m\n"),
+            (
+                "gox/store/store.go",
+                "package store\n\nfunc New() int {\n\treturn 1\n}\n",
+            ),
+            (
+                "gox/app/app.go",
+                "package app\n\nimport \"example.com/m/store\"\n\nfunc Go() {\n\tstore.New()\n}\n",
+            ),
+        ]);
+        files.extend(LINK_FILLER);
+        files.extend([
+            ("g1.py", "def g1():\n    pass\n"),
+            ("g2.py", "def g2():\n    pass\n"),
+            ("g3.py", "def g3():\n    pass\n"),
+            ("g4.py", "def g4():\n    pass\n"),
+        ]);
+        // Each step: the file written, its new text, and the edge of a file
+        // not written whose answer must change — so no scenario passes by
+        // changing nothing.
+        let steps: [(&str, &str, &str, &str, i32); 25] = [
+            (
+                "p/B.java",
+                "package p;\npublic class B extends C {}\n",
+                "q/U.java",
+                "B.m",
+                8,
+            ),
+            (
+                "p/R.java",
+                "package p;\npublic class R { public Y find() { return null; } }\n",
+                "q/U.java",
+                "doIt",
+                9,
+            ),
+            // `@lombok.Data` removed: the getter's field (medium) becomes
+            // undecided — a resolved row the mode (c) does not pick.
+            (
+                "p/D.java",
+                "package p;\npublic class D { private String name; }\n",
+                "q/U.java",
+                "D.getName",
+                10,
+            ),
+            // The type of a member receiver's field changes.
+            (
+                "p/H.java",
+                "package p;\npublic class H { public Y item; }\n",
+                "q/U.java",
+                "doIt",
+                11,
+            ),
+            // TASK-017 (e): a class's `implements` changes: a call of another
+            // file to an inherited default method follows it.
+            (
+                "p/K.java",
+                "package p;\npublic class K implements I2 { public void work() {} }\n",
+                "q/W.java",
+                "K.helper",
+                5,
+            ),
+            // A supertype's `extends` changes: a subtype's bare call follows.
+            (
+                "p/B.java",
+                "package p;\npublic class B extends C {}\n",
+                "p/B2.java",
+                "m",
+                3,
+            ),
+            // The return type of a statically imported `name()` changes.
+            (
+                "p/Util.java",
+                "package p;\npublic class Util { public static Y name() { return null; } }\n",
+                "q/V.java",
+                "doIt",
+                5,
+            ),
+            // A barrel re-exports `Svc` from the other library: only the
+            // importers rule reaches `c.ts` (the barrel defines no name).
+            (
+                "web/libs/barrel/index.ts",
+                "export { Svc } from '../b/svc';\n",
+                "web/app/c.ts",
+                "Svc.run",
+                5,
+            ),
+            // The alias moves: no source file changes, only the config rule
+            // (a full pass under another `tsconfig`) reaches `d.ts`.
+            (
+                "tsconfig.base.json",
+                TS_CONFIG_B,
+                "web/app/d.ts",
+                "Svc.run",
+                3,
+            ),
+            // The inner barrel of a barrel moves: the importers rule, through
+            // the outer barrel, reaches `e.ts`.
+            (
+                "web/libs/deep/inner.ts",
+                "export { Svc } from '../b/svc';\n",
+                "web/app/e.ts",
+                "Svc.run",
+                3,
+            ),
+            // The barrel behind `A.f()`'s return type moves: `c.ts` imports
+            // only `A` (an importer of the barrel), and only an importer's
+            // names (`f`) reach its `a.f().g()`.
+            (
+                "web/m1/w.ts",
+                "export { Foo } from './y';\n",
+                "web/m1/c.ts",
+                "g",
+                3,
+            ),
+            // A package `__init__.py` re-exports `Svc` from the other module:
+            // it defines no name, so only the importers rule reaches `app.py`.
+            (
+                "py/pkg/__init__.py",
+                "from .b import Svc\n",
+                "py/app.py",
+                "run",
+                5,
+            ),
+            // The manifest declares `requests`: no source changes, only the
+            // environment rule (a full pass) makes `requests.get` external.
+            (
+                "requirements.txt",
+                "httpx\nrequests\n",
+                "py/net.py",
+                "get",
+                5,
+            ),
+            // `pkg/__init__.py` re-exports `f` from the other module: only
+            // `pkg/__init__.py` in the reach of `import pkg.sub` reaches
+            // `use.py`.
+            (
+                "pp/pkg/__init__.py",
+                "from .inner.y import f\n",
+                "pp/use.py",
+                "f",
+                5,
+            ),
+            // `sc/` becomes a package: the script's own directory is no
+            // root any more, and only the rule that a written
+            // `__init__.py` reopens its directory reaches `run.py`.
+            ("sc/__init__.py", "X = 1\n", "sc/run.py", "assist", 3),
+            // The crate root re-exports `Svc` from the other module: it
+            // defines no `Svc`, so only the importers rule (a `use` of the
+            // crate root) reaches `c.rs`.
+            (
+                "rs/src/lib.rs",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod ops2;\npub mod ops3;\npub mod pre;\npub mod sub;\npub mod util2;\npub use b::Svc;\n",
+                "rs/src/c.rs",
+                "Svc.run",
+                4,
+            ),
+            // Review, performance: in a Rust importer only the rows that
+            // name what its `use`s bind are reopened; the `use` row itself is
+            // one of them.
+            (
+                "rs/src/lib.rs",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod ops2;\npub mod ops3;\npub mod pre;\npub mod sub;\npub mod util2;\npub use b::Svc;\n",
+                "rs/src/c.rs",
+                "crate::Svc",
+                1,
+            ),
+            // Second review N1(a): `impl Default` in another file; the call
+            // was external (`inherited` `medium`): only its name reaches it.
+            (
+                "rs/src/ops3.rs",
+                "use crate::a::Svc;\n\nimpl Default for Svc {\n    fn default() -> Self {\n        Svc\n    }\n}\n",
+                "rs/src/g.rs",
+                "Svc.default",
+                4,
+            ),
+            // N1(b): the module defines its own `take` instead of re-exporting
+            // `std`'s: a path through a repository module, reopened by name.
+            (
+                "rs/src/util2.rs",
+                "pub fn take(_v: &mut i32) -> i32 {\n    0\n}\n",
+                "rs/src/h.rs",
+                "crate::util2::take",
+                2,
+            ),
+            // N2: an importer's `const` is typed by the re-exported type.
+            (
+                "rs/src/lib.rs",
+                "pub mod a;\npub mod b;\npub mod c;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod ops2;\npub mod ops3;\npub mod pre;\npub mod sub;\npub mod util2;\npub use b::Svc;\n",
+                "rs/src/sub/m.rs",
+                "C.run",
+                4,
+            ),
+            // Review: an `impl` of another file loses `save`; `e.rs` has no
+            // `use` of it, and only its gone destination reaches it.
+            (
+                "rs/src/ops2.rs",
+                "use crate::a::Svc;\n\nimpl Svc {}\n",
+                "rs/src/e.rs",
+                "Svc.save",
+                4,
+            ),
+            // Review, performance: an external path call is not reopened by
+            // name; when the glob it reaches it through re-exports a
+            // repository type instead, the importers rule still does.
+            (
+                "rs/src/pre.rs",
+                "pub use crate::a::Svc as Map;\n",
+                "rs/src/f.rs",
+                "Map.new",
+                4,
+            ),
+            // Review: an importer's `pipe(): Foo` types a chain like any
+            // other name with a declared return (the generic-name filter no
+            // longer drops it).
+            ("web/m2/w.ts", "export { Foo } from './y';\n", "web/m2/c.ts", "g", 3),
+            // A `Cargo.toml` makes `ralpha` a crate of the workspace: no
+            // source changes, only the environment rule resolves the path.
+            (
+                "rw/alpha/Cargo.toml",
+                "[package]\nname = \"ralpha\"\n",
+                "rw/app/src/main.rs",
+                "Thing.go",
+                4,
+            ),
+            // The module is renamed: no source changes, only the environment
+            // rule makes the import another module's (external).
+            (
+                "gox/go.mod",
+                "module example.com/other\n",
+                "gox/app/app.go",
+                "New",
+                6,
+            ),
+        ];
+        // Each scenario on a branch of its own, so every one is judged (and
+        // reported) whatever the others do.
+        let mut failures: Vec<String> = Vec::new();
+        for (i, (file, text, seen_in, dst, line)) in steps.into_iter().enumerate() {
+            let (dir, repo) = graph_repo(&format!("linkeq{i}"), &files);
+            let store = Store::open_in_memory(DIM).unwrap();
+            index_with(&store, &dir, true, None);
+            assert!(full_link_changes(&store, &repo, &dir).is_empty());
+            let watched = |store: &Store| {
+                store
+                    .file_symbol_edges(&repo, "main", seen_in)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| {
+                        (e.kind == "calls" || e.kind == "imports")
+                            && e.dst_name == dst
+                            && e.line == line
+                    })
+                    .unwrap_or_else(|| panic!("no {dst} at {seen_in}:{line}"))
+            };
+            let before = watched(&store);
+            write(&dir, file, text);
+            commit_all(&dir, file);
+            let inc = index_with(&store, &dir, false, None);
+            // A manifest may be no indexed file of its own (`.toml`, `.txt`).
+            let unindexed = [".toml", ".txt", "go.mod", ".cfg"]
+                .iter()
+                .any(|e| file.ends_with(e));
+            if !unindexed {
+                assert_eq!(inc.files_indexed, 1, "{file}: {inc:?}");
+            }
+            let after = watched(&store);
+            if before == after {
+                failures.push(format!(
+                    "{file}: the watched edge did not change: {after:?}"
+                ));
+            }
+            let diff = full_link_changes(&store, &repo, &dir);
+            if !diff.is_empty() {
+                failures.push(format!("{file}: the incremental pass left {diff:#?}"));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    const PY_SVC: &str = "class Svc:\n    def run(self):\n        pass\n";
+    const RS_SVC: &str = "pub struct Svc;\n\nimpl Svc {\n    pub fn run(&self) {}\n}\n";
+    const TS_FOO: &str = "export class Foo {\n  g(): void {}\n}\n";
+    const TS_SVC: &str = "export class Svc {\n  run(): void {}\n}\n";
+    const TS_CONFIG_A: &str =
+        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@acme/svc\": [\"web/libs/a/svc.ts\"] } } }\n";
+    const TS_CONFIG_B: &str =
+        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@acme/svc\": [\"web/libs/b/svc.ts\"] } } }\n";
+
+    /// TASK-006 review, M4: a `tsconfig.base.json` left unreadable (a merge
+    /// conflict) relinks nothing and loses no alias; a readable one again is
+    /// a changed environment, relinked in full.
+    #[test]
+    fn an_unreadable_tsconfig_keeps_the_last_good_one() {
+        let mut files = vec![
+            ("web/libs/a/svc.ts", TS_SVC),
+            ("web/libs/b/svc.ts", TS_SVC),
+            ("tsconfig.base.json", TS_CONFIG_A),
+            (
+                "web/app/d.ts",
+                "import { Svc } from '@acme/svc';\nexport function go(s: Svc): void {\n  \
+                 s.run();\n}\n",
+            ),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkenv", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let watched = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "web/app/d.ts")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.kind == "calls" && e.dst_name == "Svc.run")
+                .unwrap()
+        };
+        let good = watched(&store);
+        assert_eq!(good.confidence.as_deref(), Some("high"), "{good:?}");
+        write(
+            &dir,
+            "tsconfig.base.json",
+            &format!("<<<<<<< HEAD\n{TS_CONFIG_A}=======\n{TS_CONFIG_B}>>>>>>> other\n"),
+        );
+        commit_all(&dir, "conflict");
+        let inc = index_with(&store, &dir, false, None);
+        assert_eq!(inc.edges_linked, 0, "no relink: {inc:?}");
+        assert_eq!(watched(&store), good, "the alias is kept");
+        write(&dir, "tsconfig.base.json", TS_CONFIG_B);
+        commit_all(&dir, "resolved");
+        index_with(&store, &dir, false, None);
+        let moved = watched(&store);
+        assert_ne!(
+            moved.dst_id, good.dst_id,
+            "the new alias relinks: {moved:?}"
+        );
+        assert_eq!(moved.confidence.as_deref(), Some("high"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-006 second review, mi1: a `package.json` that is no JSON (an
+    /// Nx generator's template) committed after a good index, together with
+    /// a moved alias: the alias is seen, the broken manifest costs only
+    /// itself.
+    #[test]
+    fn a_broken_manifest_does_not_freeze_the_aliases() {
+        let mut files = vec![
+            ("web/libs/a/svc.ts", TS_SVC),
+            ("web/libs/b/svc.ts", TS_SVC),
+            ("tsconfig.base.json", TS_CONFIG_A),
+            (
+                "web/app/d.ts",
+                "import { Svc } from '@acme/svc';\nexport function go(s: Svc): void {\n  \
+                 s.run();\n}\n",
+            ),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkmanifest", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let watched = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "web/app/d.ts")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.kind == "calls" && e.dst_name == "Svc.run")
+                .unwrap()
+        };
+        let before = watched(&store);
+        write(
+            &dir,
+            "tools/generators/x/files/package.json",
+            "{ \"name\": \"<%= name %>\" ",
+        );
+        write(&dir, "tsconfig.base.json", TS_CONFIG_B);
+        commit_all(&dir, "generator template and a moved alias");
+        index_with(&store, &dir, false, None);
+        let after = watched(&store);
+        assert_ne!(after.dst_id, before.dst_id, "the moved alias: {after:?}");
+        assert_eq!(after.confidence.as_deref(), Some("high"));
+        assert!(full_link_changes(&store, &repo, &dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-006 second review, mi2: a file that starts defining `map` does
+    /// not change an import of `map` from a declared package (it stays
+    /// external), and the incremental pass equals a full one.
+    #[test]
+    fn a_repository_homonym_does_not_unmake_a_package_import() {
+        let mut files = vec![
+            (
+                "package.json",
+                "{ \"dependencies\": { \"rxjs\": \"7\" } }\n",
+            ),
+            (
+                "web/m3/f.ts",
+                "import { map } from 'rxjs';\nexport function useMap(): void {\n  map();\n}\n",
+            ),
+            ("web/m3/util.ts", "export function other(): void {}\n"),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkhomonym", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        write(
+            &dir,
+            "web/m3/util.ts",
+            "export function other(): void {}\nexport function map(): void {}\n",
+        );
+        commit_all(&dir, "a homonym");
+        index_with(&store, &dir, false, None);
+        let rows = store
+            .file_symbol_edges(&repo, "main", "web/m3/f.ts")
+            .unwrap();
+        for dst in ["rxjs#map", "map"] {
+            let e = rows.iter().find(|e| e.dst_name == dst).unwrap();
+            assert_eq!(
+                (e.external, e.confidence.as_deref()),
+                (Some(true), Some("high")),
+                "{e:?}"
+            );
+        }
+        assert!(full_link_changes(&store, &repo, &dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-007: the `Cargo.toml`, `go.mod` and Python manifests are part of
+    /// the link environment. One left unreadable (a merge conflict) relinks
+    /// nothing; a changed one relinks the branch in full, though no source
+    /// file changed.
+    #[test]
+    fn a_changed_manifest_relinks_and_an_unreadable_one_does_not() {
+        let mut files = vec![
+            ("crates/a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("go.mod", "module example.com/m\n"),
+            ("requirements.txt", "requests\n"),
+            ("caller.py", "def go():\n    print(1)\n"),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, _repo) = graph_repo("linkcargo", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        for (file, broken) in [
+            ("crates/a/Cargo.toml", "[package]\n<<<<<<< HEAD\n"),
+            ("go.mod", "<<<<<<< HEAD\nmodule x\n"),
+            ("requirements.txt", "<<<<<<< HEAD\nrequests\n"),
+        ] {
+            write(&dir, file, broken);
+            commit_all(&dir, "conflict");
+            let inc = index_with(&store, &dir, false, None);
+            assert_eq!(inc.edges_linked, 0, "{file}: no relink: {inc:?}");
+        }
+        for (file, text) in [
+            (
+                "crates/a/Cargo.toml",
+                "[package]\nname = \"a\"\n[dependencies]\nserde = \"1\"\n",
+            ),
+            ("go.mod", "module example.com/renamed\n"),
+            ("requirements.txt", "requests\nhttpx\n"),
+        ] {
+            write(&dir, file, text);
+            commit_all(&dir, file);
+            let inc = index_with(&store, &dir, false, None);
+            assert!(inc.edges_linked > 0, "{file}: a full relink: {inc:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link pass cut short (a stop, a crash) is owed: the next run does it
+    /// in full, though its files are unchanged and it writes none (MAJOR 5).
+    #[test]
+    fn a_link_pass_cut_short_is_done_by_the_next_run() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkcut", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        write(
+            &dir,
+            "src/a/Caller.java",
+            &LINK_CALLER.replace("go(", "walk("),
+        );
+        commit_all(&dir, "rename go");
+        let stop = CancelAt::new(Some("link"), usize::MAX);
+        let cut = index_with(&store, &dir, false, Some(&stop));
+        assert!(cut.cancelled, "{cut:?}");
+        let unlinked = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind != "contains" && e.resolution.is_none())
+                .count()
+        };
+        assert!(unlinked(&store) > 0, "the cut left the file unlinked");
+        let next = index_with(&store, &dir, false, None);
+        assert_eq!(next.files_indexed, 0, "nothing to reindex: {next:?}");
+        assert_eq!(unlinked(&store), 0, "the owed link pass did not run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A build whose link rules differ from the ones that linked the branch
+    /// relinks it in full on its next run, changed files or not (MAJOR 6).
+    #[test]
+    fn a_new_link_version_relinks_the_branch() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkver", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let good = store
+            .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+            .unwrap();
+        // What an older rule wrote: resolved, so no incremental selection
+        // would pick it again.
+        let stale: Vec<_> = good
+            .iter()
+            .filter(|e| e.kind != "contains")
+            .map(|e| devctx_store::StoredSymbolEdge {
+                resolution: Some("unique_name".into()),
+                confidence: Some("medium".into()),
+                dst_id: Some(e.src_id),
+                external: Some(false),
+                ..e.clone()
+            })
+            .collect();
+        store
+            .replace_files_linked_edges(&repo, "main", &[("src/a/Caller.java", stale)])
+            .unwrap();
+        let repo_path = repo_path_of(&dir);
+        store
+            .set_index_meta(&repo_path, "main", crate::link::LINK_VERSION_META_KEY, "0")
+            .unwrap();
+        index_with(&store, &dir, false, None);
+        assert_eq!(
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap(),
+            good
+        );
+        assert_eq!(
+            store
+                .get_index_meta(&repo_path, "main", crate::link::LINK_VERSION_META_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(crate::link::LINK_VERSION)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dropped call is kept, marked `discarded` (MAJOR 7): when a written
+    /// file defines its name, the incremental pass reopens it by name.
+    #[test]
+    fn a_discarded_call_is_kept_and_reopens_by_name() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkdisc", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let vanish = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.dst_name == "vanish")
+                .expect("the dropped call is kept")
+        };
+        let first = vanish(&store);
+        assert_eq!(first.resolution.as_deref(), Some("discarded"));
+        assert_eq!((first.dst_id, first.external), (None, Some(false)));
+        write(
+            &dir,
+            "src/b/Ghost.java",
+            "package b;\npublic class Ghost { public void vanish() {} }\n",
+        );
+        commit_all(&dir, "a vanish");
+        index_with(&store, &dir, false, None);
+        assert_eq!(vanish(&store).resolution.as_deref(), Some("name_only"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rows the incremental pass re-resolves on its own, whatever was
+    /// written: the undecided ones (mode c), never the discarded.
+    fn undecided_live(store: &Store, repo: &str) -> usize {
+        store
+            .branch_linkable_edges(repo, "main")
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.dst_id.is_none()
+                    && !e.external.unwrap_or(false)
+                    && e.resolution.as_deref() != Some(crate::link::DISCARDED)
+            })
+            .count()
+    }
+
+    /// Discarded rows are reopened by name, not by mode (c): a run that
+    /// writes an unrelated file leaves them alone (follow-up 4).
+    #[test]
+    fn discarded_rows_wait_for_their_name() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkwait", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        assert_eq!(store.branch_discarded_calls(&repo, "main").unwrap(), 1);
+        let expected = undecided_live(&store, &repo);
+        write(&dir, "f1.py", "def f1():\n    return 1\n");
+        commit_all(&dir, "unrelated");
+        let inc = index_with(&store, &dir, false, None);
+        assert_eq!(inc.files_indexed, 1, "{inc:?}");
+        assert_eq!(inc.edges_linked, expected, "{inc:?}");
+        assert_eq!(inc.edges_discarded, 1, "the branch's total: {inc:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The words of a hint (`typed`, `field`, `name`…) are no names: a
+    /// written file defining a symbol `field` reopens nothing by them
+    /// (follow-up 2).
+    #[test]
+    fn hint_keywords_do_not_reopen_edges() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkkw", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let expected = undecided_live(&store, &repo);
+        write(&dir, "k.py", "field = 1\nname = 2\ntyped = 3\n");
+        commit_all(&dir, "keywords as names");
+        let inc = index_with(&store, &dir, false, None);
+        assert_eq!(inc.files_indexed, 1, "{inc:?}");
+        assert_eq!(inc.edges_linked, expected, "{inc:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A call dropped for its arity (an untyped receiver, and no method of
+    /// that name takes those arguments) is reopened when a written file adds
+    /// the overload that does.
+    #[test]
+    fn a_call_discarded_for_its_arity_reopens_with_the_overload() {
+        let caller = "package a;\nimport java.util.List;\npublic class Caller {\n    \
+                      void go(List<String> xs) {\n        xs.forEach(x -> x.vanish(1, 2));\n    }\n}\n";
+        let mut files = vec![
+            ("src/a/Caller.java", caller),
+            (
+                "src/b/Ghost.java",
+                "package b;\npublic class Ghost { public void vanish() {} }\n",
+            ),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkarity", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_with(&store, &dir, true, None);
+        let vanish = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "src/a/Caller.java")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.dst_name == "vanish")
+                .unwrap()
+        };
+        assert_eq!(vanish(&store).resolution.as_deref(), Some("discarded"));
+        write(
+            &dir,
+            "src/b/Ghost.java",
+            "package b;\npublic class Ghost {\n    public void vanish() {}\n    \
+             public void vanish(int a, int b) {}\n}\n",
+        );
+        commit_all(&dir, "the overload");
+        index_with(&store, &dir, false, None);
+        assert_eq!(vanish(&store).resolution.as_deref(), Some("name_only"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that is no source (a README) is no graph write: it does not
+    /// wake the link pass (MINOR).
+    #[test]
+    fn a_non_graph_file_does_not_wake_the_link_pass() {
+        let mut files = vec![
+            ("src/a/Caller.java", LINK_CALLER),
+            ("src/b/Helper.java", LINK_HELPER),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, _repo) = graph_repo("linkmd", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        let full = index_with(&store, &dir, true, None);
+        assert!(full.edges_linked > 0, "{full:?}");
+        write(&dir, "README.md", "# notes\n");
+        commit_all(&dir, "docs");
+        let docs = index_with(&store, &dir, false, None);
+        assert_eq!(docs.files_indexed, 1, "{docs:?}");
+        assert_eq!(
+            docs.edges_linked, 0,
+            "the link pass ran for a README: {docs:?}"
+        );
+        std::fs::remove_file(dir.join("README.md")).unwrap();
+        commit_all(&dir, "no docs");
+        let gone = index_with(&store, &dir, false, None);
+        assert_eq!(gone.files_deleted, 1, "{gone:?}");
+        assert_eq!(
+            gone.edges_linked, 0,
+            "the link pass ran for a deleted README: {gone:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DD-6 mode (b) by name: an edge that is resolved and points at a
+    /// symbol that still exists is re-resolved when a written file adds a
+    /// symbol named like its destination — here a second `utilFn`, which
+    /// makes the unique name ambiguous. Only `c.ts` is indexed; `a.ts`'s
+    /// row is neither dangling nor undecided, so nothing but the name picks
+    /// it.
+    #[test]
+    fn an_added_homonym_reopens_a_resolved_edge_by_name() {
+        // A free name of a script nothing imports (TypeScript keeps rule 7 for
+        // it; Python no longer does, TASK-007: a name Python cannot see is
+        // undecided).
+        let mut files = vec![
+            ("a.ts", "export function go(): void {\n  utilFn();\n}\n"),
+            ("b.ts", "export function utilFn(): void {}\n"),
+        ];
+        files.extend(LINK_FILLER);
+        let (dir, repo) = graph_repo("linkname", &files);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let edge = |store: &Store| {
+            store
+                .file_symbol_edges(&repo, "main", "a.ts")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.kind == "calls" && e.dst_name == "utilFn")
+                .unwrap()
+        };
+        let first = edge(&store);
+        assert_eq!(first.resolution.as_deref(), Some("unique_name"));
+        assert_eq!(first.confidence.as_deref(), Some("medium"));
+        assert!(first.dst_id.is_some());
+
+        write(&dir, "c.ts", "export function utilFn(): void {}\n");
+        commit_all(&dir, "a homonym");
+        let inc = index_branch(&store, &dir, "main", false);
+        assert_eq!(inc.files_indexed, 1, "{inc:?}");
+        let now = edge(&store);
+        assert_eq!(now.resolution.as_deref(), Some("name_only"), "{now:?}");
+        assert_eq!((now.dst_id, now.confidence.as_deref()), (None, Some("low")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_relation_of_a_file_is_an_edge() {
+        let src = "\
+package com.example;
+
+import java.util.List;
+
+public class A extends B implements C {
+    private List<D> ds = new ArrayList<>();
+
+    public A(D d) {
+        helper();
+    }
+
+    void run() {
+        helper();
+    }
+}
+";
+        let (dir, repo) = graph_repo("kinds", &[("src/A.java", src)]);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let syms = store.file_symbols(&repo, "main", "src/A.java").unwrap();
+        let edges = store
+            .file_symbol_edges(&repo, "main", "src/A.java")
+            .unwrap();
+        let kinds: std::collections::BTreeSet<&str> =
+            edges.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds.into_iter().collect::<Vec<_>>(),
+            [
+                "calls",
+                "contains",
+                "implements",
+                "imports",
+                "inherits",
+                "instantiates",
+                "references"
+            ]
+        );
+        let file = symbol(&syms, "src/A.java");
+        let class = symbol(&syms, "A");
+        let ctor = symbol(&syms, "A.A");
+        assert_eq!(ctor.kind, "constructor");
+        assert_eq!(ctor.signature.as_deref(), Some("public A(D d)"));
+        assert!(syms
+            .iter()
+            .all(|s| s.package.as_deref() == Some("com.example")));
+        assert_eq!(class.exported, Some(true));
+        assert_eq!(symbol(&syms, "A.run").exported, Some(false));
+        let one = |kind: &str, dst: &str| {
+            edges
+                .iter()
+                .find(|e| e.kind == kind && e.dst_name == dst)
+                .unwrap_or_else(|| panic!("no {kind} {dst} in {edges:#?}"))
+        };
+        assert_eq!(one("imports", "java.util.List").src_id, file.id);
+        assert_eq!(one("inherits", "B").src_id, class.id);
+        assert_eq!(one("implements", "C").src_id, class.id);
+        let field = symbol(&syms, "A.ds");
+        assert_eq!(one("instantiates", "ArrayList").src_id, field.id);
+        assert_eq!(one("references", "List").src_id, field.id);
+        assert_eq!(one("references", "D").src_id, field.id);
+        // The constructor is a symbol: its call and its parameter's type
+        // come from it.
+        assert!(edges
+            .iter()
+            .any(|e| e.kind == "calls" && e.dst_name == "helper" && e.src_id == ctor.id));
+        assert!(edges
+            .iter()
+            .any(|e| e.kind == "references" && e.dst_name == "D" && e.src_id == ctor.id));
+        // Containment is resolved in the file; nothing else is yet.
+        let contains: Vec<_> = edges.iter().filter(|e| e.kind == "contains").collect();
+        assert_eq!(
+            contains.len(),
+            syms.len() - 1,
+            "one per symbol but the file's"
+        );
+        let top = one("contains", "A");
+        assert_eq!((top.src_id, top.dst_id), (file.id, Some(class.id)));
+        assert_eq!(one("contains", "A.run").src_id, class.id);
+        // Intra-file only, and marked as such: `structural`, not DD-7's
+        // `same_file` (rule 6), so gold-edge precision does not count it.
+        let ids: std::collections::HashSet<u64> = syms.iter().map(|s| s.id).collect();
+        for c in &contains {
+            assert_eq!(c.resolution.as_deref(), Some("structural"), "{c:?}");
+            assert!(ids.contains(&c.src_id) && c.dst_id.is_some_and(|d| ids.contains(&d)));
+        }
+        // Everything else went through the link pass (TASK-005): decided,
+        // with a confidence, whatever the answer.
+        assert!(edges
+            .iter()
+            .filter(|e| e.kind != "contains")
+            .all(|e| e.confidence.is_some() && e.resolution.is_some()));
+        assert_eq!(one("calls", "helper").confidence.as_deref(), Some("low"));
+        assert_no_orphans(&store, &repo, "main", &["src/A.java"]);
+        // `graph_edges` stays calls only, in its 0.9.0 shape.
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        assert!(old.iter().all(|e| e.kind == "calls"), "{old:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deleted file takes its symbols and edges with it.
+    #[test]
+    fn deleting_a_file_drops_its_graph_rows() {
+        let (dir, repo) = graph_repo(
+            "delete",
+            &[
+                ("a.py", "def a():\n    b()\n"),
+                ("b.py", "def b():\n    a()\n"),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        // Two symbols per file; per file a call and a `contains`.
+        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), (4, 4));
+        std::fs::remove_file(dir.join("b.py")).unwrap();
+        commit_all(&dir, "drop b");
+        let r = index_branch(&store, &dir, "main", false);
+        assert_eq!(r.files_deleted, 1, "{r:?}");
+        assert!(store
+            .file_symbols(&repo, "main", "b.py")
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .file_symbol_edges(&repo, "main", "b.py")
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), (2, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping a branch takes its graph rows and nobody else's.
+    #[test]
+    fn dropping_a_branch_drops_its_graph_rows() {
+        let dir = two_branch_repo("graph_drop");
+        let repo = dir.file_name().unwrap().to_string_lossy().to_string();
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        index_branch(&store, &dir, "feature", true);
+        let main = store.graph_row_counts(&repo, "main").unwrap();
+        assert!(main.0 > 0);
+        assert_eq!(store.graph_row_counts(&repo, "feature").unwrap(), main);
+        store
+            .drop_branch(&repo, &repo_path_of(&dir), "feature")
+            .unwrap();
+        assert_eq!(store.graph_row_counts(&repo, "feature").unwrap(), (0, 0));
+        assert_eq!(store.graph_row_counts(&repo, "main").unwrap(), main);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index stamped by extractor v1 (0.9.0) has no symbol graph: it reads
+    /// stale, an incremental run does not hide that, and `--full` fills the
+    /// tables and re-stamps it.
+    #[test]
+    fn a_v1_index_reads_stale_until_a_full_run_fills_the_graph() {
+        let (dir, repo) = graph_repo("v1", &[("a.py", "def a():\n    b()\n")]);
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let repo_path = repo_path_of(&dir);
+        // What 0.9.0 left: its own stamp, no rows in the new tables.
+        store
+            .set_index_meta(&repo_path, "main", "extractor", "v1-0123456789abcdef")
+            .unwrap();
+        store.delete_file_graph(&repo, "main", "a.py").unwrap();
+        let now = extractor_fingerprint();
+        let version = format!("v{}-", devctx_parse::EXTRACTOR_VERSION);
+        assert!(now.starts_with(&version), "{now}");
+        assert!(store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, "main", &now)
+            .unwrap());
+
+        write(&dir, "b.py", "def b():\n    pass\n");
+        commit_all(&dir, "add b");
+        let inc = index_branch(&store, &dir, "main", false);
+        assert!(inc.extractor_stale, "an incremental run must not hide it");
+        assert!(store
+            .file_symbols(&repo, "main", "a.py")
+            .unwrap()
+            .is_empty());
+
+        let full = index_branch(&store, &dir, "main", true);
+        assert!(!full.extractor_stale);
+        assert!(!store
+            .extractor_stale(&repo_short_of(&dir), &repo_path, "main", &now)
+            .unwrap());
+        assert_eq!(store.file_symbols(&repo, "main", "a.py").unwrap().len(), 2);
+        assert_eq!(
+            store
+                .file_symbol_edges(&repo, "main", "a.py")
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "calls")
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A downgraded 0.9.0 reads `graph_edges` with the queries it always had
+    /// (the read side of `graph.rs` is unchanged since 0.9.0): the table must
+    /// stay what that release wrote — qualified sources, one row per pair, no
+    /// row without a source — next to the new tables it does not know.
+    #[test]
+    fn graph_edges_stays_readable_by_0_9_0() {
+        let (dir, repo) = graph_repo(
+            "compat",
+            &[(
+                "svc.py",
+                "class Svc:\n    def run(self):\n        self.helper()\n        self.helper()\n\n    def helper(self):\n        pass\n\nSvc().run()\n",
+            )],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!(
+            (old[0].source.as_str(), old[0].target.as_str()),
+            ("Svc.run", "Svc.helper")
+        );
+        let refs = store.find_references(&repo, "main", "Svc.helper").unwrap();
+        assert_eq!(refs.len(), 1);
+        let impact = store
+            .impact_analysis(&repo, "main", "Svc.helper", 2)
+            .unwrap();
+        assert_eq!(impact.upstream, vec![("Svc.run".to_string(), 1)]);
+        // The new tables hold the occurrences 0.9.0 folded or dropped.
+        let edges = store.file_symbol_edges(&repo, "main", "svc.py").unwrap();
+        let calls = edges.iter().filter(|e| e.kind == "calls").count();
+        assert_eq!(calls, 4, "{edges:?}"); // helper ×2, Svc, run at module level
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a downgraded 0.9.0 finds in `graph_edges` for every shape of a
+    /// Rust path call: what the v0.9.0 binary wrote and answered on this same
+    /// fixture (PLAN-009 TASK-019) — every path call by its last segment
+    /// (`helper`, `open`, `new`, `m`, `Variant`), so the walk through
+    /// `Store.open` stops where 0.9.0's stopped (`open` is no source). The
+    /// table is 0.9.0's own extraction (`devctx_parse::legacy_v090`); the
+    /// golden of every language is `devctx-parse/tests/legacy_v090.rs`.
+    #[test]
+    fn rust_path_calls_stay_walkable_by_0_9_0() {
+        let (dir, repo) = graph_repo(
+            "compat_rust_path",
+            &[
+                ("src/lib.rs", "mod store;\nmod util;\n\nuse store::Store;\n\npub enum Kind {\n    Variant(u8),\n    Other,\n}\n\npub trait Named {\n    fn m(&self) -> u8;\n}\n\npub struct Svc;\n\nimpl Named for Svc {\n    fn m(&self) -> u8 {\n        1\n    }\n}\n\nimpl Svc {\n    pub fn new() -> Self {\n        Svc\n    }\n\n    pub fn by_self() -> Self {\n        Self::new()\n    }\n}\n\npub fn mod_crate() {\n    crate::util::helper();\n}\n\npub fn mod_rel() {\n    util::helper();\n}\n\npub fn type_mod(p: &str) -> Store {\n    store::Store::open(p)\n}\n\npub fn type_crate(p: &str) -> Store {\n    crate::store::Store::open(p)\n}\n\npub fn type_used(p: &str) -> Store {\n    Store::open(p)\n}\n\npub fn ufcs(s: &Svc) -> u8 {\n    <Svc as Named>::m(s)\n}\n\npub fn variant() -> Kind {\n    Kind::Variant(1)\n}\n\npub fn turbofish() -> Vec<u8> {\n    Vec::<u8>::new()\n}\n"),
+                ("src/store.rs", "pub struct Store;\n\nimpl Store {\n    pub fn open(_p: &str) -> Self {\n        crate::util::leaf();\n        Store\n    }\n}\n"),
+                ("src/util.rs", "pub fn helper() {\n    leaf();\n}\n\npub fn leaf() {}\n"),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        // The walk, as 0.9.0 does it (`impact_analysis` here is 0.9.0's
+        // reader: only the seed expands, the rest goes by exact name).
+        let mut up = store
+            .impact_analysis(&repo, "main", "leaf", 2)
+            .unwrap()
+            .upstream;
+        up.sort();
+        let want: Vec<(String, usize)> = [
+            ("Store.open", 1),
+            ("helper", 1),
+            ("mod_crate", 2),
+            ("mod_rel", 2),
+        ]
+        .iter()
+        .map(|(n, d)| (n.to_string(), *d))
+        .collect();
+        assert_eq!(up, want);
+        let mut down = store
+            .impact_analysis(&repo, "main", "mod_crate", 2)
+            .unwrap()
+            .downstream;
+        down.sort();
+        assert_eq!(
+            down,
+            vec![("helper".to_string(), 1), ("leaf".to_string(), 2)]
+        );
+        // One hop, by the bare name, for every shape.
+        let callers = |name: &str| -> Vec<String> {
+            let mut v: Vec<String> = store
+                .find_references(&repo, "main", name)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.source)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(callers("helper"), ["mod_crate", "mod_rel"]);
+        assert_eq!(callers("open"), ["type_crate", "type_mod", "type_used"]);
+        assert_eq!(callers("new"), ["Svc.by_self", "turbofish"]);
+        assert_eq!(callers("m"), ["ufcs"]);
+        assert_eq!(callers("Variant"), ["variant"]);
+        // What is stored, pinned: the rows of the v0.9.0 binary.
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        let mut rows: Vec<(&str, &str)> = old
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str()))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("Store.open", "leaf"),
+                ("Svc.by_self", "new"),
+                ("helper", "leaf"),
+                ("mod_crate", "helper"),
+                ("mod_rel", "helper"),
+                ("turbofish", "new"),
+                ("type_crate", "open"),
+                ("type_mod", "open"),
+                ("type_used", "open"),
+                ("ufcs", "m"),
+                ("variant", "Variant"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caller nested in another symbol is written in `graph_edges` as 0.9.0
+    /// wrote it — its innermost container and its name (`Deeper.deep`,
+    /// `C.f`), or the bare name (`inner`, a Rust `helper` in `mod tests`) —
+    /// never the qualified name the symbol graph uses
+    /// (`Outer.Testable.Deeper.deep`, `outer.inner`, `tests.helper`), which cut
+    /// a downgraded 0.9.0's walk by exact name and lost the callers 0.9.0
+    /// found (PLAN-009 TASK-019, a test helper in a nested class of a Java
+    /// repository, at depth 2). The rows below are what the v0.9.0 binary
+    /// wrote for this fixture; the table is 0.9.0's own extraction
+    /// (`devctx_parse::legacy_v090`).
+    #[test]
+    fn nested_callers_stay_walkable_by_0_9_0() {
+        let (dir, repo) = graph_repo(
+            "compat_nested",
+            &[
+                ("src/main/java/p/Svc.java", "package p;\n\npublic class Svc {\n    public static int calc() {\n        return 1;\n    }\n}\n"),
+                ("src/main/java/p/Outer.java", "package p;\n\npublic class Outer {\n    static class Testable {\n        int invoke() {\n            return Svc.calc();\n        }\n\n        int again() {\n            return this.invoke();\n        }\n\n        static class Deeper {\n            int deep() {\n                return Svc.calc();\n            }\n        }\n    }\n\n    void run() {\n        Testable t = new Testable();\n        t.invoke();\n    }\n\n    void runDeep() {\n        Testable.Deeper d = new Testable.Deeper();\n        d.deep();\n    }\n}\n"),
+                ("a.py", "class C:\n    def m(self):\n        def f():\n            leaf()\n        f()\n\n\ndef outer():\n    def inner():\n        leaf()\n    inner()\n\n\ndef leaf():\n    pass\n"),
+                ("Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+                ("src/lib.rs", "pub fn leaf() {}\n\npub fn top() {\n    leaf();\n}\n\n#[cfg(test)]\nmod tests {\n    fn helper() {\n        super::leaf();\n    }\n\n    #[test]\n    fn t() {\n        helper();\n    }\n}\n"),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        let mut sources: Vec<&str> = old.iter().map(|e| e.source.as_str()).collect();
+        sources.sort();
+        sources.dedup();
+        assert_eq!(
+            sources,
+            [
+                "C.f",
+                "C.m",
+                "Deeper.deep",
+                "Outer.run",
+                "Outer.runDeep",
+                "Testable.again",
+                "Testable.invoke",
+                "helper",
+                "inner",
+                "outer",
+                "t",
+                "top",
+            ],
+            "{old:?}"
+        );
+        // The walk, as 0.9.0 does it: every caller the v0.9.0 binary found
+        // on this fixture (`devctx impact calc|leaf --depth 3`).
+        let up = |name: &str| -> Vec<(String, usize)> {
+            let mut v = store
+                .impact_analysis(&repo, "main", name, 3)
+                .unwrap()
+                .upstream;
+            v.sort();
+            v
+        };
+        let calc = up("calc");
+        for want in [
+            ("Testable.invoke", 1),
+            ("Deeper.deep", 1),
+            ("Outer.run", 2),
+            ("Testable.again", 2),
+        ] {
+            assert!(
+                calc.contains(&(want.0.to_string(), want.1)),
+                "{want:?} not in {calc:?}"
+            );
+        }
+        let leaf = up("leaf");
+        for want in [
+            ("C.f", 1),
+            ("top", 1),
+            ("helper", 1),
+            ("inner", 1),
+            ("t", 2),
+            ("outer", 2),
+        ] {
+            assert!(
+                leaf.contains(&(want.0.to_string(), want.1)),
+                "{want:?} not in {leaf:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The callables 0.10 made symbols and 0.9.0 did not source a call from,
+    /// and the targets 0.9.0 typed by its own rules, against what the v0.9.0
+    /// binary wrote and answered for this fixture (PLAN-009 TASK-019):
+    ///
+    /// - an arrow, a function expression and a named function expression
+    ///   bound to a `const` in a TS method: 0.9.0 gave the call to the method;
+    ///   a class field arrow has no function around it and no row;
+    /// - a Java lambda and anonymous class, a Rust closure and nested `fn`, a
+    ///   Python lambda, a Go function literal;
+    /// - Go: a call into another package of the repository (`store.Open()` →
+    ///   `Open`), a method expression (`Val.Get(v)` → `Val.Get`), a method on
+    ///   a pointer parameter (`Handle`) and on a value parameter
+    ///   (`Server.Handle`) — 0.9.0's map is file-wide, so once `s Server` is
+    ///   declared anywhere every `s.Handle()` of the file is `Server.Handle`;
+    /// - Java `s.get()` on a `Supplier<Integer> s`: `get`, untyped.
+    ///
+    /// The table is exactly the binary's rows, and `impact_analysis` (0.9.0's
+    /// reader) at depth 3 answers exactly what the binary answered.
+    #[test]
+    fn callables_0_9_0_did_not_source_stay_walkable_by_0_9_0() {
+        let (dir, repo) = graph_repo(
+            "compat_forms",
+            &[
+                ("svc.ts", "export function leaf(): number {\n  return 1;\n}\n\nexport class C {\n  field = () => leaf();\n\n  m(): number {\n    const cb = () => leaf();\n    return cb();\n  }\n\n  m2(): number {\n    const fe = function () {\n      return leaf();\n    };\n    return fe();\n  }\n\n  m3(): number {\n    function inner(): number {\n      return leaf();\n    }\n    return inner();\n  }\n\n  m4(): number {\n    const fe2 = function named() {\n      return leaf();\n    };\n    return fe2();\n  }\n\n  run(): number {\n    return this.m();\n  }\n\n  run4(): number {\n    return this.m4();\n  }\n\n  runField(): number {\n    return this.field();\n  }\n\n  run2(): number {\n    return this.m2();\n  }\n\n  run3(): number {\n    return this.m3();\n  }\n}\n"),
+                ("src/main/java/p/Svc.java", "package p;\n\npublic class Svc {\n    public static int calc() {\n        return 1;\n    }\n}\n"),
+                ("src/main/java/p/Lam.java", "package p;\n\nimport java.util.function.Supplier;\n\npublic class Lam {\n    int withLambda() {\n        Supplier<Integer> s = () -> Svc.calc();\n        return s.get();\n    }\n\n    int withAnon() {\n        Supplier<Integer> s = new Supplier<Integer>() {\n            @Override\n            public Integer get() {\n                return Svc.calc();\n            }\n        };\n        return s.get();\n    }\n\n    int runLambda() {\n        return withLambda();\n    }\n\n    int runAnon() {\n        return withAnon();\n    }\n}\n"),
+                ("Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+                ("src/lib.rs", "pub fn leaf() -> u8 {\n    1\n}\n\npub fn with_closure() -> u8 {\n    let c = || leaf();\n    c()\n}\n\npub fn outer() -> u8 {\n    fn inner() -> u8 {\n        leaf()\n    }\n    inner()\n}\n\npub fn run_closure() -> u8 {\n    with_closure()\n}\n\npub fn run_outer() -> u8 {\n    outer()\n}\n"),
+                ("py/mod.py", "def leaf():\n    return 1\n\n\ndef with_lambda():\n    f = lambda: leaf()\n    return f()\n\n\ndef run_lambda():\n    return with_lambda()\n\n\nclass K:\n    def m(self):\n        g = lambda: leaf()\n        return g()\n\n    def run(self):\n        return self.m()\n"),
+                ("go/go.mod", "module example.com/fx\n\ngo 1.21\n"),
+                ("go/fx.go", "package fx\n\nimport \"example.com/fx/store\"\n\nfunc Leaf() int {\n\treturn 1\n}\n\nfunc WithLiteral() int {\n\tf := func() int {\n\t\treturn Leaf()\n\t}\n\treturn f()\n}\n\nfunc RunLiteral() int {\n\treturn WithLiteral()\n}\n\ntype Server struct{}\n\nfunc (s *Server) Handle() int {\n\treturn Leaf()\n}\n\nfunc RunHandle(s *Server) int {\n\treturn s.Handle()\n}\n\nfunc RunStore() int {\n\treturn store.Open()\n}\n\ntype Val struct{}\n\nfunc (v Val) Get() int {\n\treturn Leaf()\n}\n\nfunc ViaExpr() int {\n\treturn Val.Get(Val{})\n}\n\nfunc RunViaExpr() int {\n\treturn ViaExpr()\n}\n\nfunc ViaValue(s Server) int {\n\treturn s.Handle()\n}\n\nfunc RunViaValue() int {\n\treturn ViaValue(Server{})\n}\n"),
+                ("go/store/store.go", "package store\n\nfunc Base() int {\n\treturn 1\n}\n\nfunc Open() int {\n\treturn Base()\n}\n"),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        // (file, line, source, target) of every row the v0.9.0 binary wrote.
+        let v090: &[(&str, i32, &str, &str)] = &[
+            ("go/fx.go", 11, "WithLiteral", "Leaf"),
+            ("go/fx.go", 13, "WithLiteral", "f"),
+            ("go/fx.go", 17, "RunLiteral", "WithLiteral"),
+            ("go/fx.go", 23, "Handle", "Leaf"),
+            ("go/fx.go", 27, "RunHandle", "Server.Handle"),
+            ("go/fx.go", 31, "RunStore", "Open"),
+            ("go/fx.go", 37, "Get", "Leaf"),
+            ("go/fx.go", 41, "ViaExpr", "Val.Get"),
+            ("go/fx.go", 45, "RunViaExpr", "ViaExpr"),
+            ("go/fx.go", 49, "ViaValue", "Server.Handle"),
+            ("go/fx.go", 53, "RunViaValue", "ViaValue"),
+            ("go/store/store.go", 8, "Open", "Base"),
+            ("py/mod.py", 6, "with_lambda", "leaf"),
+            ("py/mod.py", 7, "with_lambda", "f"),
+            ("py/mod.py", 11, "run_lambda", "with_lambda"),
+            ("py/mod.py", 16, "K.m", "leaf"),
+            ("py/mod.py", 17, "K.m", "g"),
+            ("py/mod.py", 20, "K.run", "K.m"),
+            ("src/lib.rs", 6, "with_closure", "leaf"),
+            ("src/lib.rs", 7, "with_closure", "c"),
+            ("src/lib.rs", 12, "inner", "leaf"),
+            ("src/lib.rs", 14, "outer", "inner"),
+            ("src/lib.rs", 18, "run_closure", "with_closure"),
+            ("src/lib.rs", 22, "run_outer", "outer"),
+            ("src/main/java/p/Lam.java", 7, "Lam.withLambda", "Svc.calc"),
+            ("src/main/java/p/Lam.java", 8, "Lam.withLambda", "get"),
+            ("src/main/java/p/Lam.java", 15, "Lam.get", "Svc.calc"),
+            ("src/main/java/p/Lam.java", 18, "Lam.withAnon", "get"),
+            (
+                "src/main/java/p/Lam.java",
+                22,
+                "Lam.runLambda",
+                "withLambda",
+            ),
+            ("src/main/java/p/Lam.java", 26, "Lam.runAnon", "withAnon"),
+            ("svc.ts", 9, "C.m", "leaf"),
+            ("svc.ts", 10, "C.m", "cb"),
+            ("svc.ts", 15, "C.m2", "leaf"),
+            ("svc.ts", 17, "C.m2", "fe"),
+            ("svc.ts", 22, "C.inner", "leaf"),
+            ("svc.ts", 24, "C.m3", "inner"),
+            ("svc.ts", 29, "C.m4", "leaf"),
+            ("svc.ts", 31, "C.m4", "fe2"),
+            ("svc.ts", 35, "C.run", "C.m"),
+            ("svc.ts", 39, "C.run4", "C.m4"),
+            ("svc.ts", 43, "C.runField", "C.field"),
+            ("svc.ts", 47, "C.run2", "C.m2"),
+            ("svc.ts", 51, "C.run3", "C.m3"),
+        ];
+        let mut got: Vec<(&str, i32, &str, &str)> = old
+            .iter()
+            .map(|e| {
+                (
+                    e.source_file.as_str(),
+                    e.line,
+                    e.source.as_str(),
+                    e.target.as_str(),
+                )
+            })
+            .collect();
+        got.sort();
+        let mut want = v090.to_vec();
+        want.sort();
+        assert_eq!(got, want);
+        // `devctx impact <seed> --depth 3` of the v0.9.0 binary.
+        for (seed, callers) in [
+            (
+                "leaf",
+                &[
+                    ("C.inner", 1),
+                    ("C.m", 1),
+                    ("C.m2", 1),
+                    ("C.m3", 2),
+                    ("C.m4", 1),
+                    ("C.run", 2),
+                    ("C.run2", 2),
+                    ("C.run3", 3),
+                    ("C.run4", 2),
+                    ("K.m", 1),
+                    ("K.run", 2),
+                    ("inner", 1),
+                    ("outer", 2),
+                    ("run_closure", 2),
+                    ("run_lambda", 2),
+                    ("run_outer", 3),
+                    ("with_closure", 1),
+                    ("with_lambda", 1),
+                ][..],
+            ),
+            (
+                "Leaf",
+                &[
+                    ("Get", 1),
+                    ("Handle", 1),
+                    ("RunLiteral", 2),
+                    ("WithLiteral", 1),
+                ][..],
+            ),
+            ("Base", &[("Open", 1), ("RunStore", 2)][..]),
+            ("Val.Get", &[("RunViaExpr", 2), ("ViaExpr", 1)][..]),
+            (
+                "Server.Handle",
+                &[("RunHandle", 1), ("RunViaValue", 2), ("ViaValue", 1)][..],
+            ),
+            ("calc", &[("Lam.get", 1), ("Lam.withLambda", 1)][..]),
+        ] {
+            let mut got = store
+                .impact_analysis(&repo, "main", seed, 3)
+                .unwrap()
+                .upstream;
+            got.sort();
+            let mut want: Vec<(String, usize)> = callers
+                .iter()
+                .map(|(n, d)| (n.to_string(), *d as usize))
+                .collect();
+            want.sort();
+            assert_eq!(got, want, "{seed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `graph_edges` after an incremental run is what a full run of the same
+    /// commit writes, row for row: an edited file's rows replaced, a deleted
+    /// file's gone, a renamed file's under the new path and no longer under
+    /// the old one (PLAN-009 TASK-019; the table is written and dropped per
+    /// file, so a stale row would survive only here).
+    #[test]
+    fn graph_edges_after_an_incremental_run_equal_a_full_run() {
+        let (dir, repo) = graph_repo(
+            "compat_incremental",
+            &[
+                ("a.py", "def leaf():\n    return 1\n\n\ndef top():\n    return leaf()\n"),
+                ("b.py", "from a import leaf\n\n\nclass Svc:\n    def run(self):\n        return leaf()\n"),
+                ("c.py", "from a import top\n\n\ndef gone():\n    return top()\n"),
+                ("d.py", "from a import leaf\n\n\ndef moved():\n    return leaf()\n"),
+            ],
+        );
+        let rows = |store: &Store| -> Vec<(String, String, String, String, i32)> {
+            let mut v: Vec<_> = store
+                .graph_edges(&repo, "main", None, None, 0)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.source_file, e.source, e.target, e.kind, e.line))
+                .collect();
+            v.sort();
+            v
+        };
+        let inc = Store::open_in_memory(DIM).unwrap();
+        index_branch(&inc, &dir, "main", true);
+        let before = rows(&inc);
+        assert!(before.iter().any(|r| r.0 == "c.py"), "{before:?}");
+        write(
+            &dir,
+            "b.py",
+            "from a import leaf, top\n\n\nclass Svc:\n    def run(self):\n        return top()\n\n    def again(self):\n        return self.run()\n",
+        );
+        git(&dir, &["rm", "-q", "c.py"]);
+        git(&dir, &["mv", "d.py", "e.py"]);
+        commit_all(&dir, "edit, delete, rename");
+        index_branch(&inc, &dir, "main", false);
+        let incremental = rows(&inc);
+        let full = Store::open_in_memory(DIM).unwrap();
+        index_branch(&full, &dir, "main", true);
+        assert_eq!(incremental, rows(&full));
+        assert!(incremental.iter().all(|r| r.0 != "c.py" && r.0 != "d.py"));
+        assert!(incremental.iter().any(|r| r.0 == "e.py" && r.1 == "moved"));
+        assert!(incremental
+            .iter()
+            .any(|r| r.0 == "b.py" && r.1 == "Svc.again" && r.2 == "Svc.run"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 0.9.0 assert of [`graph_edges_stays_readable_by_0_9_0`] on
+    /// `impact_analysis`, over the symbol graph of the same index (TASK-009):
+    /// two calls from one method are one caller.
+    #[test]
+    fn impact_over_the_symbol_graph_keeps_the_0_9_0_answer() {
+        let (dir, repo) = graph_repo(
+            "compat_impact",
+            &[(
+                "svc.py",
+                "class Svc:\n    def run(self):\n        self.helper()\n        self.helper()\n\n    def helper(self):\n        pass\n\nSvc().run()\n",
+            )],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let opts = devctx_store::ImpactOptions {
+            depth: 2,
+            ..Default::default()
+        };
+        let im = store
+            .impact_graph(&repo, "main", "Svc.helper", None, &opts)
+            .unwrap();
+        let upstream: Vec<(String, usize)> = im
+            .upstream
+            .nodes
+            .iter()
+            .map(|n| (n.symbol.clone(), n.depth))
+            .collect();
+        // Depth 2 reaches the module-level `Svc().run()` too (its source is
+        // the file symbol), which 0.9.0's `graph_edges` never held.
+        assert_eq!(upstream[0], ("Svc.run".to_string(), 1));
+        assert_eq!(upstream[1..], [("svc.py".to_string(), 2)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- PLAN-009 TASK-018: the compaction note (tests 20-24) ---------------
+
+    fn compaction_note(store: &Store) -> Option<String> {
+        store
+            .get_index_meta("", "", devctx_store::compact::COMPACTION_META_KEY)
+            .unwrap()
+    }
+
+    /// Make a branch look as 0.9.0 left it: an extractor stamp of before the
+    /// graph (`v1-…`, what 0.8.3-0.9.x wrote).
+    fn stamp_pre_graph(store: &Store, root: &Path, branch: &str) {
+        let repo_path = crate::git::GitRepo::open(root)
+            .unwrap()
+            .root()
+            .to_string_lossy()
+            .into_owned();
+        store
+            .set_index_meta(
+                &repo_path,
+                branch,
+                devctx_store::EXTRACTOR_META_KEY,
+                "v1-0123456789abcdef",
+            )
+            .unwrap();
+    }
+
+    fn set_note(store: &Store, value: &str) {
+        store
+            .set_index_meta("", "", devctx_store::compact::COMPACTION_META_KEY, value)
+            .unwrap();
+    }
+
+    /// 20: a full run over a pre-graph branch that already existed owes a
+    /// compaction, and says so; an incremental run over it does not touch the
+    /// note, nor does a full run over a 0.10 index.
+    #[test]
+    fn a_full_run_over_a_pre_graph_branch_owes_a_compaction() {
+        let dir = five_file_repo("compact_owed");
+        let store = Store::open_in_memory(8).unwrap();
+        let first = index(&store, &dir);
+        assert!(first.full_reindex);
+        assert_eq!(compaction_note(&store), None, "a new index owes nothing");
+        assert_eq!(first.compaction, None);
+
+        stamp_pre_graph(&store, &dir, "main");
+        write(&dir, "m0.py", "def f0():\n    return 10\n");
+        commit_all(&dir, "change");
+        let inc = index(&store, &dir);
+        assert!(!inc.full_reindex);
+        assert_eq!(compaction_note(&store), None, "incremental");
+
+        let full = index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        assert_eq!(full.compaction.as_deref(), Some("owed:upgrade"));
+
+        set_note(&store, "done:0.10.0:1:upgrade");
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(
+            compaction_note(&store).as_deref(),
+            Some("done:0.10.0:1:upgrade"),
+            "a full run over a 0.10 index"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 21: a new branch on a 0.9.0 database does not touch the note (nor burn
+    /// the `done`); the migration of the branch that existed does.
+    #[test]
+    fn a_new_branch_does_not_touch_the_note() {
+        let dir = two_branch_repo("compact_newbranch");
+        let store = Store::open_in_memory(8).unwrap();
+        index_branch(&store, &dir, "main", true);
+        stamp_pre_graph(&store, &dir, "main");
+        set_note(&store, "done:0.10.0:1:upgrade");
+        index_branch(&store, &dir, "feature", true);
+        assert_eq!(
+            compaction_note(&store).as_deref(),
+            Some("done:0.10.0:1:upgrade")
+        );
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 22: a `done` does not block a later migration; and a repository with no
+    /// parseable file (no `symbols` rows) does not owe one on every full run.
+    #[test]
+    fn a_done_note_is_rearmed_and_a_graphless_repo_owes_nothing() {
+        let dir = five_file_repo("compact_rearm");
+        let store = Store::open_in_memory(8).unwrap();
+        index(&store, &dir);
+        stamp_pre_graph(&store, &dir, "main");
+        index_branch(&store, &dir, "main", true);
+        set_note(&store, "done:0.10.0:1:upgrade");
+        stamp_pre_graph(&store, &dir, "main");
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("devctx_compact_docs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write(&dir, "README.md", "# notes\n");
+        commit_all(&dir, "docs");
+        let store = Store::open_in_memory(8).unwrap();
+        index(&store, &dir);
+        index_branch(&store, &dir, "main", true);
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 23: the note is written when the run starts, so a cancelled migration
+    /// leaves it owed.
+    #[test]
+    fn a_cancelled_migration_leaves_the_compaction_owed() {
+        let dir = five_file_repo("compact_cancel");
+        let store = Store::open_in_memory(8).unwrap();
+        index(&store, &dir);
+        stamp_pre_graph(&store, &dir, "main");
+        let sink = CancelAfter::new(1);
+        let res = run_with(&store, &dir, true, &sink);
+        assert!(res.cancelled);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 24: two pre-graph branches: each migration rearms the note.
+    #[test]
+    fn each_pre_graph_branch_rearms_the_note() {
+        let dir = two_branch_repo("compact_two");
+        let store = Store::open_in_memory(8).unwrap();
+        index_branch(&store, &dir, "main", true);
+        index_branch(&store, &dir, "feature", true);
+        stamp_pre_graph(&store, &dir, "main");
+        stamp_pre_graph(&store, &dir, "feature");
+        index_branch(&store, &dir, "main", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        set_note(&store, "done:0.10.0:1:upgrade");
+        index_branch(&store, &dir, "feature", true);
+        assert_eq!(compaction_note(&store).as_deref(), Some("owed:upgrade"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review T2: a failed verification is not hidden by a later migration:
+    /// `owed:failed-verify` stays until `devctx compact` settles it.
+    #[test]
+    fn a_failed_verification_is_not_overwritten_by_a_migration() {
+        let dir = five_file_repo("compact_failed");
+        let store = Store::open_in_memory(8).unwrap();
+        index(&store, &dir);
+        set_note(&store, "owed:failed-verify");
+        stamp_pre_graph(&store, &dir, "main");
+        let res = index_branch(&store, &dir, "main", true);
+        assert_eq!(
+            compaction_note(&store).as_deref(),
+            Some("owed:failed-verify")
+        );
+        assert_eq!(res.compaction.as_deref(), Some("owed:failed-verify"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The store and the index agree on the names of the notes a compaction
+    /// clears.
+    #[test]
+    fn the_pending_notes_are_named_alike_in_both_crates() {
+        assert_eq!(
+            devctx_store::compact::PENDING_HNSW_KEY,
+            PENDING_HNSW_META_KEY
+        );
+        assert_eq!(devctx_store::compact::PENDING_FTS_KEY, PENDING_FTS_META_KEY);
     }
 }

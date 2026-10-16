@@ -44,6 +44,7 @@ search:
     test: 0.6
     doc: 0.6
     config: 0.6
+  centrality_weight: 0         # weight of symbol centrality in hybrid search, 0-1; 0 = off (default)
 
 reranking:
   enabled: false               # opt-in; see docs/08 ADR-15 for the measurements
@@ -90,7 +91,10 @@ server holds the config it started with: `devctx serve --stop` first (§6).
 
 `search.penalty` is explained in
 [Search](03-core-concepts/search.md#file-kind-and-the-penalty); a factor above
-`1.0` is warned about when the config loads.
+`1.0` is warned about when the config loads. `search.centrality_weight` (hybrid
+search and `build_context` only, never vector search) is explained in
+[Search](03-core-concepts/search.md#centrality-hybrid-only-opt-in); a value
+outside `[0, 1]`, or not a number, is bounded and warned about.
 
 **Where the database ends up.** `storage.db_path` wins; then
 `{state_dir}/index.duckdb`; then `.devctx/state/index.duckdb` under the project
@@ -149,12 +153,13 @@ registry's copy.
 | `DEVCTX_EMBED_BATCH_SIZE` | Texts per encoder batch. Default `8` (was `32` before 0.8.5); batches run one after another, so peak memory scales with this. `0` or unparsable falls back to the default. |
 | `DEVCTX_DB_MEMORY_LIMIT` | DuckDB per-process memory budget, any DuckDB size literal. Default `2GB`. |
 | `DEVCTX_DB_THREADS` | DuckDB worker threads. Default `4`. |
-| `DEVCTX_MODEL_IDLE_SECS` | How long an unused model is kept loaded, in project servers and in the central daemon (which drops its embedder and reloads it on the next `remember` / `recall`). Default `300`; `0` keeps it for the life of the process. |
+| `DEVCTX_NO_AUTO_COMPACT` | Never compact by itself after the `devctx index --full` that upgrades a 0.9 index; the compaction stays owed (`status` says so) until `devctx compact`. Without a terminal it never runs by itself anyway. |
+| `DEVCTX_MODEL_IDLE_SECS` | How long an unused model is kept loaded, in project servers and in the central daemon (which drops its embedder and reloads it on the next `remember` / `recall`). Default `300`; `0` keeps it for the life of the process. The adjacency `repo_map` caches is released on the same schedule. |
 | `DEVCTX_MODEL_STALL_SECS` | Seconds with no growth of the model cache before a model download is declared stuck and fails (the model is then refused until the server restarts). Default `120`; `0` disables the guard. |
 | `DEVCTX_INDEX_STALL_SECS` | How long an index run may go without reaching a new file and still keep the server from its idle exit. Default `900`. |
 | `DEVCTX_SHUTDOWN_GRACE_SECS` | Grace a stopping server gives itself before the watchdog ends it. Default and maximum `3` — it can only be lowered, so `serve --stop` never SIGKILLs mid-checkpoint. |
 | `DEVCTX_VANISH_POLL_MS` | How often a server checks that its project directory still exists. Default `10000`. |
-| `DEVCTX_MAX_OUTPUT_TOKENS` | Cap on a whole-file `read_file` with no line range. Default `8000`; `0` disables. |
+| `DEVCTX_MAX_OUTPUT_TOKENS` | Output budget of the tools that answer lists or text: a whole-file `read_file` with no line range, `search`, `search_project`, `recall`, `memory_context`, `plan_status`, `search_routes`, `memories_by_*`, `get_references`, `impact_analysis` (half per direction), `traverse` and `skeleton`, and the largest `budget` `repo_map` takes; what does not fit is counted in `omitted`. Default `8000`; `0` disables. Read by the process that answers: set it on the server (`devctx serve`), not only on the MCP client. |
 | `DEVCTX_DAEMON_TIMEOUT_SECS` | How long an MCP session waits for a routed call to the shared daemon before giving up. Default `120`. `index_repo` stays on a fixed 1800s regardless of this, since indexing a large repository can legitimately run for many minutes. |
 | `DEVCTX_NO_UPDATE_CHECK` | Opt out of the background release check. |
 | `DEVCTX_LANG` | Language of the grouped `--help` summary (`en` / `es`). |

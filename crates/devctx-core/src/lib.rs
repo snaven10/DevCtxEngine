@@ -10,12 +10,14 @@ pub mod exe;
 pub mod fallback;
 pub mod gitenv;
 pub mod hits;
+pub mod interrupt;
 pub mod kind;
 pub mod modelload;
 pub mod plans;
 pub mod procmem;
 pub mod procown;
 pub mod rank;
+pub mod symbol_id;
 pub mod types;
 
 pub use config::{ProjectConfig, CONFIG_FILE_NAME};

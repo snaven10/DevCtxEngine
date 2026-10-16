@@ -1,12 +1,15 @@
 //! `devctx-mcp` — Model Context Protocol server (stdio) exposing DevCtxEngine to agents.
 //!
-//! 23 tools over the indexing pipeline: code (`search`, `read_file`,
-//! `read_symbol`, `get_references`, `impact_analysis`, `summarize`), routes,
+//! 27 tools over the indexing pipeline: code (`search`, `read_file`,
+//! `read_symbol`, `get_references`, `impact_analysis`, `traverse`, `repo_map`, `skeleton`,
+//! `summarize`), routes,
 //! memory, and project/index management. Built on the official `rmcp` SDK.
 //! See `docs/architecture-spec.md` §8 for the process model.
 
 pub mod backend;
 pub mod lifecycle;
+pub mod repo_map;
+pub mod skeleton;
 pub mod state;
 
 use std::collections::HashMap;
@@ -187,6 +190,59 @@ struct UseProjectReq {
     project: String,
 }
 
+/// Parameters for the `traverse` tool (PLAN-009 TASK-013, DD-16).
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct TraverseReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
+    /// Where to start: a bare name (every definition of it is a root, listed
+    /// in `candidates`), a qualified one (`OrderService.place`), `file::name`,
+    /// or a file path (the file itself: what it imports, what contains it).
+    /// A symbol of that name wins over a file of that path.
+    #[serde(default)]
+    symbol: Option<String>,
+    /// Start from exactly this definition: the `sym` (hex) a node, a
+    /// candidate or another tool gave. Instead of `symbol`.
+    #[serde(default)]
+    sym: Option<String>,
+    /// Relations to follow, comma-separated, or `"all"`: `calls`,
+    /// `instantiates`, `imports`, `inherits`, `implements`, `contains`,
+    /// `references` (default `"calls"`).
+    #[serde(default)]
+    kinds: Option<String>,
+    /// `"out"` (default: callees, imported, supertypes, members, used types),
+    /// `"in"` (callers, importers, subtypes, container, users) or `"both"`.
+    #[serde(default)]
+    direction: Option<String>,
+    /// Levels, 1 (default) to 4; more is refused.
+    #[serde(default)]
+    depth: Option<usize>,
+    /// Lowest confidence of the edge that reaches a node: `"high"`,
+    /// `"medium"` (default) or `"low"`; what it leaves out is counted in
+    /// `below_confidence` and not walked.
+    #[serde(default)]
+    min_confidence: Option<String>,
+    /// List symbols of test files (default false: counted in `excluded.tests`).
+    #[serde(default)]
+    include_tests: Option<bool>,
+    /// List external (library) destinations (default false: counted in
+    /// `excluded.external`); never walked.
+    #[serde(default)]
+    include_external: Option<bool>,
+    /// With `calls`: follow dispatch through interfaces, abstract classes and
+    /// traits (default true), as `via: "dispatch"`, never `high`.
+    #[serde(default)]
+    dispatch: Option<bool>,
+    /// Nodes per page (default 50).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip this many nodes: the `next_offset` of the previous page.
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
 /// Parameters for the `impact_analysis` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -199,6 +255,38 @@ struct ImpactReq {
     /// Traversal depth (default 3).
     #[serde(default)]
     depth: Option<usize>,
+    /// Lowest confidence of the call that reaches a symbol: `"high"`,
+    /// `"medium"` (default) or `"low"`. The symbols it leaves out are counted
+    /// in `below_confidence` and not walked; the calls to the name the index
+    /// could not decide are counted apart, in calls, in `undecided_calls`
+    /// (none from tests or from callers already listed); `low` lists the
+    /// ambiguous calls and the callers of the undecided ones, marked
+    /// `undecided: true`.
+    #[serde(default)]
+    min_confidence: Option<String>,
+    /// List symbols of test files (default false: counted in
+    /// `excluded.tests`, not walked). Listed ones carry `test: true`.
+    #[serde(default)]
+    include_tests: Option<bool>,
+    /// List external (library) callees (default false: counted in
+    /// `excluded.external`). Listed ones carry `external: true`.
+    #[serde(default)]
+    include_external: Option<bool>,
+    /// Symbols per direction (default 200; 0 = no cap). The ones of the depth
+    /// that overflows are counted in `omitted`/`omitted_by_limit`, and no
+    /// deeper level is read.
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    /// Follow dispatch through interfaces, abstract classes and traits
+    /// (default true): the callers of a method the symbol overrides, and the
+    /// implementations of an interface or abstract method, as `via:
+    /// "dispatch"` with `through` (the method it went through), never surer
+    /// than `medium`. `false` follows direct calls only; `min_confidence:
+    /// "high"` also leaves them out, without reading them (not counted);
+    /// either way the answer carries `dispatch: {"evaluated": false,
+    /// "reason": "dispatch:false" | "min_confidence high"}`.
+    #[serde(default)]
+    dispatch: Option<bool>,
 }
 
 /// Parameters for the `plan_status` tool.
@@ -250,6 +338,42 @@ struct ReadSymbolReq {
     limit: Option<usize>,
 }
 
+/// Parameters for the `repo_map` tool (PLAN-009 TASK-011, DD-14).
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct RepoMapReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
+    /// Tokens the map may take (default 1024; at least 256 is used).
+    #[serde(default)]
+    budget: Option<usize>,
+    /// Files you have open or are editing (repo-relative paths, or their
+    /// tail): what they use ranks first. They are not listed themselves.
+    #[serde(default)]
+    focus_files: Option<Vec<String>>,
+    /// Symbols the task is about: bare (`place`), qualified
+    /// (`OrderService.place`) or `file::name`.
+    #[serde(default)]
+    focus_symbols: Option<Vec<String>>,
+    /// The task in words; its identifiers (camelCase, snake_case,
+    /// Type.member) count as focus symbols, and so does a one-word query.
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Parameters for the `skeleton` tool (PLAN-009 TASK-014, DD-17).
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct SkeletonReq {
+    /// Answer this call from a different project than the one bound (this call only).
+    #[serde(default)]
+    project: Option<String>,
+    /// The file: a repo-relative path (or absolute inside the repository),
+    /// as read_file takes it.
+    file: String,
+}
+
 /// Parameters for the `build_context` tool.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -277,6 +401,14 @@ struct BuildContextReq {
     /// `false` drops test files from the code (default true: tests rank lower).
     #[serde(default)]
     include_tests: Option<bool>,
+    /// Add `## Related (signatures)`: the callers, callees and supertypes of
+    /// the best code hits, as signatures (at most 20 % of the budget). The
+    /// default is the server's (off in this version).
+    #[serde(default)]
+    related: Option<bool>,
+    /// Hops of the related section: 1 (default) or 2.
+    #[serde(default)]
+    graph_hops: Option<u8>,
 }
 
 /// Parameters for the `memories_by_symbol` tool.
@@ -358,8 +490,21 @@ struct ReferencesReq {
     /// Answer this call from a different project than the one bound (this call only).
     #[serde(default)]
     project: Option<String>,
-    /// The symbol whose call sites to list.
+    /// The symbol whose references to list: a bare name (`charge`), a
+    /// qualified one (`Card.charge`, `Card::charge`) or `file::name`.
     symbol: String,
+    /// Lowest confidence listed: `"high"`, `"medium"` (default) or `"low"`.
+    /// `low` adds the ambiguous references and the calls the index could not
+    /// decide, each marked `undecided: true`; whatever the default leaves out
+    /// is counted in `below_confidence`.
+    #[serde(default)]
+    min_confidence: Option<String>,
+    /// Relations to list besides the default calls and instantiations
+    /// (`new Foo()`): any of `"references"` (type uses), `"imports"`,
+    /// `"inherits"`, `"implements"`, or `"all"`. Each reference says which in
+    /// `via`.
+    #[serde(default)]
+    kinds: Option<Vec<String>>,
 }
 
 /// Parameters for the `search_routes` tool.
@@ -1165,16 +1310,159 @@ impl DevctxServer {
     /// Blast radius of a symbol (transitive callers + callees).
     #[tool(
         description = "Impact analysis: transitive callers (blast radius) and \
-        callees of a symbol from the call graph. Returns JSON."
+        callees of a symbol, by depth. Each symbol carries `confidence` and `via`; by \
+        default only high/medium calls are followed, test files and library callees are \
+        left out, and 200 symbols per direction are listed — whatever that leaves out is \
+        counted (`below_confidence` in symbols, `undecided_calls` in calls to the name the \
+        index could not decide, `excluded`, `omitted`), never dropped silently. A call \
+        through an interface, abstract class or trait is followed by dispatch: \
+        `via: \"dispatch\"` with `through`, never `high` (`dispatch: false` turns it off; \
+        what a node's cap cut is in `omitted_by_limit.dispatch`; when it was not \
+        evaluated, `dispatch: {evaluated: false, reason}` says why). \
+        `min_confidence`, `include_tests`, `include_external`, `max_nodes` and `dispatch` \
+        change that. Returns JSON."
     )]
     async fn impact_analysis(
         &self,
         Parameters(req): Parameters<ImpactReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3)))
+        let q = state::ImpactQuery {
+            min_confidence: req.min_confidence.clone(),
+            include_tests: req.include_tests,
+            include_external: req.include_external,
+            max_nodes: req.max_nodes,
+            dispatch: req.dispatch,
+        };
+        run_blocking(move || backend.impact(&req.symbol, req.depth.unwrap_or(3), &q))
             .await
             .map(|out| Self::annotate(out, resolved))
+    }
+
+    /// Walk the symbol graph from a symbol, along the relations asked.
+    #[tool(
+        description = "Traverse the symbol graph from a symbol (multi-hop), along the relations \
+        you pick: `kinds` among calls, instantiates, imports, inherits, implements, contains, \
+        references (default calls), `direction` in/out/both (default out), `depth` 1-4 (default \
+        1). Use it to explore structure the other tools do not answer: what a class contains, \
+        its hierarchy, who imports or references a type, a chain of calls hop by hop. Use \
+        impact_analysis for the blast radius of a change (transitive callers and callees, \
+        capped per direction), and get_references for the call sites (file and line) of one \
+        symbol. Examples: callers and their callers {symbol: \"OrderService.place\", kinds: \
+        \"calls\", direction: \"in\", depth: 2}; where a type is built {symbol: \"Invoice\", \
+        kinds: \"instantiates\", direction: \"in\"}; what a file imports {symbol: \
+        \"src/api/client.ts\", kinds: \"imports\"} (a symbol named like the path wins), who \
+        imports a type (direction in); \
+        subclasses {symbol: \"BaseRepo\", kinds: \"inherits\", direction: \"in\"}; \
+        implementations {symbol: \"PaymentGateway\", kinds: \"implements\", direction: \"in\"}; \
+        members {symbol: \"OrderService\", kinds: \"contains\"}; uses of a type {symbol: \
+        \"OrderDto\", kinds: \"references\", direction: \"in\"}. Returns JSON {root, \
+        candidates? (an ambiguous name: walked from all, pass `sym` to pick one), nodes \
+        [{sym, symbol, kind, file, line, depth, confidence, via}], edges [{from, to, kind, \
+        confidence, line}] (from/to are `sym`s), total, next_offset?, omitted?}. Defaults as \
+        impact_analysis: high/medium edges, no tests, no library destinations, all counted when \
+        left out; with calls, dispatch through interfaces as `via: \"dispatch\"`, and (in, by name) \
+        the calls to the name the index could not decide counted in `undecided_calls` (min_confidence \
+        low lists their callers, `undecided: true`, not walked). A hub (a DTO \
+        used in hundreds of files) is paged: `limit` (50) and `offset`; once a page is full no \
+        deeper level is read (`partial`, and then `total_is_lower_bound: true`: `total` and \
+        `omitted.count` count only what was read). Needs an index made by 0.10 (else: devctx index --full)."
+    )]
+    async fn traverse(
+        &self,
+        Parameters(req): Parameters<TraverseReq>,
+    ) -> Result<String, ErrorData> {
+        let q = state::TraverseQuery {
+            symbol: req.symbol,
+            sym: req.sym,
+            kinds: req.kinds,
+            direction: req.direction,
+            depth: req.depth,
+            min_confidence: req.min_confidence,
+            include_tests: req.include_tests,
+            include_external: req.include_external,
+            dispatch: req.dispatch,
+            limit: req.limit,
+            offset: req.offset,
+        };
+        // A bad parameter is the caller's, said before a server is reached.
+        q.options()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        run_blocking(move || backend.traverse(&q))
+            .await
+            .map(|out| Self::annotate(out, resolved))
+    }
+
+    /// A map of the repository for orientation.
+    #[tool(
+        description = "Map of the repository, to orient yourself: the signatures (no bodies) of \
+        the symbols most relevant to your focus, grouped by file, ranked by PageRank \
+        personalized to that focus, within `budget` tokens (default 1024). Give a focus: \
+        `focus_files` (files you have open or are editing: what they use ranks first; they \
+        are not listed themselves), `focus_symbols` (names of the task: bare, Type.member or \
+        file::name) and/or `query` (the task in words: its identifiers count). Without one it \
+        is the globally central code, which on a large repository says little. Test code and \
+        libraries never appear. Use it at the start of a task to know where things are; to \
+        read code use read_symbol / read_file; for one symbol's neighbours, traverse. \
+        Returns text: per file its path and `│`-prefixed signatures under their containers, \
+        `⋮` when a file has more, and closing `[devctx]` lines that say what the focus \
+        matched and how many symbols did not fit. Needs an index made by 0.10 (else: devctx \
+        index --full)."
+    )]
+    async fn repo_map(&self, Parameters(req): Parameters<RepoMapReq>) -> Result<String, ErrorData> {
+        let q = repo_map::RepoMapQuery {
+            budget: req.budget,
+            focus_files: req.focus_files.unwrap_or_default(),
+            focus_symbols: req.focus_symbols.unwrap_or_default(),
+            query: req.query,
+            label: None,
+        };
+        // A bad parameter is the caller's, said before a server is reached.
+        q.validate()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let (backend, resolved) = self.backend_for(req.project.as_deref())?;
+        // Which repository answered is part of the answer, a line inside
+        // the budget (review of TASK-011, m6).
+        let q = repo_map::RepoMapQuery {
+            label: resolved.map(|p| format!("[devctx] map of {p}")),
+            ..q
+        };
+        run_blocking(move || backend.repo_map(&q)).await
+    }
+
+    /// The structure of one file: its symbols with signatures and lines.
+    #[tool(
+        description = "Skeleton of one file, to locate where something is: its symbols \
+        (classes, methods, functions, fields…) with their signatures and line ranges `[l1-l2]`, \
+        nested by container, without bodies, and its imports summarized in one line. Much \
+        cheaper than reading the file. Use it to locate where something is; to edit, \
+        read_symbol / read_file (a line range from the skeleton): a skeleton is not the code. \
+        `file` is a repo-relative path, as read_file takes it; a file the index does not hold \
+        is an error that names the nearest indexed paths. Test code is marked `[test]` (a \
+        test file says so in its first line). Returns text, within DEVCTX_MAX_OUTPUT_TOKENS: \
+        a symbol-count line, `imports (N): …`, one line per symbol, and a closing `[devctx] \
+        N more symbols (lines a-b)` line when it was cut. Needs an index made by 0.10 (else: \
+        devctx index --full)."
+    )]
+    async fn skeleton(
+        &self,
+        Parameters(req): Parameters<SkeletonReq>,
+    ) -> Result<String, ErrorData> {
+        let q = skeleton::SkeletonQuery::of(req.file.clone());
+        // A bad parameter is the caller's, said before a server is reached.
+        q.validate()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        // As read_file: an absolute path names its project.
+        let hint = req.project.clone().or_else(|| Some(req.file.clone()));
+        let (backend, resolved) = self.backend_for(hint.as_deref())?;
+        // Which repository answered is part of the answer, a line inside
+        // the budget (as repo_map).
+        let q = skeleton::SkeletonQuery {
+            label: resolved.map(|p| format!("[devctx] skeleton from {p}")),
+            ..q
+        };
+        run_blocking(move || backend.skeleton(&q)).await
     }
 
     /// Progress on the plans under `plans/` (markdown, source of truth).
@@ -1256,6 +1544,12 @@ impl DevctxServer {
             kind: req.kind.clone(),
             include_tests: req.include_tests,
         };
+        let opts = state::ContextOpts {
+            related: req.related,
+            graph_hops: req.graph_hops,
+        };
+        opts.resolve()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
         let (backend, label) = self
             .context_backend(req.project.as_deref(), &req.query, &sel)
             .await?;
@@ -1265,6 +1559,7 @@ impl DevctxServer {
                 req.max_tokens.unwrap_or(4096),
                 req.include_memories.unwrap_or(true),
                 &sel,
+                &opts,
             )
         })
         .await?;
@@ -1347,17 +1642,24 @@ impl DevctxServer {
 
     /// All call sites (references) of a symbol.
     #[tool(
-        description = "Find all call sites (references) of a symbol across the \
-        indexed code. Returns JSON."
+        description = "Find all call sites of a symbol across the indexed code \
+        (calls and instantiations), one per occurrence. Each carries `confidence` \
+        (high/medium/low) and `via` (the relation); by default high and medium are \
+        listed and anything lower is only counted in `below_confidence` — pass \
+        `min_confidence: \"low\"` to list it. `kinds` adds type uses, imports and \
+        inherits/implements (or `all`). Returns JSON."
     )]
     async fn get_references(
         &self,
         Parameters(req): Parameters<ReferencesReq>,
     ) -> Result<String, ErrorData> {
         let (backend, resolved) = self.backend_for(req.project.as_deref())?;
-        run_blocking(move || backend.references(&req.symbol))
-            .await
-            .map(|out| Self::annotate(out, resolved))
+        run_blocking(move || {
+            let kinds = req.kinds.as_ref().map(|k| k.join(","));
+            backend.references(&req.symbol, req.min_confidence.as_deref(), kinds.as_deref())
+        })
+        .await
+        .map(|out| Self::annotate(out, resolved))
     }
 
     /// Find HTTP routes (framework-aware) by method and/or path.

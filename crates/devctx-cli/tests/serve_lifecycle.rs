@@ -1195,6 +1195,23 @@ fn a_forced_exit_mid_index_leaves_a_sound_database() {
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
+    // The full run needs writes to be cut inside of. Over the same embedding
+    // setup it would reuse every vector and write nothing (that is the point of
+    // reuse), so the branch is made to look as if it had been indexed by another
+    // engine, as after an upgrade: every file is re-embedded and rewritten with
+    // its content unchanged — the case this test is about.
+    {
+        let store = devctx_store::Store::open(&db_path(&root), DIM).unwrap();
+        let git = devctx_index::GitRepo::open(&root).unwrap();
+        store
+            .set_index_meta(
+                &git.root().to_string_lossy(),
+                &git.state().branch,
+                devctx_store::EMBED_FP_META_KEY,
+                "engine-before-the-upgrade",
+            )
+            .unwrap();
+    }
     let mut serve = start_indexing_serve(
         &tmp,
         &root,
@@ -1234,6 +1251,32 @@ fn a_forced_exit_mid_index_leaves_a_sound_database() {
             store.count(&Default::default()).unwrap() > 0,
             "the earlier index is still there"
         );
+        // The symbol graph is part of the same per-file transaction (the
+        // stall sits after the vectors, before the graph): no file lost its
+        // symbols or kept half of them.
+        let git = devctx_index::GitRepo::open(&root).unwrap();
+        let (repo, branch) = (git.short_name(), git.state().branch);
+        for i in 0..files {
+            let f = format!("m{i:03}.rs");
+            let syms = store.file_symbols(&repo, &branch, &f).unwrap();
+            let kinds: Vec<&str> = syms.iter().map(|s| s.kind.as_str()).collect();
+            assert_eq!(kinds, ["file", "function"], "{f}: {syms:?}");
+        }
+        // The cut run had already put vectors of the new setup into some files:
+        // the branch must still be marked "transition", never the old or the new
+        // fingerprint, so no later run reuses them by mistake.
+        let git = devctx_index::GitRepo::open(&root).unwrap();
+        assert_eq!(
+            store
+                .get_index_meta(
+                    &git.root().to_string_lossy(),
+                    &git.state().branch,
+                    devctx_store::EMBED_FP_META_KEY
+                )
+                .unwrap()
+                .as_deref(),
+            Some("transition")
+        );
     }
     // The ART indexes are intact: an incremental run (which begins by deleting
     // the changed file's rows) works without a `--full`.
@@ -1250,4 +1293,44 @@ fn a_forced_exit_mid_index_leaves_a_sound_database() {
     );
     assert!(inc.status.success(), "an incremental run failed: {out}");
     assert!(!out.contains("Failed to delete all rows"), "{out}");
+}
+
+/// PLAN-009 TASK-018 test 4: `devctx serve` does not start over a database
+/// whose compaction lock is held; it exits saying so. And a command run
+/// meanwhile says the same, not a lock error naming a PID.
+#[test]
+fn serve_refuses_to_start_while_the_database_is_compacted() {
+    let tmp = Tmp::new("compacting");
+    let root = project(&tmp);
+    let db = db_path(&root);
+    drop(devctx_store::Store::open(&db, 384).unwrap());
+    let held = devctx_store::try_lock_exclusive(&db)
+        .unwrap()
+        .expect("nobody holds it");
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_MODEL_CACHE", tmp.cache())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .args(["serve", "--addr", &format!("127.0.0.1:{}", free_port())])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "it started: {said}");
+    assert!(said.contains("being compacted"), "{said}");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_devctx"))
+        .env("DEVCTX_HOME", tmp.home())
+        .env("DEVCTX_MODEL_CACHE", tmp.cache())
+        .env("DEVCTX_NO_AUTOSERVE", "1")
+        .current_dir(&root)
+        .args(["memory-stats"])
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "it opened: {said}");
+    assert!(said.contains("being compacted"), "{said}");
+    drop(held);
+    assert!(common::servers_under(&tmp.0).is_empty());
 }

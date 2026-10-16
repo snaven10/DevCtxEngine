@@ -18,7 +18,7 @@ pub mod registry;
 pub mod local;
 
 pub use error::{EmbedError, Result};
-pub use provider::{l2_normalize, EmbeddingProvider};
+pub use provider::{l2_normalize, EmbeddingProvider, LazyEmbedder};
 
 /// Resolved settings for constructing an embedding provider.
 #[derive(Debug, Clone, Default)]
@@ -89,6 +89,78 @@ pub fn dimension_for(provider: &str, model: &str) -> usize {
     }
 }
 
+/// The engine that runs local models, as `fastembed-<version>/ort-<version>`
+/// read from `Cargo.lock` by `build.rs`, so a `cargo update` of either changes
+/// it. Whatever replaces them (the `ort` engine of PLAN-010) must change this
+/// string until it is shown to produce the same vectors bit for bit: a vector
+/// reused across engines would be a silent lie.
+const LOCAL_ENGINE: &str = env!("DEVCTX_LOCAL_ENGINE");
+
+/// Everything that decides the numbers a model produces for a text: provider,
+/// model, width, engine, the per-text character cap and the normalization.
+///
+/// Two runs with equal fingerprints produce interchangeable vectors; vectors may
+/// only be reused across runs when the fingerprints are equal. Model name and
+/// dimension alone are not enough: the same name behind another engine, another
+/// provider or another truncation gives different vectors.
+pub fn embedding_fingerprint(s: &EmbedSettings, dimension: usize) -> String {
+    let provider = if s.provider.is_empty() {
+        "local"
+    } else {
+        s.provider.as_str()
+    };
+    let model = if s.model.is_empty() && provider == "local" {
+        registry::DEFAULT_LOCAL_MODEL
+    } else {
+        s.model.as_str()
+    };
+    match provider {
+        "local" => {
+            let max_chars = std::env::var("DEVCTX_EMBED_MAX_CHARS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(4096);
+            format!("local|{model}|{dimension}|{LOCAL_ENGINE}|max_chars={max_chars}|l2")
+        }
+        // The endpoint is part of what makes the vectors: a "custom" or
+        // OpenAI-compatible URL may serve another model under the same name.
+        // (The device — CPU or CUDA — stays out: it moves vectors only at the
+        // rounding level.) Credentials and query strings are not recorded.
+        other => {
+            let endpoint = endpoint_identity(s.endpoint.as_deref().unwrap_or(""));
+            format!("{other}|{model}|{dimension}|http|{endpoint}|l2")
+        }
+    }
+}
+
+/// What of an endpoint goes on disk: `scheme://host[:port]` plus a short hash
+/// of the path. Userinfo, query, fragment and the raw path (tokens live there
+/// too) are never recorded; the hash still tells two paths apart.
+fn endpoint_identity(raw: &str) -> String {
+    let (scheme, rest) = match raw.split_once("://") {
+        Some((sch, rest)) => (Some(sch), rest),
+        None => (None, raw),
+    };
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(auth_end);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let path = tail.split(['?', '#']).next().unwrap_or("");
+    let path = path.trim_end_matches('/');
+    let mut out = match scheme {
+        Some(sch) => format!("{sch}://{host}"),
+        None => host.to_string(),
+    };
+    if !path.is_empty() {
+        // FNV-1a: stable across Rust versions, unlike `DefaultHasher`.
+        let h = path.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        out.push_str(&format!("#{:08x}", h as u32));
+    }
+    out
+}
+
 /// Construct an embedding provider from resolved settings.
 pub fn create_provider(s: &EmbedSettings) -> Result<Box<dyn EmbeddingProvider>> {
     match s.provider.as_str() {
@@ -143,8 +215,103 @@ fn create_local(_s: &EmbedSettings) -> Result<Box<dyn EmbeddingProvider>> {
 }
 
 #[cfg(test)]
+#[path = "../build/lock.rs"]
+mod lock_parser;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fingerprint_changes_with_anything_that_changes_the_vectors() {
+        let base = EmbedSettings {
+            provider: "local".into(),
+            model: "minilm-l6".into(),
+            ..Default::default()
+        };
+        let fp = embedding_fingerprint(&base, 384);
+        assert_eq!(fp, embedding_fingerprint(&base, 384));
+        assert_ne!(fp, embedding_fingerprint(&base, 768), "width");
+        let other = EmbedSettings {
+            model: "bge-small".into(),
+            ..base.clone()
+        };
+        assert_ne!(fp, embedding_fingerprint(&other, 384), "model");
+        let http = EmbedSettings {
+            provider: "openai".into(),
+            ..base.clone()
+        };
+        assert_ne!(fp, embedding_fingerprint(&http, 384), "provider");
+        assert!(fp.contains(LOCAL_ENGINE) && fp.contains("max_chars="));
+        let at = |url: &str| EmbedSettings {
+            provider: "custom".into(),
+            endpoint: Some(url.into()),
+            ..base.clone()
+        };
+        assert_ne!(
+            embedding_fingerprint(&at("http://a/v1"), 384),
+            embedding_fingerprint(&at("http://b/v1"), 384),
+            "endpoint"
+        );
+        assert_eq!(
+            embedding_fingerprint(&at("http://u:p@a/v1?key=1"), 384),
+            embedding_fingerprint(&at("http://a/v1"), 384),
+            "credentials are not part of it"
+        );
+    }
+
+    /// `LOCAL_ENGINE` is read from `Cargo.lock`: it must name the versions the
+    /// lock holds (a stale or unreadable lock would leave "unlocked").
+    #[test]
+    fn the_local_engine_is_the_locked_one() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock = std::fs::read_to_string(root.join("../../Cargo.lock")).unwrap();
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let ver = |p: &str| {
+            lock_parser::locked_version(&lock, &manifest, p)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            LOCAL_ENGINE,
+            format!("fastembed-{}/ort-{}", ver("fastembed"), ver("ort"))
+        );
+    }
+
+    #[test]
+    fn the_endpoint_identity_keeps_no_secrets_and_tells_hosts_apart() {
+        let base = EmbedSettings {
+            provider: "custom".into(),
+            model: "m".into(),
+            ..Default::default()
+        };
+        let fp = |url: &str| {
+            embedding_fingerprint(
+                &EmbedSettings {
+                    endpoint: Some(url.into()),
+                    ..base.clone()
+                },
+                8,
+            )
+        };
+        for (url, secret) in [
+            ("http://h/users/a@b/v1", "a@b"),
+            ("http://h/v1/tok3n-SECRET", "SECRET"),
+            ("user:pw@host:8080", "pw"),
+            ("http://u:pw@h/v1", "pw"),
+            ("http://h/v1#frag-SECRET", "SECRET"),
+            ("http://h/v1?key=SECRET", "SECRET"),
+        ] {
+            let f = fp(url);
+            assert!(!f.contains(secret), "{url} leaked {secret}: {f}");
+            assert!(!f.contains("/v1") && !f.contains("users"), "raw path: {f}");
+        }
+        assert!(fp("user:pw@host:8080").contains("host:8080"));
+        assert_ne!(fp("http://h1/users/a@b/v1"), fp("http://h2/users/a@b/v1"));
+        assert_ne!(fp("http://h/v1"), fp("http://h/v2"), "path is hashed in");
+        assert_eq!(fp("http://h/v1"), fp("http://h/v1/"));
+        assert_eq!(fp("http://u:p@h/v1?k=1#f"), fp("http://h/v1"));
+    }
 
     #[test]
     fn openai_provider_selected_with_key() {

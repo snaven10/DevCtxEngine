@@ -3,7 +3,7 @@
 - **Plan:** PLAN-010 — Memoria de procesos
 - **Especialista:** general-purpose (Rust)
 - **Proyecto:** DevCtxEngine (`/home/you/personal/DevCtxEngine`), rama `feat/plan-010-memoria`
-- **Depende de:** TASK-002, TASK-008, TASK-009
+- **Depende de:** TASK-002, TASK-008, TASK-009, TASK-015, TASK-016, TASK-017, TASK-019
 - **Estado:** `pending`
 
 ---
@@ -39,11 +39,18 @@ cada proceso, qué perillas hay, cómo leer `status.memory` y cuándo usar `prov
       el central cae.
 - [ ] **Paso 5 — `max_length`** y el aviso de reindex.
 - [ ] **Paso 6 — CHANGELOG** con la nota "sin reindex" y la salida de fastembed.
+- [ ] **Paso 7 — calidad de búsqueda (agregado 2026-10-11).** `storage.fts` (TASK-015),
+      `queries` en `search`/`recall` y cuándo mandarlo (TASK-016), `embeddings.pooling` y
+      `max_length` para Granite con la guía de migración (`index --full --upgrade-embeddings`,
+      `memories reembed`, tiempos esperados; TASK-017), el reranker nuevo y su licencia, pool y
+      latencia (TASK-019; ADR-15 actualizado). El CHANGELOG distingue lo que **no** pide reindex
+      (motor, FTS, `queries`, reranker) de lo que lo ofrece como opt-in (pooling/`max_length`).
 
 ## Criterios de aceptación
 
 - [ ] Cada clave nueva aparece en EN y ES con default y env.
 - [ ] Los números citados son los de TASK-011 (no los de la planificación).
+- [ ] La huella de embeddings (TASK-013) y el aviso `upgrade_available` explicados en EN y ES.
 
 ## Resultado
 

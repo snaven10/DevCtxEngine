@@ -80,14 +80,15 @@ impact_analysis("processPayment")
 Transitive callers and callees. Callers tell you what a change could break;
 callees tell you what this depends on to work at all.
 
-**Read the first line.** The graph is keyed by qualified name, so a bare
-`processPayment` expands to every `Class.processPayment` and the report says
-which ones it merged. Several declarations means the radius is their union —
-ask with the qualified name to narrow it.
+**Read the first line.** A bare `processPayment` means every symbol of the
+repository with that name, and the report says which ones it stood for. Several
+declarations means the radius is their union — ask with the qualified name to
+narrow it. Read the counts too: what the defaults left out (tests, library
+calls, calls the index could not decide) is counted, not shown.
 
 **Empty is still not proof.** A clean report means "nothing found", never
-"nothing there": dynamic dispatch leaves no edge, only 7 languages produce them,
-and a stale index looks identical to absent code.
+"nothing there": a call through a callback or reflection leaves no edge, only 7
+languages produce them, and a stale index looks identical to absent code.
 
 ## Step 6 — Before concluding the code is wrong
 

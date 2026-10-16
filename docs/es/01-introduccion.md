@@ -46,8 +46,10 @@ los agentes por defecto.
 relevancia, troceado por fronteras de símbolo y no por ventanas arbitrarias de
 líneas. Vectorial, por palabras clave (BM25) o híbrida.
 
-**Grafo de símbolos.** Aristas de llamada e import extraídas del AST, de modo que
-"qué se rompe si cambio esto" es una consulta y no una conjetura.
+**Grafo de símbolos.** Símbolos y cómo se relacionan — llamadas,
+instanciaciones, imports, supertipos, usos de tipo — extraídos del AST y
+resueltos entre archivos, cada arista con qué tan segura es, de modo que "qué se
+rompe si cambio esto" es una consulta y no una conjetura.
 
 **Memoria persistente.** Decisiones, ideas y trampas que sobreviven a las
 sesiones, deduplicadas para que guardar lo mismo dos veces no acumule ruido. Una
@@ -119,7 +121,7 @@ devctx mcp configure --client claude-code --scope project
 ## Cómo funciona, en treinta segundos
 
 `devctx index` le pregunta a git qué cambió, parsea esos ficheros con tree-sitter
-en símbolos y aristas de llamada, los trocea por fronteras de símbolo, embebe cada
+en símbolos y sus relaciones, los trocea por fronteras de símbolo, embebe cada
 trozo con un modelo ONNX local, y guarda vectores, grafo y hashes por fichero en
 un único fichero DuckDB dentro del repositorio. Los ficheros sin cambios se saltan
 por hash, así que reindexar sale lo bastante barato como para hacerlo tras cada

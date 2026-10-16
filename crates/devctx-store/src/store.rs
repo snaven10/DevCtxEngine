@@ -98,6 +98,21 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// The `memory_limit` every database instance of this process gets.
+pub(crate) fn memory_limit_setting() -> String {
+    std::env::var("DEVCTX_DB_MEMORY_LIMIT")
+        .ok()
+        .filter(|v| is_size_literal(v))
+        .unwrap_or_else(|| DEFAULT_MEMORY_LIMIT.to_string())
+}
+
+/// The statements that cap a database instance (see [`DEFAULT_MEMORY_LIMIT`]).
+pub(crate) fn resource_limits_sql() -> String {
+    let limit = memory_limit_setting();
+    let threads = env_usize("DEVCTX_DB_THREADS", DEFAULT_THREADS).max(1);
+    format!("SET memory_limit = '{limit}'; SET threads = {threads};")
+}
+
 /// A DuckDB-backed store. Holds one connection and the fixed vector dimension.
 pub struct Store {
     pub(crate) conn: Connection,
@@ -114,6 +129,9 @@ pub struct Store {
     shared: Arc<Shared>,
     /// Whether this connection is inside [`in_transaction`](Self::in_transaction).
     in_tx: AtomicBool,
+    /// The open transaction dropped cached graph answers: its commit drops
+    /// them again (see [`forget_graph_step`](Self::forget_graph_step)).
+    tx_graph_dirty: AtomicBool,
 }
 
 /// State common to every connection of one open database.
@@ -124,6 +142,29 @@ struct Shared {
     /// Writers hold the read side for one statement; a freeze takes the write
     /// side to wait out the statements already running.
     gate: RwLock<()>,
+    /// `INSTALL … LOAD vss` failed once in this process. `INSTALL` reaches for
+    /// the network when the extension is not on disk, so a machine without it
+    /// would pay that on every run; the failure is remembered instead.
+    vss_unavailable: AtomicBool,
+    /// The compaction lock, held shared for as long as any connection of this
+    /// open lives (PLAN-009 TASK-018, I1 and M-C): no compaction can start
+    /// under an open store. `None` for an in-memory store, for the compactor's
+    /// own opens, and where the lock file cannot be created.
+    _compact_lock: Option<crate::oslock::FileLock>,
+    /// [`Store::graph_out_of_step`] answers, per `(repo, repo_path, branch)`,
+    /// with the branch's `index_state.indexed_at` they were computed under
+    /// (see [`Store::graph_out_of_step_cached`]).
+    graph_step: std::sync::Mutex<GraphStepCache>,
+}
+
+/// The cached graph answers and a generation that every invalidation bumps.
+#[derive(Default)]
+pub(crate) struct GraphStepCache {
+    /// Bumped by every [`Store::forget_graph_step`]: an answer computed
+    /// across a bump may have read rows from before it, and is not kept.
+    generation: u64,
+    /// `(repo, repo_path, branch)` → `(indexed_at, out of step)`.
+    answers: std::collections::HashMap<(String, String, String), (Option<String>, bool)>,
 }
 
 /// A connection borrowed for one write; see [`Store::w`].
@@ -152,6 +193,11 @@ impl Drop for TxGuard<'_> {
             // Never gated: a rollback writes nothing to the WAL, and a frozen
             // store must still be able to abandon what it started.
             let _ = self.store.conn.execute_batch("ROLLBACK");
+            // An answer read inside the transaction may describe rows that
+            // are gone now.
+            self.store.in_tx.store(false, Ordering::SeqCst);
+            self.store.tx_graph_dirty.store(false, Ordering::SeqCst);
+            self.store.forget_graph_step(None);
         }
         self.store.in_tx.store(false, Ordering::SeqCst);
     }
@@ -159,30 +205,108 @@ impl Drop for TxGuard<'_> {
 
 impl Store {
     /// Open (creating if needed) a store at `path` with vector dimension `dim`.
+    ///
+    /// Takes the compaction lock shared and keeps it while the store lives;
+    /// refused with [`StoreError::Compacting`] while a compaction runs, and
+    /// with [`StoreError::OrphanCompaction`] when a compaction's temporary
+    /// sits next to a missing database. Removes what a dead compaction left
+    /// (see [`crate::oslock`]).
     pub fn open(path: &Path, dim: usize) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        let lock = crate::oslock::guard_open(path)?;
+        let held = lock.is_some();
+        let store = Self::open_with_lock(path, dim, lock)?;
+        if held {
+            // A compaction whose copy failed verification could not write its
+            // note into a database it never writes (PLAN-009 TASK-018, T7).
+            let marker = crate::oslock::CompactPaths::for_db(path).failed_marker;
+            if marker.exists()
+                && store
+                    .set_index_meta(
+                        "",
+                        "",
+                        crate::compact::COMPACTION_META_KEY,
+                        crate::compact::COMPACTION_OWED_FAILED_VERIFY,
+                    )
+                    .is_ok()
+            {
+                let _ = std::fs::remove_file(&marker);
+            }
+        }
+        Ok(store)
+    }
+
+    /// [`open`](Self::open) without the compaction lock: the compactor's own
+    /// opens of its copy and of the source it is about to adjoin, which run
+    /// while it holds the lock exclusively.
+    pub(crate) fn open_unlocked(path: &Path, dim: usize) -> Result<Self> {
+        Self::open_with_lock(path, dim, None)
+    }
+
+    fn open_with_lock(
+        path: &Path,
+        dim: usize,
+        compact_lock: Option<crate::oslock::FileLock>,
+    ) -> Result<Self> {
         let conn = Connection::open(path)?;
         let store = Self {
             conn,
             dim,
             metric_cache: std::sync::Mutex::new(None),
+            shared: Arc::new(Shared {
+                _compact_lock: compact_lock,
+                ..Shared::default()
+            }),
+            in_tx: AtomicBool::new(false),
+            tx_graph_dirty: AtomicBool::new(false),
+        };
+        // Limits before any query can allocate against the defaults.
+        store.apply_resource_limits();
+        // Extensions before the schema: on a database that already holds an
+        // HNSW index, the checkpoint `init_schema` takes after creating a
+        // table must bind that index, and without VSS loaded DuckDB fails it
+        // fatally — "unknown index type 'HNSW'", the database invalidated —
+        // which is what opening a 0.9.0 index with `storage.hnsw` did the
+        // first time a release added a table (PLAN-009 TASK-003).
+        store.load_extensions(); // best-effort, so existing HNSW/FTS indexes are usable
+        schema::init_schema(&store.conn, dim)?;
+        Ok(store)
+    }
+
+    /// A store over an already-open connection, extensions and schema as the
+    /// caller left them: for tests that need a connection `open` would not
+    /// make (one that cannot load VSS).
+    #[cfg(test)]
+    pub(crate) fn over_connection(conn: Connection, dim: usize) -> Self {
+        Self {
+            conn,
+            dim,
+            metric_cache: std::sync::Mutex::new(None),
             shared: Arc::new(Shared::default()),
             in_tx: AtomicBool::new(false),
-        };
-        store.apply_resource_limits(); // before any query can allocate against the defaults
-        schema::init_schema(&store.conn, dim)?;
-        store.load_extensions(); // best-effort, so existing HNSW/FTS indexes are usable
-        Ok(store)
+            tx_graph_dirty: AtomicBool::new(false),
+        }
     }
 
     /// Open and immediately release the database file at `path`, to learn
     /// whether another process holds it — without loading a model or touching
     /// the schema. A file that does not exist yet is not a conflict.
     pub fn check_unlocked(path: &Path) -> Result<()> {
+        let paths = crate::oslock::CompactPaths::for_db(path);
+        // Held shared through the probe, like any open: no compaction may
+        // start while this process has the file open.
+        let _held = match crate::oslock::FileLock::try_acquire(
+            &paths.lock,
+            crate::oslock::LockMode::Shared,
+        ) {
+            Ok(Some(l)) => Some(l),
+            Ok(None) => return Err(StoreError::Compacting(paths.db)),
+            Err(_) => None,
+        };
         if path.exists() {
             drop(Connection::open(path)?);
         }
@@ -198,10 +322,11 @@ impl Store {
             metric_cache: std::sync::Mutex::new(None),
             shared: Arc::new(Shared::default()),
             in_tx: AtomicBool::new(false),
+            tx_graph_dirty: AtomicBool::new(false),
         };
         store.apply_resource_limits();
+        store.load_extensions(); // before the schema, as in `open`
         schema::init_schema(&store.conn, dim)?;
-        store.load_extensions();
         Ok(store)
     }
 
@@ -260,6 +385,7 @@ impl Store {
             metric_cache: std::sync::Mutex::new(None),
             shared: self.shared.clone(),
             in_tx: AtomicBool::new(false),
+            tx_graph_dirty: AtomicBool::new(false),
         };
         store.load_extensions();
         Ok(store)
@@ -274,14 +400,7 @@ impl Store {
     /// and inherits both settings, so it pays for no extra statements per
     /// request.
     fn apply_resource_limits(&self) {
-        let limit = std::env::var("DEVCTX_DB_MEMORY_LIMIT")
-            .ok()
-            .filter(|v| is_size_literal(v))
-            .unwrap_or_else(|| DEFAULT_MEMORY_LIMIT.to_string());
-        let threads = env_usize("DEVCTX_DB_THREADS", DEFAULT_THREADS).max(1);
-        let _ = self.conn.execute_batch(&format!(
-            "SET memory_limit = '{limit}'; SET threads = {threads};"
-        ));
+        let _ = self.conn.execute_batch(&resource_limits_sql());
     }
 
     /// Best-effort load of the optional DuckDB extensions (VSS for HNSW, FTS for
@@ -294,11 +413,19 @@ impl Store {
     /// Best-effort load of the DuckDB VSS extension (for HNSW). Returns whether
     /// it loaded; silently no-ops when the extension is unavailable (e.g. offline).
     fn load_vss(&self) -> bool {
-        self.conn
+        if self.shared.vss_unavailable.load(Ordering::Relaxed) {
+            return false;
+        }
+        let ok = self
+            .conn
             .execute_batch(
                 "INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;",
             )
-            .is_ok()
+            .is_ok();
+        if !ok {
+            self.shared.vss_unavailable.store(true, Ordering::Relaxed);
+        }
+        ok
     }
 
     /// Best-effort load of the DuckDB FTS extension (for BM25 keyword search).
@@ -529,7 +656,14 @@ impl Store {
     /// out of a server whose indexing run is mid-file. Callers that are about
     /// to end the process need to know, so they can escalate to
     /// [`force_checkpoint`](Self::force_checkpoint).
+    ///
+    /// Refused with [`StoreError::CheckpointUnsafe`] when the checkpoint would
+    /// have to bind an HNSW index without VSS loaded — DuckDB fails that
+    /// fatally and invalidates the database for the rest of the process.
     pub fn try_checkpoint(&self) -> Result<()> {
+        if !schema::checkpoint_is_safe(&self.conn) {
+            return Err(StoreError::CheckpointUnsafe);
+        }
         self.conn.execute_batch("CHECKPOINT;")?;
         Ok(())
     }
@@ -541,7 +675,12 @@ impl Store {
     /// doing is lost — which it would be anyway once the process exits — but the
     /// rows already committed are folded into the file instead of being left in
     /// a WAL whose replay breaks the ART indexes (see `checkpoint`).
+    ///
+    /// Refused like [`try_checkpoint`](Self::try_checkpoint) when unsafe.
     pub fn force_checkpoint(&self) -> Result<()> {
+        if !schema::checkpoint_is_safe(&self.conn) {
+            return Err(StoreError::CheckpointUnsafe);
+        }
         self.conn.execute_batch("FORCE CHECKPOINT;")?;
         Ok(())
     }
@@ -711,6 +850,13 @@ impl Store {
         };
         guard.finished = result.is_ok();
         drop(guard);
+        // The writes forgot the graph answers *before* they ran, and until
+        // this commit every other connection still read the old rows: one of
+        // them may have cached an answer from that snapshot under the same
+        // `indexed_at`. Forget again now that the rows are visible.
+        if result.is_ok() && self.tx_graph_dirty.swap(false, Ordering::SeqCst) {
+            self.forget_graph_step(None);
+        }
         result
     }
 
@@ -894,6 +1040,38 @@ impl Store {
         }
     }
 
+    /// The embeddings a file already has on a branch, keyed by the chunk's
+    /// `content_hash` (one query for the whole file).
+    ///
+    /// What lets a reindex skip the embedder for every chunk whose text did not
+    /// change. Deletion tombstones are left out, and so is anything whose width
+    /// is not this store's. When two chunks share a hash they share a text, so
+    /// either vector serves.
+    pub fn vectors_by_hash(
+        &self,
+        repo: &str,
+        branch: &str,
+        file: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content_hash, vector FROM vectors \
+             WHERE repo = ? AND branch = ? AND file = ? \
+               AND COALESCE(is_deletion, false) = false AND content_hash IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![repo, branch, file], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Value>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (hash, v) = row?;
+            let v = value_to_f32_vec(v);
+            if v.len() == self.dim {
+                out.entry(hash).or_insert(v);
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete every vector for a given file.
     pub fn delete_by_file(&self, repo: &str, branch: &str, file: &str) -> Result<usize> {
         let n = self.w()?.execute(
@@ -917,12 +1095,25 @@ impl Store {
     }
 
     /// Update the `file` column for every row of a renamed file.
+    ///
+    /// The file's `symbols` and `edges` are dropped instead: a symbol id
+    /// carries its file (PLAN-009 DD-3), so the renamed file's symbols are new
+    /// ones, which the reindex of `new` writes. Edges elsewhere that resolved
+    /// into it are unresolved for the link pass. One transaction.
+    ///
+    /// `file_state` is not touched: the caller re-keys it (or re-indexes
+    /// `new`). Until it does, the graph check reads the branch as out of step
+    /// (`old` has state and no `file` symbol row). No production caller
+    /// today: the pipeline indexes a rename as a delete plus an add.
     pub fn rename_file(&self, repo: &str, branch: &str, old: &str, new: &str) -> Result<usize> {
-        let n = self.w()?.execute(
-            "UPDATE vectors SET file = ? WHERE repo = ? AND branch = ? AND file = ?",
-            [new, repo, branch, old],
-        )?;
-        Ok(n)
+        self.in_transaction(|| {
+            let n = self.w()?.execute(
+                "UPDATE vectors SET file = ? WHERE repo = ? AND branch = ? AND file = ?",
+                [new, repo, branch, old],
+            )?;
+            self.rename_file_graph(repo, branch, old)?;
+            Ok(n)
+        })
     }
 
     /// Count rows, optionally filtered.
@@ -1273,6 +1464,73 @@ fn value_to_f32_vec(v: Value) -> Vec<f32> {
 }
 
 impl Store {
+    /// A cached [`graph_out_of_step`](Self::graph_out_of_step) answer, if one
+    /// was computed under the same `indexed_at`.
+    pub(crate) fn cached_graph_step(
+        &self,
+        key: &(String, String, String),
+        indexed_at: &Option<String>,
+    ) -> Option<bool> {
+        let g = self.shared.graph_step.lock().ok()?;
+        g.answers
+            .get(key)
+            .filter(|(at, _)| at == indexed_at)
+            .map(|(_, v)| *v)
+    }
+
+    /// The current invalidation generation, read before computing an answer
+    /// and handed to [`remember_graph_step`](Self::remember_graph_step).
+    pub(crate) fn graph_step_generation(&self) -> u64 {
+        self.shared
+            .graph_step
+            .lock()
+            .map(|g| g.generation)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Whether this connection is inside [`in_transaction`](Self::in_transaction).
+    pub(crate) fn in_transaction_now(&self) -> bool {
+        self.in_tx.load(Ordering::SeqCst)
+    }
+
+    /// Keep an answer computed from generation `generation` on — unless an
+    /// invalidation happened since (it may have read rows from before a
+    /// write), or this connection is inside a transaction (the answer would
+    /// describe rows no other connection can see yet).
+    pub(crate) fn remember_graph_step(
+        &self,
+        key: (String, String, String),
+        indexed_at: Option<String>,
+        out_of_step: bool,
+        generation: u64,
+    ) {
+        if self.in_tx.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut g) = self.shared.graph_step.lock() {
+            if g.generation == generation {
+                g.answers.insert(key, (indexed_at, out_of_step));
+            }
+        }
+    }
+
+    /// Drop the cached answers of `branch` (of every branch with `None`):
+    /// called by every write that can change them — `file_state`, the
+    /// graph tables, `index_state`, a rollback — before it runs, and again
+    /// (for every branch) when the transaction it ran in commits.
+    pub(crate) fn forget_graph_step(&self, branch: Option<&str>) {
+        if self.in_tx.load(Ordering::SeqCst) {
+            self.tx_graph_dirty.store(true, Ordering::SeqCst);
+        }
+        if let Ok(mut g) = self.shared.graph_step.lock() {
+            g.generation = g.generation.wrapping_add(1);
+            match branch {
+                Some(b) => g.answers.retain(|(_, _, kb), _| kb != b),
+                None => g.answers.clear(),
+            }
+        }
+    }
+
     /// Forget the resolved metric so the next search re-reads it.
     fn invalidate_metric_cache(&self) {
         if let Ok(mut g) = self.metric_cache.lock() {
@@ -1285,7 +1543,7 @@ impl Store {
 /// always-correct one. The value reaches SQL by interpolation — both in the
 /// index name and in `WITH (metric = …)` — so anything unrecognized is mapped
 /// to `cosine` rather than passed through.
-fn normalize_metric(metric: &str) -> &'static str {
+pub fn normalize_metric(metric: &str) -> &'static str {
     match metric.trim().to_ascii_lowercase().as_str() {
         "ip" | "inner_product" => "ip",
         _ => "cosine",
@@ -1811,7 +2069,7 @@ mod bench {
 }
 
 /// Rank candidate symbols against a name that matched nothing. Pure.
-fn rank_suggestions(name: &str, cands: Vec<String>, n: usize) -> Vec<String> {
+pub(crate) fn rank_suggestions(name: &str, cands: Vec<String>, n: usize) -> Vec<String> {
     let lname = name.to_lowercase();
     let threshold = (lname.chars().count() / 3).max(2);
     let mut scored: Vec<(u8, usize, String)> = Vec::new();
@@ -1838,7 +2096,7 @@ fn rank_suggestions(name: &str, cands: Vec<String>, n: usize) -> Vec<String> {
 }
 
 /// Levenshtein distance over chars.
-fn edit_distance(a: &str, b: &str) -> usize {
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();

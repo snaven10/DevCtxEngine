@@ -21,7 +21,6 @@ use std::time::Duration;
 use devctx_core::config::ProjectConfig;
 use devctx_core::{SearchFilter, SearchResult, VectorMetadata, VectorPoint};
 use devctx_embed::{create_provider, EmbedSettings, EmbeddingProvider};
-use devctx_index::GitRepo;
 use devctx_search::{search_ranked, RankOptions, SearchMode};
 use devctx_store::Store;
 use serde_json::Value;
@@ -106,6 +105,7 @@ impl MemScope {
 fn rank_options(cfg: &ProjectConfig) -> RankOptions {
     RankOptions {
         penalty: cfg.search.penalty,
+        centrality: cfg.search.centrality(),
         ..Default::default()
     }
 }
@@ -130,8 +130,10 @@ enum Engine {
         filter: SearchFilter,
         /// The project's `search.penalty`, as the CLI and MCP apply it.
         rank: RankOptions,
-        repo: String,
-        branch: String,
+        /// The repository root, for `impact_analysis`'s choice of branch.
+        root: PathBuf,
+        /// The configured default branch.
+        default_branch: Option<String>,
         project: String,
     },
     Remote {
@@ -149,25 +151,31 @@ impl Engine {
         } else {
             PathBuf::from(&cfg.project.path)
         };
-        let (repo, branch) = match GitRepo::open(&root) {
-            Ok(git) => (git.short_name(), git.state().branch),
-            Err(_) => (String::new(), String::new()),
-        };
         let project = if cfg.project.name.is_empty() {
             "default".to_string()
         } else {
             cfg.project.name.clone()
         };
         Ok(Engine::Local {
-            store,
             embedder,
             filter: SearchFilter {
                 exclude_deletions: true,
                 ..Default::default()
             },
-            rank: rank_options(cfg),
-            repo,
-            branch,
+            rank: RankOptions {
+                // Under the MCP's rule: a current symbol graph (review of
+                // TASK-010, MINOR 1).
+                centrality: devctx_mcp::state::local_centrality(
+                    &store,
+                    &root,
+                    cfg.indexing.default_branch(),
+                    cfg.search.centrality(),
+                ),
+                ..rank_options(cfg)
+            },
+            store,
+            default_branch: cfg.indexing.default_branch().map(str::to_string),
+            root,
             project,
         })
     }
@@ -223,12 +231,22 @@ impl Engine {
         match self {
             Engine::Local {
                 store,
-                repo,
-                branch,
+                root,
+                default_branch,
                 ..
             } => {
-                let im = store.impact_analysis(repo, branch, symbol, 3)?;
-                Ok((im.upstream, im.downstream))
+                // The tool's own answer (symbol graph or 0.9.0 walk: the
+                // same choice of reader and branch), with its defaults.
+                let v = devctx_mcp::state::impact_at(
+                    store,
+                    root,
+                    default_branch.as_deref(),
+                    symbol,
+                    3,
+                    &devctx_mcp::state::ImpactQuery::default(),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
+                Ok((json_pairs(&v["upstream"]), json_pairs(&v["downstream"])))
             }
             Engine::Remote { base, token } => {
                 let v = http_get(

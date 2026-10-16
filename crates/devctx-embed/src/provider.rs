@@ -1,5 +1,7 @@
 //! The embedding provider abstraction shared by local and API backends.
 
+use std::sync::{Arc, Mutex};
+
 use crate::error::Result;
 
 /// A source of text embeddings. All local providers L2-normalize their output
@@ -20,6 +22,74 @@ pub trait EmbeddingProvider: Send + Sync {
 
     /// Human-readable model identifier.
     fn model_name(&self) -> &str;
+}
+
+/// How a [`LazyEmbedder`] builds the real provider.
+type Loader<'a> = Box<dyn Fn() -> Result<Arc<dyn EmbeddingProvider>> + Send + Sync + 'a>;
+
+/// An embedder that is only built when something is actually embedded.
+///
+/// `dimension` and `model_name` are known from the configuration, so a caller
+/// that only needs them (the dimension check of an indexing run, the model
+/// recorded in `index_state`) never pays the model load. A reindex that finds
+/// every vector reusable never calls [`embed`](EmbeddingProvider::embed), and
+/// with it the ~700 MiB load transient is skipped.
+pub struct LazyEmbedder<'a> {
+    dimension: usize,
+    name: String,
+    loader: Loader<'a>,
+    loaded: Mutex<Option<Arc<dyn EmbeddingProvider>>>,
+}
+
+impl<'a> LazyEmbedder<'a> {
+    /// `dimension` and `name` must be those of what `loader` builds.
+    pub fn new(
+        dimension: usize,
+        name: impl Into<String>,
+        loader: impl Fn() -> Result<Arc<dyn EmbeddingProvider>> + Send + Sync + 'a,
+    ) -> Self {
+        Self {
+            dimension,
+            name: name.into(),
+            loader: Box::new(loader),
+            loaded: Mutex::new(None),
+        }
+    }
+
+    /// Whether the real provider has been built yet.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    fn get(&self) -> Result<Arc<dyn EmbeddingProvider>> {
+        let mut g = self.loaded.lock().map_err(|_| {
+            crate::error::EmbedError::BadResponse("the lazy embedder lock is poisoned".into())
+        })?;
+        if let Some(e) = g.as_ref() {
+            return Ok(e.clone());
+        }
+        let e = (self.loader)()?;
+        *g = Some(e.clone());
+        Ok(e)
+    }
+}
+
+impl EmbeddingProvider for LazyEmbedder<'_> {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.get()?.embed(texts)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.get()?.embed_query(text)
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn model_name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// L2-normalize a vector in place. Zero vectors are left unchanged.

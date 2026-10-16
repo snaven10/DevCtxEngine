@@ -15,8 +15,8 @@ A Cargo workspace of focused crates, each owning one concern:
 | Crate | Owns |
 |---|---|
 | `devctx-core` | Shared types, the config schema, path resolution, rank fusion |
-| `devctx-store` | DuckDB: vectors, call graph, routes, memories, index state, registry |
-| `devctx-parse` | tree-sitter: symbols, imports, call edges, framework routes |
+| `devctx-store` | DuckDB: vectors, symbol graph, routes, memories, index state, registry |
+| `devctx-parse` | tree-sitter: symbols and their relations, the per-language resolvers of the link pass, framework routes |
 | `devctx-chunk` | Semantic chunking: file / class / function / block, plus memory windows |
 | `devctx-embed` | Embeddings: local ONNX via fastembed, or OpenAI / Voyage / custom |
 | `devctx-rerank` | Cross-encoder reranking, with a no-op fallback |
@@ -84,12 +84,25 @@ needs — a save moves no commit, so a commit diff would be empty.
 
 **Skipping** happens per file by content hash. Re-indexing an unchanged file
 costs a read and a hash, not an embedding. This is what makes the post-commit
-hook and the watcher cheap enough to run constantly.
+hook and the watcher cheap enough to run constantly. A `--full` run also reuses
+the stored vector of every chunk whose text did not change, so it pays for
+parsing, not for the embedder.
+
+**The link pass** runs after the files, once per run and per branch: it loads
+the branch's symbols and resolves the edges the run touched (or all of them,
+when a fifth of the branch changed, the link rules changed, or a manifest such
+as `tsconfig.json`, `package.json`, `Cargo.toml` or `go.mod` changed) to the
+definition each one reaches, then recomputes the branch's PageRank. See
+[Symbol Graph](03-core-concepts/symbol-graph.md#what-is-in-the-graph).
 
 **State** lives in two tables keyed by `(repo_path, branch)`: `index_state` (the
 last indexed commit, the model and its dimension) and `file_state` (per-file
 hash, language, symbol and chunk counts). A model change is detected here and
-forces a full re-index rather than mixing incompatible vectors.
+forces a full re-index rather than mixing incompatible vectors. `index_meta`
+records, per branch, which extractor and which link rules built the graph and
+which embedding setup made the vectors. Another extractor is what
+`extractor_stale` reports; other link rules make the next run relink the
+branch; another embedding setup re-embeds instead of reusing.
 
 ## 4. Storage
 
@@ -98,10 +111,12 @@ One DuckDB file per project holds everything:
 | Table | Holds |
 |---|---|
 | `vectors` | Chunk embeddings (`FLOAT[n]`) plus their metadata — the only dimension-bound table |
-| `graph_edges` | Call and import edges, for impact analysis |
+| `symbols` | One row per definition: stable id, kind, qualified name, parent, signature, rank |
+| `edges` | One row per occurrence of a relation (calls, instantiates, imports, inherits, implements, references, contains), resolved by the link pass; tools read the `live_edges` view |
+| `graph_edges` | The call edges of 0.9, by name; still written so 0.9.0 can read a 0.10 index |
 | `routes` | Framework-extracted HTTP routes and their handlers |
 | `memories` | Saved decisions, insights and notes |
-| `index_state`, `file_state` | Incremental bookkeeping |
+| `index_state`, `file_state`, `index_meta` | Incremental bookkeeping, and which extractor, link rules and embedding setup built each branch |
 | `projects` | The registry — populated only in the central store |
 
 Vector search is `array_cosine_distance` over `FLOAT[n]`, a core DuckDB function

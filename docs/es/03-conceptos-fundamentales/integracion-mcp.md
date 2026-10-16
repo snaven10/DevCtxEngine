@@ -122,7 +122,7 @@ posee nada:
   runtime tiene 1 s).
 - **Reporta un binario desactualizado en vez de morir.** `index_status` y
   `list_projects` llevan
-  `"mcp": {"version": "0.9.0", "binary_replaced": false}`. Si reinstalás
+  `"mcp": {"version": "0.10.0", "binary_replaced": false}`. Si reinstalás
   `devctx` con una sesión abierta, `binary_replaced` pasa a `true` y el objeto
   suma `installed_version` y un `hint`: *reiniciá la sesión de IA para tomarlo*.
   El proceso viejo sigue funcionando con el código con el que arrancó — nada se
@@ -160,7 +160,7 @@ manuales (`kill <pid>` y borrar el archivo).
 
 ## Las herramientas
 
-24 herramientas, agrupadas por lo que responden.
+27 herramientas, agrupadas por lo que responden.
 
 ### Código
 
@@ -169,8 +169,11 @@ manuales (`kill <pid>` y borrar el archivo).
 | `search` | *¿Dónde está el código sobre X?* Modos: `vector` (default), `keyword` (BM25), `hybrid` (RRF). Filtros: `language`, `kind`, `include_tests`; ver [Búsqueda](busqueda.md) |
 | `read_file` | El archivo, opcionalmente un rango de líneas inclusivo desde 1 |
 | `read_symbol` | La definición de un símbolo, su código, archivo, rango y tipo — cuando sabés el nombre. Si no la encuentra responde con `suggestions` y, para llamadas a librerías, `external: true` |
-| `get_references` | Todos los sitios de llamada de un símbolo |
-| `impact_analysis` | Llamadores transitivos (radio de impacto) y llamados |
+| `get_references` | Cada sitio de llamada de un símbolo, uno por ocurrencia, con `confidence` y `via`; `min_confidence: "low"` agrega las ambiguas, `kinds` otras relaciones (ver [Grafo de símbolos](grafo-de-simbolos.md#get_referencessímbolo--quién-llama-a-esto)) |
+| `impact_analysis` | Llamadores transitivos (radio de impacto) y llamados, por profundidad, cada uno con `confidence` y `via`; por defecto solo llamadas high/medium, sin tests, sin llamados de librerías, 200 por dirección — lo que eso deja afuera se cuenta; las llamadas por una interfaz, clase abstracta o trait se siguen como `via: "dispatch"` (nunca `high`). `min_confidence`, `include_tests`, `include_external`, `max_nodes`, `dispatch` (ver [Grafo de símbolos](grafo-de-simbolos.md#impact_analysissímbolo--radio-de-impacto)) |
+| `traverse` | Recorrer el grafo de símbolos salto a salto desde un símbolo: `kinds` (calls, instantiates, imports, inherits, implements, contains, references), `direction` in/out/both, `depth` 1-4; nodos con `sym` y las aristas que los alcanzaron, paginado (`limit`, `offset`, `next_offset`, `omitted`), con los filtros de `impact_analysis` (ver [Grafo de símbolos](grafo-de-simbolos.md#traversesímbolo--recorrer-el-grafo-por-tu-cuenta)) |
+| `repo_map` | Un mapa del repositorio para orientarse: las firmas (sin cuerpos) más relevantes para `focus_files`, `focus_symbols` o `query`, agrupadas por archivo, ordenadas por PageRank personalizado, dentro de `budget` tokens (1024); texto (ver [Grafo de símbolos](grafo-de-simbolos.md#repo_map--un-mapa-para-orientarse)) |
+| `skeleton` | La estructura de un archivo para ubicar dónde está algo: sus símbolos con firma y `[l1-l2]`, anidados, sin cuerpos, los imports en una línea; dentro de `DEVCTX_MAX_OUTPUT_TOKENS`; texto (ver [Grafo de símbolos](grafo-de-simbolos.md#skeletonarchivo--la-estructura-de-un-archivo)). Para editar, `read_symbol` / `read_file` |
 | `summarize` | Texto reducido a ~`max_tokens`, extractivo por defecto para que sobrevivan los identificadores |
 
 La distinción entre `search` y `read_symbol` conviene interiorizarla:
@@ -235,11 +238,13 @@ que estás trabajando — la pregunta de backend que te salta editando el fronte
 
 ## Formas de retorno
 
-La mayoría devuelve **JSON**. Dos no:
+La mayoría devuelve **JSON**. Cuatro no:
 
 - `build_context` devuelve **prosa**, porque el resultado está pensado para
   leerse directo al contexto de un modelo y un sobre JSON gastaría presupuesto
   en puntuación.
+- `repo_map` y `skeleton` devuelven texto por la misma razón: firmas dispuestas
+  como código, con líneas `[devctx]` que dicen qué se cortó.
 - `summarize` devuelve texto.
 
 ### Las tools de listas siempre responden con un objeto
@@ -256,7 +261,7 @@ aparecer cualquiera de estos:
 | `omitted` | `{count, reason, next_offset?}` — lo que quedó afuera. `reason` es `limit` (el tamaño de página) o `budget` (el presupuesto de salida; gana si cortaron los dos). Ausente significa que no se dejó nada afuera. (`omitted_for_budget`, que además nombra lo descartado, se mantiene un release más.) |
 | `total`, `next_offset` | `search_routes` y `plan_status`: filas que coincidían antes de paginar, y el `offset` de la página siguiente (ausente en la última) |
 | `branch_fallback` | `{current, used, why}` — la respuesta salió de otra rama; ver [Búsqueda](busqueda.md#conciencia-de-ramas) |
-| `warning` | El índice lo produjo un extractor más viejo; reindexá con `devctx index --full` |
+| `warning` | La respuesta salió del camino de 0.9: la rama la indexó un extractor más viejo o no tiene filas de símbolos (reindexá con `devctx index --full`), o no se pudo leer la tabla de símbolos (un error de lectura, no un motivo para reindexar) |
 
 Los resultados de búsqueda llevan `score`, `file`, `start_line`, `end_line`,
 `symbol`, `symbol_type`, `level`, `language`, `kind` (`code` / `test` / `doc` /
@@ -296,7 +301,7 @@ los `files` de la memoria nombran el archivo.
 
 ## Descubrimiento
 
-En `tools/list` el servidor devuelve las 24 definiciones con parámetros en JSON
+En `tools/list` el servidor devuelve las 27 definiciones con parámetros en JSON
 Schema, declaradas de entrada. El cliente valida los argumentos antes de cada
 llamada. No hay paso de descubrimiento en tiempo de ejecución.
 
@@ -314,6 +319,28 @@ devctx serve      # servidor de larga vida que posee la DB; los demás comandos 
 `serve` importa para la concurrencia: DuckDB permite un solo escritor por
 archivo, así que un servidor de larga vida posee la base de datos y el CLI — y el
 MCP — rutean a través de él en vez de pelear por el lock.
+
+## Actualizar a 0.10
+
+- **Corré `devctx index --full` una vez por repositorio, y por cada rama que
+  uses.** 0.10 escribe un grafo de símbolos que los índices de 0.9 no tienen;
+  hasta esa corrida las herramientas de grafo responden a la manera de 0.9 con
+  un `warning`, y `traverse`, `repo_map` y `skeleton` responden un error que la
+  pide. La corrida reusa los vectores guardados. Cuánto cuesta y qué responde
+  cada herramienta mientras tanto:
+  [Mantener el índice al día → Pasar a 0.10](../13-mantener-el-indice-al-dia.md#pasar-a-010-el-grafo-de-símbolos).
+- **Reiniciá tus sesiones de IA y detené los servidores viejos** (`devctx serve
+  --stop`). Un MCP 0.9 no lista `traverse`, `repo_map` ni `skeleton` y no puede
+  pasar `min_confidence`, `kinds`, `include_tests`, `include_external`,
+  `max_nodes`, `dispatch`, `related` ni `graph_hops`. Un cliente 0.10 contra un
+  servidor 0.9 recibe un 404 en las herramientas nuevas, que convierte en
+  "reinicialo: `devctx serve --stop`", y un `warning` cuando el servidor ignoró
+  los parámetros nuevos.
+- **Lo que ve un agente cambia** aun sin parámetros: `impact_analysis` sigue
+  solo llamadas `high`/`medium`, deja afuera tests y llamados de librerías y
+  lista 200 por dirección, contando el resto; `get_references` lista una fila
+  por ocurrencia con su `confidence`, y cuenta las `low` en vez de listarlas.
+  Ver [Grafo de símbolos](grafo-de-simbolos.md).
 
 ## Actualizar a 0.9
 

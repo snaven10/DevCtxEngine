@@ -12,9 +12,34 @@ use crate::error::Result;
 pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
     conn.execute_batch(&vectors_ddl(dim))?;
     drop_legacy_memory_ref_pk(conn);
-    let had_index_meta = table_exists(conn, "index_meta");
+    // Tables a release added to an existing database: `index_meta` (0.8.3),
+    // `symbols` and `edges` (PLAN-009).
+    let had_all = ["index_meta", "symbols", "edges"]
+        .iter()
+        .all(|t| table_exists(conn, t));
     conn.execute_batch(RELATIONAL_DDL)?;
-    if !had_index_meta {
+    // `symbols.content_hash` and `edges.hint` came after the tables, before
+    // any release: a database written by a development build of PLAN-009
+    // lacks them.
+    let had_columns =
+        column_exists(conn, "symbols", "content_hash") && column_exists(conn, "edges", "hint");
+    if !had_columns {
+        conn.execute_batch(
+            "ALTER TABLE symbols ADD COLUMN IF NOT EXISTS content_hash VARCHAR;
+             ALTER TABLE edges ADD COLUMN IF NOT EXISTS hint VARCHAR;",
+        )?;
+    }
+    // The edges every reader means (PLAN-009 TASK-005): without the calls the
+    // link pass discarded, which stay as rows only to be reopened by name.
+    // A view, so a reader cannot forget the filter.
+    let had_view = view_exists(conn, "live_edges");
+    if !had_view {
+        conn.execute_batch(
+            "CREATE VIEW IF NOT EXISTS live_edges AS
+             SELECT * FROM edges WHERE coalesce(resolution, '') <> 'discarded';",
+        )?;
+    }
+    if !(had_all && had_columns && had_view) && checkpoint_is_safe(conn) {
         // A table created on an existing database is DDL in the WAL; a process
         // dying before the next checkpoint leaves a log whose replay breaks
         // the ART indexes (see `Store::checkpoint`). Best-effort, as there.
@@ -22,6 +47,51 @@ pub fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
     }
     drop_broken_project_indexes(conn);
     Ok(())
+}
+
+/// Whether a `CHECKPOINT` can bind every index of the database.
+///
+/// Not when it holds an HNSW index and the VSS extension is not loaded (an
+/// offline machine that never installed it): DuckDB then fails the checkpoint
+/// *fatally* and invalidates the database for the rest of the process. The
+/// DDL stays in the WAL instead — no worse than before the table existed.
+/// [`Store::checkpoint`](crate::Store::checkpoint) and its siblings ask the
+/// same question before every checkpoint.
+pub(crate) fn checkpoint_is_safe(conn: &Connection) -> bool {
+    let hnsw = conn
+        .query_row(
+            "SELECT count(*) > 0 FROM duckdb_indexes() WHERE upper(sql) LIKE '%USING HNSW%'",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(true);
+    if !hnsw {
+        return true;
+    }
+    conn.query_row(
+        "SELECT count(*) > 0 FROM duckdb_extensions() WHERE extension_name = 'vss' AND loaded",
+        [],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) > 0 FROM duckdb_columns() WHERE table_name = ? AND column_name = ?",
+        [table, column],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+fn view_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) > 0 FROM duckdb_views() WHERE view_name = ?",
+        [name],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 
 fn table_exists(conn: &Connection, name: &str) -> bool {
@@ -259,6 +329,66 @@ CREATE TABLE IF NOT EXISTS index_meta (
     key       VARCHAR,
     value     VARCHAR,
     PRIMARY KEY (repo_path, branch, key)
+);
+
+-- The symbol graph (PLAN-009 DD-2). One row per symbol defined in a file of a
+-- branch, and one per *occurrence* of a relation — not per pair, so the second
+-- call from one method to the same target is a row of its own. `graph_edges`
+-- above is still written, from the same facts, for one release: a downgraded
+-- binary and a branch not yet reindexed both still have a graph to read.
+--
+-- No PRIMARY KEY, UNIQUE or index, for the reason given above `projects`:
+-- uniqueness is the writer's job (it deletes a file's rows and appends them
+-- again), and an index is added only once a lookup is measured to need it,
+-- with a test pinning its equality lookups.
+--
+-- `id` (DD-3) carries no branch: the same symbol has the same id on every
+-- branch. Exposed in JSON as 16 hex digits.
+CREATE TABLE IF NOT EXISTS symbols (
+    repo        VARCHAR,
+    branch      VARCHAR,
+    id          UBIGINT,
+    parent_id   UBIGINT,
+    file        VARCHAR,
+    kind        VARCHAR,
+    name        VARCHAR,
+    qualified   VARCHAR,
+    container   VARCHAR,
+    package     VARCHAR,
+    signature   VARCHAR,
+    start_line  INTEGER,
+    end_line    INTEGER,
+    start_byte  INTEGER,
+    end_byte    INTEGER,
+    exported    BOOLEAN,
+    rank        DOUBLE,
+    in_degree   INTEGER,
+    is_test     BOOLEAN,
+    -- The file symbol's only: the file's `content_hash`, as in `file_state`.
+    content_hash VARCHAR
+);
+
+-- `src_id` is always a symbol of `file` (the file symbol for a module-level
+-- call); `dst_id` stays NULL until the link pass resolves the destination
+-- (PLAN-009 DD-6), and so do `confidence`, `resolution` and `external`.
+-- `hint` is what the file said about a call's receiver (`typed field Foo`,
+-- `name Office`, `chain find name Office /1`…): the link pass re-resolves
+-- the row from it and `dst_name`, which it never rewrites, without the source.
+CREATE TABLE IF NOT EXISTS edges (
+    repo        VARCHAR,
+    branch      VARCHAR,
+    kind        VARCHAR,
+    src_id      UBIGINT,
+    dst_id      UBIGINT,
+    dst_name    VARCHAR,
+    file        VARCHAR,
+    line        INTEGER,
+    confidence  VARCHAR,
+    resolution  VARCHAR,
+    external    BOOLEAN,
+    from_test   BOOLEAN,
+    edge_source VARCHAR,
+    hint        VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS branch_lineage (
