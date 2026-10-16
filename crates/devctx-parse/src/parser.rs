@@ -30,7 +30,14 @@ pub struct LanguageParser {
     imports: Query,
     package: Option<Query>,
     type_query: Option<Query>,
+    /// Go only: 0.9.0's variable → type query, for [`GraphEdge::legacy_target`].
+    legacy_types: Option<Query>,
 }
+
+/// 0.9.0's Go type bindings, frozen (its `languages/go.json` `types`): a
+/// variable, parameter or field declared with a plain type name. A pointer
+/// (`s *Server`) or any other type expression bound nothing.
+const LEGACY_GO_TYPES: &str = "(var_spec name: (identifier) @name type: (type_identifier) @type)\n(parameter_declaration name: (identifier) @name type: (type_identifier) @type)\n(field_declaration name: (field_identifier) @name type: (type_identifier) @type)";
 
 /// Compile one query of `lang`, naming the language on failure.
 fn compile(lang: Lang, src: &str) -> Result<Query> {
@@ -59,6 +66,7 @@ impl LanguageParser {
             imports: compile(lang, lang.import_query())?,
             package: optional(lang.package_query())?,
             type_query: optional(lang.type_bindings_query())?,
+            legacy_types: optional((lang.key() == "go").then_some(LEGACY_GO_TYPES))?,
         })
     }
 
@@ -86,7 +94,9 @@ impl LanguageParser {
             self.resolver,
             injects,
         );
-        let (edges, module_edges, refs) = self.extract_references(root, bytes, &scopes, &bound);
+        let legacy_types = self.legacy_type_map(root, bytes);
+        let (edges, module_edges, refs) =
+            self.extract_references(root, bytes, &scopes, &bound, legacy_types.as_ref());
         let file_symbol = Symbol {
             kind: devctx_core::symbol_id::FILE_KIND.to_string(),
             language: self.lang.name().to_string(),
@@ -120,6 +130,30 @@ impl LanguageParser {
         })
     }
 
+    /// 0.9.0's file-level variable → type map ([`LEGACY_GO_TYPES`]), first
+    /// binding of a name wins; `None` for a language without one.
+    fn legacy_type_map(&self, root: Node<'_>, bytes: &[u8]) -> Option<HashMap<String, String>> {
+        let query = self.legacy_types.as_ref()?;
+        let names = query.capture_names();
+        let mut map = HashMap::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, root, bytes);
+        while let Some(m) = matches.next() {
+            let (mut name, mut ty) = (None, None);
+            for cap in m.captures {
+                match names[cap.index as usize] {
+                    "name" => name = cap.node.utf8_text(bytes).ok(),
+                    "type" => ty = cap.node.utf8_text(bytes).ok(),
+                    _ => {}
+                }
+            }
+            if let (Some(n), Some(t)) = (name, ty) {
+                map.entry(n.to_string()).or_insert_with(|| t.to_string());
+            }
+        }
+        Some(map)
+    }
+
     /// Every reference: calls (split by whether a named function encloses
     /// them), instantiations and type uses.
     ///
@@ -133,6 +167,7 @@ impl LanguageParser {
         bytes: &[u8],
         scopes: &Scopes,
         bound: &Bound,
+        legacy_types: Option<&HashMap<String, String>>,
     ) -> (Vec<GraphEdge>, Vec<GraphEdge>, Vec<RefFact>) {
         let names = self.references.capture_names();
         let mut cursor = QueryCursor::new();
@@ -189,6 +224,9 @@ impl LanguageParser {
                         line: callee.start_position().row as u32 + 1,
                         byte: callee.start_byte(),
                         source_byte: func.as_ref().map(|(b, _)| *b),
+                        legacy_source: legacy_source(callee, bytes, self.lang),
+                        legacy_target: legacy_types
+                            .map(|types| legacy_go_target(callee, callee_name, bytes, types)),
                         src_id: 0,
                         hint: Some(hint),
                     };
@@ -1301,6 +1339,93 @@ fn enclosing_container<'t>(node: Node<'t>, kinds: &[String]) -> Option<Node<'t>>
         cur = n.parent();
     }
     None
+}
+
+/// The callables 0.9.0 took as the source of a call, frozen: what
+/// [`legacy_source`] walks up to. Every language kept its list except
+/// TypeScript/JavaScript, where 0.10 added arrows, function expressions and
+/// generators — 0.9.0 gave a call inside them to the function around them.
+fn legacy_function_kinds(lang: Lang) -> &'static [&'static str] {
+    const JS: &[&str] = &["function_declaration", "method_definition"];
+    match lang.key() {
+        "typescript" | "tsx" | "javascript" => JS,
+        _ => &[],
+    }
+}
+
+/// The source 0.9.0 gave a call ([`GraphEdge::legacy_source`]): the nearest
+/// enclosing callable of a kind it knew, named `Container.name` by its
+/// innermost container (the name a call through `this`/a typed receiver
+/// writes as its target), or `name`. `None` where there is no such callable.
+fn legacy_source(node: Node<'_>, bytes: &[u8], lang: Lang) -> Option<String> {
+    let frozen = legacy_function_kinds(lang);
+    let mut cur = node.parent();
+    let func = loop {
+        let n = cur?;
+        let kind = n.kind();
+        let known = if frozen.is_empty() {
+            lang.function_kinds().iter().any(|k| k == kind)
+        } else {
+            frozen.contains(&kind)
+        };
+        if known {
+            break n;
+        }
+        cur = n.parent();
+    };
+    let name = func.child_by_field_name("name")?.utf8_text(bytes).ok()?;
+    Some(
+        match enclosing_container(func, lang.container_kinds())
+            .and_then(|c| container_name(c, bytes))
+        {
+            Some(container) => format!("{container}.{name}"),
+            None => name.to_string(),
+        },
+    )
+}
+
+/// The target 0.9.0 gave a Go call ([`GraphEdge::legacy_target`]): its
+/// receiver as written when that starts with a capital (`Val.Get(v)` →
+/// `Val.Get`), the type 0.9.0's map bound to a lowercase receiver (`s.Handle()`
+/// on `s Server` → `Server.Handle`), else the bare name (`store.Open()` →
+/// `Open`, `s.Handle()` on `s *Server` → `Handle`). Only an identifier or a
+/// dotted run of them counts as a receiver, as in 0.9.0.
+fn legacy_go_target(
+    callee: Node<'_>,
+    name: &str,
+    bytes: &[u8],
+    types: &HashMap<String, String>,
+) -> String {
+    let receiver = callee
+        .parent()
+        .filter(|p| p.kind() == "selector_expression")
+        .and_then(|p| p.child_by_field_name("operand"))
+        .and_then(|n| n.utf8_text(bytes).ok())
+        .filter(|t| {
+            !t.is_empty()
+                && t.split('.').all(|part| {
+                    let mut chars = part.chars();
+                    chars
+                        .next()
+                        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+                        && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                })
+        });
+    match receiver {
+        // 0.9.0 sent these to the enclosing container, and Go has none.
+        None | Some("self" | "this" | "cls" | "super") => name.to_string(),
+        Some(r) if r.chars().next().is_some_and(char::is_uppercase) => format!("{r}.{name}"),
+        Some(r) => {
+            let key = r
+                .strip_prefix("self.")
+                .or_else(|| r.strip_prefix("this."))
+                .unwrap_or(r);
+            match types.get(key) {
+                Some(ty) => format!("{ty}.{name}"),
+                None => name.to_string(),
+            }
+        }
+    }
 }
 
 /// Display name of a container node: its `name` field, or `type` (Rust

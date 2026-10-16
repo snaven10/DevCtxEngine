@@ -1477,19 +1477,14 @@ impl Ctx<'_> {
             .edges
             .iter()
             .map(|e| StoredEdge {
-                source: legacy_source(parsed, e),
                 // `graph_edges` is what a downgraded 0.9.0 reads. It expands
-                // only the name asked for and then walks by exact name, and
-                // it wrote a Rust call through a module path as its last
-                // segment (`crate::util::helper()` → `helper`, the name the
-                // function has as a source). The extractor keeps the path
-                // since PLAN-009; here it goes back to that segment, or the
-                // caller is hidden from 0.9.0 and its walk stops there. A
-                // call through a type is already `Type.method`.
-                target: match e.target.rsplit_once("::") {
-                    Some((_, last)) => last.to_string(),
-                    None => e.target.clone(),
-                },
+                // only the name asked for and then walks by exact name, so a
+                // row must name both ends as 0.9.0 did or its walk stops
+                // there (PLAN-009 TASK-016/TASK-019). The source is the one
+                // 0.9.0 gave the call (`GraphEdge::legacy_source`: the method
+                // around an arrow, `Deeper.deep`, `helper` in `mod tests`).
+                source: e.legacy_source.clone().unwrap_or_else(|| e.source.clone()),
+                target: legacy_target(e),
                 kind: e.kind.clone(),
                 source_file: file.to_string(),
                 line: e.line as i32,
@@ -1521,26 +1516,20 @@ impl Ctx<'_> {
     }
 }
 
-/// The source of a `graph_edges` row: the name 0.9.0 gave the caller, its
-/// innermost container and its name (`Deeper.deep`, `C.f`, `Store.open`) or
-/// the bare name (`inner`, a Rust `helper` in `mod tests`, a Go method) — not
-/// the qualified name the symbol graph uses (`Outer.Testable.Deeper.deep`,
-/// `outer.inner`, `tests.helper`). A downgraded 0.9.0 walks `graph_edges` by
-/// exact name, and calls name their callee the 0.9.0 way (`t.invoke()` →
-/// `Testable.invoke`), so a longer source cut its walk there and lost the
-/// callers 0.9.0 found (PLAN-009 TASK-019). The symbol is the one the source
-/// was taken from (same qualified name, same start); without one, the source
-/// as extracted.
-fn legacy_source(parsed: &devctx_parse::ParsedFile, e: &devctx_parse::GraphEdge) -> String {
-    parsed
-        .symbols
-        .iter()
-        .find(|s| Some(s.start_byte) == e.source_byte && s.qualified == e.source)
-        .map(|s| match &s.parent {
-            Some(parent) => format!("{parent}.{}", s.name),
-            None => s.name.clone(),
-        })
-        .unwrap_or_else(|| e.source.clone())
+/// The target of a `graph_edges` row, as 0.9.0 wrote it: the parser's
+/// `legacy_target` where 0.9.0 typed by another rule (Go), else the target. A
+/// Rust call through a module path is its last segment
+/// (`crate::util::helper()` → `helper`, the name the function has as a
+/// source); the extractor keeps the path since PLAN-009. A call through a type
+/// is already `Type.method`, the method's source.
+fn legacy_target(e: &devctx_parse::GraphEdge) -> String {
+    if let Some(t) = &e.legacy_target {
+        return t.clone();
+    }
+    match e.target.rsplit_once("::") {
+        Some((_, last)) => last.to_string(),
+        None => e.target.clone(),
+    }
 }
 
 /// The `symbols` and `edges` rows of one parsed file (ids already assigned):

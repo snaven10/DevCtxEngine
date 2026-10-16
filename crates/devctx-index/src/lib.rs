@@ -4538,6 +4538,168 @@ public class A extends B implements C {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The callables 0.10 made symbols and 0.9.0 did not source a call from,
+    /// and the Go targets 0.9.0 typed by its own rule, against what the v0.9.0
+    /// binary wrote for this fixture (PLAN-009 TASK-019):
+    ///
+    /// - an arrow, a function expression and a named function expression
+    ///   bound to a `const` in a TS method: 0.9.0 gave the call to the method;
+    /// - a Java lambda and anonymous class, a Rust closure and nested `fn`, a
+    ///   Python lambda, a Go function literal: unchanged;
+    /// - Go: a call into another package of the repository (`store.Open()` →
+    ///   `Open`), a method expression (`Val.Get(v)` → `Val.Get`), a method on
+    ///   a pointer parameter (`Handle`) and on a value parameter
+    ///   (`Server.Handle`) — 0.9.0's map is file-wide, so once `s Server` is
+    ///   declared anywhere every `s.Handle()` of the file is `Server.Handle`.
+    ///
+    /// Every row the v0.9.0 binary wrote is here, source and target, line by
+    /// line, but for the two Java calls 0.10 types through the declared
+    /// interface (`Supplier.get` for 0.9.0's `get`: an external callee, no
+    /// walk goes through it); a class field arrow had no row in 0.9.0 (no
+    /// function around it) and keeps its own. And `impact_analysis` (0.9.0's
+    /// reader) at depth 3 finds every caller the v0.9.0 binary found.
+    #[test]
+    fn callables_0_9_0_did_not_source_stay_walkable_by_0_9_0() {
+        let (dir, repo) = graph_repo(
+            "compat_forms",
+            &[
+                ("svc.ts", "export function leaf(): number {\n  return 1;\n}\n\nexport class C {\n  field = () => leaf();\n\n  m(): number {\n    const cb = () => leaf();\n    return cb();\n  }\n\n  m2(): number {\n    const fe = function () {\n      return leaf();\n    };\n    return fe();\n  }\n\n  m3(): number {\n    function inner(): number {\n      return leaf();\n    }\n    return inner();\n  }\n\n  m4(): number {\n    const fe2 = function named() {\n      return leaf();\n    };\n    return fe2();\n  }\n\n  run(): number {\n    return this.m();\n  }\n\n  run4(): number {\n    return this.m4();\n  }\n\n  runField(): number {\n    return this.field();\n  }\n\n  run2(): number {\n    return this.m2();\n  }\n\n  run3(): number {\n    return this.m3();\n  }\n}\n"),
+                ("src/main/java/p/Svc.java", "package p;\n\npublic class Svc {\n    public static int calc() {\n        return 1;\n    }\n}\n"),
+                ("src/main/java/p/Lam.java", "package p;\n\nimport java.util.function.Supplier;\n\npublic class Lam {\n    int withLambda() {\n        Supplier<Integer> s = () -> Svc.calc();\n        return s.get();\n    }\n\n    int withAnon() {\n        Supplier<Integer> s = new Supplier<Integer>() {\n            @Override\n            public Integer get() {\n                return Svc.calc();\n            }\n        };\n        return s.get();\n    }\n\n    int runLambda() {\n        return withLambda();\n    }\n\n    int runAnon() {\n        return withAnon();\n    }\n}\n"),
+                ("Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+                ("src/lib.rs", "pub fn leaf() -> u8 {\n    1\n}\n\npub fn with_closure() -> u8 {\n    let c = || leaf();\n    c()\n}\n\npub fn outer() -> u8 {\n    fn inner() -> u8 {\n        leaf()\n    }\n    inner()\n}\n\npub fn run_closure() -> u8 {\n    with_closure()\n}\n\npub fn run_outer() -> u8 {\n    outer()\n}\n"),
+                ("py/mod.py", "def leaf():\n    return 1\n\n\ndef with_lambda():\n    f = lambda: leaf()\n    return f()\n\n\ndef run_lambda():\n    return with_lambda()\n\n\nclass K:\n    def m(self):\n        g = lambda: leaf()\n        return g()\n\n    def run(self):\n        return self.m()\n"),
+                ("go/go.mod", "module example.com/fx\n\ngo 1.21\n"),
+                ("go/fx.go", "package fx\n\nimport \"example.com/fx/store\"\n\nfunc Leaf() int {\n\treturn 1\n}\n\nfunc WithLiteral() int {\n\tf := func() int {\n\t\treturn Leaf()\n\t}\n\treturn f()\n}\n\nfunc RunLiteral() int {\n\treturn WithLiteral()\n}\n\ntype Server struct{}\n\nfunc (s *Server) Handle() int {\n\treturn Leaf()\n}\n\nfunc RunHandle(s *Server) int {\n\treturn s.Handle()\n}\n\nfunc RunStore() int {\n\treturn store.Open()\n}\n\ntype Val struct{}\n\nfunc (v Val) Get() int {\n\treturn Leaf()\n}\n\nfunc ViaExpr() int {\n\treturn Val.Get(Val{})\n}\n\nfunc RunViaExpr() int {\n\treturn ViaExpr()\n}\n\nfunc ViaValue(s Server) int {\n\treturn s.Handle()\n}\n\nfunc RunViaValue() int {\n\treturn ViaValue(Server{})\n}\n"),
+                ("go/store/store.go", "package store\n\nfunc Base() int {\n\treturn 1\n}\n\nfunc Open() int {\n\treturn Base()\n}\n"),
+            ],
+        );
+        let store = Store::open_in_memory(DIM).unwrap();
+        index_branch(&store, &dir, "main", true);
+        let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
+        // (file, line, source, target) of every row the v0.9.0 binary wrote.
+        let v090: &[(&str, i32, &str, &str)] = &[
+            ("go/fx.go", 11, "WithLiteral", "Leaf"),
+            ("go/fx.go", 13, "WithLiteral", "f"),
+            ("go/fx.go", 17, "RunLiteral", "WithLiteral"),
+            ("go/fx.go", 23, "Handle", "Leaf"),
+            ("go/fx.go", 27, "RunHandle", "Server.Handle"),
+            ("go/fx.go", 31, "RunStore", "Open"),
+            ("go/fx.go", 37, "Get", "Leaf"),
+            ("go/fx.go", 41, "ViaExpr", "Val.Get"),
+            ("go/fx.go", 45, "RunViaExpr", "ViaExpr"),
+            ("go/fx.go", 49, "ViaValue", "Server.Handle"),
+            ("go/fx.go", 53, "RunViaValue", "ViaValue"),
+            ("go/store/store.go", 8, "Open", "Base"),
+            ("py/mod.py", 6, "with_lambda", "leaf"),
+            ("py/mod.py", 7, "with_lambda", "f"),
+            ("py/mod.py", 11, "run_lambda", "with_lambda"),
+            ("py/mod.py", 16, "K.m", "leaf"),
+            ("py/mod.py", 17, "K.m", "g"),
+            ("py/mod.py", 20, "K.run", "K.m"),
+            ("src/lib.rs", 6, "with_closure", "leaf"),
+            ("src/lib.rs", 7, "with_closure", "c"),
+            ("src/lib.rs", 12, "inner", "leaf"),
+            ("src/lib.rs", 14, "outer", "inner"),
+            ("src/lib.rs", 18, "run_closure", "with_closure"),
+            ("src/lib.rs", 22, "run_outer", "outer"),
+            ("src/main/java/p/Lam.java", 7, "Lam.withLambda", "Svc.calc"),
+            ("src/main/java/p/Lam.java", 8, "Lam.withLambda", "get"),
+            ("src/main/java/p/Lam.java", 15, "Lam.get", "Svc.calc"),
+            ("src/main/java/p/Lam.java", 18, "Lam.withAnon", "get"),
+            (
+                "src/main/java/p/Lam.java",
+                22,
+                "Lam.runLambda",
+                "withLambda",
+            ),
+            ("src/main/java/p/Lam.java", 26, "Lam.runAnon", "withAnon"),
+            ("svc.ts", 9, "C.m", "leaf"),
+            ("svc.ts", 10, "C.m", "cb"),
+            ("svc.ts", 15, "C.m2", "leaf"),
+            ("svc.ts", 17, "C.m2", "fe"),
+            ("svc.ts", 22, "C.inner", "leaf"),
+            ("svc.ts", 24, "C.m3", "inner"),
+            ("svc.ts", 29, "C.m4", "leaf"),
+            ("svc.ts", 31, "C.m4", "fe2"),
+            ("svc.ts", 35, "C.run", "C.m"),
+            ("svc.ts", 39, "C.run4", "C.m4"),
+            ("svc.ts", 43, "C.runField", "C.field"),
+            ("svc.ts", 47, "C.run2", "C.m2"),
+            ("svc.ts", 51, "C.run3", "C.m3"),
+        ];
+        let typed_by_0_10 = [
+            ("src/main/java/p/Lam.java", 8),
+            ("src/main/java/p/Lam.java", 18),
+        ];
+        for (file, line, source, target) in v090 {
+            let here: Vec<(&str, &str)> = old
+                .iter()
+                .filter(|e| e.source_file == *file && e.line == *line)
+                .map(|e| (e.source.as_str(), e.target.as_str()))
+                .collect();
+            assert_eq!(here.len(), 1, "{file}:{line} in {old:?}");
+            assert_eq!(here[0].0, *source, "{file}:{line}");
+            if !typed_by_0_10.contains(&(*file, *line)) {
+                assert_eq!(here[0].1, *target, "{file}:{line}");
+            }
+        }
+        // `devctx impact <seed> --depth 3` of the v0.9.0 binary.
+        for (seed, callers) in [
+            (
+                "leaf",
+                &[
+                    ("C.inner", 1),
+                    ("C.m", 1),
+                    ("C.m2", 1),
+                    ("C.m3", 2),
+                    ("C.m4", 1),
+                    ("C.run", 2),
+                    ("C.run2", 2),
+                    ("C.run3", 3),
+                    ("C.run4", 2),
+                    ("K.m", 1),
+                    ("K.run", 2),
+                    ("inner", 1),
+                    ("outer", 2),
+                    ("run_closure", 2),
+                    ("run_lambda", 2),
+                    ("run_outer", 3),
+                    ("with_closure", 1),
+                    ("with_lambda", 1),
+                ][..],
+            ),
+            (
+                "Leaf",
+                &[
+                    ("Get", 1),
+                    ("Handle", 1),
+                    ("RunLiteral", 2),
+                    ("WithLiteral", 1),
+                ][..],
+            ),
+            ("Base", &[("Open", 1), ("RunStore", 2)][..]),
+            ("Val.Get", &[("RunViaExpr", 2), ("ViaExpr", 1)][..]),
+            (
+                "Server.Handle",
+                &[("RunHandle", 1), ("RunViaValue", 2), ("ViaValue", 1)][..],
+            ),
+            ("calc", &[("Lam.get", 1), ("Lam.withLambda", 1)][..]),
+        ] {
+            let got = store
+                .impact_analysis(&repo, "main", seed, 3)
+                .unwrap()
+                .upstream;
+            for (name, depth) in callers {
+                assert!(
+                    got.contains(&(name.to_string(), *depth)),
+                    "{seed}: {name} at {depth} not in {got:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The 0.9.0 assert of [`graph_edges_stays_readable_by_0_9_0`] on
     /// `impact_analysis`, over the symbol graph of the same index (TASK-009):
     /// two calls from one method are one caller.
