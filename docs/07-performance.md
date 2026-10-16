@@ -184,13 +184,15 @@ used blocks and from 153 to 296 MiB on disk, the Angular workspace from 293 to
 463 used blocks and from 83 to 171 MiB. Peak memory of the upgrade: 169–1 083
 MiB, the same order as from scratch.
 
-**The compaction after the upgrade** (PLAN-009 TASK-018, 2026-10-13, release,
-on copies of those two upgraded indexes) brings them back: the large Java
-repository to 545–550 used blocks and 137–138 MiB (+8–9 % used blocks and
-−10 % bytes against the 0.9.0 index before the upgrade), in 7.3–8.5 s with a
-peak of 364–383 MiB and 186 MiB of extra disk; the Angular workspace to
-323–327 blocks and 81–82 MiB (+10–12 %, −1 %), in 4.4–5.7 s, 267–303 MiB and
-104 MiB. Rebuilding the HNSW and BM25 indexes is about 70 % of that time. See
+**The compaction after the upgrade** brings them back. Measured with the
+final binary on all five (PLAN-009 TASK-019, 2026-10-16, each 0.9.0 index
+rebuilt at the same commit and upgraded in place with a terminal): +0 to +10 %
+used blocks and −14 to +6 % bytes against the 0.9.0 index, the compaction
+itself in 0.6–7.3 s, and the whole upgrade — the `--full`, stopping the
+server, the compaction — in 3–301 s (the large Java repository 301 s, the
+Angular workspace 227 s, at load 8–13); peak memory of the process that
+compacts 95–370 MiB, extra disk at most the size of the file (157 MiB for the
+largest). See
 [The compaction after the upgrade](13-keeping-the-index-fresh.md#the-compaction-after-the-upgrade).
 
 **The evaluation harness** (30 cases over the five repositories, median of

@@ -320,16 +320,25 @@ it copies it row by row into a new file next to it, rebuilds the HNSW and BM25
 indexes there, checks the copy against the original, and puts it in place with
 an atomic `rename`.
 
-Measured on copies of the two largest upgraded indexes above (PLAN-009
-TASK-018, 2026-10-13, release build, machine shared, load 3–4):
+Measured with the final binary on the five repositories of the field
+verification (PLAN-009 TASK-019, 2026-10-16, release `dc0111f`, each 0.9.0
+index rebuilt by the 0.9.0 binary at the same commit, upgraded in place with
+a terminal, machine shared, load 8–13):
 
-| Repository | 0.9.0 before the upgrade | After the `--full` | After the compaction | Against 0.9.0 | Time | Peak memory | Extra disk |
-|---|---|---|---|---|---|---|---|
-| a large Java repository | 504 used blocks, 153 MiB | 786, 296 MiB | 545–550, 137–138 MiB | +8–9 % used, −10 % bytes | 7.3–8.5 s | 364–383 MiB | 186 MiB |
-| an Angular workspace | 293, 83 MiB | 463, 171 MiB | 323–327, 81–82 MiB | +10–12 % used, −1 % bytes | 4.4–5.7 s | 267–303 MiB | 104 MiB |
+| Repository | 0.9.0 before the upgrade | After the `--full` | After the compaction | Against 0.9.0 | Whole upgrade | Compaction | Peak memory (CLI / server) | Extra disk |
+|---|---|---|---|---|---|---|---|---|
+| this repository | 107 used blocks, 27 MiB | 164, 61 MiB | 114, 29 MiB | +7 % used, +6 % bytes | 41 s | 2.5 s | 149 / 916 MiB | 32 MiB |
+| a Java repository | 84, 21 MiB | 111, 41 MiB | 84, 21 MiB | +0 % used, −1 % bytes | 30 s | 1.7 s | 141 / 744 MiB | 27 MiB |
+| a Python repository | 25, 6.5 MiB | 31, 13 MiB | 27, 6.8 MiB | +8 % used, +4 % bytes | 3 s | 0.6 s | 95 / 151 MiB | 7 MiB |
+| a large Java repository | 480, 153 MiB | 753, 286 MiB | 522, 131 MiB | +9 % used, −14 % bytes | 301 s | 7.3 s | 370 / 1 050 MiB | 157 MiB |
+| an Angular workspace | 281, 83 MiB | 450, 171 MiB | 308, 77 MiB | +10 % used, −8 % bytes | 227 s | 5.0 s | 276 / 926 MiB | 91 MiB |
 
-Most of the time is rebuilding the HNSW index (≈45 %) and the BM25 one
-(≈25 %); copying the rows is ≈20 %, verifying the copy under 10 %.
+"Whole upgrade" is what the person waits for: the `--full` through the server
+(97.6–100 % of the chunks reused), stopping it and the compaction. Rebuilding
+the HNSW index is about 60 % of the compaction and copying the rows about
+25 %; these indexes have no BM25 index (`fts: false`), whose rebuild adds about
+a quarter more (TASK-018). The compaction keeps `graph_edges` row for row
+(0 rows differ, `EXCEPT ALL`, in the five).
 
 **When it runs by itself.** Only at the end of a `devctx index --full` (or of
 each project of `devctx reindex --full`) that was not cancelled and left the

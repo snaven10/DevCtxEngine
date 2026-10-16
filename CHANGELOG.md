@@ -56,10 +56,11 @@ index --full`**, which reuses the stored vectors.
    again every vector row and leaves the file at about twice its content; at
    its end, with a terminal, the CLI announces it, stops the project's server
    and rewrites the database into a new file (verified against the original,
-   put in place with an atomic `rename`): measured on the two largest upgraded
-   indexes, +8–12 % used blocks and −1 to −10 % bytes against the 0.9.0 index,
-   in 4–9 s for the compaction itself (the whole upgrade, `--full` and
-   compaction through the server, is pending measurement: PLAN-009 TASK-019).
+   put in place with an atomic `rename`): measured with the final binary on
+   five repositories (PLAN-009 TASK-019), +0 to +10 % used blocks and −14 to
+   +6 % bytes against the 0.9.0 index, the compaction in 0.6–7.3 s and the
+   whole upgrade (the `--full` through the server, stopping it, compacting)
+   in 3–301 s.
    Without a terminal (an agent, a script), with
    `DEVCTX_NO_AUTO_COMPACT=1`, or if the server had to be killed, it stays owed:
    the run ends with the line `devctx compact` and `status` reports
@@ -376,10 +377,11 @@ field verification (PLAN-009 TASK-016, five repositories):
   earlier fails once with "unknown index type 'HNSW'"; retrying resolves it.
   Fixed in this release (see above); there is no 0.9.1.
 - Upgrading a 0.9.0 index in place grows the database more than indexing from
-  scratch (field verification: a 1 625-file Java repository 504 → 786 used
-  blocks, 153 → 296 MiB; from scratch 0.10 uses 523): the rewrite leaves free
+  scratch (field verification with the final binary: a 1 625-file Java
+  repository 480 → 753 used blocks, 153 → 286 MiB): the rewrite leaves free
   blocks DuckDB does not reuse. The compaction after the upgrade gives them
-  back (545–550 blocks, 137–138 MiB); until it runs, `status` says it is owed.
+  back (522 blocks, 131 MiB: +9 % used blocks and −14 % bytes against the
+  0.9.0 index); until it runs, `status` says it is owed.
   Indexing from scratch, database size, peak memory and the upgrade time are in
   [Performance → Indexing cost of 0.10 against 0.9.0](docs/07-performance.md#indexing-cost-of-010-against-090).
 - **Windows: the compaction is not verified there.** devctx cannot stop a

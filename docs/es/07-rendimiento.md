@@ -189,13 +189,15 @@ reutiliza: el Java grande pasó de 504 a 786 bloques usados y de 153 a 296 MiB
 en disco, el workspace Angular de 293 a 463 bloques usados y de 83 a 171 MiB.
 Pico de memoria del paso: 169–1 083 MiB, del mismo orden que desde cero.
 
-**La compactación después del paso** (PLAN-009 TASK-018, 2026-10-13, release,
-sobre copias de esos dos índices actualizados) los devuelve: el Java grande a
-545–550 bloques usados y 137–138 MiB (+8–9 % de bloques usados y −10 % de
-bytes contra el índice 0.9.0 de antes del paso), en 7,3–8,5 s con un pico de
-364–383 MiB y 186 MiB de disco extra; el workspace Angular a 323–327 bloques y
-81–82 MiB (+10–12 %, −1 %), en 4,4–5,7 s, 267–303 MiB y 104 MiB. Reconstruir
-los índices HNSW y BM25 es alrededor del 70 % de ese tiempo. Ver
+**La compactación después del paso** los devuelve. Medido con el binario
+final en los cinco (PLAN-009 TASK-019, 2026-10-16, cada índice 0.9.0
+reconstruido en el mismo commit y actualizado en sitio con terminal): +0 a
++10 % de bloques usados y −14 a +6 % de bytes contra el índice 0.9.0, la
+compactación en sí en 0,6–7,3 s, y el paso completo — el `--full`, parar el
+servidor, la compactación — en 3–301 s (el Java grande 301 s, el workspace
+Angular 227 s, con carga 8–13); pico de memoria del proceso que compacta
+95–370 MiB, disco extra como mucho el tamaño del fichero (157 MiB el más
+grande). Ver
 [La compactación después del paso](13-mantener-el-indice-al-dia.md#la-compactación-después-del-paso).
 
 **El arnés de evaluación** (30 casos sobre los cinco repositorios, mediana de

@@ -334,16 +334,26 @@ devctx **compacta** la base: la copia fila por fila a un fichero nuevo junto a
 ella, reconstruye ahí los índices HNSW y BM25, verifica la copia contra la
 original y la pone en su lugar con un `rename` atómico.
 
-Medido sobre copias de los dos índices actualizados más grandes de arriba
-(PLAN-009 TASK-018, 2026-10-13, build release, máquina compartida, carga 3–4):
+Medido con el binario final sobre los cinco repositorios de la verificación de
+campo (PLAN-009 TASK-019, 2026-10-16, release `dc0111f`, cada índice 0.9.0
+reconstruido por el binario 0.9.0 en el mismo commit, actualizado en sitio con
+terminal, máquina compartida, carga 8–13):
 
-| Repositorio | 0.9.0 antes del paso | Tras el `--full` | Tras la compactación | Contra 0.9.0 | Tiempo | Pico de memoria | Disco extra |
-|---|---|---|---|---|---|---|---|
-| un repositorio Java grande | 504 bloques usados, 153 MiB | 786, 296 MiB | 545–550, 137–138 MiB | +8–9 % usados, −10 % bytes | 7,3–8,5 s | 364–383 MiB | 186 MiB |
-| un workspace Angular | 293, 83 MiB | 463, 171 MiB | 323–327, 81–82 MiB | +10–12 % usados, −1 % bytes | 4,4–5,7 s | 267–303 MiB | 104 MiB |
+| Repositorio | 0.9.0 antes del paso | Tras el `--full` | Tras la compactación | Contra 0.9.0 | Paso completo | Compactación | Pico de memoria (CLI / servidor) | Disco extra |
+|---|---|---|---|---|---|---|---|---|
+| este repositorio | 107 bloques usados, 27 MiB | 164, 61 MiB | 114, 29 MiB | +7 % usados, +6 % bytes | 41 s | 2,5 s | 149 / 916 MiB | 32 MiB |
+| un repositorio Java | 84, 21 MiB | 111, 41 MiB | 84, 21 MiB | +0 % usados, −1 % bytes | 30 s | 1,7 s | 141 / 744 MiB | 27 MiB |
+| un repositorio Python | 25, 6,5 MiB | 31, 13 MiB | 27, 6,8 MiB | +8 % usados, +4 % bytes | 3 s | 0,6 s | 95 / 151 MiB | 7 MiB |
+| un repositorio Java grande | 480, 153 MiB | 753, 286 MiB | 522, 131 MiB | +9 % usados, −14 % bytes | 301 s | 7,3 s | 370 / 1 050 MiB | 157 MiB |
+| un workspace Angular | 281, 83 MiB | 450, 171 MiB | 308, 77 MiB | +10 % usados, −8 % bytes | 227 s | 5,0 s | 276 / 926 MiB | 91 MiB |
 
-La mayor parte del tiempo es reconstruir el índice HNSW (≈45 %) y el BM25
-(≈25 %); copiar las filas, ≈20 %; verificar la copia, menos del 10 %.
+"Paso completo" es lo que espera la persona: el `--full` por el servidor
+(97,6–100 % de los chunks reusados), pararlo y la compactación. Reconstruir el
+índice HNSW es alrededor del 60 % de la compactación y copiar las filas
+alrededor del 25 %; estos índices no tienen índice BM25 (`fts: false`), cuya
+reconstrucción suma alrededor de un cuarto más (TASK-018). La compactación
+conserva `graph_edges` fila por fila (0 filas distintas, `EXCEPT ALL`, en los
+cinco).
 
 **Cuándo corre sola.** Solo al terminar un `devctx index --full` (o cada
 proyecto de `devctx reindex --full`) que no se canceló y dejó la nota debida, y

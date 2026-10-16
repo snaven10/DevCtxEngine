@@ -265,7 +265,7 @@ Resumen; detalle y alternativas en [`PLAN-009-design.md`](./PLAN-009-design.md).
 | TASK-016 | Verificación de campo contra §6 (medición sobre el candidato sin compactación) | — (orquestador, con aprobación del usuario) | TASK-015 | `done` |
 | TASK-017 | Dispatch por interfaz en `impact_analysis` (y `traverse`): override-equivalentes vía `implements`/`inherits`, `medium`, `via: "dispatch"` | general-purpose (Rust) | TASK-009 | `done` |
 | TASK-018 | Compactar la base una vez tras el upgrade 0.9.0 → 0.10 (copia verificada + rename atómico) y comando `devctx compact` | general-purpose (Rust) | — | `done` |
-| TASK-019 | Mediciones finales con compactación, cierre de §6, cross-check e informe (la "etapa B" separada de TASK-016) | — (orquestador, con aprobación del usuario) | TASK-018 | `pending` |
+| TASK-019 | Mediciones finales con compactación, cierre de §6, cross-check e informe (la "etapa B" separada de TASK-016) | — (orquestador, con aprobación del usuario) | TASK-018 | `done` |
 
 (La columna `Estado` va última: el parser de `plan_status` lee la columna con encabezado `Estado`.)
 
@@ -336,7 +336,7 @@ DevCtxEngine (Rust).
 | Contratos JSON de `search`, `read_symbol`, `get_references`, `impact_analysis`, `build_context` | 0.9.0 | solo cambios aditivos (`sym`, `confidence`, `via`…); tests de `mcp_tools` verdes |
 | `index --full` desde cero | DevCtxEngine 276 archivos / 4 796 chunks: 2 393 s; backend-b 216 / 3 253: 2 489 s; Legacy 62 / 312: 572 s — **con la máquina a carga 50-125 y 3-5 índices a la vez: NO comparables**; BackEnd y FrontEnd no reindexados (ver Resultado) | ≤ +10 % |
 | `index --full` tras subir `EXTRACTOR_VERSION` (con TASK-002) | = desde cero | ≤ 20 % del tiempo de 0.9.0 desde cero |
-| Tamaño del DB | DevCtxEngine 28.1 MB, backend-b 21.0 MB, Legacy 6.8 MB, BackEnd 622 MB (1 623 archivos, 19 306 chunks), FrontEnd 2.34 GB (2 ramas indexadas) | ≤ +30 %. **Nota (2026-10-13):** desde cero cumple (+4-17 % en bloques usados); el **upgrade en sitio** de un índice 0.9.0 midió +46-58 % en usados y ~2× en archivo (backend-a 153 → 296 MiB), fuera de la meta. La meta vale también para el upgrade: lo resuelve TASK-018 (compactación tras el upgrade) y se re-mide en TASK-019, contra el índice 0.9.0 justo antes del `--full` en sitio |
+| Tamaño del DB | DevCtxEngine 28.1 MB, backend-b 21.0 MB, Legacy 6.8 MB, BackEnd 622 MB (1 623 archivos, 19 306 chunks), FrontEnd 2.34 GB (2 ramas indexadas) | ≤ +30 %. **Nota (2026-10-13):** desde cero cumple (+4-17 % en bloques usados); el **upgrade en sitio** de un índice 0.9.0 midió +46-58 % en usados y ~2× en archivo (backend-a 153 → 296 MiB), fuera de la meta. La meta vale también para el upgrade: lo resuelve TASK-018 (compactación tras el upgrade). **Medido en TASK-019 (2026-10-16, `dc0111f`): upgrade + compactación ×1,00–1,10 en usados y ×0,86–1,06 en bytes contra el B0 de 0.9.0, en los cinco repos: cumple** |
 | Pico de RAM al indexar (`VmHWM`, frontend) | **FrontEnd no medido** (> 25 min con la máquina cargada según PLAN-008 TASK-016; aquí la carga de 50-125 lo hizo inviable). Medido: DevCtxEngine 840 MiB, backend-b 727 MiB, Legacy 826 MiB | ≤ +200 MB |
 | Índice viejo tras actualizar | — (0.9.0 ya avisa: `extractor_stale: true` + `hint` en `status`, y `warning` en `symbol`) | `extractor_stale: true` + aviso en `index_status` y en tools de grafo; tools nuevas piden `index --full` |
 
@@ -494,31 +494,33 @@ Texto original de las preguntas:
 
 ## 13. Cierre
 
-<!-- Borrador de TASK-016 (2026-10-13): se cierra con el cross-check verde y las decisiones de abajo. -->
-- **Cerrado:** no todavía. La medición de campo está hecha (TASK-016, Resultado); faltan
-  TASK-018 (compactación tras el upgrade, decisión del 2026-10-13) y TASK-019 (re-medir tamaño y
-  tiempo con ella, cross-check y cierre): el
-  cross-check de Windows/macOS (push de `fix/plan-009-grafo`), la revisión de `fb1707c` (bug de
-  `graph_edges` con `::`) y de `e91a8b9` (criterio del gold para destinos `mod.f`), subir la
-  versión de los crates a 0.10.0 y el OK del usuario para el tag.
-- **Shipeó (candidato `e0b8937` + `fb1707c`):** grafo de símbolos (`symbols`/`edges`, 7
-  relaciones, `confidence`/`resolution`, `external`, `from_test`), resolvers Java/TS/Python/Rust/Go,
-  lookups por símbolo, `impact_analysis` por niveles con tope y dispatch por interfaz, PageRank
-  (centralidad opt-in, `w` = 0), `repo_map`, `traverse`, `skeleton`, sección `related` opt-in en
-  `build_context`, reuso de vectores por `content_hash`, rollout por `EXTRACTOR_VERSION`.
-- **Verificación (TASK-016, 5 repos, `ml-granite`, CPU):** cumplen basura 0, externos y `from_test`
-  marcados, gold 40/42 (`high` 40/40; 38/42 con el criterio viejo), ocurrencias repetidas,
-  `DraftResource` (`ctor_inject`), `tokenInterceptor`, `impact` p95 ≤ 197 ms, `external`
-  calificado, `Foo::new`, `repo_map`, híbrido ≥ base, vectorial idéntico, contratos aditivos,
-  indexado desde cero (−8,7 % en suma), upgrade 7-19 %, tamaño desde cero +4-17 %, RAM de frontend
-  +101/+139 MiB, aviso de índice viejo. **No cumplen:** `calls` sin decidir en Rust 16,0 % (≤ 15 %);
-  brief +6,7 pp en índice actualizado (+10,0 pp en uno nuevo); 5 tipos de arista en el repo Python.
-  **No medido:** `memories_by_symbol` de campo, DD-18 de grupo.
-- **Quedó afuera:** las tres filas que no cumplen (1, 3 y 15: limitaciones conocidas, decisión del
-  2026-10-13, §12); el crecimiento de la base en el upgrade en sitio (+46-58 % de bloques usados)
-  **ya no queda afuera: lo resuelve TASK-018**. Pendiente de decisión: retirar o no `graph_hops: 2`;
-  los pendientes de código anotados en el Resultado de TASK-016 (m5, m6, m9, `edge_level`, empates
-  de percentil, caché de `local_centrality`, follow-ups de la 2.ª pasada de TASK-012, métrica
-  `from_test_coherente`).
-- **Continúa en:** el plan que borre `graph_edges` y el camino viejo (DD-2, DD-19), SCIP, y los
-  pendientes post-009 (§4).
+- **Cerrado:** sí, con TASK-019 (2026-10-16), salvo el **cross-check** de Windows/macOS (lo dispara
+  el push de `fix/plan-009-grafo`; condición para el tag) y el OK del usuario para el tag. La
+  versión del workspace es `0.10.0`; el binario final se construye sobre el último commit de código
+  de la rama.
+- **Shipeó:** grafo de símbolos (`symbols`/`edges`, 7 relaciones, `confidence`/`resolution`,
+  `external`, `from_test`), resolvers Java/TS/Python/Rust/Go, lookups por símbolo,
+  `impact_analysis` por niveles con tope y dispatch por interfaz, PageRank (centralidad opt-in,
+  `w` = 0), `repo_map`, `traverse`, `skeleton`, sección `related` opt-in en `build_context`, reuso
+  de vectores por `content_hash`, rollout por `EXTRACTOR_VERSION`, la **compactación tras el
+  upgrade** y `devctx compact` (TASK-018), y un `graph_edges` **idéntico al de 0.9.0** (su
+  extracción copiada, TASK-019) para que el downgrade no pierda llamadores.
+- **Verificación:** TASK-016 (5 repos, candidato) y TASK-019 (5 repos, binario final): basura 0,
+  externos y `from_test` marcados, gold 40/42 (`high` 40/40), `impact` p95 ≤ 132 ms, híbrido 23/30
+  (MRR 0,647), vectorial idéntico, contratos aditivos, indexado desde cero −8,7 %, upgrade +
+  compactación ×1,00–1,10 usados (≤ 1,30), downgrade con `graph_edges` idéntico (EXCEPT ALL 0/0) y
+  0 llamadores perdidos en 336 consultas, memorias intactas en upgrade/downgrade/restauración, MCP
+  durante la compactación ("retry" y entra), lock en ext4 y v9fs. **Limitaciones aceptadas
+  (2026-10-13):** 5 tipos de arista en Python, 16,0 % de `calls` sin decidir en Rust, brief +6,7 pp
+  en un índice actualizado.
+- **Bugs que salieron en el cierre y se arreglaron:** llamadores perdidos en el downgrade
+  (`01dffb6`, `fa91a08`, reemplazados por `dc0111f`); referencias huérfanas de memorias que el
+  restore duplicaba (`d3258a9`, preexistente desde 0.9.0).
+- **Quedó afuera / sigue en otro plan:** limpieza de referencias huérfanas existentes (candidata,
+  PLAN-010 TASK-012); crecimiento de la base con el uso normal (PLAN-010 TASK-012); retirar o no
+  `graph_hops: 2`; los pendientes de código del Resultado de TASK-016 (m5, m6, m9, `edge_level`,
+  empates de percentil, caché de `local_centrality`, follow-ups de la 2.ª pasada de TASK-012,
+  métrica `from_test_coherente`); el test intermitente
+  `search_shapes_cli::group_search_keeps_the_hits_of_a_member_answered_from_a_fallback_branch`
+  (1 fallo, después 5/5 dos veces). **Continúa en:** el plan que borre `graph_edges` y el camino
+  viejo (DD-2, DD-19), SCIP, y los pendientes post-009 (§4).
