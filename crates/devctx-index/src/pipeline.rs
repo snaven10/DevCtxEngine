@@ -1473,18 +1473,17 @@ impl Ctx<'_> {
         parsed: &devctx_parse::ParsedFile,
         content_hash: &str,
     ) -> devctx_store::Result<()> {
+        // `graph_edges` is what a downgraded 0.9.0 reads, by name, with the
+        // walk it always had: its rows are 0.9.0's own, written by 0.9.0's
+        // extraction over this tree (`devctx_parse::legacy_v090`), so that
+        // walk finds every caller the 0.9.0 original found (PLAN-009
+        // TASK-019). The symbol graph lives in `symbols`/`edges`.
         let edges: Vec<StoredEdge> = parsed
-            .edges
+            .legacy_edges
             .iter()
             .map(|e| StoredEdge {
-                // `graph_edges` is what a downgraded 0.9.0 reads. It expands
-                // only the name asked for and then walks by exact name, so a
-                // row must name both ends as 0.9.0 did or its walk stops
-                // there (PLAN-009 TASK-016/TASK-019). The source is the one
-                // 0.9.0 gave the call (`GraphEdge::legacy_source`: the method
-                // around an arrow, `Deeper.deep`, `helper` in `mod tests`).
-                source: e.legacy_source.clone().unwrap_or_else(|| e.source.clone()),
-                target: legacy_target(e),
+                source: e.source.clone(),
+                target: e.target.clone(),
                 kind: e.kind.clone(),
                 source_file: file.to_string(),
                 line: e.line as i32,
@@ -1513,22 +1512,6 @@ impl Ctx<'_> {
             .collect();
         self.store
             .replace_file_routes(self.repo_short, self.branch, file, &routes, &now_stamp())
-    }
-}
-
-/// The target of a `graph_edges` row, as 0.9.0 wrote it: the parser's
-/// `legacy_target` where 0.9.0 typed by another rule (Go), else the target. A
-/// Rust call through a module path is its last segment
-/// (`crate::util::helper()` → `helper`, the name the function has as a
-/// source); the extractor keeps the path since PLAN-009. A call through a type
-/// is already `Type.method`, the method's source.
-fn legacy_target(e: &devctx_parse::GraphEdge) -> String {
-    if let Some(t) = &e.legacy_target {
-        return t.clone();
-    }
-    match e.target.rsplit_once("::") {
-        Some((_, last)) => last.to_string(),
-        None => e.target.clone(),
     }
 }
 

@@ -4351,23 +4351,12 @@ public class A extends B implements C {
     }
 
     /// What a downgraded 0.9.0 finds in `graph_edges` for every shape of a
-    /// Rust path call. 0.9.0 expands only the name asked for (`= name` or a
-    /// `.name` suffix) and then walks by exact name; it wrote every path
-    /// call as its last segment (measured with the v0.9.0 binary on this
-    /// fixture, PLAN-009 TASK-016: `helper`, `open`, `new`, `m`, `Variant`).
-    ///
-    /// - A **module** path (`crate::util::helper()`, `util::helper()`) is
-    ///   written the same way, `helper`: it is the name the free function has
-    ///   as a source, so the walk goes on. The path the extractor keeps since
-    ///   PLAN-009 (`crate::util::helper`) hid the caller, and
-    ///   `crate.util.helper` cut the walk one level later.
-    /// - A path through a **type** (`Store::open`, `store::Store::open`,
-    ///   `crate::store::Store::open`, `Self::new`, `Kind::Variant`,
-    ///   `Vec::<u8>::new`) is `Type.name`, not 0.9.0's bare name: the bare
-    ///   name still finds it by suffix, and `Store.open` is the method's
-    ///   source, so the walk now passes through it where 0.9.0's own rows
-    ///   stopped (`open` was no source).
-    /// - `<T as Trait>::m()` stays `m`, as in 0.9.0.
+    /// Rust path call: what the v0.9.0 binary wrote and answered on this same
+    /// fixture (PLAN-009 TASK-019) — every path call by its last segment
+    /// (`helper`, `open`, `new`, `m`, `Variant`), so the walk through
+    /// `Store.open` stops where 0.9.0's stopped (`open` is no source). The
+    /// table is 0.9.0's own extraction (`devctx_parse::legacy_v090`); the
+    /// golden of every language is `devctx-parse/tests/legacy_v090.rs`.
     #[test]
     fn rust_path_calls_stay_walkable_by_0_9_0() {
         let (dir, repo) = graph_repo(
@@ -4392,9 +4381,6 @@ public class A extends B implements C {
             ("helper", 1),
             ("mod_crate", 2),
             ("mod_rel", 2),
-            ("type_crate", 2),
-            ("type_mod", 2),
-            ("type_used", 2),
         ]
         .iter()
         .map(|(n, d)| (n.to_string(), *d))
@@ -4425,8 +4411,7 @@ public class A extends B implements C {
         assert_eq!(callers("new"), ["Svc.by_self", "turbofish"]);
         assert_eq!(callers("m"), ["ufcs"]);
         assert_eq!(callers("Variant"), ["variant"]);
-        // What is stored, pinned: the extractor's golden shows the path
-        // (`store::open`), `graph_edges` holds these rows.
+        // What is stored, pinned: the rows of the v0.9.0 binary.
         let old = store.graph_edges(&repo, "main", None, None, 0).unwrap();
         let mut rows: Vec<(&str, &str)> = old
             .iter()
@@ -4437,32 +4422,31 @@ public class A extends B implements C {
             rows,
             vec![
                 ("Store.open", "leaf"),
-                ("Svc.by_self", "Svc.new"),
+                ("Svc.by_self", "new"),
                 ("helper", "leaf"),
                 ("mod_crate", "helper"),
                 ("mod_rel", "helper"),
-                ("turbofish", "Vec.new"),
-                ("type_crate", "Store.open"),
-                ("type_mod", "Store.open"),
-                ("type_used", "Store.open"),
+                ("turbofish", "new"),
+                ("type_crate", "open"),
+                ("type_mod", "open"),
+                ("type_used", "open"),
                 ("ufcs", "m"),
-                ("variant", "Kind.Variant"),
+                ("variant", "Variant"),
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A caller nested in another symbol keeps, in `graph_edges`, the source
-    /// name 0.9.0 gave it: its innermost container and its name
-    /// (`Deeper.deep`, `C.f`), or the bare name (`inner`, a Rust `helper` in
-    /// `mod tests`) — never the qualified name the symbol graph uses
-    /// (`Outer.Testable.Deeper.deep`, `outer.inner`, `tests.helper`). 0.9.0
-    /// walks by exact name, and a call names its callee the 0.9.0 way
-    /// (`t.invoke()` → `Testable.invoke`), so a longer source cut the walk
-    /// there: a downgraded 0.9.0 lost the callers 0.9.0 found (PLAN-009
-    /// TASK-019, a test helper in a nested class of a Java repository, at
-    /// depth 2). The rows below are what the v0.9.0 binary wrote for this
-    /// fixture.
+    /// A caller nested in another symbol is written in `graph_edges` as 0.9.0
+    /// wrote it — its innermost container and its name (`Deeper.deep`,
+    /// `C.f`), or the bare name (`inner`, a Rust `helper` in `mod tests`) —
+    /// never the qualified name the symbol graph uses
+    /// (`Outer.Testable.Deeper.deep`, `outer.inner`, `tests.helper`), which cut
+    /// a downgraded 0.9.0's walk by exact name and lost the callers 0.9.0
+    /// found (PLAN-009 TASK-019, a test helper in a nested class of a Java
+    /// repository, at depth 2). The rows below are what the v0.9.0 binary
+    /// wrote for this fixture; the table is 0.9.0's own extraction
+    /// (`devctx_parse::legacy_v090`).
     #[test]
     fn nested_callers_stay_walkable_by_0_9_0() {
         let (dir, repo) = graph_repo(
@@ -4539,25 +4523,23 @@ public class A extends B implements C {
     }
 
     /// The callables 0.10 made symbols and 0.9.0 did not source a call from,
-    /// and the Go targets 0.9.0 typed by its own rule, against what the v0.9.0
-    /// binary wrote for this fixture (PLAN-009 TASK-019):
+    /// and the targets 0.9.0 typed by its own rules, against what the v0.9.0
+    /// binary wrote and answered for this fixture (PLAN-009 TASK-019):
     ///
     /// - an arrow, a function expression and a named function expression
     ///   bound to a `const` in a TS method: 0.9.0 gave the call to the method;
+    ///   a class field arrow has no function around it and no row;
     /// - a Java lambda and anonymous class, a Rust closure and nested `fn`, a
-    ///   Python lambda, a Go function literal: unchanged;
+    ///   Python lambda, a Go function literal;
     /// - Go: a call into another package of the repository (`store.Open()` →
     ///   `Open`), a method expression (`Val.Get(v)` → `Val.Get`), a method on
     ///   a pointer parameter (`Handle`) and on a value parameter
     ///   (`Server.Handle`) — 0.9.0's map is file-wide, so once `s Server` is
-    ///   declared anywhere every `s.Handle()` of the file is `Server.Handle`.
+    ///   declared anywhere every `s.Handle()` of the file is `Server.Handle`;
+    /// - Java `s.get()` on a `Supplier<Integer> s`: `get`, untyped.
     ///
-    /// Every row the v0.9.0 binary wrote is here, source and target, line by
-    /// line, but for the two Java calls 0.10 types through the declared
-    /// interface (`Supplier.get` for 0.9.0's `get`: an external callee, no
-    /// walk goes through it); a class field arrow had no row in 0.9.0 (no
-    /// function around it) and keeps its own. And `impact_analysis` (0.9.0's
-    /// reader) at depth 3 finds every caller the v0.9.0 binary found.
+    /// The table is exactly the binary's rows, and `impact_analysis` (0.9.0's
+    /// reader) at depth 3 answers exactly what the binary answered.
     #[test]
     fn callables_0_9_0_did_not_source_stay_walkable_by_0_9_0() {
         let (dir, repo) = graph_repo(
@@ -4628,22 +4610,21 @@ public class A extends B implements C {
             ("svc.ts", 47, "C.run2", "C.m2"),
             ("svc.ts", 51, "C.run3", "C.m3"),
         ];
-        let typed_by_0_10 = [
-            ("src/main/java/p/Lam.java", 8),
-            ("src/main/java/p/Lam.java", 18),
-        ];
-        for (file, line, source, target) in v090 {
-            let here: Vec<(&str, &str)> = old
-                .iter()
-                .filter(|e| e.source_file == *file && e.line == *line)
-                .map(|e| (e.source.as_str(), e.target.as_str()))
-                .collect();
-            assert_eq!(here.len(), 1, "{file}:{line} in {old:?}");
-            assert_eq!(here[0].0, *source, "{file}:{line}");
-            if !typed_by_0_10.contains(&(*file, *line)) {
-                assert_eq!(here[0].1, *target, "{file}:{line}");
-            }
-        }
+        let mut got: Vec<(&str, i32, &str, &str)> = old
+            .iter()
+            .map(|e| {
+                (
+                    e.source_file.as_str(),
+                    e.line,
+                    e.source.as_str(),
+                    e.target.as_str(),
+                )
+            })
+            .collect();
+        got.sort();
+        let mut want = v090.to_vec();
+        want.sort();
+        assert_eq!(got, want);
         // `devctx impact <seed> --depth 3` of the v0.9.0 binary.
         for (seed, callers) in [
             (
@@ -4686,17 +4667,69 @@ public class A extends B implements C {
             ),
             ("calc", &[("Lam.get", 1), ("Lam.withLambda", 1)][..]),
         ] {
-            let got = store
+            let mut got = store
                 .impact_analysis(&repo, "main", seed, 3)
                 .unwrap()
                 .upstream;
-            for (name, depth) in callers {
-                assert!(
-                    got.contains(&(name.to_string(), *depth)),
-                    "{seed}: {name} at {depth} not in {got:?}"
-                );
-            }
+            got.sort();
+            let mut want: Vec<(String, usize)> = callers
+                .iter()
+                .map(|(n, d)| (n.to_string(), *d as usize))
+                .collect();
+            want.sort();
+            assert_eq!(got, want, "{seed}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `graph_edges` after an incremental run is what a full run of the same
+    /// commit writes, row for row: an edited file's rows replaced, a deleted
+    /// file's gone, a renamed file's under the new path and no longer under
+    /// the old one (PLAN-009 TASK-019; the table is written and dropped per
+    /// file, so a stale row would survive only here).
+    #[test]
+    fn graph_edges_after_an_incremental_run_equal_a_full_run() {
+        let (dir, repo) = graph_repo(
+            "compat_incremental",
+            &[
+                ("a.py", "def leaf():\n    return 1\n\n\ndef top():\n    return leaf()\n"),
+                ("b.py", "from a import leaf\n\n\nclass Svc:\n    def run(self):\n        return leaf()\n"),
+                ("c.py", "from a import top\n\n\ndef gone():\n    return top()\n"),
+                ("d.py", "from a import leaf\n\n\ndef moved():\n    return leaf()\n"),
+            ],
+        );
+        let rows = |store: &Store| -> Vec<(String, String, String, String, i32)> {
+            let mut v: Vec<_> = store
+                .graph_edges(&repo, "main", None, None, 0)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.source_file, e.source, e.target, e.kind, e.line))
+                .collect();
+            v.sort();
+            v
+        };
+        let inc = Store::open_in_memory(DIM).unwrap();
+        index_branch(&inc, &dir, "main", true);
+        let before = rows(&inc);
+        assert!(before.iter().any(|r| r.0 == "c.py"), "{before:?}");
+        write(
+            &dir,
+            "b.py",
+            "from a import leaf, top\n\n\nclass Svc:\n    def run(self):\n        return top()\n\n    def again(self):\n        return self.run()\n",
+        );
+        git(&dir, &["rm", "-q", "c.py"]);
+        git(&dir, &["mv", "d.py", "e.py"]);
+        commit_all(&dir, "edit, delete, rename");
+        index_branch(&inc, &dir, "main", false);
+        let incremental = rows(&inc);
+        let full = Store::open_in_memory(DIM).unwrap();
+        index_branch(&full, &dir, "main", true);
+        assert_eq!(incremental, rows(&full));
+        assert!(incremental.iter().all(|r| r.0 != "c.py" && r.0 != "d.py"));
+        assert!(incremental.iter().any(|r| r.0 == "e.py" && r.1 == "moved"));
+        assert!(incremental
+            .iter()
+            .any(|r| r.0 == "b.py" && r.1 == "Svc.again" && r.2 == "Svc.run"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

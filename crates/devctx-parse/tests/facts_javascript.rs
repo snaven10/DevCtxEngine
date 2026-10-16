@@ -34,7 +34,7 @@ fn javascript_arrow_consts_fields_and_constructors() {
 
 /// `exports.handler = function () {…}` and `this.onTick = () => …` bind no
 /// symbol: their calls are the module's and the constructor's, in
-/// `graph_edges` as well as in `edges`.
+/// the call edges (`GraphEdge`) as well as in `edges`.
 #[test]
 fn javascript_assignments_bind_no_graph_source() {
     let pf = facts(Lang::javascript(), "javascript/app.js", "web/app.js");

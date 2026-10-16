@@ -1,0 +1,435 @@
+# graph_edges que escribió el binario v0.9.0 (tag v0.9.0 = commit fdc7dd21cb617e257e3a79b1a9cfd5fb086b8524,
+# devctx-0.9.0 sha256 715d42c231c23f93eb1cb7cea96e43ed99f0b0e40043d6401df386f8d91fb9b2) al indexar
+# crates/devctx-parse/tests/fixtures/ como raíz de un repositorio (PLAN-009 TASK-019). Columnas de la tabla:
+# source, target, kind, source_file, target_file, line, repo, branch, metadata; target_file y metadata vacíos en todas las filas (0 distintas), repo y branch
+# los del índice. Abajo: `file` por cada archivo de código que indexó, y una fila por arista:
+# source_file, line, source, target, kind (orden de la tabla tras ORDER BY). Regenerar: ver legacy_v090.rs (test).
+file	go/link/lib/util2/do.go
+file	go/link/server/helpers.go
+file	go/link/server/locked.go
+file	go/link/server/review.go
+file	go/link/server/server.go
+file	go/link/store/platform_linux.go
+file	go/link/store/platform_windows.go
+file	go/link/store/store.go
+file	go/server.go
+file	java/OrderService.java
+file	java/link/src/main/java/com/example/app/entity/Office.java
+file	java/link/src/main/java/com/example/app/resource/AuditHelper.java
+file	java/link/src/main/java/com/example/app/resource/AuditUtil.java
+file	java/link/src/main/java/com/example/app/resource/Cases.java
+file	java/link/src/main/java/com/example/app/resource/DraftResource.java
+file	java/link/src/main/java/com/example/app/resource/Reports.java
+file	java/link/src/main/java/com/example/app/service/AlphaService.java
+file	java/link/src/main/java/com/example/app/service/BetaService.java
+file	java/link/src/main/java/com/example/app/service/GammaService.java
+file	javascript/app.js
+file	legacy_v090/go/fx.go
+file	legacy_v090/go/store/store.go
+file	legacy_v090/java/p/Lam.java
+file	legacy_v090/java/p/Outer.java
+file	legacy_v090/java/p/Svc.java
+file	legacy_v090/java/p/Typed.java
+file	legacy_v090/javascript/app.js
+file	legacy_v090/python/forms.py
+file	legacy_v090/python/nested.py
+file	legacy_v090/rust/forms.rs
+file	legacy_v090/rust/nested.rs
+file	legacy_v090/rust/paths.rs
+file	legacy_v090/ts/svc.ts
+file	python/link/calendar/__init__.py
+file	python/link/shop/__init__.py
+file	python/link/shop/compat.py
+file	python/link/shop/lookup.py
+file	python/link/shop/mix.py
+file	python/link/shop/repo.py
+file	python/link/shop/service.py
+file	python/link/shop/special.py
+file	python/link/shop/sub/__init__.py
+file	python/link/shop/sub/deep.py
+file	python/link/shop/typing_forms.py
+file	python/link/shop/yaml.py
+file	python/link/tools/cal.py
+file	python/link/tools/forms.py
+file	python/link/tools/helpers.py
+file	python/link/tools/mixed.py
+file	python/link/tools/run.py
+file	python/link/tools/typing_use.py
+file	python/link/types/index.ts
+file	python/link/utils.py
+file	python/orders.py
+file	rust/cache.rs
+file	rust/inline_tests.rs
+file	rust/link/crates/app/src/extra.rs
+file	rust/link/crates/app/src/main.rs
+file	rust/link/crates/app/src/review.rs
+file	rust/link/crates/app/src/util.rs
+file	rust/link/crates/orphan/src/lib.rs
+file	rust/link/crates/store/src/failure.rs
+file	rust/link/crates/store/src/helpers.rs
+file	rust/link/crates/store/src/lib.rs
+file	rust/link/crates/store/src/ops.rs
+file	rust/link/crates/store/src/store.rs
+file	rust/link/crates/store/tests/common/mod.rs
+file	rust/link/crates/store/tests/it.rs
+file	rust/link/crates/utils/src/lib.rs
+file	ts-dispatch/api.ts
+file	ts-dispatch/svc.ts
+file	ts/apps/legacy/helpers.js
+file	ts/apps/legacy/main.js
+file	ts/apps/shell/src/app/blocks.ts
+file	ts/apps/shell/src/app/data.component.ts
+file	ts/apps/shell/src/app/local-inject.ts
+file	ts/apps/shell/src/app/login.component.ts
+file	ts/apps/shell/src/app/mixed.ts
+file	ts/apps/shell/src/app/store.ts
+file	ts/apps/shell/src/app/use-mixed.ts
+file	ts/apps/shell/src/app/use-package.ts
+file	ts/apps/shell/src/app/use-util.ts
+file	ts/apps/shell/src/app/util.ts
+file	ts/libs/auth-data/src/index.ts
+file	ts/libs/auth-data/src/lib/services/auth.service.ts
+file	ts/libs/auth/src/index.ts
+file	ts/libs/auth/src/lib/providers/token.interceptor.ts
+file	ts/libs/auth/src/lib/services/auth.service.ts
+file	tsx/Button.tsx
+file	typescript/token.interceptor.ts
+go/link/server/locked.go	11	Go	Close	calls
+go/link/server/locked.go	15	Closer	Shutdown	calls
+go/link/server/review.go	9	Review	Platform	calls
+go/link/server/review.go	10	Review	Do	calls
+go/link/server/review.go	11	Review	NewServer	calls
+go/link/server/review.go	13	Review	Error	calls
+go/link/server/review.go	16	Review	helper	calls
+go/link/server/review.go	22	Add	helper	calls
+go/link/server/server.go	22	Handle	Println	calls
+go/link/server/server.go	23	Handle	helper	calls
+go/link/server/server.go	24	Handle	Get	calls
+go/link/server/server.go	25	Handle	NewServer	calls
+go/link/server/server.go	27	Handle	New	calls
+go/link/server/server.go	31	Handle	WithContext	calls
+go/link/server/server.go	35	Handle	f	calls
+go/link/server/server.go	36	Handle	other	calls
+go/link/server/server.go	37	Handle	len	calls
+go/server.go	27	Handle	Println	calls
+go/server.go	28	Handle	helper	calls
+java/OrderService.java	17	OrderService.OrderService	init	calls
+java/OrderService.java	22	OrderService.find	OrderRepository.findById	calls
+java/OrderService.java	36	OrderService.run	flush	calls
+java/link/src/main/java/com/example/app/entity/Office.java	11	Office.findByCode	find	calls
+java/link/src/main/java/com/example/app/entity/Office.java	11	Office.findByCode	firstResult	calls
+java/link/src/main/java/com/example/app/entity/Office.java	15	Office.normalize	String.trim	calls
+java/link/src/main/java/com/example/app/resource/AuditUtil.java	5	AuditUtil.toJson	String.valueOf	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	31	Cases.members	rename	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	32	Cases.members	port	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	33	Cases.members	of	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	37	Cases.afterExternal	get	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	37	Cases.afterExternal	getOffice	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	38	Cases.afterExternal	rename	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	39	Cases.afterExternal	map	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	39	Cases.afterExternal	orElseThrow	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	43	Cases.shadowed	AlphaService.findPaginated	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	43	Cases.shadowed	Office.rename	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	43	Cases.shadowed	forEach	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	45	Cases.shadowed	rename	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	50	Cases.escalation	Holder.getOffice	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	50	Cases.escalation	rename	calls
+java/link/src/main/java/com/example/app/resource/Cases.java	51	Cases.escalation	Office.rename	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	26	AlphaServiceAdapter.page	AlphaService.findPaginated	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	34	BetaServiceAdapter.page	AlphaService.findPaginated	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	42	GammaServiceAdapter.page	AlphaService.findPaginated	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	51	DraftResource.query	EntityManager.createQuery	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	52	DraftResource.query	var.setParameter	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	54	DraftResource.query	var.rename	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	58	DraftResource.log	LOG.info	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	62	DraftResource.audit	AuditHelper.record	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	66	DraftResource.imported	AuditUtil.toJson	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	67	DraftResource.imported	Office.normalize	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	71	DraftResource.find	Office.findByCode	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	71	DraftResource.find	flatMap	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	71	DraftResource.find	persist	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	75	DraftResource.listing	Office.listAll	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	75	DraftResource.listing	map	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	79	DraftResource.byId	Office.findById	calls
+java/link/src/main/java/com/example/app/resource/DraftResource.java	83	DraftResource.loop	rename	calls
+java/link/src/main/java/com/example/app/resource/Reports.java	15	Reports.check	Row.getLabel	calls
+java/link/src/main/java/com/example/app/resource/Reports.java	15	Reports.check	assertEquals	calls
+java/link/src/main/java/com/example/app/resource/Reports.java	16	Reports.check	forEach	calls
+java/link/src/main/java/com/example/app/resource/Reports.java	16	Reports.check	toString	calls
+java/link/src/main/java/com/example/app/resource/Reports.java	17	Reports.check	equals	calls
+java/link/src/main/java/com/example/app/service/AlphaService.java	7	AlphaService.findPaginated	List.of	calls
+java/link/src/main/java/com/example/app/service/BetaService.java	7	BetaService.findPaginated	List.of	calls
+java/link/src/main/java/com/example/app/service/GammaService.java	7	GammaService.findPaginated	List.of	calls
+javascript/app.js	9	boot	start	calls
+javascript/app.js	16	App.constructor	App.tick	calls
+javascript/app.js	20	App.run	boot	calls
+legacy_v090/go/fx.go	11	WithLiteral	Leaf	calls
+legacy_v090/go/fx.go	13	WithLiteral	f	calls
+legacy_v090/go/fx.go	17	RunLiteral	WithLiteral	calls
+legacy_v090/go/fx.go	23	Handle	Leaf	calls
+legacy_v090/go/fx.go	27	RunHandle	Server.Handle	calls
+legacy_v090/go/fx.go	31	RunStore	Open	calls
+legacy_v090/go/fx.go	37	Get	Leaf	calls
+legacy_v090/go/fx.go	41	ViaExpr	Val.Get	calls
+legacy_v090/go/fx.go	45	RunViaExpr	ViaExpr	calls
+legacy_v090/go/fx.go	49	ViaValue	Server.Handle	calls
+legacy_v090/go/fx.go	53	RunViaValue	ViaValue	calls
+legacy_v090/go/store/store.go	8	Open	Base	calls
+legacy_v090/java/p/Lam.java	7	Lam.withLambda	Svc.calc	calls
+legacy_v090/java/p/Lam.java	8	Lam.withLambda	get	calls
+legacy_v090/java/p/Lam.java	15	Lam.get	Svc.calc	calls
+legacy_v090/java/p/Lam.java	18	Lam.withAnon	get	calls
+legacy_v090/java/p/Lam.java	22	Lam.runLambda	withLambda	calls
+legacy_v090/java/p/Lam.java	26	Lam.runAnon	withAnon	calls
+legacy_v090/java/p/Outer.java	6	Testable.invoke	Svc.calc	calls
+legacy_v090/java/p/Outer.java	10	Testable.again	Testable.invoke	calls
+legacy_v090/java/p/Outer.java	15	Deeper.deep	Svc.calc	calls
+legacy_v090/java/p/Outer.java	22	Outer.run	Testable.invoke	calls
+legacy_v090/java/p/Outer.java	27	Outer.runDeep	deep	calls
+legacy_v090/java/p/Typed.java	10	Typed.byFullName	load	calls
+legacy_v090/java/p/Typed.java	14	Typed.byPlainName	Store.load	calls
+legacy_v090/java/p/Typed.java	19	Typed.byLocal	Store.load	calls
+legacy_v090/java/p/Typed.java	23	Typed.byParam	Store.load	calls
+legacy_v090/java/p/Typed.java	27	Typed.byThisField	Store.load	calls
+legacy_v090/java/p/Typed.java	31	Typed.chained	get	calls
+legacy_v090/java/p/Typed.java	31	Typed.chained	load	calls
+legacy_v090/java/p/Typed.java	36	Inner.viaOuterName	Store.load	calls
+legacy_v090/javascript/app.js	7	Widget.render	leaf	calls
+legacy_v090/javascript/app.js	8	Widget.render	Widget.paint	calls
+legacy_v090/javascript/app.js	8	Widget.render	cb	calls
+legacy_v090/javascript/app.js	12	Widget.paint	draw	calls
+legacy_v090/javascript/app.js	18	inner	leaf	calls
+legacy_v090/javascript/app.js	20	outer	inner	calls
+legacy_v090/python/forms.py	6	with_lambda	leaf	calls
+legacy_v090/python/forms.py	7	with_lambda	f	calls
+legacy_v090/python/forms.py	11	run_lambda	with_lambda	calls
+legacy_v090/python/forms.py	16	K.m	leaf	calls
+legacy_v090/python/forms.py	17	K.m	g	calls
+legacy_v090/python/forms.py	20	K.run	K.m	calls
+legacy_v090/python/nested.py	4	C.f	leaf	calls
+legacy_v090/python/nested.py	5	C.m	f	calls
+legacy_v090/python/nested.py	10	inner	leaf	calls
+legacy_v090/python/nested.py	11	outer	inner	calls
+legacy_v090/rust/forms.rs	6	with_closure	leaf	calls
+legacy_v090/rust/forms.rs	7	with_closure	c	calls
+legacy_v090/rust/forms.rs	12	inner	leaf	calls
+legacy_v090/rust/forms.rs	14	outer	inner	calls
+legacy_v090/rust/forms.rs	18	run_closure	with_closure	calls
+legacy_v090/rust/forms.rs	22	run_outer	outer	calls
+legacy_v090/rust/nested.rs	4	top	leaf2	calls
+legacy_v090/rust/nested.rs	10	helper	leaf2	calls
+legacy_v090/rust/nested.rs	15	t	helper	calls
+legacy_v090/rust/paths.rs	14	Svc.by_self	new	calls
+legacy_v090/rust/paths.rs	19	mod_crate	helper	calls
+legacy_v090/rust/paths.rs	23	type_used	open	calls
+legacy_v090/rust/paths.rs	27	turbofish	new	calls
+legacy_v090/rust/paths.rs	36	Cached<T>.touch	Cached<T>.read	calls
+legacy_v090/rust/paths.rs	40	Cached<T>.read	T.clone	calls
+legacy_v090/rust/paths.rs	50	Guard<'a>.drop	Guard<'a>.release	calls
+legacy_v090/rust/paths.rs	56	Guard<'_>.release	helper	calls
+legacy_v090/rust/paths.rs	61	typed	Store.reopen	calls
+legacy_v090/ts/svc.ts	9	C.m	leaf	calls
+legacy_v090/ts/svc.ts	10	C.m	cb	calls
+legacy_v090/ts/svc.ts	15	C.m2	leaf	calls
+legacy_v090/ts/svc.ts	17	C.m2	fe	calls
+legacy_v090/ts/svc.ts	22	C.inner	leaf	calls
+legacy_v090/ts/svc.ts	24	C.m3	inner	calls
+legacy_v090/ts/svc.ts	29	C.m4	leaf	calls
+legacy_v090/ts/svc.ts	31	C.m4	fe2	calls
+legacy_v090/ts/svc.ts	35	C.run	C.m	calls
+legacy_v090/ts/svc.ts	39	C.run4	C.m4	calls
+legacy_v090/ts/svc.ts	43	C.runField	C.field	calls
+legacy_v090/ts/svc.ts	47	C.run2	C.m2	calls
+legacy_v090/ts/svc.ts	51	C.run3	C.m3	calls
+python/link/shop/compat.py	8	build	Store	calls
+python/link/shop/compat.py	21	use	decorated	calls
+python/link/shop/repo.py	6	Repo.load	Item	calls
+python/link/shop/service.py	22	Service.__init__	Repo	calls
+python/link/shop/service.py	27	Service.run	helper	calls
+python/link/shop/service.py	29	Service.run	Repo.save	calls
+python/link/shop/service.py	30	Service.run	save	calls
+python/link/shop/service.py	31	Service.run	lookup_id	calls
+python/link/shop/service.py	32	Service.run	len	calls
+python/link/shop/service.py	33	Service.run	dict.get	calls
+python/link/shop/service.py	34	Service.run	join	calls
+python/link/shop/service.py	35	Service.run	safe_load	calls
+python/link/shop/service.py	36	Service.run	get	calls
+python/link/shop/service.py	37	Service.run	info	calls
+python/link/shop/service.py	38	Service.run	warning	calls
+python/link/shop/service.py	39	Service.run	strip	calls
+python/link/shop/service.py	40	Service.run	cb	calls
+python/link/shop/service.py	41	Service.run	ghost	calls
+python/link/shop/service.py	42	Service.run	thing	calls
+python/link/shop/service.py	43	Service.run	Repo	calls
+python/link/shop/service.py	43	Service.run	load	calls
+python/link/shop/service.py	43	Service.run	price	calls
+python/link/shop/service.py	44	Service.run	Service.again	calls
+python/link/shop/service.py	50	Service.chained	Repo.load	calls
+python/link/shop/service.py	51	Service.chained	price	calls
+python/link/shop/service.py	54	Service.shadow	Repo.save	calls
+python/link/shop/service.py	56	Service.shadow	save	calls
+python/link/shop/service.py	62	Plain.__init__	Repo	calls
+python/link/shop/service.py	65	Plain.go	Repo.save	calls
+python/link/shop/service.py	69	make	Repo	calls
+python/link/shop/special.py	7	Special.save	save	calls
+python/link/shop/special.py	7	Special.save	super	calls
+python/link/shop/special.py	8	Special.save	Special.load	calls
+python/link/shop/special.py	9	Special.save	lookup_id	calls
+python/link/shop/special.py	14	Failure.go	Failure.with_traceback	calls
+python/link/shop/special.py	20	first	inner	calls
+python/link/shop/special.py	26	second	inner	calls
+python/link/shop/sub/deep.py	6	make	Repo	calls
+python/link/shop/sub/deep.py	7	make	ghost2	calls
+python/link/shop/typing_forms.py	9	anything	Any.save	calls
+python/link/shop/typing_forms.py	13	either	object.save	calls
+python/link/shop/typing_forms.py	17	obj	object.save	calls
+python/link/shop/typing_forms.py	21	generic	object.save	calls
+python/link/shop/typing_forms.py	25	klass	load	calls
+python/link/shop/typing_forms.py	36	Builder.go	Builder.fluent	calls
+python/link/shop/typing_forms.py	36	Builder.go	done	calls
+python/link/tools/forms.py	6	go	Repo	calls
+python/link/tools/forms.py	7	go	Item	calls
+python/link/tools/mixed.py	5	use_mixed	thing2	calls
+python/orders.py	14	OrderService.find	Repo.get	calls
+python/orders.py	18	OrderService.step	audit	calls
+python/orders.py	19	OrderService._hidden	step	calls
+python/orders.py	24	wrapper	record	calls
+python/orders.py	25	wrapper	f	calls
+python/orders.py	30	main	OrderService	calls
+python/orders.py	30	main	find	calls
+rust/cache.rs	22	Cached<T>.new	build	calls
+rust/cache.rs	27	Cached<T>.tag	mark	calls
+rust/cache.rs	35	Cached<T>.name	bar	calls
+rust/cache.rs	36	Cached<T>.name	open	calls
+rust/cache.rs	37	Cached<T>.name	new	calls
+rust/inline_tests.rs	7	marks	mark	calls
+rust/inline_tests.rs	13	shipped	mark	calls
+rust/inline_tests.rs	18	fake_client	mark	calls
+rust/link/crates/app/src/main.rs	12	main	open	calls
+rust/link/crates/app/src/main.rs	12	main	unwrap	calls
+rust/link/crates/app/src/main.rs	13	main	new	calls
+rust/link/crates/app/src/main.rs	14	main	save	calls
+rust/link/crates/app/src/main.rs	15	main	get	calls
+rust/link/crates/app/src/main.rs	16	main	name	calls
+rust/link/crates/app/src/main.rs	17	main	from_str	calls
+rust/link/crates/app/src/main.rs	18	main	spawn	calls
+rust/link/crates/app/src/main.rs	21	main	len	calls
+rust/link/crates/app/src/main.rs	22	main	tidy	calls
+rust/link/crates/app/src/main.rs	24	main	helper_free	calls
+rust/link/crates/app/src/main.rs	26	main	count_ones	calls
+rust/link/crates/app/src/main.rs	26	main	iter	calls
+rust/link/crates/app/src/main.rs	26	main	map	calls
+rust/link/crates/app/src/main.rs	27	main	make	calls
+rust/link/crates/app/src/main.rs	27	main	run	calls
+rust/link/crates/app/src/main.rs	28	main	go	calls
+rust/link/crates/app/src/main.rs	35	opener	open	calls
+rust/link/crates/app/src/main.rs	36	opener	save	calls
+rust/link/crates/app/src/main.rs	37	opener	Ok	calls
+rust/link/crates/app/src/main.rs	46	Wrapper.go	Store.save	calls
+rust/link/crates/app/src/main.rs	47	Wrapper.go	save	calls
+rust/link/crates/app/src/main.rs	52	Wrapper.go	Some	calls
+rust/link/crates/app/src/main.rs	56	Wrapper.go	f	calls
+rust/link/crates/app/src/review.rs	14	crates	tidy_up	calls
+rust/link/crates/app/src/review.rs	15	crates	make	calls
+rust/link/crates/app/src/review.rs	16	crates	new	calls
+rust/link/crates/app/src/review.rs	17	crates	lone	calls
+rust/link/crates/app/src/review.rs	22	first	T.name	calls
+rust/link/crates/app/src/review.rs	29	second	T.name	calls
+rust/link/crates/app/src/review.rs	33	third	T.name	calls
+rust/link/crates/app/src/review.rs	39	overloads	from	calls
+rust/link/crates/app/src/review.rs	39	overloads	new	calls
+rust/link/crates/app/src/review.rs	40	overloads	Failure.name	calls
+rust/link/crates/app/src/review.rs	45	platform	platform	calls
+rust/link/crates/app/src/review.rs	51	t1	polish	calls
+rust/link/crates/app/src/review.rs	56	t2	polish	calls
+rust/link/crates/app/src/review.rs	61	missing	Store.render	calls
+rust/link/crates/app/src/review.rs	67	not_mine	ext	calls
+rust/link/crates/app/src/review.rs	73	values	new	calls
+rust/link/crates/app/src/review.rs	73	values	open	calls
+rust/link/crates/app/src/review.rs	74	values	save	calls
+rust/link/crates/app/src/review.rs	76	make	new	calls
+rust/link/crates/app/src/review.rs	78	values	make	calls
+rust/link/crates/app/src/review.rs	79	values	T.save	calls
+rust/link/crates/app/src/review.rs	80	values	Ok	calls
+rust/link/crates/app/src/review.rs	85	modes	Parse	calls
+rust/link/crates/app/src/review.rs	91	defaults	default	calls
+rust/link/crates/app/src/review.rs	92	defaults	save	calls
+rust/link/crates/app/src/review.rs	97	chained	Store.logger	calls
+rust/link/crates/app/src/review.rs	98	chained	info	calls
+rust/link/crates/app/src/review.rs	99	chained	open	calls
+rust/link/crates/app/src/review.rs	100	chained	logger	calls
+rust/link/crates/app/src/review.rs	102	chained	Ok	calls
+rust/link/crates/app/src/review.rs	107	mystery_typed	Store.tidy_up	calls
+rust/link/crates/app/src/review.rs	114	closure_use	polish	calls
+rust/link/crates/app/src/review.rs	116	closure_use	c	calls
+rust/link/crates/app/src/review.rs	127	Vec<u8>.size	Vec<u8>.tidy_up	calls
+rust/link/crates/app/src/review.rs	135	closure_receiver	P.shine	calls
+rust/link/crates/app/src/review.rs	137	closure_receiver	c	calls
+rust/link/crates/app/src/review.rs	150	String.wave	String.hello	calls
+rust/link/crates/app/src/review.rs	166	std::path::PathBuf.report	std::path::PathBuf.len	calls
+rust/link/crates/app/src/review.rs	179	u32.greet	u32.bow	calls
+rust/link/crates/app/src/review.rs	196	String.total	String.len	calls
+rust/link/crates/app/src/util.rs	9	tidies	tidy	calls
+rust/link/crates/store/src/failure.rs	17	Failure.name	new	calls
+rust/link/crates/store/src/ops.rs	10	Named.shout	Named.name	calls
+rust/link/crates/store/src/ops.rs	22	Store.name	from	calls
+rust/link/crates/store/src/ops.rs	34	Failure.name	from	calls
+rust/link/crates/store/src/store.rs	12	Store.open	is_empty	calls
+rust/link/crates/store/src/store.rs	13	Store.open	Err	calls
+rust/link/crates/store/src/store.rs	13	Store.open	new	calls
+rust/link/crates/store/src/store.rs	15	Store.open	Ok	calls
+rust/link/crates/store/src/store.rs	19	Store.new	helper	calls
+rust/link/crates/store/src/store.rs	21	Store.new	new	calls
+rust/link/crates/store/src/store.rs	33	Store.get	Logger.info	calls
+rust/link/crates/store/src/store.rs	34	Store.get	get	calls
+rust/link/crates/store/tests/it.rs	7	seeds	seed	calls
+ts-dispatch/api.ts	7	Api.handle	IService.update	calls
+ts-dispatch/api.ts	8	Api.handle	BaseService.update	calls
+ts/apps/legacy/main.js	6	Main.run	Main.go	calls
+ts/apps/legacy/main.js	7	Main.run	greet	calls
+ts/apps/legacy/main.js	8	Main.run	vanishing	calls
+ts/apps/legacy/main.js	9	Main.run	express	calls
+ts/apps/legacy/main.js	9	Main.run	listen	calls
+ts/apps/shell/src/app/blocks.ts	6	outer	cb	calls
+ts/apps/shell/src/app/data.component.ts	8	DataComponent.load	token	calls
+ts/apps/shell/src/app/local-inject.ts	8	useLocal	inject	calls
+ts/apps/shell/src/app/local-inject.ts	9	useLocal	token	calls
+ts/apps/shell/src/app/login.component.ts	12	LoginComponent.constructor	Store.save	calls
+ts/apps/shell/src/app/login.component.ts	16	LoginComponent.submit	AuthService.login	calls
+ts/apps/shell/src/app/login.component.ts	16	LoginComponent.submit	map	calls
+ts/apps/shell/src/app/login.component.ts	16	LoginComponent.submit	pipe	calls
+ts/apps/shell/src/app/login.component.ts	20	LoginComponent.shadow	token	calls
+ts/apps/shell/src/app/login.component.ts	24	LoginComponent.callback	AuthService.token	calls
+ts/apps/shell/src/app/login.component.ts	24	LoginComponent.callback	forEach	calls
+ts/apps/shell/src/app/store.ts	3	Store.save	setItem	calls
+ts/apps/shell/src/app/use-mixed.ts	4	useMixed	mystery	calls
+ts/apps/shell/src/app/use-package.ts	10	usePackage	formatName	calls
+ts/apps/shell/src/app/use-package.ts	11	usePackage	selectUser	calls
+ts/apps/shell/src/app/use-package.ts	12	usePackage	Widget.render	calls
+ts/apps/shell/src/app/use-package.ts	13	usePackage	readFileSync	calls
+ts/apps/shell/src/app/use-package.ts	14	usePackage	of	calls
+ts/apps/shell/src/app/use-package.ts	15	usePackage	helper	calls
+ts/apps/shell/src/app/use-package.ts	16	usePackage	filter	calls
+ts/apps/shell/src/app/use-util.ts	9	run	formatName	calls
+ts/apps/shell/src/app/use-util.ts	10	run	helper	calls
+ts/apps/shell/src/app/use-util.ts	11	run	clear	calls
+ts/apps/shell/src/app/use-util.ts	12	run	fromPackage	calls
+ts/apps/shell/src/app/use-util.ts	13	run	of	calls
+ts/apps/shell/src/app/use-util.ts	14	run	tokenInterceptor	calls
+ts/apps/shell/src/app/util.ts	4	helper	JSON.stringify	calls
+ts/apps/shell/src/app/util.ts	4	helper	log	calls
+ts/apps/shell/src/app/util.ts	11	run	stop	calls
+ts/apps/shell/src/app/util.ts	19	m	n	calls
+ts/apps/shell/src/app/util.ts	27	build	Klass.make	calls
+ts/apps/shell/src/app/util.ts	28	build	call	calls
+ts/libs/auth/src/lib/services/auth.service.ts	15	AuthService.login	of	calls
+ts/libs/auth/src/lib/services/auth.service.ts	19	AuthService.refresh	AuthService.token	calls
+typescript/token.interceptor.ts	30	AuthService.constructor	AuthService.tick	calls
+typescript/token.interceptor.ts	34	AuthService.ngOnInit	AuthService.load	calls
+typescript/token.interceptor.ts	35	AuthService.ngOnInit	audit	calls
+typescript/token.interceptor.ts	35	AuthService.ngOnInit	map	calls
+typescript/token.interceptor.ts	36	AuthService.ngOnInit	AuthService.process	calls
+typescript/token.interceptor.ts	36	AuthService.ngOnInit	HttpClient.get	calls
+typescript/token.interceptor.ts	36	AuthService.ngOnInit	subscribe	calls
+typescript/token.interceptor.ts	37	AuthService.ngOnInit	AuthService.track	calls
+typescript/token.interceptor.ts	38	AuthService.ngOnInit	cb	calls

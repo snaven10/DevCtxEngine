@@ -8,7 +8,7 @@ use devctx_parse::Lang;
 const PATH: &str = "crates/demo/src/cache.rs";
 
 /// `impl<T: Clone> Cached<T>` names its methods `Cached.m`, never
-/// `Cached<T>.m` (master §2 H5) — in the symbols and in `graph_edges`.
+/// `Cached<T>.m` (master §2 H5) — in the symbols and in the call edges.
 #[test]
 fn a_bounded_generic_impl_names_its_methods_after_the_bare_type() {
     let pf = facts(Lang::rust(), "rust/cache.rs", PATH);

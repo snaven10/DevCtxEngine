@@ -104,20 +104,6 @@ pub struct GraphEdge {
     pub byte: usize,
     /// Byte offset of the enclosing function node, if there is one.
     pub source_byte: Option<usize>,
-    /// The source 0.9.0 gave this call, for `graph_edges` only (what a
-    /// downgraded 0.9.0 walks by exact name): the nearest enclosing callable
-    /// of a kind 0.9.0 knew, as `Container.name` or `name` — the method
-    /// around an arrow or a function expression, `Deeper.deep` for a method
-    /// of a nested class, `helper` in a Rust `mod tests`. `None` where 0.9.0
-    /// saw no function (it dropped the call). `symbols`/`edges` never read it.
-    pub legacy_source: Option<String>,
-    /// The target 0.9.0 gave this call, for `graph_edges` only, where it
-    /// differs by rule from [`target`](Self::target): Go, which 0.9.0 typed
-    /// only by a receiver written with a capital (`Val.Get`) or a variable,
-    /// parameter or field declared with a plain type name — `s.Handle()` on
-    /// an `s *Server` was `Handle`, `store.Open()` was `Open`. `None` for the
-    /// other languages.
-    pub legacy_target: Option<String>,
     /// Id of the source symbol, `0` until [`ParsedFile::assign_ids`] runs.
     pub src_id: u64,
     /// What the file says about the receiver (`edges.hint`, PLAN-009
@@ -138,13 +124,17 @@ pub struct ParsedFile {
     /// Extracted imports, in source order.
     pub imports: Vec<Import>,
     /// Extracted call-graph edges whose source is a named function, in source
-    /// order. What `graph_edges` is made of.
+    /// order: the calls of the `edges` table. `graph_edges` is made of
+    /// [`legacy_edges`](Self::legacy_edges) instead.
     pub edges: Vec<GraphEdge>,
     /// Calls with no named enclosing function — module level, a class body,
     /// an anonymous function — in source order, `source` empty. They used to
     /// be dropped; the `edges` table keeps them, sourced from the innermost
     /// symbol around them or the file symbol.
     pub module_edges: Vec<GraphEdge>,
+    /// The `graph_edges` rows, as 0.9.0 wrote them: its own extraction, run
+    /// over this tree ([`crate::legacy_v090`]). What a downgraded 0.9.0 reads.
+    pub legacy_edges: Vec<crate::legacy_v090::GraphEdge>,
     /// The file's own symbol (`kind = file`), spanning the whole source.
     pub file_symbol: Symbol,
     /// Package, structured imports, supertypes, instantiations and type uses

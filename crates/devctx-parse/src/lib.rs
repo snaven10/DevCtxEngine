@@ -9,6 +9,7 @@
 pub mod error;
 pub mod facts;
 pub mod lang;
+pub mod legacy_v090;
 pub mod parser;
 pub mod registry;
 pub mod resolve;

@@ -23,7 +23,7 @@ fn an_exported_arrow_const_is_a_function_and_the_source_of_its_calls() {
             "{target}: {c:?}"
         );
     }
-    // `graph_edges` names it as the source too.
+    // the call edge names it as the source too.
     assert!(pf
         .edges
         .iter()
@@ -114,7 +114,7 @@ fn typescript_imports_are_structured() {
     assert_eq!(pf.facts.imports[4].alias.as_deref(), Some("AuthStore"));
 }
 
-/// `graph_edges` names its source by text, and `impact_analysis` /
+/// A call edge names its source by text, and `impact_analysis` /
 /// `get_references` read it: an arrow is that source only when it is a
 /// symbol (a `const` or a class field). An arrow bound to an object key, to
 /// `this.x` or nested in a call belongs to the function that wrote it, and
@@ -149,7 +149,7 @@ fn graph_edges_name_an_arrow_only_when_it_is_a_symbol() {
         c.contains(&t2("AuthService.constructor", "AuthService.tick")),
         "{c:?}"
     );
-    // Every `graph_edges` source is the qualified name of a symbol.
+    // Every call-edge source is the qualified name of a symbol.
     let names: Vec<&str> = pf.symbols.iter().map(|s| s.qualified.as_str()).collect();
     for e in &pf.edges {
         assert!(

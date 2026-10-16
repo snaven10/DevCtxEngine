@@ -13,8 +13,8 @@
 //! - each symbol: kind, qualified name, id, parent (the `contains` edge),
 //!   container, `exported`, lines and signature;
 //! - each call: source symbol → target, line, the source name
-//!   `graph_edges` records (`-` for a call with no named function around
-//!   it, which `graph_edges` leaves out) and the receiver `hint` the link
+//!   a call edge (`GraphEdge`) records (`-` for a call with no named function around
+//!   it, which those leave out) and the receiver `hint` the link
 //!   pass resolves it from;
 //! - each instantiation and type use, supertype and import, with its source.
 //!

@@ -1,9 +1,10 @@
-//! Every source `graph_edges` records is the qualified name of the symbol the
-//! call is in (PLAN-009 TASK-004 review, m-c and NIT).
+//! Every source a call edge (`GraphEdge`) records is the qualified name of the
+//! symbol the call is in (PLAN-009 TASK-004 review, m-c and NIT). Since
+//! TASK-019 the `graph_edges` table is not made of these edges but of 0.9.0's
+//! own extraction (`legacy_v090`, pinned by `tests/legacy_v090.rs`).
 //!
-//! `impact_analysis` and `get_references` read `graph_edges` by name, so a
-//! source that names no symbol — or another symbol than the one the `edges`
-//! row points at — loses the caller. A named callable used to be sourced as
+//! A source that names no symbol — or another symbol than the one the `edges`
+//! row points at — loses the caller to whoever reads the calls by name. A named callable used to be sourced as
 //! `Container.name` whatever scopes sat between: a Python decorator's
 //! `wrapper` was `wrapper` (the symbol is `traced.wrapper`), a Java anonymous
 //! class's `run` was `OrderService.run` (it is `OrderService.init.run`), a
@@ -32,7 +33,7 @@ const FIXTURES: &[(&str, &str, &str)] = &[
     ("go", "go/server.go", "api/server.go"),
 ];
 
-/// In every fixture, each `graph_edges` source is the qualified name of a
+/// In every fixture, each call edge's source is the qualified name of a
 /// symbol, and of the very symbol the `edges` row is sourced from.
 #[test]
 fn every_graph_source_is_the_qualified_name_of_its_symbol() {
