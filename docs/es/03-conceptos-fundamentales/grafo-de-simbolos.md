@@ -102,9 +102,10 @@ hay (`edges_discarded`) y cuántas llamadas quedan sin decidir
 (`edges_unresolved`).
 
 `graph_edges`, la tabla de llamadas de 0.9 (una fila por par llamador → llamado,
-con nombres en vez de ids), se sigue escribiendo al lado, en su formato viejo,
-para que un índice hecho por 0.10 siga legible si volvés a 0.9.0. Nada en 0.10
-la lee salvo el camino viejo de una rama que todavía no se reconstruyó.
+con nombres en vez de ids), se sigue escribiendo al lado, con la extracción de
+0.9.0 (su código, copiado tal cual), así que la tabla es idéntica a la que
+escribe 0.9.0 y un 0.9.0 al que volvés responde como antes. Nada en 0.10 la lee
+salvo el camino viejo de una rama que todavía no se reconstruyó.
 
 ### Cómo se resuelve una referencia
 

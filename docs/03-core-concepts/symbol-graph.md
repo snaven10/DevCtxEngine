@@ -100,8 +100,9 @@ reports how many there are (`edges_discarded`) and how many calls are still
 undecided (`edges_unresolved`).
 
 `graph_edges`, the call table of 0.9 (one row per caller → callee pair, names
-instead of ids), is still written alongside, in its old format, so an index
-made by 0.10 stays readable if you go back to 0.9.0. Nothing in 0.10 reads it
+instead of ids), is still written alongside, by 0.9.0's own extraction (its
+code, copied as it was), so the table is identical to the one 0.9.0 writes and
+a 0.9.0 you go back to answers as it did before. Nothing in 0.10 reads it
 except the old path for a branch not yet rebuilt.
 
 ### How a reference is resolved

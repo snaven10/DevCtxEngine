@@ -74,34 +74,26 @@ The guide, with the measurements and what each tool answers meanwhile:
 
 Install 0.9.0, `devctx serve --stop`, restart the AI sessions. The new tables
 stay in the database, unread and harmless; nothing is migrated or rewritten.
-`graph_edges` was kept current in its 0.9 format, so 0.9.0's graph tools answer
-from it (field verification: the 0.9.0 binary over five upgraded indexes answers
-every call, with its `extractor_stale` warning). 0.9.0 reports `extractor_stale`
-and works anyway; its `--full` would re-embed everything (0.9.0 does not reuse
-vectors). Coming back to 0.10 after 0.9.0 indexed files: the branch reads as
-stale (`graph_out_of_step`) and asks for `devctx index --full` again, with
-vectors reused.
+0.9.0's graph tools answer from `graph_edges` (field verification: the 0.9.0
+binary over five upgraded indexes answers every call, with its
+`extractor_stale` warning). 0.9.0 reports `extractor_stale` and works anyway;
+its `--full` would re-embed everything (0.9.0 does not reuse vectors). Coming
+back to 0.10 after 0.9.0 indexed files: the branch reads as stale
+(`graph_out_of_step`) and asks for `devctx index --full` again, with vectors
+reused.
 
-The downgrade contract:
-
-- **Module paths stay as in 0.9.0.** A Rust call through a module path is
-  written in `graph_edges` by its last segment, as 0.9.0 wrote it
-  (`crate::util::helper()` → `helper`).
-- **Calls through a type stay `Type.method`** (`Store::open()` →
-  `Store.open`). 0.9.0 still finds them by name (the `.open` suffix), and
-  since `Type.method` is also the method's name as a caller, its `impact` walk
-  goes one level further than over its own rows. For these Rust path calls no
-  caller is lost (test `rust_path_calls_stay_walkable_by_0_9_0`).
-- **Answers can differ in details**, because the rows come from 0.10's
-  extractor: nested classes qualified by their outer class, `var.*` and
-  constants taken for types gone.
-- **Pending (PLAN-009 TASK-019): calls into nested classes.** The field
-  verification saw a 0.9.0 `impact` walk through a nested class stop one level
-  earlier than 0.9.0 did over its own index. That would be callers lost, so it
-  is being reproduced against the original 0.9.0 and is not part of this
-  contract until then; so are the 60 field cases over a compacted index.
-- **To be identical to 0.9.0 again, index again with 0.9.0** (`devctx index
-  --full`, which re-embeds everything).
+The downgrade contract: **`graph_edges` is identical to the one 0.9.0
+writes, false positives included.** It is filled by 0.9.0's own extraction,
+copied as it was (`crates/devctx-parse/src/legacy_v090.rs`), so a downgraded
+0.9.0 gives the graph answers 0.9.0 gave before the upgrade for the same
+commit — same names, same callers at every depth, same mistakes; the symbol
+graph lives only in the tables 0.9.0 does not read. Verified in PLAN-009
+TASK-019 on five repositories at the same commit: 0 rows differ both ways
+between the table 0.9.0 wrote and the one 0.10 wrote after the upgrade and
+the compaction (`EXCEPT ALL`, every column), and the 0.9.0 binary finds the
+same callers over both for every seed of the evaluation set at depths 1–3. A
+golden test pins the rows the 0.9.0 binary writes for every language's
+fixtures.
 
 ### Added
 
@@ -169,8 +161,8 @@ The downgrade contract:
   Measured on call sites labelled by hand: Java 20 of 25 right (19 of 19
   `high`), TypeScript 20 of 20, Python 26 of 27, Rust 26 of 26; calls left
   undecided 4–8 % (Java), 11 % (TypeScript), 2 % (Python), 17.5 % (Rust), from
-  59–94 % unqualified before. `graph_edges` loses its `var.*` and `LOG.*`
-  targets.
+  59–94 % unqualified before. `graph_edges` is not affected: it keeps the
+  rows 0.9.0 writes (see *Going back to 0.9.0*).
 - **`traverse`** (TASK-013): a new tool (MCP, `POST /traverse`,
   `devctx traverse`) to walk the symbol graph hop by hop from a symbol — a bare,
   qualified or `file::name` symbol, a file path, or one `sym` — along the
@@ -308,9 +300,9 @@ The downgrade contract:
   200-character cap: the head is capped on its own, ending in `…` when cut,
   and the annotations that fit whole in another 200 stay in front.
 - **The type of an `impl` is named as its definition is** (`impl<T> Foo<T>`,
-  `impl Display for &'a Foo`, `impl crate::x::Foo` → `Foo`): the `graph_edges`
-  source of such a method is `Foo.get` (was `Foo<T>.get`) and its chunks'
-  header changes with it.
+  `impl Display for &'a Foo`, `impl crate::x::Foo` → `Foo`): such a method is
+  `Foo.get` in the symbol graph and its chunks' header changes with it
+  (`graph_edges` keeps 0.9.0's `Foo<T>.get`).
 - **Reindex reuses vectors by chunk `content_hash`** (TASK-002): a `--full`
   embeds only the chunks whose text changed, and over unchanged source embeds
   nothing, loads no model and rebuilds no HNSW/BM25 index (measured: 4.4 s

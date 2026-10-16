@@ -431,31 +431,20 @@ sessions. Then:
 - The 0.10 tables (`symbols`, `edges`, the `live_edges` view, extra `index_meta`
   keys) stay in the database, unread and harmless. Nothing is migrated or
   rewritten.
-- `graph_edges` was kept up to date in its 0.9 format, so 0.9.0's
-  `read_symbol`, `get_references` and `impact_analysis` answer from it. Checked
-  with the 0.9.0 binary over five upgraded indexes (2026-10-13): every call
-  answers, with its `extractor_stale` warning, and its vector search returns
-  the same results as 0.10 on the same database.
-- **What 0.9.0 reads there.** A Rust call through a module path is written as
-  0.9.0 wrote it, by its last segment (`crate::util::helper()` → `helper`). A
-  call through a type is written `Type.method` (`Store::open()` →
-  `Store.open`): 0.9.0 still finds it by name (its `.open` suffix), and since
-  `Store.open` is also the method's name as a caller, its `impact` walk goes
-  one level further than over its own rows, where `open` led nowhere. For
-  these Rust path calls no caller is lost: a test
-  (`rust_path_calls_stay_walkable_by_0_9_0`) walks both shapes with 0.9.0's
-  reader.
-- **The answers can differ in details** from the ones 0.9.0 gave before the
-  upgrade, because the rows come from 0.10's extractor: nested classes are
-  qualified by their outer class, and `var.*` and constants taken for types
-  are gone. To get exactly the 0.9.0 answers back, index again with 0.9.0
-  (`devctx index --full`, which re-embeds everything).
-- **Pending (PLAN-009 TASK-019): calls into nested classes.** The field
-  verification saw a 0.9.0 `impact` walk through a nested class stop one
-  level earlier than 0.9.0 did over its own index. That would be callers
-  lost, so it is being reproduced against the original 0.9.0 and is not
-  covered by the paragraphs above until then; neither are the 60 field cases
-  over a compacted index.
+- **`graph_edges` is identical to the one 0.9.0 writes, false positives
+  included.** 0.10 fills it with 0.9.0's own extraction (its code, copied
+  as it was in `crates/devctx-parse/src/legacy_v090.rs`), so a downgraded
+  0.9.0's `read_symbol`, `get_references` and `impact_analysis` give the
+  answers 0.9.0 gave before the upgrade, for the same commit — the same
+  names, the same callers at every depth, and the same mistakes (a call
+  joined by a bare name to another function, a type it could not see). The
+  symbol graph and its improvements live only in the tables 0.9.0 does not
+  read. Checked (PLAN-009 TASK-019, five repositories, the same commit): the
+  table written by 0.9.0 and the one written by 0.10 after the upgrade and
+  the compaction differ in 0 rows both ways, every column compared
+  (`EXCEPT ALL`), and the 0.9.0 binary over both finds the same callers for
+  every seed of the evaluation set at depths 1, 2 and 3; a golden test pins
+  the rows the 0.9.0 binary writes for the fixtures of every language.
 - 0.9.0 sees a stamp it did not write and reports `extractor_stale` with its own
   warning. It works anyway; its `--full` would re-embed every chunk (0.9.0 does
   not reuse vectors), and is not needed for it to answer.

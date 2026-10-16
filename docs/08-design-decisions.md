@@ -303,8 +303,8 @@ output is pinned by a golden test, so every change of it is an
 ## ADR-20: The symbol graph is additive; the old call table stays a release
 
 **Decision.** 0.10 adds `symbols` and `edges` (no primary key, no `UNIQUE`: the
-writer replaces a file's rows) and keeps writing 0.9's `graph_edges` in its old
-format. A branch not yet rebuilt is answered by 0.9's readers with a warning;
+writer replaces a file's rows) and keeps writing 0.9's `graph_edges`, with
+0.9.0's own extraction copied as it was, so the table is identical to 0.9.0's. A branch not yet rebuilt is answered by 0.9's readers with a warning;
 the tools that only exist on the new graph refuse with an error that names the
 fix. A reindex is asked for, never done behind the user's back.
 

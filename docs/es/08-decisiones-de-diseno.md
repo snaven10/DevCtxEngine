@@ -328,7 +328,8 @@ para cada usuario.
 
 **Decisión.** 0.10 agrega `symbols` y `edges` (sin clave primaria ni `UNIQUE`:
 el escritor reemplaza las filas de un archivo) y sigue escribiendo
-`graph_edges` de 0.9 en su formato viejo. Una rama todavía no reconstruida la
+`graph_edges` de 0.9 con la extracción de 0.9.0 copiada tal cual, así que la
+tabla es idéntica a la de 0.9.0. Una rama todavía no reconstruida la
 responden los lectores de 0.9 con un aviso; las herramientas que solo existen
 sobre el grafo nuevo se niegan con un error que nombra el arreglo. Un
 reindexado se pide, nunca se hace a espaldas del usuario.
