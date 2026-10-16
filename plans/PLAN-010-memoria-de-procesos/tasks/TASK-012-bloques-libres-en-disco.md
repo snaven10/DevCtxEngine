@@ -39,6 +39,13 @@ por decisión del usuario (2026-10-07). No bloquea la 0.10.0.
   atómico), con el riesgo conocido sobre índices HNSW (extensión VSS) y sobre el WAL.
 - Instrumentación disponible: el bloque `memory` de `status` (tamaño de la base y del HNSW) y
   `scripts/memprobe.sh` (TASK-001).
+- **Candidata, no compromiso (PLAN-009 TASK-019, 2026-10-16):** hasta 0.10, `forget_memory` y
+  `purge_memories_for_project` dejaban en `memory_symbol_references` las filas de las memorias que
+  borraban (huérfanas; 0.9.0 hace lo mismo). 0.10 ya no las deja y el restore del sidecar no las
+  duplica, pero **no limpia las que ya existen** (la compactación las copia tal cual, a propósito:
+  copia verificada, no migración). Si se decide limpiarlas, que sea una migración explícita
+  (`DELETE … WHERE memory_id NOT IN (SELECT id FROM memories)`), anunciada y medida; no un efecto
+  colateral de la compactación.
 
 ## Archivos
 
